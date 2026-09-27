@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -52,6 +53,74 @@ def _endpoints(command: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+#: The document a Hugging Face Diffusers repository names its pipeline components in.
+DIFFUSERS_INDEXES = ("model_index.json", "modular_model_index.json")
+
+
+def diffusers_configs(index: bytes) -> dict[str, str]:
+    """Each Diffusers component's construction config file, by component name.
+
+    A model is built from its folder's ``config.json`` and a scheduler from its
+    ``scheduler_config.json``; tokenizers and processors are assets, not constructors.
+    Classic indexes map a component to ``[library, class]``, modular ones add a spec whose
+    ``subfolder`` and ``type_hint`` name the folder and class.
+    """
+    document = json.loads(index)
+    found: dict[str, str] = {}
+    for name, entry in document.items() if isinstance(document, dict) else ():
+        if name.startswith("_") or not isinstance(entry, list) or len(entry) < 2:
+            continue
+        kind = entry[1]
+        spec = entry[2] if len(entry) > 2 and isinstance(entry[2], dict) else {}
+        hint = spec.get("type_hint")
+        if not isinstance(kind, str) and isinstance(hint, list) and len(hint) == 2:
+            kind = hint[1]
+        folder = spec.get("subfolder") or name
+        if not isinstance(kind, str) or not isinstance(folder, str):
+            continue
+        if kind.endswith("Scheduler"):
+            found[name] = f"{folder}/scheduler_config.json"
+        elif not any(word in kind for word in ("Tokenizer", "Processor", "FeatureExtractor")):
+            found[name] = f"{folder}/config.json"
+    return found
+
+
+def _merge(selection: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Small metadata rides in the same pin as the carriers, never as a carrier."""
+    names = {row[0] for row in selection["members"]}
+    selection["members"] = sorted(
+        [*selection["members"], *(row for row in metadata["members"] if row[0] not in names)]
+    )
+    for key in ("allowed_hosts", "credential_hosts"):
+        selection[key] = sorted({*selection[key], *metadata[key]})
+
+
+def _pinned(store: Any, uri: str, names: list[str], command: dict[str, Any]) -> dict[str, Any]:
+    """The files of ``names`` the pinned revision holds; one it lacks is not selected."""
+    try:
+        return dict(store.resolve_source(uri, files=names, **_endpoints(command)))
+    except Exception as exc:
+        if getattr(exc, "code", None) != "MISSING_FIELD":
+            raise
+    found: dict[str, Any] = {"members": [], "allowed_hosts": [], "credential_hosts": []}
+    for name in names if len(names) > 1 else ():
+        _merge(found, _pinned(store, uri, [name], command))
+    return found
+
+
+def _diffusers_members(store: Any, uri: str, command: dict[str, Any]) -> dict[str, Any]:
+    """A Diffusers repository's index and each component's config, in the same pin."""
+    for index in DIFFUSERS_INDEXES:
+        pinned = _pinned(store, uri, [index], command)
+        if pinned["members"]:
+            break
+    else:
+        return pinned
+    member = tuple(pinned["members"][0])
+    ((_, body),) = fill.tensorfs_module().read_source_heads(uri, [member], **_endpoints(command))
+    return _pinned(store, uri, [index, *sorted(set(diffusers_configs(body).values()))], command)
+
+
 def resolve(store: Any, command: dict[str, Any]) -> dict[str, Any]:
     operation, arguments = command["operation"], command["arguments"]
     recipe = recipe_of(arguments, operation)
@@ -69,13 +138,13 @@ def resolve(store: Any, command: dict[str, Any]) -> dict[str, Any]:
         )
     if recipe is not None:
         # Reviewed metadata rides in the same pin; its bytes are named by the recipe.
-        metadata = store.resolve_source(uri, files=sorted(recipe.metadata), **_endpoints(command))
-        names = {row[0] for row in selection["members"]}
-        selection["members"] = sorted(
-            [*selection["members"], *(row for row in metadata["members"] if row[0] not in names)]
+        _merge(
+            selection,
+            store.resolve_source(uri, files=sorted(recipe.metadata), **_endpoints(command)),
         )
-        for key in ("allowed_hosts", "credential_hosts"):
-            selection[key] = sorted({*selection[key], *metadata[key]})
+    elif operation == "upload_huggingface":
+        # A Diffusers repository's components are constructed from its own configs.
+        _merge(selection, _diffusers_members(store, uri, command))
     return {"selection": selection}
 
 
@@ -184,6 +253,18 @@ def compose(store: Any, command: dict[str, Any], prepared: list[dict[str, Any]])
     return {"digest": "sha256:" + manifest["sha256"], "length": manifest["length"]}
 
 
+def _added_configs(store: Any, command: dict[str, Any]) -> dict[str, bytes]:
+    """The Diffusers configs landed beside the carriers, named by their component."""
+    files = {
+        name: bytes(store.document(digest.removeprefix("sha256:"), size))
+        for name, digest, size, _ in command.get("metadata", [])
+    }
+    index = next((files[name] for name in DIFFUSERS_INDEXES if name in files), None)
+    if index is None:
+        return {}
+    return {name: files[path] for name, path in diffusers_configs(index).items() if path in files}
+
+
 def _union_writer(store: Any, command: dict[str, Any], prepared: list[dict[str, Any]]) -> Any:
     sources: dict[str, tuple[str, int]] = {}
     targets: dict[str, dict[str, Any]] = {}
@@ -206,16 +287,24 @@ def _union_writer(store: Any, command: dict[str, Any], prepared: list[dict[str, 
                     "model_source_configs_overlap", f"profiles both carry config {name}"
                 )
             configs[name] = {"kind": "copy", "source": slot, "source_config": name}
-    return store.begin_derived(
+    added = _added_configs(store, command)
+    for name in added:
+        if name in configs:
+            raise UploadRefusal("model_source_configs_overlap", f"config {name} is carried twice")
+        configs[name] = {"kind": "add"}
+    writer = store.begin_derived(
         command["native_owner"],
         int(command["writer_epoch"]),
         sources,
         targets,
         configs,
         order,
-        0,
+        sum(len(body) for body in added.values()),
         work_fingerprint=command["computation_digest"],
     )
+    for name, body in sorted(added.items()):
+        writer.add_config(name, io.BytesIO(body))
+    return writer
 
 
 def _recipe_writer(store: Any, command: dict[str, Any], prepared: list[dict[str, Any]]) -> Any:

@@ -583,6 +583,10 @@ class SourceCalls:
             }
             if self.native_registry is not None:
                 effective["registry"] = hashlib.sha256(self.native_registry).hexdigest()
+            configs = [m for m in content["members"] if not upload_plan.carrier(m["member"])]
+            if upload.recipe is None and configs:
+                # A Diffusers source's configs are inputs: they become the model's configs.
+                effective["configs"] = configs
             computation = computation_key(row["operation"], effective)
             checkpoint = upload.run(
                 _native_selection(command.selection),

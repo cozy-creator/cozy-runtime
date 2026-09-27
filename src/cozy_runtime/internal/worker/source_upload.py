@@ -225,7 +225,12 @@ class Upload:
     def run(
         self, selection: dict[str, Any], content: dict[str, Any], computation: str, epoch: int
     ) -> CheckpointRef:
-        metadata_names = set(self.recipe.metadata) if self.recipe is not None else set()
+        # A recipe names its metadata; otherwise every non-carrier (Diffusers configs) is.
+        metadata_names = (
+            set(self.recipe.metadata)
+            if self.recipe is not None
+            else {str(row[0]) for row in selection["members"] if not upload_plan.carrier(row[0])}
+        )
         rows: list[Row] = [
             (str(member), str(digest), int(length), str(url))
             for member, digest, length, url in selection["members"]
