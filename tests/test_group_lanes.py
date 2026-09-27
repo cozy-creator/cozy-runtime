@@ -76,38 +76,28 @@ MEASURED = {
 # --------------------------------------------------------------------- bookkeeping
 
 
-def test_fuse_and_split_are_typed_and_bump_the_revision() -> None:
-    """FUSE replaces K empty device lanes with ONE group lane whose seal names all K entries
-    and whose id joins the ordinals; SPLIT restores them; each moves `revision` (the
-    worker's admission-epoch cue). A group never nests and never steals a device."""
+def test_a_group_lane_overlaps_its_device_lanes_and_shares_their_locks() -> None:
+    """A group lane over K devices joins the device lanes instead of replacing them: its
+    seal names all K entries, its id joins the ordinals, and its device lock is the K
+    device locks, so a device runs one attempt whichever lane it comes from."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
-    assert lanes_.revision == 0 and len(lanes_) == 3
-    fused = lanes_.fuse((0, 1))
-    assert fused.lane_id == "lane-0+1" and fused.ordinals == (0, 1) and fused.devices == "0,1"
-    assert fused.group and fused.degree == 2 and fused.entries == ("0", "1")
-    assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0+1", "lane-2"]
-    assert lanes_.by_id["lane-0+1"] is fused and "lane-0" not in lanes_.by_id
-    assert lanes_.holder_of(1) is fused and lanes_.revision == 1
+    group = lanes_.group((0, 1))
+    assert group.lane_id == "lane-0+1" and group.ordinals == (0, 1) and group.devices == "0,1"
+    assert group.group and group.degree == 2 and group.entries == ("0", "1")
+    assert lanes_.group((0, 1)) is group
+    assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-0+1", "lane-1", "lane-2"]
+    assert group.locks == (lanes_.by_id["lane-0"].locks[0], lanes_.by_id["lane-1"].locks[0])
     assert lanes_.envelope.ordinals == (0, 1, 2), "the job's envelope lane is untouched"
+    assert [lane.lane_id for lane in lanes_.sharing(lanes_.by_id["lane-1"])] == [
+        "lane-1",
+        "lane-0+1",
+    ]
     # a group is ONE device seat and ONE staged seat regardless of K (per-lane constants)
     assert (lanes.LANE_RUNNING, lanes.LANE_STAGED) == (1, 1)
-    with pytest.raises(lanes.LaneRefusal) as nested:
-        lanes_.fuse((1, 2))
-    assert nested.value.code == "device_pin_infeasible" and "held by group" in nested.value.detail
-    with pytest.raises(lanes.LaneRefusal) as outside:
-        lanes_.fuse((2, 3))
-    assert outside.value.code == "device_pin_infeasible" and "outside" in outside.value.detail
-    with pytest.raises(lanes.LaneRefusal):
-        lanes_.fuse((1,))  # K >= 2
-    fused.placements.add("p")
-    with pytest.raises(lanes.LaneRefusal) as held:
-        lanes_.split(fused)
-    assert "still holds ['p']" in held.value.detail
-    fused.placements.discard("p")
-    parts = lanes_.split(fused)
-    assert [lane.lane_id for lane in parts] == ["lane-0", "lane-1"]
+    group.placements.add("p")
+    assert not lanes_.release("q") and lanes_.by_id["lane-0+1"] is group
+    assert lanes_.release("p"), "the group left with its last placement"
     assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-1", "lane-2"]
-    assert lanes_.revision == 2 and "lane-0+1" not in lanes_.by_id
 
 
 def test_a_group_binds_exactly_or_refuses_typed() -> None:
@@ -119,32 +109,28 @@ def test_a_group_binds_exactly_or_refuses_typed() -> None:
     assert tenant.lane_id == "lane-1"
 
     def refused(ordinals: tuple[int, ...], placement_id: str = "g") -> lanes.LaneRefusal:
-        revision = lanes_.revision
         with pytest.raises(lanes.LaneRefusal) as caught:
             lanes_.bind(placement_id, ordinals, model_bearing=True, measured=MEASURED)
         assert lanes_.lane_of(placement_id) is None
-        assert lanes_.revision == revision, "a refused bind fused nothing"
+        assert len(lanes_.lanes) == 3, "a refused bind made no lane"
         return caught.value
 
     assert refused((0, 3)).code == "device_pin_infeasible"  # outside the envelope
-    occupied = refused((0, 1))
-    assert occupied.code == "device_pin_infeasible" and "lane-1 holds ['t']" in occupied.detail
     assert refused((1, 0)).code == "device_pin_infeasible"  # sorted unique only
     unreadable = refused((0, 2))
     assert unreadable.code == "device_group_infeasible"
     assert "ordinal 2 ('2') free bytes unreadable" in unreadable.detail
-    lanes_.release("t")
     with pytest.raises(lanes.LaneRefusal) as weightless:
         lanes_.bind("w", (0, 1), model_bearing=False, measured={})
     assert weightless.value.code == "device_group_unsupported"
+    # a tenant on lane-1 does not keep a group off device 1, nor the group a singleton
     group = lanes_.bind("g", (0, 1), model_bearing=True, measured=MEASURED)
-    assert group.lane_id == "lane-0+1" and group.placements == {"g"} and lanes_.revision == 1
+    assert group.lane_id == "lane-0+1" and group.placements == {"g"}
     assert lanes_.bind("g", (0, 1), model_bearing=True, measured=MEASURED) is group
-    later = refused((0,), placement_id="h")
-    assert later.code == "device_pin_infeasible" and "lane-0+1" in later.detail
+    assert lanes_.bind("h", (0,), model_bearing=True, measured=MEASURED).lane_id == "lane-0"
+    assert lanes_.lane_of("t") is tenant
     lanes_.release("g")
     assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-1", "lane-2"]
-    assert lanes_.revision == 2
 
 
 def _place(
@@ -172,7 +158,7 @@ def test_an_owner_pin_runs_at_the_largest_declared_degree_it_forms() -> None:
     devices it leaves out stay free device lanes."""
     lanes_, lane = _place("0,1,2", (0, 1, 2), (2, 4))
     assert lane.ordinals == (0, 1) and lane.placements == {"p"}
-    assert [other.lane_id for other in lanes_.lanes] == ["lane-0+1", "lane-2"]
+    assert [other.lane_id for other in lanes_.lanes] == ["lane-0", "lane-0+1", "lane-1", "lane-2"]
     other = lanes_.bind(
         "q",
         (2,),
@@ -183,7 +169,7 @@ def test_an_owner_pin_runs_at_the_largest_declared_degree_it_forms() -> None:
     lanes_.release("p")
     assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-1", "lane-2"]
     lanes_, lane = _place("0,1,2", (0, 1, 2), ())
-    assert lane.ordinals == (0,) and not lane.group and lanes_.revision == 0
+    assert lane.ordinals == (0,) and not lane.group and len(lanes_.lanes) == 3
     assert _place("0,1,2,3", (0, 1, 2, 3), (2,))[1].ordinals == (0, 1)
     assert _place("0,1", (0, 1), (2,))[1].ordinals == (0, 1)
     assert _place("0,1,2", None, (2, 4))[1].ordinals == (0, 1)
@@ -194,7 +180,7 @@ def test_per_device_rows_and_the_min_ceiling() -> None:
     the lane's reading is the tightest card's, an unreadable card makes the lane
     unreadable, and the process ceiling every rank is handed is the MIN capacity."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
-    group = lanes_.fuse((0, 1))
+    group = lanes_.group((0, 1))
     assert lanes.fold_memory({0: MEASURED[0], 1: MEASURED[1]}) == accel.DeviceMemory(
         "measured", 4 * GiB, 8 * GiB
     )
@@ -221,7 +207,7 @@ def test_per_device_rows_and_the_min_ceiling() -> None:
         assert one.memory(accel.host_backend_family()).total_bytes == real.total_bytes
         assert (
             lanes.LaneSet.from_envelope("0,1", worker_pid=os.getpid())
-            .fuse((0, 1))
+            .group((0, 1))
             .memory(accel.host_backend_family())
             .state
             == "unreadable"
@@ -340,8 +326,8 @@ def _lane_rows(target: pb.ObservedWorkerState | pb.WorkerSnapshotBody) -> list[d
 
 def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
     """cr-066's Σ-lanes rule holds verbatim: a 2-device envelope as two lanes advertises
-    two seats; fused into one group it advertises ONE. The group's seat is taken by a held
-    attempt like any other. The wire (proto-024) carries exactly what the runtime holds:
+    two seats; a placement on the group over both advertises ONE. The group's seat is taken
+    by a held attempt like any other. The wire (proto-024) carries exactly what the runtime holds:
     `ObservedWorkerState.lanes[]` is the lane documents, the worker-level count is their
     sum, and `PlacementStatus.device_lane_id` names the group."""
     with _workspace() as root:
@@ -376,19 +362,24 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             worker.hosted.pop("p1").supervision.close()
             worker._release_lane("p1")
             worker._release_lane("p0")
-            group = worker.lanes.fuse((0, 1))
+            group = worker.lanes.group((0, 1))
             group.placements.add("p0")
             primary.lane_id = group.lane_id
             assert worker.available_attempt_slots() == 2
             documents = worker.lane_documents()
             assert documents == [
                 {
-                    "lane_id": "lane-0+1",
-                    "device_ordinals": [0, 1],
-                    "available_attempt_slots": 2,
-                    "placement_ids": ["p0"],
+                    "lane_id": lane_id,
+                    "device_ordinals": ordinals,
+                    "available_attempt_slots": 2 if placements else 0,
+                    "placement_ids": placements,
                     "resident_placement_ids": [],
                 }
+                for lane_id, ordinals, placements in (
+                    ("lane-0", [0], []),
+                    ("lane-0+1", [0, 1], ["p0"]),
+                    ("lane-1", [1], []),
+                )
             ]
             held = AttemptRecord(request_id="r", attempt=1, digest=b"", spec={})
             held.placement_id = "p0"
@@ -403,7 +394,7 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             worker.engine.history[staged.key()] = staged
             assert worker.available_attempt_slots() == 0, "and one staged behind it"
             taken = worker.observed_state()
-            assert _lane_rows(taken) == [dict(documents[0], available_attempt_slots=0)]
+            assert _lane_rows(taken) == [dict(row, available_attempt_slots=0) for row in documents]
             assert taken.available_attempt_slots == 0
             queued = {row.request_id: row for row in taken.held_attempts}
             assert queued["s"].state == pb.AttemptState.ATTEMPT_STATE_QUEUED
@@ -417,21 +408,20 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             assert observed.available_attempt_slots == 2
             (status,) = observed.placements
             assert status.device_lane_id == "lane-0+1"
-            assert worker.admission_epoch == epoch, "fusing by hand bumps nothing; binding does"
-            # release SPLITS the group and bumps the admission epoch once
+            # the group leaves with its placement; the device lanes never moved, so no
+            # offer's lane changed and the admission epoch stays
             worker._release_lane("p0")
             assert [lane.lane_id for lane in worker.lanes.lanes] == ["lane-0", "lane-1"]
-            assert worker.admission_epoch == epoch + 1
+            assert worker.admission_epoch == epoch
         finally:
             for slot in worker.hosted.values():
                 slot.supervision.close()
             worker.supervision.close()
 
 
-def test_a_pin_through_the_worker_fuses_and_bumps_the_admission_epoch() -> None:
-    """`_assign_lane` reads the accepted pin and the bindings' declared degrees, fuses on
-    success and bumps `admission_epoch` once; a refusal latches the placement typed and
-    leaves the lanes exactly as they were."""
+def test_a_pin_through_the_worker_binds_a_group_without_moving_admission() -> None:
+    """`_assign_lane` reads the accepted pin and the bindings' declared degrees; a refusal
+    latches the placement typed and leaves the lanes exactly as they were."""
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
@@ -450,15 +440,15 @@ def test_a_pin_through_the_worker_fuses_and_bumps_the_admission_epoch() -> None:
             placement.device_pin = (0, 1)
             epoch = worker.admission_epoch
             # the second card does not exist here: the driver's honest UNREADABLE refuses
-            # the group before anything fuses (never authorized zero)
+            # the group before any lane exists (never authorized zero)
             assert not worker._assign_lane(placement, bindings, worker.supervision)
             fault = worker.engine.faults[-1]
             assert fault.reason == "device_group_infeasible", fault
             assert fault.kind == pb.FaultKind.FAULT_KIND_CONFIG_REFUSED
             assert "ordinal 1 ('1') free bytes unreadable" in fault.detail
-            assert placement.lane_id == "" and worker.lanes.revision == 0
+            assert placement.lane_id == "" and len(worker.lanes.lanes) == 2
             assert worker.admission_epoch == epoch
-            # a weightless placement pinned to one device lands on it, no fuse, no bump
+            # a weightless placement pinned to one device lands on it, no bump
             weightless = _placement("w")
             worker.accepted.device_pins = {"w": (1,)}
             weightless.device_pin = (1,)
@@ -771,10 +761,8 @@ def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group(
             described = worker.supervision.spawn(imposed=worker.imposed(single))
             assert not described.ready_bindings and not described.loaded
             assert described.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0"
-            group = worker.lanes.fuse((0, 1))
-            tenant = Tenant(
-                _placement("candidate"), worker.supervision, {}, {}, {}, group, "candidate"
-            )
+            group = worker.lanes.group((0, 1))
+            tenant = Tenant(_placement("candidate"), worker.supervision, {}, {}, group, "candidate")
             prepared = worker._own_executor(tenant)
             assert not isinstance(prepared, str), prepared
             assert prepared is not described, (
@@ -808,7 +796,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
         interface = root / "metadata" / "package-interface.json"
         interface.parent.mkdir()
         interface.write_bytes(package_interface.canonical_bytes(body))
-        group = worker.lanes.fuse((0, 1))
+        group = worker.lanes.group((0, 1))
         assert worker.imposed(group)["CUDA_VISIBLE_DEVICES"] == "0,1"
         assert worker.imposed(group)["NCCL_NVLS_ENABLE"] == "0"
         # the wide envelope lane a job takes IS a group lane (K = the envelope), so its
@@ -1178,7 +1166,7 @@ def test_a_seal_width_change_is_a_replacement_not_a_reuse() -> None:
             WorkerOptions(root=root / "worker", devices="0,1"),
             InMemoryControlHost(),
         )
-        group = worker.lanes.fuse((0, 1))
+        group = worker.lanes.group((0, 1))
         single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
         executor = worker.supervision.spawn(imposed=worker.imposed(single))
         try:
@@ -1210,7 +1198,7 @@ def test_a_group_sealed_executor_records_both_ordinals() -> None:
             WorkerOptions(root=root / "worker", devices="0,1"),
             InMemoryControlHost(),
         )
-        group = worker.lanes.fuse((0, 1))
+        group = worker.lanes.group((0, 1))
         executor = worker.supervision.spawn(imposed=worker.imposed(group))
         try:
             assert executor.sealed_devices == "0,1" == group.devices

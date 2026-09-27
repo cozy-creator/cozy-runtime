@@ -188,7 +188,7 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
             lanes = LaneSet.from_envelope(
                 ",".join(str(rank) for rank in range(degree)), worker_pid=os.getpid()
             )
-            row = lanes.fuse(tuple(range(degree))).row("fixture")
+            row = lanes.group(tuple(range(degree))).row("fixture")
             backend = model._cozy_residency.backend
             row.ledger.observe_construction(
                 {

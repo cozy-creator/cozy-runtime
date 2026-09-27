@@ -355,7 +355,7 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
     preparation). A lane the driver cannot read is never chosen. Choosing authorizes no
     bytes, and binding takes exactly the chosen ordinals."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
-    assert len(lanes_) == 3 and lanes_.envelope.ordinals == (0, 1, 2) and lanes_.wide
+    assert len(lanes_.lanes) == 3 and lanes_.envelope.ordinals == (0, 1, 2) and lanes_.wide
     measured = {
         0: accel.DeviceMemory("measured", 4 << 30, 8 << 30),
         1: accel.DeviceMemory("measured", 16 << 30, 24 << 30),

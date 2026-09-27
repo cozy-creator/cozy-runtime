@@ -14,32 +14,28 @@ whole envelope as one group lane with one seat: it is the shape a job takes (cr-
 door), never a serving placement's.
 
 Residence ceilings are ASSIGNED by the worker, not derived in the executor (cr-025's
-`authorized_device_limit_bytes`): a process ceiling is the lane's measured capacity less
-what its co-tenants hold, and loads on a lane are serialized by its device lock, so two
-executors on one device cannot both be handed the same headroom. Every input is a
-measurement; nothing here is configured.
+`authorized_device_limit_bytes`): a process ceiling is what a device measures less what its
+co-tenants hold there, and loads are serialized by the device lock, so two executors on one
+device cannot both be handed the same headroom. Every input is a measurement.
 
-Two model-bearing placements on ONE lane share it by RESIDENCY ARBITRATION, never by
-concurrency (cr-022, the owner's "one gets to use it first, then the next gets to use it
-for a different request"). Both executors exist, sealed to the lane; at most one holds
-its weights on the device at a time unless the measured card holds both. The trigger is
-an attempt (or a prepare) for a tenant whose demand does not fit what the driver reports
-free: the other tenants VACATE, LRU-first, until it does — eviction FREES (weights are
-immutable, nothing is copied out) and the vacated tenant re-stages on its own next
-attempt through the ordinary demand-pull admission. No timer and no idleness clock
-decides anything here; a tenant that fits beside its neighbours is never moved.
+A GROUP lane has d > 1 ordinals (cr-068): ONE executor sealed to all d devices, one seat
+and one staged, one `DeviceFacts` row per device. Lanes OVERLAP: a group over 0-3 and the
+device lanes 0..3 exist together, so a device holds any number of tenants (the owner's
+"allow models to share GPUs"). `gpu_scheduler` decides which ordinals a placement gets and
+`bind` binds exactly those; nothing is refused or retired for occupancy.
 
-A GROUP lane is a lane whose `ordinals` has d > 1 entries (cr-068): ONE executor sealed to
-all d devices, one device seat and one staged, one ledger with one `DeviceFacts` row per
-device. `gpu_scheduler` decides which ordinals a placement gets; `bind` FUSES exactly those
-empty device lanes into one, or refuses typed. It never runs a group on fewer devices. The
-lane stays a group while its placement holds it and SPLITS back when the placement leaves.
-`revision` moves on every fuse and split, which is the worker's cue to bump
-`admission_epoch`: the seat count changed meaning.
+EXECUTION is exclusive per physical device (law 8): each device has one lock and a lane
+takes its devices' locks in ordinal order. RESIDENCY is shared: co-tenants of a device
+hold weights side by side while they fit; when a tenant's demand does not fit, co-tenants
+on its tightest device VACATE, LRU-first — the process and its construction stay, the
+weights re-stage on that tenant's next attempt. No timer decides anything here; a tenant
+that fits beside its neighbours is never moved, and one on the card is never a victim:
+the arbiter holds that device's lock.
 """
 
 from __future__ import annotations
 
+import itertools
 import queue
 import threading
 from collections.abc import Iterator, Mapping
@@ -72,6 +68,26 @@ LANE_RELEASED = 1
 ENVELOPE_LANE = "envelope"
 #: A weightless machine replica's own lane: sealed to no device, so it never waits for one.
 HOST_LANE = "host-"
+#: The LRU clock, worker-wide so tenants of different lanes on one device compare
+_CLOCK = itertools.count(1)
+
+
+class Devices:
+    """A lane's devices as ONE re-entrant lock: each device's lock, taken in ordinal order,
+    so lanes sharing a device serialize on it and overlapping lanes never deadlock."""
+
+    __slots__ = ("locks",)
+
+    def __init__(self, locks: tuple[threading.RLock, ...]) -> None:
+        self.locks = locks
+
+    def __enter__(self) -> None:
+        for lock in self.locks:
+            lock.acquire()
+
+    def __exit__(self, *_: object) -> None:
+        for lock in reversed(self.locks):
+            lock.release()
 
 
 class LaneRefusal(Exception):
@@ -132,7 +148,13 @@ class DeviceLane:
     """ONE serialized resource: devices, one attempt thread, one row per executor."""
 
     def __init__(
-        self, lane_id: str, ordinals: tuple[int, ...], devices: str, *, worker_pid: int
+        self,
+        lane_id: str,
+        ordinals: tuple[int, ...],
+        devices: str,
+        *,
+        worker_pid: int,
+        locks: tuple[threading.RLock, ...] = (),
     ) -> None:
         self.lane_id = lane_id
         #: envelope-local ordinals (position in the worker's `--devices` list)
@@ -156,14 +178,14 @@ class DeviceLane:
         self.post: queue.Queue[Released | None] = queue.Queue()
         #: this lane's gate: has it STOPPED moving? A rebuild on another lane leaves it set.
         self.settled = threading.Event()
-        #: THE DEVICE, as a lock: held by the lane thread from an attempt's admission to its
+        #: one lock per physical device, shared with every lane over that device
+        self.locks = locks or (threading.RLock(),)
+        #: THE DEVICES, as a lock: held by the lane thread from an attempt's admission to its
         #: device release, and by any model-bearing prepare on this lane. Residency arbitration
         #: vacates co-tenants under it, so a tenant is never evicted while its own attempt
         #: is on the card. Re-entrant because the lane thread rebuilds (prepares) inside
         #: its own hold.
-        self.device = threading.RLock()
-        #: the LRU clock: advanced by `touch`, never by time
-        self.clock = 0
+        self.device = Devices(self.locks)
 
     def __repr__(self) -> str:
         return f"DeviceLane({self.lane_id!r}, devices={self.devices!r})"
@@ -220,13 +242,9 @@ class DeviceLane:
         """Drop a slot's row when its placement leaves this lane."""
         self.rows.pop(slot, None)
 
-    def model_bearing_slots(self) -> list[str]:
-        return sorted(slot for slot, row in self.rows.items() if row.model_bearing)
-
     def touch(self, slot: str) -> None:
         """`slot`'s tenant used the device (an admission or a prepare): it is now MRU."""
-        self.clock += 1
-        self.row(slot).last_used = self.clock
+        self.row(slot).last_used = next(_CLOCK)
 
     def holding(self) -> list[tuple[str, LaneRow]]:
         """Every slot whose executor holds device bytes NOW: a model-bearing row with
@@ -237,22 +255,6 @@ class DeviceLane:
             for key, row in self.rows.items()
             if row.model_bearing and row.resident_bytes() > 0 and row.executor() is not None
         ]
-
-    def victims(self, slot: str) -> list[tuple[str, LaneRow]]:
-        """The co-tenants of `slot` that hold device bytes, LRU first (the arbitration's
-        eviction order, design §4.6)."""
-        held = [(key, row) for key, row in self.holding() if key != slot]
-        return sorted(held, key=lambda item: item[1].last_used)
-
-    def residency_signature(self) -> str:
-        """WHO HOLDS WHAT ON THIS LANE, right now, as one comparable word (cr-097).
-
-        The question a retry has to be able to answer: is the device in the same state it
-        was in when the last attempt died? Bytes rather than names, because a co-tenant
-        that vacated half its components changed the answer even though the set of tenants
-        did not.
-        """
-        return ";".join(f"{slot}={row.resident_bytes()}" for slot, row in sorted(self.rows.items()))
 
     def resident_placement_ids(self) -> list[str]:
         """`DeviceLane.resident_placement_ids` (proto-026 / cr-080): the placements of this
@@ -294,8 +296,8 @@ def fold_memory(measured: Mapping[int, DeviceMemory]) -> DeviceMemory:
 
 @dataclass(slots=True)
 class LaneSet:
-    """Every lane this worker drives: one per envelope entry (or one per GROUP of entries
-    while a placement holds them), plus the envelope lane."""
+    """Every lane this worker drives: one per envelope entry, one per GROUP of entries a
+    placement is bound to (overlapping them), plus the envelope and orchestration lanes."""
 
     entries: tuple[str, ...]
     lanes: tuple[DeviceLane, ...]
@@ -304,8 +306,6 @@ class LaneSet:
     worker_pid: int
     by_id: dict[str, DeviceLane] = field(default_factory=dict)
     composition: dict[str, DeviceLane] = field(default_factory=dict)
-    #: moves on every fuse and split: the seat set changed meaning (`admission_epoch`)
-    revision: int = 0
 
     @classmethod
     def from_envelope(cls, devices: str, *, worker_pid: int) -> LaneSet:
@@ -331,9 +331,6 @@ class LaneSet:
     def __iter__(self) -> Iterator[DeviceLane]:
         return iter((*self.lanes, self.envelope, self.orchestration, *self.composition.values()))
 
-    def __len__(self) -> int:
-        return len(self.lanes)
-
     @property
     def wide(self) -> bool:
         """More than one device in the envelope: the shape a pin decides (cr-068)."""
@@ -349,98 +346,90 @@ class LaneSet:
             None,
         )
 
-    def holder_of(self, ordinal: int) -> DeviceLane | None:
-        """The lane (device or group) that holds `ordinal` right now."""
-        return next((lane for lane in self.lanes if ordinal in lane.ordinals), None)
+    def group(self, ordinals: tuple[int, ...]) -> DeviceLane:
+        """The lane over exactly `ordinals` (K >= 2), sharing each device's lock with its
+        device lane; created on first use and gone when its last placement leaves."""
+        lane = self.by_id.get(lane_id_for(ordinals))
+        if lane is None:
+            devices = [self.by_id[lane_id_for((ordinal,))] for ordinal in ordinals]
+            lane = DeviceLane(
+                lane_id_for(ordinals),
+                ordinals,
+                ",".join(device.devices for device in devices),
+                worker_pid=self.worker_pid,
+                locks=tuple(device.locks[0] for device in devices),
+            )
+            self.lanes = tuple(sorted((*self.lanes, lane), key=lambda other: other.ordinals))
+            self.by_id[lane.lane_id] = lane
+        return lane
 
     def release(self, placement_id: str) -> bool:
-        """A placement leaves: its rows go, and a group it held alone SPLITS. True when a
-        device-less host lane went with it."""
-        for lane in list(self.lanes):
+        """A placement leaves; a group or host lane it held alone goes with it. True when a
+        lane left the set."""
+        gone = False
+        for lane in self.lanes:
             lane.placements.discard(placement_id)
             lane.forget(placement_id)
             if lane.group and not lane.placements:
-                self.split(lane)
+                self.by_id.pop(lane.lane_id, None)
+                gone = True
+        self.lanes = tuple(lane for lane in self.lanes if lane.lane_id in self.by_id)
         host = self.composition.pop(HOST_LANE + placement_id, None)
         if host is not None:
             self.by_id.pop(host.lane_id, None)
-        return host is not None
+        return gone or host is not None
 
-    # -------------------------------------------------------------------- fuse/split
+    # ------------------------------------------------------------------ residency
 
-    def _replace(self, remove: tuple[DeviceLane, ...], add: tuple[DeviceLane, ...]) -> None:
-        kept = [lane for lane in self.lanes if lane not in remove]
-        self.lanes = tuple(sorted((*kept, *add), key=lambda lane: lane.ordinals[0]))
-        for lane in remove:
-            self.by_id.pop(lane.lane_id, None)
-        for lane in add:
-            self.by_id[lane.lane_id] = lane
-        self.revision += 1
+    def sharing(self, lane: DeviceLane) -> list[DeviceLane]:
+        """`lane` and every lane over one of its devices: whose tenants share its memory."""
+        mine = set(lane.ordinals)
+        return [lane, *(o for o in self.lanes if o is not lane and mine & set(o.ordinals))]
 
-    def fuse(self, ordinals: tuple[int, ...]) -> DeviceLane:
-        """FUSE K empty device lanes into ONE group lane sealed to all K (cr-068).
+    def tenants(self, lane: DeviceLane, ordinal: int | None = None) -> list[tuple[str, LaneRow]]:
+        """Model-bearing rows on `lane`'s devices (on `ordinal` alone, if given)."""
+        return [
+            (slot, row)
+            for other in self.sharing(lane)
+            if ordinal is None or ordinal in other.ordinals
+            for slot, row in other.rows.items()
+            if row.model_bearing
+        ]
 
-        Every ordinal must be in the envelope and held by a device lane with no placement
-        on it — a group never steals a device from a tenant, and never nests. The group's
-        `devices` is the K entries joined, which is exactly what its seal imposes.
+    def victims(self, lane: DeviceLane, slot: str, ordinal: int) -> list[tuple[str, LaneRow]]:
+        """`slot`'s co-tenants holding bytes on `ordinal`, one of `lane`'s devices, LRU
+        first. None is on the card: the caller holds `lane.device`, which any of them
+        needs to execute."""
+        held = [
+            (key, row)
+            for key, row in self.tenants(lane, ordinal)
+            if key != slot and row.resident_bytes() > 0 and row.executor() is not None
+        ]
+        return sorted(held, key=lambda item: item[1].last_used)
+
+    def beside(self, lane: DeviceLane, slot: str) -> int:
+        """The most any one of `lane`'s devices holds for tenants other than `slot`."""
+        return max(
+            (
+                sum(row.resident_bytes() for key, row in self.tenants(lane, o) if key != slot)
+                for o in lane.ordinals
+            ),
+            default=0,
+        )
+
+    def signature(self, lane: DeviceLane) -> str:
+        """WHO HOLDS WHAT ON `lane`'s DEVICES, right now, as one comparable word (cr-097).
+
+        The question a retry has to be able to answer: is the device in the same state it
+        was in when the last attempt died? Bytes rather than names, because a co-tenant
+        that vacated half its components changed the answer even though the set of tenants
+        did not.
         """
-        wanted = tuple(sorted(set(ordinals)))
-        if len(wanted) < 2 or wanted != tuple(ordinals):
-            raise LaneRefusal(
-                "device_pin_infeasible",
-                f"a group pin is K >= 2 sorted unique ordinals; got {list(ordinals)}",
-            )
-        members: list[DeviceLane] = []
-        for ordinal in wanted:
-            holder = self.holder_of(ordinal)
-            if ordinal >= len(self.entries) or holder is None:
-                raise LaneRefusal(
-                    "device_pin_infeasible",
-                    f"ordinal {ordinal} is outside this worker's envelope of "
-                    f"{len(self.entries)} device(s)",
-                )
-            if holder.group:
-                raise LaneRefusal(
-                    "device_pin_infeasible",
-                    f"ordinal {ordinal} is held by group {holder.lane_id} "
-                    f"(placements {sorted(holder.placements)})",
-                )
-            if holder.placements:
-                raise LaneRefusal(
-                    "device_pin_infeasible",
-                    f"{holder.lane_id} holds {sorted(holder.placements)}; a group takes only "
-                    "empty devices and moves no other placement",
-                )
-            members.append(holder)
-        fused = DeviceLane(
-            lane_id_for(wanted),
-            wanted,
-            ",".join(self.entries[ordinal] for ordinal in wanted),
-            worker_pid=self.worker_pid,
+        rows = sorted(
+            ((slot, row) for other in self.sharing(lane) for slot, row in other.rows.items()),
+            key=lambda item: item[0],
         )
-        self._replace(tuple(members), (fused,))
-        return fused
-
-    def split(self, lane: DeviceLane) -> tuple[DeviceLane, ...]:
-        """SPLIT an empty group lane back into its device lanes."""
-        if not lane.group or lane.lane_id not in self.by_id:
-            raise LaneRefusal("device_pin_infeasible", f"{lane.lane_id} is not a group lane")
-        if lane.placements:
-            raise LaneRefusal(
-                "device_pin_infeasible",
-                f"{lane.lane_id} still holds {sorted(lane.placements)}",
-            )
-        parts = tuple(
-            DeviceLane(
-                lane_id_for((ordinal,)),
-                (ordinal,),
-                self.entries[ordinal],
-                worker_pid=self.worker_pid,
-            )
-            for ordinal in lane.ordinals
-        )
-        self._replace((lane,), parts)
-        return parts
+        return ";".join(f"{slot}={row.resident_bytes()}" for slot, row in rows)
 
     # ------------------------------------------------------------------- assignment
 
@@ -452,11 +441,10 @@ class LaneSet:
         model_bearing: bool,
         measured: Mapping[int, DeviceMemory],
     ) -> DeviceLane:
-        """Bind a placement to EXACTLY `ordinals`, or refuse typed; nothing else moves.
+        """Bind a placement to EXACTLY `ordinals`, or refuse typed. Occupancy never refuses:
+        devices are shared and residency arbitration decides who holds memory.
 
-        More than one ordinal fuses a group of that width for a model-bearing placement,
-        from empty device lanes whose memory the driver can read. A group never degrades
-        to fewer devices: `device_pin_infeasible` (envelope, occupancy),
+        A group never degrades to fewer devices: `device_pin_infeasible` (envelope),
         `device_group_unsupported` (a weightless group), `device_group_infeasible` (an
         unreadable device).
         """
@@ -483,29 +471,19 @@ class LaneSet:
             for o in ordinals
             if model_bearing and measured.get(o, DeviceMemory("unreadable")).state != "measured"
         ]
-        if len(ordinals) > 1:
-            if not model_bearing:
-                raise LaneRefusal(
-                    "device_group_unsupported",
-                    f"placement {placement_id!r} is weightless and granted {len(ordinals)} "
-                    "devices; a group shards a model's attention and there is no model",
-                )
-            if unreadable:
-                raise LaneRefusal(
-                    "device_group_infeasible",
-                    f"placement {placement_id!r} cannot form a {len(ordinals)}-device group: "
-                    + "; ".join(unreadable),
-                )
-            lane = self.fuse(ordinals)
-        else:
-            holder = self.holder_of(ordinals[0])
-            if holder is None or holder.group or unreadable:
-                raise LaneRefusal(
-                    "device_pin_infeasible",
-                    f"placement {placement_id!r} cannot take ordinal {ordinals[0]}: "
-                    + ("; ".join(unreadable) or f"held by {holder!r}"),
-                )
-            lane = holder
+        if len(ordinals) > 1 and not model_bearing:
+            raise LaneRefusal(
+                "device_group_unsupported",
+                f"placement {placement_id!r} is weightless and granted {len(ordinals)} "
+                "devices; a group shards a model's attention and there is no model",
+            )
+        if unreadable:
+            raise LaneRefusal(
+                "device_group_infeasible" if len(ordinals) > 1 else "device_pin_infeasible",
+                f"placement {placement_id!r} cannot take {list(ordinals)}: "
+                + "; ".join(unreadable),
+            )
+        lane = self.group(ordinals) if len(ordinals) > 1 else self.by_id[lane_id_for(ordinals)]
         lane.placements.add(placement_id)
         return lane
 
@@ -520,12 +498,12 @@ class LaneSet:
     ) -> tuple[int, ...]:
         """Pick `width` ordinals for a placement no scheduler grant pinned exactly.
 
-        A group takes the first empty candidates. One device is chosen by measured fit,
-        envelope order within each step: a lane with no other model-bearing tenant whose
-        free bytes cover the declared weights; a lane whose free bytes cover them beside its
-        tenants (cr-022 co-fit); a lane whose total covers them (time-sliced); any readable
-        lane (bounded preparation decides the working set). A weightless placement goes to
-        the candidate lane with the fewest placements.
+        A group takes the first `width` candidates. One device is chosen by measured fit,
+        envelope order within each step: a device with no model-bearing tenant whose free
+        bytes cover the declared weights; one whose free bytes cover them beside its
+        tenants (cr-022 co-fit); one whose total covers them (time-sliced); any readable
+        device (bounded preparation decides the working set). A weightless placement goes
+        to the candidate device lane with the fewest placements.
         """
         if not candidates or not set(candidates) <= set(range(len(self.entries))):
             raise LaneRefusal(
@@ -534,54 +512,29 @@ class LaneSet:
                 f"{len(self.entries)}-device envelope",
             )
         if width > 1:
-            empty = [
-                o
-                for o in candidates
-                if (holder := self.holder_of(o)) is not None
-                and not holder.group
-                and not holder.placements
-            ]
-            if len(empty) < width:
-                raise LaneRefusal(
-                    "device_pin_infeasible",
-                    f"a {width}-device group needs empty devices; only {empty} of "
-                    f"{list(candidates)} are empty and a group moves no other placement",
-                )
-            return tuple(empty[:width])
-        pool = list(
-            dict.fromkeys(
-                holder
-                for o in candidates
-                if (holder := self.holder_of(o)) is not None and not holder.group
-            )
-        )
-        if not model_bearing and pool:
+            return tuple(sorted(candidates)[:width])
+        pool = [self.by_id[lane_id_for((o,))] for o in dict.fromkeys(candidates)]
+        if not model_bearing:
             return min(pool, key=lambda lane: (len(lane.placements), lane.ordinals)).ordinals
         readable = [
             (lane, memory)
             for lane in pool
-            if (
-                memory := fold_memory(
-                    {o: measured.get(o, DeviceMemory("unreadable")) for o in lane.ordinals}
-                )
-            ).state
+            if (memory := measured.get(lane.ordinals[0], DeviceMemory("unreadable"))).state
             == "measured"
         ]
+
+        def crowd(lane: DeviceLane) -> tuple[int, tuple[int, ...]]:
+            return len(self.tenants(lane)), lane.ordinals
+
         steps = (
             [
                 lane
                 for lane, m in readable
-                if not lane.model_bearing_slots() and m.free_bytes >= declared_bytes
+                if not self.tenants(lane) and m.free_bytes >= declared_bytes
             ],
             [lane for lane, m in readable if m.free_bytes >= declared_bytes],
-            sorted(
-                (lane for lane, m in readable if m.total_bytes >= declared_bytes),
-                key=lambda lane: (len(lane.model_bearing_slots()), lane.ordinals),
-            ),
-            sorted(
-                (lane for lane, _m in readable),
-                key=lambda lane: (len(lane.model_bearing_slots()), lane.ordinals),
-            ),
+            sorted((lane for lane, m in readable if m.total_bytes >= declared_bytes), key=crowd),
+            sorted((lane for lane, _m in readable), key=crowd),
         )
         for step in steps:
             if step:

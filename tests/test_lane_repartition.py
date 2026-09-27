@@ -30,7 +30,7 @@ def _weightless_groups(monkeypatch: pytest.MonkeyPatch) -> None:
         self: lanes.LaneSet, placement_id: str, ordinals: tuple[int, ...], **kwargs: Any
     ) -> lanes.DeviceLane:
         if len(ordinals) > 1 and self.lane_of(placement_id) is None:
-            group = self.fuse(ordinals)
+            group = self.group(ordinals)
             group.placements.add(placement_id)
             return group
         return bind(self, placement_id, ordinals, **kwargs)
@@ -46,7 +46,7 @@ def test_split_lanes_execute_after_worker_started_on_a_group() -> None:
     def worker_hook(worker: Worker) -> None:
         # Start with one group lane. No GPU model is fabricated: the test concerns
         # replacement queue consumers, and the later real invocation is weightless.
-        group = worker.lanes.fuse((0, 1))
+        group = worker.lanes.group((0, 1))
         group.placements.add("retired-group")
         workers.append(worker)
 

@@ -13,6 +13,8 @@ import base64
 import copy
 import hashlib
 import os
+import tempfile
+import threading
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -36,10 +38,13 @@ from cozy_runtime.internal.worker.gpu_scheduler import (
     width_for,
 )
 from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
+from cozy_runtime.internal.worker.plan import DeclaredBinding
+from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace_executions import TERMINAL
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from test_end_to_end import NO_EXECUTOR
 
 GiB = 1 << 30
 OWNER = "owner"
@@ -90,7 +95,7 @@ def test_default_ladder_picks_the_widest_rung_so_h3_is_one_four_gpu_group(
         },
     )
     monkeypatch.setattr(
-        machine_model_defaults.hostfacts,
+        hostfacts,
         "measure",
         lambda _: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
     )
@@ -152,28 +157,54 @@ def test_a_stopped_roots_attempt_keeps_its_devices_until_it_leaves_them() -> Non
     assert exit_ == {"key": "a#1", "ordinals": [0, 1], "cause": "exited", "ranks": ranks}
 
 
-def test_group_lanes_bind_exactly_the_grant_or_refuse_typed() -> None:
+def test_a_group_and_singletons_share_devices_and_execute_one_at_a_time() -> None:
     lane_set = lanes.LaneSet.from_envelope("0,1,2,3", worker_pid=os.getpid())
     ok = accel.DeviceMemory("measured", 80 * GiB, 80 * GiB)
     measured = dict.fromkeys(range(4), ok)
     group = lane_set.bind("h3", (0, 1, 2, 3), model_bearing=True, measured=measured)
-    assert group.ordinals == (0, 1, 2, 3) and group.lane_id == "lane-0+1+2+3"
-    lane_set.release("h3")
+    qwen = [lane_set.bind(f"q{o}", (o,), model_bearing=True, measured=measured) for o in range(3)]
+    assert group.lane_id == "lane-0+1+2+3" and [q.lane_id for q in qwen] == [
+        "lane-0",
+        "lane-1",
+        "lane-2",
+    ]
+    assert all(lane_set.lane_of(p) is not None for p in ("h3", "q0", "q1", "q2"))
+
+    def free(lane: lanes.DeviceLane) -> bool:
+        """Whether this thread could take `lane`'s devices now (never waits)."""
+        taken = [lock for lock in lane.locks if lock.acquire(blocking=False)]
+        for lock in taken:
+            lock.release()
+        return len(taken) == len(lane.locks)
+
+    # H3 on the card holds devices 0-3: no Qwen enters, so none arbitrates it away
+    on_card, leave = threading.Event(), threading.Event()
+
+    def run() -> None:
+        with group.device:
+            on_card.set()
+            leave.wait()
+
+    attempt = threading.Thread(target=run)
+    attempt.start()
+    on_card.wait()
+    assert not any(free(q) for q in qwen) and not free(lane_set.by_id["lane-3"])
+    leave.set()
+    attempt.join()
+    assert all(free(q) for q in qwen) and free(group)
     with pytest.raises(lanes.LaneRefusal) as refused:
         lane_set.bind(
-            "h3",
+            "wide",
             (0, 1, 2, 3),
             model_bearing=True,
             measured={**measured, 3: accel.DeviceMemory("unreadable")},
         )
-    assert refused.value.code == "device_group_infeasible"
-    lane_set.bind("qwen", (1,), model_bearing=True, measured=measured)
-    with pytest.raises(lanes.LaneRefusal) as refused:
-        lane_set.bind("h3", (0, 1, 2, 3), model_bearing=True, measured=measured)
-    assert refused.value.code == "device_pin_infeasible"  # never a smaller group
+    assert refused.value.code == "device_group_infeasible"  # never a smaller group
     helper = lane_set.bind("helper", (), model_bearing=False, measured={})
     assert helper.ordinals == () and helper.devices == "" and lane_set.lane_of("helper") is helper
     assert lane_set.release("helper") and lane_set.lane_of("helper") is None
+    assert lane_set.release("h3") and "lane-0+1+2+3" not in lane_set.by_id
+    assert [lane_set.lane_of(f"q{o}") for o in range(3)] == qwen
 
 
 def test_mixed_degree_declarations_are_refused_when_the_interface_is_built() -> None:
@@ -397,6 +428,52 @@ class Machine:
         self.executions.workspace.outcome(OWNER, terminal)
         self.executions.observe(OWNER, pb.WorkerFrame(attempt_outcome=terminal))
 
+    def warm(self) -> dict[str, tuple[int, int]]:
+        """Finish every pending replica's activation as a started executor would.
+
+        These templates name no installed package, so acquisition refused them; this binds
+        each to its grant through the worker's own `_assign_lane`, starts a real executor
+        process sealed to that lane, and makes it dispatchable. Returns placement ->
+        (executor epoch, pid)."""
+        for placement_id, hosted in self.worker.hosted.items():
+            if hosted.supervision.current is not None:
+                continue
+            kind = hosted.placement.installation_id.removeprefix("inst-")
+            degrees = (2, 4) if kind == "h3" else ()
+            binding = DeclaredBinding(
+                entrypoint_binding_digest="sha256:" + hashlib.sha256(kind.encode()).hexdigest(),
+                entrypoint="marco",
+                model_class="M",
+                model_binding_path="marco.models.model",
+                model_parameter_name="model",
+                release="r",
+                model_weight_bytes=GiB,
+                models=(
+                    WorkerSlot(
+                        *("M", "marco.models.model", "model", "", "", ""),
+                        components=("unet",),
+                        snapshots={},
+                        sequence_parallel_degrees=degrees,
+                    ),
+                ),
+            )
+            hosted.latched = ""
+            hosted.bindings = {binding.entrypoint_binding_digest: binding}
+            hosted.failed_bindings = {}
+            with self.worker.control_lock:
+                assert self.worker._assign_lane(
+                    hosted.placement, hosted.bindings, hosted.supervision
+                )
+            lane = self.worker._lane_of(placement_id)
+            hosted.supervision.spawn(imposed=self.worker.imposed(lane))
+            hosted.placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+            hosted.placement.serving = pb.ServingState.SERVING_STATE_DISPATCHABLE
+        return self.executors()
+
+    def executors(self) -> dict[str, tuple[int, int]]:
+        live = {p: h.supervision.current for p, h in self.worker.hosted.items()}
+        return {p: (e.epoch, e.pid) for p, e in live.items() if e is not None and e.alive()}
+
     def tick(self) -> dict[str, Any]:
         self.worker.drive_executions()
         for thread in list(self.worker._activating.values()):
@@ -431,21 +508,25 @@ class Machine:
 
 
 @pytest.fixture
-def machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
+def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
     unreadable: set[str] = set()
+    free: dict[str, int] = {}
 
     def device_memory(entry: str, kind: str) -> accel.DeviceMemory:
         if entry in unreadable:
             return accel.DeviceMemory("unreadable")
-        return accel.DeviceMemory("measured", 80 * GiB, 80 * GiB)
+        return accel.DeviceMemory("measured", free.get(entry, 80 * GiB), 80 * GiB)
 
     monkeypatch.setattr(accel, "device_memory", device_memory)
-    made = Machine(tmp_path, "0,1,2,3", "boot-one")
-    made.unreadable = unreadable  # type: ignore[attr-defined]
-    try:
-        yield made
-    finally:
-        made.worker.shutdown()
+    # Short: an executor's control socket lives under it and `sun_path` holds 108 bytes.
+    with tempfile.TemporaryDirectory(prefix="cz-gpu.", dir="/tmp") as root:
+        made = Machine(Path(root), "0,1,2,3", "boot-one")
+        made.unreadable = unreadable  # type: ignore[attr-defined]
+        made.free = free  # type: ignore[attr-defined]
+        try:
+            yield made
+        finally:
+            made.worker.shutdown()
 
 
 def test_an_older_root_holds_all_four_gpus_through_its_gap_and_b_starts_after(
@@ -599,7 +680,7 @@ def test_sibling_replicas_activate_together_and_a_failure_refuses_only_its_call(
     machine.tick()
     replicas = [p for p in machine.worker.hosted if p.startswith("machine-")]
     # D7: all three bind in one tick, beside each other, without a desired-state revision
-    assert sorted(machine.worker.hosted[p].placement.device_pin for p in replicas) == [
+    assert sorted(machine.worker.hosted[p].placement.device_pin or () for p in replicas) == [
         (0,),
         (1,),
         (2,),
@@ -646,3 +727,94 @@ def test_machine_execution_state_reports_the_gpu_phase(machine: Machine) -> None
     machine.finish("A")
     machine.tick()
     assert gpu("B").phase == "granted"
+
+
+needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+
+
+@needs_executor
+def test_consecutive_roots_of_different_widths_reuse_every_warm_executor(
+    machine: Machine,
+) -> None:
+    """References at width 1, then a 4-rank shot, twice: the group and the singletons stay
+    resident beside each other, and the second root spawns and retires nothing."""
+    machine.root("A")
+    references = [machine.child("A", "qwen") for _ in range(3)]
+    machine.tick()
+    qwen = machine.warm()
+    assert len(qwen) == 3
+    for reference in references:
+        machine.finish(reference)
+    shot = machine.child("A", "h3")
+    machine.tick()
+    assert machine.granted(shot) == [0, 1, 2, 3]
+    warm = machine.warm()
+    assert len(warm) == 4 and {p: warm[p] for p in qwen} == qwen, "the shot retired nothing"
+    lanes_of = {p: machine.worker._lane_of(p).lane_id for p in warm}
+    degrees = {
+        b.sequence_parallel_degrees()
+        for h in machine.worker.hosted.values()
+        for b in h.bindings.values()
+    }
+    assert degrees == {(), (2, 4)}
+    assert sorted(lanes_of.values()) == ["lane-0", "lane-0+1+2+3", "lane-1", "lane-2"]
+    epoch, started = machine.worker.admission_epoch, dict(machine.worker._activating)
+    machine.finish(shot)
+    machine.finish("A")
+    machine.root("B")
+    references = [machine.child("B", "qwen") for _ in range(3)]
+    machine.tick()
+    assert sorted(tuple(machine.granted(r)) for r in references) == [(0,), (1,), (2,)]
+    for reference in references:
+        machine.finish(reference)
+    shot = machine.child("B", "h3")
+    machine.tick()
+    assert machine.granted(shot) == [0, 1, 2, 3]
+    assert machine.worker._activating == started, "every grant found its replica started"
+    assert machine.executors() == warm, "no executor was spawned, replaced or retired"
+    assert {p: machine.worker._lane_of(p).lane_id for p in warm} == lanes_of
+    assert machine.worker.admission_epoch == epoch
+
+
+@needs_executor
+def test_memory_pressure_vacates_idle_co_tenants_and_kills_none(machine: Machine) -> None:
+    """The arbiter frees the tightest device of the tenant that needs room, LRU-first:
+    only co-tenants on that device are asked, their processes stay, and the caller is
+    never its own victim."""
+    machine.root("A")
+    references = [machine.child("A", "qwen") for _ in range(3)]
+    machine.tick()
+    machine.warm()
+    worker = machine.worker
+    for reference in references:
+        machine.finish(reference)
+    shot = machine.child("A", "h3")
+    machine.tick()
+    before = machine.warm()
+    by_lane = {worker._lane_of(p).lane_id: p for p in worker.hosted}
+    h3, q0, q1 = by_lane["lane-0+1+2+3"], by_lane["lane-0"], by_lane["lane-1"]
+    for placement_id in worker.hosted:
+        lane = worker._lane_of(placement_id)
+        lane.row(placement_id).ledger.observe_construction({"resident": {"unet": 20 * GiB}})
+        lane.touch(placement_id)
+    worker._lane_of(q0).touch(q0)  # q0 is now the most recently used
+
+    def vacated() -> list[str]:
+        return [e.step for e in worker.activity if " vacated " in e.step]
+
+    # H3 needs room and device 0 is the tight one: only device 0's tenants are asked
+    machine.free["0"] = GiB  # type: ignore[attr-defined]
+    group = worker._lane_of(h3)
+    worker._make_room(group, h3, lambda memory: False, "the shot")
+    assert [step.split("'")[1] for step in vacated()] == [q0]
+    # Qwen on device 1 needs room: the idle H3 group is its only co-tenant there
+    machine.free.pop("0")  # type: ignore[attr-defined]
+    machine.free["1"] = GiB  # type: ignore[attr-defined]
+    worker._make_room(worker._lane_of(q1), q1, lambda memory: False, "a reference")
+    assert [step.split("'")[1] for step in vacated()] == [q0, h3]
+    assert machine.executors() == before, "vacated, not killed: every process is the same"
+    assert all(
+        h.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+        for h in worker.hosted.values()
+    )
+    assert machine.granted(shot) == [0, 1, 2, 3]
