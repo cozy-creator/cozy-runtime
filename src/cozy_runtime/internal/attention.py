@@ -480,10 +480,19 @@ def _load_snapshot(candidate: Candidate, loader: Any, device: DeviceFacts) -> st
 #: The probe: one H3 rank's post-exchange document at 10 s (a measured packed length, odd so
 #: the last block is partial), because error grows with length: FA3 FP8 measured 0.10 rel L2
 #: at 16k rows and 0.31 at 109k where a 256-row probe passed it (h3a-044). Every probed
-#: kernel reduces within a head, so two heads keep it ~150 MB on any card. The sampled rows
+#: kernel reduces within a head, so two heads keep it ~150 MB on any card. The checked rows
 #: are held to exact float64 attention over every key.
 PROBE: tuple[int, int, int, int] = (1, 73_439, 2, 128)
 PROBE_ROWS = 64
+#: Rows checked on every probe besides the samples, because a kernel that mishandles one
+#: region (a partial tail tile, a tile edge) passes a sample. Every kernel tiles query rows in
+#: multiples of 16, so both rows at each multiple of 16 are edge rows of every tile any kernel
+#: uses, and the first and last 256 rows hold the first tile and the partial tail tile of any
+#: tile height up to 256. Each group is held to the budget alone, so a fault cannot average out.
+PROBE_TILE_GRAIN = 16
+PROBE_END_ROWS = 256
+#: Exact rows per float64 pass: 256 x 73,439 keys is ~150 MB of weights.
+_EXACT_ROWS_PER_PASS = 256
 #: Torch's quadratic-memory math fallback cannot hold the production length and does not
 #: accumulate across keys, so it is probed here; so is Sol's policy contract.
 PROBE_SHORT: tuple[int, int, int, int] = (1, 256, 4, 128)
@@ -532,14 +541,16 @@ def _computes(entry: Ready, device: DeviceFacts) -> dict[str, Any] | None:
             query, key, value = (t[:, : PROBE_SHORT[1]].contiguous() for t in (query, key, value))
         got = dispatch_attention_fn(query, key, value, backend=entry.member)
         got = _validate_probe_contract(entry, device, got, query)
-        rows = torch.linspace(0, query.shape[1] - 1, PROBE_ROWS, device=target).long()
-        exact = _exact_rows(query, key, value, rows)
-        disagreement = float((got[:, rows].double() - exact).norm() / exact.norm())
-        floor = float((exact.to(dtype).double() - exact).norm() / exact.norm())
-    _gate(entry, device, disagreement, f"{len(rows)} sampled rows over {query.shape[1]} keys")
+        by_rows, floor, checked = _disagreement(got, query, key, value, seed)
+    worst = max(by_rows, key=by_rows.__getitem__)
+    disagreement = by_rows[worst]
+    _gate(
+        entry, device, disagreement, f"{worst} rows of {checked} checked over {query.shape[1]} keys"
+    )
     return {
         "shape": list(query.shape),
-        "sampled_rows": len(rows),
+        "checked_rows": checked,
+        "rel_l2_by_rows": by_rows,
         "rel_l2_to_exact": disagreement,
         "rounding_floor": floor,
         "rel_l2_max": entry.candidate.rel_l2_max,
@@ -548,8 +559,52 @@ def _computes(entry: Ready, device: DeviceFacts) -> dict[str, Any] | None:
     }
 
 
+def _probe_rows(length: int, seed: Any, device: Any) -> dict[str, Any]:
+    """The probe's row groups: evenly spaced and seeded random samples, the first and last
+    `PROBE_END_ROWS` rows, and both rows at every `PROBE_TILE_GRAIN` edge."""
+    import torch
+
+    ends = min(PROBE_END_ROWS, length)
+    edges = torch.arange(PROBE_TILE_GRAIN, length, PROBE_TILE_GRAIN, device=device)
+    sampled = torch.cat(
+        (
+            torch.linspace(0, length - 1, PROBE_ROWS, device=device).long(),
+            torch.randint(length, (PROBE_ROWS,), generator=seed, device=device),
+        )
+    )
+    return {
+        "sampled": sampled,
+        "first": torch.arange(ends, device=device),
+        "last": torch.arange(length - ends, length, device=device),
+        "tile_edges": torch.cat((edges - 1, edges)),
+    }
+
+
+def _disagreement(
+    got: Any, query: Any, key: Any, value: Any, seed: Any
+) -> tuple[dict[str, float], float, int]:
+    """Rel L2 of `got` to exact attention per row group, the BF16/FP16 rounding floor of the
+    exact rows, and how many distinct rows were checked."""
+    import torch
+
+    groups = _probe_rows(query.shape[1], seed, query.device)
+    checked = torch.zeros(query.shape[1], dtype=torch.bool, device=query.device)
+    for members in groups.values():
+        checked[members] = True
+    rows = checked.nonzero().flatten()
+    exact = _exact_rows(query, key, value, rows)
+    error = got[:, rows].double() - exact
+    by_rows: dict[str, float] = {}
+    for name, members in groups.items():
+        mask = torch.isin(rows, members)
+        by_rows[name] = float(error[:, mask].norm() / exact[:, mask].norm())
+    floor = float((exact.to(query.dtype).double() - exact).norm() / exact.norm())
+    return by_rows, floor, len(rows)
+
+
 def _exact_rows(query: Any, key: Any, value: Any, rows: Any) -> Any:
-    """Exact float64 attention for `rows` of the query over every key, one head at a time."""
+    """Exact float64 attention for `rows` of the query over every key, one head and at most
+    `_EXACT_ROWS_PER_PASS` rows at a time."""
     import torch
 
     out = torch.empty(
@@ -558,10 +613,12 @@ def _exact_rows(query: Any, key: Any, value: Any, rows: Any) -> Any:
         device=query.device,
     )
     for head in range(query.shape[2]):
-        q = query[:, rows, head].double()
         k, v = key[:, :, head].double(), value[:, :, head].double()
-        weights = (q @ k.transpose(1, 2) * q.shape[-1] ** -0.5).softmax(dim=-1)
-        out[:, :, head] = weights @ v
+        for start in range(0, len(rows), _EXACT_ROWS_PER_PASS):
+            chunk = rows[start : start + _EXACT_ROWS_PER_PASS]
+            q = query[:, chunk, head].double()
+            weights = (q @ k.transpose(1, 2) * q.shape[-1] ** -0.5).softmax(dim=-1)
+            out[:, start : start + len(chunk), head] = weights @ v
     return out
 
 
