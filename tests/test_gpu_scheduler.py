@@ -95,7 +95,7 @@ def test_default_ladder_picks_the_widest_rung_so_h3_is_one_four_gpu_group(
         },
     )
     monkeypatch.setattr(
-        machine_model_defaults.hostfacts,
+        hostfacts,
         "measure",
         lambda _: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
     )
@@ -680,7 +680,7 @@ def test_sibling_replicas_activate_together_and_a_failure_refuses_only_its_call(
     machine.tick()
     replicas = [p for p in machine.worker.hosted if p.startswith("machine-")]
     # D7: all three bind in one tick, beside each other, without a desired-state revision
-    assert sorted(machine.worker.hosted[p].placement.device_pin for p in replicas) == [
+    assert sorted(machine.worker.hosted[p].placement.device_pin or () for p in replicas) == [
         (0,),
         (1,),
         (2,),
