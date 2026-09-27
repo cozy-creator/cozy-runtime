@@ -457,3 +457,102 @@ def test_repeated_group_pin_requires_every_scoped_prepared_site() -> None:
     del modules[1].processor._attention_backend
     # Class defaults do not turn an unmanaged/missing instance choice into a match.
     assert not attention._is_selected(defaults, roots, "base/dit=sdpa")
+
+
+def _h3_roots(dtype: str) -> dict[str, Any]:
+    """Real Diffusers attention sites under H3's component names, 128-dimension heads."""
+    torch = pytest.importorskip("torch")
+    from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
+
+    processor_type: Any = WanAttnProcessor
+    return {
+        name: torch.nn.ModuleList(
+            [WanAttention(dim=256, heads=2, dim_head=128, processor=processor_type())]
+        ).to(getattr(torch, dtype))
+        for name in ("fl2va_dit", "ref2va_dit", "audio_vae", "video_vae")
+    }
+
+
+def _cuda(sm: int) -> DeviceFacts:
+    """Device facts only: nothing below computes on them, so no card is needed."""
+    return DeviceFacts(kind="cuda", name=f"sm{sm}", sm=sm, driver="", configuration="", index=0)
+
+
+def test_h3_prefers_sol_then_sage_then_fa3_for_every_dit_and_never_fp8() -> None:
+    from cozy_runtime.models.minimax_h3.model import DIT_ATTENTION, H3Model, H3TurboBase
+
+    assert DIT_ATTENTION == ("sol-attn", "sageattention", "flash-attn3", "sdpa")
+    fp8 = {"flash-attn3-fp8", "flashinfer-bf16-fp8"}
+    assert not fp8 & set(DIT_ATTENTION)
+    for device in (_device(), _cuda(90), _cuda(100)):
+        assert not fp8 & {candidate.name for candidate in attention.for_device(device)}
+    for model_type in (H3Model, H3TurboBase):
+        model = object.__new__(model_type)
+        for component in ("fl2va_dit", "ref2va_dit", "audio_vae", "video_vae", "text_encoder"):
+            context = AttentionContext(
+                component, "0", "cuda", "H100", 90, "bfloat16", 128, 4, (), "flash-attn3", ""
+            )
+            expected = DIT_ATTENTION if component.endswith("_dit") else None
+            assert model.choose_attention(context) == expected
+
+
+@pytest.mark.parametrize("sm", [90, 100])
+def test_h3_dits_fall_through_to_fa3_when_sol_and_sage_cannot_serve(sm: int) -> None:
+    """sm90 without Sol/Sage in the environment, and a non-SM90 card: both walk to FA3 and
+    say why each earlier preference was skipped. FA3 is installation-only here, as above."""
+    from cozy_runtime.models.minimax_h3.model import H3Model
+
+    roots = _h3_roots("bfloat16")
+    skipped: dict[str, str] = {}
+    applied = attention.install(
+        _ready("flash-attn3", "sdpa"),
+        roots,
+        device=_cuda(sm),
+        choose=object.__new__(H3Model).choose_attention,
+        skipped=skipped,
+    )
+    assert applied.hosts == {name: {"flash-attn3": 1} for name in roots}
+    assert {"sol-attn", "sageattention"} <= set(skipped), skipped
+    if sm != 90:
+        assert f"sm{sm}" in skipped["sol-attn"] and f"sm{sm}" in skipped["sageattention"]
+    assert not {name for name in skipped if "fp8" in name}
+
+
+def test_h3_preference_records_skips_through_real_cpu_selection() -> None:
+    from cozy_runtime.models.minimax_h3.model import H3Model
+
+    applied = attention.select(
+        _device(), _h3_roots("float32"), choose=object.__new__(H3Model).choose_attention
+    )
+    assert applied.totals() == {"sdpa": 4}
+    assert applied.skipped is not None
+    assert {"sol-attn", "sageattention", "flash-attn3"} <= set(applied.skipped)
+    assert "skipped" in applied.line()
+
+
+def test_a_pin_overrides_the_h3_preference() -> None:
+    from cozy_runtime.models.minimax_h3.model import H3Model
+
+    policy = object.__new__(H3Model)
+    consulted: list[str] = []
+
+    def choose(context: AttentionContext) -> Any:
+        consulted.append(context.component)
+        return policy.choose_attention(context)
+
+    ready = _ready("flash-attn3", "sdpa")
+    scoped = attention.install(
+        ready, _h3_roots("bfloat16"), "ref2va_dit=sdpa", device=_cuda(90), choose=choose
+    )
+    assert scoped.hosts["ref2va_dit"] == {"sdpa": 1}
+    assert scoped.hosts["fl2va_dit"] == {"flash-attn3": 1}
+    assert "ref2va_dit" not in consulted
+    consulted.clear()
+    whole = attention.install(ready, _h3_roots("bfloat16"), "sdpa", device=_cuda(90), choose=choose)
+    assert whole.totals() == {"sdpa": 4} and not consulted
+
+
+def test_an_unknown_preferred_kernel_refuses() -> None:
+    with pytest.raises(attention.AttentionRefusal) as refused:
+        attention.select(_device(), _roots(), choose=lambda context: ("sdpa-typo", "sdpa"))
+    assert refused.value.code == "attention_kernel_unknown"

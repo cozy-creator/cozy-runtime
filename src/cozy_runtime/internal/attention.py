@@ -1187,19 +1187,92 @@ def _matches(component: str, scope: str) -> bool:
     return bool(owned and model in owners.split("+") and name == component_name)
 
 
-def _eligible(
+def _ineligible(
     candidate: Candidate, device: DeviceFacts, dtype: str, head_dim: int, degree: int
-) -> bool:
-    if _device_admits(candidate, device) or not _admits(candidate, dtype, head_dim):
-        return False
+) -> str:
+    """Empty when this site, device and environment admit CANDIDATE, else why not. Static:
+    resolution and the numerical probe come after."""
+    unsupported = _device_admits(candidate, device)
+    if unsupported:
+        return unsupported
+    if not _admits(candidate, dtype, head_dim):
+        return (
+            f"{candidate.name} does not serve {dtype or 'unknown'} activations at head "
+            f"dimension {head_dim or 'unknown'}"
+        )
     try:
         _admit_arch(candidate, _baked_archs(candidate), device)
         if candidate.distribution:
             metadata.version(candidate.distribution)
         member = _member(candidate)
-        return member in _registry()._backends and (degree == 1 or _context_parallel(member))
-    except Exception:
-        return False
+        if member not in _registry()._backends:
+            return f"{candidate.name} is not registered with Diffusers"
+        if degree > 1 and not _context_parallel(member):
+            return f"{candidate.name} cannot shard sequence-parallel degree {degree}"
+    except metadata.PackageNotFoundError:
+        return f"{candidate.name} needs the {candidate.distribution} distribution, not installed"
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"[:300]
+    return ""
+
+
+def _eligible(
+    candidate: Candidate, device: DeviceFacts, dtype: str, head_dim: int, degree: int
+) -> bool:
+    return not _ineligible(candidate, device, dtype, head_dim, degree)
+
+
+def _preferred(
+    order: Sequence[str],
+    device: DeviceFacts,
+    dtype: str,
+    head_dim: int,
+    degree: int,
+    resolved: dict[str, Ready],
+    refused: dict[str, str],
+) -> Ready | None:
+    """The first kernel of a model's preference that serves this site on this rank, each
+    one held to the same capability checks and numerical probe as auto-selection. A kernel
+    that fails either is recorded in `refused` and the walk continues."""
+    for name in order:
+        candidate = BY_NAME.get(name)
+        if candidate is None:
+            raise AttentionRefusal(
+                "attention_kernel_unknown",
+                f"model attention preference names {name!r}; this runtime knows {sorted(BY_NAME)}",
+            )
+        if name in refused:
+            continue
+        entry = resolved.get(name)
+        if entry is not None:
+            if (
+                not _device_admits(candidate, device)
+                and _admits(candidate, dtype, head_dim)
+                and (degree == 1 or _context_parallel(entry.member))
+            ):
+                return entry
+            continue
+        reason = _ineligible(candidate, device, dtype, head_dim, degree)
+        if (
+            reason
+            and not _device_admits(candidate, device)
+            and not _admits(candidate, dtype, head_dim)
+        ):
+            # This site's shape only; another site may still admit the kernel.
+            refused.setdefault(f"{name} at {dtype or 'unknown'}/{head_dim or 'unknown'}", reason)
+            continue
+        if reason:
+            refused[name] = reason
+            continue
+        try:
+            resolved[name] = _resolve(candidate, device)
+        except Exception as exc:
+            # As in `available`: a preferred kernel that does not resolve or compute here
+            # leaves the walk rather than failing a prepare that has a later preference.
+            refused[name] = f"{type(exc).__name__}: {exc}"[:300]
+            continue
+        return resolved[name]
+    return None
 
 
 def install(
@@ -1209,14 +1282,21 @@ def install(
     degree: int = 1,
     *,
     device: DeviceFacts | None = None,
-    choose: Callable[[AttentionContext], str | None] | None = None,
+    choose: Callable[[AttentionContext], str | Sequence[str] | None] | None = None,
+    skipped: dict[str, str] | None = None,
 ) -> Applied:
-    """Validate a complete per-site selection before changing any processor."""
+    """Validate a complete per-site selection before changing any processor.
+
+    `choose` returning a name is an explicit choice and refuses when unavailable; returning
+    a sequence is a preference, walked per site under auto-selection's own checks, whose
+    refused kernels are written into `skipped`. A pin always overrides either.
+    """
     scope, name = _pin_parts(pin)
     hosts: dict[str, dict[str, int]] = {}
     locations: dict[str, str] = {}
     assignments: list[tuple[str, str, Any, Any, Ready]] = []
     resolved = {entry.name: entry for entry in ready}
+    refused: dict[str, str] = dict(skipped or {})
     matched = False
     eligible_sites: dict[tuple[str, int], tuple[str, ...]] = {}
     for component, path, module, processor in _attention_records(roots):
@@ -1244,7 +1324,9 @@ def install(
                         reason,
                     )
                 )
-                if selection is not None:
+                # A preference cannot be served here and says so by staying unchanged; an
+                # explicit choice refuses.
+                if selection is not None and not isinstance(selection, (tuple, list)):
                     raise AttentionRefusal("attention_kernel_unsupported", reason)
             continue
 
@@ -1290,7 +1372,12 @@ def install(
                 entry.candidate.why,
             )
             selection = choose(context)
-            if selection is not None:
+            if isinstance(selection, (tuple, list)):
+                entry = (
+                    _preferred(selection, device, dtype, head_dim, degree, resolved, refused)
+                    or entry
+                )
+            elif selection is not None:
                 if not isinstance(selection, str) or selection not in eligible:
                     raise AttentionRefusal(
                         "attention_kernel_unsupported",
@@ -1317,6 +1404,8 @@ def install(
     )
     for _component, _path, _module, processor, entry in assignments:
         processor._attention_backend = entry.member
+    if skipped is not None:
+        skipped.update(refused)
     proofs = {name: entry.admission for name, entry in resolved.items() if entry.admission}
     artifacts = {name: entry.artifact for name, entry in resolved.items() if entry.artifact}
     return Applied(hosts, locations, tuple(resolved), pin, proofs or None, artifacts or None)
@@ -1553,7 +1642,7 @@ def select(
     pin: str = "",
     degree: int = 1,
     *,
-    choose: Callable[[AttentionContext], str | None] | None = None,
+    choose: Callable[[AttentionContext], str | Sequence[str] | None] | None = None,
 ) -> Applied:
     """Select once at preparation; optional model policy and request pins are validated."""
     scope, name = _pin_parts(pin)
@@ -1561,7 +1650,7 @@ def select(
     ready = pinned(name, device) if name and not scope else available(device, skipped)
     if scope:
         ready = [entry for entry in ready if entry.name != name] + pinned(name, device)
-    applied = install(ready, roots, pin, degree, device=device, choose=choose)
+    applied = install(ready, roots, pin, degree, device=device, choose=choose, skipped=skipped)
     return replace(applied, skipped=skipped or None)
 
 
