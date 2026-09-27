@@ -51,7 +51,8 @@ from __future__ import annotations
 import functools
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -112,6 +113,8 @@ class ComponentResidency:
     #: THE ACTIVE SCOPE — (method, its declared set) — or None between scopes. Serial by
     #: law 8: a component is in this set or it is evictable (its fence permitting).
     active: tuple[str, frozenset[str]] | None = None
+    #: Admission frees nothing while set (`sparing`): an optional call taken on room alone.
+    spare: bool = False
     fences: dict[str, Fence] = field(default_factory=dict)
     #: Set on the first mid-mutation failure or accounting violation and never cleared.
     #: The executor reads it after every attempt and converts it into its own poison, so
@@ -366,6 +369,8 @@ class ComponentResidency:
         # the weights — a 1024px VAE decode next to 6.46 GiB of resident weights runs out of
         # memory INSIDE the kernel, where nothing can decide.
         local = tuple(name for name in components if name not in self.hosted)
+        if self.spare:
+            self._require_spare_room(local, method)
         if local:
             self._make_headroom(local, method)
         headroom = self.scope_headrooms.get(method, self.headroom)
@@ -708,6 +713,38 @@ class ComponentResidency:
             self._evict(name)
         self.hosted = self.hosted | {name}
 
+    @contextmanager
+    def sparing(self) -> Iterator[None]:
+        """Admit under this block only what fits beside everything already held.
+
+        For a call the group may run anywhere (`author.spread`): a rank takes it on measured
+        room or declines it, and never frees a component to make that room, least of all
+        one it hosts for the group (H3's 51.5 GB text encoder, which rank 0 cannot hold).
+        What it stages must also leave room for the largest scratch any scope of this
+        attempt has measured, so the next request's scopes do not evict it again.
+        """
+        self.spare = True
+        try:
+            yield
+        finally:
+            self.spare = False
+
+    def _require_spare_room(self, local: tuple[str, ...], method: str) -> None:
+        if method not in self.measured:
+            raise self._spared(method, "its scratch is not measured at this request's shape")
+        absent = sum(self._size(name) for name in local if name not in self.backend.components)
+        headroom = max([self.headroom, *self.scope_headrooms.values()])
+        allocatable = self._allocatable()
+        if allocatable < absent + headroom:
+            raise self._spared(
+                method,
+                f"needs {absent} B of weights and {headroom} B of scratch beside what this "
+                f"rank holds; {allocatable} B are allocatable",
+            )
+
+    def _spared(self, method: str, why: str) -> ResidencyRefusal:
+        return ResidencyRefusal("device_spared", f"{method}() declined: {why}")
+
     def observe_remote(self, method: str, working_bytes: int) -> None:
         """A hosted call's scratch on its home rank is this scope's demand there."""
         peaks = self.attempt_activation_peaks
@@ -835,6 +872,10 @@ class ComponentResidency:
 
     def _evict(self, victim: str) -> None:
         """One eviction, timed and MEASURED against the allocator on both sides."""
+        if self.spare:
+            raise self._spared(
+                self.active[0] if self.active else "admission", f"it would evict {victim!r}"
+            )
         started = time.perf_counter()
         allocated = self._allocated()
         self.evictions += 1

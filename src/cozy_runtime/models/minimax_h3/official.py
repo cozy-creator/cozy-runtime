@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Any, Literal
 
 import msgspec
+import numpy as np
 import torch
 from diffusers import (
     AutoencoderKLMiniMaxH3Audio,
@@ -64,6 +65,7 @@ from cozy_runtime.author import (
     ConformanceError,
     DecodedAudio,
     DecodedVideo,
+    DerivedCache,
     Image,
     InvalidRequest,
     OutputError,
@@ -71,6 +73,7 @@ from cozy_runtime.author import (
     attention_scope,
     canonical_json,
     expect_attention,
+    spread,
 )
 
 from .adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
@@ -676,6 +679,33 @@ class ResidentWeights:
         self._verdicts[storage] = fill
 
 
+@dataclass(frozen=True, slots=True)
+class ReferenceMemo:
+    """Where one generation keeps its reference latents (`loader.cache`), and the identity of
+    the construction that encoded them (its checkpoint's manifest)."""
+
+    cache: DerivedCache
+    identity: str
+
+
+def _unreachable() -> Any:
+    raise AssertionError("a memo hit was just checked")
+
+
+def _returning(value: Any) -> Callable[[], Any]:
+    return lambda: value
+
+
+def reference_digest(pixels: Any) -> tuple[str, tuple[int, ...], str]:
+    """The exact encoder input: dtype, shape and the SHA-256 of the pixel bytes."""
+    contiguous = np.ascontiguousarray(pixels)
+    return (
+        str(contiguous.dtype),
+        tuple(int(d) for d in contiguous.shape),
+        hashlib.sha256(contiguous).hexdigest(),
+    )
+
+
 @dataclass
 class _Observation:
     """One stage's queued device reductions; nothing is read until it settles."""
@@ -1279,6 +1309,19 @@ class OfficialH3Pipeline:
         runner = contextvars.copy_context().run
         threading.Thread(target=runner, args=(state_length,), daemon=True).start()
 
+    def text_state(self, state: Any) -> Any:
+        """A copy of `state` for the text block alone: it reads the prompt and the references
+        as they stand now, whatever the media block appends meanwhile (`adopt_text`)."""
+        return PipelineState(
+            dict(state.values), {k: list(v) for k, v in state.kwargs_mapping.items()}
+        )
+
+    def adopt_text(self, task: Task, state: Any, text: Any) -> None:
+        """The text block's outputs, from its copy into `state`, as the block writes them."""
+        block = self._blocks[self._workflow(task, state)].sub_blocks["text_encoder"]
+        for output in block.intermediate_outputs:
+            state.set(output.name, text.get(output.name), output.kwargs_type)
+
     def condition_text(
         self, task: Task, state: Any, *, checks: NumericalChecks | None = None
     ) -> None:
@@ -1300,11 +1343,23 @@ class OfficialH3Pipeline:
             )
 
     def condition_media(
-        self, task: Task, state: Any, *, checks: NumericalChecks | None = None
-    ) -> None:
+        self,
+        task: Task,
+        state: Any,
+        *,
+        checks: NumericalChecks | None = None,
+        memo: ReferenceMemo | None = None,
+    ) -> tuple[int, int]:
+        """Encode the request's keyframes or references. For `ref2va`, the (hits, encoded)
+        count of reference latents (`_encode_references`)."""
         # Encode public references first; private context never reaches Qwen or a VAE
         # on the receiving segment. Its tensors already use the native normalization.
-        self._run(task, "vae_encoder", state, component="video_vae")
+        counts = (0, 0)
+        if _TRUNK[task] == "ref2va":
+            with _audio_weight_norm_scope(self.components["audio_vae"]):
+                counts = self._encode_references(task, state, memo)
+        else:
+            self._run(task, "vae_encoder", state, component="video_vae")
         context = state.get("continuation_context")
         if context is not None:
             state.set("condition_latents", [*state.condition_latents, context.video_latents])
@@ -1323,6 +1378,103 @@ class OfficialH3Pipeline:
                 .intermediate_outputs,
                 required=True,
             )
+        return counts
+
+    def _encode_references(
+        self, task: Task, state: Any, memo: ReferenceMemo | None
+    ) -> tuple[int, int]:
+        """Diffusers' `MiniMaxH3Ref2VAReferenceEncoderStep`, one reference at a time.
+
+        The same arithmetic: each image or video reference through `encode_vae_condition`
+        (sampled under its own fixed seed, rounded to float16, normalized on the CPU), each
+        soundtrack through the audio VAE's posterior mode. Two things change where it runs:
+
+        - A video-VAE encode is a pure function of the reference's pixels, so its latents are
+          memoized per generation by an exact key (`ReferenceMemo`): a long-form piece's
+          later shots reuse their references' latents. The audio encode is not: H3's audio
+          is not bitwise reproducible run to run (h3a-088), so it runs every time.
+        - Image encodes that miss run across the group's idle ranks (`author.spread`,
+          sparing: the DiT the denoise needs next stays where it is), each on one rank from
+          its own pixels, so each result is what rank 0 alone computes on an identical card.
+        """
+        with torch.no_grad():
+            workflow = self._workflow(task, state)
+            view = _ScopedPipeline(self._pipes[workflow], self.components["video_vae"])
+            device = view._execution_device
+            vae, audio_vae = view.vae, view.audio_vae
+            pixel_mean, pixel_std = tuple(view.pixel_mean), tuple(view.pixel_std)
+            seed = int(view.keyframe_encode_seed)
+            latents_mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1)
+            latents_std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1)
+            identity = (
+                memo.identity if memo is not None else "",
+                str(device.type),
+                str(next(vae.parameters()).dtype),
+                pixel_mean,
+                pixel_std,
+                seed,
+            )
+            references = state.normalized_references
+            visual: dict[int, tuple[Any, tuple[Any, ...]]] = {}
+            for index, reference in enumerate(references):
+                if reference.kind == "image":
+                    pixels = np.array(reference.image)
+                elif reference.kind == "video":
+                    # Snap down to `17n + 5` frames, as the official step does.
+                    count = reference.frames.shape[0]
+                    count = (
+                        max(1, (count - view.vae_latents_per_chunk) // view.vae_frames_per_chunk)
+                        * view.vae_frames_per_chunk
+                        + view.vae_latents_per_chunk
+                    )
+                    pixels = reference.frames[:count].copy()
+                else:
+                    continue
+                visual[index] = (pixels, (*identity, *reference_digest(pixels)))
+            latents: dict[int, Any] = {}
+            if memo is not None:
+                for index, (_, key) in visual.items():
+                    if key in memo.cache:
+                        latents[index] = memo.cache.get(key, build=_unreachable)
+            missing = [index for index in visual if index not in latents]
+            images = [index for index in missing if visual[index][0].ndim == 3]
+            arguments = (
+                (torch.from_numpy(visual[i][0]), pixel_mean, pixel_std, seed) for i in images
+            )
+            encoded = spread(vae, "encode_condition", arguments, spare=True)
+            for index, raw in zip(images, encoded, strict=True):
+                latents[index] = (raw.cpu() - latents_mean) / latents_std
+            for index in missing:
+                if index not in latents:
+                    raw = vae.encode_condition(
+                        torch.from_numpy(visual[index][0]), pixel_mean, pixel_std, seed
+                    )
+                    latents[index] = (raw.cpu() - latents_mean) / latents_std
+            if memo is not None:
+                for index in missing:
+                    memo.cache.get(visual[index][1], build=_returning(latents[index]))
+            # The memo keeps its own tensors: the request gets copies it cannot share.
+            condition_latents = [
+                latents[index].clone() if memo is not None else latents[index] for index in visual
+            ]
+
+            audio_mean = torch.tensor(audio_vae.config.latents_mean).view(1, 1, -1)
+            audio_std = torch.tensor(audio_vae.config.latents_std).view(1, 1, -1)
+            audio_condition_latents = []
+            for reference in references:
+                if reference.has_audio:
+                    waveform = reference.audio.to(device)[:, None]
+                    posterior = audio_vae.encode(waveform, return_dict=False)[0]
+                    # Channel-major rows: the two stereo channels are two batch items of the mono
+                    # audio VAE. Soundtracks take the posterior mean and are never sampled.
+                    rows = posterior.mode().float().cpu().transpose(1, 2)
+                    normalized = (rows - audio_mean) / audio_std
+                    audio_condition_latents.append(
+                        normalized.reshape(-1, view.audio_latent_channels)
+                    )
+            state.set("condition_latents", condition_latents)
+            state.set("audio_condition_latents", audio_condition_latents)
+            return len(visual) - len(missing), len(missing)
 
     def warm_dit(self, task: Task, *, overlay: TurboOverlay | None = None) -> None:
         """One dry forward of this task's DiT over a packed sequence of every modality.

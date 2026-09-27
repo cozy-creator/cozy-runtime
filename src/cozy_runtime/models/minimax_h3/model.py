@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import sys
+import time
 from collections.abc import Callable, Sequence
+from functools import partial
 from typing import Any, Literal
 
 from cozy_runtime.author import (
     AttentionContext,
     Context,
+    DerivedCache,
     Loader,
     Model,
+    concurrently,
     placeable,
     sequence_parallel,
     uses_components,
@@ -21,6 +25,7 @@ from .official import (
     NumericalChecks,
     OfficialH3Pipeline,
     OfficialH3TurboLoRA,
+    ReferenceMemo,
     ScheduleFacts,
     Task,
     _validate_sol_dense_steps,
@@ -35,6 +40,34 @@ from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
 #: (H100 Ulysses-4 runs 1240-1252) and is never preferred. The VAEs keep Runtime's ranking.
 DIT_ATTENTION: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
 DIT_COMPONENTS: frozenset[str] = frozenset({"fl2va_dit", "ref2va_dit"})
+#: Reference latents one generation keeps (`ReferenceMemo`), least recently used first out. A
+#: 2048-edge image reference is ~6 MB of float32 latents, a 5 s video reference ~25 MB.
+REFERENCE_MEMO_ENTRIES = 256
+REFERENCE_MEMO_BYTES = 1 << 30
+
+
+def condition_references(
+    model: H3Model, task: Task, state: Any, *, checks: NumericalChecks
+) -> None:
+    """`condition_text` and `condition_ref2va_media` of one `ref2va` request, overlapped where
+    the group keeps the text encoder on a follower (`author.concurrently`): rank 0 encodes
+    the references while the follower runs the conditioner.
+
+    Both read only the prompt and the references and write disjoint outputs. The text block
+    reads a copy taken before the media block may append a continuation's layout, and its
+    outputs land in `state` once both have finished, as the block writes them. So the state
+    equals the sequential one wherever the two ran.
+    """
+    text = model.pipe.text_state(state)
+    started = time.perf_counter()
+    concurrently(
+        partial(model.condition_text, task, text, checks=checks),
+        partial(model.condition_ref2va_media, task, state, checks=checks),
+    )
+    model.pipe.adopt_text(task, state, text)
+    checks.telemetry.log(
+        "h3 conditioning", wall_ms=round((time.perf_counter() - started) * 1000, 1)
+    )
 
 
 @placeable("text_encoder")
@@ -61,6 +94,15 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
 
     def load(self, loader: Loader) -> None:
         self.pipe = loader.construct(OfficialH3Pipeline, factory=build_h3_pipeline)
+        self._declare_caches(loader)
+
+    def _declare_caches(self, loader: Loader) -> None:
+        """The generation's reference latents (`ReferenceMemo`): memory only, bounded."""
+        self.reference_latents = loader.cache(
+            "reference_latents",
+            max_entries=REFERENCE_MEMO_ENTRIES,
+            max_bytes=REFERENCE_MEMO_BYTES,
+        )
 
     def unload(self, loader: Loader) -> None:
         return None
@@ -165,7 +207,10 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
     def condition_ref2va_media(self, task: Task, state: Any, *, checks: NumericalChecks) -> None:
         for name in ("video_vae", "audio_vae"):
             checks.component(name, self.pipe.components[name])
-        self.pipe.condition_media(task, state, checks=checks)
+        cache: DerivedCache | None = getattr(self, "reference_latents", None)
+        memo = None if cache is None else ReferenceMemo(cache, self.checkpoint_ref)
+        reused, encoded = self.pipe.condition_media(task, state, checks=checks, memo=memo)
+        checks.telemetry.log("h3 reference latents", reused=reused, encoded=encoded)
 
     @uses_components("fl2va_dit")
     def sample_fl2va(
@@ -198,6 +243,7 @@ class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
 
     def load(self, loader: Loader) -> None:
         self.pipe = loader.construct(OfficialH3Pipeline, factory=build_h3_turbo_base)
+        self._declare_caches(loader)
 
     @uses_components("fl2va_dit")
     def sample_fl2va_turbo(

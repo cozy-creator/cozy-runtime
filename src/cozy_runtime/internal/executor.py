@@ -724,6 +724,8 @@ class Executor:
         return {
             "degree": self.world,
             "ranks": ranks,
+            # per spread method: the calls each rank ran, and why a rank declined
+            "spread": dict(self.group.spread_log) if self.group is not None else {},
             "executor": dict(self.host.boot),
             "construction": {
                 "prepared_unix_ms": int(facts.get("prepared_unix_ms", 0)),
@@ -816,6 +818,9 @@ class Executor:
         result: Any = None
         models = {key[0]: model for key, (model, _root) in self.group_components.items()}
         started_us = execution_evidence.now_us()
+        homes = any(rank == self.rank for rank in self.group_hosted.values())
+        # A spread call rank 0 waits on over the group: a header always answers it.
+        answered = False
         try:
             spool = Path(command["spool"])
             if self._run_entry is None or self._run_entry[0] != spool:
@@ -846,7 +851,6 @@ class Executor:
                     if residency is not None and self._group_attempts.get(key) != spool:
                         # A rank that hosts a component holds a set rank 0's plan never
                         # priced, so it may always make room: demand-pull when measured.
-                        homes = any(rank == self.rank for rank in self.group_hosted.values())
                         residency.open_attempt(
                             "component_staged" if homes else scope["placement"],
                             scope["headroom_bytes"],
@@ -854,6 +858,9 @@ class Executor:
                             tuple(scope.get("measured_scopes") or ()),
                         )
                         self._group_attempts[key] = spool
+                    if spread and residency is not None and (homes or command.get("spare")):
+                        # An optional call: taken on room alone, declined rather than evict.
+                        stack.enter_context(residency.sparing())
                     stack.enter_context(models[key]._cozy_scope(scope["method"], components))
                     active[key] = components
                 if name[0] not in active or name[1] not in active[name[0]]:
@@ -883,6 +890,7 @@ class Executor:
                 if spread:
                     # A pure method call whose one tensor result goes straight to rank 0.
                     output = getattr(component, str(command["method"]))(*args, **kwargs)
+                    answered = True
                     wire.send_tensor(output, 0, self.pg)
                 elif hosted:
                     plane = models[name[0]]._cozy_residency
@@ -897,7 +905,9 @@ class Executor:
                         plane.shed()
                         accel.release_cached(self.torch, self.device_kind)
                         output = call(*args, **kwargs)
-                    result = wire.marshal(output, wire.TensorSpool(spool / "hosted"))
+                    result = wire.marshal(
+                        output, wire.TensorSpool(spool / str(command.get("results", "hosted")))
+                    )
                 else:
                     component(*args, **kwargs)
                 accel.synchronize(self.torch, self.device_kind)
@@ -911,6 +921,23 @@ class Executor:
                 accel.peak_allocated(self.torch, self.device_kind) - self._run_entry[1] - moved, 0
             )
         except Exception as exc:
+            if spread and not answered:
+                declined = self._declines(exc)
+                with contextlib.suppress(Exception):
+                    wire.send_nothing(
+                        0, self.pg, self._rank_device(self.torch), failed=declined is None
+                    )
+                if declined is not None:
+                    # Nothing moved that this rank must keep: the call is pure and runs on
+                    # another rank. The generation stays Ready.
+                    return {
+                        "ok": True,
+                        "rank": self.rank,
+                        "component": list(name),
+                        "sol_calls": {},
+                        "working_peak_bytes": 0,
+                        "declined": declined,
+                    }
             outcome = classify(exc)
             self.poisoned = f"mirrored {name} failed: {outcome.code}"
             return {
@@ -938,6 +965,18 @@ class Executor:
                 ),
             ),
         }
+
+    def _declines(self, exc: Exception) -> str | None:
+        """Why a spread call is declined rather than failed: no room without evicting
+        (`device_spared`), or the device ran out inside the call."""
+        if isinstance(exc, ResidencyRefusal) and exc.code == "device_spared":
+            return exc.detail
+        if self.device_kind == "cuda" and isinstance(
+            exc, accel.oom_error(self.torch, self.device_kind)
+        ):
+            accel.release_cached(self.torch, self.device_kind)
+            return f"device_out_of_memory: {exc}"[:300]
+        return None
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
         """A group that could not form or hold is THIS process's poison: the worker
@@ -1018,10 +1057,16 @@ class Executor:
                         and _cancelled(owner.root, owner._attempt_request)
                     ),
                 )
-        homes = {rank for rank in owner.group_hosted.values()}
-        spreading = (0, *(rank for rank in range(1, self.world) if rank not in homes))
-        if self.rank == 0 and len(spreading) > 1:
+        # Every rank may take a spread call. A rank homing a placeable component takes one
+        # only beside everything it holds (measured room), so it never gives up the
+        # component it hosts for a clip (`Executor.run`, `ComponentResidency.sparing`).
+        sparing = sorted(set(owner.group_hosted.values()))
+        if self.rank == 0:
             assert self.group is not None
+            if hosted:
+                object.__setattr__(
+                    model, "_cozy_placement", mirror.GroupPlacement(hosted, self.group, torch)
+                )
             for component_name, root in roots.items():
                 name = (self._group_model_key, component_name)
                 if name in owner.group_sharded or name in owner.group_hosted:
@@ -1032,7 +1077,6 @@ class Executor:
                     prepared=owner.group_components,
                     group=self.group,
                     spool=lambda: owner._attempt_spool,
-                    ranks=spreading,
                     device=self._rank_device(torch),
                     cancelled=lambda: (
                         bool(owner._attempt_request)
@@ -1044,7 +1088,8 @@ class Executor:
             "rank": self.rank,
             "components": list(installed),
             "hosted": hosted,
-            "spread_ranks": list(spreading),
+            "spread_ranks": list(range(self.world)),
+            "sparing_ranks": sparing,
             "followers": list(self.group.pids()) if self.group is not None else [],
         }
         return None
@@ -3110,6 +3155,7 @@ class Executor:
         if self.group is not None:
             self.group.working_peaks.clear()
             self.group.rank_records.clear()
+            self.group.spread_log.clear()
 
         # The lossy lane, carrying BOTH kinds of live record. A progress frame is not
         # retained anywhere: its `position` is the monotone unit count the worker's

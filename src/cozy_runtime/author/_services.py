@@ -17,6 +17,7 @@ import math
 import os
 import shutil
 import stat
+import threading
 import time
 from collections.abc import Buffer, Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -178,6 +179,8 @@ class Attempt:
     _step_mark: float = 0.0
     _overall_fraction: float | None = None
     _progress_diagnostics: set[str] = field(default_factory=set)
+    #: Overlapped calls (`author.concurrently`) record from their own threads.
+    _recording: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
         if not self.ring.subject:
@@ -185,9 +188,10 @@ class Attempt:
 
     def emit(self, kind: str, name: str, value: Scalar = None, **fields: Scalar) -> Observation:
         """One RETAINED record: the bounded ring, its emit-boundary checks, then the lane."""
-        observation = self.ring.emit(cast("Any", kind), name, value, **fields)
-        if self.sink is not None:
-            self.sink(observation)
+        with self._recording:
+            observation = self.ring.emit(cast("Any", kind), name, value, **fields)
+            if self.sink is not None:
+                self.sink(observation)
         return observation
 
     def signal(self, frame: ProgressFrame) -> None:

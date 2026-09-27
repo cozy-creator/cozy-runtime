@@ -188,6 +188,9 @@ def unmarshal(value: Any, spool: TensorSpool, *, device: Any) -> Any:
 #: dtypes a point-to-point result may carry, by position in its header
 _P2P_DTYPES = ("float32", "float16", "bfloat16", "float64", "int64", "int32", "uint8", "bool")
 _P2P_RANK = 8
+#: header codes for a call that sends no tensor: declined (the rank had no room) or failed
+_P2P_DECLINED = -1
+_P2P_FAILED = -2
 
 
 def send_tensor(tensor: Any, dst: int, pg: Any) -> None:
@@ -198,20 +201,31 @@ def send_tensor(tensor: Any, dst: int, pg: Any) -> None:
     dtype = str(tensor.dtype).removeprefix("torch.")
     if dtype not in _P2P_DTYPES or tensor.ndim > _P2P_RANK:
         raise UncrossableArgument(f"a {dtype} tensor of rank {tensor.ndim} has no p2p header")
-    head = [_P2P_DTYPES.index(dtype), tensor.ndim, *tensor.shape]
-    head += [0] * (_P2P_RANK + 2 - len(head))
-    torch.distributed.send(
-        torch.tensor(head, dtype=torch.int64, device=tensor.device), dst=dst, group=pg
-    )
+    _send_head([_P2P_DTYPES.index(dtype), tensor.ndim, *tensor.shape], dst, pg, tensor.device)
     torch.distributed.send(tensor.contiguous(), dst=dst, group=pg)
 
 
+def send_nothing(dst: int, pg: Any, device: Any, *, failed: bool) -> None:
+    """A header with no tensor behind it, so a receiver waiting on this rank never hangs."""
+    _send_head([_P2P_FAILED if failed else _P2P_DECLINED, 0], dst, pg, device)
+
+
+def _send_head(head: list[int], dst: int, pg: Any, device: Any) -> None:
+    import torch
+
+    head += [0] * (_P2P_RANK + 2 - len(head))
+    torch.distributed.send(torch.tensor(head, dtype=torch.int64, device=device), dst=dst, group=pg)
+
+
 def recv_tensor(src: int, pg: Any, device: Any) -> Any:
+    """The tensor rank `src` sent, or None when it sent a header alone (its reply says why)."""
     import torch
 
     head = torch.empty(_P2P_RANK + 2, dtype=torch.int64, device=device)
     torch.distributed.recv(head, src=src, group=pg)
     code, ndim, *shape = head.tolist()
+    if code < 0:
+        return None
     out = torch.empty(shape[:ndim], dtype=getattr(torch, _P2P_DTYPES[code]), device=device)
     torch.distributed.recv(out, src=src, group=pg)
     return out

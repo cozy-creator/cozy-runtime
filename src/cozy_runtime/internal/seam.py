@@ -31,6 +31,7 @@ import json
 import os
 import socket
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
@@ -108,6 +109,9 @@ class Channel:
     frames_out: int = 0
     frames_in: int = 0
     refusals: list[str] = field(default_factory=list)
+    #: One frame at a time: follower progress is forwarded from reader threads and overlapped
+    #: calls log from theirs, beside the thread that owns the attempt.
+    sending: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def send(self, message: dict[str, Any]) -> None:
         _scan(message)
@@ -119,9 +123,10 @@ class Channel:
                 f"{len(data)} B over the {MAX_FRAME} B control cap — the seam carries "
                 "control, not data (bytes go through the brokered attempt spool)",
             )
-        self.sock.sendall(HEADER.pack(len(data)) + data)
-        self.sent_bytes += HEADER.size + len(data)
-        self.frames_out += 1
+        with self.sending:
+            self.sock.sendall(HEADER.pack(len(data)) + data)
+            self.sent_bytes += HEADER.size + len(data)
+            self.frames_out += 1
 
     def send_descriptor(self, descriptor: socket.socket) -> None:
         """Transfer one already-connected local capability after its control answer."""
