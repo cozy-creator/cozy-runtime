@@ -517,6 +517,7 @@ class ReleaseRoots:
             capture_document=capture,
             preparation=canonical_json.encode(preparation),
             publication_authorization_id=request.publication_authorization_id,
+            owner_memo=request.owner_memo,
         )
         worker.machine_sources.declare(owner, offer.request_id)
         executions.record(

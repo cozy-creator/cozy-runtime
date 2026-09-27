@@ -6,6 +6,7 @@ import base64
 import dataclasses
 import threading
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import grpc
@@ -132,6 +133,7 @@ class MachineExecutionRPC:
                 release_roots=self.worker.machine_calls is not None,
                 input_object_reuse=True,
                 event_wait=True,
+                memo_lookup=self.worker.owner_memo is not None,
             )
 
         return self._call(request.claim, context, get)
@@ -201,6 +203,7 @@ class MachineExecutionRPC:
                     capture_document=request.capture_canonical_bytes,
                     preparation=canonical.write(prepared),
                     publication_authorization_id=request.publication_authorization_id,
+                    owner_memo=request.owner_memo,
                 )
             else:
                 preparation = machine_capture.verify(self.worker, request)
@@ -216,6 +219,7 @@ class MachineExecutionRPC:
                     preparation=preparation,
                     publication_authorization_id=request.publication_authorization_id,
                     arguments=value,
+                    owner_memo=request.owner_memo,
                 )
             self.worker.machine_sources.declare(owner, offered.request_id)
             return pb.MachineExecutionReceipt(**dataclasses.asdict(receipt))
@@ -295,6 +299,12 @@ class MachineExecutionRPC:
     ) -> Any:
         def events() -> pb.MachineExecutionEventPage:
             self._query(request.execution)
+            if self.worker.owner_memo is not None:
+                self.worker.owner_memo.read(
+                    request.execution.claim.record_owner_id,
+                    request.execution.request_id,
+                    request.after,
+                )
             if request.wait:
                 page = self._wait_events(request, context)
             else:
@@ -335,13 +345,19 @@ class MachineExecutionRPC:
 
         if hasattr(context, "add_callback"):
             context.add_callback(leave)
-        return executions.wait_events(
-            owner,
-            request.execution.request_id,
-            request.after,
-            request.limit or 256,
-            lambda: left.is_set() or self.worker.stop.is_set(),
-        )
+        memo = self.worker.owner_memo
+        with (
+            memo.wait_read(owner, request.execution.request_id, left.is_set)
+            if memo is not None
+            else nullcontext()
+        ):
+            return executions.wait_events(
+                owner,
+                request.execution.request_id,
+                request.after,
+                request.limit or 256,
+                lambda: left.is_set() or self.worker.stop.is_set(),
+            )
 
     def ControlMachineExecution(self, request: pb.MachineExecutionControl, context: Any) -> Any:
         def control() -> pb.MachineExecutionState:
@@ -352,6 +368,8 @@ class MachineExecutionRPC:
                         request.execution.claim, request.execution.request_id, request.publication
                     )
                 )
+            if request.action == pb.MACHINE_EXECUTION_ACTION_ANSWER_MEMO:
+                return self._state(self._answer_memo(request))
             action = {
                 pb.MACHINE_EXECUTION_ACTION_PAUSE: "pause",
                 pb.MACHINE_EXECUTION_ACTION_RESUME: "resume",
@@ -369,6 +387,16 @@ class MachineExecutionRPC:
             return self._state(state)
 
         return self._call(request.execution.claim, context, control)
+
+    def _answer_memo(self, request: pb.MachineExecutionControl) -> Any:
+        memo, executions = self.worker.owner_memo, self.worker.executions
+        claim, request_id = request.execution.claim, request.execution.request_id
+        if memo is None or executions is None:
+            raise ExecutionWorkspaceRefusal("memo_lookup_unsupported", "workspace has no memo")
+        if not executions.owns(claim.record_owner_id, request_id):
+            raise _ExecutionNotFound("execution is not held by this owner")
+        memo.answer(claim.record_owner_id, request_id, request.memo)
+        return self.worker.execution_status(claim, request_id)
 
     def CollectMachineExecution(self, request: pb.MachineExecutionCollect, context: Any) -> Any:
         def collect() -> pb.AttemptOutcome:

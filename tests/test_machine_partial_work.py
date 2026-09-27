@@ -219,7 +219,10 @@ class Machine:
         wait(what, done, self.thread.is_alive, seconds)
 
     def submit(
-        self, request: str, credentials: tuple[pb.SourceCredential, ...] = ()
+        self,
+        request: str,
+        credentials: tuple[pb.SourceCredential, ...] = (),
+        owner_memo: bool = False,
     ) -> pb.MachineExecutionSubmit:
         generator = LocalRecordOwner(
             LocalRequest(
@@ -254,6 +257,7 @@ class Machine:
                 pb.MachineExecutionWorkspaceQuery(claim=self.claim)
             ).execution_workspace_id,
             source_credentials=credentials,
+            owner_memo=owner_memo,
         )
         self.client.SubmitMachineExecution(submission)
         return submission

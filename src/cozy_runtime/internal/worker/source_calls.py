@@ -34,6 +34,7 @@ from cozy_runtime.internal.worker import (
     workspace_partial,
     workspace_sources,
 )
+from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationClient, PublicationRefusal
 from cozy_runtime.internal.worker.stage_progress import Progress, StageProgress
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
@@ -218,8 +219,10 @@ class SourceCalls:
         spool_root: Path | None = None,
         progress: Progress | None = None,
         publication: Callable[[str, str, int], PublicationClient] | None = None,
+        memo: OwnerMemo | None = None,
     ):
         self.workspace, self.owner, self.send, self.current = workspace, owner, send, current
+        self.memo = memo
         self.progress = progress
         # The latest failure detail per native call, for the machine child-call result.
         self.details: dict[str, str] = {}
@@ -245,6 +248,7 @@ class SourceCalls:
                 process = self.processes.get(command.service_id)
                 if process is not None:
                     process.kill()
+            self._wake()
             return
         if (
             command.operation
@@ -308,6 +312,12 @@ class SourceCalls:
                     process = self.processes.get(service)
                     if process is not None:
                         process.kill()
+        self._wake()
+
+    def _wake(self) -> None:
+        """A call parked on its owner's memo answer sees its cancellation."""
+        if self.memo is not None:
+            self.memo.wake()
 
     def acknowledge(self, ack: pb.AttemptOutcomeAck, finished: Callable[[], None]) -> bool:
         """Drain native processes and finalize off the heartbeat/control thread."""
@@ -396,6 +406,7 @@ class SourceCalls:
                     process = self.processes.get(service)
                     if process is not None and process.poll() is None:
                         process.kill()
+        self._wake()
 
     def _status(
         self,
@@ -588,6 +599,28 @@ class SourceCalls:
                 # A Diffusers source's configs are inputs: they become the model's configs.
                 effective["configs"] = configs
             computation = computation_key(row["operation"], effective)
+            hit = (
+                self.memo.lookup(
+                    owner,
+                    call,
+                    row["operation"],
+                    computation,
+                    upload.destination,
+                    lambda: self._stopped(command.service_id),
+                )
+                if self.memo is not None
+                else None
+            )
+            if hit is not None:
+                workspace_sources.record_upload(self.workspace, owner, command, hit, computation)
+                terminal(
+                    command,
+                    pb.NATIVE_SOURCE_STATE_SUCCEEDED,
+                    result=hit,
+                    computation=computation,
+                    memo_hit=True,
+                )
+                return
             checkpoint = upload.run(
                 _native_selection(command.selection),
                 content,
@@ -609,6 +642,8 @@ class SourceCalls:
             stage.finish(True)
         result = canonical_json.encode(msgspec.to_builtins(checkpoint))
         workspace_sources.record_upload(self.workspace, owner, command, result, computation)
+        if self.memo is not None:
+            self.memo.record(owner, call, row["operation"], computation, result)
         try:
             upload.finish()
         except Exception:

@@ -130,6 +130,7 @@ from cozy_runtime.internal.worker.lanes import (
     fold_memory,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
+from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
@@ -1222,6 +1223,7 @@ class Worker:
             else None
         )
         self.engine.calls = self.calls
+        self.owner_memo = OwnerMemo(self.executions) if self.executions is not None else None
         from cozy_runtime.internal.worker.source_calls import SourceCalls
 
         self.source_calls = (
@@ -1239,6 +1241,7 @@ class Worker:
                 publication=(
                     self.machine_effects.source_client if self.machine_effects is not None else None
                 ),
+                memo=self.owner_memo,
             )
             if self.workspace is not None
             else None
@@ -2235,6 +2238,7 @@ class Worker:
         preparation: bytes = b"",
         publication_authorization_id: str = "",
         arguments: dict[str, Any] | None = None,
+        owner_memo: bool = False,
     ) -> workspace_executions.Receipt:
         """Authenticated root intake; accepted execution never depends on the caller's stream."""
         with self.control_lock:
@@ -2313,6 +2317,7 @@ class Worker:
                     preparation=preparation,
                     worker_id=self.options.worker_id,
                     publication_authorization_id=publication_authorization_id,
+                    owner_memo=owner_memo,
                 )
             self.publish_activity(strict=True)
             return receipt
