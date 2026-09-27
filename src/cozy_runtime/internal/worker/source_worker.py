@@ -19,6 +19,22 @@ from cozy_runtime.internal import fill
 MAX_COMMAND = 2 << 20
 
 
+class ConversionRefusal(ValueError):
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+
+
+def profiles_of(arguments: dict[str, Any]) -> tuple[str, ...]:
+    """The reviewed profiles one conversion composes, in their declared order."""
+    single, several = arguments.get("profile", ""), tuple(arguments.get("profiles", ()))
+    if bool(single) == bool(several) or len(set(several)) != len(several):
+        raise ConversionRefusal(
+            "model_source_profiles_invalid", "name one profile or distinct profiles"
+        )
+    return (single,) if single else several
+
+
 def execute(command: dict[str, Any]) -> dict[str, Any]:
     store = fill.store(command["store"])
     operation = command["operation"]
@@ -114,6 +130,11 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
     if observed.get("state") == "committed":
         receipt = observed["receipt"]
     else:
+        # One reviewed profile per slot; several profiles compose one model whose
+        # components are the union of theirs.
+        slots = [(f"part{index}", profile) for index, profile in enumerate(profiles_of(args))]
+        if len(slots) == 1:
+            slots = [("model", slots[0][1])]
         checkpoints: list[tuple[str, str, int]] = []
         adopt = command.get("adopt_operation")
         registry = (
@@ -125,7 +146,7 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
             prepared = store.prepare_source_artifact(
                 command["source_owner"],
                 conversion_id,
-                [("model", args["profile"])],
+                slots,
                 checkpoints=checkpoints,
                 adopt_from_operation_id=adopt,
                 registry=registry,
@@ -136,26 +157,41 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
             checkpoints = [
                 (row["slot"], row["head"], row["head_length"]) for row in prepared["checkpoints"]
             ]
-        converted = prepared["sources"][0]
+        converted = {row["slot"]: row for row in prepared["sources"]}
         if epoch := observed.get("writer_session_id"):
             store.derived_fence(transaction, epoch)
-        header = fill.tensorfs_module().parse_header(
-            store.manifest(converted["manifest_digest"])["header"]
-        )
-        components = header["components"]
-        targets = {
-            name: {"source": "converted", "source_component": name, "drop": [], "add": {}}
-            for name in components
-        }
-        configs = {
-            name: {"kind": "copy", "source": "converted", "source_config": name}
-            for name in header["configs"]
-        }
-        order = [(name, key) for name, tensors in components.items() for key in tensors]
+        sources: dict[str, tuple[str, int]] = {}
+        targets: dict[str, dict[str, Any]] = {}
+        configs: dict[str, dict[str, str]] = {}
+        order: list[tuple[str, str]] = []
+        assets: dict[str, list[str]] = {}
+        for slot, _ in slots:
+            part = converted[slot]
+            sources[slot] = (part["manifest_digest"], part["manifest_length"])
+            header = fill.tensorfs_module().parse_header(
+                store.manifest(part["manifest_digest"])["header"]
+            )
+            for name, tensors in header["components"].items():
+                if name in targets:
+                    raise ConversionRefusal(
+                        "model_source_components_overlap",
+                        f"source profiles both produce component {name}",
+                    )
+                targets[name] = {"source": slot, "source_component": name, "drop": [], "add": {}}
+                order.extend((name, key) for key in tensors)
+            for name in header["configs"]:
+                if name in configs:
+                    raise ConversionRefusal(
+                        "model_source_configs_overlap",
+                        f"source profiles both carry config {name}",
+                    )
+                configs[name] = {"kind": "copy", "source": slot, "source_config": name}
+            if header["assets"]:
+                assets[slot] = sorted(header["assets"])
         writer = store.begin_derived(
             transaction,
             int(command["writer_epoch"]),
-            {"converted": (converted["manifest_digest"], converted["manifest_length"])},
+            sources,
             targets,
             configs,
             order,
@@ -163,13 +199,13 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
             work_fingerprint=command["computation_digest"],
         )
         receipt = writer.commit()
-        if header["assets"]:
+        for slot, names in assets.items():
             inherited = store.inherit_model_assets(
                 receipt["manifest"]["sha256"],
                 receipt["manifest"]["length"],
-                converted["manifest_digest"],
-                converted["manifest_length"],
-                sorted(header["assets"]),
+                sources[slot][0],
+                sources[slot][1],
+                names,
             )
             receipt["manifest"] = {
                 "sha256": inherited["manifest_id"].removeprefix("sha256:"),
