@@ -79,7 +79,7 @@ def serve(backend: str, argv: list[str]) -> None:
 class Driver:
     """The worker's side of the seam, reduced to what these arms need."""
 
-    def __init__(self, root: Path, backend: str, devices: str) -> None:
+    def __init__(self, root: Path, backend: str, devices: str, *, scope: str = "") -> None:
         root.mkdir(parents=True, exist_ok=True)
         path = str(root / "seam.sock")
         sock = listener(path)
@@ -90,8 +90,11 @@ class Driver:
             "MKL_NUM_THREADS": "1",
             "PYTHONFAULTHANDLER": "1",
         }
+        # A named transient systemd scope puts the executor in its own memory cgroup.
+        prefix = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={scope}"] if scope else []
         self.process = subprocess.Popen(
             [
+                *prefix,
                 sys.executable,
                 str(Path(__file__)),
                 "--serve",
@@ -430,6 +433,49 @@ def refused_loads(root: Path) -> dict[str, Any]:
         driver.close()
 
 
+def _executor_cgroup(pid: int) -> Path:
+    line = Path(f"/proc/{pid}/cgroup").read_text().strip().splitlines()[0]
+    return Path("/sys/fs/cgroup") / line.split("::", 1)[1].lstrip("/")
+
+
+def host_budget(root: Path, size: int) -> dict[str, Any]:
+    """Fill a checkpoint with host memory capped at what is held plus 1.5x the checkpoint.
+
+    On CPU the destinations ARE host memory, so the cap is the model plus half of it: a
+    fill that also held a whole host image of the checkpoint would exceed it and be
+    OOM-killed. Page cache from the store reads is charged too and must be reclaimed.
+    """
+    store = root / "store"
+    torch.manual_seed(7)
+    pipe = BlockPipe(Config({"block": {"size": size}}))
+    native.native_model(store, "block-big", pipe.components, {"block": {"size": size}})
+    expected = float(pipe.components["block"](torch.ones(1, size)).sum().detach())
+    checkpoint = size * size * 4
+    del pipe
+    os.environ["CUDA_VISIBLE_DEVICES"] = "cpu0"
+    binding = _stage(root, BLOCK, "A", {"generate.models.block": "test/block-big@1"}, store)
+    driver = Driver(root / "run", "cpu", "cpu0", scope=f"cozy-host-budget-{os.getpid()}")
+    try:
+        pid = driver.call({"cmd": "hello"})["pid"]
+        assert _start(driver, binding, 1, "cpu0")["ok"]
+        cgroup = _executor_cgroup(pid)
+        held = int((cgroup / "memory.current").read_text())
+        limit = held + checkpoint + checkpoint // 2
+        (cgroup / "memory.swap.max").write_text("0")
+        (cgroup / "memory.max").write_text(str(limit))
+        loaded = driver.call(_load_command(binding, "A", 1, "cpu", 64 << 30))
+        assert loaded["ok"], loaded
+        assert driver.call({"cmd": "activate", "construction": "A"})["ok"]
+        served = _serve(driver, root, "A", "host-budget")
+        assert math.isclose(served["checksum"], expected, rel_tol=1e-3), served
+        events = dict(line.split() for line in (cgroup / "memory.events").read_text().splitlines())
+        assert int(events["oom_kill"]) == 0, events
+        peak = int((cgroup / "memory.peak").read_text())
+        return {"checkpoint": checkpoint, "limit": limit, "peak": peak, "held": held}
+    finally:
+        driver.close()
+
+
 def main() -> None:
     if "--serve" in sys.argv:
         index = sys.argv.index("--serve")
@@ -437,7 +483,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument(
-        "--arm", choices=("two-models", "sized-blocks", "refused-loads"), required=True
+        "--arm",
+        choices=("two-models", "sized-blocks", "refused-loads", "host-budget"),
+        required=True,
     )
     parser.add_argument("--degree", type=int, default=1)
     parser.add_argument("--size", type=int, default=8192)
@@ -447,6 +495,8 @@ def main() -> None:
         facts = two_models(args.root, args.degree)
     elif args.arm == "refused-loads":
         facts = refused_loads(args.root)
+    elif args.arm == "host-budget":
+        facts = host_budget(args.root, args.size)
     else:
         facts = sized_blocks(args.root, args.size)
     print(json.dumps(facts), flush=True)

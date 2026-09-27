@@ -59,3 +59,15 @@ def test_loads_refused_before_holding_device_bytes_keep_the_process_serving(
 ) -> None:
     facts = _run(tmp_path, "--arm", "refused-loads")
     assert facts["codes"] == ["model_fit_refused", "device_shortfall"]
+
+
+def test_a_fill_completes_under_a_host_memory_cap_below_two_checkpoints(tmp_path: Path) -> None:
+    probe = subprocess.run(
+        ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=1G", "true"],
+        capture_output=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        pytest.skip("no delegated systemd user scope with a memory controller")
+    facts = _run(tmp_path, "--arm", "host-budget", "--size", "12288")
+    assert facts["peak"] <= facts["limit"] < facts["held"] + 2 * facts["checkpoint"], facts

@@ -888,41 +888,44 @@ class StagingRing:
         inflight: int,
         fence: bool = True,
     ) -> None:
-        if slots < 2:
-            raise _refuse(
-                "lease_live",
-                f"a {slots}-slot ring cannot double-buffer: the single slot is refilled "
-                "while its copy is in flight, so there is no lease to hold",
-            )
-        if inflight >= slots:
-            raise _refuse(
-                "lease_live",
-                f"{inflight} copies in flight against {slots} slots leaves the reader pool "
-                "nothing to fill: a slot whose H2D has not completed is NOT free, so the "
-                "ring must hold strictly more slots than in-flight copies",
-            )
+        # Double buffering needs two slots and one free slot beyond the copies in flight;
+        # a smaller request is raised to that minimum rather than refused.
+        slots = max(int(slots), 2)
         self.torch = torch
         self.device = device
         self.window_bytes = int(window_bytes)
         self.fence = fence
-        self.keep = int(inflight)
-        #: The page-locked bytes this ring REGISTERED with the driver, and the high-water
-        #: of slots DMA-live at once. Facts for the worker's ledger, never a budget.
-        self.registered_bytes = self.window_bytes * slots
         self.in_flight_peak = 0
         self.stream = torch.cuda.Stream(device=device)
         self.buffers: list[Any] = []
         self.views: list[memoryview] = []
-        for _ in range(slots):
+        pinned, locked = True, 0
+        while len(self.buffers) < slots:
             # device="cpu" is NOT redundant: construction runs under an ambient meta
             # device, and a meta staging buffer has data_ptr() == 0 — the ring would read
             # into address zero. Every allocation this plane makes names its device.
-            buffer = torch.empty(
-                self.window_bytes, dtype=torch.uint8, pin_memory=True, device="cpu"
-            )
+            try:
+                buffer = torch.empty(
+                    self.window_bytes, dtype=torch.uint8, pin_memory=pinned, device="cpu"
+                )
+            except RuntimeError:
+                # A host that cannot page-lock more gets a smaller ring, and one that
+                # cannot page-lock two slots stages through pageable memory: slower, never
+                # a refusal (host RAM is whatever the machine has).
+                if len(self.buffers) >= 2:
+                    break
+                if not pinned:
+                    raise
+                pinned = False
+                continue
+            locked += pinned
             block = (ctypes.c_ubyte * buffer.numel()).from_address(buffer.data_ptr())
             self.buffers.append(buffer)
             self.views.append(memoryview(block).cast("B"))
+        self.keep = min(int(inflight), len(self.buffers) - 1)
+        #: The page-locked bytes this ring REGISTERED with the driver, and the high-water
+        #: of slots DMA-live at once. Facts for the worker's ledger, never a budget.
+        self.registered_bytes = self.window_bytes * locked
         self.inflight: collections.deque[tuple[Any, Any]] = collections.deque()
         self.waits = 0
         self.charged = 0
