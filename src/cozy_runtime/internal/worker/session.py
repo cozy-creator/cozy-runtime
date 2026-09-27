@@ -5746,6 +5746,9 @@ class Worker:
             code=str(reply.get("code")),
         )
         detail = str(reply.get("detail"))[:1024]
+        request_attention_refusal = str(reply.get("code") or "").startswith(
+            "attention_kernel_"
+        )
         shortfall = reply.get("shortfall") or {}
         if shortfall:
             detail = (
@@ -5755,7 +5758,7 @@ class Worker:
             )[:1024]
         with self.control_lock:
             current = self._current_tenant(tenant)
-            for member in group:
+            for member in (group if not request_attention_refusal else ()):
                 # PER-BINDING (#572d), and it OUTLIVES the rebuild the refusal causes: the
                 # process is replaced, but this construction is not tried again until the
                 # desired state changes.
