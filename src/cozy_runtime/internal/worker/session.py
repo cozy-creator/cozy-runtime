@@ -2272,6 +2272,22 @@ class Worker:
             self.publish_activity(strict=True)
             return state
 
+    def reconcile_publication(
+        self, claim: pb.Claim, request_id: str, reconciliation: pb.MachinePublicationReconciliation
+    ) -> workspace_executions.State:
+        """Settle one sent publication of this execution from its owner's Hub read."""
+        executions, owner = self._execution_service(claim)
+        if self.machine_effects is None or not executions.owns(owner, request_id):
+            raise WorkspaceRefusal("execution holds no publication effects")
+        self.machine_effects.reconcile(
+            owner,
+            request_id,
+            reconciliation.call_index,
+            reconciliation.http_status,
+            reconciliation.finalization,
+        )
+        return executions.status(owner, request_id)
+
     def drive_executions(self) -> None:
         """A custody handoff fences dispatch without killing the lifecycle watchdog."""
         from .workspace import WorkspaceInactive

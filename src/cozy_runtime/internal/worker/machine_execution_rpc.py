@@ -105,6 +105,7 @@ class MachineExecutionRPC:
                 if options.gpus or options.accelerator_backend == "none"
                 else "",
                 executor_uid_isolation=options.executor_uid >= 0,
+                owner_publication_reconciliation=self.worker.machine_effects is not None,
                 cpu_slot_model_inputs=machine_slots.MODEL_INPUTS,
                 exact_execution_gpus=True,
             )
@@ -253,6 +254,12 @@ class MachineExecutionRPC:
     def ControlMachineExecution(self, request: pb.MachineExecutionControl, context: Any) -> Any:
         def control() -> pb.MachineExecutionState:
             self._query(request.execution)
+            if request.action == pb.MACHINE_EXECUTION_ACTION_RECONCILE_PUBLICATION:
+                return self._state(
+                    self.worker.reconcile_publication(
+                        request.execution.claim, request.execution.request_id, request.publication
+                    )
+                )
             action = {
                 pb.MACHINE_EXECUTION_ACTION_PAUSE: "pause",
                 pb.MACHINE_EXECUTION_ACTION_RESUME: "resume",

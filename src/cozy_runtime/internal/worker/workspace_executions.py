@@ -849,6 +849,12 @@ class Executions:
                     db, row, "progress" if document.get("type") == "progress" else "log", raw
                 )
 
+    def notice(self, owner: str, request: str, kind: str, document: dict[str, Any]) -> None:
+        """A durable effect fact on the execution in any state: its owner acts on it."""
+        raw = canonical_json.encode(document)
+        with self.workspace.locked() as db, transaction(db):
+            self._event(db, self._row(db, owner, request), kind, raw)
+
     def events(self, owner: str, request: str, after: int = 0, limit: int = MAX_PAGE) -> EventPage:
         if not 0 <= after < 1 << 63 or not 1 <= limit <= MAX_PAGE:
             raise WorkspaceRefusal("execution event cursor or page bound is invalid")
