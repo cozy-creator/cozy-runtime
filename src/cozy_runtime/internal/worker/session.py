@@ -1809,9 +1809,13 @@ class Worker:
             return self._prepare_local_in(request)
 
     def _installed_call_bindings(self, attempt: AttemptRecord) -> list[dict[str, Any]]:
-        if self.executions is None or attempt.job is None:
-            return []
         owner = self.fence.record_owner_id
+        if (
+            self.executions is None
+            or attempt.job is None
+            or not self.executions.owns(owner, attempt.request_id)
+        ):
+            return []
         root = self.executions.capture_root(owner, attempt.request_id)
         capture = self.executions.capture(owner, root)
         prepared = self.executions.preparation(owner, root)["installations"]
