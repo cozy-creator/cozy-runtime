@@ -375,6 +375,7 @@ class Workspace:
                     "SELECT * FROM weights WHERE owner=? AND request=? AND ordinal=?",
                     (owner, attempt["request"], attempt["ordinal"]),
                 ).fetchall()
+                detail = "Previous Runtime execution process ended before recording its outcome."
                 for weight in weights:
                     try:
                         receipt = db.native(
@@ -382,25 +383,23 @@ class Workspace:
                         )
                         if receipt is not None:
                             db.native(partial(self.record_receipt, owner, receipt))
-                    except Exception:
+                    except Exception as exc:
                         db.guard()
-                        settled = db.execute(
-                            "SELECT state FROM attempts WHERE owner=? AND request=? AND ordinal=?",
-                            (owner, attempt["request"], attempt["ordinal"]),
-                        ).fetchone()
-                        if settled is None or settled["state"] not in ("accepted", "running"):
-                            break  # another recovery completed and may have admitted a successor
-                        raise
+                        # One unrecoverable row ends only its own attempt: the claim
+                        # snapshot and every other attempt keep going.
+                        cause = f"{type(exc).__name__}: {exc}"
+                        detail = (
+                            "Previous Runtime execution ended and its native result could not "
+                            "be recovered: "
+                            + "".join(c if " " <= c <= "~" else "?" for c in cause)[:512]
+                        )
+                        break
                 current = db.execute(
                     "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
                     (owner, attempt["request"], attempt["ordinal"]),
                 ).fetchone()
                 if current is not None and current["state"] in ("accepted", "running"):
-                    workspace_recovery.terminal(
-                        db,
-                        current,
-                        "Previous Runtime execution process ended before recording its outcome.",
-                    )
+                    workspace_recovery.terminal(db, current, detail)
 
     @staticmethod
     def _outcome_frame(row: sqlite3.Row) -> pb.AttemptOutcome:

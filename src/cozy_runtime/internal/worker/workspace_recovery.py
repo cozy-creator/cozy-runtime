@@ -30,7 +30,7 @@ def _boot() -> str:
 
 def process_ended(identity: bytes) -> bool:
     value = canonical_json.decode(identity)
-    if not isinstance(value, dict) or set(value) != {"boot", "pid", "started_ticks"}:
+    if not isinstance(value, dict) or not {"boot", "pid", "started_ticks"} <= set(value):
         raise WorkspaceRefusal("workspace process identity is invalid")
     boot, pid, ticks = value["boot"], value["pid"], value["started_ticks"]
     if (
@@ -75,7 +75,12 @@ def native_result(workspace: Workspace, row: dict[str, Any]) -> pb.WeightsReceip
     if found.get("disposition", {}).get("kind") == "released":
         return None
     native = found["receipt"]
-    if canonical_json.encode(native["declaration"]) != row["declaration"]:
+    admitted = canonical_json.decode(row["declaration"])
+    declared = native["declaration"]
+    # Another TensorFS version may add declaration facts; only a changed shared fact counts.
+    if not isinstance(admitted, dict) or any(
+        declared.get(key) != value for key, value in admitted.items() if key in declared
+    ):
         raise WorkspaceRefusal("interrupted native result changed its admitted declaration")
     raw = canonical_json.encode(native)
     outer, digest = documents.identity(

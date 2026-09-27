@@ -606,7 +606,12 @@ class SourceCalls:
                     self.workspace, owner, command, result, computation, receipt
                 )
                 workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
-                workspace_memo.record_native(self.workspace, owner, command.service_id)
+                # The memo is an optional cache: a row it cannot record (for example one
+                # written by another Runtime version) never fails a completed call.
+                try:
+                    workspace_memo.record_native(self.workspace, owner, command.service_id)
+                except Exception:
+                    _LOG.exception("native memo was not recorded")
             terminal(
                 command,
                 pb.NATIVE_SOURCE_STATE_SUCCEEDED,
