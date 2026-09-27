@@ -527,6 +527,12 @@ class LaneSet:
         lane (bounded preparation decides the working set). A weightless placement goes to
         the candidate lane with the fewest placements.
         """
+        if not candidates or not set(candidates) <= set(range(len(self.entries))):
+            raise LaneRefusal(
+                "device_pin_infeasible",
+                f"{list(candidates)} names ordinals outside this worker's "
+                f"{len(self.entries)}-device envelope",
+            )
         if width > 1:
             empty = [
                 o
