@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from cozy.worker.v1 import weights_limits, worker_pb2, worker_pb2_grpc
 from cozy.worker.v1.wire_version import (
+    CAPABILITY_UNAVAILABLE_CODE,
     CAPTURED_MODEL_DEFAULTS_WIRE_MINOR,
     MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR,
     MIN_COMPATIBLE_WIRE_MINOR,
@@ -37,6 +38,7 @@ from cozy.worker.v1.wire_version import (
 from cozy_runtime.protocol import documents
 
 __all__ = [
+    "CAPABILITY_UNAVAILABLE_CODE",
     "CAPTURED_MODEL_DEFAULTS_WIRE_MINOR",
     "MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR",
     "MIN_COMPATIBLE_WIRE_MINOR",

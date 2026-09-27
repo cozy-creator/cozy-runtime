@@ -160,7 +160,6 @@ class ClaimRejection(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CLAIM_REJECTION_WORKER_ID_MISMATCH: _ClassVar[ClaimRejection]
     CLAIM_REJECTION_RELEASE_ID_MISMATCH: _ClassVar[ClaimRejection]
     CLAIM_REJECTION_UNDURABLE: _ClassVar[ClaimRejection]
-    CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE: _ClassVar[ClaimRejection]
 
 class FaultKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -440,7 +439,6 @@ CLAIM_REJECTION_EPOCH_HELD: ClaimRejection
 CLAIM_REJECTION_WORKER_ID_MISMATCH: ClaimRejection
 CLAIM_REJECTION_RELEASE_ID_MISMATCH: ClaimRejection
 CLAIM_REJECTION_UNDURABLE: ClaimRejection
-CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE: ClaimRejection
 FAULT_KIND_UNSPECIFIED: FaultKind
 FAULT_KIND_BINDING_UNAVAILABLE: FaultKind
 FAULT_KIND_BINDING_DEGRADED: FaultKind

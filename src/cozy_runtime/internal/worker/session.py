@@ -129,7 +129,13 @@ from cozy_runtime.internal.worker.plan import (
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents, weights_limits
+from cozy_runtime.protocol import (
+    CAPABILITY_UNAVAILABLE_CODE,
+    MIN_COMPATIBLE_WIRE_MINOR,
+    WIRE_MINOR,
+    documents,
+    weights_limits,
+)
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
@@ -512,6 +518,13 @@ def _stamped(message: Any, fence: OwnershipFence) -> Any:
     return message
 
 
+def _capability_unavailable(operation: str, minor: int) -> str:
+    return (
+        f"{operation} needs wire minor {MIN_COMPATIBLE_WIRE_MINOR} or newer and the owner "
+        f"speaks {minor}; update Creator. Other work on this worker continues."
+    )
+
+
 def desired_state_body(desired: pb.DesiredWorkerState) -> bytes:
     """The canonical bytes of a DesiredWorkerState's DESIRED STATE — envelope excluded (#494a).
 
@@ -722,25 +735,8 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         for slot_index, value in enumerate(slots):
             slot = _document(value, "Slot")
             _required(slot, {"slot", "reference_model_id"}, "Slot")
-            # THE DELETED PLANE (model-code-fit D1, D12; the proto reserves both at
-            # xs-010). `stamps` is `[]` on every wire document — the canonical writer spells
-            # closed repeated fields even when empty — and anything in it refuses typed; a
-            # `model_construction_contract` ref refuses at all.
-            if "model_construction_contract" in slot:
-                raise documents.DocumentError(
-                    "slot.model_construction_contract_retired",
-                    "Slot.model_construction_contract: the ModelConstructionContract is "
-                    "deleted (model-code-fit D12); fit is a function of the header and the census",
-                )
-            stamps = slot.get("stamps", [])
-            if not isinstance(stamps, list):
-                raise documents.DocumentError("wrong_type", "Slot.stamps")
-            if stamps:
-                raise documents.DocumentError(
-                    "slot.stamps_retired",
-                    "Slot.stamps: stamps are deleted (model-code-fit D1); a semantic twin is a "
-                    "component name or an inline CozyTensors config fact",
-                )
+            # Retired `stamps` and `model_construction_contract` from older writers are
+            # ignored like any other unknown key: fit is the header and the census.
             slot_names.append(_identifier(slot["slot"], f"slots[{slot_index}].slot"))
             if slot["reference_model_id"] not in known_models:
                 raise documents.DocumentError("unknown_model", "Slot.reference_model_id")
@@ -2009,10 +2005,14 @@ class Worker:
                 or claim.record_owner_id != self.fence.record_owner_id
                 or claim.record_owner_epoch != self.fence.record_owner_epoch
                 or claim.control_stream_epoch != 0
-                or claim.wire_minor < MIN_COMPATIBLE_WIRE_MINOR
             ):
                 raise WorkspaceRefusal(
                     "workspace call does not name the current authenticated owner"
+                )
+            if claim.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
+                raise WorkspaceRefusal(
+                    f"{CAPABILITY_UNAVAILABLE_CODE}: "
+                    + _capability_unavailable("workspace calls", claim.wire_minor)
                 )
             if self.config.record_owner_public_key:
                 if (
@@ -3152,11 +3152,6 @@ class Worker:
                 pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
                 "the bootstrap credential is absent or wrong",
             )
-        if claim.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
-            return reject(
-                pb.ClaimRejection.CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE,
-                "peer is below the supported wire compatibility floor",
-            )
         if claim.worker_id and claim.worker_id != self.options.worker_id:
             return reject(
                 pb.ClaimRejection.CLAIM_REJECTION_WORKER_ID_MISMATCH,
@@ -3513,6 +3508,18 @@ class Worker:
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
             return
         if kind == "desired_state":
+            minor = inner.wire_minor or self.fence.wire_minor
+            if minor < MIN_COMPATIBLE_WIRE_MINOR:
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FAULT_KIND_CONFIG_REFUSED,
+                        subject=f"revision {inner.revision}",
+                        reason=CAPABILITY_UNAVAILABLE_CODE,
+                        detail=_capability_unavailable("package preparation", minor),
+                    )
+                )
+                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+                return
             if self.executions is not None and self.executions.active(self.fence.record_owner_id):
                 self.engine.fault(
                     pb.Fault(
@@ -6328,6 +6335,14 @@ class Worker:
                 "worker_stopping",
                 "the worker is stopping and admits no new attempts",
                 CAUSE.CAUSE_CODE_NO_CAPACITY,
+            )
+            return
+        if self.fence.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
+            self.refuse(
+                offered,
+                CAPABILITY_UNAVAILABLE_CODE,
+                _capability_unavailable("execution", self.fence.wire_minor),
+                CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
             )
             return
         if offered.admission_epoch != self.admission_epoch:

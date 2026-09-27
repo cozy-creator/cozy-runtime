@@ -14,7 +14,7 @@ mapping below is proto3 -> JSON value:
     `sha256:<hex>`; every other `bytes` field is opaque payload spelled base64,
   * a `format` tag (`<full.Name>/1`) domain-separates two document kinds with equal fields.
 
-The reading half refuses non-canonical encoding and a wrong `format`. Keys this binding does
+The reading half refuses non-canonical encoding, floats and a wrong `format`. Keys this binding does
 not know are additive fields from a newer writer: the digest still covers the exact bytes, and
 the reader acts on the fields it consumes.
 
@@ -203,7 +203,20 @@ def read(data: bytes, cls: type[Message]) -> dict[str, Any]:
         raise DocumentError(exc.code, exc.detail) from exc
     if not isinstance(value, dict):
         raise DocumentError("wrong_type", "a document is a JSON object")
+    _integers_only(value)
     want = doc_format(cls.DESCRIPTOR.full_name)
     if value.get("format") != want:
         raise DocumentError("unknown_format", f"{value.get('format')!r} is not {want!r}")
     return value
+
+
+def _integers_only(value: Any) -> None:
+    """A float has no single canonical spelling across writers, so it is an ambiguous encoding."""
+    if isinstance(value, float):
+        raise DocumentError("non_integer_number", "documents are integer-only")
+    if isinstance(value, dict):
+        for item in value.values():
+            _integers_only(item)
+    elif isinstance(value, list):
+        for item in value:
+            _integers_only(item)

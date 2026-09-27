@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from cozy.worker.v1 import worker_pb2
+from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import WIRE_MINOR, documents
 
 CORPUS = Path(__file__).resolve().parent / "testdata" / "worker-protocol"
@@ -32,7 +33,8 @@ SOURCE = CORPUS / "SOURCE"
 BINDINGS_SOURCE = Path(__file__).resolve().parents[1] / "src" / "cozy" / "worker" / "v1" / "SOURCE"
 WANT_REPOSITORY = "https://github.com/cozy-creator/worker-protocol-v2"
 REMEDY = (
-    "re-vendor: copy MANIFEST.json, canonical/ and red/ from worker-protocol's fixtures/ "
+    "re-vendor: copy MANIFEST.json, canonical/, red/ and tolerated/ from worker-protocol's "
+    "fixtures/ "
     "into tests/testdata/worker-protocol/ and rewrite its SOURCE (same commit as the "
     "bindings SOURCE)"
 )
@@ -62,7 +64,7 @@ def read_corpus_manifest() -> tuple[str, str, int, dict[str, str]]:
             assert value.isdigit(), f"{SOURCE}:{number}: wire_minor {value!r} is not a number"
             wire_minor = int(value)
         elif key == "MANIFEST.json" or (
-            key.startswith(("canonical/", "red/")) and key.endswith((".json", ".bin"))
+            key.startswith(("canonical/", "red/", "tolerated/")) and key.endswith((".json", ".bin"))
         ):
             assert value.startswith("sha256:") and len(value) == 71, (
                 f"{SOURCE}:{number}: {key} digest is not a sha256: {value!r}"
@@ -169,16 +171,29 @@ def test_canonical_documents() -> None:
     )
 
 
-def test_red_twins_refuse_ambiguous_bytes_but_not_additive_keys() -> None:
-    """Duplicate keys and non-canonical bytes refuse; an additive key is read and ignored.
+def test_tolerated_documents_are_read() -> None:
+    """Unknown keys at any depth and absent collections from another writer are read."""
+    tolerated = json.loads((CORPUS / "MANIFEST.json").read_text())["tolerated"]
+    assert tolerated
+    for name, row in sorted(tolerated.items()):
+        body = (CORPUS / "tolerated" / f"{name}.json").read_bytes()
+        assert documents.spell(documents.digest_of(body)) == row["id"], name
+        cls = getattr(worker_pb2, row["type"].rpartition(".")[2])
+        documents.read(body, cls)
+        if cls is worker_pb2.PlacementSet:
+            read_placement_set(
+                worker_pb2.DesiredPlacementSet(
+                    placement_set_digest=documents.digest_of(body),
+                    placement_set_canonical_bytes=body,
+                )
+            )
 
-    ``twin_float`` is an additive key carrying a float, which Runtime's JCS layer admits.
-    """
-    for name in ("twin_float", "twin_unknown_key"):
-        body = (CORPUS / "red" / f"{name}.json").read_bytes()
-        assert documents.read(body, worker_pb2.InvocationSpec)
+
+def test_red_twins_refuse_ambiguous_encodings() -> None:
+    """Duplicate keys, a float and non-canonical bytes are ambiguous encodings: all refuse."""
     for name, want_code in {
         "twin_duplicate_key": "duplicate_key",
+        "twin_float": "non_integer_number",
         "twin_whitespace": "noncanonical_encoding",
     }.items():
         body = (CORPUS / "red" / f"{name}.json").read_bytes()

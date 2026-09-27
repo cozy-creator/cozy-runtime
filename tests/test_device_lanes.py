@@ -170,33 +170,6 @@ def test_one_lane_serves_sealed_to_its_device() -> None:
     assert seals == ["0"], seals
 
 
-def _owner_below_lanes(owner: LocalRecordOwner) -> None:
-    """Re-author the local owner as one that negotiates the minor BEFORE device lanes
-    (proto-024, 22): the queued claim and every desired state it will send say 21. This
-    is the older peer's exact bytes, not a switch inside the runtime."""
-    older = lane_wire.LANES_WIRE_MINOR - 1
-    queued = owner.host.inbound.get_nowait()
-    assert queued is not None and queued.WhichOneof("msg") == "claim"
-    claim = queued.claim
-    owner.host.deliver(
-        pb.RecordOwnerFrame(
-            claim=pb.Claim(
-                record_owner_epoch=claim.record_owner_epoch,
-                record_owner_id=claim.record_owner_id,
-                wire_minor=older,
-            )
-        )
-    )
-    desired_state = owner._desired_state
-
-    def _desired_state() -> pb.DesiredWorkerState:
-        directive = desired_state()
-        directive.wire_minor = older
-        return directive
-
-    owner._desired_state = _desired_state  # type: ignore[method-assign]
-
-
 @needs_executor
 def test_previous_minor_owner_runs_inference_on_current_worker() -> None:
     def previous(owner: LocalRecordOwner) -> None:
@@ -217,28 +190,6 @@ def test_previous_minor_owner_runs_inference_on_current_worker() -> None:
         outcome, seals = _slice(root, devices="0", kind="entrypoint", owner_hook=previous)
     assert outcome.result == {"message": "polo"}, (outcome.error, outcome.faults)
     assert seals == ["0"]
-
-
-@needs_executor
-def test_old_wire_owner_is_refused_before_device_envelope_changes() -> None:
-    """The compatibility floor now rejects old peers before ownership or lane changes."""
-    workers: list[Worker] = []
-    with _workspace() as root:
-        outcome, seals = _slice(
-            root,
-            devices="0,1",
-            kind="entrypoint",
-            hook=workers.append,
-            owner_hook=_owner_below_lanes,
-        )
-    assert outcome.result is None
-    assert "CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE" in outcome.error, outcome.error
-    assert seals == [], f"an executor was spawned behind the fence: {seals}"
-    (worker,) = workers
-    assert worker.phase == pb.WorkerPhase.WORKER_PHASE_ONLINE
-    assert not worker.latched
-    assert worker.fence.control_stream_epoch == 0
-    assert worker.supervision.spawns == 0
 
 
 @needs_executor
