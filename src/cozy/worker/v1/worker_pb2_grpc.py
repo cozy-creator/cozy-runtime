@@ -70,6 +70,11 @@ class WorkerControlStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionCollectionAck.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionState.FromString,
                 _registered_method=True)
+        self.ReadMachineExecutionTriage = channel.unary_unary(
+                '/cozy.worker.v1.WorkerControl/ReadMachineExecutionTriage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriageQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriage.FromString,
+                _registered_method=True)
         self.Control = channel.stream_stream(
                 '/cozy.worker.v1.WorkerControl/Control',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOwnerFrame.SerializeToString,
@@ -133,6 +138,14 @@ class WorkerControlServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReadMachineExecutionTriage(self, request, context):
+        """Capability supports_machine_execution_triage. The triage bundle one terminal attempt's
+        outcome names, read over the same authenticated seam as the outcome.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Control(self, request_iterator, context):
         """Durable control: the RecordOwner's request stream carries RecordOwnerFrames, the worker's
         response stream carries WorkerFrames. Durable messages are never shed to backpressure.
@@ -191,6 +204,11 @@ def add_WorkerControlServicer_to_server(servicer, server):
                     servicer.AcknowledgeMachineExecutionCollection,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionCollectionAck.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionState.SerializeToString,
+            ),
+            'ReadMachineExecutionTriage': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReadMachineExecutionTriage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriageQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriage.SerializeToString,
             ),
             'Control': grpc.stream_stream_rpc_method_handler(
                     servicer.Control,
@@ -393,6 +411,33 @@ class WorkerControl(object):
             '/cozy.worker.v1.WorkerControl/AcknowledgeMachineExecutionCollection',
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionCollectionAck.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadMachineExecutionTriage(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.WorkerControl/ReadMachineExecutionTriage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriageQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriage.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1874,7 +1919,7 @@ class PodHostStub(object):
     terminal status, or REPLAYED) or attaches to the operation still in flight. Progress is the
     owner's observed signal; no lane needs a wall-clock guess.
 
-    Locally PodHost is not a service: the daemon calls the same host functions in-process.
+    A local machine runs the same Host and serves the same PodHost; only the dial address differs.
     ---------------------------------------------------------------------------
     """
 
@@ -1923,6 +1968,11 @@ class PodHostStub(object):
                 '/cozy.worker.v1.PodHost/AcknowledgeMachineExecutionCollection',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionCollectionAck.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionState.FromString,
+                _registered_method=True)
+        self.ReadMachineExecutionTriage = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ReadMachineExecutionTriage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriageQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriage.FromString,
                 _registered_method=True)
         self.ProtocolInfo = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/ProtocolInfo',
@@ -2085,7 +2135,7 @@ class PodHostServicer(object):
     terminal status, or REPLAYED) or attaches to the operation still in flight. Progress is the
     owner's observed signal; no lane needs a wall-clock guess.
 
-    Locally PodHost is not a service: the daemon calls the same host functions in-process.
+    A local machine runs the same Host and serves the same PodHost; only the dial address differs.
     ---------------------------------------------------------------------------
     """
 
@@ -2135,6 +2185,13 @@ class PodHostServicer(object):
 
     def AcknowledgeMachineExecutionCollection(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReadMachineExecutionTriage(self, request, context):
+        """Authenticated forwarding only; Runtime holds the bundle bytes.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -2347,6 +2404,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionCollectionAck.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionState.SerializeToString,
             ),
+            'ReadMachineExecutionTriage': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReadMachineExecutionTriage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriageQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriage.SerializeToString,
+            ),
             'ProtocolInfo': grpc.unary_unary_rpc_method_handler(
                     servicer.ProtocolInfo,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.FromString,
@@ -2514,7 +2576,7 @@ class PodHost(object):
     terminal status, or REPLAYED) or attaches to the operation still in flight. Progress is the
     owner's observed signal; no lane needs a wall-clock guess.
 
-    Locally PodHost is not a service: the daemon calls the same host functions in-process.
+    A local machine runs the same Host and serves the same PodHost; only the dial address differs.
     ---------------------------------------------------------------------------
     """
 
@@ -2724,6 +2786,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/AcknowledgeMachineExecutionCollection',
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionCollectionAck.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadMachineExecutionTriage(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ReadMachineExecutionTriage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriageQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriage.FromString,
             options,
             channel_credentials,
             insecure,

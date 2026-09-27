@@ -1,4 +1,9 @@
-"""Fixed environment-neutral Runtime worker for Cozy and base worker image hosts."""
+"""The one Runtime worker every machine runs: a pod rooted at `/`, a laptop at its Host's root.
+
+Privilege is detected, never configured: started as root it isolates package executors under
+their own uid and hands its handoff files to the Host's dropped uid; started as a user it runs
+executors as that user and hands nothing over.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,7 @@ import stat
 import sys
 import threading
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
@@ -41,8 +47,36 @@ POD_SUPERVISOR_GID = 65532
 SUPERVISOR_STOP_FD = 3
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Boot empty, host WorkerControl, prove both listeners, and publish readiness."""
+@dataclass(frozen=True, slots=True)
+class Identity:
+    """What this process's uid lets it do: the one privilege fact the worker branches on."""
+
+    executor_uid: int = -1
+    executor_gid: int = -1
+    host_owner: tuple[int, int] | None = None
+
+    @classmethod
+    def detect(cls) -> Identity:
+        euid, egid = os.geteuid(), os.getegid()
+        if euid == 0 and egid == 0:
+            return cls(POD_EXECUTOR_UID, POD_EXECUTOR_GID, (POD_SUPERVISOR_UID, POD_SUPERVISOR_GID))
+        if euid == 0 or egid == 0:
+            raise LaunchRefusal(
+                "worker_identity_invalid", f"uid {euid} gid {egid} is neither root nor a user"
+            )
+        return cls()
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    gpus: Sequence[readiness.RuntimeGPU] | None = None,
+) -> int:
+    """Boot empty, host WorkerControl, prove both listeners, and publish readiness.
+
+    `gpus` replaces the driver measurement for an in-process launcher (a virtual inventory);
+    the console entry point never passes it.
+    """
 
     opts = Options()
     try:
@@ -50,12 +84,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             argv = sys.argv[1:]
         if argv:
             raise LaunchRefusal("worker_arguments_forbidden", "fixed worker takes no arguments")
-        if os.geteuid() != 0 or os.getegid() != 0:
-            raise LaunchRefusal("worker_identity_invalid", "pod worker must start as UID/GID 0")
+        identity = Identity.detect()
         config = read_worker_host_config()
         _arm_supervisor_lifetime()
         storage_admission.inherit(config.storage_admission_fd)
-        return _run(config)
+        return _run(config, identity, gpus)
     except ConfigError as err:
         emit_error(CliError(err.name, err.message, err.remedy, err.code), opts)
         return int(err.code)
@@ -86,32 +119,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             os.close(SUPERVISOR_STOP_FD)
 
 
-def _run(config: WorkerHostConfig) -> int:
-    boot_id = readiness.pod_boot_id(host_paths.BOOT_ID)
-    certificate_der = readiness.certificate(host_paths.TLS_CERTIFICATE)
+def _run(
+    config: WorkerHostConfig,
+    identity: Identity,
+    virtual_gpus: Sequence[readiness.RuntimeGPU] | None = None,
+) -> int:
+    layout = config.layout
+    boot_id = readiness.pod_boot_id(layout.boot_id)
+    certificate_der = readiness.certificate(layout.tls_certificate)
     try:
         base = package_environment.observe_base()
     except package_environment.EnvironmentRefusal as exc:
         raise LaunchRefusal(exc.code, exc.detail) from exc
-    accelerator_backend = base.accelerator_backend
-    gpus = readiness.runtime_gpus(config.child_base_env, accelerator_backend=accelerator_backend)
-    tensorfs_root = prepare_boot(config)
-    options = _worker_options(
-        config,
-        tensorfs_root,
-        boot_id,
-        gpus,
-        certificate_der=certificate_der,
-        accelerator_backend=accelerator_backend,
+    if base.accelerator_backend not in {"cuda", "none"}:
+        raise LaunchRefusal("runtime_accelerator_backend_invalid", base.accelerator_backend)
+    required = base.accelerator_backend == "cuda"
+    gpus = (
+        readiness.runtime_gpus(config.child_base_env, required=required)
+        if virtual_gpus is None
+        else readiness.validated_gpus(list(virtual_gpus), required=required)
     )
+    tensorfs_root = prepare_boot(config)
+    options = _worker_options(config, identity, tensorfs_root, boot_id, gpus, certificate_der)
     runtime_config = runtime_config_from_host(config)
-    host_paths.WORKER_STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    host_paths.WORKER_CONTROL_ADDRESS.unlink(missing_ok=True)
+    layout.worker_state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    layout.worker_control_address.unlink(missing_ok=True)
     host = GrpcControlHost(
         f"127.0.0.1:{config.worker_internal_port}",
-        host_paths.WORKER_CONTROL_ADDRESS,
-        tls_cert=host_paths.TLS_CERTIFICATE,
-        tls_key=host_paths.TLS_PRIVATE_KEY,
+        layout.worker_control_address,
+        tls_cert=layout.tls_certificate,
+        tls_key=layout.tls_private_key,
     )
     worker = Worker(runtime_config, options, host)
     host.preparer = worker.prepare_package_set
@@ -134,7 +171,7 @@ def _run(config: WorkerHostConfig) -> int:
     def ready(_address: str) -> None:
         if worker.stop.is_set():
             raise LaunchRefusal("supervisor_stop_before_readiness", "fd 3 closed before ready")
-        certificate_pem = host_paths.TLS_CERTIFICATE.read_bytes()
+        certificate_pem = layout.tls_certificate.read_bytes()
         readiness.prove_tls_leaf(config.worker_internal_port, certificate_der, owner="worker")
         readiness.prove_worker_foreign_refusal(config.worker_internal_port, certificate_pem)
         readiness.prove_media_foreign_refusal(config.media_internal_port, certificate_der)
@@ -147,11 +184,7 @@ def _run(config: WorkerHostConfig) -> int:
             media_internal_port=config.media_internal_port,
             gpus=gpus,
         )
-        readiness.publish(
-            host_paths.READINESS_PAYLOAD,
-            payload,
-            owner=(POD_SUPERVISOR_UID, POD_SUPERVISOR_GID),
-        )
+        readiness.publish(layout.readiness_payload, payload, owner=identity.host_owner)
         worker.mark_claim_ready()
 
     host.on_bound = ready
@@ -177,33 +210,28 @@ def _run(config: WorkerHostConfig) -> int:
 
 def _worker_options(
     config: WorkerHostConfig,
+    identity: Identity,
     tensorfs_root: Path,
     boot_id: str,
     gpus: list[readiness.RuntimeGPU],
-    *,
     certificate_der: bytes,
-    accelerator_backend: str,
 ) -> WorkerOptions:
     """Construct the worker core directly; no public ``serve`` parser participates."""
 
-    if accelerator_backend == "cuda" and not gpus:
-        raise LaunchRefusal("runtime_gpus_invalid", "CUDA base measured no GPUs")
-    if accelerator_backend == "none" and gpus:
-        raise LaunchRefusal("runtime_gpus_invalid", "CPU base measured a GPU inventory")
-    if accelerator_backend not in {"cuda", "none"}:
-        raise LaunchRefusal("runtime_accelerator_backend_invalid", accelerator_backend)
+    layout = config.layout
     return WorkerOptions(
-        root=host_paths.WORKER_STATE,
+        root=layout.worker_state,
         worker_id=config.worker_id,
         instance_id=boot_id,
         worker_boot_id=boot_id,
-        ownership_required=host_paths.READINESS_ENVELOPE.exists(),
+        ownership_required=layout.readiness_envelope.exists(),
         owns_tensorfs_store=True,
-        accelerator_backend=accelerator_backend,
+        accelerator_backend="cuda" if gpus else "none",
         devices=",".join(str(row["device_index"]) for row in gpus),
-        grant_roots=(str(host_paths.MEDIA_ROOT), str(host_paths.input_media_root())),
-        install_root=host_paths.INSTALL_ROOT,
-        artifact_cache=host_paths.PREPARE_CACHE,
+        gpus=tuple(gpus),
+        grant_roots=(str(layout.media_root), str(host_paths.input_media_root())),
+        install_root=layout.install_root,
+        artifact_cache=layout.prepare_cache,
         tensorfs_root=tensorfs_root,
         publication_authority=PublicationAuthority(
             config.tensorhub_origin,
@@ -214,24 +242,21 @@ def _worker_options(
         else None,
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
         claim_ready=False,
-        executor_uid=POD_EXECUTOR_UID,
-        executor_gid=POD_EXECUTOR_GID,
-        # Triage bundles are committed under the media plane's subtree and handed to its
-        # uid, so the owner fetches one over the plane the outputs already cross
-        # (`GET /v1/triage/{subject}`, cl-101) instead of reading a path on a machine
-        # it cannot reach.
-        triage_root=host_paths.MEDIA_ROOT / "triage",
-        triage_owner=(POD_SUPERVISOR_UID, POD_SUPERVISOR_GID),
-        # The supervisor's one window into whether this pod is being used (th-142). It is
-        # the pod's release decision: nobody attached, nothing in flight, and nothing
-        # moving is a rental nobody is holding.
-        activity_path=host_paths.WORKER_ACTIVITY,
-        activity_owner=(POD_SUPERVISOR_UID, POD_SUPERVISOR_GID),
+        executor_uid=identity.executor_uid,
+        executor_gid=identity.executor_gid,
+        # The controller reads a bundle through ReadMachineExecutionTriage. It stays under
+        # the media subtree, readable by the Host's uid, while `/v1/triage` still serves it.
+        triage_root=layout.triage_root,
+        triage_owner=identity.host_owner,
+        # The Host's one window into whether this machine is being used (th-142): nobody
+        # attached, nothing in flight, and nothing moving is idle.
+        activity_path=layout.worker_activity,
+        activity_owner=identity.host_owner,
     )
 
 
 def _arm_supervisor_lifetime() -> None:
-    """Bind this root worker to PID 1 and its EOF-only fd 3."""
+    """Bind this worker to the Host that exec'd it and its EOF-only fd 3."""
 
     try:
         info = os.fstat(SUPERVISOR_STOP_FD)

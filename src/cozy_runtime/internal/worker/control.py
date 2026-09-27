@@ -469,6 +469,7 @@ class _PreparationServicer(WorkspaceRPC):
             supports_local_installation_reuse=self.local_package_handler is not None,
             supports_mixed_model_inputs=self.unpublished_placement_handler is not None,
             supports_weights_transaction_refusal=True,
+            supports_machine_execution_triage=True,
         )
 
     def NumericalEnvironment(self, _request: pb.NumericalEnvironmentRequest, context: Any) -> Any:

@@ -117,9 +117,9 @@ class RuntimeConfig:
 class WorkerHostConfig:
     """The fixed product-host handoff to ``cozy-runtime-worker``.
 
-    Fixed filesystem paths are Runtime constants, not environment configuration. The readiness
-    HMAC remains supervisor-only. Desired placements, accepted placements and attempts arrive
-    after Claim over WorkerControl.
+    The Host names one machine root; every Runtime path is the fixed layout under it
+    (`host_paths.Layout`). The readiness HMAC remains Host-only. Desired placements, accepted
+    placements and attempts arrive after Claim over WorkerControl.
     """
 
     worker_id: str
@@ -134,6 +134,7 @@ class WorkerHostConfig:
     tensorhub_worker_token: str = field(default="", repr=False)
     """Worker-only Hub capability; never inherited by a job executor."""
     object_storage_hosts: tuple[str, ...] = ()
+    layout: host_paths.Layout = field(default_factory=host_paths.Layout)
     lease_expiry_unix: int = 0
     """What the supervisor SAID the lease expires at, or 0 for no lease. Carried, never
     decided on (xs-007 row 18): tensorhub deleted the rental cap, the supervisor still
@@ -358,7 +359,7 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
 def read_worker_host_config(
     environ: Mapping[str, str] | None = None,
     *,
-    publication_authority_path: Path = host_paths.MACHINE_PUBLICATION_AUTHORITY,
+    publication_authority_path: Path | None = None,
 ) -> WorkerHostConfig:
     """Read the understood product-host handoff once; ignore unused additions."""
 
@@ -464,13 +465,20 @@ def read_worker_host_config(
         raise ConfigError(
             "worker_host_config", "worker and media ports are equal", "fix host launch"
         )
+    try:
+        layout = host_paths.layout(env.get("COZY_MACHINE_ROOT"))
+    except ValueError as exc:
+        raise ConfigError(
+            "worker_host_config", f"COZY_MACHINE_ROOT is invalid: {exc}", "fix host launch"
+        ) from exc
     storage_fd = env.get("COZY_STORAGE_ADMISSION_FD")
     if storage_fd not in (None, "4"):
         raise ConfigError(
             "worker_host_config", "storage admission must use inherited fd 4", "fix host launch"
         )
     hub_origin, worker_token = _machine_publication_authority(
-        publication_authority_path, bounded("COZY_WORKER_ID")
+        publication_authority_path or layout.machine_publication_authority,
+        bounded("COZY_WORKER_ID"),
     )
     parsed = WorkerHostConfig(
         object_storage_hosts=parse_object_storage_hosts(
@@ -485,6 +493,7 @@ def read_worker_host_config(
         control_public_key_ed25519=public_key,
         control_public_key_ed25519_b64url=public_key_text,
         media_token_sha256=tuple(str(item) for item in token_hashes),
+        layout=layout,
         lease_expiry_unix=decimal("COZY_WORKER_LEASE_EXPIRY_UNIX", (1 << 53) - 1, absent=0),
         child_base_env=tuple(
             sorted(
@@ -543,13 +552,13 @@ def runtime_config_from_host(host: WorkerHostConfig) -> RuntimeConfig:
     """Project one parsed host handoff into the existing worker core config."""
 
     return RuntimeConfig(
-        cozy_home=Path("/run/cozy"),
+        cozy_home=host.layout.cozy_home,
         credentials=Credentials(),
         record_owner_public_key=host.control_public_key_ed25519,
         child_base_env=host.child_base_env,
         object_storage_hosts=host.object_storage_hosts,
-        dependency_cache=host_paths.DEPENDENCY_CACHE,
-        python_root=host_paths.INSTALL_ROOT / "python",
+        dependency_cache=host.layout.dependency_cache,
+        python_root=host.layout.install_root / "python",
     )
 
 

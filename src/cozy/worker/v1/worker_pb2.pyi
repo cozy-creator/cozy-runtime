@@ -662,14 +662,36 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    DEVICES_FIELD_NUMBER: _ClassVar[int]
+    ACCELERATOR_BACKEND_FIELD_NUMBER: _ClassVar[int]
+    EXECUTOR_UID_ISOLATION_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ...) -> None: ...
+    devices: _containers.RepeatedCompositeFieldContainer[MachineDevice]
+    accelerator_backend: str
+    executor_uid_isolation: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ...) -> None: ...
+
+class MachineDevice(_message.Message):
+    __slots__ = ("ordinal", "name", "uuid", "memory_bytes", "pci_bus_id", "driver_version")
+    ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    UUID_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PCI_BUS_ID_FIELD_NUMBER: _ClassVar[int]
+    DRIVER_VERSION_FIELD_NUMBER: _ClassVar[int]
+    ordinal: int
+    name: str
+    uuid: str
+    memory_bytes: int
+    pci_bus_id: str
+    driver_version: str
+    def __init__(self, ordinal: _Optional[int] = ..., name: _Optional[str] = ..., uuid: _Optional[str] = ..., memory_bytes: _Optional[int] = ..., pci_bus_id: _Optional[str] = ..., driver_version: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionSubmit(_message.Message):
     __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id")
@@ -829,6 +851,22 @@ class MachineExecutionCollectionAck(_message.Message):
     outcome: AttemptOutcomeAck
     def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., outcome: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ...) -> None: ...
 
+class MachineExecutionTriageQuery(_message.Message):
+    __slots__ = ("execution", "attempt_ordinal")
+    EXECUTION_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    execution: MachineExecutionQuery
+    attempt_ordinal: int
+    def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., attempt_ordinal: _Optional[int] = ...) -> None: ...
+
+class MachineExecutionTriage(_message.Message):
+    __slots__ = ("bundle", "bundle_canonical_bytes")
+    BUNDLE_FIELD_NUMBER: _ClassVar[int]
+    BUNDLE_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    bundle: TriageBundleRef
+    bundle_canonical_bytes: bytes
+    def __init__(self, bundle: _Optional[_Union[TriageBundleRef, _Mapping]] = ..., bundle_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+
 class WorkspaceImportBegin(_message.Message):
     __slots__ = ("claim", "migration_id", "record_count", "source_schema")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
@@ -902,7 +940,7 @@ class WorkspaceActivationCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ...) -> None: ...
 
 class ProtocolInfoResult(_message.Message):
-    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery", "supports_local_installation_reuse", "supports_rental_keepalive", "supports_weights_transaction_refusal")
+    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery", "supports_local_installation_reuse", "supports_rental_keepalive", "supports_weights_transaction_refusal", "supports_machine_execution_triage")
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_MIXED_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
@@ -910,6 +948,7 @@ class ProtocolInfoResult(_message.Message):
     SUPPORTS_LOCAL_INSTALLATION_REUSE_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_RENTAL_KEEPALIVE_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_WEIGHTS_TRANSACTION_REFUSAL_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_MACHINE_EXECUTION_TRIAGE_FIELD_NUMBER: _ClassVar[int]
     wire_minor: int
     minimum_wire_minor: int
     supports_mixed_model_inputs: bool
@@ -917,7 +956,8 @@ class ProtocolInfoResult(_message.Message):
     supports_local_installation_reuse: bool
     supports_rental_keepalive: bool
     supports_weights_transaction_refusal: bool
-    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ..., supports_rental_keepalive: bool = ..., supports_weights_transaction_refusal: bool = ...) -> None: ...
+    supports_machine_execution_triage: bool
+    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ..., supports_rental_keepalive: bool = ..., supports_weights_transaction_refusal: bool = ..., supports_machine_execution_triage: bool = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
     __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "supports_model_materialization_recovery", "python_requires", "python_version", "package_interface")

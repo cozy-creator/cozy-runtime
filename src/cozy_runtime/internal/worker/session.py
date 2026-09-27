@@ -64,6 +64,7 @@ from cozy_runtime.internal import (
     package_installation,
     prepare_diagnostics,
     proctree,
+    readiness,
     weights_sink,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
@@ -301,6 +302,9 @@ class WorkerOptions:
     accelerator_backend: str = ""
     """Baked pod profile backend (`cuda`/`none`), or empty for local auto-detection."""
     devices: str = "0"
+    gpus: tuple[readiness.RuntimeGPU, ...] = ()
+    """The measured inventory `devices` spans, in ordinal order, reported to the controller.
+    Tests supply a virtual one here; nothing reads an environment variable for it."""
     grant_roots: tuple[str, ...] = ()
     """Every directory tree a `file://` DeliveryGrant may address on this machine (#506b).
     A launcher that knows its own root states it — cozy-creator passes its local root, a
