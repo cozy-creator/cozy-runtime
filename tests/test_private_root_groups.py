@@ -70,6 +70,34 @@ def submit(executions: Executions, request: str, *, pins: tuple[int, ...] = ()) 
     return offer
 
 
+def submit_serving(executions: Executions, request: str) -> pb.AttemptOffer:
+    """A private serving root whose durable execution row has no preparation pin."""
+    spec = pb.InvocationSpec(
+        installation_id="installed",
+        serving=pb.ServingInvocationSpec(
+            entrypoint_binding_digest="sha256:" + "2" * 64,
+            bindings_digest=DIGEST,
+        ),
+    )
+    raw, identity = documents.identity(spec)
+    offer = pb.AttemptOffer(
+        request_id=request,
+        attempt_ordinal=1,
+        placement_id="h3-placement",
+        invocation_spec_canonical_bytes=raw,
+        invocation_spec_digest=identity,
+    )
+    executions.submit(
+        OWNER,
+        request,
+        b"c" * 32,
+        offer,
+        expected_execution_workspace_id=executions.workspace_id,
+        preparation=b"",
+    )
+    return offer
+
+
 def running(executions: Executions, request: str) -> None:
     offer = executions.offer(OWNER, request)
     accepted = pb.AttemptAccepted(
@@ -337,6 +365,26 @@ def test_transient_singletons_do_not_change_later_group_degree(tmp_path: Path) -
     )
     assert h3 is not None
     assert tuple(h3[1][0].device_ordinals) == (0, 1, 2, 3)
+
+
+def test_serving_roots_without_preparation_pin_still_reserve_their_group(tmp_path: Path) -> None:
+    """A hosted serving root's placement pin is the admission fact.
+
+    Published/private serving offers do not carry the private execution preparation
+    document used by child submissions.  Before this fallback both roots passed
+    ``Groups.admits`` and the second root could enter the same H3 group lane.
+    """
+    host, groups, executions = worker(tmp_path, 4)
+    cast(Any, host)._placement_by_id = lambda placement_id: (
+        SimpleNamespace(device_pin=(0, 1, 2, 3))
+        if placement_id == "h3-placement"
+        else None
+    )
+    first = submit_serving(executions, "serving-first")
+    second = submit_serving(executions, "serving-second")
+    groups.refresh(OWNER)
+    assert groups.admits(OWNER, first.request_id, {})
+    assert not groups.admits(OWNER, second.request_id, {})
 
 
 def test_free_non_aligned_group_is_usable(tmp_path: Path) -> None:

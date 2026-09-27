@@ -841,6 +841,21 @@ def _parameter_names_by_model(group: Sequence[DeclaredBinding]) -> list[list[str
     ]
 
 
+def _attention_construction_key(base: str, pin: str) -> str:
+    """Return the cached construction identity for a request attention override.
+
+    Attention is selected while a construction is loaded, before context parallel
+    collectives and warm-up.  A request pin therefore cannot be applied by swapping a
+    prepared executor in place.  Keeping the pin in the construction key gives the lane
+    a request-local prepared variant: the normal construction remains reusable, while a
+    pinned request gets a correctly prepared (and independently cached) variant.
+    """
+    if not pin:
+        return base
+    digest = hashlib.sha256(pin.encode("utf-8")).hexdigest()[:24]
+    return f"{base}:attention-{digest}"
+
+
 def executor_load_command(
     binding: DeclaredBinding,
     *,
@@ -864,8 +879,9 @@ def executor_load_command(
     a group lane's K, the ONE new fact its executor receives; a plain prepare is unchanged.
     `parameter_names[i]` is every parameter name the i-th model is bound under across the
     bindings that share this construction (h3a-018); absent, the model binds under this
-    binding's own name. `attention_pin` rides the same way, and only when a dev-mode
-    override named a kernel (cr-125): a serving prepare carries no such key at all.
+    binding's own name. `attention_pin` rides the same way when a request-scoped
+    development override names a kernel (cr-125). The worker keys that construction by
+    the pin, so the executor selects it before context-parallel installation.
     """
 
     models = []
@@ -5539,11 +5555,15 @@ class Worker:
                 or not executor.alive()
             ):
                 return  # admission refuses it with the real reason
-            key = declared.construction_key()
+            attention_pin = str(
+                attempt.spec.get("attention_kernel") or self.options.attention_pin
+            )
+            base_key = declared.construction_key()
+            key = _attention_construction_key(base_key, attention_pin)
             group = [
                 binding
                 for binding in tenant.bindings.values()
-                if binding.construction_key() == key
+                if binding.construction_key() == base_key
                 and binding.entrypoint_binding_digest not in tenant.failed_bindings
             ]
             loaded = executor.loaded.get(key)
@@ -5554,7 +5574,7 @@ class Worker:
                 or not {b.entrypoint_binding_digest for b in group} <= loaded.bindings
             )
         if load:
-            self._load_construction(tenant, executor, key, group)
+            self._load_construction(tenant, executor, key, group, attention_pin=attention_pin)
         if executor.active != key:
             self._activate_construction(tenant, executor, key)
 
@@ -5599,11 +5619,14 @@ class Worker:
         executor: child.Executor,
         key: str,
         group: list[DeclaredBinding],
+        *,
+        attention_pin: str = "",
     ) -> None:
         """Build one construction in the live process. Raises the attempt's refusal."""
         lane, slot = tenant.lane, tenant.slot
         placement_id = tenant.placement.placement_id
         first = group[0]
+        base_key = first.construction_key()
         label = key.removeprefix("sha256:")[:12]
         if not first.weightless:
             # A CO-TENANT PROCESS on a shared single-device lane gives the card up first
@@ -5629,7 +5652,7 @@ class Worker:
             authorized_device_limit_bytes=authorized,
             sequence_parallel_degree=_rank_degree(lane, tenant.bindings.values()),
             parameter_names=_parameter_names_by_model(group),
-            attention_pin=self.options.attention_pin,
+            attention_pin=attention_pin,
         )
         subject = f"load:{label}"
         began = time.perf_counter()
@@ -5668,7 +5691,7 @@ class Worker:
             # maps while this load ran without the control lock.
             current = self._current_tenant(tenant)
             for digest, binding in current.bindings.items():
-                if binding.construction_key() == key:
+                if binding.construction_key() == base_key:
                     current.prepared_models[digest] = resolved
             row = tenant.row()
             row.model_bearing = row.model_bearing or not first.weightless

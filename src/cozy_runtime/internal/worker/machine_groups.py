@@ -279,7 +279,20 @@ class Groups:
             return tuple(sorted(available))
 
     def admits(self, owner: str, request: str, preparation: dict[str, Any]) -> bool:
+        # Private serving roots submitted through the execution API do not carry a
+        # ``preparation`` document.  Their placement is already durable in the
+        # execution offer, however, and its device pin is the same scheduling fact
+        # Creator supplied for an ordinary serving offer.  Reading that pin here is
+        # what makes root admission use the same group lease as child admission.
         group = pinned(preparation, len(self.worker.lanes.entries))
+        if not group:
+            executions = self.worker.executions
+            assert executions is not None
+            offer = executions.offer(owner, request)
+            lookup = getattr(self.worker, "_placement_by_id", None)
+            placement = lookup(offer.placement_id) if lookup is not None else None
+            if placement is not None and placement.device_pin:
+                group = tuple(placement.device_pin)
         if not group:
             return True
         if any(ordinal >= len(self.worker.lanes.entries) for ordinal in group):
