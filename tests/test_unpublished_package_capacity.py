@@ -1,4 +1,4 @@
-"""Captured wheel capacity is checked before base probing or carrier reads."""
+"""Private file capacity is checked before interpreter probing or carrier reads."""
 
 from pathlib import Path
 
@@ -14,15 +14,17 @@ def test_unpublished_revision_count_refused_before_io(count: int, tmp_path: Path
         prepare_package(
             package_name="local/capacity",
             release="1.0.0",
-            wheels=[pb.LocalPackageWheel()] * count,
+            files=[pb.LocalPackageFile()] * count,
             wheel_root=tmp_path / "absent",
-            placement_seed=b"capacity",
+            installation_id="local-capacity",
             artifact_cache=tmp_path / "cache",
             install_root=tmp_path / "installs",
             python=tmp_path / "no-python",
             describe=lambda *_: b"",
             verified=lambda *_: None,
-            development=pb.DevelopmentPackage(),
+            development=pb.DevelopmentPackage(
+                package="local/capacity", release="1.0.0", installation_id="local-capacity"
+            ),
         )
     assert fault.value.code == "package_prepare_file_count"
     assert list(tmp_path.iterdir()) == []

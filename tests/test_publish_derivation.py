@@ -12,6 +12,7 @@ Three planes, each driven for real:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -19,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
@@ -31,7 +33,7 @@ from cozy_runtime.author._describe import describe
 from cozy_runtime.author._loader import Loader
 from cozy_runtime.internal import (
     canonical,
-    package_environment,
+    package_installation,
     package_interface,
     static_interface,
 )
@@ -148,7 +150,7 @@ def test_lane_words_are_not_selection_leaks() -> None:
 
 
 def test_interface_slot_grammar_has_no_legacy_members() -> None:
-    """The current slot grammar admits no retired field, including an empty value."""
+    """Describe emits no retired slot field; readers tolerate one but not a bad consent."""
     app = App()
 
     @app.entrypoint
@@ -171,9 +173,8 @@ def test_interface_slot_grammar_has_no_legacy_members() -> None:
         {"source_profile": "acme/sd-turbo/1.0.0/bf16"},
     )
     for legacy in legacy_members:
-        with pytest.raises(package_interface.StalePackageInterface) as retired:
-            package_interface.read_bytes(planted(**legacy))
-        assert retired.value.code == "malformed_package_interface"
+        # Readers tolerate members a newer or older writer added; they carry no authority.
+        package_interface.read_bytes(planted(**legacy))
     with pytest.raises(package_interface.StalePackageInterface) as unknown:
         package_interface.read_bytes(planted(encoded_leaves="maybe"))
     assert unknown.value.code == "malformed_package_interface"
@@ -275,32 +276,22 @@ def _sha(path: Path) -> str:
 
 
 def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
-    """Wire 30: the request's release facts are admitted before anything installs.
+    """Wire 30: the request's exact lock and project pin are admitted before anything installs.
 
-    Fail-on-parent: before xs-019 the same request carried a staged interface and wheels.
+    Application and slot facts are advisory; the installed interface is the authority.
     """
 
     lock = (
         b"--index-url https://pypi.org/simple\nmarco-polo==1.0.4 --hash=sha256:" + b"a" * 64 + b"\n"
     )
 
-    def prep(
-        *,
-        application: str = "marco_polo_package:app",
-        slots: list[str] | None = None,
-        inventory: pb.ImageInventory | None = None,
-        locked: bytes = lock,
-        interface: bytes = b"{}",
-    ) -> pb.PreparePackageSetResult:
+    def prep(*, locked: bytes = lock) -> pb.PreparePackageSetResult:
         return prepare_package_set(
             pb.PreparePackageSetRequest(
                 download_delegation=_download_set("paul/marco-polo", "1.0.4"),
                 install_root=str(tmp_path / "environment"),
-                application=application,
-                model_slot_paths=slots or [],
-                image_inventory=inventory or _inventory(),
+                image_inventory=_inventory(),
                 locked_requirements=locked,
-                package_interface=interface,
             ),
             artifact_cache=tmp_path / "artifacts",
             tensorfs_root=tmp_path / "store",
@@ -308,14 +299,6 @@ def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
             python=Path(sys.executable),
             verified=lambda _digest, _length, _path: None,
         )
-
-    with pytest.raises(PreparationRefusal) as no_application:
-        prep(application="")
-    assert no_application.value.code == "package_prepare_application_invalid"
-
-    with pytest.raises(PreparationRefusal) as unsorted:
-        prep(slots=["b.models.x", "a.models.y"])
-    assert unsorted.value.code == "package_prepare_model_slot_paths_invalid"
 
     with pytest.raises(PreparationRefusal) as no_lock:
         prep(locked=b"")
@@ -396,17 +379,31 @@ def _closure_rows(uv: str) -> list[str]:
     return rows
 
 
-def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None:
+def _with_interface(wheel: Path, interface: bytes) -> None:
+    """Carry the release interface as installed dist-info metadata, as a published wheel does."""
+
+    with zipfile.ZipFile(wheel) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    (record,) = (name for name in members if name.endswith(".dist-info/RECORD"))
+    member = record.rsplit("/", 1)[0] + "/package-interface.json"
+    members[member] = interface
+    encoded = base64.urlsafe_b64encode(hashlib.sha256(interface).digest()).rstrip(b"=")
+    members[record] += f"{member},sha256={encoded.decode()},{len(interface)}\n".encode()
+    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, body in members.items():
+            archive.writestr(name, body)
+
+
+def test_pod_prepares_from_the_exact_export_and_refuses_a_wrong_hash() -> None:
     """xs-017/xs-019 end to end, no mocks: real wheels, BOTH indexes, a real hash-pinned
     export, a real uv venv, and a real import of the installed application.
 
-    * the pod materializes its venv from the export alone — PyPI for a registry dependency,
+    * the pod installs its venv from the export alone — PyPI for a registry dependency,
       the org-shaped loopback index for the release's own wheels, every artifact matched
       against a hash the export names;
-    * the interface is the release's own document from the wire (proto-061 C): nothing is
-      described and no executor is spawned, and the request's application fact cross-checks it;
-    * a wrong application fact refuses typed; a wrong hash refuses at install, which is the
-      dependency-confusion guard doing its job.
+    * the interface is the installed release's own metadata: nothing is described and no
+      executor is spawned, and the request's advisory copy is not an authority;
+    * a wrong hash refuses at install, which is the dependency-confusion guard doing its job.
     """
 
     uv = shutil.which("uv")
@@ -423,6 +420,8 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
             )
         runtime_wheel = next(wheel_set.glob("cozy_runtime-*.whl"))
         project_wheel = next(wheel_set.glob("marco_polo-*.whl"))
+        interface = package_interface.canonical_bytes(static_interface.build(PACKAGE))
+        _with_interface(project_wheel, interface)
         release = project_wheel.name.split("-")[1]
         runtime_version = runtime_wheel.name.split("-")[1]
         image_python = _image_python(uv, root, runtime_wheel)
@@ -444,56 +443,53 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
                 ]
             ).encode()
 
-            interface = package_interface.canonical_bytes(static_interface.build(PACKAGE))
-
-            def prep(application: str, export_bytes: bytes) -> pb.PreparePackageSetResult:
+            def prep(
+                export_bytes: bytes,
+                *,
+                install_root: Path | None = None,
+                python_version: str = "",
+                held: list[package_installation.InstalledEnvironment] | None = None,
+            ) -> pb.PreparePackageSetResult:
+                target = install_root or root / "environments"
                 return prepare_package_set(
                     pb.PreparePackageSetRequest(
                         download_delegation=_download_set("paul/marco-polo", release),
-                        install_root=str(root / "environments"),
-                        application=application,
-                        model_slot_paths=[],
+                        install_root=str(target),
                         image_inventory=_inventory(),
                         locked_requirements=export_bytes,
-                        package_interface=interface,
+                        python_requires=">=3.12" if python_version else "",
+                        python_version=python_version,
+                        package_interface=b"{}",
                     ),
                     artifact_cache=root / "artifacts",
                     tensorfs_root=root / "store",
-                    install_root=root / "environments",
+                    install_root=target,
                     python=image_python,
                     verified=lambda _digest, _length, _path: None,
+                    materialized=held.append if held is not None else None,
                 )
 
             (root / "artifacts").mkdir()
             (root / "store").mkdir()
-            prepared = prep("marco_polo_package:app", export)
-            placement_bytes = prepared.placement_set.placement_set_canonical_bytes
-            placement = json.loads(placement_bytes)["placements"][0]
-            # The placement carries the lock's identity, never a wheel list.
+            held: list[package_installation.InstalledEnvironment] = []
+            prepared = prep(export, held=held)
+            placement = json.loads(prepared.placement_set.placement_set_canonical_bytes)[
+                "placements"
+            ][0]
             assert placement["package"] == {"package": "paul/marco-polo", "release": release}
-            assert placement["environment"] == {
-                "local_wheels": [],
-                "locked_requirements": {
-                    "digest": "sha256:" + hashlib.sha256(export).hexdigest(),
-                    "length": len(export),
-                },
-            }
-            generation = root / "environments" / "contents"
-            venv_pythons = list(generation.glob("*/bin/python"))
-            assert len(venv_pythons) == 1
+            assert placement["installation_id"] == held[0].installation_id
+            assert base64.b64decode(placement["package_interface"]) == interface
+            venv_pythons = list((root / "environments/installations").glob("*/venv/bin/python"))
+            assert venv_pythons == [held[0].python]
             probe = subprocess.run(
-                [str(venv_pythons[0]), "-I", "-c", "import marco_polo_package"],
+                [str(held[0].python), "-I", "-c", "import marco_polo_package"],
                 capture_output=True,
                 text=True,
             )
             assert probe.returncode == 0, probe.stderr
-            # The uv cache was operation-scoped derived work and is gone after install.
-            assert not list((root / "environments").glob(".uv-cache-*"))
             # The hard guard, observed live: preparing a package never loads derive.
             assert "cozy_runtime.internal.derive" not in sys.modules
-
-            # The staged interface IS the wire document, byte for byte.
-            staged = root / "artifacts" / placement["package_interface"]["digest"][7:]
+            staged = root / "artifacts" / hashlib.sha256(interface).hexdigest()
             assert staged.read_bytes() == interface
             # Minor 60 callers still have this pre-check while the 60-61 window is supported.
             assert hasattr(pb_grpc.RuntimePreparationServicer, "CheckPackageSetCompatibility")
@@ -504,43 +500,19 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
             from cozy_runtime.internal import python_interpreters
 
             for selected in python_interpreters.available():
-                local_root = root / f"local-{selected.version}"
-                local_request = pb.PreparePackageSetRequest(
-                    download_delegation=_download_set("paul/marco-polo", release),
-                    install_root=str(local_root),
-                    application="marco_polo_package:app",
-                    locked_requirements=export,
-                    python_requires=">=3.12",
+                local: list[package_installation.InstalledEnvironment] = []
+                prep(
+                    export,
+                    install_root=root / f"local-{selected.version}",
                     python_version=selected.version,
-                    package_interface=interface,
+                    held=local,
                 )
-                held: list[package_environment.InstalledEnvironment] = []
-                for _ in range(2):
-                    prepare_package_set(
-                        local_request,
-                        artifact_cache=root / "artifacts",
-                        tensorfs_root=root / "store",
-                        install_root=local_root,
-                        python=image_python,
-                        preinstalled_python=image_python,
-                        verified=lambda _digest, _length, _path: None,
-                        materialized=held.append,
-                    )
-                assert held[1].reused
-                assert held[0].generation == held[1].generation
-                assert python_interpreters.probe(held[0].python).version == selected.version
-                identity = json.loads(
-                    (held[0].generation / package_environment.CONTENT_IDENTITY_NAME).read_bytes()
-                )
-                assert "dependency_snapshot" not in identity
-
-            with pytest.raises(PreparationRefusal) as disagreed:
-                prep("marco_polo_package:other", export)
-            assert disagreed.value.code == "package_prepare_application_disagrees"
+                assert python_interpreters.probe(local[0].python).version == selected.version
+                assert local[0].site_packages.is_relative_to(local[0].generation)
 
             poisoned = export.replace(_sha(project_wheel).encode(), _sha(runtime_wheel).encode())
             with pytest.raises(PreparationRefusal) as mismatched:
-                prep("marco_polo_package:app", poisoned)
-            assert mismatched.value.code == "package_environment_uv_failed"
+                prep(poisoned)
+            assert mismatched.value.code == "package_installation_uv_failed"
         finally:
             index.close()

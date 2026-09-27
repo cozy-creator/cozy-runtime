@@ -86,7 +86,7 @@ def test_plain_script_returns_installed_public_struct_after_managed_call(
         "    return await select()\n"
     )
     monkeypatch.delitem(sys.modules, "selection_client", raising=False)
-    artifact = {
+    artifact: dict[str, Any] = {
         "producer_request_id": "child",
         "output_slot": "model",
         "manifest": {"digest": "sha256:" + "1" * 64, "length": 163},
@@ -172,8 +172,8 @@ def test_a_different_public_result_schema_keeps_the_generated_wire_type(
 ) -> None:
     imported, _, _ = installed(tmp_path, monkeypatch)
     binding = imported.__cozy_bindings__["select"]
-    imported.__cozy_bindings__ = {}
-    imported.Selection = msgspec.defstruct("Selection", fields, **options)
+    cast(Any, imported).__cozy_bindings__ = {}
+    cast(Any, imported).Selection = msgspec.defstruct("Selection", fields, **options)
     kept = call_types.public_result(imported, replace(binding, python_result=None))
     assert kept.python_result is None and kept.result is binding.result
 
@@ -186,7 +186,7 @@ def test_public_result_conversion_preserves_tag_validation_and_native_grants(
         "Report", [("file", FileAsset)], tag="report", forbid_unknown_fields=True
     )
     module = ModuleType("native_report")
-    module.Report = public
+    cast(Any, module).Report = public
     binding = call_types.public_result(
         module, _CallType("", module.__name__, "produce", wire, wire)
     )
@@ -213,7 +213,7 @@ def test_public_result_conversion_preserves_tag_validation_and_native_grants(
         },
     }
     token = object()
-    result, _ = decode(
+    decoded, _ = decode(
         value,
         wire,
         [grant],
@@ -223,7 +223,8 @@ def test_public_result_conversion_preserves_tag_validation_and_native_grants(
         grant_token=token,
         python_type=binding.python_result,
     )
-    assert type(result) is public and result.file._grant_token is token
+    result = cast(Any, decoded)
+    assert type(decoded) is public and result.file._grant_token is token
     assert result.file._local == path
     for wrong in ({**value, "type": "different"}, {**value, "unexpected": 1}):
         with pytest.raises(msgspec.ValidationError):

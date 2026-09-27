@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import base64
 import json
 import os
 import socket
@@ -12,7 +13,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import package_environment as environments
+from cozy_runtime.internal import builtin_operations, package_installation, package_interface
 from cozy_runtime.internal import storage_admission as storage
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -70,36 +71,17 @@ worker = Worker(
 try:
     assert storage.enabled() and worker.machine_calls is not None
     builtins = worker.machine_calls.builtins
-    frozen = builtins.capture()
-    assert frozen is not None
-    capsule = root / "installs/runtime-builtins/carriers" / frozen["carrier"]["filename"]
-    base = environments.observe_base()
-    wheel, measured = environments.measure_wheel(capsule, "project", base)
-    source = environments.Input(
-        "sha256:" + "a" * 64,
-        wheel.digest,
-        (wheel,),
-        (environments.BlobGrant(wheel.digest, wheel.length, capsule, measured),),
+    captured = builtins.capture()
+    assert builtins.capture() is captured
+    installed = package_installation.open_installation(
+        root / "installs", captured["installation_id"]
     )
-    try:
-        environments.materialize(source, root / "forbidden", dependency_python=Path(sys.executable))
-    except environments.EnvironmentRefusal as exc:
-        assert exc.code == "package_environment_dependency_snapshot_local_only"
-    else:
-        raise AssertionError("generic rented snapshot was allowed")
-    # The mutable controller SDK is no longer the implementation owner.
-    original = Path(environments.__file__).parents[1] / "derive/operations.py"
-    original.unlink()  # Do not mutate uv's shared cache inode.
-    original.write_text("raise AssertionError('mutable controller SDK used')\n")
-    prepared = builtins._prepare(frozen)
-    assert prepared["runtime_builtin"] == frozen
-    assert prepared["placement"]["development"]["local_revision_digest"]
-    assert prepared["receipt_digest"] and leases
-    installed = environments.open_generation(
-        root / "installs",
-        receipt_digest=prepared["receipt_digest"],
-        environment_digest=prepared["placement"]["environment_digest"],
-    )
+    assert installed.python == Path(sys.executable)
+    assert installed.release == captured["runtime_version"]
+    placement = captured["placement"]
+    assert placement["installation_id"] == captured["installation_id"]
+    interface = package_interface.read_bytes(base64.b64decode(placement["package_interface"]))
+    assert set(builtin_operations.EXPORTS) <= {row["name"] for row in interface["jobs"]}
     actual = subprocess.check_output(
         [
             str(installed.python),
@@ -110,8 +92,8 @@ try:
         ],
         text=True,
     )
-    assert json.loads(actual) == frozen["sdk"]
-    print("RENTED BUILTIN PASS", frozen["sdk"], "leases", len(leases))
+    assert json.loads(actual) == {"runtime_version": captured["runtime_version"]}
+    print("RENTED BUILTIN PASS", captured["runtime_version"], "leases", len(leases))
 finally:
     worker.shutdown()
     assert storage._channel is not None
