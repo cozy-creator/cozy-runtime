@@ -1,0 +1,1 @@
+`commit_file` refuses a request field this Runtime does not implement as a typed `commit_request_unsupported` refusal of that call alone, naming the fields and the recovery. Native source call interfaces advertise each operation's request fields, and the SDK omits an unadvertised option while it keeps its default.

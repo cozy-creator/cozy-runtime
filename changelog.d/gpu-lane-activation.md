@@ -1,0 +1,1 @@
+Machine replicas activate per GPU grant as hosted placements on their own threads, so replicas on different GPUs start together; the global converged gate and revision-based overlap are gone. A failed activation refuses only its own call. `MachineExecutionState.gpu` reports the GPU phase (none, waiting with width and blocker, granted, executing, holding).
