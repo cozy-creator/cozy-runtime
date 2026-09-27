@@ -1528,15 +1528,23 @@ class OfficialH3Pipeline:
                 if selected.shape[0]:
                     on_chunk(selected)
 
-    def export_completed_av_tail(self, state: Any, *, provenance: str) -> AVContext:
+    def export_completed_av_tail(
+        self, state: Any, *, frames: Any, windows: Sequence[int], provenance: str
+    ) -> AVContext:
         tail = state.get("completed_av_tail")
         if not isinstance(tail, CompletedTail) or state.get("audio") is None:
             raise OutputError("continuation requires completed video and audio decode")
-        raw = tail.export(state.audio[0], int(state.sampling_rate), provenance)
-        windows = {}
-        # Run exactly the native reference encoder, separately for each delivered
+        if not windows or not set(windows) <= set(CONTEXT_FRAMES):
+            raise InvalidRequest(
+                "continuation windows are 22, 39 or 56 frames",
+                code="h3_continuation",
+                fields=["context"],
+            )
+        raw = tail.export(frames, state.audio[0], int(state.sampling_rate), provenance)
+        encoded = {}
+        # Run exactly the native reference encoder, separately for each requested
         # window. Do not slice latent suffixes: both VAEs have window-local grids.
-        for count in CONTEXT_FRAMES:
+        for count in sorted(set(windows)):
             selected = raw.select(count)
             encoding = PipelineState(
                 values={
@@ -1551,16 +1559,17 @@ class OfficialH3Pipeline:
                 }
             )
             self._run("ref2va", "vae_encoder", encoding, component="video_vae")
-            windows[count] = (
+            encoded[count] = (
                 encoding.condition_latents[0].detach().float().cpu().contiguous(),
                 encoding.audio_condition_latents[0].detach().float().cpu().contiguous(),
             )
         return AVContext(
-            windows,
+            encoded,
             int(raw.frames.shape[1]),
             int(raw.frames.shape[2]),
             raw.source_end_frame,
             provenance,
+            max(encoded),
         )
 
     def _run(self, task: Task, name: str, state: Any, *, component: str | None = None) -> None:

@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
 pytest.importorskip("diffusers")
+
+from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (  # noqa: E402
+    AutoencoderKLMiniMaxH3Audio,
+)
+from diffusers.modular_pipelines.minimax_h3 import (  # noqa: E402
+    MiniMaxH3Blocks,
+    MiniMaxH3ModularPipeline,
+)
+from diffusers.modular_pipelines.modular_pipeline import PipelineState  # noqa: E402
 
 from cozy_runtime.author import InvalidRequest  # noqa: E402
 from cozy_runtime.models.minimax_h3.continuation import (  # noqa: E402
@@ -21,17 +31,19 @@ from cozy_runtime.models.minimax_h3.continuation import (  # noqa: E402
     encode_context,
     plan_continuation,
 )
+from cozy_runtime.models.minimax_h3.official import OfficialH3Pipeline  # noqa: E402
+from cozy_runtime.models.minimax_h3.vae_tiles import TileBatchedVideoVAE  # noqa: E402
 
 
-def context(frames: int = 56, end: int = 262) -> AVContext:
-    windows = {
+def context(frames: int = 56, end: int = 262, windows: tuple[int, ...] = (22, 39, 56)) -> AVContext:
+    encoded = {
         n: (
             torch.full((1, 24, 5 * ((n - 5) // 17) + 2, 2, 4), n / 100),
             torch.full((2 * ((n * 5 + 2) // 3), 32), n / 100),
         )
-        for n in (22, 39, 56)
+        for n in windows
     }
-    return AVContext(windows, 32, 64, end, "model-and-inference-v1", frames)
+    return AVContext(encoded, 32, 64, end, "model-and-inference-v1", frames)
 
 
 @pytest.mark.parametrize("prefix,sampled", [(0, 243), (22, 277), (39, 294), (56, 311)])
@@ -73,6 +85,15 @@ def test_context_codec_and_selection_preserve_independent_native_windows(frames:
         encode_context(broken)
 
 
+def test_a_context_carries_only_the_windows_its_producer_was_asked_for() -> None:
+    single = decode_context(encode_context(context(22, windows=(22,))))
+    assert set(single.windows) == {22} and single.select(22).frame_count == 22
+    with pytest.raises(InvalidRequest, match="absent"):
+        single.select(39)
+    with pytest.raises(InvalidRequest, match="selected"):
+        context(56, windows=(22,))
+
+
 @pytest.mark.parametrize("prefix", [0, 22, 39, 56])
 def test_streaming_tail_comes_from_delivered_end_not_sample_padding(prefix: int) -> None:
     plan = plan_continuation(240, context_frames=prefix)
@@ -83,19 +104,20 @@ def test_streaming_tail_comes_from_delivered_end_not_sample_padding(prefix: int)
         chunk = (indexes.float() / 400)[:, None, None, None].expand(-1, 3, 32, 64)
         part = collector.push(chunk)
         parts.append(part)
-    with pytest.raises(InvalidRequest, match="completed"):
-        collector.export(torch.zeros(2, 500000), 32000, "model")
-    collector.finish()
     delivered = torch.cat(parts)
+    landed = (delivered.clamp(0, 1) * 255).round().byte().permute(0, 2, 3, 1).contiguous()
+    soundtrack = torch.arange(500000, dtype=torch.float32)[None].repeat(2, 1) / 500000
+    with pytest.raises(InvalidRequest, match="completed"):
+        collector.export(landed, soundtrack, 32000, "model")
+    collector.finish()
     assert len(delivered) == 240
     assert delivered[0, 0, 0, 0] == prefix / 400
     assert delivered[-1, 0, 0, 0] == (prefix + 239) / 400
-    soundtrack = torch.arange(500000, dtype=torch.float32)[None].repeat(2, 1) / 500000
-    tail = collector.export(soundtrack, 32000, "model")
+    with pytest.raises(InvalidRequest, match="completed"):
+        collector.export(landed[1:], soundtrack, 32000, "model")
+    tail = collector.export(landed, soundtrack, 32000, "model")
     assert tail.frame_count == 56 and tail.source_end_frame == prefix + 240
-    assert np.array_equal(
-        tail.frames, (delivered[-56:].clamp(0, 1) * 255).round().byte().permute(0, 2, 3, 1).numpy()
-    )
+    assert np.array_equal(tail.frames, landed[-56:].numpy())
     start, end = audio_sample_range(prefix + 240 - 56, prefix + 240, 32000)
     assert torch.equal(tail.audio, soundtrack[:, start:end])
     assert tail.frames[-1, 0, 0, 0] != round((plan.sample_frames - 1) / 400 * 255)
@@ -168,3 +190,68 @@ def test_native_context_layout_preserves_refs_and_every_scheduler_step(frames: i
         assert torch.equal(state.latents[:cv], torch.ones(cv, 96))
         assert torch.equal(state.audio_latents[:ca], torch.ones(ca, 32))
     assert not torch.equal(state.latents[cv:], torch.ones_like(state.latents[cv:]))
+
+
+def test_export_encodes_only_the_named_windows_of_the_landed_tail() -> None:
+    """The real streamed decode and reference encoder at toy widths: a one-window export is
+    that window of a full export, read from the frames the output landed."""
+    torch.manual_seed(3)
+    video_vae = TileBatchedVideoVAE(
+        latent_channels=24,
+        block_out_channels=(8,) * 6,
+        layers_per_block=1,
+        norm_num_groups=4,
+        decoder_num_layers=1,
+        decoder_num_attention_heads=2,
+        decoder_attention_head_dim=8,
+        decoder_num_register_tokens=1,
+        decoder_ffn_mult=1,
+        latents_mean=(0.0,) * 24,
+        latents_std=(1.0,) * 24,
+    ).eval()
+    audio_vae = AutoencoderKLMiniMaxH3Audio(
+        encoder_dim=4,
+        latent_dim=32,
+        latent_channels=32,
+        num_attention_heads=1,
+        decoder_dim=128,
+        latents_mean=[0.0] * 32,
+        latents_std=[1.0] * 32,
+    ).eval()
+    blocks = MiniMaxH3Blocks().get_workflow("ref2va")
+    upstream = MiniMaxH3ModularPipeline(blocks=blocks)
+    upstream.register_components(vae=video_vae, audio_vae=audio_vae)
+    pipe = OfficialH3Pipeline.__new__(OfficialH3Pipeline)
+    pipe.components = {"video_vae": video_vae, "audio_vae": audio_vae}
+    pipe._blocks = {"ref2va": blocks}
+    pipe._pipes = {"ref2va": upstream}
+
+    plan = plan_continuation(120, context_frames=22)
+    state = PipelineState()
+    latent_frames = 5 * ((plan.sample_frames - 5) // 17) + 2
+    state.set("latents", torch.randn(1, 24, latent_frames, 2, 4))
+    state.set("continuation_delivery", plan)
+    landed: list[Any] = []
+    delivered = pipe.decode_video_chunks(
+        "ref2va",
+        state,
+        lambda chunk: landed.append((chunk.clamp(0, 1) * 255).round().byte().permute(0, 2, 3, 1)),
+    )
+    frames = torch.cat(landed)
+    assert delivered == len(frames) == 120
+    state.set("audio", torch.rand(1, 2, plan.sample_frames * 32000 // 24) - 0.5)
+    state.set("sampling_rate", 32000)
+
+    one = pipe.export_completed_av_tail(state, frames=frames, windows=(22,), provenance="p")
+    every = pipe.export_completed_av_tail(
+        state, frames=frames, windows=(22, 39, 56), provenance="p"
+    )
+    assert set(one.windows) == {22} and one.frame_count == 22
+    assert set(every.windows) == {22, 39, 56} and one.source_end_frame == plan.delivery_end
+    for ours, theirs in zip(one.windows[22], every.windows[22], strict=True):
+        assert torch.equal(ours, theirs)
+    assert decode_context(encode_context(one)).select(22).frame_count == 22
+    with pytest.raises(InvalidRequest):
+        pipe.export_completed_av_tail(state, frames=frames, windows=(), provenance="p")
+    with pytest.raises(InvalidRequest, match="completed"):
+        pipe.export_completed_av_tail(state, frames=frames[1:], windows=(22,), provenance="p")
