@@ -7,6 +7,8 @@ import json
 import os
 import queue
 import signal
+import subprocess
+import sys
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -202,6 +204,24 @@ def test_crashed_source_worker_failure_carries_its_signal_and_stderr_tail(tmp_pa
     ended = stage(frames, "Downloading source")[-1]
     assert ended["kind"] == "log" and not ended["fields"]["completed"]
     assert ended["value"] == "warning" and ended["fields"]["bytes"] < len(body)
+
+
+def test_an_uncoded_source_worker_error_names_itself_in_the_diagnosis() -> None:
+    """A Python error without a native code (a Runtime/TensorFS signature skew raised a
+    TypeError here) is still the fixed code, but its type and frames reach the detail."""
+    child = subprocess.run(
+        [sys.executable, "-m", "cozy_runtime.internal.worker.source_worker"],
+        input=canonical_json.encode({}),
+        capture_output=True,
+        check=True,
+    )
+    assert canonical_json.decode(child.stdout.strip()) == {
+        "code": "native_source_failed",
+        "ok": False,
+    }
+    detail = diagnosis(0, child.stderr.decode(), "")
+    assert "ValueError: native source execution needs its process owner" in detail
+    assert "source_worker.py:" in detail and " in main" in detail
 
 
 def test_diagnosis_redacts_credentials_and_signed_urls() -> None:

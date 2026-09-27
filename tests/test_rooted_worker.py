@@ -184,7 +184,7 @@ class Machine:
 
         stream = self.control.Control(frames(), timeout=BOOT_BOUND)
         ack = next(stream).claim_ack
-        assert ack.accepted, ack
+        assert ack.accepted, (ack, self.output())
         stream.cancel()
         return claim
 
