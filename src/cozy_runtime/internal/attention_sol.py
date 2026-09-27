@@ -3,11 +3,25 @@
 No sparse kernel is implemented here. Sparse block selection is approximate;
 protected query rows are recomputed with the selected dense reference. The
 model supplies its live layout, step policy and dense module paths explicitly.
+
+The kernel compiles at most once per key per machine (h3a-087). Upstream's SM90 kernel is
+specialized on the live token count, which only the request knows, so the first dense step
+that sees a count starts a niced, GPU-less builder for it and the dense steps cover the
+compile; the first sparse call then loads the object from the machine kernel store, or waits
+on the builder's lock, never switching kernels. Upstream's preprocess autotuning is pinned to
+one configuration, because its candidates differ bitwise and a timing race must not choose
+the output.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import subprocess
+import sys
+import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -19,6 +33,7 @@ from types import MethodType
 from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
+from cozy_runtime.internal import kernel_cache, kernel_compile
 from cozy_runtime.internal.attention_ulysses import Local
 
 
@@ -35,19 +50,35 @@ _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", defau
 _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
     "cozy_sol_rank_counts", default=None
 )
+_KERNEL_ROWS: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "cozy_sol_kernel_rows", default=None
+)
 
 
 @contextmanager
-def observing(*, ranks: dict[int, dict[str, int]] | None = None) -> Iterator[dict[str, int]]:
-    """Count successful calls in this request, restoring any outer observation."""
+def observing(
+    *,
+    ranks: dict[int, dict[str, int]] | None = None,
+    kernels: list[dict[str, Any]] | None = None,
+) -> Iterator[dict[str, int]]:
+    """Count successful calls in this request, restoring any outer observation. `kernels`
+    receives one row per kernel this request started building or resolved."""
     counts = dict.fromkeys(("sparse", "dense_step", "dense_path", "dense_prefix"), 0)
     token = _COUNTS.set(counts)
     rank_token = _RANK_COUNTS.set(ranks)
+    kernel_token = _KERNEL_ROWS.set(kernels)
     try:
         yield counts
     finally:
         _COUNTS.reset(token)
         _RANK_COUNTS.reset(rank_token)
+        _KERNEL_ROWS.reset(kernel_token)
+
+
+def _kernel_row(row: dict[str, Any]) -> None:
+    rows = _KERNEL_ROWS.get()
+    if rows is not None:
+        rows.append(row)
 
 
 def _count(kind: str) -> None:
@@ -191,12 +222,220 @@ def _validate_result(output: Any, query: Any) -> None:
         raise ValueError("attention backend returned incompatible output")
 
 
+#: Loaded SM90 kernels by (tokens, kv_splits). One object serves every head count and device:
+#: neither is a compile input (h3a-087).
+_KERNELS: dict[tuple[int, int], kernel_compile.Loaded] = {}
+_KEYS: dict[tuple[int, int], str] = {}
+#: Counts this process already considered for a background build, and the builders it started.
+_CONSIDERED: set[tuple[int, int]] = set()
+_BUILDERS: dict[tuple[int, int], _Builder] = {}
+_PINNED: list[bool] = []
+#: The builder is `kernel_compile.main` under this process's own import path, isolated from
+#: the environment's startup hooks.
+_BUILDER_BOOT = (
+    "import json, sys; sys.path[:] = json.loads(sys.argv.pop(1)); "
+    "from cozy_runtime.internal.kernel_compile import main; raise SystemExit(main(sys.argv[1:]))"
+)
+
+
+@dataclass(slots=True)
+class _Builder:
+    key: str
+    started: float
+    step: int
+    done: threading.Event
+    exit_status: int | None = None
+    ms: float = 0.0
+    detail: str = ""
+
+    def document(self) -> dict[str, Any]:
+        """Flat scalar fields, the only shape an observation row carries. `builder_exit` is
+        None while the builder still runs."""
+        return {
+            "builder_step": self.step,
+            "builder_exit": self.exit_status,
+            "builder_ms": self.ms,
+            **({"detail": self.detail} if self.detail else {}),
+        }
+
+
+def _sm90(device: Any) -> bool:
+    return device.type == "cuda" and bool(
+        import_module("torch").cuda.get_device_capability(device) == (9, 0)
+    )
+
+
+def _key(tokens: int, kv_splits: int, device: Any) -> kernel_cache.Key:
+    capability = tuple(import_module("torch").cuda.get_device_capability(device))
+    return kernel_compile.sol_key(tokens, kv_splits, kernel_compile.target(capability))
+
+
+def _prefetch(tokens: int, kv_splits: int, device: Any, step: int) -> None:
+    """At the first dense step that shows this count: load it, or start its builder."""
+    wanted = (tokens, kv_splits)
+    if wanted in _CONSIDERED or wanted in _KERNELS or not _sm90(device):
+        return
+    _CONSIDERED.add(wanted)
+    store = kernel_cache.from_environment(os.environ)
+    if store is None:
+        return
+    started = time.perf_counter()
+    try:
+        key = _key(tokens, kv_splits, device)
+        data = store.get(key)
+        if data is not None:
+            _KERNELS[wanted], _KEYS[wanted] = kernel_compile.load(data), key.digest[:16]
+            _kernel_row(_row(wanted, key.digest[:16], "store", started, step=step))
+            return
+        lock = store.claim(key)
+        if lock is None:
+            # Another rank or executor on this machine is building it.
+            _kernel_row(_row(wanted, key.digest[:16], "peer_building", started, step=step))
+            return
+        try:
+            _BUILDERS[wanted] = _spawn(key, tokens, kv_splits, device, lock, step)
+        finally:
+            os.close(lock)
+        _kernel_row(_row(wanted, key.digest[:16], "background_started", started, step=step))
+    except Exception as exc:
+        # Nothing needs the kernel yet. The sparse call resolves it again and fails THERE,
+        # precisely; this row keeps the first failure from being invisible.
+        _kernel_row(
+            {
+                "source": "prefetch_failed",
+                "tokens": tokens,
+                "step": step,
+                "detail": f"{type(exc).__name__}: {exc}"[:300],
+            }
+        )
+
+
+def builder_command(
+    tokens: int, kv_splits: int, arch: str, lock: int
+) -> tuple[list[str], dict[str, str]]:
+    """The builder's argv and environment: this interpreter and import path, no GPU, the
+    key's target imposed before the DSL imports, and the inherited build lock."""
+    argv = [
+        sys.executable,
+        "-I",
+        "-c",
+        _BUILDER_BOOT,
+        json.dumps(sys.path),
+        "--tokens",
+        str(tokens),
+        "--kv-splits",
+        str(kv_splits),
+        "--target",
+        arch,
+        "--lock-fd",
+        str(lock),
+    ]
+    return argv, {**os.environ, "CUDA_VISIBLE_DEVICES": "", "CUTE_DSL_ARCH": arch}
+
+
+def _spawn(
+    key: kernel_cache.Key, tokens: int, kv_splits: int, device: Any, lock: int, step: int
+) -> _Builder:
+    capability = tuple(import_module("torch").cuda.get_device_capability(device))
+    argv, environment = builder_command(tokens, kv_splits, kernel_compile.target(capability), lock)
+    process = subprocess.Popen(
+        argv,
+        env=environment,
+        pass_fds=(lock,),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    builder = _Builder(key.digest[:16], time.perf_counter(), step, threading.Event())
+
+    def reap() -> None:
+        _, err = process.communicate()
+        builder.exit_status = process.returncode
+        builder.ms = round((time.perf_counter() - builder.started) * 1000, 1)
+        if process.returncode:
+            builder.detail = err.decode(errors="replace")[-600:]
+        builder.done.set()
+
+    threading.Thread(target=reap, name=f"sol-builder-{tokens}", daemon=True).start()
+    return builder
+
+
+def _row(
+    wanted: tuple[int, int], key: str, source: str, started: float, **extra: Any
+) -> dict[str, Any]:
+    builder = _BUILDERS.get(wanted)
+    # `source` becomes the observation's value; the key digest names the split count too.
+    return {
+        "source": source,
+        "tokens": wanted[0],
+        "key": key,
+        "ms": round((time.perf_counter() - started) * 1000, 1),
+        **(builder.document() if builder is not None else {}),
+        **extra,
+    }
+
+
+def _resolve(tokens: int, kv_splits: int, device: Any) -> kernel_compile.Loaded | None:
+    """The kernel for this count: loaded, waited for, or compiled here and published.
+
+    Every path yields the same bytes, so none of them changes the output. With no store
+    (no rooted worker) upstream compiles in-process exactly as it always has."""
+    wanted = (tokens, kv_splits)
+    loaded = _KERNELS.get(wanted)
+    if loaded is not None:
+        rows = _KERNEL_ROWS.get()
+        if rows is not None and not any(row.get("tokens") == tokens for row in rows):
+            # Resident from an earlier request: say so once, rather than print nothing.
+            rows.append(_row(wanted, _KEYS[wanted], "memory", time.perf_counter()))
+        return loaded
+    store = kernel_cache.from_environment(os.environ)
+    if store is None:
+        return None
+    started = time.perf_counter()
+    key = _key(tokens, kv_splits, device)
+    data, source = store.get(key), "store"
+    if data is None:
+        with store.building(key):
+            data, source = store.get(key), "waited"
+            if data is None:
+                data, source = kernel_compile.compile_sol(tokens, kv_splits), "compiled"
+                store.put(key, data, kernel_compile.producer(started))
+    loaded = _KERNELS[wanted] = kernel_compile.load(data)
+    _KEYS[wanted] = key.digest[:16]
+    _kernel_row(_row(wanted, _KEYS[wanted], source, started))
+    return loaded
+
+
+def _pin_preprocess() -> None:
+    """Upstream autotunes its K/V block reductions over 4 and 8 warps by timing, and the two
+    reduce in different orders: measured bitwise-different summaries, which can flip a
+    routing decision. Keep upstream's first candidate only, so no timing race picks it."""
+    if _PINNED:
+        return
+    preprocess = import_module("sol_attn.preprocess")
+    for tuned in (preprocess._reduce_kc_kernel, preprocess._reduce_vc_kernel):
+        chosen = [c for c in tuned.configs if c.num_warps == 4 and c.num_stages == 1]
+        if len(chosen) != 1:
+            raise RuntimeError("Sol preprocess no longer offers its 4-warp, 1-stage candidate")
+        tuned.configs = chosen
+    _PINNED.append(True)
+
+
 def _native(query: Any, key: Any, value: Any, scale: float | None, sink_tokens: int) -> Any:
     """Call the upstream kernel; a full-document sink selects every KV block.
 
     This does not perform the wrapper's protected-query recomputation. The same
     public upstream call therefore provides an all-keys arithmetic control.
     """
+    if query.device.type == "cuda":
+        _pin_preprocess()
+    if _sm90(query.device):
+        batch, tokens, heads, _ = query.shape
+        loaded = _resolve(tokens, 1, query.device)
+        if loaded is not None:
+            import_module("sol_attn.interface")._compiled[
+                (query.device.index, (9, 0), batch, tokens, heads, 1)
+            ] = loaded
     return import_module("sol_attn").sol_attn(
         query.contiguous(),
         key.contiguous(),
@@ -282,6 +521,9 @@ def _execute(
         raise ValueError("attention layout exceeds Q/K/V sequence length")
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
     if dense_path or layout.step < layout.dense_until_step:
+        if not dense_path:
+            # The dense steps run on the GPU while this count's kernel compiles on the CPU.
+            _prefetch(layout.live_tokens, 1, query.device, layout.step)
         live_output = _dense(q, k, v, scale)
         _count("dense_path" if dense_path else "dense_step")
     else:

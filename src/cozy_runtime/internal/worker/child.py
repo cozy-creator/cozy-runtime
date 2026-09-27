@@ -377,10 +377,12 @@ class ExecutorSupervision:
         executor_uid: int = -1,
         executor_gid: int = -1,
         jit_pod_scope: str = "",
+        kernel_cache: Path | None = None,
         device_process: Callable[[int], accel.ProcessMemory] | None = None,
         socket_path: Path | None = None,
     ) -> None:
         self.root = root
+        self.kernel_cache = kernel_cache
         self.python = python
         self.environment_installation_id = ""
         self.jit_cache = ""
@@ -803,7 +805,15 @@ class ExecutorSupervision:
                 gid=self.executor_gid,
             )
             self.jit_cache = str(prepared.root)
-            return prepared.environment
+            if self.kernel_cache is None:
+                return prepared.environment
+            # Runtime-served kernel objects (and FA4's own cache) outlive this boot scope.
+            return {
+                **prepared.environment,
+                **jit_cache.machine(
+                    self.kernel_cache, uid=self.executor_uid, gid=self.executor_gid
+                ),
+            }
         except jit_cache.JITCacheRefusal as exc:
             raise ExecutorGone(str(exc)) from exc
 

@@ -17,6 +17,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from cozy_runtime.internal import kernel_cache
 from cozy_runtime.internal.child_env import JIT_CACHE_ENV
 
 _INSTALLATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
@@ -91,6 +92,43 @@ def remove_pod(cozy_home: Path, pod_scope: str) -> None:
         raise JITCacheRefusal(f"JIT cache pod is mutable or unowned: {pod}")
     pod.chmod(0o700)
     shutil.rmtree(pod)
+
+
+def machine(root: Path, *, uid: int = -1, gid: int = -1) -> dict[str, str]:
+    """The executor's namespaces of the persistent kernel store, and FA4's cache inside its own.
+
+    Unlike the boot scope above, nothing here is deleted: entries are keyed by every compile
+    input, so a worker restart, a new package version or a Runtime update reads them as it
+    found them. The boundary is the WRITER: an executor writes only `u<its uid>` and reads the
+    worker's `u<worker uid>`, so under uid isolation no placement writes where another reads.
+    """
+
+    if not root.is_absolute():
+        raise JITCacheRefusal("kernel cache root must be absolute")
+    worker = kernel_cache.namespace(root, os.geteuid())
+    root.mkdir(parents=True, exist_ok=True, mode=0o711)
+    worker.mkdir(exist_ok=True, mode=0o755)
+    for boundary in (root, worker):
+        _require_boundary(boundary)
+    root.chmod(0o711)
+    worker.chmod(0o755)
+    own = worker
+    if uid >= 0 and uid != os.geteuid():
+        own = kernel_cache.namespace(root, uid)
+        own.mkdir(exist_ok=True, mode=0o700)
+        info = own.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise JITCacheRefusal(f"kernel cache namespace is not a real directory: {own}")
+        if info.st_uid != uid or (gid >= 0 and info.st_gid != gid):
+            os.chown(own, uid, gid)
+        own.chmod(0o700)
+    environment = {
+        kernel_cache.OWN_ENV: str(own),
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": str(own / "flash-attn4"),
+    }
+    if own != worker:
+        environment[kernel_cache.TRUSTED_ENV] = str(worker)
+    return environment
 
 
 def _require_boundary(path: Path) -> None:
