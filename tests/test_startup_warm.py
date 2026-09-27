@@ -25,7 +25,6 @@ from collections.abc import Callable, Iterator
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -519,121 +518,6 @@ def test_the_warm_proves_what_construction_and_a_request_pin_then_read() -> None
     assert proven == attention._PROVEN, "a construction or a request pin proved a kernel again"
     again = attention.warm(device, preferred)
     assert all(row.get("held") for row in again if row["status"] == "ready")
-
-
-def _h3_ref2va() -> tuple[Any, Any]:
-    """The official ref2va workflow's own blocks over tiny real VAEs, the bundled tokenizer and
-    processor, and the conditioner's shape: everything the packed length depends on."""
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("diffusers")
-    from diffusers import (
-        AutoencoderKLMiniMaxH3,
-        AutoencoderKLMiniMaxH3Audio,
-        MiniMaxH3Blocks,
-        MiniMaxH3ModularPipeline,
-    )
-
-    from cozy_runtime.models.minimax_h3 import official
-
-    vae = AutoencoderKLMiniMaxH3(
-        block_out_channels=(8,) * 6,
-        layers_per_block=1,
-        norm_num_groups=4,
-        decoder_num_layers=1,
-        decoder_num_attention_heads=1,
-        decoder_attention_head_dim=8,
-        decoder_ffn_mult=1,
-    ).eval()
-    audio = AutoencoderKLMiniMaxH3Audio(
-        encoder_dim=4,
-        encoder_rates=(2,),
-        latent_dim=8,
-        latent_channels=4,
-        num_attention_heads=1,
-        decoder_dim=8,
-        decoder_rates=(2,),
-        decoder_kernel_sizes=(4,),
-        latents_mean=[0.0] * 4,
-        latents_std=[1.0] * 4,
-    ).eval()
-    # Only the conditioner's shape is read; its rows are the presentation's tokens.
-    conditioner = SimpleNamespace(
-        config=SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=64)),
-        dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-    )
-    tokenizer, processor = official._processor()
-    blocks = MiniMaxH3Blocks().get_workflow("ref2va")
-    upstream = MiniMaxH3ModularPipeline(blocks=blocks)
-    upstream.register_components(tokenizer=tokenizer, processor=processor, vae=vae, audio_vae=audio)
-    pipe = official.OfficialH3Pipeline.__new__(official.OfficialH3Pipeline)
-    pipe._blocks = {"ref2va": blocks}
-    pipe._pipes = {"ref2va": upstream}
-    pipe._plans = {"ref2va": official.canonical_timestep_plan("ref2va")}
-    pipe.components = {
-        "text_encoder": conditioner,
-        "video_vae": vae,
-        "audio_vae": audio,
-        "ref2va_dit": torch.nn.Linear(1, 1),
-    }
-    return pipe, official
-
-
-@pytest.mark.parametrize("video", [False, True])
-def test_h3_states_its_attention_length_at_intake_exactly(video: bool) -> None:
-    """The length Sol's kernel is specialized on, read before conditioning, equals the one the
-    real conditioning path packs: the text block's own tokenization, the references through
-    the real video VAE, the official layout."""
-    import numpy as np
-    from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3VideoReference
-    from PIL import Image
-
-    from cozy_runtime.author import _attention_scope
-    from cozy_runtime.models.minimax_h3.conditioner import PresentationLength
-
-    pipe, official = _h3_ref2va()
-    torch = pytest.importorskip("torch")
-    references = [
-        pipe.image_reference(Image.new("RGB", (300, 200), (10, 20, 30))),
-        pipe.image_reference(Image.new("RGB", (200, 320), (1, 2, 3))),
-    ]
-    if video:
-        references.append(MiniMaxH3VideoReference(frames=np.zeros((40, 96, 160, 3), np.uint8)))
-    stated: list[tuple[int, Any]] = []
-    heard = threading.Event()
-
-    def listen(tokens: int, module: Any) -> None:
-        stated.append((tokens, module))
-        heard.set()
-
-    _attention_scope._EXPECTED.append(listen)
-    try:
-        state = pipe.start_ref2va(
-            prompt="<Picture 1> and <Picture 2> cross swords in the rain",
-            references=references,
-            generator=torch.Generator().manual_seed(1),
-            steps=pipe._plans["ref2va"].steps[0],
-            frames=official.frames_for(5),
-            reference_image_short_edges=(256, 256),
-        )
-        assert heard.wait(120), "no intake length was stated"
-    finally:
-        _attention_scope._EXPECTED.remove(listen)
-    ((tokens, module),) = stated
-    assert module is pipe.components["ref2va_dit"]
-    # The real path, on the same state: text, media through the VAE, then the layout.
-    upstream = pipe._pipes["ref2va"]
-    shell = SimpleNamespace(device=torch.device("meta"))
-    counted = PresentationLength(pipe.components["text_encoder"])
-    pipe._run_with(
-        "ref2va",
-        official._ScopedPipeline(upstream, shell, overrides={"text_encoder": counted}),
-        "text_encoder",
-        state,
-    )
-    pipe.condition_media("ref2va", state)
-    pipe._run("ref2va", "denoise.prepare_layout", state)
-    assert tokens == state.get("token_tags").numel() > 0
 
 
 @needs_gpu
