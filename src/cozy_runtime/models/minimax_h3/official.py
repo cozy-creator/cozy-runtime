@@ -1052,15 +1052,18 @@ class OfficialH3Pipeline:
         return MiniMaxH3ImageReference(image=image if image.mode == "RGB" else image.convert("RGB"))
 
     def audio_reference(self, audio: DecodedAudio) -> Any:
-        return MiniMaxH3AudioReference(audio=_audio_tensor(audio), sample_rate=audio.sample_rate)
+        waveform = _resample(_audio_tensor(audio), audio.sample_rate, self.sample_rate)
+        return MiniMaxH3AudioReference(audio=waveform, sample_rate=self.sample_rate)
 
     def video_reference(self, video: DecodedVideo) -> Any:
-        soundtrack = _aligned_soundtrack(video)
+        track, soundtrack = video.soundtrack, _aligned_soundtrack(video)
+        if track is not None and soundtrack is not None:
+            soundtrack = _resample(soundtrack, track.sample_rate, self.sample_rate)
         return MiniMaxH3VideoReference(
             frames=_video_at_24fps(video),
             fps=float(FPS),
             audio=soundtrack,
-            sample_rate=None if video.soundtrack is None else video.soundtrack.sample_rate,
+            sample_rate=None if track is None else self.sample_rate,
         )
 
     def start_fl2va(
@@ -1977,6 +1980,33 @@ def _audio_tensor(audio: DecodedAudio) -> Any:
         torch.frombuffer(bytearray(channel), dtype=torch.float32) for channel in audio.pcm_f32le
     ]
     return torch.stack(channels)
+
+
+def _resample(waveform: Any, rate: int, target: int) -> Any:
+    """Bit-identical port of `torchaudio.transforms.Resample(rate, target)` defaults.
+
+    The official pipeline resamples reference audio with torchaudio, which has no release for
+    the Torch this Runtime serves, so references reach it already at the audio VAE rate.
+    Resampling before the pipeline's duration cut differs only within the filter span there.
+    """
+    if rate == target:
+        return waveform
+    gcd = math.gcd(rate, target)
+    rate, target = rate // gcd, target // gcd
+    base = min(rate, target) * 0.99
+    width = math.ceil(6 * rate / base)
+    idx = torch.arange(-width, width + rate, dtype=torch.float64)[None, None] / rate
+    t = torch.arange(0, -target, -1, dtype=torch.float32)[:, None, None] / target + idx
+    t *= base
+    t = t.clamp_(-6, 6)
+    window = torch.cos(t * math.pi / 6 / 2) ** 2
+    t *= math.pi
+    kernel = torch.where(t == 0, torch.tensor(1.0).to(t), t.sin() / t)
+    kernel *= window * (base / rate)
+    channels, length = waveform.shape
+    padded = torch.nn.functional.pad(waveform, (width, width + rate))
+    out = torch.nn.functional.conv1d(padded[:, None], kernel.to(torch.float32), stride=rate)
+    return out.transpose(1, 2).reshape(channels, -1)[:, : math.ceil(target * length / rate)]
 
 
 def _aligned_soundtrack(video: DecodedVideo) -> Any | None:
