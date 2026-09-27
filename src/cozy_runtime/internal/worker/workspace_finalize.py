@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill
 from cozy_runtime.internal.weights_sink import weights_transaction_id
-from cozy_runtime.internal.worker import weights_finalize
+from cozy_runtime.internal.worker import weights_finalize, workspace_partial
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -89,7 +89,26 @@ def finalize(
         weights_finalize._record(directory / (name + ".intent"), decision)
         if legacy.get("result") is not None:
             weights_finalize._record(directory / (name + ".result"), legacy["result"])
-        if request.disposition != pb.WEIGHTS_FINALIZE_DISPOSITION_ADOPT:
+        # A memoized attempt's checkpointed, uncommitted output is retired rather than
+        # destroyed: the owner abandons it, a later identical attempt may still adopt it.
+        retire = False
+        if request.disposition == pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED:
+            held = db.execute(
+                "SELECT w.state,w.checkpoint,a.memoize FROM weights w JOIN attempts a "
+                "ON a.owner=w.owner AND a.request=w.request AND a.ordinal=w.ordinal "
+                "WHERE w.owner=? AND w.id=?",
+                (owner, transaction),
+            ).fetchone()
+            retire = (
+                held is not None
+                and held["state"] == "intent"
+                and bool(held["checkpoint"])
+                and bool(held["memoize"])
+                and observed.get("state") == "open"
+            )
+        if retire:
+            workspace_partial.retire_weights(db, transaction)
+        elif request.disposition != pb.WEIGHTS_FINALIZE_DISPOSITION_ADOPT:
             db.execute(
                 "UPDATE weights SET state='released' WHERE owner=? AND id=?", (owner, transaction)
             )
@@ -101,5 +120,6 @@ def finalize(
                 tensorfs_root=workspace.store_root,
                 journal_root=workspace.directory,
                 on_abandon=on_abandon,
+                retain_partial=retire,
             )
         )

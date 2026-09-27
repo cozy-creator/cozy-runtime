@@ -729,6 +729,8 @@ class SourceCalls:
                 workspace_sources.record_complete(
                     self.workspace, owner, command, result, computation, receipt
                 )
+                if adopted := envelope.get("adopt_operation"):
+                    workspace_sources.consume_partial(self.workspace, owner, str(adopted))
                 workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
                 # The memo is an optional cache: a row it cannot record (for example one
                 # written by another Runtime version) never fails a completed call.

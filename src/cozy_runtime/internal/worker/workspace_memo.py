@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.local_storage_admission import POLICY
-from cozy_runtime.internal.worker import store_gc
+from cozy_runtime.internal.worker import store_gc, workspace_partial
 from cozy_runtime.internal.worker.workspace import (
     _ID,
     Journal,
@@ -932,6 +932,15 @@ def _reclaim_unused(
         result.reclaimed_bytes = collected.reclaimed_bytes
         result.store_busy = collected.store_busy
         if result.store_busy or result.reclaimed_bytes >= target_bytes:
+            return result
+        # Stopped work nobody has adopted is the cheapest to lose: oldest partials go first.
+        reclaimed, removed, busy = workspace_partial.evict(
+            db, workspace, target_bytes=target_bytes - result.reclaimed_bytes
+        )
+        result.reclaimed_bytes += reclaimed
+        result.removed_entries += removed
+        if busy or result.reclaimed_bytes >= target_bytes:
+            result.store_busy = result.store_busy or busy
             return result
         candidates = db.execute(
             "SELECT owner,id FROM operation_cache WHERE state<>'disabled' "

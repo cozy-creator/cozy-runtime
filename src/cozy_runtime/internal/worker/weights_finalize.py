@@ -149,7 +149,10 @@ def finalize(
     tensorfs_root: Path,
     journal_root: Path,
     on_abandon: Callable[[str], None] | None = None,
+    retain_partial: bool = False,
 ) -> pb.WeightsFinalizeResult:
+    """``retain_partial`` fences an open abandoned writer but keeps its checkpointed parts
+    for a later identical attempt to adopt; the owner holds nothing either way."""
     if not tensorfs_root.is_absolute() or not journal_root.is_absolute():
         raise FinalizationRefusal("weights finalization requires absolute worker storage roots")
     decision = _decision(request, owner_scope)
@@ -214,7 +217,8 @@ def finalize(
     if request.disposition == pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED:
         if observed["state"] == "open" and observed.get("writer_session_id"):
             store.derived_fence(transaction_id, observed["writer_session_id"])
-        observed = store.derived_abandon(transaction_id)
+        if not (retain_partial and observed["state"] == "open"):
+            observed = store.derived_abandon(transaction_id)
         if observed["state"] == "committed":
             result.weights_receipt.CopyFrom(_receipt(request, transaction_id, observed["receipt"]))
             store.derived_dispose(transaction_id)
