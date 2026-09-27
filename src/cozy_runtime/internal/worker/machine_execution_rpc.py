@@ -12,7 +12,7 @@ import grpc
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
-from cozy_runtime.internal.worker import machine_capture, triage
+from cozy_runtime.internal.worker import machine_capture, machine_slots, triage
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import (
@@ -105,6 +105,7 @@ class MachineExecutionRPC:
                 if options.gpus or options.accelerator_backend == "none"
                 else "",
                 executor_uid_isolation=options.executor_uid >= 0,
+                cpu_slot_model_inputs=machine_slots.MODEL_INPUTS,
             )
 
         return self._call(request.claim, context, get)

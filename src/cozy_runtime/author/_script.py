@@ -49,6 +49,19 @@ class ScriptContext:
         self._telemetry.metric(name, value, unit=unit)
 
 
+#: What torch raises when a process without a visible device asks for CUDA.
+_CUDA_UNAVAILABLE = (
+    "No CUDA GPUs are available",
+    "Found no NVIDIA driver",
+    "Torch not compiled with CUDA enabled",
+    "no CUDA-capable device",
+)
+
+
+def _cuda_unavailable(exc: BaseException) -> bool:
+    return any(text in str(exc) for text in _CUDA_UNAVAILABLE)
+
+
 class _ScriptRequest(msgspec.Struct):
     pass
 
@@ -86,7 +99,7 @@ def script_app(module: str) -> App:
     payload_types: dict[str, Any] = {}
     execution_context = False
     try:
-        models, weights = declarations(raw)
+        models, weights, accelerator = declarations(raw)
         for parameter in parameters:
             if parameter.arg == "ctx":
                 if parameter.annotation is not None:
@@ -166,6 +179,14 @@ def script_app(module: str) -> App:
                 raise ConformanceError(
                     "script exited with a nonzero status", code="script_exit"
                 ) from exc
+        except (RuntimeError, AssertionError) as exc:
+            if not accelerator and _cuda_unavailable(exc):
+                raise ConformanceError(
+                    f"this script used CUDA on a CPU slot ({exc}); declare "
+                    "`accelerator = true` under [tool.cozy] in its script metadata",
+                    code="job_needs_accelerator",
+                ) from exc
+            raise
         ctx.raise_if_cancelled()
         return result_type(result) if returned is not type(None) else result_type()
 
@@ -189,5 +210,5 @@ def script_app(module: str) -> App:
         ],
         return_annotation=result_type,
     )
-    app.job(weights=weights, emits_media=emits_media)(main)
+    app.job(weights=weights, emits_media=emits_media, accelerator=accelerator)(main)
     return app

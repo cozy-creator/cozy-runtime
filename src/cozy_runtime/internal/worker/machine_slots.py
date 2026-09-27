@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
 from cozy_runtime.internal.worker.child import ExecutorSupervision
@@ -22,16 +23,27 @@ def key(request: str) -> str:
     return "cpu-" + hashlib.sha256(request.encode()).hexdigest()[:16]
 
 
-def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: JobBinding) -> bool:
-    """Return false for ordinary model/weight/GPU jobs; CPU tasks get a bounded own lane."""
-    declaration = worker.engine._job_declaration(binding, binding.job_descriptor_id)
-    if (
+def admits(directive: pb.JobDirective, declaration: Mapping[str, Any]) -> bool:
+    """Whether a job takes the CPU slot. The device grant alone decides: the declaration's
+    Models are derive-only Manifest views and its weights outputs are TensorFS writes."""
+    del declaration  # no rule reads it; MODEL_INPUTS asks this function about one
+    return not (
         directive.device_count
         or directive.resource_caps.device_required
         or directive.resource_caps.max_device_memory_bytes
-        or declaration.get("models")
-        or declaration.get("weights_outputs")
-    ):
+    )
+
+
+#: What `MachineExecutionWorkspace.cpu_slot_model_inputs` reports: asked of `admits` itself.
+MODEL_INPUTS = admits(
+    pb.JobDirective(orchestration=True), {"models": [{}], "weights_outputs": [{}]}
+)
+
+
+def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: JobBinding) -> bool:
+    """Return false for jobs granted a device; CPU tasks get a bounded own lane."""
+    declaration = worker.engine._job_declaration(binding, binding.job_descriptor_id)
+    if not admits(directive, declaration):
         return False
     slot_key = key(request)
     old = worker.job_slots.get(slot_key)

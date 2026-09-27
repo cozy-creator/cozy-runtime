@@ -54,7 +54,9 @@ def main_definition(tree: ast.Module) -> ast.FunctionDef | ast.AsyncFunctionDef:
     return definition
 
 
-def declarations(raw: bytes) -> tuple[dict[str, str], tuple[WeightsOutput, ...]]:
+def declarations(raw: bytes) -> tuple[dict[str, str], tuple[WeightsOutput, ...], bool]:
+    """A script's `[tool.cozy]` models, weights outputs and accelerator. A script composes
+    package calls on CPU unless it declares `accelerator = true`."""
     block: list[str] = []
     opened = found = False
     for line in raw.decode("utf-8").splitlines():
@@ -74,8 +76,11 @@ def declarations(raw: bytes) -> tuple[dict[str, str], tuple[WeightsOutput, ...]]
     if not isinstance(tool, dict):
         raise ValueError("script tool metadata must be a table")
     cozy = tool.get("cozy", {})
-    if not isinstance(cozy, dict) or set(cozy) - {"models", "weights"}:
-        raise ValueError("script tool.cozy accepts models and weights only")
+    if not isinstance(cozy, dict) or set(cozy) - {"models", "weights", "accelerator"}:
+        raise ValueError("script tool.cozy accepts models, weights and accelerator only")
+    accelerator = cozy.get("accelerator", False)
+    if type(accelerator) is not bool:
+        raise ValueError("script accelerator must be a boolean")
     models = cozy.get("models", {})
     weights = cozy.get("weights", {})
     if not isinstance(models, dict) or any(
@@ -92,8 +97,10 @@ def declarations(raw: bytes) -> tuple[dict[str, str], tuple[WeightsOutput, ...]]
         )
     ):
         raise ValueError("script weights must map output names to finite positive byte limits")
-    return models, tuple(
-        WeightsOutput(name, max_new_bytes=limit) for name, limit in weights.items()
+    return (
+        models,
+        tuple(WeightsOutput(name, max_new_bytes=limit) for name, limit in weights.items()),
+        accelerator,
     )
 
 
