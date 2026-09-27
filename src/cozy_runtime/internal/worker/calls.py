@@ -15,7 +15,13 @@ import msgspec
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_BYTES, MAX_CALL_INDEX
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._errors import InvalidRequest
-from cozy_runtime.internal import canonical, output_budget, package_interface
+from cozy_runtime.internal import (
+    builtin_operations,
+    canonical,
+    native_interfaces,
+    output_budget,
+    package_interface,
+)
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.capture_observation import document as observation_document
 from cozy_runtime.internal.seam import MAX_FRAME
@@ -26,6 +32,12 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.worker.attempts import AttemptRecord
+
+
+class CapabilityUnavailable(ValueError):
+    """The executor expects a native operation this worker cannot serve."""
+
+    code = "child_capability_unavailable"
 
 
 @dataclass(slots=True)
@@ -73,13 +85,11 @@ class Calls:
     def bindings(self, attempt: AttemptRecord) -> list[dict[str, Any]]:
         if attempt.job is None:
             return []
-        from cozy_runtime.internal import builtin_operations, effect_interfaces, source_interfaces
-
         result = [dict(row) for row in attempt.job.call_interfaces]
         if self.installed_bindings is not None:
             result.extend(self.installed_bindings(attempt))
-        result.extend(source_interfaces.rows())
-        result.extend(effect_interfaces.rows())
+        executor = attempt.executor
+        result.extend(native_interfaces.rows(executor.hello if executor is not None else {}))
         if builtin_operations.supports_environment(attempt.job.python):
             result.extend(builtin_operations.rows())
         raw = Path(attempt.job.package_interface).read_bytes()
@@ -231,6 +241,8 @@ class Calls:
                     "detail": result.safe_detail,
                     "child_request_id": result.child_request_id,
                 }
+            except CapabilityUnavailable as exc:
+                return {"ok": False, "code": exc.code, "detail": str(exc)[:1024]}
             except (
                 OSError,
                 ValueError,
@@ -290,6 +302,8 @@ class Calls:
             raise ValueError(
                 "call does not name a locked interface dependency or current App export"
             )
+        if allowed.get("unavailable"):
+            raise CapabilityUnavailable(allowed["unavailable"])
         payload = frame.get("payload")
         if not isinstance(payload, str) or len(payload.encode()) > MAX_CALL_BYTES:
             raise ValueError("call request exceeds its inline bound")

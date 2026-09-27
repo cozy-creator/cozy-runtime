@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-
 import msgspec
 
 from cozy_runtime import canonical_json
@@ -62,7 +60,7 @@ class CommitFile(msgspec.Struct, frozen=True):
     media_type: str
 
 
-_TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
+TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
     "download_huggingface": (HuggingFace, SourceArtifact),
     "download_civitai": (Civitai, SourceArtifact),
     "convert_cozytensors": (Convert, ModelArtifact),
@@ -75,39 +73,21 @@ _TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
 UPLOADS = ("upload_huggingface", "upload_civitai")
 #: Each operation's output semantics, bumped by hand when the same inputs would produce
 #: a different result. Native source memo keys carry this, never a source-tree hash.
-OPERATION_VERSIONS: dict[str, int] = {name: 1 for name in _TYPES}
+OPERATION_VERSIONS: dict[str, int] = {name: 1 for name in TYPES}
 DOCUMENT = canonical_json.encode(
     {
         "format": "cozy.native-source-interface/1",
         "module": MODULE,
         "operations": {
             name: {"request": schema.render(request), "result": schema.render(result)}
-            for name, (request, result) in _TYPES.items()
+            for name, (request, result) in TYPES.items()
         },
     }
 )
-DIGEST = "sha256:" + hashlib.sha256(DOCUMENT).hexdigest()
 
 
-def bindings() -> dict[tuple[str, str, str], _CallType]:
+def bindings() -> dict[str, _CallType]:
     return {
-        (prefix, MODULE, name): _CallType(DIGEST, MODULE, name, request, result)
-        for name, (request, result) in _TYPES.items()
-        for prefix in ("", DIGEST)
+        name: _CallType("", MODULE, name, request, result)
+        for name, (request, result) in TYPES.items()
     }
-
-
-def rows() -> list[dict[str, object]]:
-    """``request_fields`` lets a newer SDK omit options this Runtime does not serve."""
-    return [
-        {
-            "interface_digest": DIGEST,
-            "module": MODULE,
-            "export": name,
-            "native_source": True,
-            "request_fields": sorted(
-                field.encode_name for field in msgspec.structs.fields(request)
-            ),
-        }
-        for name, (request, _) in _TYPES.items()
-    ]

@@ -76,15 +76,14 @@ from cozy_runtime.internal import (
     attention_ulysses,
     canonical,
     child_env,
-    effect_interfaces,
     execution_evidence,
     kernel_site,
     model_config,
+    native_interfaces,
     package_interface,
     prepare_diagnostics,
     proctree,
     sandbox,
-    source_interfaces,
 )
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
@@ -3716,6 +3715,7 @@ class Executor:
                 "call interface inventory exceeds its bound", code="child_interface"
             )
         bindings: dict[tuple[str, str], _CallType] = {}
+        own = native_interfaces.bindings()
         for row in rows:
             interface, module, export = (
                 row.get("interface_digest", ""),
@@ -3723,17 +3723,17 @@ class Executor:
                 row["export"],
             )
             if row.get("native_source") or row.get("native_effect"):
-                # Runtime owns these services; a digest recorded by another Runtime is advisory.
-                service = source_interfaces if row.get("native_source") else effect_interfaces
-                native = service.bindings().get(("", module, export))
+                # Admission is per operation: the worker judged this one against what this
+                # Runtime stated at hello. One this Runtime lacks cannot be called from here.
+                native = own.get((module, export))
                 if native is None:
-                    raise CapabilityError(
-                        f"this Runtime offers no native operation {module}.{export}",
-                        code="child_interface",
-                    )
+                    continue
                 served = row.get("request_fields")
                 if isinstance(served, list) and all(isinstance(name, str) for name in served):
                     native = dataclasses.replace(native, served_fields=frozenset(served))
+                unavailable = row.get("unavailable")
+                if isinstance(unavailable, str) and unavailable:
+                    native = dataclasses.replace(native, unavailable=unavailable[:1024])
                 bindings[(module, export)] = native
             elif row.get("builtin"):
                 import msgspec
@@ -3821,6 +3821,8 @@ class Executor:
                 if prior is not None and prior != binding:
                     raise CapabilityError("ambiguous managed export", code="child_interface")
                 bindings[(module, export)] = binding
+        for module, export in own.keys() - bindings.keys():
+            bindings[(module, export)] = native_interfaces.unserved(module, export)
         return _Broker(str(command["request_id"]), bindings, self._durable)
 
     def _durable(
@@ -4320,6 +4322,7 @@ def main(argv: list[str] | None = None) -> int:
                     "python_executable": sys.executable,
                     "runtime_version": RUNTIME_VERSION,
                     "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
+                    "native_interfaces": native_interfaces.stated(),
                     "pgid": os.getpgrp(),
                     "no_new_privs": _proc_status("NoNewPrivs"),
                     "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),

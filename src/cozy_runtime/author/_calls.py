@@ -211,6 +211,8 @@ class _CallType:
     python_result: type[msgspec.Struct] | None = None
     #: Request fields the serving Runtime accepts; ``None`` when it did not say.
     served_fields: frozenset[str] | None = None
+    #: Why the serving Runtime cannot serve this operation; "" when it can.
+    unavailable: str = ""
 
 
 RUNTIME_UPDATE = (
@@ -324,6 +326,8 @@ class _Broker:
             raise CapabilityError(
                 "export is not an exact locked dependency", code="child_undeclared"
             )
+        if binding.unavailable:
+            raise CapabilityError(binding.unavailable, code="child_capability_unavailable")
         if len(self.calls) >= MAX_ACTIVE_CALLS:
             raise CapabilityError("active package call bound exceeded", code="child_fanout")
         if self.next_index > MAX_CALL_INDEX:

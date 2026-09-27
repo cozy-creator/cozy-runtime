@@ -48,7 +48,10 @@ def JOB(ctx: Context, payload: Request) -> Result:
 """
 
 
-def package(root: Path, label: str) -> tuple[Path, pb.PrepareLocalPackageRequest]:
+def package(
+    root: Path, label: str, *, runtime: str = ""
+) -> tuple[Path, pb.PrepareLocalPackageRequest]:
+    """A local package locked to this checkout's Runtime, or to released `runtime` from PyPI."""
     project = root / ("project_" + label)
     project.mkdir()
     name, module = "prepare-" + label, "prepare_" + label
@@ -77,7 +80,9 @@ def package(root: Path, label: str) -> tuple[Path, pb.PrepareLocalPackageRequest
     dependencies = [Requirement(raw) for raw in parsed.get_all("Requires-Dist", [])]
     requirements = root / (label + "-requirements.in")
     requirements.write_text(
-        "\n".join(
+        f"cozy-runtime=={runtime}\n"
+        if runtime
+        else "\n".join(
             str(row)
             for row in dependencies
             if row.marker is None or row.marker.evaluate({"extra": ""})
@@ -101,7 +106,7 @@ def package(root: Path, label: str) -> tuple[Path, pb.PrepareLocalPackageRequest
     return environment, pb.PrepareLocalPackageRequest(
         operation_id=label,
         package=_development("local/" + name, "1.0.0"),
-        files=_wheel_rows([wheel, runtime_copy]),
+        files=_wheel_rows([wheel] if runtime else [wheel, runtime_copy]),
         dependency_requirements=locked.read_bytes(),
         install_root=str(environment),
     )

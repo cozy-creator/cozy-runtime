@@ -591,7 +591,8 @@ def secret(ctx: Context, payload: Request) -> Result:
             python=sys.executable,
             package_interface=str(interface_path),
             installation_id="install-sealed",
-        )
+        ),
+        executor=None,
     )
     calls = Calls(lambda _frame: None, lambda: 0, lambda: 0)
     bindings = [row for row in calls.bindings(cast(Any, parent)) if row["module"] == "dual_fixture"]
