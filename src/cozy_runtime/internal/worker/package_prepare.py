@@ -99,6 +99,8 @@ def prepare_package_set(
 
     The worker owns the installation and its interface. The caller supplies release
     selection, dependency requirements and model selections, never a code fingerprint.
+    While the Host is still landing the models (`models_landing`) none is read: the result
+    is the installation, and its PlacementSet binds no model.
     """
 
     if (
@@ -141,7 +143,7 @@ def prepare_package_set(
         package_name=package_name,
         release=release,
         locked=locked,
-        models=models,
+        models=[] if request.models_landing else models,
         artifact_cache=artifact_cache,
         tensorfs_root=tensorfs_root,
         install_root=install_root,
@@ -155,6 +157,25 @@ def prepare_package_set(
         dependency_cache=dependency_cache,
         materialized=materialized,
     )
+
+
+def landing_models(request: pb.PreparePackageSetRequest, interface: bytes) -> list[Any]:
+    """The model slots of every serving entrypoint the download set selects whole: what a
+    root of this preparation constructs, and so the cards its executor starts on."""
+    try:
+        download_set = documents.read(request.download_delegation, pb.DownloadDelegation)
+    except documents.DocumentError as exc:
+        raise PreparationRefusal("package_prepare_download_set_invalid", exc.detail) from exc
+    rows = download_set.get("models")
+    selected = {str(row.get("slot", "")) for row in rows or () if isinstance(row, dict)}
+    body = package_interface.read_bytes(interface, "landing package interface")
+    return [
+        slot
+        for entry in body["entrypoints"]
+        if (declared := entry.get("models"))
+        and {str(model.get("path", "")) for model in declared} <= selected
+        for slot in declared
+    ]
 
 
 def _installed_interface(

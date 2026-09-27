@@ -33,6 +33,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import hmac
 import itertools
@@ -2048,6 +2049,17 @@ class Worker:
             raise package_prepare.PreparationRefusal(
                 "published_package_result_invalid", "published preparation needs one exact revision"
             )
+        if request.models_landing:
+            # The Host is still landing the weights (h3a-089). Nothing read a model, so no
+            # placement is retained; the installation starts its executor meanwhile.
+            self._collect_superseded_installations(published[0])
+            interface = bytes(result.installed_package.package_interface)
+            self.prespawns.request_landing(
+                published[0].installation_id,
+                interface,
+                package_prepare.landing_models(request, interface),
+            )
+            return pb.PreparePackageSetResult(installed_package=result.installed_package)
         stored = self._placement_from_entry(entries[0], result.placement_set.placement_set_digest)
         stored.installed = published[0]
         self.prepared_installations[stored.prepared_key] = stored
@@ -2091,6 +2103,7 @@ class Worker:
                 continue
             if installed.package != current.package:
                 continue
+            self.prespawns.forget(identifier)
             package_installation.remove(root, identifier)
             shutil.rmtree(self.config.cozy_home / "job-plans" / identifier, ignore_errors=True)
             for key in [key for key in self.prepared_installations if key[1] == identifier]:
@@ -2390,7 +2403,11 @@ class Worker:
                     preparation = machine_lanes.placement_for(
                         self.executions.preparation(owner, request), offered, ordinals
                     )
-                    if preparation and not self._prepare_execution(preparation, request):
+                    if preparation and not self._prepare_execution(
+                        preparation,
+                        request,
+                        functools.partial(self._journal_row, request, state.attempt_ordinal),
+                    ):
                         continue
                 except Exception as exc:
                     self.refuse(
@@ -2450,6 +2467,8 @@ class Worker:
         }
         readable: tuple[int, ...] | None = None
         demands: list[Demand] = []
+        #: grant key -> the installation it runs, so a Host-started process finds its root
+        installations: dict[str, str] = {}
         for request, state in states.items():
             key = f"{request}#{state.attempt_ordinal}"
             held = self.engine.history.get((request, state.attempt_ordinal))
@@ -2457,6 +2476,7 @@ class Worker:
                 granted = self.gpu.granted(key)
                 if held.state in self.engine.PRE_RELEASE and granted is not None:
                     demands.append(Demand(key, self._gpu_shapes[request].root, len(granted)))
+                    installations[key] = self._gpu_shapes[request].template[0]
                 continue
             if state.state != "queued" or not self.executions.assigned_here(
                 owner, request, state.attempt_ordinal, self.fence.worker_boot_id
@@ -2499,9 +2519,10 @@ class Worker:
             demands.append(
                 Demand(key, shape.root, width, self._warm(shape.template), tuple(sorted(exclude)))
             )
+            installations[key] = shape.template[0]
         roots = self.executions.scheduling_roots(owner)
         grants = self.gpu.sync(roots, demands)
-        self.prespawns.reconcile(roots, self.gpu.view())
+        self.prespawns.reconcile(roots, self.gpu.view(), installations)
         for root, event, body in self.gpu.drain():
             with contextlib.suppress(WorkspaceRefusal):
                 self.executions.record(owner, root, event, body)
@@ -2619,7 +2640,17 @@ class Worker:
         failed = hosted.failed_bindings if hosted is not None else self.failed_bindings
         return failed.get(serving.get("entrypoint_binding_digest", ""))
 
-    def _prepare_execution(self, preparation: dict[str, Any], request_id: str = "") -> bool:
+    def _journal_row(self, request: str, attempt: int, frame: dict[str, Any]) -> None:
+        """One worker observation on an execution's own journal; narration never fails it."""
+        with contextlib.suppress(WorkspaceRefusal, OSError):
+            self.emit_progress(request, attempt, frame)
+
+    def _prepare_execution(
+        self,
+        preparation: dict[str, Any],
+        request_id: str = "",
+        journal: Callable[[dict[str, Any]], None] | None = None,
+    ) -> bool:
         """Reuse the existing preparation/convergence engine without replacing live work."""
         if self.phase == pb.WorkerPhase.WORKER_PHASE_FAILED:
             # A failed convergence lane can never satisfy the pending-revision
@@ -2653,7 +2684,7 @@ class Worker:
             machine_capture.restore(self, preparation)
             return machine_slots.ensure(self, request_id, desired.job, binding)
         if request_id and desired.WhichOneof("mode") == "placement_set":
-            return self._bind_replica(preparation, desired)
+            return self._bind_replica(preparation, desired, journal)
         desired.revision = self.accepted.accepted_desired_state_revision
         if desired_state_body(desired) == self.accepted.desired_state_body:
             return True
@@ -2674,7 +2705,12 @@ class Worker:
         self._apply_desired_state(desired)
         return self.dispatchable()
 
-    def _bind_replica(self, preparation: dict[str, Any], desired: pb.DesiredWorkerState) -> bool:
+    def _bind_replica(
+        self,
+        preparation: dict[str, Any],
+        desired: pb.DesiredWorkerState,
+        journal: Callable[[dict[str, Any]], None] | None = None,
+    ) -> bool:
         """Activate this machine replica on its grant, beside every other placement.
 
         No desired-state revision is written, so replicas on other GPUs activate at once
@@ -2712,7 +2748,8 @@ class Worker:
         placement = self._placement_from_entry(row, desired.placement_set.placement_set_digest)
         placement.device_pin = pin
         # The process started beside this replica's download (h3a-087), when there is one.
-        warm = self.prespawns.claim(placement.installation_id, pin or ())
+        # One the Host started for a root it had not submitted yet journals its phases here.
+        warm = self.prespawns.claim(placement.installation_id, pin or (), journal)
         supervision = (
             warm.supervision
             if warm is not None

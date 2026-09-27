@@ -11,7 +11,11 @@ import pytest
 
 from cozy_runtime.internal import canonical, package_installation, package_interface
 from cozy_runtime.internal import package_environment as environments
-from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package_set
+from cozy_runtime.internal.worker.package_prepare import (
+    PreparationRefusal,
+    landing_models,
+    prepare_package_set,
+)
 from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_publish_derivation import _SimpleIndex
@@ -295,3 +299,107 @@ async def generate(payload: Request, model: Reference) -> Reply:
         finally:
             worker.shutdown()
             index.close()
+
+
+def test_a_landing_preparation_installs_the_release_and_reads_no_model(tmp_path: Path) -> None:
+    """h3a-089: while the Host is still landing the models, preparation installs the release
+    and answers its installation; the selected model is not in the Store and nothing reads
+    it. The same selection without `models_landing` reads the Store and refuses."""
+    slot = {"class": "Model", "path": "generate.models.model", "component_use": {}}
+    slot["sequence_parallel"] = {"degrees": [2, 4]}
+    interface = canonical.write(
+        {
+            "format": package_interface.SCHEMA,
+            "application": "serving_child:app",
+            "entrypoints": [
+                {
+                    "name": "generate",
+                    "models": [slot],
+                    "request": {"fields": []},
+                    "result": {"fields": []},
+                },
+                {
+                    "name": "other",
+                    "models": [
+                        {"class": "Model", "path": "other.models.model", "component_use": {}}
+                    ],
+                    "request": {"fields": []},
+                    "result": {"fields": []},
+                },
+            ],
+            "jobs": [],
+        }
+    )
+    wheel = _wheel(
+        tmp_path,
+        "serving_child",
+        ("cozy-runtime>=0.1",),
+        b"VALUE=42\n",
+        version="1.0.0",
+        resources={"serving_child-1.0.0.dist-info/package-interface.json": interface},
+    )
+    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n", version="1.0.0")
+    index = _SimpleIndex(tmp_path / "index", [wheel, runtime])
+    base = environments.observe_base()
+    root = tmp_path / "installs"
+    retained: list[package_installation.InstalledEnvironment] = []
+    try:
+        locked = "\n".join(
+            sorted(
+                f"{item.name.split('-')[0].replace('_', '-')}=={item.name.split('-')[1]} "
+                f"--hash=sha256:{hashlib.sha256(item.read_bytes()).hexdigest()}"
+                for item in [wheel, runtime]
+            )
+        )
+        request = pb.PreparePackageSetRequest(
+            install_root=str(root),
+            application="serving_child:app",
+            package_interface=interface,
+            model_slot_paths=["generate.models.model", "other.models.model"],
+            download_delegation=canonical.write(
+                {
+                    "format": "cozy.worker.v1.DownloadDelegation/1",
+                    "packages": [{"package": "proof/serving-child", "release": "1.0.0"}],
+                    "models": [
+                        {
+                            "package": "proof/serving-child",
+                            "slot": "generate.models.model",
+                            "model": "proof/landing",
+                            "release": "1.0.0",
+                            "lane": "bf16",
+                            "manifest": "sha256:" + "ab" * 32,
+                        }
+                    ],
+                }
+            ),
+            locked_requirements=f"--index-url {index.url}\n{locked}\n".encode(),
+            models_landing=True,
+        )
+
+        def prepare(selected: pb.PreparePackageSetRequest) -> pb.PreparePackageSetResult:
+            return prepare_package_set(
+                selected,
+                artifact_cache=tmp_path / "artifacts",
+                tensorfs_root=tmp_path / "store",
+                install_root=root,
+                python=Path(sys.executable),
+                verified=lambda *args: None,
+                base=base,
+                materialized=retained.append,
+            )
+
+        landed = prepare(request)
+        assert not (tmp_path / "store").exists(), "a landing preparation opened the Store"
+        (placement,) = read_placement_set(landed.placement_set)
+        assert placement["models"] == placement["entrypoints"] == []
+        assert placement["installation_id"] == retained[0].installation_id
+        assert (retained[0].site_packages / "serving_child.py").is_file()
+        # The executor starts at the width of what the selection binds whole: `generate`.
+        assert landing_models(request, bytes(landed.installed_package.package_interface)) == [slot]
+        request.models_landing = False
+        with pytest.raises(PreparationRefusal, match="package_prepare_model"):
+            prepare(request)
+        # Both calls named one environment; the second installed nothing again.
+        assert {row.installation_id for row in retained} == {retained[0].installation_id}
+    finally:
+        index.close()
