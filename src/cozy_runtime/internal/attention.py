@@ -701,18 +701,20 @@ def for_device(device: DeviceFacts) -> list[Candidate]:
     return [candidate for candidate in CANDIDATES if not _device_admits(candidate, device)]
 
 
-def available(device: DeviceFacts) -> list[Ready]:
+def available(device: DeviceFacts, skipped: dict[str, str] | None = None) -> list[Ready]:
     """The ranked kernels this device and environment can actually run, fastest first.
 
     Never raises: the floor takes everything, so auto-selection has no refusal arm. A ranked
-    kernel this image does not ship is simply not in the answer, and an environment with no
-    diffusers at all offers nothing — which is right, because it holds no attention site.
+    kernel this image does not ship is not in the answer; why is written into `skipped`.
+    An environment with no diffusers at all offers nothing — it holds no attention site.
     """
     ready: list[Ready] = []
     for candidate in for_device(device):
         try:
             ready.append(_resolve(candidate, device))
-        except Exception:
+        except Exception as exc:
+            if skipped is not None:
+                skipped[candidate.name] = f"{type(exc).__name__}: {exc}"[:300]
             # BROAD ON PURPOSE. Auto-selection has no refusal arm — the floor takes
             # everything — so a kernel that fails to resolve for ANY reason must drop out of
             # the ranking rather than fail the prepare that was only trying to go faster. A
@@ -720,7 +722,6 @@ def available(device: DeviceFacts) -> list[Ready]:
             # RESOLVES BUT DOES NOT COMPUTE now leaves by this same door, which is the point:
             # auto-selection silently taking a dead kernel is what would have shipped
             # corrupted video (h3a-013).
-            continue
     return ready
 
 
@@ -899,6 +900,8 @@ class Applied:
     pin: str = ""
     admission: dict[str, dict[str, Any]] | None = None
     artifacts: dict[str, dict[str, Any]] | None = None
+    #: ranked kernels auto-selection could not use here, and why
+    skipped: dict[str, str] | None = None
 
     def totals(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -916,6 +919,7 @@ class Applied:
             "pin": self.pin,
             **({"admission": self.admission} if self.admission else {}),
             **({"artifacts": self.artifacts} if self.artifacts else {}),
+            **({"skipped": self.skipped} if self.skipped else {}),
             # RENDERED HERE, not by the worker: one renderer for the one line, in the module
             # that knows what it means.
             "line": self.line(),
@@ -923,7 +927,8 @@ class Applied:
 
     def line(self) -> str:
         """The ONE line a pod prints at boot. It is the whole per-run attention record."""
-        return line(self.totals(), self.hosts, list(self.offered), self.pin)
+        skipped = f"; skipped {sorted(self.skipped)}" if self.skipped else ""
+        return line(self.totals(), self.hosts, list(self.offered), self.pin) + skipped
 
 
 def line(
@@ -953,6 +958,7 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
     pins: set[str] = set()
     admission: dict[str, Any] = {}
     artifacts: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
     for parameter, row in documents.items():
         for component, chosen in (row.get("hosts") or {}).items():
             hosts[f"{parameter}/{component}"] = dict(chosen)
@@ -968,6 +974,7 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
             admission[parameter] = row["admission"]
         if row.get("artifacts"):
             artifacts[parameter] = row["artifacts"]
+        skipped.update(row.get("skipped") or {})
     if not kernels:
         return None
     pin = "+".join(sorted(pins))
@@ -979,7 +986,9 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
         "pin": pin,
         **({"admission": admission} if admission else {}),
         **({"artifacts": artifacts} if artifacts else {}),
-        "line": line(kernels, hosts, offered, pin),
+        **({"skipped": skipped} if skipped else {}),
+        "line": line(kernels, hosts, offered, pin)
+        + (f"; skipped {sorted(skipped)}" if skipped else ""),
     }
 
 
@@ -1322,23 +1331,19 @@ def admit(pin: str, degree: int) -> None:
             )
 
 
-def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Candidate:
+def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, degree: int = 1) -> Candidate:
+    """Refuse a request pin these sites, this device or this group degree cannot serve."""
+    admit(name, degree)
     scope, backend = _pin_parts(name)
-    candidate = BY_NAME.get(backend)
-    if candidate is None:
-        raise AttentionRefusal(
-            "attention_kernel_unknown",
-            f"unknown attention kernel {backend!r}; this runtime knows {sorted(BY_NAME)}",
-        )
+    candidate = BY_NAME[backend]
     selected = {component: root for component, root in roots.items() if _matches(component, scope)}
-    blocked = frozen or _baked_in(selected)
+    blocked = _baked_in(selected)
     if blocked:
         raise AttentionRefusal(
             "attention_kernel_frozen",
-            f"{name} cannot be swapped into this prepared construction: {blocked}. "
-            "Send the pin with the request so the worker prepares a pinned construction "
-            "(or set it in the model attention policy) before compilation or parallel-group "
-            "construction",
+            f"{name} cannot be pinned per request: {blocked}. "
+            "Prepare a new generation with this choice in the model attention policy "
+            "before compilation",
         )
     unsupported = _device_admits(candidate, device)
     if unsupported:
@@ -1360,8 +1365,8 @@ def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str 
     return candidate
 
 
-def plan(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Swap:
-    candidate = check(device, roots, name, frozen)
+def plan(device: DeviceFacts, roots: Mapping[str, Any], name: str, degree: int = 1) -> Swap:
+    candidate = check(device, roots, name, degree)
     scope, _ = _pin_parts(name)
     entry = pinned(candidate.name, device)[0]
     records = [
@@ -1387,10 +1392,12 @@ def select(
 ) -> Applied:
     """Select once at preparation; optional model policy and request pins are validated."""
     scope, name = _pin_parts(pin)
-    ready = pinned(name, device) if name and not scope else available(device)
+    skipped: dict[str, str] = {}
+    ready = pinned(name, device) if name and not scope else available(device, skipped)
     if scope:
         ready = [entry for entry in ready if entry.name != name] + pinned(name, device)
-    return install(ready, roots, pin, degree, device=device, choose=choose)
+    applied = install(ready, roots, pin, degree, device=device, choose=choose)
+    return replace(applied, skipped=skipped or None)
 
 
 def capabilities(device: DeviceFacts) -> dict[str, Any]:

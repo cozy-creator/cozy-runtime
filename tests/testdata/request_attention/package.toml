@@ -1,0 +1,7 @@
+[application]
+object = "request_attention:app"
+
+[bindings."generate.models.model"]
+model = "test/attention"
+release = "1"
+lane = "main"

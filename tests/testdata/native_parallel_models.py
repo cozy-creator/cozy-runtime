@@ -384,7 +384,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
                         "attention_kernel": changed_pin,
                     }
                 )
-                assert refused["code"] == "attention_kernel_frozen", refused
+                assert refused["code"] == "attention_kernel_unsupported", refused
                 assert "changed-pin" not in executor.prepared
                 assert not executor.poisoned
         request = host.serve_request(

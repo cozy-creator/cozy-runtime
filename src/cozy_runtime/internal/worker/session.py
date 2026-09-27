@@ -342,9 +342,8 @@ class WorkerOptions:
     `cozy-runtime run` builds in memory can carry one, which is exactly the dev mode the
     A/B needs: two runs, two pins, one honest comparison.
 
-    It reaches `attention.select` at PREPARE, which is the only moment it can act — a pin
-    applied after `warm` compiled the module or after a group installed its collectives is
-    a field nobody reads. So this is a construction fact and never a per-request one."""
+    It is the pin of every request that names none: an execution parameter of `invoke`,
+    applied on every rank for that attempt, never a construction of its own (cr-191)."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
@@ -430,7 +429,6 @@ class HostedPlacement:
     placement: Placement
     supervision: ExecutorSupervision
     bindings: dict[str, DeclaredBinding] = field(default_factory=dict)
-    prepared_models: dict[str, PreparedModel] = field(default_factory=dict)
     failed_bindings: dict[str, str] = field(default_factory=dict)
     latched: str = ""
 
@@ -449,7 +447,6 @@ class Tenant:
     placement: Placement
     supervision: ExecutorSupervision
     bindings: dict[str, DeclaredBinding]
-    prepared_models: dict[str, PreparedModel]
     failed_bindings: dict[str, str]
     lane: DeviceLane
     slot: str
@@ -840,21 +837,6 @@ def _parameter_names_by_model(group: Sequence[DeclaredBinding]) -> list[list[str
     ]
 
 
-def _attention_construction_key(base: str, pin: str) -> str:
-    """Return the cached construction identity for a request attention override.
-
-    Attention is selected while a construction is loaded, before context parallel
-    collectives and warm-up.  A request pin therefore cannot be applied by swapping a
-    prepared executor in place.  Keeping the pin in the construction key gives the lane
-    a request-local prepared variant: the normal construction remains reusable, while a
-    pinned request gets a correctly prepared (and independently cached) variant.
-    """
-    if not pin:
-        return base
-    digest = hashlib.sha256(pin.encode("utf-8")).hexdigest()[:24]
-    return f"{base}:attention-{digest}"
-
-
 def executor_load_command(
     binding: DeclaredBinding,
     *,
@@ -878,9 +860,9 @@ def executor_load_command(
     a group lane's K, the ONE new fact its executor receives; a plain prepare is unchanged.
     `parameter_names[i]` is every parameter name the i-th model is bound under across the
     bindings that share this construction (h3a-018); absent, the model binds under this
-    binding's own name. `attention_pin` rides the same way when a request-scoped
-    development override names a kernel (cr-125). The worker keys that construction by
-    the pin, so the executor selects it before context-parallel installation.
+    binding's own name. `attention_pin` rides the same way when a caller prepares a
+    construction for one kernel (cr-125). The worker never does: a request's pin, and the
+    dev-mode `WorkerOptions.attention_pin` default, are execution parameters of `invoke`.
     """
 
     models = []
@@ -1080,7 +1062,6 @@ class Worker:
         #: plan id -> why THIS binding could not be prepared (#572d). A faulted binding
         #: refuses its own entrypoints and denies its siblings nothing.
         self.failed_bindings: dict[str, str] = {}
-        self.prepared_models: dict[str, PreparedModel] = {}
         self.jobs: dict[str, JobBinding] = {}
         from cozy_runtime.internal.worker.job_slots import JobSlot
 
@@ -1160,6 +1141,7 @@ class Worker:
             jobs={},
             spool_root=self.root / "spool",
             instance_id=options.instance_id,
+            attention_pin=options.attention_pin,
             send=self.send,
             progress=self.emit_progress,
             bundles=self.bundles,
@@ -1529,7 +1511,6 @@ class Worker:
             supervision = selected_job.supervision if selected_job is not None else self.supervision
             row = lane.row("")
             bindings: Mapping[str, DeclaredBinding] = {}
-            prepared: Mapping[str, PreparedModel] = {}
             failed: Mapping[str, str] = {}
         else:
             hosted = self.hosted.get(attempt.placement_id)
@@ -1538,7 +1519,6 @@ class Worker:
                 supervision = self.supervision
                 row = lane.row(self._primary_slot())
                 bindings = self.bindings
-                prepared = self.prepared_models
                 failed = self.failed_bindings
                 if self.placement is not None:
                     bindings_digest = documents.spell(self.placement.bindings_digest)
@@ -1547,7 +1527,6 @@ class Worker:
                 supervision = hosted.supervision
                 row = lane.row(attempt.placement_id)
                 bindings = hosted.bindings
-                prepared = hosted.prepared_models
                 failed = hosted.failed_bindings
                 bindings_digest = documents.spell(hosted.placement.bindings_digest)
         if attempt.lane_id and attempt.lane_id != lane.lane_id:
@@ -1570,7 +1549,6 @@ class Worker:
             ledger=row.ledger,
             chooser=row.chooser,
             bindings=bindings,
-            prepared_models=prepared,
             failed_bindings=failed,
             lane_id=lane.lane_id,
             devices=lane.devices,
@@ -4233,7 +4211,6 @@ class Worker:
             self.pending = None
             self._retire_hosted(set())
             self.bindings = {}
-            self.prepared_models = {}
             self.set_job_ready(False)
             return
 
@@ -4299,7 +4276,6 @@ class Worker:
         self.engine.jobs = {}
         if not placements:
             self.bindings = {}
-            self.prepared_models = {}
             executor = self.supervision.current
             if executor is not None:
                 try:
@@ -4542,7 +4518,6 @@ class Worker:
             self.placement = candidate
             self.pending = None
             self.bindings = bindings
-            self.prepared_models = {}
             self.bump_admission(
                 f"placement {candidate.placement_id or '(unnamed)'} moved to set "
                 f"{documents.spell(candidate.placement_set_digest)[:23]}…"
@@ -4633,9 +4608,6 @@ class Worker:
             self.placement = candidate
             self.pending = None
             self.bindings = bindings
-            self.prepared_models = {
-                digest: model for digest, model in self.prepared_models.items() if digest in kept
-            }
             self.failed_bindings = {
                 digest: why for digest, why in self.failed_bindings.items() if digest in kept
             }
@@ -4654,7 +4626,6 @@ class Worker:
                     <= loaded.parameters
                 ):
                     loaded.bindings = loaded.bindings | {digest}
-                    self.prepared_models[digest] = loaded.prepared_model
             wanted = {binding.construction_key() for binding in bindings.values()}
             stale = sorted(key for key in executor.loaded if key not in wanted)
             served = {digest for digest, key in before.items() if key in stale}
@@ -4880,7 +4851,6 @@ class Worker:
         if installed is not None:
             hosted.supervision.use_environment(str(installed.python), installed.installation_id)
         hosted.bindings = bindings
-        hosted.prepared_models = {}
         hosted.failed_bindings = {}
         if not self._assign_lane(placement, bindings, hosted.supervision):
             placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
@@ -5298,7 +5268,6 @@ class Worker:
                     )
                 self.job_slots.pop("envelope", None)
                 self.bindings = {}
-                self.prepared_models = {}
                 if self.placement is not None:
                     self._release_lane(self.placement.placement_id)
                 self.placement = None
@@ -5386,7 +5355,6 @@ class Worker:
         rather than being filled with a plausible OFFLINE.
         """
         self.bindings = {}
-        self.prepared_models = {}
         self.jobs = {}
         previous = self.supervision.current
         if previous is not None:
@@ -5568,7 +5536,6 @@ class Worker:
                 placement=self.placement,
                 supervision=self.supervision,
                 bindings=self.bindings,
-                prepared_models=self.prepared_models,
                 failed_bindings=self.failed_bindings,
                 lane=self._primary_lane(),
                 slot=self._primary_slot(),
@@ -5577,7 +5544,6 @@ class Worker:
             placement=hosted.placement,
             supervision=hosted.supervision,
             bindings=hosted.bindings,
-            prepared_models=hosted.prepared_models,
             failed_bindings=hosted.failed_bindings,
             lane=self._lane_of(placement_id),
             slot=placement_id,
@@ -5793,13 +5759,11 @@ class Worker:
                 or not executor.alive()
             ):
                 return  # admission refuses it with the real reason
-            attention_pin = str(attempt.spec.get("attention_kernel") or self.options.attention_pin)
-            base_key = declared.construction_key()
-            key = _attention_construction_key(base_key, attention_pin)
+            key = declared.construction_key()
             group = [
                 binding
                 for binding in tenant.bindings.values()
-                if binding.construction_key() == base_key
+                if binding.construction_key() == key
                 and binding.entrypoint_binding_digest not in tenant.failed_bindings
             ]
             loaded = executor.loaded.get(key)
@@ -5810,7 +5774,7 @@ class Worker:
                 or not {b.entrypoint_binding_digest for b in group} <= loaded.bindings
             )
         if load:
-            self._load_construction(tenant, executor, key, group, attention_pin=attention_pin)
+            self._load_construction(tenant, executor, key, group)
         if executor.active != key:
             self._activate_construction(tenant, executor, key)
 
@@ -5862,7 +5826,6 @@ class Worker:
         lane, slot = tenant.lane, tenant.slot
         placement_id = tenant.placement.placement_id
         first = group[0]
-        base_key = first.construction_key()
         label = key.removeprefix("sha256:")[:12]
         if not first.weightless:
             # A CO-TENANT PROCESS on a shared single-device lane gives the card up first
@@ -5939,12 +5902,6 @@ class Worker:
                 bindings=frozenset(binding.entrypoint_binding_digest for binding in group),
                 facts=facts,
             )
-            # The CURRENT slot, re-read: an in-place update may have swapped the placement's
-            # maps while this load ran without the control lock.
-            current = self._current_tenant(tenant)
-            for digest, binding in current.bindings.items():
-                if binding.construction_key() == base_key:
-                    current.prepared_models[digest] = resolved
             row = tenant.row()
             row.model_bearing = row.model_bearing or not first.weightless
             if row.ledger.executor_pid != executor.pid:
@@ -6030,10 +5987,9 @@ class Worker:
                 f"{code} - {detail}. The executor held nothing for it and keeps serving",
             )
             return
-        request_attention_refusal = code.startswith("attention_kernel_")
         with self.control_lock:
             current = self._current_tenant(tenant)
-            for member in group if not request_attention_refusal else ():
+            for member in group:
                 # PER-BINDING (#572d), and it OUTLIVES the rebuild the refusal causes: the
                 # process is replaced, but this construction is not tried again until the
                 # desired state changes.
