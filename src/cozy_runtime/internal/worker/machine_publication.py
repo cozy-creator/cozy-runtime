@@ -32,7 +32,7 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 _MAX_METADATA = 8 << 20
-# Most pushes in flight; the caller narrows it to the memory the pod can use.
+# Pushes in flight an upload starts with; measured progress grows it within memory.
 PUBLICATION_UPLOADS = 16
 # Hub's per-request object selection bound, and the progress-publication object bound.
 _PUBLICATION_WINDOW = 128
@@ -453,13 +453,13 @@ def upload_checkpoint(
     before_write: Callable[[], None],
     push: Callable[[str, int, str], None],
     landed: Callable[[int, int], None],
-    window: int,
+    streams: int,
 ) -> CheckpointRef:
     """Stage one exact retained closure and commit it; native TensorFS performs each push.
 
     The caller freezes the closure and keeps it retained before invoking this function,
-    and sizes ``window``, the pushes in flight. ``push`` receives only an admitted member
-    and its signed grant.
+    and bounds ``streams``, the pushes its memory holds in flight. ``push`` receives only
+    an admitted member and its signed grant.
     Opening, granting and pushing only stage bytes under the frozen operation, so
     ``before_stage`` fences them without a send marker; retrying them re-grants only
     objects the Hub does not hold. ``before_write`` records the one commit, finalize.
@@ -526,7 +526,7 @@ def upload_checkpoint(
         observed[key] = length
         if state not in {"accepted", "verifying"}:
             pending.append(key)
-    stage_objects(client, path, objects, pending, before_stage, push, landed, window)
+    stage_objects(client, path, objects, pending, before_stage, push, landed, streams)
     before_write()
     try:
         answer = _object(
@@ -553,6 +553,56 @@ def upload_checkpoint(
     return _checkpointed(answer, operation, checkpoint, objects)
 
 
+class _Pace:
+    """How many pushes run: from ``first``, doubled while the rate they land at improves.
+
+    A level's rate is the pushes measured in flight on average since it began, times its
+    landed pushes' bytes per second of push, once that many pushes started at the level
+    have landed. The best level measured then holds, never above ``most``, the pushes the
+    machine's memory holds.
+    """
+
+    def __init__(self, first: int, most: int) -> None:
+        self.level, self.most = max(1, min(first, most)), most
+        self.best = (0.0, self.level)
+        self.settled = self.level >= most
+        self.running = 0
+        self.at = time.monotonic()
+        self._begin()
+
+    def _begin(self) -> None:
+        self.since, self.busy = self.at, 0.0
+        self.moved = self.spent = 0.0
+        self.count = 0
+
+    def _tick(self, change: int) -> None:
+        now = time.monotonic()
+        self.busy += self.running * (now - self.at)
+        self.at, self.running = now, self.running + change
+
+    def started(self) -> None:
+        self._tick(1)
+
+    def ended(self, level: int, landed: tuple[int, float] | None) -> None:
+        """One push ended; ``landed`` is its bytes and seconds when it succeeded."""
+        self._tick(-1)
+        if self.settled or level != self.level or landed is None:
+            return
+        self.moved += landed[0]
+        self.spent += landed[1]
+        self.count += 1
+        if self.count < level or not self.spent or self.at <= self.since:
+            return
+        rate = self.busy / (self.at - self.since) * self.moved / self.spent
+        if rate > self.best[0]:
+            self.best = (rate, level)
+            if level < self.most:
+                self.level = min(2 * level, self.most)
+                self._begin()
+                return
+        self.level, self.settled = self.best[1], True
+
+
 def stage_objects(
     client: PublicationClient,
     path: str,
@@ -561,12 +611,12 @@ def stage_objects(
     before_stage: Callable[[], None],
     push: Callable[[str, int, str], None],
     landed: Callable[[int, int], None],
-    window: int,
+    streams: int,
 ) -> None:
-    """Grant and push the claimed members of one open publication the Hub does not hold.
+    """Grant, push and verify the claimed members of one open publication the Hub lacks.
 
     ``landed`` receives the count and bytes of ``objects`` the Hub is known to hold;
-    ``window`` bounds the pushes in flight.
+    ``streams`` bounds the pushes in flight, and measured progress picks how many run.
     """
     pending = sorted(pending)
     held_count = len(objects) - len(pending)
@@ -574,12 +624,15 @@ def stage_objects(
     count_lock = threading.Lock()
     landed(held_count, held_bytes)
 
-    def pushed(key: str, length: int, grant: str) -> None:
+    def pushed(key: str, length: int, grant: str) -> float:
         nonlocal held_count, held_bytes
+        started = time.monotonic()
         push(key, length, grant)
+        seconds = time.monotonic() - started
         with count_lock:
             held_count, held_bytes = held_count + 1, held_bytes + length
             landed(held_count, held_bytes)
+        return seconds
 
     def granted(selected: list[str]) -> list[tuple[str, int, str, float]]:
         """Validate one complete grants answer before spending any of its grants.
@@ -629,41 +682,81 @@ def stage_objects(
                 landed(held_count, held_bytes)
         return uploads
 
-    # A sliding window: each finished push starts the next granted object, and grants are
-    # fetched two windows ahead while pushes run. A grant gone cold before its push starts
-    # is asked for again. A failed push stops new pushes; the Hub re-grants only what is
-    # still missing when the same operation is retried. Every push finishes before this
-    # scope exits, so the caller's retention outlives it.
+    def verified(selected: list[str]) -> list[tuple[str, int, str, float]]:
+        """Hub verifies landed objects while pushes run, so its commit need not."""
+        before_stage()
+        body = canonical_json.encode({"object_ids": selected})
+        answer = _object(client.request("POST", path + "/verify", body)).get("publication")
+        if not isinstance(answer, dict):
+            raise PublicationRefusal("publication.response_invalid")
+        return []
+
+    # A sliding window of pushes. One Hub thread fetches grants two windows ahead and
+    # verifies landed objects, so a push never waits on the Hub. A grant gone cold before
+    # its push starts is asked for again. A failed push stops new pushes; the Hub re-grants
+    # only what is still missing when the same operation is retried. Every push finishes
+    # before this scope exits, so the caller's retention outlives it.
+    pace = _Pace(PUBLICATION_UPLOADS, streams)
     queued: deque[tuple[str, int, str, float]] = deque()
     cold: list[str] = []
-    running: set[Future[None]] = set()
+    unverified: list[str] = []
+    running: dict[Future[float], tuple[str, int, int]] = {}
+    # The one Hub call in flight: grants, answering uploads, or a verification, none.
+    asking: Future[list[tuple[str, int, str, float]]] | None = None
     failure: BaseException | None = None
     offset = 0
-    with ThreadPoolExecutor(max_workers=window) as pool:
+    with ThreadPoolExecutor(max_workers=streams) as pool, ThreadPoolExecutor(1) as hub:
         while True:
             if failure is None:
-                if len(queued) < window and (cold or offset < len(pending)):
-                    selected, cold = cold[: 2 * window], cold[2 * window :]
-                    fresh = pending[offset : offset + 2 * window - len(selected)]
+                unpushed = bool(cold or offset < len(pending))
+                if asking is None and len(queued) < pace.level and unpushed:
+                    batch = min(2 * pace.level, _PUBLICATION_WINDOW)
+                    selected, cold = cold[:batch], cold[batch:]
+                    fresh = pending[offset : offset + batch - len(selected)]
                     offset += len(fresh)
-                    queued.extend(granted(selected + fresh))
-                while queued and len(running) < window:
+                    asking = hub.submit(granted, selected + fresh)
+                elif (
+                    asking is None
+                    and unverified
+                    and (
+                        len(unverified) >= _PUBLICATION_WINDOW
+                        or not (unpushed or queued or running)
+                    )
+                ):
+                    selected = unverified[:_PUBLICATION_WINDOW]
+                    del unverified[:_PUBLICATION_WINDOW]
+                    asking = hub.submit(verified, selected)
+                while queued and len(running) < pace.level:
                     key, length, grant, expiry = queued.popleft()
                     if time.monotonic() >= expiry:
                         cold.append(key)
                         continue
                     before_stage()
-                    running.add(pool.submit(pushed, key, length, grant))
-            if not running:
+                    running[pool.submit(pushed, key, length, grant)] = key, length, pace.level
+                    pace.started()
+            waiting: set[Future[Any]] = set(running)
+            if asking is not None:
+                waiting.add(asking)
+            if not waiting:
                 if failure is not None:
                     raise failure
-                if offset >= len(pending) and not queued and not cold:
-                    break
-                continue
-            done, running = wait(running, return_when=FIRST_COMPLETED)
+                if cold or queued or unverified or offset < len(pending):
+                    continue
+                break
+            done, _ = wait(waiting, return_when=FIRST_COMPLETED)
             for future in done:
+                error = future.exception()
+                if future is asking:
+                    asking = None
+                    if error is None:
+                        queued.extend(future.result())
+                else:
+                    key, length, level = running.pop(future)
+                    pace.ended(level, None if error else (length, future.result()))
+                    if error is None:
+                        unverified.append(key)
                 if failure is None:
-                    failure = future.exception()
+                    failure = error
 
 
 def retain_objects(
@@ -674,7 +767,7 @@ def retain_objects(
     objects: Mapping[str, int],
     before_stage: Callable[[], None],
     push: Callable[[str, int, str], None],
-    window: int,
+    streams: int,
 ) -> None:
     """Put exact objects in Hub custody under an open publication that never finalizes.
 
@@ -720,7 +813,7 @@ def retain_objects(
         _require(state in {"accepted", "verifying", "claimed", "transferring"})
         if state not in {"accepted", "verifying"}:
             pending.append(key)
-    stage_objects(client, path, objects, pending, before_stage, push, lambda _n, _b: None, window)
+    stage_objects(client, path, objects, pending, before_stage, push, lambda _n, _b: None, streams)
     keys = sorted(objects)
     for offset in range(0, len(keys), _PUBLICATION_WINDOW):
         selected = keys[offset : offset + _PUBLICATION_WINDOW]

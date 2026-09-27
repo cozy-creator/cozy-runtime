@@ -29,7 +29,6 @@ from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.internal import fill, storage_admission
 from cozy_runtime.internal.worker import store_gc, upload_plan
 from cozy_runtime.internal.worker.machine_publication import (
-    PUBLICATION_UPLOADS,
     PublicationClient,
     PublicationRefusal,
     abandon_publication,
@@ -197,8 +196,6 @@ class Upload:
         self.tensorfs = fill.tensorfs_module()
         self.recipe = upload_plan.recipe_of(arguments, operation)
         self.slots = upload_plan.slots(arguments, self.recipe)
-        # Pushes in flight, narrowed to what the machine's memory holds.
-        self.window = self.tensorfs.transfer_streams(PUBLICATION_UPLOADS)
         self.passes = 0
 
     # ------------------------------------------------------------------ steps
@@ -503,7 +500,7 @@ class Upload:
                     objects=batch,
                     before_stage=self.check,
                     push=self._push(""),
-                    window=self.window,
+                    streams=self.tensorfs.transfer_streams(len(batch)),
                 )
             )
             self.tensorfs.record_model_source_custody(
@@ -553,7 +550,7 @@ class Upload:
                 before_write=self.check,
                 push=self._push(model["digest"]),
                 landed=lambda _n, _b: None,
-                window=self.window,
+                streams=self.tensorfs.transfer_streams(len(objects)),
             )
         )
 

@@ -17,7 +17,6 @@ from cozy_runtime.internal.worker import machine_models
 from cozy_runtime.internal.worker.machine_artifacts import model_retention
 from cozy_runtime.internal.worker.machine_publication import (
     FINALIZATION_ABSENT,
-    PUBLICATION_UPLOADS,
     PublicationAuthority,
     PublicationClient,
     PublicationRefusal,
@@ -602,7 +601,7 @@ class Effects:
                 before_write=lambda: self._before_write(owner, call),
                 push=push,
                 landed=landed,
-                window=fill.tensorfs_module().transfer_streams(PUBLICATION_UPLOADS),
+                streams=fill.tensorfs_module().transfer_streams(len(objects)),
             )
         except Exception as caught:
             exc = _refusal(caught)
