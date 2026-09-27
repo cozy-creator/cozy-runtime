@@ -2,8 +2,8 @@
 
 Real Worker, real delegated executor, real native source child and TensorFS store, driven
 through the machine-execution RPCs a rented run uses. The download origin is the only
-stand-in: it serves one carrier in two native ranges and can hold the second open, so the
-test sees exactly when the pod stops moving bytes.
+stand-in: it can hold a carrier's body open at the first 64 MiB checkpoint, so the test
+sees exactly when the pod stops moving bytes and which bytes a re-run fetches again.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast
 
 import grpc
 import pytest
@@ -31,6 +32,7 @@ from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+from cozy_runtime.internal.worker.stage_progress import SAMPLE_SECONDS
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
@@ -52,22 +54,22 @@ async def nested(ctx: Context, payload: Request) -> Result:
     return Result(1)
 """ % ("a" * 40)
 
-BLOCK = 64 << 20  # one native download range
+BLOCK = 64 << 20  # TensorFS makes a download durable every 64 MiB
 CHUNK = bytes(range(256)) * 4096
 LENGTH = BLOCK + 8 * len(CHUNK)
 
 
 class Origin:
-    """Serves provider/big.safetensors; while holding, the second range stops halfway and stays
-    open until its client hangs up."""
+    """Serves provider/big.safetensors. While holding, every body stops at the first 64 MiB
+    checkpoint and stays open until its client hangs up, so exactly that prefix is durable."""
 
     def __init__(self) -> None:
         self.holding = True
-        self.ranges: list[int] = []
         self.held = threading.Event()
         self.left = threading.Event()
-        self.first = threading.Event()
         self.closed = threading.Event()
+        # (start, bytes sent) of each body served after holding ends.
+        self.resumed: list[tuple[int, int]] = []
         digest = hashlib.sha256(CHUNK * (LENGTH // len(CHUNK))).hexdigest()
         origin = self
 
@@ -93,25 +95,32 @@ class Origin:
                     self.wfile.write(data)
                     return
                 start, end = map(int, self.headers["Range"].removeprefix("bytes=").split("-"))
-                origin.ranges.append(start)
-                hold = origin.holding and start == BLOCK
+                hold = origin.holding
                 self.send_response(206)
                 self.send_header("Content-Range", f"bytes {start}-{end}/{LENGTH}")
                 self.send_header("Content-Length", str(end - start + 1))
                 self.end_headers()
-                chunks = (end - start + 1) // len(CHUNK)
+                offset = start
                 try:
-                    for index in range(chunks):
-                        if hold and index == chunks // 2:
+                    while offset <= end:
+                        # A split run past the checkpoint never lands while holding, so the
+                        # durable prefix is exactly the first 64 MiB.
+                        if hold and (offset == BLOCK or start > BLOCK):
                             self.wfile.flush()
                             origin.held.set()
                             self._await_hangup()
                             return
-                        self.wfile.write(CHUNK)
-                    if start == 0:
-                        origin.first.set()
+                        if hold and offset + len(CHUNK) == BLOCK:
+                            # The durable report arrives after the progress lane's throttle.
+                            time.sleep(1.5 * SAMPLE_SECONDS)
+                        piece = CHUNK[offset % len(CHUNK) :][: end + 1 - offset]
+                        self.wfile.write(piece)
+                        offset += len(piece)
                 except (BrokenPipeError, ConnectionResetError):
                     origin.left.set()
+                finally:
+                    if not hold:
+                        origin.resumed.append((start, offset - start))
 
             def _await_hangup(self) -> None:
                 connection: socket.socket = self.connection
@@ -130,6 +139,16 @@ class Origin:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+
+
+def durable(pod: Machine) -> int:
+    """The source bytes the first run's download progress reports durable."""
+    rows = pod.rows("SELECT body FROM execution_events WHERE request='first' AND kind='progress'")
+    positions = [
+        canonical_json.decode(cast(bytes, row["body"])).get("payload", {}).get("position", 0)
+        for row in rows
+    ]
+    return max(positions, default=0)
 
 
 def registry() -> bytes:
@@ -336,8 +355,8 @@ def test_canceled_download_stops_and_a_rerun_resumes_its_prefix(
             pod.worker.source_calls.native_registry = registry()
             pod.start(())
             pod.submit("first")
-            pod.wait("the second range to be held open", origin.held.is_set, 120)
-            pod.wait("the first range to arrive whole", origin.first.is_set, 60)
+            pod.wait("a body to be held at the checkpoint", origin.held.is_set, 120)
+            pod.wait("the first 64 MiB reported durable", lambda: durable(pod) >= BLOCK, 60)
             pod.cancel("first")
 
             # The pod stops moving bytes: the held body is abandoned, not drained, and the
@@ -349,16 +368,16 @@ def test_canceled_download_stops_and_a_rerun_resumes_its_prefix(
                     p for p in pod.worker.source_calls.processes.values() if p and p.poll() is None
                 ]
             assert not live, "a native source child outlived its canceled parent"
-            moved = len(origin.ranges)
 
-            # An identical re-run resumes after the canceled run's durable first range.
+            # An identical re-run fetches exactly the bytes the canceled run left undurable.
             origin.holding = False
             pod.submit("second")
             body = pod.outcome("second")
             assert body["status"] == pb.OUTCOME_STATUS_SUCCEEDED, body
-            assert origin.ranges[moved:] == [BLOCK], (
-                f"re-run fetched ranges {origin.ranges[moved:]} after the durable first range"
+            assert origin.resumed and all(start >= BLOCK for start, _ in origin.resumed), (
+                f"re-run fetched {origin.resumed} below the durable 64 MiB prefix"
             )
+            assert sum(sent for _, sent in origin.resumed) == LENGTH - BLOCK
             (spent,) = pod.rows("SELECT state FROM native_calls WHERE parent_request='first'")
             assert spent["state"] == "released", "the adopted partial was not spent"
     finally:
