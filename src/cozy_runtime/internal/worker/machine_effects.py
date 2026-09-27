@@ -16,6 +16,7 @@ from cozy_runtime.internal import effect_interfaces, fill
 from cozy_runtime.internal.worker import machine_models
 from cozy_runtime.internal.worker.machine_artifacts import model_retention
 from cozy_runtime.internal.worker.machine_publication import (
+    FINALIZATION_ABSENT,
     PUBLICATION_UPLOADS,
     PublicationAuthority,
     PublicationClient,
@@ -25,6 +26,7 @@ from cozy_runtime.internal.worker.machine_publication import (
     attach_assessment,
     prepare_release,
     reconcile_checkpoint,
+    settle_checkpoint,
     upload_checkpoint,
 )
 from cozy_runtime.internal.worker.stage_progress import Progress, StageProgress
@@ -47,6 +49,14 @@ _STALLED_ATTEMPTS = 10
 _MAX_BACKOFF_SECONDS = 60.0
 # Hub's durable finalization job is progressing on its own: poll it at most 8 s apart.
 _PENDING_POLL_STALLS = 3
+# The machine's own publication authority no longer answers: only its owner can read Hub.
+AUTHORITY_LOST = frozenset(
+    {
+        "publication.authority_absent",
+        "publication.authority_refused",
+        "publication.authority_expired",
+    }
+)
 
 
 def _transient(exc: Exception) -> bool:
@@ -75,6 +85,29 @@ def _refusal(exc: Exception) -> Exception:
     return PublicationRefusal(code[:128], status=503 if native in _TRANSIENT_NATIVE else 409)
 
 
+def _publication(call: Call) -> dict[str, Any] | None:
+    """The Hub publication a checkpoint upload call names, or None for other effects."""
+    intent = canonical_json.decode(call.intent)
+    if (
+        intent.get("module") != effect_interfaces.MODULE
+        or intent.get("export") != "upload_checkpoint"
+    ):
+        return None
+    return {
+        "call_index": call.call_index,
+        "publication": call.child_request,
+        "destination": intent["request"]["destination"],
+    }
+
+
+def _document(body: bytes) -> dict[str, Any] | None:
+    try:
+        value = canonical_json.decode(body)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 class Effects:
     def __init__(
         self,
@@ -100,6 +133,8 @@ class Effects:
         # The stage each effect is in; it outlives retries, so its timing covers them.
         self.stages: dict[tuple[str, str], StageProgress] = {}
         self.cleanup_after: dict[str, tuple[int, str]] = {}
+        # Sent publications whose awaiting-owner notice this process already recorded.
+        self.noticed: set[tuple[str, str]] = set()
         self.stopped = False
 
     def _stalls(self, key: tuple[str, str], landed: int) -> int:
@@ -275,6 +310,7 @@ class Effects:
             latest = self.journal.get(owner, call.parent_request, call.call_index)
             if latest.sent:
                 self.journal.complete(owner, call, raw)
+                self._notice_settled(owner, latest, True)
             else:
                 self.journal.observe_result(owner, call, raw)
             self._settled(key, True)
@@ -313,8 +349,18 @@ class Effects:
             if latest.sent and isinstance(exc, PublicationUncommitted):
                 # Hub durably reports the commit did not land: settle like a refusal.
                 self.journal.uncommitted(owner, latest, exc.code, "publication commit did not land")
+                self._notice_settled(owner, latest, False)
                 self._settled(key, False)
                 return
+            target = _publication(latest)
+            if (
+                latest.sent
+                and target is not None
+                and isinstance(exc, PublicationRefusal)
+                and exc.code in AUTHORITY_LOST
+            ):
+                # Only the owner's own Hub credential can now read whether it committed.
+                self._notice_unresolved(owner, latest, target, exc.code)
             if (
                 latest.sent
                 and isinstance(exc, PublicationRefusal)
@@ -341,6 +387,7 @@ class Effects:
                         **({"stage": f"{stage.stage} / {phase}"} if stage is not None else {}),
                         "operation": "publication",
                         "call_index": call.call_index,
+                        **(target or {}),
                         "phase": phase,
                         "code": exc.code
                         if isinstance(exc, PublicationRefusal)
@@ -349,6 +396,123 @@ class Effects:
                 },
             )
             raise
+
+    def _notice_unresolved(self, owner: str, call: Call, target: dict[str, Any], code: str) -> None:
+        key = owner, call.child_request
+        with self.lock:
+            if key in self.noticed:
+                return
+            self.noticed.add(key)
+        self.executions.notice(
+            owner, call.parent_request, "publication_unresolved", {**target, "code": code}
+        )
+
+    def _notice_settled(self, owner: str, call: Call, committed: bool) -> None:
+        target = _publication(call)
+        if target is None:
+            return
+        with self.lock:
+            self.noticed.discard((owner, call.child_request))
+        self.executions.notice(
+            owner, call.parent_request, "publication_settled", {**target, "committed": committed}
+        )
+
+    def reconcile(
+        self, owner: str, request: str, call_index: int, status: int, body: bytes
+    ) -> None:
+        """Settle one sent publication from its owner's finalization read.
+
+        Refused while this machine's own authority still reads Hub: then it reconciles the
+        call itself. The owner's document must name this call's operation, checkpoint and
+        objects; a queued or running finalization is refused as pending.
+        """
+        call = self.journal.get(owner, request, call_index)
+        target = _publication(call)
+        if target is None:
+            raise WorkspaceRefusal("call is not a checkpoint publication")
+        if call.result or not call.sent:
+            return
+        upload = msgspec.convert(
+            canonical_json.decode(call.intent)["request"],
+            type=effect_interfaces.Upload,
+            strict=True,
+        )
+        checkpoint, objects = self._closure(call, upload)
+        try:
+            grant = self.executions.publication_authorization(owner, call.parent_request)
+            if not grant or self.authority is None:
+                raise PublicationRefusal("publication.authority_absent", status=403)
+            reconcile_checkpoint(
+                self.authority.client(grant),
+                operation=call.child_request,
+                checkpoint=checkpoint,
+                objects=objects,
+            )
+        except Exception as caught:
+            exc = _refusal(caught)
+            if not isinstance(exc, PublicationRefusal) or exc.code not in AUTHORITY_LOST:
+                raise WorkspaceRefusal(
+                    "machine publication authority still reads Hub; it reconciles this call"
+                ) from caught
+        else:
+            raise WorkspaceRefusal(
+                "machine publication authority still reads Hub; it reconciles this call"
+            )
+        document = _document(body)
+        committed, raw, code, detail = False, b"", "", ""
+        if 200 <= status < 300 and document is not None:
+            try:
+                settled = settle_checkpoint(
+                    document, operation=call.child_request, checkpoint=checkpoint, objects=objects
+                )
+            except PublicationUncommitted as exc:
+                code, detail = exc.code, "the owner's Hub reports the commit did not land"
+            except PublicationRefusal as exc:
+                raise WorkspaceRefusal(
+                    f"owner finalization read does not settle: {exc.code}"
+                ) from exc
+            else:
+                committed = True
+                raw = canonical_json.encode(msgspec.to_builtins(settled))
+        elif (
+            status == 404
+            and document is not None
+            and isinstance(document.get("error"), dict)
+            and document["error"].get("code") in FINALIZATION_ABSENT
+        ):
+            code = "publication.finalize_absent"
+            detail = "the owner's Hub holds no finalization for this publication"
+        else:
+            raise WorkspaceRefusal("owner finalization read is not a settlement")
+        try:
+            if committed:
+                self.journal.complete(owner, call, raw)
+            else:
+                self.journal.uncommitted(owner, call, code, detail)
+        except WorkspaceRefusal:
+            latest = self.journal.get(owner, request, call_index)
+            if latest.result or not latest.sent:
+                return  # settled concurrently
+            raise
+        self._notice_settled(owner, call, committed)
+        self._settled((owner, call.child_request), committed)
+
+    def _closure(
+        self, call: Call, upload: effect_interfaces.Upload
+    ) -> tuple[CheckpointRef, dict[str, int]]:
+        """The frozen checkpoint and its exact object inventory from the native manifest."""
+        artifact = upload.artifact
+        store = fill.store(self.workspace.store_root)
+        objects = {artifact.manifest.digest: artifact.manifest.length}
+        for row in store.walk_cozytensors(artifact.manifest.digest):
+            key, length = str(row["id"]), int(row["length"])
+            if key in objects and objects[key] != length:
+                raise WorkspaceRefusal("publication closure changed its object length")
+            objects[key] = length
+        checkpoint = CheckpointRef(
+            upload.destination, artifact.manifest.digest, artifact.manifest, call.child_request, ""
+        )
+        return checkpoint, objects
 
     def _settled(self, key: tuple[str, str], completed: bool) -> None:
         with self.lock:
@@ -387,15 +551,7 @@ class Effects:
         # The retention above keeps the closure; the native manifest fixes this inventory,
         # so no second file/catalog journal or inventory copy lives in execution_calls.
         store = fill.store(self.workspace.store_root)
-        objects = {artifact.manifest.digest: artifact.manifest.length}
-        for row in store.walk_cozytensors(artifact.manifest.digest):
-            key, length = str(row["id"]), int(row["length"])
-            if key in objects and objects[key] != length:
-                raise WorkspaceRefusal("publication closure changed its object length")
-            objects[key] = length
-        checkpoint = CheckpointRef(
-            request.destination, artifact.manifest.digest, artifact.manifest, call.child_request, ""
-        )
+        checkpoint, objects = self._closure(call, request)
         total = sum(objects.values())
         if call.sent:
             # A sent finalize is decided by Hub's durable job, without re-staging bytes.

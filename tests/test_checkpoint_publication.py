@@ -44,7 +44,7 @@ from cozy_runtime.internal.worker.machine_publication import (
     upload_checkpoint,
 )
 from cozy_runtime.internal.worker.session import _progress_document
-from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call, Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -100,6 +100,8 @@ class Hub:
         self.grant_seconds = 3600
         # Abandoned publications: Hub released their holds and refuses to stage them again.
         self.abandoned: set[str] = set()
+        # The machine authorization was revoked: its token and every token it holds refuse.
+        self.revoked = False
 
     def held(self, object_id: str) -> bool:
         with self.bucket.lock:
@@ -134,6 +136,8 @@ class Hub:
 
     def route(self, method: str, path: str, body: bytes) -> tuple[int, Any] | None:
         """``None``: the connection drops before Hub reads the request."""
+        if self.revoked:
+            return (403 if path.endswith("/token") else 401), {"code": "auth.revoked"}
         if method == "POST" and path == f"/v1/worker/machine-authorizations/{AUTHORIZATION}/token":
             return 200, {"token": "hub-token", "expires_at": "2099-01-01T00:00:00Z"}
         if path.startswith(MODELS + "/checkpoints/") and method == "GET":
@@ -407,6 +411,10 @@ class Stage:
         page = self.executions.events("owner", "parent")
         return [json.loads(event.body)["payload"] for event in page.events if event.kind == kind]
 
+    def notices(self, kind: str) -> list[dict[str, Any]]:
+        page = self.executions.events("owner", "parent")
+        return [json.loads(event.body) for event in page.events if event.kind == kind]
+
     def report(self, request: str, attempt: int, _index: int, frame: dict[str, Any]) -> None:
         """The worker's lane: a frame journals on its parent execution, as Creator reads it."""
         self.executions.progress("owner", request, attempt, _progress_document(frame))
@@ -608,6 +616,8 @@ def test_canceled_parent_settles_a_finalize_that_never_reached_the_hub(
         "stage": "Publishing checkpoint / reconciling",
         "operation": "publication",
         "call_index": 0,
+        "publication": staged.call().child_request,
+        "destination": "alice/model",
         "phase": "reconciling",
         "code": "publication.control_transport_unavailable",
     }
@@ -787,3 +797,85 @@ def test_a_retry_opens_only_the_objects_it_sends(stage: tuple[Stage, Hub, Effect
     )
     assert hub.bucket.puts[failing] > 1 and hub.bucket.puts[landed] == 1
     drive(effects, lambda: staged.hold_states() == ["released"])
+
+
+def owner_read(hub: Hub, operation: str) -> tuple[int, bytes]:
+    """The owner's own GET of the finalization status, as Hub answers it."""
+    with hub.lock:
+        view = hub.finalizations.get(operation)
+        if view is None:
+            body: dict[str, Any] = {
+                "error": {"code": "publication.finalization_absent", "message": "absent"}
+            }
+            return 404, json.dumps(body).encode()
+        return 200, json.dumps({k: v for k, v in view.items() if k != "manifest"}).encode()
+
+
+def revoke_after_send(staged: Stage, hub: Hub, effects: Effects) -> Call:
+    """The finalize is sent, then the machine authorization stops answering."""
+    drive(effects, lambda: staged.call().sent)
+    hub.revoked = True
+    drive(effects, lambda: bool(staged.notices("publication_unresolved")))
+    return staged.call()
+
+
+def test_expired_machine_authority_is_settled_committed_from_the_owners_read(
+    stage: tuple[Stage, Hub, Effects],
+) -> None:
+    staged, hub, effects = stage
+    hub.finalize_seconds = 3600  # the job commits when the test says so
+    call = revoke_after_send(staged, hub, effects)
+    publication = {"call_index": 0, "publication": call.child_request, "destination": "alice/model"}
+    assert staged.notices("publication_unresolved") == [
+        {**publication, "code": "publication.authority_refused"}
+    ]
+    drive(effects, lambda: any(e.get("publication") for e in staged.progress()))
+    assert {
+        **publication,
+        "phase": "reconciling",
+        "code": "publication.authority_refused",
+    }.items() <= [e for e in staged.progress() if e.get("publication")][-1].items()
+    # The owner reads the job still running: pending is not a settlement.
+    with pytest.raises(WorkspaceRefusal, match="finalization_pending"):
+        effects.reconcile("owner", "parent", 0, *owner_read(hub, call.child_request))
+    # Another operation's document does not settle this call.
+    status, body = owner_read(hub, call.child_request)
+    forged = json.loads(body) | {"operation": "call-other"}
+    with pytest.raises(WorkspaceRefusal):
+        effects.reconcile("owner", "parent", 0, status, json.dumps(forged).encode())
+    hub.finish(call.child_request)
+    effects.reconcile("owner", "parent", 0, *owner_read(hub, call.child_request))
+    settled = staged.call()
+    assert canonical_json.decode(settled.result)["checkpoint"] == staged.artifact.manifest.digest
+    assert staged.notices("publication_settled") == [{**publication, "committed": True}]
+    effects.reconcile("owner", "parent", 0, *owner_read(hub, call.child_request))  # idempotent
+    drive(effects, lambda: staged.hold_states() == ["released"])
+    assert not staged.calls.has_unsettled_effects("owner", "parent")
+
+
+def test_expired_machine_authority_with_no_finalization_releases_its_hold(
+    stage: tuple[Stage, Hub, Effects],
+) -> None:
+    staged, hub, effects = stage
+    hub.lose_finalize = True
+    call = revoke_after_send(staged, hub, effects)
+    # A 401 of the owner's own is not an answer.
+    with pytest.raises(WorkspaceRefusal, match="not a settlement"):
+        effects.reconcile("owner", "parent", 0, 401, b'{"error":{"code":"auth.required"}}')
+    effects.reconcile("owner", "parent", 0, *owner_read(hub, call.child_request))
+    settled = staged.call()
+    assert settled.safe_code == "publication.finalize_absent" and not settled.sent
+    assert staged.notices("publication_settled")[-1]["committed"] is False
+    drive(effects, lambda: staged.hold_states() == ["released"])
+    assert not staged.calls.has_unsettled_effects("owner", "parent")
+
+
+def test_a_machine_whose_authority_answers_refuses_owner_reconciliation(
+    stage: tuple[Stage, Hub, Effects],
+) -> None:
+    staged, hub, effects = stage
+    hub.finalize_seconds = 5.0
+    drive(effects, lambda: staged.call().sent)
+    with pytest.raises(WorkspaceRefusal, match="still reads Hub"):
+        effects.reconcile("owner", "parent", 0, *owner_read(hub, staged.call().child_request))
+    assert not staged.call().result

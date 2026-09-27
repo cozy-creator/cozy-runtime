@@ -13,6 +13,7 @@ class MachineExecutionAction(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     MACHINE_EXECUTION_ACTION_PAUSE: _ClassVar[MachineExecutionAction]
     MACHINE_EXECUTION_ACTION_RESUME: _ClassVar[MachineExecutionAction]
     MACHINE_EXECUTION_ACTION_CANCEL: _ClassVar[MachineExecutionAction]
+    MACHINE_EXECUTION_ACTION_RECONCILE_PUBLICATION: _ClassVar[MachineExecutionAction]
 
 class ChildCallState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -340,6 +341,7 @@ MACHINE_EXECUTION_ACTION_UNSPECIFIED: MachineExecutionAction
 MACHINE_EXECUTION_ACTION_PAUSE: MachineExecutionAction
 MACHINE_EXECUTION_ACTION_RESUME: MachineExecutionAction
 MACHINE_EXECUTION_ACTION_CANCEL: MachineExecutionAction
+MACHINE_EXECUTION_ACTION_RECONCILE_PUBLICATION: MachineExecutionAction
 CHILD_CALL_STATE_UNSPECIFIED: ChildCallState
 CHILD_CALL_STATE_PENDING: ChildCallState
 CHILD_CALL_STATE_SUCCEEDED: ChildCallState
@@ -662,7 +664,7 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus", "owner_publication_reconciliation")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -671,6 +673,7 @@ class MachineExecutionWorkspace(_message.Message):
     EXECUTOR_UID_ISOLATION_FIELD_NUMBER: _ClassVar[int]
     CPU_SLOT_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
     EXACT_EXECUTION_GPUS_FIELD_NUMBER: _ClassVar[int]
+    OWNER_PUBLICATION_RECONCILIATION_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -679,7 +682,8 @@ class MachineExecutionWorkspace(_message.Message):
     executor_uid_isolation: bool
     cpu_slot_model_inputs: bool
     exact_execution_gpus: bool
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ...) -> None: ...
+    owner_publication_reconciliation: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ..., owner_publication_reconciliation: bool = ...) -> None: ...
 
 class MachineDevice(_message.Message):
     __slots__ = ("ordinal", "name", "uuid", "memory_bytes", "pci_bus_id", "driver_version")
@@ -828,16 +832,28 @@ class MachineExecutionEventPage(_message.Message):
     def __init__(self, events: _Optional[_Iterable[_Union[MachineExecutionEvent, _Mapping]]] = ..., next_after: _Optional[int] = ..., head_sequence: _Optional[int] = ..., compacted_through: _Optional[int] = ...) -> None: ...
 
 class MachineExecutionControl(_message.Message):
-    __slots__ = ("execution", "command_id", "expected_generation", "action")
+    __slots__ = ("execution", "command_id", "expected_generation", "action", "publication")
     EXECUTION_FIELD_NUMBER: _ClassVar[int]
     COMMAND_ID_FIELD_NUMBER: _ClassVar[int]
     EXPECTED_GENERATION_FIELD_NUMBER: _ClassVar[int]
     ACTION_FIELD_NUMBER: _ClassVar[int]
+    PUBLICATION_FIELD_NUMBER: _ClassVar[int]
     execution: MachineExecutionQuery
     command_id: str
     expected_generation: int
     action: MachineExecutionAction
-    def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., command_id: _Optional[str] = ..., expected_generation: _Optional[int] = ..., action: _Optional[_Union[MachineExecutionAction, str]] = ...) -> None: ...
+    publication: MachinePublicationReconciliation
+    def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., command_id: _Optional[str] = ..., expected_generation: _Optional[int] = ..., action: _Optional[_Union[MachineExecutionAction, str]] = ..., publication: _Optional[_Union[MachinePublicationReconciliation, _Mapping]] = ...) -> None: ...
+
+class MachinePublicationReconciliation(_message.Message):
+    __slots__ = ("call_index", "http_status", "finalization")
+    CALL_INDEX_FIELD_NUMBER: _ClassVar[int]
+    HTTP_STATUS_FIELD_NUMBER: _ClassVar[int]
+    FINALIZATION_FIELD_NUMBER: _ClassVar[int]
+    call_index: int
+    http_status: int
+    finalization: bytes
+    def __init__(self, call_index: _Optional[int] = ..., http_status: _Optional[int] = ..., finalization: _Optional[bytes] = ...) -> None: ...
 
 class MachineExecutionCollect(_message.Message):
     __slots__ = ("execution", "attempt_ordinal")

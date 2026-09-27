@@ -405,6 +405,22 @@ def _settle(
     return _checkpointed(view.get("result"), operation, checkpoint, objects)
 
 
+#: Hub codes of the owner's finalization read meaning no finalize ever reached it.
+FINALIZATION_ABSENT = frozenset({"publication.not_found", "publication.finalization_absent"})
+
+
+def settle_checkpoint(
+    view: Mapping[str, Any],
+    *,
+    operation: str,
+    checkpoint: CheckpointRef,
+    objects: Mapping[str, int],
+) -> CheckpointRef:
+    """Settle a sent finalize from a finalization document another reader fetched."""
+    path, _ = _checkpoint_inputs(operation, checkpoint, objects)
+    return _settle(dict(view), path, operation, checkpoint, objects)
+
+
 def reconcile_checkpoint(
     client: PublicationClient,
     *,
