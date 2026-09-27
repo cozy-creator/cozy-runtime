@@ -169,9 +169,9 @@ def select(
 ) -> Interpreter:
     constraint = _constraint(requires, version)
     choices = available(default, root=root)
-    for candidate in choices:
-        if constraint.contains(candidate.version):
-            return candidate
+    chosen = _choose(choices, constraint, version)
+    if chosen is not None:
+        return chosen
     raise InterpreterRefusal(
         f"requires Python {requires or 'any'}"
         f"{(' with captured version ' + version) if version else ''}; "
@@ -197,14 +197,23 @@ def provisionable_minors() -> tuple[str, ...]:
 
 
 def _constraint(requires: str, version: str) -> SpecifierSet:
+    """Authored requirements stay exact; a captured version selects only its ABI minor."""
     if version and not re.fullmatch(r"3\.[0-9]+(?:\.[0-9]+)?", version):
         raise InterpreterRefusal(f"invalid stable CPython version: {version}")
-    if version and version.count(".") == 1:
-        version += ".*"
+    minor = ".".join(version.split(".")[:2]) + ".*" if version else ""
     try:
-        return SpecifierSet(",".join(filter(None, (requires, "==" + version if version else ""))))
+        return SpecifierSet(",".join(filter(None, (requires, "==" + minor if minor else ""))))
     except InvalidSpecifier as exc:
         raise InterpreterRefusal(f"invalid Python requirement: {exc}") from exc
+
+
+def _choose(
+    choices: tuple[Interpreter, ...], constraint: SpecifierSet, version: str
+) -> Interpreter | None:
+    """The captured patch when installed, otherwise the lowest compatible interpreter."""
+    matching = [candidate for candidate in choices if constraint.contains(candidate.version)]
+    exact = [candidate for candidate in matching if candidate.version == version]
+    return next(iter(exact or matching), None)
 
 
 def _check_cancel(cancel: Callable[[], bool] | None) -> None:
@@ -262,7 +271,10 @@ def _run_uv(command: list[str], *, env: dict[str, str], cancel: Callable[[], boo
 
 
 def _download_version(
-    uv: str, constraint: SpecifierSet, cancel: Callable[[], bool] | None = None
+    uv: str,
+    constraint: SpecifierSet,
+    cancel: Callable[[], bool] | None = None,
+    preferred: str = "",
 ) -> str:
     # uv's bundled catalogue is read offline. Filter every patch, so <3.13.5 does
     # not download the latest 3.13 only to discover that an older patch was needed.
@@ -298,6 +310,8 @@ def _download_version(
             f"requires Python {constraint}; supported window: {', '.join(supported_minors())}; "
             "no matching stable CPython download in uv's catalogue"
         )
+    if preferred and Version(preferred) in versions:
+        return preferred
     minor = min((v.major, v.minor) for v in versions)
     return str(max(v for v in versions if (v.major, v.minor) == minor))
 
@@ -321,14 +335,13 @@ def ensure(
 
     constraint = _constraint(requires, version)
     _check_cancel(cancel)
-    choices = available(default, root=root)
-    for candidate in choices:
-        if constraint.contains(candidate.version):
-            return candidate
+    chosen = _choose(available(default, root=root), constraint, version)
+    if chosen is not None:
+        return chosen
     uv = shutil.which("uv")
     if uv is None:
         raise InterpreterRefusal("uv is required to provision a supported Python interpreter")
-    selected = _download_version(uv, constraint, cancel)
+    selected = _download_version(uv, constraint, cancel, version)
     _check_cancel(cancel)
     # Reserve archive + extraction + cache before creating any owned directories.
     # CPython's stripped standalone build fits well below this conservative bound.
@@ -336,9 +349,9 @@ def ensure(
         _require_owned_root(root)
         # Recheck after admission. uv itself locks its managed directory across
         # the installed-version check and atomic publication, including races here.
-        for candidate in available(default, root=root):
-            if constraint.contains(candidate.version):
-                return candidate
+        chosen = _choose(available(default, root=root), constraint, version)
+        if chosen is not None:
+            return chosen
         if progress is not None:
             progress(f"Installing CPython {selected}")
         managed = root / "managed"

@@ -6,10 +6,8 @@
 * the hub's facts assembler, so a release whose callables are all jobs shipped
   `model_slot_paths: []` and the pod refused every download set that bound a job slot
   (paul/minimax-h3-tools is exactly that shape; its four-lane binds two of nine);
-* `_prepare_published`'s `declared` cross-check, which would then have refused
-  `package_prepare_model_slots_disagree` the moment the hub started telling the truth --
-  paul/anima, whose `generate` is the only callable anyone had exercised, breaks here
-  first;
+* `_prepare_published`'s `declared` cross-check against the hub's copy of the slot list,
+  now deleted: the installed interface is the only slot authority;
 * `_entrypoints`' unused-selection check, which insisted every selected model be bound
   into an Entrypoint. A job has no placement and no residency: its Model parameter is an
   attempt-held, derive-only view of one TensorFS Manifest, so a job's selection is
@@ -37,10 +35,8 @@ from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     _entrypoints,
     _prepare_published,
-    _request_facts,
     _slot_paths,
 )
-from cozy_runtime.protocol import worker_pb2 as pb
 
 ROOT = Path(__file__).resolve().parent.parent
 TENANT = ROOT / "corpus" / "tenant"
@@ -211,8 +207,6 @@ def test_a_job_shaped_selection_prepares(
     result = _prepare_published(
         package_name=PACKAGE,
         release=RELEASE,
-        application=str(interface["application"]),
-        model_slot_paths=tuple(sorted((ENTRYPOINT_SLOT, RETOUCH_SLOT, JOB_SLOT))),
         locked=package_environment.read_locked_requirements(
             b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
         ),
@@ -364,67 +358,3 @@ def test_a_selection_no_callable_declares_still_refuses(
         )
     assert refusal.value.code == "package_prepare_model_selection_mismatch"
     assert "no_such.models.source" in refusal.value.detail
-
-
-def test_an_entrypoints_only_facts_request_refuses_and_names_the_gap(
-    interface: dict[str, Any], released: tuple[Path, str, int], tmp_path: Path
-) -> None:
-    """The two halves must ship together. A hub that still reads only `entrypoints` sends
-    a slot set the derived interface disagrees with, and the refusal names WHICH slot is
-    missing rather than printing two lists to diff by eye."""
-
-    store_root, manifest, _length = released
-    raw = package_interface.canonical_bytes(interface)
-    with pytest.raises(PreparationRefusal) as refusal:
-        _prepare_published(
-            package_name=PACKAGE,
-            release=RELEASE,
-            application=str(interface["application"]),
-            model_slot_paths=(ENTRYPOINT_SLOT, RETOUCH_SLOT),
-            locked=package_environment.read_locked_requirements(
-                b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
-            ),
-            models=[_selection(JOB_SLOT, manifest)],
-            artifact_cache=tmp_path / "artifacts",
-            tensorfs_root=store_root,
-            install_root=tmp_path / "install",
-            python=Path(sys.executable),
-            interface=lambda _installed, _distribution: raw,
-            verified=lambda _digest, _length, _path: None,
-            job_plan_root=tmp_path / "job-plans",
-            base=None,
-            installed_environment=_installed(tmp_path),
-        )
-    assert refusal.value.code == "package_prepare_model_slots_disagree"
-    assert f"interface-only=['{JOB_SLOT}']" in refusal.value.detail
-
-
-def _facts_request(slot_paths: list[str]) -> pb.PreparePackageSetRequest:
-    return pb.PreparePackageSetRequest(
-        application="tenant_job:app",
-        model_slot_paths=slot_paths,
-        image_inventory=pb.ImageInventory(profile="test", python="3.12.0"),
-        locked_requirements=b"--index-url https://pypi.org/simple\n"
-        b"tenant==1 --hash=sha256:" + b"a" * 64 + b"\n",
-    )
-
-
-def test_the_bound_slots_are_a_subset_of_the_declared_ones() -> None:
-    """The relation the pod enforces on every prepare. An invocation binds SOME of what the
-    release declares; only a slot the release does not declare is a refusal."""
-
-    # sorted unique: the wire bound the hub already honours.
-    declared = sorted([ENTRYPOINT_SLOT, RETOUCH_SLOT, JOB_SLOT])
-    for bound in ([], [JOB_SLOT], [ENTRYPOINT_SLOT], declared):
-        _, slot_paths, _ = _request_facts(
-            _facts_request(declared), [_selection(slot, "sha256:" + "b" * 64) for slot in bound]
-        )
-        assert set(bound).issubset(slot_paths)
-
-    with pytest.raises(PreparationRefusal) as refusal:
-        _request_facts(
-            _facts_request([ENTRYPOINT_SLOT]),
-            [_selection(JOB_SLOT, "sha256:" + "b" * 64)],
-        )
-    assert refusal.value.code == "package_prepare_model_slot_unknown"
-    assert refusal.value.detail == JOB_SLOT
