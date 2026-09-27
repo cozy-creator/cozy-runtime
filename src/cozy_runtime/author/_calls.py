@@ -477,6 +477,7 @@ class _Broker:
                 self.nudges.setblocking(False)
                 self.loop = asyncio.get_running_loop()
                 self.loop.add_reader(self.nudges.fileno(), self._drain)
+                return  # a change before the socket existed nudged no one: poll once more
         if self.nudges is None:
             await asyncio.sleep(_UNNOTIFIED_POLL_SECONDS)
             return
