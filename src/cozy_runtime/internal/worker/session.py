@@ -1088,6 +1088,8 @@ class Worker:
         self.job_slots: dict[str, JobSlot] = {}
         #: idle CPU executors by (installation, job, directive), adopted by the next request
         self.warm_cpu: dict[tuple[str, str, bytes], JobSlot] = {}
+        #: the last (owner epoch, proof) whose Ed25519 signature this worker verified
+        self._proven_claim: tuple[int, bytes] = (0, b"")
         self.placement: Placement | None = None
         #: The INCOMING placement being staged while `placement` keeps serving (#474). It is
         #: a separate field precisely because one field cannot hold both, which is the same
@@ -2163,16 +2165,21 @@ class Worker:
                     or claim.worker_id != self.options.worker_id
                 ):
                     raise WorkspaceRefusal("workspace proof names another worker lifetime")
-                try:
-                    downloads.verify_claim_proof(
-                        claim,
-                        self.config.record_owner_public_key,
-                        worker_id=self.options.worker_id,
-                        worker_boot_id=self.fence.worker_boot_id,
-                        worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
-                    )
-                except downloads.DownloadRefusal as exc:
-                    raise WorkspaceRefusal("workspace owner proof was refused") from exc
+                # The transcript is (epoch, boot, worker, certificate); all but the epoch are
+                # this process's own, so one verified signature stands for the epoch.
+                proven = (claim.record_owner_epoch, bytes(claim.proof))
+                if proven != self._proven_claim:
+                    try:
+                        downloads.verify_claim_proof(
+                            claim,
+                            self.config.record_owner_public_key,
+                            worker_id=self.options.worker_id,
+                            worker_boot_id=self.fence.worker_boot_id,
+                            worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
+                        )
+                    except downloads.DownloadRefusal as exc:
+                        raise WorkspaceRefusal("workspace owner proof was refused") from exc
+                    self._proven_claim = proven
             elif (
                 not self.bootstrap
                 or not hmac.compare_digest(claim.proof, self.bootstrap.encode())
