@@ -2,8 +2,8 @@
 
 This adapter calls the upstream `sol_attn.sol_attn` package. It does not implement
 a sparse kernel. The first supported interface is BF16, batch-one NHD, head
-width128, unmasked noncausal inference on SM90. Ulysses degrees 2 and 4 are
-supported when heads divide evenly. Ring attention, compiled execution, dropout,
+width128, unmasked noncausal inference on SM90. Any Ulysses degree that divides
+the heads is supported. Ring attention, compiled execution, dropout,
 GQA and LSE requests refuse explicitly.
 
 A model opens `attention_scope(AttentionLayout(...))` around each DiT step. It
@@ -32,7 +32,7 @@ conditioning prefix.
 
 CPU tests cover immutable/nested scopes, real module-hook cleanup, genuine dense
 attention with poisoned trailing padding, refiner document isolation and invalid
-requests. Real two/four-process Gloo tests cover unequal token shards and the
+requests. Real Gloo tests at degrees 2, 4, 7 and 8 cover unequal token shards and the
 component-call layout transport. A separate native helper runs actual NCCL and
 Sol, compares head partitions against the full-head call, and uses upstream
 preparation plus a native all-keys control to prove genuine sparse work. This

@@ -192,11 +192,14 @@ class H3Calls(Model[object]):
 
 
 def h3_model() -> H3Calls:
-    from diffusers import MiniMaxH3Transformer3DModel
+    from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
 
     torch.manual_seed(231)
-    dit = MiniMaxH3Transformer3DModel(
-        num_attention_heads=4,
+    # The served AdaLN-pruned DiT with H3's 56 heads, so every declared degree divides them.
+    dit = AdaLNPrunedMiniMaxH3Transformer(
+        table_timesteps=(0.0, 0.25, 0.75),
+        table_block_keys=[(row, tag) for row in range(3) for tag in range(3)],
+        num_attention_heads=56,
         attention_head_dim=16,
         hidden_size=16,
         num_layers=2,
@@ -211,6 +214,9 @@ def h3_model() -> H3Calls:
         time_embed_dim=8,
         rope_freq_dim=2,
     ).eval()
+    with torch.no_grad():
+        for table in (dit.norm_out.table, *(b.adaln_proj.table for b in dit.transformer_blocks)):
+            table.normal_()
     # Runtime's own selection: its SDPA runs through the Ulysses wrapper on sharded sites.
     attention.install(attention.available(DeviceFacts("cpu", "CPU", 0, "", "", 0)), {"dit": dit})
 
@@ -223,37 +229,38 @@ def h3_model() -> H3Calls:
 
 def h3_batch(*, mixed_lengths: bool = False) -> dict[str, Any]:
     # Interleaved modalities exercise packed indices across each shard. Gloo cannot
-    # gather uneven tensor sizes; actual uneven H3 lengths require the NCCL CLI gate.
+    # gather uneven tensor sizes, so both packings are 56 rows, which every declared degree
+    # divides; uneven lengths are exercised by the attention exchange tests and NCCL.
     generator = torch.Generator().manual_seed(91)
     if mixed_lengths:
         # Different modality lengths and a nonperiodic packing catch an accidental
-        # per-modality split. Packed length 32 keeps the final Gloo gather uniform.
-        tags = torch.tensor([0] * 5 + [1] * 16 + [2] * 11)
-        tags = tags[torch.randperm(32, generator=generator)]
+        # per-modality split.
+        tags = torch.tensor([0] * 9 + [1] * 28 + [2] * 19)
+        tags = tags[torch.randperm(56, generator=generator)]
         return {
-            "hidden_states": torch.randn(1, 5, 2, generator=generator),
-            "audio_hidden_states": torch.randn(1, 11, 2, generator=generator),
-            "encoder_hidden_states": torch.randn(1, 16, 4, generator=generator),
+            "hidden_states": torch.randn(1, 9, 2, generator=generator),
+            "audio_hidden_states": torch.randn(1, 19, 2, generator=generator),
+            "encoder_hidden_states": torch.randn(1, 28, 4, generator=generator),
             "timestep": torch.tensor([0.0, 0.25, 0.75]),
-            "timestep_indices": torch.arange(32) % 3,
+            "timestep_indices": torch.arange(56) % 3,
             "token_tags": tags,
-            "position_ids": torch.arange(96).reshape(32, 3) % 5,
+            "position_ids": torch.arange(168).reshape(56, 3) % 5,
             "video_indices": torch.where(tags == 0)[0],
             "text_indices": torch.where(tags == 1)[0],
             "audio_indices": torch.where(tags == 2)[0],
             "return_dict": False,
         }
     return {
-        "hidden_states": torch.randn(1, 8, 2, generator=generator),
-        "audio_hidden_states": torch.randn(1, 8, 2, generator=generator),
-        "encoder_hidden_states": torch.randn(1, 8, 4, generator=generator),
+        "hidden_states": torch.randn(1, 19, 2, generator=generator),
+        "audio_hidden_states": torch.randn(1, 18, 2, generator=generator),
+        "encoder_hidden_states": torch.randn(1, 19, 4, generator=generator),
         "timestep": torch.tensor([0.0, 0.25, 0.75]),
-        "timestep_indices": torch.arange(24) % 3,
-        "token_tags": torch.arange(24) % 3,
-        "position_ids": torch.arange(72).reshape(24, 3) % 5,
-        "video_indices": torch.arange(0, 24, 3),
-        "text_indices": torch.arange(1, 24, 3),
-        "audio_indices": torch.arange(2, 24, 3),
+        "timestep_indices": torch.arange(56) % 3,
+        "token_tags": torch.arange(56) % 3,
+        "position_ids": torch.arange(168).reshape(56, 3) % 5,
+        "video_indices": torch.arange(0, 56, 3),
+        "text_indices": torch.arange(1, 56, 3),
+        "audio_indices": torch.arange(2, 56, 3),
         "return_dict": False,
     }
 

@@ -118,7 +118,7 @@ class OverlayPipe:
         self.components = {"projection": torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)}
 
 
-@sequence_parallel(degrees=(2, 4))
+@sequence_parallel(degrees=(2, 4, 7, 8))
 class Base(Model[BasePipe], encoded_leaves="accept"):
     pipe: BasePipe
 
@@ -186,7 +186,7 @@ class Base(Model[BasePipe], encoded_leaves="accept"):
             return self.pipe.components["fl2va_dit"](**values)
 
 
-@sequence_parallel(degrees=(2, 4))
+@sequence_parallel(degrees=(2, 4, 7, 8))
 class Overlay(Model[OverlayPipe]):
     pipe: OverlayPipe
 

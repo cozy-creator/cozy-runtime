@@ -209,11 +209,13 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--degree", type=int, choices=(2, 4), required=True)
+    parser.add_argument("--degree", type=int, required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--heads", type=int, choices=(8, 56), default=8)
     args = parser.parse_args()
+    if args.degree < 2 or args.heads % args.degree:
+        parser.error(f"Ulysses degree {args.degree} must be >= 2 and divide {args.heads} heads")
     args.root.mkdir(parents=True, exist_ok=True)
     spawn_ranks: Any = spawn
     spawn_ranks(

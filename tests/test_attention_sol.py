@@ -202,7 +202,7 @@ def test_mirrored_attention_layout_is_closed_and_restores_on_failure(tmp_path: P
     assert _ACTIVE_LAYOUT.get() is None
 
 
-@pytest.mark.parametrize("degree", [2, 4])
+@pytest.mark.parametrize("degree", [2, 4, 7, 8])
 def test_sol_global_document_exchange_on_real_gloo(tmp_path: Path, degree: int) -> None:
     """Actual Diffusers unequal-sequence all-to-all and dense policy; no sparse GPU claim."""
     import os
@@ -219,6 +219,8 @@ def test_sol_global_document_exchange_on_real_gloo(tmp_path: Path, degree: int) 
             str(degree),
             "--root",
             str(tmp_path),
+            "--heads",
+            "56",
         ],
         env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
         text=True,

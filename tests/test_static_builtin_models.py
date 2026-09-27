@@ -44,7 +44,7 @@ def render(ctx: Context, payload: Request, model: Custom) -> Result:
     assert model["class"] == "Custom"
     assert model["encoded_leaves"] == "accept"
     assert model["fusion"] == "accept"
-    assert model["sequence_parallel"] == {"degrees": [2, 4]}
+    assert model["sequence_parallel"] == {"degrees": [2, 4, 7, 8]}
     assert model["component_use"]["sample_fl2va"] == ["fl2va_dit"]
     assert model["component_use"]["extra"] == ["text_encoder"]
     assert model["default_ladder"] == [{"gpu": "H100", "lane": "paul/minimax-h3@1.0.0/fp8"}]
