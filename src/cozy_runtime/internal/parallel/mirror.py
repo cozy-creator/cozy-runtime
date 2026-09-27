@@ -72,6 +72,7 @@ def mirror_component(
                     placement=residency.placement,
                     headroom_bytes=residency.headroom,
                     scope_headroom_bytes=residency.scope_headrooms,
+                    measured_scopes=sorted(residency.measured),
                 )
             scopes.append(scope)
         payloads = wire.TensorSpool(directory / "ranks", references)

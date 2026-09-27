@@ -302,6 +302,7 @@ class _CompositeResidency:
         placement: str,
         headroom_bytes: int,
         scope_headroom_bytes: dict[str, int] | None = None,
+        measured: tuple[str, ...] | frozenset[str] = (),
     ) -> None:
         for name, row in self.rows.items():
             prefix = name + "."
@@ -310,7 +311,8 @@ class _CompositeResidency:
                 for key, value in (scope_headroom_bytes or {}).items()
                 if key.startswith(prefix)
             }
-            row.open_attempt(placement, headroom_bytes, scoped)
+            mine = tuple(key.removeprefix(prefix) for key in measured if key.startswith(prefix))
+            row.open_attempt(placement, headroom_bytes, scoped, mine)
 
     def vacate(self) -> dict[str, Any]:
         """Every slot frees its own components; the reports merge under the slot prefix."""
@@ -835,6 +837,7 @@ class Executor:
                             scope["placement"],
                             scope["headroom_bytes"],
                             scope["scope_headroom_bytes"],
+                            tuple(scope.get("measured_scopes") or ()),
                         )
                         self._group_attempts[key] = spool
                     stack.enter_context(models[key]._cozy_scope(scope["method"], components))
@@ -2930,6 +2933,7 @@ class Executor:
                     str(method): int(value)
                     for method, value in (command.get("scope_headroom_bytes") or {}).items()
                 },
+                tuple(str(method) for method in command.get("measured_scopes") or ()),
             )
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
