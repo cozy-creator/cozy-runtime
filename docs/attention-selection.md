@@ -104,8 +104,10 @@ whose reductions stay within a head therefore matches one GPU; FlashInfer's glob
 amax does not, so it is registered without context parallelism. Ring is refused.
 
 Each rank probes the function it serves at `(1, 73439, 2, 128)` — one H3 rank's 10 s
-document, where length-dependent error shows — against exact float64 attention over four
-row groups, each gated alone so a localized fault cannot average out: 128 sampled rows
+document, where length-dependent error shows — on QK-normalised inputs whose logits have
+standard deviation 4 (the sharp attention video DiTs serve; N(0, 1) inputs attend almost
+uniformly and let per-head FP8 pass while it garbles H3) — against exact float64 attention
+over four row groups, each gated alone so a localized fault cannot average out: 128 sampled rows
 (even and seeded random), the first and last 256 rows (first tile, partial tail tile) and
 both rows at every multiple of 16 (every tile edge). Non-finite output fails first; then
 the worst group's rel L2 against the kernel's

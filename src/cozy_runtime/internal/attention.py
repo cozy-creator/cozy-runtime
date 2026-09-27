@@ -491,6 +491,13 @@ PROBE_ROWS = 64
 #: tile height up to 256. Each group is held to the budget alone, so a fault cannot average out.
 PROBE_TILE_GRAIN = 16
 PROBE_END_ROWS = 256
+#: Probe Q/K rows are RMS-normalised and scaled so logits have this standard deviation: the
+#: sharp attention QK-normalised video DiTs serve (effective keys ~30 of 73k). N(0, 1) inputs
+#: give logit std 1, near-uniform attention where per-head FP8 rounding of K averages out:
+#: FA3 FP8 passed its budget there on H100 and garbled H3 video (run 1250). At std 4 its
+#: dequantised inputs alone measure 0.11 rel L2 against 0.032 for Kitchen INT8 and 0.0018
+#: for BF16 kernels (h3a-044 real H3 deep blocks: 0.18 for FP8 inputs, 0.066 for Sage).
+PROBE_LOGIT_STD = 4.0
 #: Exact rows per float64 pass: 256 x 73,439 keys is ~150 MB of weights.
 _EXACT_ROWS_PER_PASS = 256
 #: Torch's quadratic-memory math fallback cannot hold the production length and does not
@@ -501,8 +508,13 @@ PROBE_SHORT: tuple[int, int, int, int] = (1, 256, 4, 128)
 _PROBE_SEEDS = count(0x5A6E)
 
 
-def _computes(entry: Ready, device: DeviceFacts) -> dict[str, Any] | None:
-    """PROVE the served function computes attention on THIS device, or refuse it by name."""
+def probe(
+    entry: Ready, device: DeviceFacts, shape: tuple[int, int, int, int] | None = None
+) -> dict[str, Any] | None:
+    """PROVE the served function computes attention on THIS device, or refuse it by name.
+
+    `shape` overrides the probe geometry (default `PROBE`; Sol's default is `PROBE_SHORT`
+    plus one row), so a caller can hold a kernel to a served per-rank shape."""
     if device.kind != "cuda":
         # There is no device to prove anything on, and the only entry a CPU executor admits is
         # torch's own eager dispatch. Silence here is the honest answer, not a skipped gate.
@@ -518,16 +530,15 @@ def _computes(entry: Ready, device: DeviceFacts) -> dict[str, Any] | None:
     target = torch.device("cuda", device.index)
     seed = torch.Generator(device=target).manual_seed(next(_PROBE_SEEDS))
     if entry.name == "sol-attn":
-        batch, sequence, heads, dim = PROBE_SHORT
-        shape = (batch, sequence + 1, heads, dim)  # Sol's partial final block as well.
+        if shape is None:
+            batch, sequence, heads, dim = PROBE_SHORT
+            shape = (batch, sequence + 1, heads, dim)  # Sol's partial final block as well.
         query, key, value = (
             (torch.randn(shape, generator=seed, device=target) * 0.5).to(dtype) for _ in range(3)
         )
         with torch.no_grad(), torch.cuda.device(target):
             return _probe_sol(entry, device, query, key, value)
-    query, key, value = (
-        torch.randn(PROBE, generator=seed, device=target, dtype=dtype) for _ in range(3)
-    )
+    query, key, value = probe_inputs(shape or PROBE, seed, target, dtype)
     options = {
         "attn_mask": None,
         "dropout_p": 0.0,
@@ -556,7 +567,20 @@ def _computes(entry: Ready, device: DeviceFacts) -> dict[str, Any] | None:
         "rel_l2_max": entry.candidate.rel_l2_max,
         **({"budget": "uncalibrated"} if device.sm in entry.candidate.uncalibrated else {}),
         "impl": impl,
+        "logit_std": PROBE_LOGIT_STD,
     }
+
+
+def probe_inputs(
+    shape: tuple[int, int, int, int], seed: Any, device: Any, dtype: Any
+) -> tuple[Any, Any, Any]:
+    """Probe Q/K/V: Gaussian, with every Q/K row at RMS `sqrt(PROBE_LOGIT_STD)` (QK norm)."""
+    import torch
+
+    query, key, value = (torch.randn(shape, generator=seed, device=device) for _ in range(3))
+    gain = PROBE_LOGIT_STD**0.5
+    query, key = (t * (gain / t.pow(2).mean(-1, keepdim=True).sqrt()) for t in (query, key))
+    return query.to(dtype), key.to(dtype), value.to(dtype)
 
 
 def _probe_rows(length: int, seed: Any, device: Any) -> dict[str, Any]:
@@ -783,7 +807,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     if candidate.name == "sol-attn":
         _bind_sol_dense(device, registry)
     ready = Ready(candidate, _member(candidate), location, artifact=artifact)
-    return replace(ready, admission=_computes(ready, device))
+    return replace(ready, admission=probe(ready, device))
 
 
 def _bind_sol_dense(device: DeviceFacts, registry: Any) -> None:

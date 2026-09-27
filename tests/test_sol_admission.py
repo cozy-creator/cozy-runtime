@@ -112,7 +112,7 @@ def test_native_sol_admission_separates_all_keys_from_sparse_policy() -> None:
         index=torch.cuda.current_device(),
     )
     with torch.no_grad():
-        report = attention._computes(entry, device)
+        report = attention.probe(entry, device)
     assert report is not None
     assert report["arithmetic_control"] == "native_all_keys_selected"
     assert report["arithmetic_rel_l2_to_fp32"] <= 0.02
