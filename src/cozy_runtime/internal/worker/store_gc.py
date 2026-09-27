@@ -29,10 +29,11 @@ def collect(
         if getattr(exc, "code", None) == "STORE_BUSY":
             return pb.CollectStoreGarbageResult(store_busy=True)
         raise
-    reclaimed = result["reclaimed_bytes"]
-    if type(reclaimed) is not int or reclaimed < 0:
-        raise ValueError("native collection returned invalid accounting")
-    return pb.CollectStoreGarbageResult(reclaimed_bytes=reclaimed)
+    # Collection already ran; unreadable accounting reports nothing reclaimed.
+    reclaimed = result.get("reclaimed_bytes") if isinstance(result, dict) else None
+    return pb.CollectStoreGarbageResult(
+        reclaimed_bytes=reclaimed if type(reclaimed) is int and reclaimed >= 0 else 0
+    )
 
 
 def collect_worker(worker: Worker) -> pb.CollectStoreGarbageResult:

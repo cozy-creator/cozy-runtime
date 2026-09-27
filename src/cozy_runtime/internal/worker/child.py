@@ -36,6 +36,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from packaging.specifiers import SpecifierSet
+from packaging.version import InvalidVersion, Version
+
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.internal import accel, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import (
@@ -122,9 +125,6 @@ def require_executor_protocol(hello: dict[str, Any]) -> None:
         # Older Runtime releases predate the hello field but use the reviewed
         # revision-1 command/reply contract. Do not require patch-level lockstep;
         # unknown older implementations are still refused.
-        from packaging.specifiers import SpecifierSet
-        from packaging.version import InvalidVersion, Version
-
         try:
             legacy = Version(str(hello.get("runtime_version", "")))
             if legacy in SpecifierSet(">=0.18.30,<0.18.34"):
