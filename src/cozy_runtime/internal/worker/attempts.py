@@ -46,7 +46,7 @@ from typing import Any, cast
 from cozy_runtime.author import _codec
 from cozy_runtime.author._errors import DEVICE_OOM, OutputError
 from cozy_runtime.author._observations import EventRing, Observation
-from cozy_runtime.internal import canonical, fill, output_budget, package_interface, seam
+from cozy_runtime.internal import canonical, fill, liveness, output_budget, package_interface, seam
 from cozy_runtime.internal import weights_sink as weights_bridge
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
@@ -348,7 +348,11 @@ class AttemptRecord:
     replays: int = 0
     payload: dict[str, Any] = dataclasses_field(default_factory=dict)
     canceling: str = ""
+    #: monotonic instant the cancel was marked; `math.inf` once escalation has finished
     cancel_started: float = 0.0
+    #: the executor's frames for this attempt, counted: the meter a cancel is judged by
+    pace: liveness.Pace = dataclasses_field(default_factory=liveness.Pace)
+    moves: int = 0
     transition_lock: threading.Lock = dataclasses_field(default_factory=threading.Lock)
     """Arbitrates natural finalization against forceful executor reclaim."""
     reclaim_done: threading.Event = dataclasses_field(default_factory=threading.Event)
@@ -417,6 +421,30 @@ class AttemptRecord:
 
     def key(self) -> tuple[str, int]:
         return (self.request_id, self.attempt)
+
+    def moved(self) -> None:
+        """One executor frame for this attempt: measured movement."""
+        self.moves += 1
+        self.pace.observe(self.moves)
+
+    def cancel_stall(self, floor: float, now: float | None = None) -> dict[str, float] | None:
+        """The measurement a cancelled attempt that has not stopped is killed on, or None.
+
+        Stillness counts from its last frame or the cancel, whichever is later, and is
+        judged by `liveness.Pace`: STILL_FACTOR times the longest gap between frames this
+        executor has shown (this attempt or an earlier one), never below `floor`.
+        """
+        at = time.monotonic() if now is None else now
+        still = at - max(self.pace.moved_at, self.cancel_started)
+        patience = self.pace.patience(floor)
+        if still <= patience:
+            return None
+        return {
+            "still_s": round(still, 3),
+            "worst_gap_s": round(self.pace.worst_pause, 3),
+            "frames": self.moves,
+            "patience_s": round(patience, 3),
+        }
 
     def compact(self) -> None:
         """Keep the REPLAY IDENTITY; drop everything a closed attempt cannot need again.
@@ -1688,6 +1716,9 @@ class AttemptEngine:
         attempt.spool = spool
         if getattr(supervision, "isolated", False):
             supervision.grant_directory(spool, attempt.executor_epoch)
+        # The pace opens at dispatch, seeded with the gaps this process already showed.
+        attempt.pace = liveness.Pace(worst_pause=executor.worst_pause)
+        attempt.pace.observe(0)
         attempt.state = "running"
         attempt.executions += 1
         self.executed += 1
@@ -1733,12 +1764,21 @@ class AttemptEngine:
             epoch=attempt.executor_epoch,
             deadline_s=round(seconds, 3) if seconds is not None else None,
         )
+
+        def on_progress(frame: dict[str, Any]) -> None:
+            attempt.moved()
+            self.progress(attempt.request_id, attempt.attempt, frame)
+
+        def on_request(frame: dict[str, Any]) -> dict[str, Any]:
+            attempt.moved()
+            return self.durable_exchange(attempt, frame)
+
         try:
             reply = executor.call(
                 self._command(attempt, key, spool, seconds),
                 timeout=None,
-                on_progress=lambda frame: self.progress(attempt.request_id, attempt.attempt, frame),
-                on_request=(lambda frame: self.durable_exchange(attempt, frame)) if job else None,
+                on_progress=on_progress,
+                on_request=on_request if job else None,
             )
         except ExecutorGone as exc:
             attempt.resulted_at = time.perf_counter()
@@ -1768,6 +1808,7 @@ class AttemptEngine:
             grants.abort_outputs(spool)
             return self.abandon(attempt, str(exc))
         finally:
+            executor.worst_pause = max(executor.worst_pause, attempt.pace.worst_pause)
             if self.weights is not None:
                 self.weights.writer_broker.close_attempt(attempt)
         return self.release(attempt, reply, spool, key)
@@ -3083,16 +3124,17 @@ class AttemptEngine:
                 return "executor already gone or cooperative marker unavailable"
             return f"cooperative cancel marked ({held.canceling})"
 
-    def escalate(self, attempt: AttemptRecord, grace: float) -> dict[str, Any]:
+    def escalate(self, attempt: AttemptRecord, stall: Mapping[str, float]) -> dict[str, Any]:
         """The FORCEFUL half, and the exact ordering §5 requires: forced kill -> output
         abort -> epoch invalidation -> record CANCELED. Rebuilding readiness happens
-        AFTER, off the cancellation critical path."""
+        AFTER, off the cancellation critical path. `stall` is the measurement that
+        justified it (`AttemptRecord.cancel_stall`)."""
         executor = attempt.executor
         started = time.perf_counter()
         evidence = None
         if not attempt.begin_reclaim():
             return {
-                "grace_s": grace,
+                **stall,
                 "skipped": "natural finalization already owns completion",
                 "executor_epoch": attempt.executor_epoch,
             }
@@ -3105,7 +3147,7 @@ class AttemptEngine:
         aborted = grants.abort_outputs(attempt.spool) if attempt.spool else 0
         attempt.reclaim_done.set()
         return {
-            "grace_s": grace,
+            **stall,
             "killed": int(evidence is not None),
             "exit_status": evidence.exit_status if evidence is not None else None,
             "kill_to_gone_ms": round((gone_at - started) * 1000, 2),

@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.author._errors import Cancelled
 from cozy_runtime.internal import attention_sol, execution_evidence
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
@@ -20,8 +21,12 @@ def mirror_component(
     prepared: Mapping[tuple[str, str], tuple[Any, Any]],
     group: RankGroup,
     spool: Callable[[], Path | None],
+    cancelled: Callable[[], bool] = lambda: False,
 ) -> None:
     """Wrap the module call outside all torch and diffusers hooks.
+
+    Each call is a cancellation safe point: a cancelled attempt raises here, before any rank
+    is commanded, so every rank stops at the same boundary and none is left mid-collective.
 
     Leave forward and its signature intact: diffusers filters layout kwargs through it.
     Scope admission has already happened on the leader. Followers receive that same
@@ -51,6 +56,8 @@ def mirror_component(
                 f"{name}: a sharded forward needs an active component scope and attempt spool"
             )
         group.check_alive()
+        if cancelled():
+            raise Cancelled(f"the attempt was cancelled before a mirrored {name[1]!r} call")
         references = {
             key: root
             for key, (_model, root) in prepared.items()
