@@ -6,6 +6,7 @@ import hashlib
 import json
 import queue
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +19,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal import storage_admission
 from cozy_runtime.internal.worker import workspace_memo
 from cozy_runtime.internal.worker.source_calls import SourceCalls
+from cozy_runtime.internal.worker.stage_progress import SAMPLE_SECONDS
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_workspace_native_memo import accepted
@@ -231,16 +233,23 @@ def test_real_retained_source_conversion_reuses_and_registry_edit_invalidates(
 def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A killed download's durable prefix is adopted: the fresh script fetches only the rest.
+
+    TensorFS asks for a run with one ranged GET and makes it durable every 64 MiB mid-body.
+    The origin stalls the first script right after that checkpoint; once its download
+    progress reports the prefix durable, the process is killed.
+    """
     # This SourceCalls has no Worker admission owner; a Worker leaked by another test would
     # otherwise hold local write admission for the whole download and block the resolve.
     monkeypatch.setattr(storage_admission, "_reclaimers", WeakValueDictionary())
-    block = 64 << 20
+    checkpoint = 64 << 20
     chunk = bytes(range(256)) * 4096
-    length = block + len(chunk)
-    digest = hashlib.sha256(chunk * 65).hexdigest()
-    waiting = threading.Event()
+    length = checkpoint + len(chunk)
+    digest = hashlib.sha256(chunk * (length // len(chunk))).hexdigest()
+    stalled = threading.Event()
     release = threading.Event()
-    ranges: list[int] = []
+    refetched: list[tuple[int, int]] = []
+    frames: list[dict[str, object]] = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args: object) -> None:
@@ -264,19 +273,29 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
                 self.wfile.write(data)
                 return
             start, end = map(int, self.headers["Range"].removeprefix("bytes=").split("-"))
-            ranges.append(start)
-            if start == block and not release.is_set():
-                waiting.set()
-                release.wait(30)
+            resumed = release.is_set()
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {start}-{end}/{length}")
             self.send_header("Content-Length", str(end - start + 1))
             self.end_headers()
+            offset = start
             try:
-                for _ in range((end - start + 1) // len(chunk)):
-                    self.wfile.write(chunk)
+                while offset <= end:
+                    if not resumed and offset == checkpoint:
+                        stalled.set()
+                        release.wait(60)
+                        return
+                    if not resumed and offset + len(chunk) == checkpoint:
+                        # The durable report arrives after the progress lane's throttle.
+                        time.sleep(1.5 * SAMPLE_SECONDS)
+                    piece = chunk[offset % len(chunk) :][: end + 1 - offset]
+                    self.wfile.write(piece)
+                    offset += len(piece)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            finally:
+                if resumed:
+                    refetched.append((start, offset - start))
 
     origin = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=origin.serve_forever)
@@ -290,6 +309,7 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
             messages.put,
             lambda _: True,
             endpoints={"huggingface": f"http://127.0.0.1:{origin.server_port}"},
+            progress=lambda *row: frames.append(row[-1]),
         )
         first = accepted(workspace, "crashing-script")
         first.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
@@ -299,13 +319,17 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
         first.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         first.selection.CopyFrom(resolved.selection)
         calls.handle(first)
-        assert waiting.wait(30), "download never reached the second native range"
+        assert stalled.wait(60), "download never reached its first checkpoint"
         # Another metadata control operation can run while the payload transfer waits.
         second = accepted(workspace, "corrected-script")
         second.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
         calls.handle(second)
         resolved = messages.get(timeout=30).native_source_status
         assert resolved.state == pb.NATIVE_SOURCE_STATE_RESOLVED
+        deadline = time.monotonic() + 60
+        while not any(frame.get("position") == checkpoint for frame in frames):
+            assert time.monotonic() < deadline, "the checkpoint was never reported durable"
+            time.sleep(0.05)
         with calls.lock:
             process = calls.processes[first.service_id]
             assert process is not None
@@ -313,14 +337,15 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
         stopped = messages.get(timeout=30).native_source_status
         assert stopped.state == pb.NATIVE_SOURCE_STATE_FAILED
         release.set()
-        before = len(ranges)
         second.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         second.selection.CopyFrom(resolved.selection)
         calls.handle(second)
         finished = messages.get(timeout=30).native_source_status
         assert finished.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, finished.safe_code
         assert not finished.memo_hit
-        assert ranges[before:] == [block], "fresh script did not reuse the native durable prefix"
+        # Exactly the bytes the killed script had not made durable are fetched again.
+        assert refetched and all(start >= checkpoint for start, _ in refetched)
+        assert sum(moved for _, moved in refetched) == length - checkpoint
         store = tensorfs.Store.open(str(workspace.store_root))
         assert store.contains(digest)
         assert store.verify(digest)["verdict"] in {"recorded", "valid", "rehashed", "verified"}

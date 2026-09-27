@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -602,6 +602,56 @@ def check_manifest(source: pb.NativeByteTreeRef, body: bytes) -> list[dict[str, 
     return members
 
 
+def _held(db: Journal, owner: str, request: pb.NativeByteRetentionRequest) -> bool:
+    source = request.source
+    row = db.execute(
+        "SELECT * FROM holds WHERE id=? AND owner=?", (request.retention_id, owner)
+    ).fetchone()
+    return row is not None and (
+        row["state"] == "held"
+        and row["kind"] == "tree"
+        and row["transaction_id"] == source.producer_root_id
+        and row["native_digest"] == source.receipt_digest
+        and row["manifest"] == source.manifest.digest
+        and row["manifest_length"] == source.manifest.length
+    )
+
+
+def _retained(
+    db: Journal, workspace: Workspace, owner: str, request: pb.NativeByteRetentionRequest
+) -> Any:
+    if not _held(db, owner, request):
+        raise WorkspaceRefusal("ordinary artifact has no exact received retention")
+    store = fill.store(workspace.store_root)
+    root = db.native(lambda: store.tree_root(request.retention_id))
+    if (
+        not root
+        or not root["complete"]
+        or root["released"]
+        or root["receipt_digest"] != documents.spell(request.source.receipt_digest)
+    ):
+        raise WorkspaceRefusal("ordinary artifact recipient root is unavailable")
+    return store
+
+
+def retained(
+    workspace: Workspace, owner: str, request: pb.NativeByteRetentionRequest
+) -> tuple[Any, Callable[[], bool]]:
+    """Check one independently held recipient without leasing its tree.
+
+    Returns the store and a re-check of the hold. The retention keeps the tree from
+    collection, so a reader leases only the objects it reads.
+    """
+    with workspace.locked() as db:
+        store = _retained(db, workspace, owner, request)
+
+    def held() -> bool:
+        with workspace.locked() as db:
+            return _held(db, owner, request)
+
+    return store, held
+
+
 @contextmanager
 def leased(
     workspace: Workspace, owner: str, request: pb.NativeByteRetentionRequest
@@ -611,36 +661,12 @@ def leased(
     lease = None
     try:
         with workspace.locked() as db:
-
-            def held() -> bool:
-                row = db.execute(
-                    "SELECT * FROM holds WHERE id=? AND owner=?", (request.retention_id, owner)
-                ).fetchone()
-                return row is not None and (
-                    row["state"] == "held"
-                    and row["kind"] == "tree"
-                    and row["transaction_id"] == source.producer_root_id
-                    and row["native_digest"] == source.receipt_digest
-                    and row["manifest"] == source.manifest.digest
-                    and row["manifest_length"] == source.manifest.length
-                )
-
-            if not held():
-                raise WorkspaceRefusal("ordinary artifact has no exact received retention")
-            store = fill.store(workspace.store_root)
-            root = db.native(lambda: store.tree_root(request.retention_id))
-            if (
-                not root
-                or not root["complete"]
-                or root["released"]
-                or root["receipt_digest"] != documents.spell(source.receipt_digest)
-            ):
-                raise WorkspaceRefusal("ordinary artifact recipient root is unavailable")
+            store = _retained(db, workspace, owner, request)
             manifest = documents.spell(source.manifest.digest)
             lease = db.native(lambda: store.acquire_manifest(manifest))
             body = db.native(lambda: bytes(store.manifest(manifest)["manifest"]))
             members = check_manifest(source, body)
-            if not held():
+            if not _held(db, owner, request):
                 raise WorkspaceRefusal(
                     "ordinary artifact was released while acquiring its read lease"
                 )

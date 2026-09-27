@@ -16,6 +16,7 @@ from cozy_runtime.internal import effect_interfaces, fill
 from cozy_runtime.internal.worker import machine_models
 from cozy_runtime.internal.worker.machine_artifacts import model_retention
 from cozy_runtime.internal.worker.machine_publication import (
+    PUBLICATION_UPLOADS,
     PublicationAuthority,
     PublicationClient,
     PublicationRefusal,
@@ -46,6 +47,12 @@ _STALLED_ATTEMPTS = 10
 _MAX_BACKOFF_SECONDS = 60.0
 # Hub's durable finalization job is progressing on its own: poll it at most 8 s apart.
 _PENDING_POLL_STALLS = 3
+
+
+def _transient(exc: Exception) -> bool:
+    return isinstance(exc, PublicationRefusal) and (
+        exc.status in {408, 425, 429} or exc.status >= 500
+    )
 
 
 def _refusal(exc: Exception) -> Exception:
@@ -94,6 +101,10 @@ class Effects:
         self.stages: dict[tuple[str, str], StageProgress] = {}
         self.cleanup_after: dict[str, tuple[int, str]] = {}
         self.stopped = False
+
+    def _stalls(self, key: tuple[str, str], landed: int) -> int:
+        """Consecutive attempts, this one included, that landed nothing; caller holds the lock."""
+        return 0 if self.landed.get(key, 0) > landed else self.stalls.get(key, 0) + 1
 
     def _register_poller(self) -> None:
         with self.lock:
@@ -243,16 +254,14 @@ class Effects:
             )
             with self.lock:
                 stopping = self.stopped
-                stalls = 0 if self.landed.get(key, 0) > landed else self.stalls.get(key, 0) + 1
+                stalls = self._stalls(key, landed)
                 self.stalls[key] = min(stalls, _PENDING_POLL_STALLS) if pending else stalls
             if stopping or isinstance(caught, (CallFenced, WorkspaceInactive, WorkspaceBusy)):
                 # This attempt may not act now. The parent's next generation, its
                 # cancellation or the next worker decides; none of those is a refusal.
                 raise
             latest = self.journal.get(owner, call.parent_request, call.call_index)
-            transient = isinstance(exc, PublicationRefusal) and (
-                exc.status in {408, 425, 429} or exc.status >= 500
-            )
+            transient = _transient(exc)
             if not latest.sent and (not transient or stalls >= _STALLED_ATTEMPTS):
                 # Nothing committed, so no remote readback is owed: settle and release.
                 code = (
@@ -332,14 +341,17 @@ class Effects:
         else:
             self.journal.check_active(owner, call)
             call = self.journal.freeze(owner, call, canonical_json.encode({"source": serialized}))
-        registered, _ = machine_models.retain(
-            self.workspace, owner, call.child_request, "artifact", artifact
-        )
-        if registered != source:
-            raise WorkspaceRefusal("publication input changed its semantic custody")
         manifest = pb.Ref(
             digest=documents.raw(artifact.manifest.digest), length=artifact.manifest.length
         )
+        # The first attempt retains the closure. Later attempts and reconcile polls only
+        # check that hold: retaining again re-verifies every closure object.
+        if not self.workspace.model_held(owner, source, manifest):
+            registered, _ = machine_models.retain(
+                self.workspace, owner, call.child_request, "artifact", artifact
+            )
+            if registered != source:
+                raise WorkspaceRefusal("publication input changed its semantic custody")
         slot = owner, call.child_request
         # The retention above keeps the closure; the native manifest fixes this inventory,
         # so no second file/catalog journal or inventory copy lives in execution_calls.
@@ -366,26 +378,34 @@ class Effects:
             # a canceled one never will, so nothing can land.
             if self.journal.canceled(owner, call):
                 raise PublicationUncommitted("publication.finalize_absent")
-        with self.workspace.held_model(owner, source, manifest):
+        # The retention keeps the closure from collection. Each push leases only its own
+        # object and re-checks that hold, so an attempt never opens objects it does not send.
+        digest = artifact.manifest.digest
 
-            def push(key: str, length: int, grant: str) -> None:
+        def push(key: str, length: int, grant: str) -> None:
+            lease = None if key == digest else store.acquire(digest, [(key, length)])
+            try:
+                if not self.workspace.model_held(owner, source, manifest):
+                    raise WorkspaceRefusal("publication hold was released during acquisition")
                 store.checkpoint_push(
-                    key,
-                    length,
-                    key == artifact.manifest.digest,
-                    grant,
-                    allow_local=self.allow_local,
+                    key, length, key == digest, grant, allow_local=self.allow_local
                 )
+            finally:
+                if lease is not None:
+                    lease.release()
 
-            def landed(count: int, held: int) -> None:
-                with self.lock:
-                    self.landed[slot] = max(self.landed.get(slot, 0), count)
-                if held < total:
-                    self._stage(slot, call, "Uploading checkpoint").update(held, total)
-                else:
-                    # Every closure byte is held; Hub's finalization publishes it.
-                    self._stage(slot, call, "Publishing checkpoint")
+        def landed(count: int, held: int) -> None:
+            with self.lock:
+                self.landed[slot] = max(self.landed.get(slot, 0), count)
+            if held < total:
+                self._stage(slot, call, "Uploading checkpoint").update(held, total)
+            else:
+                # Every closure byte is held; Hub's finalization publishes it.
+                self._stage(slot, call, "Publishing checkpoint")
 
+        with self.lock:
+            before = self.landed.get(slot, 0)
+        try:
             return upload_checkpoint(
                 client,
                 operation=call.child_request,
@@ -395,7 +415,26 @@ class Effects:
                 before_write=lambda: self._before_write(owner, call),
                 push=push,
                 landed=landed,
+                window=fill.tensorfs_module().transfer_streams(PUBLICATION_UPLOADS),
             )
+        except Exception as caught:
+            exc = _refusal(caught)
+            with self.lock:
+                stalled = self._stalls(slot, before) >= _STALLED_ATTEMPTS
+            if (
+                call.sent
+                and isinstance(exc, PublicationRefusal)
+                and not isinstance(exc, PublicationUncommitted)
+                and (stalled or not _transient(exc))
+                and reconcile_checkpoint(
+                    client, operation=call.child_request, checkpoint=checkpoint, objects=objects
+                )
+                is None
+            ):
+                # Hub still holds no finalize from this call, and staging it again was refused
+                # or stopped landing objects: it cannot land, so its hold is released.
+                raise PublicationUncommitted(exc.code) from caught
+            raise
 
     def _cleanup(self, owner: str) -> None:
         after = self.cleanup_after.get(owner, (0, ""))

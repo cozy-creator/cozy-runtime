@@ -32,10 +32,8 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 _MAX_METADATA = 8 << 20
-# Pushes in flight. Each finished push starts the next; grants are fetched ahead in
-# batches (Hub allows 128 ids) small enough that a queued grant starts well before it expires.
-_PUBLICATION_UPLOADS = 16
-_GRANT_BATCH = 32
+# Most pushes in flight; the caller narrows it to the memory the pod can use.
+PUBLICATION_UPLOADS = 16
 
 
 class PublicationRefusal(Exception):
@@ -417,11 +415,13 @@ def upload_checkpoint(
     before_write: Callable[[], None],
     push: Callable[[str, int, str], None],
     landed: Callable[[int, int], None],
+    window: int,
 ) -> CheckpointRef:
     """Stage one exact retained closure and commit it; native TensorFS performs each push.
 
-    The caller freezes the closure and holds its native lease before invoking
-    this function. ``push`` receives only an admitted member and its signed grant.
+    The caller freezes the closure and keeps it retained before invoking this function,
+    and sizes ``window``, the pushes in flight. ``push`` receives only an admitted member
+    and its signed grant.
     Opening, granting and pushing only stage bytes under the frozen operation, so
     ``before_stage`` fences them without a send marker; retrying them re-grants only
     objects the Hub does not hold. ``before_write`` records the one commit, finalize.
@@ -501,10 +501,15 @@ def upload_checkpoint(
             held_count, held_bytes = held_count + 1, held_bytes + length
             landed(held_count, held_bytes)
 
-    def granted(selected: list[str]) -> list[tuple[str, int, str]]:
-        """Validate one complete grants answer before spending any of its grants."""
+    def granted(selected: list[str]) -> list[tuple[str, int, str, float]]:
+        """Validate one complete grants answer before spending any of its grants.
+
+        Each grant carries the local time it goes cold: its lifetime on the Hub's clock,
+        counted from before the request, less the second that clock truncates.
+        """
         nonlocal held_count, held_bytes
         before_stage()
+        asked = time.monotonic()
         body = canonical_json.encode({"object_ids": selected})
         answer = _object(client.request("POST", path + "/grants", body))
         grants, held = answer.get("grants"), answer.get("held")
@@ -523,7 +528,7 @@ def upload_checkpoint(
         _require(seen == set(selected))
         for item in held:
             _require(item.get("state") in {"accepted", "verifying"})
-        uploads: list[tuple[str, int, str]] = []
+        uploads: list[tuple[str, int, str, float]] = []
         for item in grants:
             key = item["object_id"]
             required = {
@@ -532,12 +537,11 @@ def upload_checkpoint(
             }
             _require(item.get("required_headers") == required and isinstance(item.get("url"), str))
             now, expires = answer.get("server_time_unix"), item.get("expires_at_unix")
-            _require(
-                type(now) is int and type(expires) is int and expires > now,
-                "publication.grant_expired",
-            )
+            _require(type(now) is int and type(expires) is int)
+            expiry = asked + expires - now - 1
+            _require(expiry > time.monotonic(), "publication.grant_expired")
             headers = (f"{name}: {value}" for name, value in required.items())
-            uploads.append((key, objects[key], "\n".join([item["url"], *headers])))
+            uploads.append((key, objects[key], "\n".join([item["url"], *headers]), expiry))
         if held:
             with count_lock:
                 held_count += len(held)
@@ -545,28 +549,35 @@ def upload_checkpoint(
                 landed(held_count, held_bytes)
         return uploads
 
-    # A sliding window: each finished push starts the next granted object, and the next
-    # grant batch is fetched while pushes run. A failed push stops new pushes; the Hub
-    # re-grants only what is still missing when the same operation is retried. Every
-    # push finishes before this scope exits, so the caller's native lease outlives it.
-    queued: deque[tuple[str, int, str]] = deque()
+    # A sliding window: each finished push starts the next granted object, and grants are
+    # fetched two windows ahead while pushes run. A grant gone cold before its push starts
+    # is asked for again. A failed push stops new pushes; the Hub re-grants only what is
+    # still missing when the same operation is retried. Every push finishes before this
+    # scope exits, so the caller's retention outlives it.
+    queued: deque[tuple[str, int, str, float]] = deque()
+    cold: list[str] = []
     running: set[Future[None]] = set()
     failure: BaseException | None = None
     offset = 0
-    with ThreadPoolExecutor(max_workers=_PUBLICATION_UPLOADS) as pool:
+    with ThreadPoolExecutor(max_workers=window) as pool:
         while True:
             if failure is None:
-                if len(queued) < _PUBLICATION_UPLOADS and offset < len(pending):
-                    selected = pending[offset : offset + _GRANT_BATCH]
-                    offset += len(selected)
-                    queued.extend(granted(selected))
-                while queued and len(running) < _PUBLICATION_UPLOADS:
+                if len(queued) < window and (cold or offset < len(pending)):
+                    selected, cold = cold[: 2 * window], cold[2 * window :]
+                    fresh = pending[offset : offset + 2 * window - len(selected)]
+                    offset += len(fresh)
+                    queued.extend(granted(selected + fresh))
+                while queued and len(running) < window:
+                    key, length, grant, expiry = queued.popleft()
+                    if time.monotonic() >= expiry:
+                        cold.append(key)
+                        continue
                     before_stage()
-                    running.add(pool.submit(pushed, *queued.popleft()))
+                    running.add(pool.submit(pushed, key, length, grant))
             if not running:
                 if failure is not None:
                     raise failure
-                if offset >= len(pending) and not queued:
+                if offset >= len(pending) and not queued and not cold:
                     break
                 continue
             done, running = wait(running, return_when=FIRST_COMPLETED)

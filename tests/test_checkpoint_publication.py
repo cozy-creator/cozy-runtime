@@ -2,7 +2,9 @@
 
 A real retained TensorFS model is pushed by the real effect worker through the real
 publication client (verified TLS) to a stand-in Hub whose grants address a stand-in
-bucket. The bucket fails pushes the way R2 does (HTTP 503 bursts).
+bucket. The bucket refuses pushes the way R2 does (HTTP 403), for one key or past a grant's
+expiry. TensorFS reports a refused PUT at once; it re-sends a 503 only after its measured
+patience, so a 503 burst would exercise the same effect retry, far slower.
 """
 
 from __future__ import annotations
@@ -31,10 +33,16 @@ from cryptography.x509.oid import NameOID
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ModelArtifact
+from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.internal import effect_interfaces
 from cozy_runtime.internal.call_intent import canonical_intent
-from cozy_runtime.internal.worker.machine_effects import Effects
-from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
+from cozy_runtime.internal.worker.machine_effects import _STALLED_ATTEMPTS, Effects
+from cozy_runtime.internal.worker.machine_publication import (
+    PublicationAuthority,
+    PublicationRefusal,
+    reconcile_checkpoint,
+    upload_checkpoint,
+)
 from cozy_runtime.internal.worker.session import _progress_document
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Call, Calls
@@ -50,9 +58,10 @@ MODELS = "/v1/models/alice/model"
 
 
 class Bucket:
-    """Immutable content-addressed keys; ``failing`` answers 503 until the Hub reopens.
+    """Immutable content-addressed keys; ``failing`` answers 403 until the Hub reopens.
 
-    Each PUT takes ``seconds`` (``slow`` for one key), standing in for transfer time.
+    Each PUT takes ``seconds`` (``slow`` for one key), standing in for transfer time. A PUT
+    arriving after its grant's expiry is refused (403) and counted in ``expired``.
     """
 
     def __init__(self) -> None:
@@ -63,7 +72,7 @@ class Bucket:
         self.reopened = threading.Event()
         self.seconds = 0.0
         self.slow: tuple[str, float] = ("", 0.0)
-        self.active = self.peak = 0
+        self.active = self.peak = self.expired = 0
 
 
 class Hub:
@@ -88,6 +97,9 @@ class Hub:
         self.finalize_seconds = 0.3
         self.fail_finalization = ""
         self.lose_finalize = False
+        self.grant_seconds = 3600
+        # Abandoned publications: Hub released their holds and refuses to stage them again.
+        self.abandoned: set[str] = set()
 
     def held(self, object_id: str) -> bool:
         with self.bucket.lock:
@@ -138,6 +150,8 @@ class Hub:
                 if finalization is None:
                     return 404, {"code": "publication.finalization_absent"}
                 return 200, {k: v for k, v in finalization.items() if k != "manifest"}
+            if operation in self.abandoned:
+                return 409, {"code": "publication.not_open"}
             if method == "PUT" and not action:
                 declared = {row["object_id"]: row["length"] for row in request["objects"]}
                 if self.objects.setdefault(operation, declared) != declared:
@@ -181,18 +195,19 @@ class Hub:
                             {"object_id": key, "length": declared[key], "state": "accepted"}
                         )
                         continue
+                    expires = int(time.time()) + self.grant_seconds
                     grants.append(
                         {
                             "object_id": key,
                             "length": declared[key],
-                            "url": f"{self.bucket_url}/objects/{key}?X-Amz-Signature=test",
+                            "url": f"{self.bucket_url}/objects/{key}?expires={expires}",
                             "required_headers": {
                                 "if-none-match": "*",
                                 "x-amz-checksum-sha256": base64.b64encode(
                                     bytes.fromhex(key[7:])
                                 ).decode(),
                             },
-                            "expires_at_unix": int(time.time()) + 3600,
+                            "expires_at_unix": expires,
                         }
                     )
                 return 200, {
@@ -276,8 +291,14 @@ def hub_handler(hub: Hub) -> Callable[[BaseHTTPRequestHandler, str], None]:
 def bucket_handler(bucket: Bucket) -> Callable[[BaseHTTPRequestHandler, str], None]:
     def handle(handler: BaseHTTPRequestHandler, method: str) -> None:
         body = handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
-        key = handler.path.split("?", 1)[0].rsplit("/", 1)[1]
+        target, _, expires = handler.path.partition("?expires=")
+        key = target.rsplit("/", 1)[1]
         assert method == "PUT" and handler.headers["If-None-Match"] == "*"
+        if time.time() >= int(expires):
+            with bucket.lock:
+                bucket.expired += 1
+            reply(handler, 403, b"")
+            return
         digest = hashlib.sha256(body).digest()
         assert handler.headers["x-amz-checksum-sha256"] == base64.b64encode(digest).decode()
         with bucket.lock:
@@ -288,7 +309,7 @@ def bucket_handler(bucket: Bucket) -> Callable[[BaseHTTPRequestHandler, str], No
             bucket.active -= 1
             bucket.puts[key] += 1
             if key == bucket.failing and not bucket.reopened.is_set():
-                status = 503
+                status = 403
             elif key in bucket.objects:
                 status = 412
             else:
@@ -481,7 +502,7 @@ def test_push_failure_retries_the_frozen_operation_without_repushing(
     assert result["observation"] == "acknowledged"
     assert hub.opens[call.child_request] == 2
     assert set(hub.bucket.objects) == closure
-    # The burst outlived TensorFS's own PUT retries; the effect re-granted only that object.
+    # TensorFS reported the refused PUT; the effect re-granted only that object.
     assert hub.bucket.puts[failing] > 1
     assert all(hub.bucket.puts[key] == 1 for key in closure - {failing})
     assert any(
@@ -497,7 +518,7 @@ def test_pushes_slide_through_a_full_window_with_grants_fetched_ahead(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with staging(tmp_path, monkeypatch.setenv, parts=100) as (staged, hub, effects):
-        hub.bucket.seconds = 0.05
+        hub.bucket.seconds = 0.2
         call = settle(staged, effects)
         assert not call.safe_code and canonical_json.decode(call.result)["observation"] == (
             "acknowledged"
@@ -624,3 +645,145 @@ def test_canceled_parent_releases_an_uncommitted_upload(
     call = staged.call()
     assert not call.sent and not call.result and not hub.checkpoints
     assert not staged.calls.has_unsettled_effects("owner", "parent")
+
+
+def upload(staged: Stage, effects: Effects, window: int) -> CheckpointRef:
+    """The real upload of the stage's retained closure, at the window a pod's memory allows."""
+    assert effects.authority is not None
+    client = effects.authority.client(AUTHORIZATION)
+    store = tensorfs.Store.ensure(staged.workspace.store_root)
+    manifest = staged.artifact.manifest
+    objects = {manifest.digest: manifest.length} | {
+        str(row["id"]): int(row["length"]) for row in store.walk_cozytensors(manifest.digest)
+    }
+    checkpoint = CheckpointRef("alice/model", manifest.digest, manifest, "direct", "")
+
+    def push(key: str, length: int, grant: str) -> None:
+        store.checkpoint_push(key, length, key == manifest.digest, grant, allow_local=True)
+
+    try:
+        return upload_checkpoint(
+            client,
+            operation="direct",
+            checkpoint=checkpoint,
+            objects=objects,
+            before_stage=lambda: None,
+            before_write=lambda: None,
+            push=push,
+            landed=lambda count, held: None,
+            window=window,
+        )
+    except PublicationRefusal as exc:
+        assert exc.code == "publication.finalization_pending"
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        with contextlib.suppress(PublicationRefusal):
+            settled = reconcile_checkpoint(
+                client, operation="direct", checkpoint=checkpoint, objects=objects
+            )
+            assert settled is not None
+            return settled
+        time.sleep(0.05)
+    raise AssertionError("finalization did not complete")
+
+
+@pytest.mark.parametrize("window", [1, 3])
+def test_a_narrow_window_still_uploads_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, window: int
+) -> None:
+    """No RAM floor: a small pod pushes fewer at once, down to one, and still commits."""
+    with staging(tmp_path, monkeypatch.setenv, parts=20) as (staged, hub, effects):
+        hub.bucket.seconds = 0.2
+        assert upload(staged, effects, window).observation == "acknowledged"
+        assert len(hub.bucket.objects) == 22 and set(hub.bucket.puts.values()) == {1}
+        assert hub.bucket.peak == window
+        # Grants are fetched two windows ahead.
+        batch = 2 * window
+        assert hub.grant_batches == [batch] * (22 // batch) + ([22 % batch] if 22 % batch else [])
+
+
+def test_a_grant_gone_cold_in_the_queue_is_asked_for_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A one-push window outlasts a queued grant: its object is re-granted, never sent cold."""
+    with staging(tmp_path, monkeypatch.setenv, parts=2) as (staged, hub, effects):
+        hub.grant_seconds, hub.bucket.seconds = 2, 1.2
+        assert upload(staged, effects, 1).observation == "acknowledged"
+        assert set(hub.bucket.puts.values()) == {1} and len(hub.bucket.objects) == 4
+        assert hub.bucket.expired == 0
+        # The second grant of each batch went cold behind the push ahead of it.
+        assert hub.grant_batches == [2, 2, 2, 1]
+        assert hub.opens["direct"] == 1
+
+
+def test_sent_upload_settles_when_the_hub_refuses_to_stage_it_again(
+    stage: tuple[Stage, Hub, Effects],
+) -> None:
+    """The finalize never arrived and Hub abandoned the publication: settle, parent live."""
+    staged, hub, effects = stage
+    hub.lose_finalize = True
+    drive(effects, lambda: any(e.get("phase") == "reconciling" for e in staged.progress()))
+    operation = staged.call().child_request
+    hub.lose_finalize = False
+    hub.abandoned.add(operation)
+    call = settle(staged, effects)
+    assert call.safe_code == "publication.http_refused"
+    assert call.safe_detail == "publication commit did not land"
+    assert not call.sent and not call.result and not hub.finalizations
+    assert hub.opens[operation] == 1
+    drive(effects, lambda: staged.hold_states() == ["released"])
+    assert not staged.calls.has_unsettled_effects("owner", "parent")
+    assert not staged.calls.canceled("owner", call)
+
+
+def test_sent_upload_settles_once_restaging_stops_landing_objects(
+    stage: tuple[Stage, Hub, Effects],
+) -> None:
+    """Every finalize is lost: after the stall rule, a fresh read still finds none, so settle."""
+    staged, hub, effects = stage
+    hub.lose_finalize = True
+    operation = staged.call().child_request
+    deadline = time.monotonic() + 60
+    while not staged.call().safe_code:
+        # The rule counts attempts, not time: skip each backoff's wait.
+        with effects.lock:
+            effects.retry_after.clear()
+        effects.drive("owner")
+        assert time.monotonic() < deadline, "effect did not settle"
+        time.sleep(0.02)
+    call = staged.call()
+    assert call.safe_code == "publication.control_transport_unavailable"
+    assert call.safe_detail == "publication commit did not land"
+    assert not call.sent and not call.result and not hub.finalizations
+    # One attempt landed the closure; each later one staged it again and landed nothing.
+    assert hub.opens[operation] == 1 + _STALLED_ATTEMPTS
+    assert set(hub.bucket.puts.values()) == {1}
+    drive(effects, lambda: staged.hold_states() == ["released"])
+    assert not staged.calls.has_unsettled_effects("owner", "parent")
+
+
+def test_a_retry_opens_only_the_objects_it_sends(stage: tuple[Stage, Hub, Effects]) -> None:
+    """The retention guards the closure; a retry leases just what Hub still lacks.
+
+    A tensor part Hub already holds is removed locally between attempts. Retaining the
+    closure again or leasing all of it would refuse on it; the retry only checks the hold,
+    sends the failed part and commits.
+    """
+    staged, hub, effects = stage
+    store = tensorfs.Store.ensure(staged.workspace.store_root)
+    manifest = staged.artifact.manifest.digest
+    parts = sorted(
+        str(row["id"]) for row in store.walk_cozytensors(manifest) if row["kind"] == "part"
+    )
+    failing, landed = parts[3], parts[0]
+    hub.bucket.failing = failing
+    drive(effects, lambda: any(e.get("phase") == "retrying" for e in staged.progress()))
+    assert hub.held(landed)
+    digest = landed.removeprefix("sha256:")
+    (staged.workspace.store_root / "blobs" / digest[:2] / digest[2:4] / digest).unlink()
+    call = settle(staged, effects)
+    assert not call.safe_code and canonical_json.decode(call.result)["observation"] == (
+        "acknowledged"
+    )
+    assert hub.bucket.puts[failing] > 1 and hub.bucket.puts[landed] == 1
+    drive(effects, lambda: staged.hold_states() == ["released"])

@@ -113,18 +113,7 @@ class NativeArtifactTransfers:
             raise WorkspaceRefusal("native artifact command identity is incomplete")
 
         def held() -> bool:
-            with self.workspace.locked() as db:
-                row = db.execute(
-                    "SELECT * FROM holds WHERE id=? AND owner=?",
-                    (source.retention_id, self.owner()),
-                ).fetchone()
-            return row is not None and (
-                row["state"] == "held"
-                and row["transaction_id"] == source.weights_transaction_id
-                and row["native_digest"] == source.tensorfs_receipt_digest
-                and row["manifest"] == command.manifest.digest
-                and row["manifest_length"] == command.manifest.length
-            )
+            return self.workspace.model_held(self.owner(), source, command.manifest)
 
         if not held():
             raise WorkspaceRefusal("native artifact has no matching held owner obligation")
@@ -171,13 +160,12 @@ class NativeArtifactTransfers:
 
     def execute(self, command: pb.NativeArtifactTransfer) -> pb.NativeArtifactTransferStatus:
         result = self._status(command)
-        byte_context = None
-        held: Callable[[], bool] | None = None
         reader: Any = None
         try:
             if command.HasField("source") == command.HasField("byte_source"):
                 raise WorkspaceRefusal("native artifact transfer requires exactly one source")
-            if command.HasField("byte_source"):
+            trees = command.HasField("byte_source")
+            if trees:
                 if (
                     not self.valid(command)
                     or not command.effect_id
@@ -186,17 +174,14 @@ class NativeArtifactTransfers:
                     or command.manifest != command.byte_source.source.manifest
                 ):
                     raise WorkspaceRefusal("ordinary artifact transfer changed its exact subject")
-                byte_context = workspace_byte_outputs.leased(
+                store, held = workspace_byte_outputs.retained(
                     self.workspace, self.owner(), command.byte_source
                 )
-                store, _, _ = byte_context.__enter__()
             else:
                 held = self._held(command)
                 store = fill.store(self.workspace.store_root)
             manifest = documents.spell(command.manifest.digest)
-            closure = self._closure(
-                store, manifest, command.manifest.length, byte_context is not None
-            )
+            closure = self._closure(store, manifest, command.manifest.length, trees)
             objects, ordered = closure.objects, closure.ordered
             result.closure_digest = closure.digest
             if not command.HasField("grant"):
@@ -228,7 +213,7 @@ class NativeArtifactTransfers:
                     grant.object_id,
                     grant.length,
                 )
-                if held is not None and not held():
+                if not held():
                     raise WorkspaceRefusal("native artifact hold was released during acquisition")
             host = urlparse(grant.url).hostname or ""
             receipt = egress.put_from(
@@ -262,5 +247,3 @@ class NativeArtifactTransfers:
         finally:
             if reader is not None:
                 reader.close()
-            if byte_context is not None:
-                byte_context.__exit__(None, None, None)

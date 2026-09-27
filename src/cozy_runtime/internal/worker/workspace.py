@@ -474,6 +474,26 @@ class Workspace:
                 )
             ]
 
+    @staticmethod
+    def _model_held(
+        db: Journal, owner: str, source: pb.DerivedRetentionRequest, manifest: pb.Ref
+    ) -> bool:
+        row = db.execute(
+            "SELECT * FROM holds WHERE id=? AND owner=?", (source.retention_id, owner)
+        ).fetchone()
+        return row is not None and (
+            row["state"] == "held"
+            and row["transaction_id"] == source.weights_transaction_id
+            and row["native_digest"] == source.tensorfs_receipt_digest
+            and row["manifest"] == manifest.digest
+            and row["manifest_length"] == manifest.length
+        )
+
+    def model_held(self, owner: str, source: pb.DerivedRetentionRequest, manifest: pb.Ref) -> bool:
+        """Whether the exact retained owner obligation still keeps this model's closure."""
+        with self.locked() as db:
+            return self._model_held(db, owner, source, manifest)
+
     @contextmanager
     def held_model(
         self, owner: str, source: pb.DerivedRetentionRequest, manifest: pb.Ref
@@ -484,17 +504,7 @@ class Workspace:
             raise WorkspaceRefusal("native model manifest is incomplete")
 
         def verify(db: Journal) -> None:
-            row = db.execute(
-                "SELECT * FROM holds WHERE id=? AND owner=?", (source.retention_id, owner)
-            ).fetchone()
-            if (
-                row is None
-                or row["state"] != "held"
-                or row["transaction_id"] != source.weights_transaction_id
-                or row["native_digest"] != source.tensorfs_receipt_digest
-                or row["manifest"] != manifest.digest
-                or row["manifest_length"] != manifest.length
-            ):
+            if not self._model_held(db, owner, source, manifest):
                 raise WorkspaceRefusal("native model has no exact retained owner obligation")
 
         store = fill.store(self.store_root)

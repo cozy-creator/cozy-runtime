@@ -1,11 +1,15 @@
 """Native retained-artifact transfer, with actual TensorFS roots and HTTP object writes."""
 
+import hashlib
 from pathlib import Path
 
+from cozy_runtime import canonical_json
+from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_weights_upload import ObjectStore, serving
+from test_workspace_byte_outputs import producing
 from test_workspace_custody import produced
 
 
@@ -240,3 +244,65 @@ def test_reclaimed_control_stream_does_not_drop_reused_command_number(tmp_path: 
         server.shutdown()
         server.server_close()
         serving_thread.join()
+
+
+def test_byte_tree_upload_leases_only_the_object_it_sends(tmp_path: Path) -> None:
+    """The tree's retention guards collection; a command opens just the member it sends.
+
+    A member this command does not send is removed locally: a whole-tree lease would
+    refuse on it. Releasing the retention still refuses the next command.
+    """
+    workspace, spec, _, _ = producing(tmp_path)
+    bodies = {"a": b"alpha" * 4000, "b": b"bravo" * 4000}
+    files = []
+    for name, body in bodies.items():
+        (tmp_path / name).write_bytes(body)
+        files.append((name, tmp_path / name))
+    manifest = canonical_json.encode(
+        {
+            "entries": [
+                {
+                    "path": name,
+                    "kind": "file",
+                    "blob": {"sha256": hashlib.sha256(body).hexdigest(), "length": len(body)},
+                }
+                for name, body in bodies.items()
+            ]
+        }
+    )
+    source = outputs.commit(
+        workspace, "owner", "producer", 1, spec, "report", manifest, files, 1 << 20
+    )
+    hold = pb.NativeByteRetentionRequest(source=source, retention_id="sha256:" + "dd" * 32)
+    outputs.change_hold(workspace, "owner", hold, release=False)
+    unsent = hashlib.sha256(bodies["a"]).hexdigest()
+    (workspace.store_root / "blobs" / unsent[:2] / unsent[2:4] / unsent).unlink()
+    sent = hashlib.sha256(bodies["b"]).hexdigest()
+    transfers = NativeArtifactTransfers(
+        workspace, lambda: "owner", lambda _: None, lambda _: True, allow_private_egress=True
+    )
+    sink = ObjectStore()
+    try:
+        with serving(sink) as url:
+            command = pb.NativeArtifactTransfer(
+                effect_id="attachment",
+                command_id=1,
+                byte_source=hold,
+                manifest=source.manifest,
+                grant_revision=1,
+                server_time_unix=100,
+                grant=pb.WeightsUploadGrant(
+                    object_id="sha256:" + sent,
+                    length=len(bodies["b"]),
+                    url=url,
+                    expires_at_unix=200,
+                ),
+            )
+            upload = transfers.execute(command)
+            assert upload.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED and not upload.safe_code
+            assert sink.body == bodies["b"]
+            outputs.change_hold(workspace, "owner", hold, release=True)
+            command.command_id = 2
+            assert transfers.execute(command).outcome == pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
+    finally:
+        transfers.pool.shutdown(wait=True)
