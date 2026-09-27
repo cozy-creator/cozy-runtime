@@ -13,8 +13,8 @@ also prevents filling an existing version with artifacts from another source.
 
 from __future__ import annotations
 
-import json
 import argparse
+import json
 import os
 import pathlib
 import re

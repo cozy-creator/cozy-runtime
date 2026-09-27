@@ -14,7 +14,13 @@ from cozy_runtime.internal.worker.child import ExecutorProtocolMismatch, require
 
 @pytest.mark.parametrize(
     "revision,version,accepted",
-    [(1, "9.8.7", True), (2, "0.18.33", False), (None, "0.18.33", True), (None, "0.18.32", True), (None, "0.18.20", False)],
+    [
+        (1, "9.8.7", True),
+        (2, "0.18.33", False),
+        (None, "0.18.33", True),
+        (None, "0.18.32", True),
+        (None, "0.18.20", False),
+    ],
 )
 def test_real_executor_hello_uses_protocol_contract(
     tmp_path: Path, revision: int | None, version: str, accepted: bool

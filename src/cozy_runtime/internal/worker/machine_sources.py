@@ -6,8 +6,6 @@ import threading
 from typing import TYPE_CHECKING
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import source_interfaces
-from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import machine_models, workspace_byte_outputs, workspace_memo, workspace_sources

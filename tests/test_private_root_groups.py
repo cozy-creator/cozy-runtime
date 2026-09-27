@@ -376,9 +376,7 @@ def test_serving_roots_without_preparation_pin_still_reserve_their_group(tmp_pat
     """
     host, groups, executions = worker(tmp_path, 4)
     cast(Any, host)._placement_by_id = lambda placement_id: (
-        SimpleNamespace(device_pin=(0, 1, 2, 3))
-        if placement_id == "h3-placement"
-        else None
+        SimpleNamespace(device_pin=(0, 1, 2, 3)) if placement_id == "h3-placement" else None
     )
     first = submit_serving(executions, "serving-first")
     second = submit_serving(executions, "serving-second")

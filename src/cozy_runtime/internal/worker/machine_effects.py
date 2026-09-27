@@ -118,9 +118,7 @@ class Effects:
             if not grant or self.authority is None:
                 raise PublicationRefusal("publication.authority_absent", status=403)
             intent = canonical_json.decode(call.intent)
-            if (
-                intent["module"] != effect_interfaces.MODULE
-            ):
+            if intent["module"] != effect_interfaces.MODULE:
                 raise PublicationRefusal("publication.interface_changed")
             client = self.authority.client(grant)
             operation = intent["export"]

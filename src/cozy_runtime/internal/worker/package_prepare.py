@@ -194,9 +194,13 @@ def _installed_interface(
         body = package_interface.read_bytes(raw, "installed package interface")
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
-    if metadata and describe is not None and any(
-        entry.get("invocable", {}).get("memoize")
-        for entry in [*body["jobs"], *body["entrypoints"]]
+    if (
+        metadata
+        and describe is not None
+        and any(
+            entry.get("invocable", {}).get("memoize")
+            for entry in [*body["jobs"], *body["entrypoints"]]
+        )
     ):
         # Installed callee/helper definitions own memo invalidation. The wheel's
         # static schema is never a second code reading to compare or admit against.
@@ -315,14 +319,26 @@ def _prepare_published(
     if installed_environment is not None:
         installed = installed_environment
     else:
-        requirements = "\n".join(
-            [*(f"{('--index-url' if i == 0 else '--extra-index-url')} {url}"
-               for i, url in enumerate(locked.indexes)), *(row.text for row in locked.rows)]
-        ).encode() + b"\n"
+        requirements = (
+            "\n".join(
+                [
+                    *(
+                        f"{('--index-url' if i == 0 else '--extra-index-url')} {url}"
+                        for i, url in enumerate(locked.indexes)
+                    ),
+                    *(row.text for row in locked.rows),
+                ]
+            ).encode()
+            + b"\n"
+        )
         try:
             installed = package_installation.install(
-                install_root, package=package_name, release=release, python=python,
-                requirements=requirements, cache=dependency_cache,
+                install_root,
+                package=package_name,
+                release=release,
+                python=python,
+                requirements=requirements,
+                cache=dependency_cache,
             )
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
@@ -388,13 +404,15 @@ def _prepare_published(
         materialized(installed)
     return pb.PreparePackageSetResult(
         installed_package=pb.InstalledPackage(
-            installation_id=installed.installation_id, package=package_name,
-            release=release, package_interface=interface_raw,
+            installation_id=installed.installation_id,
+            package=package_name,
+            release=release,
+            package_interface=interface_raw,
         ),
         placement_set=pb.DesiredPlacementSet(
             placement_set_digest=documents.digest_of(placement_bytes),
             placement_set_canonical_bytes=placement_bytes,
-        )
+        ),
     )
 
 
@@ -599,18 +617,30 @@ def prepare_model_placement(
 
 
 def prepare_package(
-    *, package_name: str, release: str, files: Sequence[pb.LocalPackageFile],
-    wheel_root: Path, installation_id: str, artifact_cache: Path, install_root: Path,
-    python: Path, describe: Callable[[package_installation.InstalledEnvironment, str], bytes],
-    verified: Callable[[str, int, Path], None], source_archive: str = "",
+    *,
+    package_name: str,
+    release: str,
+    files: Sequence[pb.LocalPackageFile],
+    wheel_root: Path,
+    installation_id: str,
+    artifact_cache: Path,
+    install_root: Path,
+    python: Path,
+    describe: Callable[[package_installation.InstalledEnvironment, str], bytes],
+    verified: Callable[[str, int, Path], None],
+    source_archive: str = "",
     base: base_observation.Observation | None = None,
     dependency_python: Path | None = None,
     builtin_snapshot: package_installation.InstalledEnvironment | None = None,
-    dependency_cache: Path | None = None, job_plan_root: Path | None = None,
-    development: pb.DevelopmentPackage | None = None, dependency_requirements: bytes = b"",
-    python_requires: str = "", python_version: str = "",
+    dependency_cache: Path | None = None,
+    job_plan_root: Path | None = None,
+    development: pb.DevelopmentPackage | None = None,
+    dependency_requirements: bytes = b"",
+    python_requires: str = "",
+    python_version: str = "",
     materialized: Callable[[package_installation.InstalledEnvironment], None] | None = None,
-    cancel: Callable[[], bool] | None = None, progress: Callable[[str], None] | None = None,
+    cancel: Callable[[], bool] | None = None,
+    progress: Callable[[str], None] | None = None,
     python_root: Path | None = None,
 ) -> pb.PreparePackageSetResult:
     """Install a synchronized source project or ordinary wheels; describe installed code."""
@@ -627,7 +657,8 @@ def prepare_package(
     if installed is not None:
         if (installed.package, installed.release) != (package_name, release):
             raise PreparationRefusal(
-                "package_installation_conflict", "installation ID belongs to another package release"
+                "package_installation_conflict",
+                "installation ID belongs to another package release",
             )
     elif any(not row.path for row in files):
         # Host removes operation carriers after recording successful installation.
@@ -635,13 +666,23 @@ def prepare_package(
         raise PreparationRefusal("local_package_reuse_unavailable", installation_id)
     else:
         installed = _install_private_files(
-            package_name=package_name, release=release, files=files,
-            wheel_root=wheel_root, installation_id=installation_id,
-            install_root=install_root, python=python, verified=verified,
-            source_archive=source_archive, base=base, dependency_cache=dependency_cache,
+            package_name=package_name,
+            release=release,
+            files=files,
+            wheel_root=wheel_root,
+            installation_id=installation_id,
+            install_root=install_root,
+            python=python,
+            verified=verified,
+            source_archive=source_archive,
+            base=base,
+            dependency_cache=dependency_cache,
             dependency_requirements=dependency_requirements,
-            python_requires=python_requires, python_version=python_version,
-            cancel=cancel, progress=progress, python_root=python_root,
+            python_requires=python_requires,
+            python_version=python_version,
+            cancel=cancel,
+            progress=progress,
+            python_root=python_root,
         )
     if materialized is not None:
         materialized(installed)
@@ -652,30 +693,52 @@ def prepare_package(
     interface_path.write_bytes(interface_raw)
     interface_path.chmod(0o644)
     _stage_job_plans(
-        interface_body, root=job_plan_root, installation_id=installation_id,
-        interface_path=interface_path, installed=installed,
+        interface_body,
+        root=job_plan_root,
+        installation_id=installation_id,
+        interface_path=interface_path,
+        installed=installed,
     )
     selected_models, entrypoints = _entrypoints(
-        interface_body, package_name=package_name, selections=(), tensorfs_root=None,
-        verified=verified, census=None,
+        interface_body,
+        package_name=package_name,
+        selections=(),
+        tensorfs_root=None,
+        verified=verified,
+        census=None,
     )
-    bindings_digest = documents.digest_of(canonical.write({
-        "entrypoints": [documents.body(row) for row in entrypoints], "models": [],
-    }))
+    bindings_digest = documents.digest_of(
+        canonical.write(
+            {
+                "entrypoints": [documents.body(row) for row in entrypoints],
+                "models": [],
+            }
+        )
+    )
     placement = pb.Placement(
         placement_id="package-" + installation_id,
         development=pb.DevelopmentPackage(
-            package=package_name, release=release, installation_id=installation_id,
+            package=package_name,
+            release=release,
+            installation_id=installation_id,
         ),
-        installation_id=installation_id, package_interface=interface_raw,
-        bindings_digest=bindings_digest, models=selected_models, entrypoints=entrypoints,
+        installation_id=installation_id,
+        package_interface=interface_raw,
+        bindings_digest=bindings_digest,
+        models=selected_models,
+        entrypoints=entrypoints,
     )
-    placement_bytes = canonical.write({
-        "format": "cozy.worker.v1.PlacementSet/1", "placements": [documents.body(placement)],
-    })
+    placement_bytes = canonical.write(
+        {
+            "format": "cozy.worker.v1.PlacementSet/1",
+            "placements": [documents.body(placement)],
+        }
+    )
     return pb.PreparePackageSetResult(
         installed_package=pb.InstalledPackage(
-            installation_id=installation_id, package=package_name, release=release,
+            installation_id=installation_id,
+            package=package_name,
+            release=release,
             package_interface=interface_raw,
         ),
         placement_set=pb.DesiredPlacementSet(
@@ -686,18 +749,34 @@ def prepare_package(
 
 
 def _install_private_files(
-    *, package_name: str, release: str, files: Sequence[pb.LocalPackageFile],
-    wheel_root: Path, installation_id: str, install_root: Path, python: Path,
-    verified: Callable[[str, int, Path], None], source_archive: str,
-    base: base_observation.Observation | None, dependency_cache: Path | None,
-    dependency_requirements: bytes, python_requires: str, python_version: str,
-    cancel: Callable[[], bool] | None, progress: Callable[[str], None] | None,
+    *,
+    package_name: str,
+    release: str,
+    files: Sequence[pb.LocalPackageFile],
+    wheel_root: Path,
+    installation_id: str,
+    install_root: Path,
+    python: Path,
+    verified: Callable[[str, int, Path], None],
+    source_archive: str,
+    base: base_observation.Observation | None,
+    dependency_cache: Path | None,
+    dependency_requirements: bytes,
+    python_requires: str,
+    python_version: str,
+    cancel: Callable[[], bool] | None,
+    progress: Callable[[str], None] | None,
     python_root: Path | None,
 ) -> package_installation.InstalledEnvironment:
     """Read transferred carriers only when this installation does not exist yet."""
     python, base = _select_python(
-        python, python_requires, python_version, base,
-        root=python_root or install_root / "python", cancel=cancel, progress=progress,
+        python,
+        python_requires,
+        python_version,
+        base,
+        root=python_root or install_root / "python",
+        cancel=cancel,
+        progress=progress,
     )
     archive = None
     wheels = []
@@ -707,17 +786,25 @@ def _install_private_files(
     for row in files:
         path = Path(row.path)
         if (
-            not path.is_absolute() or path.name != row.filename or path.parent != wheel_root
-            or path.resolve(strict=True) != path or not 0 < row.length <= MAX_FILE_BYTES
+            not path.is_absolute()
+            or path.name != row.filename
+            or path.parent != wheel_root
+            or path.resolve(strict=True) != path
+            or not 0 < row.length <= MAX_FILE_BYTES
             or path.stat().st_size != row.length
         ):
             raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
         if row.filename == source_archive:
             if row.digest:
-                raise PreparationRefusal("package_prepare_source_invalid", "source is operation-scoped")
+                raise PreparationRefusal(
+                    "package_prepare_source_invalid", "source is operation-scoped"
+                )
             archive = path
         else:
-            if len(row.digest) != 32 or package_environment.wheel_name_version(row.filename) is None:
+            if (
+                len(row.digest) != 32
+                or package_environment.wheel_name_version(row.filename) is None
+            ):
                 raise PreparationRefusal("package_prepare_file_invalid", row.filename)
             with path.open("rb") as stream:
                 measured = hashlib.file_digest(stream, "sha256").digest()
@@ -729,9 +816,15 @@ def _install_private_files(
         raise PreparationRefusal("package_prepare_source_absent", source_archive)
     try:
         installed = package_installation.install(
-            install_root, package=package_name, release=release, python=python,
-            installation_id=installation_id, source_archive=archive,
-            requirements=dependency_requirements, wheels=tuple(wheels), cache=dependency_cache,
+            install_root,
+            package=package_name,
+            release=release,
+            python=python,
+            installation_id=installation_id,
+            source_archive=archive,
+            requirements=dependency_requirements,
+            wheels=tuple(wheels),
+            cache=dependency_cache,
         )
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc

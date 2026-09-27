@@ -60,7 +60,7 @@ def test_context_codec_and_selection_preserve_independent_native_windows(frames:
     assert selected.frame_count == frames
     if frames != 56:
         assert not torch.equal(
-            selected.video_latents, original.video_latents[:, :, -selected.video_latents.shape[2]:]
+            selected.video_latents, original.video_latents[:, :, -selected.video_latents.shape[2] :]
         )
     assert selected.provenance == original.provenance
     with pytest.raises(InvalidRequest):

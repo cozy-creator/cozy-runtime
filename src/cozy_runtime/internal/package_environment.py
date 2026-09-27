@@ -5,96 +5,26 @@ No composite package identities, copied SDK snapshots, or installation receipts 
 
 from __future__ import annotations
 
-
-import base64
-
-
-import csv
-
-
-import errno
-
-
 import hashlib
-
-
-import io
-
-
 import json
-
-
-import logging
-
-
-import os
-
-
 import re
-
-
-import shutil
-
-
 import stat
-
-
 import subprocess
-
-
 import sys
-
-
-import uuid
-
-
 import zipfile
-
-
-from collections.abc import Callable, Mapping, Sequence
-
-
-from contextlib import suppress
-
-
+from collections.abc import Mapping
 from dataclasses import dataclass
-
-
-from email.parser import BytesParser
-
-
-from pathlib import Path, PurePosixPath
-
-
-from typing import Any, cast
-
-
+from pathlib import Path
+from typing import cast
 from urllib.parse import unquote, urlsplit
 
-
 from packaging.markers import default_environment
-
-
 from packaging.requirements import InvalidRequirement, Requirement
-
-
-from packaging.tags import Tag, compatible_tags, cpython_tags, parse_tag
-
-
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+from packaging.version import InvalidVersion
 
-
-from packaging.version import InvalidVersion, Version
-
-
-from cozy_runtime.internal import base_observation, canonical, storage_admission
-
-
-from cozy_runtime.internal.config import package_install_environment
-
-
+from cozy_runtime.internal import base_observation
 from cozy_runtime.protocol import weights_limits
-
 
 MAX_METADATA_BYTES = 4 << 20
 

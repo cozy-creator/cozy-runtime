@@ -130,9 +130,7 @@ class Groups:
             if root is not None:
                 root.downloads = max(0, root.downloads + change)
 
-    def reserve(
-        self, owner: str, parent: str, child: str, ordinals: Sequence[int]
-    ) -> None:
+    def reserve(self, owner: str, parent: str, child: str, ordinals: Sequence[int]) -> None:
         """Reserve a selected child lane until its durable execution is submitted.
 
         Model preparation and child admission happen on the worker drive thread before
@@ -255,8 +253,10 @@ class Groups:
                 }
                 used.update(
                     ordinal
-                    for (reservation_owner, _child), (reservation_root, ordinals)
-                    in self.reservations.items()
+                    for (reservation_owner, _child), (
+                        reservation_root,
+                        ordinals,
+                    ) in self.reservations.items()
                     if reservation_owner == owner and reservation_root == name
                     for ordinal in ordinals
                 )
