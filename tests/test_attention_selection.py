@@ -853,7 +853,7 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     # h3a-022, through the real registry: the range is bounded ABOVE as well as below, and the
     # card above the ceiling is refused by name rather than probed.
     assert out["too_new"]["code"] == "attention_kernel_unsupported"
-    assert "sageattention serves sm90 only" in out["too_new"]["detail"]
+    assert "sageattention-fp16pv serves sm90 only" in out["too_new"]["detail"]
 
     # And the pin computes: one real forward through the pinned site.
     assert out["forward"] == {"shape": [1, 64, 1024], "dtype": "torch.bfloat16"}

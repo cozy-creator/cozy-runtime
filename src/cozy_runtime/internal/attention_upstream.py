@@ -276,7 +276,8 @@ def _sage(modes: dict[int, tuple[str, str, str]]) -> Local:
         major, minor = torch.cuda.get_device_capability(query.device)
         found = modes.get(major * 10 + minor)
         if found is None:
-            raise ValueError(f"sageattention has no mode for sm{major}{minor}; it serves {modes}")
+            served = sorted(modes)
+            raise ValueError(f"sageattention has no mode for sm{major}{minor}; it serves {served}")
         return found
 
     def forward(
