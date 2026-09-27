@@ -2,24 +2,16 @@
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import io
 import json
 import os
-import subprocess
-import sys
-import zipfile
 from pathlib import Path
 
 import pytest
 
 from cozy_runtime.internal import (
     canonical,
-    package_interface,
     readiness,
     source_interfaces,
-    static_interface,
 )
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
@@ -36,9 +28,7 @@ from cozy_runtime.internal.worker.session import (
 from cozy_runtime.internal.worker.source_calls import computation_key
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from test_serving_interfaces import project
 
-ROOT = Path(__file__).resolve().parents[1]
 SOURCE = {"source": {"digest": "sha256:" + "a" * 64, "length": 1}}
 
 
@@ -160,45 +150,3 @@ def test_stale_placement_shape_asks_its_owner_to_prepare_again(tmp_path: Path) -
         assert fault.subject == "revision 3" and not worker.latched
     finally:
         worker.shutdown()
-
-
-def test_interface_wheel_replaces_a_derived_wheel_with_other_bytes(tmp_path: Path) -> None:
-    root = project(tmp_path)
-    interface = tmp_path / "package-interface.json"
-    interface.write_bytes(package_interface.canonical_bytes(static_interface.build(root)))
-    implementation = io.BytesIO()
-    with zipfile.ZipFile(implementation, "w") as archive:
-        archive.writestr("serving_fixture.py", (root / "serving_fixture.py").read_text())
-        archive.writestr(
-            "serving_fixture-0.1.0.dist-info/METADATA",
-            "Metadata-Version: 2.4\nName: serving-fixture\nVersion: 0.1.0\n",
-        )
-        archive.writestr(
-            "serving_fixture-0.1.0.dist-info/WHEEL",
-            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
-        )
-    wheel = tmp_path / "serving_fixture-0.1.0-py3-none-any.whl"
-    wheel.write_bytes(implementation.getvalue())
-    output = tmp_path / "out"
-    output.mkdir()
-    (output / wheel.name).write_bytes(b"an older generator's wheel")
-    body = {
-        "distribution": "serving-fixture",
-        "version": "0.1.0",
-        "interface_path": str(interface),
-        "output_directory": str(output),
-        "implementation_wheel": str(wheel),
-        "implementation_wheel_digest": "sha256:" + hashlib.sha256(wheel.read_bytes()).hexdigest(),
-    }
-    result = subprocess.run(
-        [str(Path(sys.executable).with_name("cozy-runtime")), "--json", "interface-wheel"],
-        input=json.dumps(body),
-        text=True,
-        capture_output=True,
-        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    built = (output / wheel.name).read_bytes()
-    assert json.loads(result.stdout)["digest"] == "sha256:" + hashlib.sha256(built).hexdigest()
-    assert base64.b64encode(built)[:2] == b"UE"  # a zip archive, not the stale bytes

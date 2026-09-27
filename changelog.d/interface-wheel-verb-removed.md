@@ -1,0 +1,1 @@
+The private `interface-wheel` verb and its implementation-overlay builder (`interface_wheel.build`, `overlay_sources`, the `Cozy-Interface-Generator` wheel metadata) are removed: nothing calls them since Creator stopped capturing frozen interface wheels. Callers are generated in-process by the executor from the installed interface (`interface_wheel.generate`).
