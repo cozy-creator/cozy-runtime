@@ -11,11 +11,13 @@ says whether an offer is admissible. One fence, not two to keep consistent. `inv
 still exists and still withdraws dispatchability; what it no longer does is mint an ordinal
 nobody could reconcile against the other one.
 
-Cancellation is cooperative then forceful and the WORKER owns both clocks: the grace
-budget is a runtime constant here (`GRACE_SECONDS`), overridable by the operator through
-`CancelAttempt.grace_ms`, and never an author knob. Writable cgroup v2 remains the kernel
-boundary; a strictly proven credential-unwritable container uses the narrower first-party
-process-tree backend described in :mod:`cozy_runtime.internal.proctree`.
+Cancellation is cooperative then forceful. The executor stops at its next safe point and
+stays warm; the WORKER escalates only when the attempt has stopped moving against its own
+measured frame cadence (`AttemptRecord.cancel_stall`), never on a flat grace.
+
+Writable cgroup v2 remains the kernel boundary; a strictly proven credential-unwritable
+container uses the narrower first-party process-tree backend described in
+:mod:`cozy_runtime.internal.proctree`.
 """
 
 from __future__ import annotations
@@ -54,11 +56,6 @@ from cozy_runtime.internal.seam import (
     listener,
 )
 from cozy_runtime.internal.worker.plan import PreparedModel
-
-#: The grace budget: long enough for the longest uninterruptible kernel plus one loop step,
-#: short enough that a caller's cancel is not a lifetime. A RUNTIME CONSTANT; `grace_ms` on
-#: CancelAttempt is the operator override door, and no author surface reaches it.
-GRACE_SECONDS = 3.0
 
 #: How often the worker LOOKS while a spawned executor is dialling back. A sampling
 #: cadence, not a bound: `spawn` waits while the child is alive, and this only says how
@@ -198,6 +195,9 @@ class Executor:
     #: The measurement a `watched` call killed this process on, so the ExecutorGone the
     #: waiting caller then sees names the wedge and not merely the death.
     wedged: str = ""
+    #: the longest gap between frames this process has shown across its attempts (seconds);
+    #: a later cancel's patience is never derived from less
+    worst_pause: float = 0.0
     _calls: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property

@@ -825,6 +825,7 @@ class Telemetry(_Bound):
     ) -> None:
         attempt = self._attempt
         attempt.check_open("Telemetry.progress")
+        self._ctx.raise_if_cancelled()
         name = self._stage_name(stage)
         if name is None:
             return
@@ -920,6 +921,7 @@ class Telemetry(_Bound):
         should leave the range unknown. Ordinary timing stages keep their semantics.
         """
         self._attempt.check_open("Telemetry.scope")
+        self._ctx.raise_if_cancelled()
         stage = self._stage_name(name)
         bounds = self._overall_range(overall_range)
         if stage is None:
@@ -1004,6 +1006,7 @@ class Telemetry(_Bound):
         `timing-decides-nothing` fence proves the module cannot reach them.
         """
         self._attempt.check_open("Telemetry.stage")
+        self._ctx.raise_if_cancelled()
         stage = self._stage_name(name)
         bounds = self._overall_range(overall_range)
         if stage is not None:

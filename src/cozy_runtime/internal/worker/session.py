@@ -20,8 +20,8 @@ Threads, and why each exists: each accepted STREAM runs its conversation on the 
 thread and must never do slow work (a cancel has to arrive while an attempt runs); ONE
 DEVICE LANE PER DEVICE of the envelope (`worker/lanes.py`, cr-066) holds that device's lease
 and serializes its attempts in arrival order — the whole of worker-local arbitration, per
-lane; the REPORTER ticks the durable Report; the WATCHDOG owns the deadline and the grace
-clock, because the deadline is worker-enforced and never merely handed to author code.
+lane; the REPORTER ticks the durable Report; the WATCHDOG owns the deadline and the cancel
+escalation, because the deadline is worker-enforced and never merely handed to author code.
 
 This process never imports torch. `scripts/worker-live.py nocuda` proves that against the
 RUNNING process's loaded modules and mapped libraries, not against the import graph.
@@ -37,6 +37,7 @@ import hashlib
 import hmac
 import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -60,6 +61,7 @@ from cozy_runtime.internal import (
     fill,
     hostfacts,
     job_plan,
+    liveness,
     package_environment,
     package_installation,
     prepare_diagnostics,
@@ -101,7 +103,6 @@ from cozy_runtime.internal.worker.attempts import (
     safe,
 )
 from cozy_runtime.internal.worker.child import (
-    GRACE_SECONDS,
     INTERFACE_DOCUMENT,
     ExecutorGone,
     ExecutorProtocolMismatch,
@@ -352,7 +353,6 @@ class WorkerOptions:
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
-    grace: float = GRACE_SECONDS
     claim_ready: bool = True
     """False only for fixed product-host boot until listener/readiness proof commits."""
     executor_uid: int = -1
@@ -7525,7 +7525,12 @@ class Worker:
         self.terminate(attempt, self.engine.finish_cancel, "deadline")
 
     def watchdog(self) -> None:
-        """The deadline and the grace clock — both the WORKER's, never author code's."""
+        """The deadline and cancel escalation — both the WORKER's, never author code's.
+
+        A cancelled attempt stops at its executor's next safe point and the executor stays
+        warm. It is killed only when its frames stop against their own measured cadence
+        (`AttemptRecord.cancel_stall`), never after a flat grace.
+        """
         while not self.stop.wait(0.05):
             self.drive_executions()
             for attempt in list(self.engine.live.values()):
@@ -7549,21 +7554,23 @@ class Worker:
                             self.engine.supervision_for(attempt).cooperative_cancel(
                                 executor, f"{attempt.request_id}#{attempt.attempt}"
                             )
-                        attempt.cancel_started = time.perf_counter()
+                        attempt.cancel_started = time.monotonic()
                         deadline_expired = True
                 if deadline_expired:
                     self.note("cancel", f"deadline expired for {attempt.request_id}")
                 if attempt.canceling:
-                    started = getattr(attempt, "cancel_started", 0.0) or time.perf_counter()
-                    attempt.cancel_started = started
-                    if time.perf_counter() - started > self.options.grace:
+                    attempt.cancel_started = attempt.cancel_started or time.monotonic()
+                    stall = attempt.cancel_stall(liveness.noise_floor())
+                    if stall is not None:
                         self.note(
                             "cancel",
-                            f"grace of {self.options.grace:g} s expired: escalating to a "
-                            "forceful kill (the handler never asked whether it was cancelled)",
+                            f"no measured progress for {stall['still_s']:g} s after the "
+                            f"cancel (longest earlier gap {stall['worst_gap_s']:g} s over "
+                            f"{stall['frames']} frame(s); patience {stall['patience_s']:g} s): "
+                            "escalating to a forceful kill",
                         )
                         try:
-                            facts = self.engine.escalate(attempt, self.options.grace)
+                            facts = self.engine.escalate(attempt, stall)
                         except Exception as exc:
                             # A failed reclaim is NOT a cancellation result. Keep the
                             # executor owned, withdraw machine admission, and leave this
@@ -7571,7 +7578,7 @@ class Worker:
                             # to kill the watchdog thread and strand the executor forever.
                             self.note(
                                 "cancel",
-                                f"forceful reclaim failed; retrying after the grace window: "
+                                f"forceful reclaim failed; retrying after the same window: "
                                 f"{type(exc).__name__}: {exc}",
                             )
                             if attempt.placement_id in self.hosted:
@@ -7580,11 +7587,11 @@ class Worker:
                                 )
                             else:
                                 self.capacity_dropped("executor reclaim is not proved")
-                            attempt.cancel_started = time.perf_counter()
+                            attempt.cancel_started = time.monotonic()
                             continue
                         self.note("cancel", f"forceful: {json.dumps(facts)}")
                         attempt.canceling = attempt.canceling or "client"
-                        attempt.cancel_started = time.perf_counter() + 1e9
+                        attempt.cancel_started = math.inf
 
     def reporter(self) -> None:
         """The ObservedWorkerState tick, and the liveness SAMPLE that rides it."""
@@ -8016,7 +8023,8 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--development-installation-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
+    # Ignored: cancel escalation is measured, not a grace. Deployed launchers still pass it.
+    parser.add_argument("--grace", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--executor-uid", type=int, default=-1, help=argparse.SUPPRESS)
     parser.add_argument("--executor-gid", type=int, default=-1, help=argparse.SUPPRESS)
     parser.add_argument("--tls-cert", default="", help="PEM cert for a non-loopback listener")
@@ -8090,7 +8098,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         development_installation_id=args.development_installation_id,
         alloc_conf=args.alloc_conf,
         threads=args.threads,
-        grace=args.grace,
         executor_uid=args.executor_uid,
         executor_gid=args.executor_gid,
     )

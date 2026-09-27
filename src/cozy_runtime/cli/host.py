@@ -92,6 +92,7 @@ _SERVE_FLAGS: dict[str, str] = {
     "--executor-uid": "--executor-uid",
     "--executor-gid": "--executor-gid",
     "--threads": "--threads",
+    # Accepted and ignored: cancel escalation is measured (session.watchdog).
     "--grace": "--grace",
     # The REMOTE leg (cl-014 item 1): a non-loopback listener requires both, and the
     # worker refuses plaintext off-loopback. The bearer owner token arrives via
@@ -113,7 +114,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
 
     `--socket`/`--out` are the launcher-issued path grants; `_SERVE_FLAGS` are
     the launch facts a launcher must state because nothing can discover them for it —
-    identity, release, device envelope, budgets and the grace clock. Everything else —
+    identity, release, device envelope and budgets. Everything else —
     directives, grants, config — arrives over the protocol, and always will.
 
     `--socket` is the local binding this worker SERVES on (#436: the owner dials the

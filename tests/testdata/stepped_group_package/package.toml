@@ -1,0 +1,7 @@
+[application]
+object = "stepped_group_package:app"
+
+[bindings."generate.models.base"]
+model = "test/base"
+release = "1"
+lane = "main"

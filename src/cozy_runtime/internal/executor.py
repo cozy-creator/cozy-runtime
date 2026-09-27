@@ -24,8 +24,9 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
 
 Cancellation is attempt-keyed: `ctx.cancelled` reads the marker the worker publishes for
 this exact request. A stale cancellation therefore cannot cross into the next attempt.
-The worker owns the grace clock and forcefully reclaims the whole executor scope if author
-code does not cooperate.
+Every telemetry step, stage and progress call and, in a group, every mirrored call is a safe
+point; the attempt ends CANCELED there and the process stays Ready. The worker reclaims the
+whole executor scope only when the attempt stops moving against its own measured cadence.
 
 The env seal is enforced, not trusted: the sealed values are snapshotted BEFORE torch is
 imported, re-imposed before Torch import, CUDA init and every reply, and any names package
@@ -561,6 +562,8 @@ class Executor:
         self._startup_reported = False
         #: the attempt spool while an attempt runs: where a mirrored call's payloads go
         self._attempt_spool: Path | None = None
+        #: rank 0 only: the attempt whose cancel marker the mirror reads before each call
+        self._attempt_request = ""
         #: cr-038: the fill plane's capture directory, taken from the sealed environment
         #: snapshot at process entry and passed down — never read ambiently.
         self.fill_forensics_dir = fill_forensics_dir
@@ -934,6 +937,10 @@ class Executor:
                     prepared=owner.group_components,
                     group=self.group,
                     spool=lambda: owner._attempt_spool,
+                    cancelled=lambda: (
+                        bool(owner._attempt_request)
+                        and _cancelled(owner.root, owner._attempt_request)
+                    ),
                 )
         self.facts["sequence_parallel"] = {
             "degree": self.world,
@@ -2895,6 +2902,7 @@ class Executor:
         deadline = _deadline(command["deadline_s"])
         torch = self.torch
         self._attempt_spool = self.host._attempt_spool = spool
+        self.host._attempt_request = command["request_id"]
         if self.group is not None:
             self.group.working_peaks.clear()
             self.group.rank_records.clear()
@@ -3002,6 +3010,7 @@ class Executor:
         )
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = self.host._attempt_spool = None
+        self.host._attempt_request = ""
         if self.group is not None and self.group.broken and not self.poisoned:
             # A FOLLOWER DIED OR DIVERGED UNDER THIS ATTEMPT (cr-068): the group is one
             # executor, so this process is poisoned with it and the worker rebuilds all K.
