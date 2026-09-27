@@ -28,6 +28,8 @@ from collections.abc import Iterator
 import torch
 from diffusers import AutoencoderKLMiniMaxH3
 
+from cozy_runtime.author import spread
+
 #: Tiles per decoder forward. The release geometry (1344x768 at 256 px tiles, 64 px
 #: overlap) is a 4x7 grid, so one chunk is exactly one forward; a larger frame decodes in
 #: groups of this many, which bounds the batch's activation footprint. The batch size is
@@ -83,10 +85,14 @@ class TileBatchedVideoVAE(AutoencoderKLMiniMaxH3):  # type: ignore[misc]
         if pad_tokens > 0:
             z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
         overlap = None
-        for i in range(num_chunks):
-            start = i * tokens_chunk_size
-            stop = start + tokens_chunk_size + self.token_overlap
-            clip = self._decode_clip(z[:, :, start:stop])
+        # Every clip decodes from its own latent window alone; only the cross-fade below
+        # reads a neighbour. So a group decodes a round of clips on its ranks at once and
+        # the fade runs here, in order, unchanged.
+        windows = (
+            (z[:, :, i * tokens_chunk_size : (i + 1) * tokens_chunk_size + self.token_overlap],)
+            for i in range(num_chunks)
+        )
+        for clip in spread(self, "_decode_clip", windows):
             for j in range(int(token_drop > 0) + 1):
                 frame_start = j * chunk_num_frames
                 chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]

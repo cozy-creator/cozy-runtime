@@ -357,15 +357,20 @@ class RankGroup:
 
     def call_one(self, rank: int, command: dict[str, Any]) -> dict[str, Any]:
         """One command to ONE follower and its reply: a hosted component's call."""
+        self.send_one(rank, command)
+        return self.reply_one(rank, str(command["cmd"]))
+
+    def send_one(self, rank: int, command: dict[str, Any]) -> None:
         self.check_alive()
-        follower = self.followers[rank - 1]
         try:
-            follower.channel.send(command)
+            self.followers[rank - 1].channel.send(command)
         except SeamError as exc:
             raise GroupRefusal(
                 f"rank {rank} cannot be commanded: {exc}", code="group_broken"
             ) from exc
-        return self._reply(follower, str(command["cmd"]))
+
+    def reply_one(self, rank: int, name: str) -> dict[str, Any]:
+        return self._reply(self.followers[rank - 1], name)
 
     def _reply(self, follower: Follower, name: str) -> dict[str, Any]:
         pace = liveness.Pace()
