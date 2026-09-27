@@ -55,8 +55,7 @@ class Builtins:
         interface_path = (
             root / "installations" / installed.installation_id / "package-interface.json"
         )
-        interface_path.write_bytes(interface_raw)
-        interface_path.chmod(0o644)
+        package_interface.publish(interface_path, interface_raw)
         package_prepare._stage_job_plans(
             interface,
             root=worker.config.cozy_home / "job-plans",

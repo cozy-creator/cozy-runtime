@@ -3,7 +3,7 @@ boundary.
 
 th-128 deleted the pod-global artifact CAS, and the worker image stopped creating
 `/var/lib/cozy/tmp/transfers` with it. The SERVING half never noticed, because
-`acquire._stage` has always made its own root; the PREPARING half did not, and a rented pod
+`acquire._stage` made its own root; the PREPARING half did not, and a rented pod
 refused with
 
     [Errno 2] No such file or directory:
@@ -12,7 +12,7 @@ refused with
 The second half of the same lesson is the mode. A staged interface's PATH is recorded into
 job plans and handed to the executor, which runs as its own uid, so a root-owned 0400
 document is the same class of refusal one layer further in -- which is exactly why
-`acquire._stage` writes 0444.
+`acquire._stage` wrote 0444.
 """
 
 from __future__ import annotations

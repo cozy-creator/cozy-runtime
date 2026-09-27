@@ -1149,8 +1149,7 @@ def development_placement_documents(
         staged_interface = (
             artifact_cache / "installed-interfaces" / installation_id / "package-interface.json"
         )
-        staged_interface.parent.mkdir(parents=True, exist_ok=True)
-        staged_interface.write_bytes(interface_bytes)
+        package_interface.publish(staged_interface, interface_bytes)
         interface_path = str(staged_interface)
     modeled_paths = sorted(
         str(model.get("path", ""))

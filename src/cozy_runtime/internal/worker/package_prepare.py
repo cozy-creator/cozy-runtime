@@ -718,8 +718,7 @@ def prepare_package(
     interface_raw = describe(installed, distribution)
     interface_body = package_interface.read_bytes(interface_raw, "installed package interface")
     interface_path = install_root / "installations" / installation_id / "package-interface.json"
-    interface_path.write_bytes(interface_raw)
-    interface_path.chmod(0o644)
+    package_interface.publish(interface_path, interface_raw)
     _stage_job_plans(
         interface_body,
         root=job_plan_root,
@@ -1261,7 +1260,7 @@ def _stage(root: Path, raw: bytes) -> tuple[str, int]:
     """Stage one control document into the worker's content-addressed cache.
 
     THIS FUNCTION OWNS ITS ROOT, and the mode it leaves behind is a uid decision. Its
-    sibling `acquire._stage` has always done both -- `mkdir(parents=True)` and `chmod
+    former sibling `acquire._stage` did both -- `mkdir(parents=True)` and `chmod
     0444` -- which is why the serving half survived th-128 deleting
     `/var/lib/cozy/tmp/transfers` from the worker image and this half did not: run 188
     refused a rented pod with `[Errno 2] No such file or directory:
@@ -1283,7 +1282,7 @@ def _stage(root: Path, raw: bytes) -> tuple[str, int]:
     # can repair either. A fresh pod with a different umask works and the same pod never
     # does — the shape that makes a fault look deterministic and hides its cause.
     #
-    # `acquire._stage`, the sibling this docstring says it matches, has always chmod'd
+    # The former `acquire._stage`, the sibling this docstring says it matches, chmod'd
     # explicitly. This half only asked.
     root.mkdir(parents=True, exist_ok=True, mode=0o755)
     root.chmod(0o755)

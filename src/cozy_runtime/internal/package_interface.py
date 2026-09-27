@@ -7,8 +7,11 @@ Its one identity is SHA-256 over canonical JSON. Creator obtains those exact byt
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import tempfile
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, cast
 
 from cozy_runtime.author import ConformanceError, Surface, WeightsOutput
@@ -429,6 +432,31 @@ def read_bytes(raw: bytes, source: str = "package interface") -> dict[str, Json]
         )
     _validate(parsed, source)
     return parsed
+
+
+def publish(path: Path, raw: bytes) -> None:
+    """Publish interface bytes at `path` for an executor to read, never partially.
+
+    Sibling replicas of one installation activate concurrently (#725) and publish the same
+    path while executors read it, so the bytes land by rename. The mode is set, not masked:
+    the executor reads as its own uid."""
+
+    try:
+        if path.stat().st_mode & 0o777 == 0o644 and path.read_bytes() == raw:
+            return
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=".package-interface-")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(name, 0o644)
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def _validate(body: Mapping[str, Json], source: str) -> None:
