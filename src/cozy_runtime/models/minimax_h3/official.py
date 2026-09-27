@@ -89,7 +89,7 @@ from .continuation import (
 )
 from .table_layout import TableLayout
 from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK, TurboOverlay, TurboSchedule
-from .vae_tiles import TileBatchedVideoVAE
+from .vae_tiles import TileBatchedVideoVAE, encode_condition
 
 #: A trunk is one DiT and its conditioning workflow; a task is one served function — the
 #: trunk's official plan, or the trunk under the turbo bank's fixed 8-evaluation plan.
@@ -1441,13 +1441,18 @@ class OfficialH3Pipeline:
             arguments = (
                 (torch.from_numpy(visual[i][0]), pixel_mean, pixel_std, seed) for i in images
             )
-            encoded = spread(vae, "encode_condition", arguments, spare=True)
+            # Only the runtime's own VAE class carries the method a group rank can run.
+            encoded = (
+                spread(vae, "encode_condition", arguments, spare=True)
+                if isinstance(vae, TileBatchedVideoVAE)
+                else (encode_condition(vae, *args) for args in arguments)
+            )
             for index, raw in zip(images, encoded, strict=True):
                 latents[index] = (raw.cpu() - latents_mean) / latents_std
             for index in missing:
                 if index not in latents:
-                    raw = vae.encode_condition(
-                        torch.from_numpy(visual[index][0]), pixel_mean, pixel_std, seed
+                    raw = encode_condition(
+                        vae, torch.from_numpy(visual[index][0]), pixel_mean, pixel_std, seed
                     )
                     latents[index] = (raw.cpu() - latents_mean) / latents_std
             if memo is not None:

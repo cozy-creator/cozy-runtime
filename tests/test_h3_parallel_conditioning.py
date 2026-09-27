@@ -75,7 +75,7 @@ def _assert_equal(actual: dict[str, Any], expected: dict[str, Any]) -> None:
 @pytest.fixture(scope="module")
 def sequential() -> dict[str, Any]:
     """One process, the calls in order: what every rank layout must reproduce."""
-    torch.set_num_threads(2)
+    torch.set_num_threads(1)
     model = h3.model()
     checks, _ = _checks(model)
     state = h3.start(model)
@@ -352,6 +352,6 @@ def test_an_h100_home_rank_spares_its_conditioner_and_a_roomier_one_keeps_the_va
 @pytest.fixture(autouse=True)
 def _threads() -> Iterator[None]:
     before = torch.get_num_threads()
-    torch.set_num_threads(2)
+    torch.set_num_threads(1)
     yield
     torch.set_num_threads(before)
