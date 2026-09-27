@@ -15,8 +15,9 @@ import hashlib
 import json
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from importlib import import_module, metadata
 from itertools import count
@@ -35,9 +36,11 @@ from cozy_runtime.internal.encoding import DeviceFacts
 class AttentionRefusal(RuntimeError):
     """An unsupported explicit selection or unavailable attention implementation."""
 
-    def __init__(self, code: str, detail: str) -> None:
+    def __init__(self, code: str, detail: str, measured: Mapping[str, Any] | None = None) -> None:
         super().__init__(detail)
         self.code = code
+        #: the probe's measurement behind a numeric refusal
+        self.measured = measured
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,15 +515,12 @@ _PROBE_SEEDS = count(0x5A6E)
 
 def probe(
     entry: Ready, device: DeviceFacts, shape: tuple[int, int, int, int] | None = None
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     """PROVE the served function computes attention on THIS device, or refuse it by name.
 
-    `shape` overrides the probe geometry (default `PROBE`; Sol's default is `PROBE_SHORT`
-    plus one row), so a caller can hold a kernel to a served per-rank shape."""
-    if device.kind != "cuda":
-        # There is no device to prove anything on, and the only entry a CPU executor admits is
-        # torch's own eager dispatch. Silence here is the honest answer, not a skipped gate.
-        return None
+    `shape` overrides the probe geometry (default `PROBE` on CUDA and `PROBE_SHORT` on CPU,
+    whose kernel does not tile; Sol's default is `PROBE_SHORT` plus one row), so a caller can
+    hold a kernel to a served per-rank shape."""
     import torch
     from diffusers.models.attention_dispatch import dispatch_attention_fn
 
@@ -529,7 +529,9 @@ def probe(
         if not entry.candidate.dtypes or "bfloat16" in entry.candidate.dtypes
         else torch.float16
     )
-    target = torch.device("cuda", device.index)
+    cuda = device.kind == "cuda"
+    target = torch.device("cuda", device.index) if cuda else torch.device("cpu")
+    current = torch.cuda.device(target) if cuda else nullcontext()
     seed = torch.Generator(device=target).manual_seed(next(_PROBE_SEEDS))
     if entry.name == "sol-attn":
         if shape is None:
@@ -538,9 +540,9 @@ def probe(
         query, key, value = (
             (torch.randn(shape, generator=seed, device=target) * 0.5).to(dtype) for _ in range(3)
         )
-        with torch.no_grad(), torch.cuda.device(target):
+        with torch.no_grad(), current:
             return _probe_sol(entry, device, query, key, value)
-    query, key, value = probe_inputs(shape or PROBE, seed, target, dtype)
+    query, key, value = probe_inputs(shape or (PROBE if cuda else PROBE_SHORT), seed, target, dtype)
     options = {
         "attn_mask": None,
         "dropout_p": 0.0,
@@ -548,7 +550,7 @@ def probe(
         "scale": None,
         "enable_gqa": False,
     }
-    with torch.no_grad(), torch.cuda.device(target):
+    with torch.no_grad(), current:
         impl = entry.candidate.local.impl(query, key, value, options)
         if impl == "math":
             query, key, value = (t[:, : PROBE_SHORT[1]].contiguous() for t in (query, key, value))
@@ -557,10 +559,7 @@ def probe(
         by_rows, floor, checked = _disagreement(got, query, key, value, seed)
     worst = max(by_rows, key=by_rows.__getitem__)
     disagreement = by_rows[worst]
-    _gate(
-        entry, device, disagreement, f"{worst} rows of {checked} checked over {query.shape[1]} keys"
-    )
-    return {
+    measured = {
         "shape": list(query.shape),
         "checked_rows": checked,
         "rel_l2_by_rows": by_rows,
@@ -571,6 +570,9 @@ def probe(
         "impl": impl,
         "logit_std": PROBE_LOGIT_STD,
     }
+    where = f"{worst} rows of {checked} checked over {query.shape[1]} keys"
+    _gate(entry, device, disagreement, where, measured)
+    return measured
 
 
 def probe_inputs(
@@ -648,7 +650,13 @@ def _exact_rows(query: Any, key: Any, value: Any, rows: Any) -> Any:
     return out
 
 
-def _gate(entry: Ready, device: DeviceFacts, disagreement: float, where: str) -> None:
+def _gate(
+    entry: Ready,
+    device: DeviceFacts,
+    disagreement: float,
+    where: str,
+    measured: Mapping[str, Any] | None = None,
+) -> None:
     """Hold a finite result to its declared budget. Past rel L2 1 the output carries no
     attention at all (a kernel returning its uninitialized buffer raises nothing and has the
     right shape, h3a-013); below it, the kernel runs and is out of budget, said so by name."""
@@ -661,6 +669,7 @@ def _gate(entry: Ready, device: DeviceFacts, disagreement: float, where: str) ->
         f"{entry.name} disagrees with exact attention at rel L2 {disagreement:.4g} on "
         f"{device.name} (sm{device.sm}) ({where}), past its declared budget of {budget:.4g}"
         + ("" if code == "attention_kernel_wrong" else "; it runs, numerically out of budget"),
+        measured,
     )
 
 
@@ -683,12 +692,20 @@ def _probe_sol(
     native = _validate_probe_contract(
         entry, device, attention_sol._native(query, key, value, None, sequence), query
     )
-    _gate(entry, device, float((native.float() - exact).norm() / exact.norm()), "all-keys")
+    arithmetic = float((native.float() - exact).norm() / exact.norm())
+    measured = {
+        "shape": list(query.shape),
+        "rel_l2_by_rows": {"all_keys": arithmetic},
+        "rel_l2_max": entry.candidate.rel_l2_max,
+    }
+    _gate(entry, device, arithmetic, "all-keys", measured)
     if any(
         not torch.equal(t.view(torch.uint8), old.view(torch.uint8))
         for t, old in zip(inputs, originals, strict=True)
     ):
-        raise AttentionRefusal("attention_kernel_wrong", "Sol all-keys control modified its inputs")
+        raise AttentionRefusal(
+            "attention_kernel_wrong", "Sol all-keys control modified its inputs", measured
+        )
 
     padded = tuple(
         torch.cat((t, torch.full_like(t[:, :padding], float("nan"))), dim=1) for t in inputs
@@ -721,16 +738,17 @@ def _probe_sol(
             "attention_kernel_wrong",
             "Sol sparse policy violated protected-prefix, padding, repeat "
             "or input-ownership contracts",
+            measured,
         )
     return {
+        **measured,
         "arithmetic_control": "native_all_keys_selected",
-        "arithmetic_rel_l2_to_fp32": float((native.float() - exact).norm() / exact.norm()),
+        "arithmetic_rel_l2_to_fp32": arithmetic,
         "arithmetic_rel_l2_max": entry.candidate.rel_l2_max,
         "sparse_policy_rel_l2_to_fp32": float(
             (sparse[:, :sequence].float() - exact).norm() / exact.norm()
         ),
         "sparse_error_meaning": "approximation_only_not_model_quality",
-        "shape": list(query.shape),
         "protected_prefix": prefix,
         "padding": padding,
         "repeat_equal": True,
@@ -853,14 +871,15 @@ def warm(device: DeviceFacts, preferred: Sequence[str] = ()) -> list[dict[str, A
         )
         return status == "ready"
 
-    for name in preferred:
-        candidate = BY_NAME.get(name)
-        if candidate is not None and not _device_admits(candidate, device) and one(candidate):
-            break
-    done = {row["kernel"] for row in rows}
-    for candidate in for_device(device):
-        if candidate.name not in done:
-            one(candidate)
+    with measuring("warm"):
+        for name in preferred:
+            candidate = BY_NAME.get(name)
+            if candidate is not None and not _device_admits(candidate, device) and one(candidate):
+                break
+        done = {row["kernel"] for row in rows}
+        for candidate in for_device(device):
+            if candidate.name not in done:
+                one(candidate)
     return rows
 
 
@@ -893,7 +912,58 @@ def _prove(candidate: Candidate, device: DeviceFacts) -> Ready:
     if candidate.name == "sol-attn":
         _bind_sol_dense(device, registry)
     ready = Ready(candidate, _member(candidate), location, artifact=artifact)
-    return replace(ready, admission=probe(ready, device))
+    try:
+        admission = probe(ready, device)
+    except Exception as exc:
+        code = getattr(exc, "code", type(exc).__name__)
+        _note(candidate, device, code, getattr(exc, "measured", None))
+        raise
+    _note(candidate, device, "ready", admission)
+    return replace(ready, admission=admission)
+
+
+#: The phase proving a kernel now: the startup `warm`, a construction's selection
+#: (`prepare`) or a request's pin (`request`). Verdicts are kept, so it is when each was MEASURED.
+_SOURCE: ContextVar[str] = ContextVar("attention_probe_source", default="prepare")
+#: kernel -> this process's latest probe of it. One process serves one device.
+_MEASURED: dict[str, dict[str, Any]] = {}
+
+
+@contextmanager
+def measuring(source: str) -> Iterator[None]:
+    token = _SOURCE.set(source)
+    try:
+        yield
+    finally:
+        _SOURCE.reset(token)
+
+
+def _note(
+    candidate: Candidate, device: DeviceFacts, status: str, measured: Mapping[str, Any] | None
+) -> None:
+    row = measured or {}
+    _MEASURED[candidate.name] = {
+        "kernel": candidate.name,
+        "status": status,
+        "source": _SOURCE.get(),
+        "shape": list(row.get("shape") or ()),
+        "rel_l2_by_rows": dict(row.get("rel_l2_by_rows") or {}),
+        "budget": candidate.rel_l2_max,
+        "budget_state": "uncalibrated" if device.sm in candidate.uncalibrated else "calibrated",
+    }
+
+
+def evidence(served: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
+    """This process's probes as per-rank execution evidence: `probes` for the kernels it
+    `served`, `skipped` for every kernel its probe refused. Empty lists are absent."""
+    names = set(served)
+    probes = [dict(_MEASURED[name]) for name in sorted(names) if name in _MEASURED]
+    skipped = [
+        dict(row)
+        for name, row in sorted(_MEASURED.items())
+        if name not in names and row["status"] != "ready"
+    ]
+    return {**({"probes": probes} if probes else {}), **({"skipped": skipped} if skipped else {})}
 
 
 def _bind_sol_dense(device: DeviceFacts, registry: Any) -> None:

@@ -112,7 +112,16 @@ def test_an_attempt_records_its_rank_setup_and_every_step(executor: Executor) ->
     execution = reply["execution"]
     assert execution["degree"] == 1
     [rank] = execution["ranks"]
-    assert set(rank) == {"rank", "pid", "ordinal", "uuid", "start_us", "end_us", "attention"}
+    assert set(rank) == {
+        "rank",
+        "pid",
+        "ordinal",
+        "uuid",
+        "arch",
+        "start_us",
+        "end_us",
+        "attention",
+    }
     assert (rank["rank"], rank["pid"]) == (0, os.getpid())
     assert 0 < rank["start_us"] <= rank["end_us"]
     assert rank["attention"] == {"requested": "", "observed": "", "impl": ""}
@@ -140,6 +149,48 @@ def test_the_request_pin_is_what_every_rank_reports_as_requested() -> None:
     for start, end in ((5, 9), (2, 4), (10, 12)):
         execution_evidence.widen(held, execution_evidence.record(1, {"pid": 7}, start, end))
     assert (held[1]["start_us"], held[1]["end_us"], held[1]["pid"]) == (2, 12, 7)
+
+
+def test_a_kernel_the_probe_refuses_is_evidence_with_its_measurement() -> None:
+    """A kernel 5% off exact attention runs, and the probe refuses it by name: the rank's
+    `skipped` evidence carries the refusal with the numbers behind it."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
+    from cozy_runtime.internal import attention, attention_ulysses
+    from cozy_runtime.internal.encoding import DeviceFacts
+
+    def off(query: Any, key: Any, value: Any, **_options: Any) -> Any:
+        exact = torch.nn.functional.scaled_dot_product_attention(
+            *(t.transpose(1, 2) for t in (query, key, value))
+        )
+        return (exact * 1.05).transpose(1, 2)
+
+    candidate = attention.Candidate(
+        name="off-by-five",
+        backend="_cozy_off_by_five_test",
+        local=attention_ulysses.Local(off, lambda *_: "scaled"),
+        min_sm=0,
+        dtypes=frozenset(),
+        max_head_dim=0,
+        rel_l2_max=1e-2,
+    )
+    try:
+        with pytest.raises(attention.AttentionRefusal) as refused:
+            attention._resolve(candidate, DeviceFacts("cpu", "CPU", 0, "", "", 0))
+        assert refused.value.code == "attention_kernel_out_of_budget"
+        [row] = [r for r in attention.evidence(())["skipped"] if r["kernel"] == "off-by-five"]
+        assert row["status"] == "attention_kernel_out_of_budget"
+        assert (row["source"], row["budget"], row["budget_state"]) == (
+            "prepare",
+            1e-2,
+            "calibrated",
+        )
+        assert row["shape"] == list(attention.PROBE_SHORT)
+        assert set(row["rel_l2_by_rows"]) == {"sampled", "first", "last", "tile_edges"}
+        assert min(row["rel_l2_by_rows"].values()) == pytest.approx(0.05, abs=5e-3)
+        assert "off-by-five" not in str(attention.evidence(("off-by-five",)).get("skipped"))
+    finally:
+        attention._MEASURED.pop("off-by-five", None)
 
 
 def test_a_long_schedule_keeps_a_bounded_series_and_counts_the_rest() -> None:
