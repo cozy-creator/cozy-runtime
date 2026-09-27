@@ -312,10 +312,9 @@ def preinstalled_development(
     interface_path = (
         cache_root / "installed-interfaces" / placement.installation_id / "package-interface.json"
     )
-    interface_path.parent.mkdir(parents=True, exist_ok=True)
-    interface_path.write_bytes(placement.package_interface)
+    package_interface.publish(interface_path, placement.package_interface)
     try:
-        interface = package_interface.read_bytes(interface_path.read_bytes(), str(interface_path))
+        interface = package_interface.read_bytes(placement.package_interface, str(interface_path))
     except package_interface.StalePackageInterface as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
@@ -570,11 +569,10 @@ class Acquirer:
     def _bindings(self, placement: Any) -> tuple[Mapping[str, DeclaredBinding], int]:
         development = placement.development
         interface_path = self.selection_root / placement.installation_id / "package-interface.json"
-        interface_path.parent.mkdir(parents=True, exist_ok=True)
-        interface_path.write_bytes(placement.package_interface)
+        package_interface.publish(interface_path, placement.package_interface)
         try:
             interface = package_interface.read_bytes(
-                interface_path.read_bytes(), str(interface_path)
+                placement.package_interface, str(interface_path)
             )
         except package_interface.StalePackageInterface as exc:
             raise AcquisitionRefusal(
@@ -740,19 +738,6 @@ class Acquirer:
                 "PlacementSet/1 does not select the required interface entrypoints",
             )
         return bindings, count
-
-    def _stage(self, digest: str, raw: bytes) -> Path:
-        self.selection_root.mkdir(parents=True, exist_ok=True, mode=0o755)
-        self.selection_root.chmod(0o755)
-        target = self.selection_root / digest.removeprefix("sha256:")
-        if target.exists():
-            _verify_file(target, digest, len(raw))
-            return target
-        temporary = self.selection_root / f".stage-{digest[7:23]}"
-        temporary.write_bytes(raw)
-        temporary.chmod(0o444)
-        temporary.replace(target)
-        return target
 
 
 def _model_group_weight_bytes(
