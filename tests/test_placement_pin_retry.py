@@ -29,9 +29,10 @@ def test_failed_group_pin_then_same_document_corrected_pin_serves(
             nonlocal initial
             initial = desired()
             assert owner.placement is not None
+            # An ordinal outside the two-device envelope: refused typed, never guessed.
             initial.placement_set.device_pins.append(
                 pb.PlacementDevicePin(
-                    placement_id=owner.placement.placement_id, device_ordinals=[0, 1]
+                    placement_id=owner.placement.placement_id, device_ordinals=[0, 2]
                 )
             )
             return initial
@@ -130,7 +131,7 @@ def test_changed_pin_reassigns_live_or_failed_hosted_placement(hosted: bool) -> 
             initial.placement_set.device_pins.append(
                 pb.PlacementDevicePin(
                     placement_id="hosted" if hosted else owner.placement.placement_id,
-                    device_ordinals=[0, 1] if hosted else [0],
+                    device_ordinals=[0, 2] if hosted else [0],
                 )
             )
             return initial

@@ -13,6 +13,32 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _slice, _workspace, needs_executor
 
 
+def _weightless_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CPU fixture supplies model-independent group formation only: a weightless
+    placement pinned to both devices is placed on both, as a declared degree would be.
+    This is queue/seal proof, not model CP-degree admission."""
+    from cozy_runtime.internal.worker import lanes
+
+    bind, choose = lanes.LaneSet.bind, lanes.LaneSet.choose
+
+    def choose_pin(
+        self: lanes.LaneSet, candidates: tuple[int, ...], width: int, **kwargs: Any
+    ) -> tuple[int, ...]:
+        return candidates if len(candidates) > 1 else choose(self, candidates, width, **kwargs)
+
+    def bind_group(
+        self: lanes.LaneSet, placement_id: str, ordinals: tuple[int, ...], **kwargs: Any
+    ) -> lanes.DeviceLane:
+        if len(ordinals) > 1 and self.lane_of(placement_id) is None:
+            group = self.fuse(ordinals)
+            group.placements.add(placement_id)
+            return group
+        return bind(self, placement_id, ordinals, **kwargs)
+
+    monkeypatch.setattr(lanes.LaneSet, "choose", choose_pin)
+    monkeypatch.setattr(lanes.LaneSet, "bind", bind_group)
+
+
 @needs_executor
 def test_split_lanes_execute_after_worker_started_on_a_group() -> None:
     workers: list[Worker] = []
@@ -69,17 +95,9 @@ def test_split_lanes_execute_after_worker_started_on_a_group() -> None:
 def test_fused_lane_dispatches_a_real_executor_after_boot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cozy_runtime.internal.worker import lanes
 
     workers: list[Worker] = []
     consumers: list[tuple[threading.Thread, ...]] = []
-
-    def form_test_group(self: lanes.LaneSet, placement_id: str, **kwargs: Any) -> lanes.DeviceLane:
-        # Only group formation is supplied by this CPU fixture. The author is
-        # weightless; this is queue/seal proof, not model CP-degree admission.
-        group = self.fuse(tuple(kwargs["pin"]))
-        group.placements.add(placement_id)
-        return group
 
     def owner_hook(owner: LocalRecordOwner) -> None:
         desired = owner._desired_state
@@ -132,7 +150,7 @@ def test_fused_lane_dispatches_a_real_executor_after_boot(
         owner._send = replay_offer  # type: ignore[method-assign]
         owner._on_observed_state = report  # type: ignore[method-assign]
 
-    monkeypatch.setattr(lanes.LaneSet, "assign", form_test_group)
+    _weightless_groups(monkeypatch)
     with _workspace() as root:
         outcome, seals = _slice(
             root, devices="0,1", kind="entrypoint", hook=workers.append, owner_hook=owner_hook
@@ -158,23 +176,12 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     import shutil
 
     import test_device_lanes
-    from cozy_runtime.internal.worker import lanes
     from cozy_runtime.protocol import documents
 
-    assign = lanes.LaneSet.assign
     workers: list[Worker] = []
     completed: list[str] = []
     overlap: list[set[str]] = []
     cold_waits: list[int] = []
-
-    def assign_fixture(self: lanes.LaneSet, placement_id: str, **kwargs: Any) -> lanes.DeviceLane:
-        pin = kwargs.get("pin")
-        if pin and len(pin) > 1:
-            # The CPU fixture supplies model-independent group formation only.
-            group = self.fuse(tuple(pin))
-            group.placements.add(placement_id)
-            return group
-        return assign(self, placement_id, **kwargs)
 
     def owner_hook(owner: LocalRecordOwner) -> None:
         desired = owner._desired_state
@@ -414,7 +421,7 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
         owner._on_outcome = terminal  # type: ignore[method-assign]
         owner._on_accepted = accepted  # type: ignore[method-assign]
 
-    monkeypatch.setattr(lanes.LaneSet, "assign", assign_fixture)
+    _weightless_groups(monkeypatch)
     with _workspace() as root:
         barrier = root / "barrier"
         barrier.mkdir()
