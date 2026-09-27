@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, BinaryIO, cast
@@ -17,6 +18,20 @@ from cozy_runtime.internal.worker.weights import _LeaseReader
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+
+# Recent content-addressed closures. One upload effect sends one command per object.
+_CLOSURES = 8
+
+
+class _Closure:
+    __slots__ = ("digest", "manifest", "objects", "ordered")
+
+    def __init__(self, manifest: bytes, objects: dict[str, int]) -> None:
+        self.manifest, self.objects = manifest, objects
+        self.ordered = sorted(objects.items())
+        self.digest = hashlib.sha256(
+            canonical_json.encode([[key, length] for key, length in self.ordered])
+        ).digest()
 
 
 class NativeArtifactTransfers:
@@ -34,6 +49,7 @@ class NativeArtifactTransfers:
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="native-artifact")
         self.lock = threading.Lock()
         self.active: dict[tuple[str, int, int, str, str, int], bytes] = {}
+        self.closures: OrderedDict[tuple[str, bool], _Closure] = OrderedDict()
 
     def handle(self, command: pb.NativeArtifactTransfer) -> None:
         if not self.valid(command):
@@ -80,9 +96,12 @@ class NativeArtifactTransfers:
     def close(self) -> None:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
-    def _hold(self, command: pb.NativeArtifactTransfer) -> tuple[Any, str]:
+    def _held(self, command: pb.NativeArtifactTransfer) -> Callable[[], bool]:
+        """Check the retained owner obligation; the native retention keeps the closure.
+
+        No closure-wide lease: that opened every object for every object sent.
+        """
         source = command.source
-        manifest = documents.spell(command.manifest.digest)
         if (
             not self.valid(command)
             or not command.effect_id
@@ -92,28 +111,47 @@ class NativeArtifactTransfers:
             or not command.manifest.length
         ):
             raise WorkspaceRefusal("native artifact command identity is incomplete")
-        with self.workspace.locked() as db:
-            held = db.execute(
-                "SELECT * FROM holds WHERE id=? AND owner=?", (source.retention_id, self.owner())
-            ).fetchone()
-            if (
-                held is None
-                or held["state"] != "held"
-                or held["transaction_id"] != source.weights_transaction_id
-                or held["native_digest"] != source.tensorfs_receipt_digest
-                or held["manifest"] != command.manifest.digest
-                or held["manifest_length"] != command.manifest.length
-            ):
-                raise WorkspaceRefusal("native artifact has no matching held owner obligation")
-            store = fill.store(self.workspace.store_root)
-            lease = db.native(lambda: store.acquire_cozytensors(manifest))
-            current = db.execute(
-                "SELECT state FROM holds WHERE id=?", (source.retention_id,)
-            ).fetchone()
-            if current is None or current["state"] != "held":
-                lease.release()
-                raise WorkspaceRefusal("native artifact hold was released during acquisition")
-            return lease, manifest
+
+        def held() -> bool:
+            with self.workspace.locked() as db:
+                row = db.execute(
+                    "SELECT * FROM holds WHERE id=? AND owner=?",
+                    (source.retention_id, self.owner()),
+                ).fetchone()
+            return row is not None and (
+                row["state"] == "held"
+                and row["transaction_id"] == source.weights_transaction_id
+                and row["native_digest"] == source.tensorfs_receipt_digest
+                and row["manifest"] == command.manifest.digest
+                and row["manifest_length"] == command.manifest.length
+            )
+
+        if not held():
+            raise WorkspaceRefusal("native artifact has no matching held owner obligation")
+        return held
+
+    def _closure(self, store: Any, manifest: str, length: int, trees: bool) -> _Closure:
+        key = manifest, trees
+        with self.lock:
+            cached = self.closures.get(key)
+            if cached is not None:
+                self.closures.move_to_end(key)
+                return cached
+        body = bytes(store.manifest(manifest)["manifest"])
+        if len(body) != length or "sha256:" + hashlib.sha256(body).hexdigest() != manifest:
+            raise WorkspaceRefusal("native artifact manifest identity changed")
+        objects = {manifest: length}
+        for row in store.walk(manifest) if trees else store.walk_cozytensors(manifest):
+            object_id, size = str(row["id"]), int(row["length"])
+            if object_id in objects and objects[object_id] != size:
+                raise WorkspaceRefusal("native artifact closure changes an object length")
+            objects[object_id] = size
+        closure = _Closure(body, objects)
+        with self.lock:
+            self.closures[key] = closure
+            while len(self.closures) > _CLOSURES:
+                self.closures.popitem(last=False)
+        return closure
 
     @staticmethod
     def _status(command: pb.NativeArtifactTransfer) -> pb.NativeArtifactTransferStatus:
@@ -133,8 +171,8 @@ class NativeArtifactTransfers:
 
     def execute(self, command: pb.NativeArtifactTransfer) -> pb.NativeArtifactTransferStatus:
         result = self._status(command)
-        lease = None
         byte_context = None
+        held: Callable[[], bool] | None = None
         reader: Any = None
         try:
             if command.HasField("source") == command.HasField("byte_source"):
@@ -151,32 +189,16 @@ class NativeArtifactTransfers:
                 byte_context = workspace_byte_outputs.leased(
                     self.workspace, self.owner(), command.byte_source
                 )
-                store, lease, _ = byte_context.__enter__()
-                manifest = documents.spell(command.manifest.digest)
+                store, _, _ = byte_context.__enter__()
             else:
-                lease, manifest = self._hold(command)
+                held = self._held(command)
                 store = fill.store(self.workspace.store_root)
-            held = store.manifest(manifest)
-            manifest_bytes = bytes(held["manifest"])
-            if (
-                len(manifest_bytes) != command.manifest.length
-                or hashlib.sha256(manifest_bytes).digest() != command.manifest.digest
-            ):
-                raise WorkspaceRefusal("native artifact manifest identity changed")
-            objects = {manifest: command.manifest.length}
-            for row in (
-                store.walk(manifest)
-                if byte_context is not None
-                else store.walk_cozytensors(manifest)
-            ):
-                object_id, length = str(row["id"]), int(row["length"])
-                if object_id in objects and objects[object_id] != length:
-                    raise WorkspaceRefusal("native artifact closure changes an object length")
-                objects[object_id] = length
-            ordered = sorted(objects.items())
-            result.closure_digest = hashlib.sha256(
-                canonical_json.encode([[key, length] for key, length in ordered])
-            ).digest()
+            manifest = documents.spell(command.manifest.digest)
+            closure = self._closure(
+                store, manifest, command.manifest.length, byte_context is not None
+            )
+            objects, ordered = closure.objects, closure.ordered
+            result.closure_digest = closure.digest
             if not command.HasField("grant"):
                 if not 0 < command.limit <= 128 or command.offset > len(ordered):
                     raise WorkspaceRefusal("native artifact inventory page is outside its bound")
@@ -199,13 +221,15 @@ class NativeArtifactTransfers:
             ):
                 raise WorkspaceRefusal("native artifact grant repeats a header")
             if grant.object_id == manifest:
-                reader = io.BytesIO(manifest_bytes)
+                reader = io.BytesIO(closure.manifest)
             else:
                 reader = _LeaseReader(
                     store.acquire(manifest, [(grant.object_id, grant.length)]),
                     grant.object_id,
                     grant.length,
                 )
+                if held is not None and not held():
+                    raise WorkspaceRefusal("native artifact hold was released during acquisition")
             host = urlparse(grant.url).hostname or ""
             receipt = egress.put_from(
                 grant.url,
@@ -240,5 +264,3 @@ class NativeArtifactTransfers:
                 reader.close()
             if byte_context is not None:
                 byte_context.__exit__(None, None, None)
-            elif lease is not None:
-                lease.release()
