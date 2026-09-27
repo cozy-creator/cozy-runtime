@@ -18,9 +18,10 @@ import threading
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, get_args, get_type_hints
 
 import msgspec
+import tensorfs
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._errors import AuthorError
@@ -166,17 +167,26 @@ def _native_selection(value: pb.NativeSourceSelection) -> dict[str, Any]:
     }
 
 
-def computation_key(operation: str, effective: dict[str, Any]) -> bytes:
-    """The native memo key: the operation, its declared output version and its real inputs.
+# The CozyTensors format this TensorFS writes, as its typed header declares it.
+OUTPUT_FORMAT: str = get_args(get_type_hints(tensorfs.Header)["format"])[0]
 
-    A Runtime or TensorFS release that keeps an operation's output meaning keeps the key;
-    one that changes it bumps `source_interfaces.OPERATION_VERSIONS` by hand.
+
+def computation_key(
+    operation: str, effective: dict[str, Any], output_format: str = OUTPUT_FORMAT
+) -> bytes:
+    """The native memo key: the operation, its declared output version, TensorFS's output
+    format and its real inputs.
+
+    A Runtime or TensorFS release that keeps an operation's output meaning and format keeps
+    the key. A TensorFS writing another format misses; a changed meaning bumps
+    `source_interfaces.OPERATION_VERSIONS` by hand.
     """
     return hashlib.sha256(
         canonical_json.encode(
             {
                 "operation": operation,
                 "version": source_interfaces.OPERATION_VERSIONS[operation],
+                "format": output_format,
                 "effective": effective,
             }
         )
