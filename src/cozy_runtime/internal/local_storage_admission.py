@@ -37,9 +37,10 @@ def pressure_target(path: Path) -> int:
     observed = os.statvfs(existing_directory(path))
     total = observed.f_blocks * observed.f_frsize
     available = observed.f_bavail * observed.f_frsize
-    if total <= 0 or not 0 <= available <= total or observed.f_files <= 0:
+    if total <= 0 or not 0 <= available <= total:
         raise OSError("filesystem capacity is unavailable")
-    if observed.f_favail <= max(
+    # Filesystems without an inode table (btrfs reports zero) have no inode pressure.
+    if observed.f_files > 0 and observed.f_favail <= max(
         POLICY["minimum_free_inodes"], observed.f_files // POLICY["enter_free_capacity_divisor"]
     ):
         return (1 << 63) - 1
@@ -61,15 +62,16 @@ def shortfall(writes: Sequence[Write]) -> dict[str, int] | None:
         available = observed.f_bavail * observed.f_frsize
         count, free = observed.f_files, observed.f_favail
         reserve = max(POLICY["minimum_free_bytes"], total // POLICY["reserve_capacity_divisor"])
-        inode_reserve = POLICY["minimum_free_inodes"]
+        # A filesystem that reports no inode table (btrfs) is admitted on bytes alone.
+        inode_reserve = POLICY["minimum_free_inodes"] if count else 0
         if (
             not 0 < reserve < total
             or not 0 <= available <= total
-            or not 0 < inode_reserve < count
+            or (count and not inode_reserve < count)
             or not 0 <= free <= count
         ):
             raise OSError("filesystem capacity is unknown or cannot honor the storage reserve")
-        if size > available - reserve or inodes > free - inode_reserve:
+        if size > available - reserve or (count and inodes > free - inode_reserve):
             return {
                 "available": available,
                 "required": size,

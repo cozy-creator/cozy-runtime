@@ -14,12 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import canonical, package_interface
+from cozy_runtime.internal import canonical, interface_wheel, package_interface, static_interface
 from cozy_runtime.internal.worker.package_prepare import prepare_package_set
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from test_serving_interfaces import project
 
 
 def _interface() -> bytes:
@@ -127,3 +128,33 @@ def test_missing_required_interface_fields_still_refuse() -> None:
     del body["jobs"]
     with pytest.raises(package_interface.StalePackageInterface, match="missing jobs"):
         package_interface.read_bytes(canonical.write(body))
+
+
+def test_additive_asset_bound_keys_are_read_and_not_generated(tmp_path: Path) -> None:
+    root = project(tmp_path)
+    source = (root / "serving_fixture.py").read_text()
+    source = source.replace(
+        "from cozy_runtime.author import App, Context, Model",
+        "from typing import Annotated\n"
+        "from cozy_runtime.author import App, AssetBound, Context, ImageAsset, Model",
+    ).replace(
+        "    prompt: str\n",
+        "    prompt: str\n    image: Annotated[ImageAsset, AssetBound(max_bytes=4096)]\n",
+    )
+    (root / "serving_fixture.py").write_text(source)
+    body = json.loads(package_interface.canonical_bytes(static_interface.build(root)))
+    bounds = [
+        field["asset_bound"]
+        for entry in body["entrypoints"]
+        for field in entry["request"]["fields"]
+        if "asset_bound" in field
+    ]
+    assert bounds
+    for bound in bounds:
+        bound["max_frames"] = 3
+    raw = canonical.write(body)
+    package_interface.read_bytes(raw)
+    for name, generated in interface_wheel.generate(raw).items():
+        if name.endswith(".py"):
+            assert b"max_frames" not in generated
+            compile(generated, name, "exec")

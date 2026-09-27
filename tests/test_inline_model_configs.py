@@ -14,7 +14,7 @@ from tensorfs.derived import Derivation, Source, Target
 
 from cozy_runtime.author import Config, ConformanceError
 from cozy_runtime.internal import canonical, model_config
-from cozy_runtime.internal.worker.package_prepare import _selected_models
+from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, _selected_models
 from test_derived_config_runtime import _released_source
 from test_model_runtime_closure import _CONFIG
 
@@ -217,3 +217,38 @@ def test_a_construction_config_naming_a_source_carrier_still_refuses(tmp_path: P
         Config(canonical.parse_canonical(config), "config")
     assert refused.value.code == "config_path"
     assert refused.value.fields == ("config.weights",)
+
+
+def test_a_selection_serves_its_manifest_after_its_lane_moves(tmp_path: Path) -> None:
+    """A release/lane is a label: the selected digest is served even when the lane now
+    names another manifest, and an identical repeated selection is one selection."""
+
+    store, checkpoint = _lane_checkpoint(tmp_path, None, canonical.write(FA3_CONFIG))
+    current = store.resolve_release("test", "model", "1", "main")["manifest_digest"]
+    assert current != checkpoint
+    selection = {
+        "package": "example/package",
+        "slot": "generate.models.model",
+        "model": "test/model",
+        "release": "1",
+        "lane": "main",
+        "manifest": checkpoint,
+    }
+    selected = _selected_models(
+        "example/package",
+        [selection, dict(selection)],
+        Path(store.root),
+        lambda *_args: None,
+        construction_slots={"generate.models.model"},
+    )
+    assert selected["generate.models.model"]["manifest_length"] == len(
+        bytes(store.manifest(checkpoint)["manifest"])
+    )
+    with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
+        _selected_models(
+            "example/package",
+            [selection, {**selection, "manifest": current}],
+            Path(store.root),
+            lambda *_args: None,
+            construction_slots={"generate.models.model"},
+        )

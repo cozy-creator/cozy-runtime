@@ -665,10 +665,8 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
                 constraints = field["constraints"]
                 if not isinstance(constraints, dict) or not constraints:
                     _invalid(source, f"{field_path}.constraints", "must be a non-empty object")
-            if "asset_bound" in field:
-                _subset_object(
-                    field["asset_bound"], _ASSET_BOUND_KEYS, source, f"{field_path}.asset_bound"
-                )
+            if "asset_bound" in field and not isinstance(field["asset_bound"], dict):
+                _invalid(source, f"{field_path}.asset_bound", "must be an object")
         return
     if form == "union":
         union = _fields(value, {"union"}, source, path)
@@ -724,11 +722,6 @@ def _fields(value: Json, required: set[str], source: str, path: str) -> dict[str
     return cast(dict[str, Json], value)
 
 
-def _subset_object(value: Json, allowed: set[str], source: str, path: str) -> None:
-    if not isinstance(value, dict) or not value or not set(value) <= allowed:
-        _invalid(source, path, f"must be a non-empty object using {sorted(allowed)}")
-
-
 def _invalid(source: str, path: str, detail: str) -> NoReturn:
     raise StalePackageInterface(f"{source}: {path} {detail}", code="malformed_package_interface")
 
@@ -737,7 +730,8 @@ _SCALARS = frozenset({"bool", "float", "int", "null", "str"})
 _SCHEMA_FORMS = frozenset(
     {"asset", "fields", "input", "list", "literal", "map", "opaque", "tuple", "union"}
 )
-_ASSET_BOUND_KEYS = {"max_bytes", "max_decoded_bytes", "media_types"}
+#: The asset-bound facts this Runtime consumes; a newer writer's additional bounds are ignored.
+ASSET_BOUND_KEYS = frozenset({"max_bytes", "max_decoded_bytes", "media_types"})
 
 
 def counts(body: Mapping[str, Json]) -> dict[str, int]:

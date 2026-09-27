@@ -977,36 +977,6 @@ def _stage_job_plans(
     return staged
 
 
-def _resolved_manifest_length(
-    resolved: Mapping[str, Any], digest: str, declared: int, where: str
-) -> int:
-    """The length of the manifest a selection resolves to, cross-checked against it.
-
-    THE SELECTION DECLARES A DIGEST; THE STORE DECLARES THE LENGTH. `cli/package_prepare`
-    requires `manifest_length` on every selection row it accepts, but the pod's rows come
-    from a DownloadDelegation whose model entries are lane/manifest/model/package/
-    release/slot -- there is no length in them. Reading one and comparing it to the store's
-    real length compared 0 against a real number, which no store can satisfy: every modeled
-    preparation on a pod refused `package_prepare_model_selection_mismatch` while naming the
-    digest that had in fact matched. `local.py` already gets this right -- the length comes
-    from the resolved row, and a caller-supplied one is cross-checked only when it exists --
-    and this is that rule, given a name so the two halves cannot drift apart again.
-    """
-
-    resolved_digest = str(resolved["manifest_digest"])
-    length = int(resolved["manifest_length"])
-    if resolved_digest != digest or (declared and declared != length):
-        # Name BOTH sides. The old message quoted only the digest the caller expected, so a
-        # length disagreement and a digest disagreement read identically -- which sent a
-        # reader hunting for a lane mix-up that was never there.
-        raise PreparationRefusal(
-            "package_prepare_model_selection_mismatch",
-            f"{where} resolves to {resolved_digest}/{length}, "
-            f"not the selected {digest}" + (f"/{declared}" if declared else ""),
-        )
-    return length
-
-
 def _selected_models(
     package_name: str,
     selections: Sequence[Any],
@@ -1030,7 +1000,7 @@ def _selected_models(
         if not isinstance(row, dict) or row.get("package") != package_name:
             raise PreparationRefusal("package_prepare_model_selection_mismatch", "package")
         slot = str(row.get("slot", ""))
-        if not slot or slot in selected:
+        if not slot or (slot in selected and selected[slot]["selection"] != row):
             raise PreparationRefusal("package_prepare_model_selection_mismatch", slot)
         selected[slot] = {"selection": row}
     if not selected:
@@ -1047,43 +1017,20 @@ def _selected_models(
         manifests: dict[str, tuple[int, bytes, bytes]] = {}
         for value in selected.values():
             selection = value["selection"]
+            # The selected manifest digest is the model's identity; release and lane are
+            # labels. Where a mutable lane points now does not change what was selected.
             digest = str(selection["manifest"])
-            # A DOWNLOAD SET NAMES A DIGEST AND NO LENGTH. `cli/package_prepare` requires
-            # `manifest_length` in every selection row it accepts, but the pod's rows come
-            # from a DownloadDelegation whose model entries are
-            # lane/manifest/model/package/release/slot -- there is no length to read. So
-            # this defaulted to 0 and compared 0 against the store's real length, which no
-            # store can ever satisfy: every modeled preparation on a pod refused
-            # `package_prepare_model_selection_mismatch` naming the digest that had in fact
-            # matched. `local.py` already resolves this correctly -- the length comes from
-            # the resolved row and a caller-supplied one is only cross-checked when it
-            # exists -- and this is that, for the same reason.
-            declared = int(selection.get("manifest_length", 0))
             model = str(selection.get("model", ""))
             release = str(selection.get("release", ""))
             lane = str(selection.get("lane", ""))
             parts = model.split("/")
             if len(parts) != 2 or not all(parts) or bool(release) != bool(lane):
                 raise PreparationRefusal("package_prepare_model_selection_mismatch", model)
-            length = declared
-            if release:
-                length = _resolved_manifest_length(
-                    store.resolve_release(parts[0], parts[1], release, lane),
-                    digest,
-                    declared,
-                    f"{model}@{release}/{lane}",
-                )
             held = store.manifest(digest)
             raw = bytes(held["manifest"])
-            if not release and not declared:
-                length = len(raw)
-            if (
-                length <= 0
-                or len(raw) != length
-                or "sha256:" + hashlib.sha256(raw).hexdigest() != digest
-            ):
+            if not raw or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
                 raise PreparationRefusal("package_prepare_model_manifest_mismatch", digest)
-            manifests[digest] = (length, raw, bytes(held["header"]))
+            manifests[digest] = (len(raw), raw, bytes(held["header"]))
         for digest, (length, raw, header_raw) in sorted(manifests.items()):
             header_digest, header_length = acquire.cozytensors_ref(tensorfs, raw)
             if (

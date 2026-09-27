@@ -99,3 +99,29 @@ def test_unknown_capacity_refuses_without_pruning_or_running_author_write(
         assert recovered == []
     finally:
         registration.close()
+
+
+def test_filesystem_without_inode_table_is_admitted_on_bytes(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = os.statvfs(root)
+
+    def btrfs(path: str | os.PathLike[str]) -> os.statvfs_result:
+        # btrfs reports no inode table: f_files, f_ffree and f_favail are all zero.
+        fields = list(real)
+        fields[5:8] = [0, 0, 0]
+        return os.statvfs_result(fields)
+
+    monkeypatch.setattr(local.os, "statvfs", btrfs)
+    registration = storage.register_workspace(root, lambda _target: None)
+    assert storage.pressure_enabled() and local.pressure_target(root) >= 0
+    with storage.admit(storage.Write(root / "blob", 1 << 20, 4)):
+        (root / "blob").write_bytes(b"x")
+    too_large = real.f_bavail * real.f_frsize + 1
+    with (
+        pytest.raises(storage.StorageRefusal) as refused,
+        storage.admit(storage.Write(root / "huge", too_large, 1)),
+    ):
+        pass
+    assert refused.value.code == "insufficient_storage"
+    registration.close()
