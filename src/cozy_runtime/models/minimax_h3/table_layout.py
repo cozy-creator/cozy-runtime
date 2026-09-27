@@ -1,7 +1,6 @@
 """The checkpoint's ordered AdaLN row labels, independent of a sampling preset.
 
-Canonical source: cozy_runtime.models.minimax_h3.table_layout. The producer vendors
-these exact bytes as h3_tables._table_layout; scripts/sync-h3-table-layout.py checks the copy.
+Runtime owns this reader; the table producer imports it rather than vendoring a copy.
 """
 
 from __future__ import annotations
@@ -36,6 +35,17 @@ def _timestep(value: object) -> float:
     return number
 
 
+def _modality_tag(row: Mapping[str, object]) -> int:
+    """The row's modality from its tag, its name, or both when they agree."""
+    tag, name = row.get("modality_tag"), row.get("modality")
+    named = _MODALITIES.index(name) if name in _MODALITIES else None
+    if type(tag) is int and tag in range(3) and named in (None, tag):
+        return tag
+    if tag is None and named is not None:
+        return named
+    _refuse("must label modalities as video=0, text=1, or audio=2")
+
+
 @dataclass(frozen=True, slots=True)
 class TableLayout:
     timesteps: tuple[float, ...]
@@ -43,26 +53,19 @@ class TableLayout:
 
     @classmethod
     def parse(cls, value: object) -> TableLayout:
-        if not isinstance(value, Mapping) or set(value) != {
-            "final_normalization",
-            "block_modulation",
-        }:
+        """Read the labels a writer of any version recorded; unknown keys are ignored."""
+        if not isinstance(value, Mapping):
             _refuse("must include their final-normalization and block-modulation row labels")
-        final = value["final_normalization"]
-        blocks = value["block_modulation"]
+        final = value.get("final_normalization")
+        blocks = value.get("block_modulation")
         if not isinstance(final, list) or not final or not isinstance(blocks, list) or not blocks:
-            _refuse("must contain nonempty row-label lists")
+            _refuse("must contain nonempty final-normalization and block-modulation label lists")
         timesteps: list[float] = []
         rows: dict[float, int] = {}
         for index, row in enumerate(final):
-            if (
-                not isinstance(row, Mapping)
-                or set(row) != {"index", "timestep"}
-                or type(row["index"]) is not int
-                or row["index"] != index
-            ):
-                _refuse("need contiguous final-normalization row indexes starting at zero")
-            timestep = _timestep(row["timestep"])
+            if not isinstance(row, Mapping) or row.get("index", index) != index:
+                _refuse("need final-normalization rows in index order starting at zero")
+            timestep = _timestep(row.get("timestep"))
             if timestep in rows:
                 _refuse("contain duplicate final-normalization timestep labels")
             rows[timestep] = index
@@ -70,17 +73,10 @@ class TableLayout:
         keys: list[tuple[int, int]] = []
         seen: set[tuple[int, int]] = set()
         for index, row in enumerate(blocks):
-            if (
-                not isinstance(row, Mapping)
-                or set(row) != {"index", "timestep", "modality", "modality_tag"}
-                or type(row["index"]) is not int
-                or row["index"] != index
-            ):
-                _refuse("need contiguous block-modulation row indexes starting at zero")
-            tag = row["modality_tag"]
-            if type(tag) is not int or tag not in range(3) or row["modality"] != _MODALITIES[tag]:
-                _refuse("must label modalities as video=0, text=1, or audio=2")
-            timestep = _timestep(row["timestep"])
+            if not isinstance(row, Mapping) or row.get("index", index) != index:
+                _refuse("need block-modulation rows in index order starting at zero")
+            tag = _modality_tag(row)
+            timestep = _timestep(row.get("timestep"))
             if timestep not in rows:
                 _refuse("reference a timestep absent from their final-normalization rows")
             key = (rows[timestep], tag)

@@ -25,7 +25,6 @@ from urllib.parse import parse_qs, urlsplit
 
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.internal import attention_fp8, attention_sol, attention_upstream
-from cozy_runtime.internal.anima_optimization import DIFFUSERS_VERSION
 from cozy_runtime.internal.encoding import DeviceFacts
 
 try:
@@ -217,30 +216,18 @@ class Ready:
 
 
 def _registry() -> Any:
-    """diffusers' attention backend registry at the reviewed version, or a typed absence."""
-    try:
-        installed = metadata.version("diffusers")
-    except metadata.PackageNotFoundError as exc:
-        raise AttentionRefusal(
-            "attention_kernel_absent", "diffusers is not installed; attention backends are its"
-        ) from exc
-    if installed != DIFFUSERS_VERSION:
-        raise AttentionRefusal(
-            "attention_kernel_absent",
-            f"the reviewed attention backends are diffusers=={DIFFUSERS_VERSION}; this "
-            f"environment installs {installed}",
-        )
-    loaded = import_module("diffusers")
-    actual = getattr(loaded, "__version__", "unknown")
-    if actual != DIFFUSERS_VERSION:
-        raise AttentionRefusal(
-            "attention_kernel_absent",
-            f"diffusers metadata is {installed}, but the imported module is {actual} "
-            f"at {getattr(loaded, '__file__', 'unknown')}; Runtime requires "
-            f"diffusers=={DIFFUSERS_VERSION}",
-        )
-    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+    """Diffusers' attention backend registry, or a typed absence.
 
+    Any Diffusers exposing the per-site dispatch registry qualifies; each backend is
+    still proven by registration and a numerical smoke test before it serves.
+    """
+    try:
+        from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+    except ImportError as exc:
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"this environment's diffusers exposes no attention backend registry: {exc}",
+        ) from exc
     return _AttentionBackendRegistry
 
 
@@ -452,8 +439,8 @@ def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
     if member not in _HUB_KERNELS_REGISTRY:
         raise AttentionRefusal(
             "attention_kernel_absent",
-            f"diffusers=={DIFFUSERS_VERSION} does not resolve {candidate.backend!r} through "
-            "its Hub-kernel registry, so a baked snapshot cannot be placed in its slot",
+            f"diffusers does not resolve {candidate.backend!r} through its Hub-kernel "
+            "registry, so a baked snapshot cannot be placed in its slot",
         )
     config = _HUB_KERNELS_REGISTRY[member]
     config.kernel_fn = _lookup(module, config.function_attr, candidate.name)
@@ -642,7 +629,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     if member not in registry._backends:
         raise AttentionRefusal(
             "attention_kernel_absent",
-            f"diffusers=={DIFFUSERS_VERSION} registers no backend {candidate.backend!r}",
+            f"diffusers registers no backend {candidate.backend!r}",
         )
     if candidate.baked:
         loaded_member, location = _load_baked(candidate, device)

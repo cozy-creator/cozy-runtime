@@ -218,23 +218,24 @@ def witness(root: Path, argv: list[str]) -> int:
 
 
 def read_events(root: Path) -> list[dict[str, Any]]:
-    """Read and validate the surviving event rows with no live process anywhere."""
+    """Read the surviving event rows with no live process anywhere.
+
+    Witnesses of other Runtime versions append to the same log: rows of unknown kinds,
+    additive fields and a torn final line are skipped, never a reason to lose the rest.
+    """
 
     path = root / "witness" / "events.jsonl"
     if not path.is_file():
         return []
     events: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+    for line in path.read_text().splitlines():
         try:
             event = json.loads(line)
-        except ValueError as exc:
-            raise WitnessRefusal("witness_corrupt", f"{path}:{line_number}: invalid event") from exc
-        kind = event.get("event") if isinstance(event, dict) else None
-        if not isinstance(kind, str) or kind not in _EVENT_FIELDS:
-            raise WitnessRefusal("witness_corrupt", f"{path}:{line_number}: unknown witness event")
-        if set(event) != _EVENT_FIELDS[kind]:
-            raise WitnessRefusal("witness_corrupt", f"{path}:{line_number}: wrong event fields")
-        events.append(event)
+        except ValueError:
+            continue
+        required = _EVENT_FIELDS.get(event.get("event")) if isinstance(event, dict) else None
+        if required is not None and required <= set(event):
+            events.append(event)
     return events
 
 

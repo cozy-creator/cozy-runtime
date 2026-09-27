@@ -16,7 +16,7 @@ from cozy_runtime.author._services import MAX_OUTPUT_BYTES, Attempt
 from cozy_runtime.author.sources import _call
 
 
-class CommittedFile(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class CommittedFile(msgspec.Struct, frozen=True):
     file: Annotated[FileAsset, AssetBound(max_bytes=MAX_OUTPUT_BYTES)]
 
 

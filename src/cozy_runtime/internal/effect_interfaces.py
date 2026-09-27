@@ -16,19 +16,19 @@ from cozy_runtime.internal import schema
 MODULE = "cozy_runtime.author.publication"
 
 
-class Upload(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class Upload(msgspec.Struct, frozen=True):
     artifact: ModelArtifact
     destination: str
 
 
-class Publish(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class Publish(msgspec.Struct, frozen=True):
     destination: str
     release: str
     lanes: dict[str, CheckpointRef]
     expected_revision: int | None = None
 
 
-class AttachAssessment(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class AttachAssessment(msgspec.Struct, frozen=True):
     checkpoint: CheckpointRef
     report: FileAsset
     workloads: FileAsset

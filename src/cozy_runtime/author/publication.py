@@ -13,7 +13,7 @@ from cozy_runtime.author._calls import _current
 from cozy_runtime.author._errors import CapabilityError
 
 
-class CheckpointRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class CheckpointRef(msgspec.Struct, frozen=True):
     destination: str
     checkpoint: str
     manifest: ObjectRef
@@ -21,7 +21,7 @@ class CheckpointRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     observation: str
 
 
-class AssessmentRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class AssessmentRef(msgspec.Struct, frozen=True):
     destination: str
     checkpoint: str
     report: ObjectRef
@@ -29,7 +29,7 @@ class AssessmentRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     observation: str
 
 
-class ReleaseReceipt(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class ReleaseReceipt(msgspec.Struct, frozen=True):
     destination: str
     release: str
     revision: int

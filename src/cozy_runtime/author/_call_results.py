@@ -68,10 +68,10 @@ def decode(
             if not isinstance(node, dict):
                 raise ValueError("native result field is not an asset record")
             kind = node.get("kind")
-            allowed = {"asset_ref", "kind", "digest", "size_bytes"}
+            required = {"asset_ref", "kind", "digest", "size_bytes"}
             if kind in _ASSETS:
-                allowed.add("media_type")
-            if set(node) != allowed or (kind not in _ASSETS and kind != "tree"):
+                required.add("media_type")
+            if not required <= set(node) or (kind not in _ASSETS and kind != "tree"):
                 raise ValueError("native result field has an invalid asset shape")
             digest, size = node["digest"], node["size_bytes"]
             media_type = node.get("media_type", "")

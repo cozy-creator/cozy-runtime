@@ -20,7 +20,7 @@ from cozy_runtime.author._markers import AssetBound
 SOURCE_FILES_MAX_BYTES = 64 << 20
 
 
-class _SourceFilesResult(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class _SourceFilesResult(msgspec.Struct, frozen=True):
     files: Annotated[Tree, AssetBound(max_bytes=SOURCE_FILES_MAX_BYTES)]
 
 

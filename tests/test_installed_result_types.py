@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
@@ -15,7 +16,6 @@ import pytest
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import (
-    ConformanceError,
     FileAsset,
     Invocation,
     ModelArtifact,
@@ -152,15 +152,15 @@ def test_public_result_conversion_retains_generated_wire_refusals(
         ([("projection", ModelArtifact | None), ("ready", bool)], {"array_like": True}),
     ],
 )
-def test_same_name_cannot_bind_a_different_public_result_schema(
+def test_a_different_public_result_schema_keeps_the_generated_wire_type(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fields: list[Any], options: dict[str, Any]
 ) -> None:
     imported, _, _ = installed(tmp_path, monkeypatch)
     binding = imported.__cozy_bindings__["select"]
     imported.__cozy_bindings__ = {}
     imported.Selection = msgspec.defstruct("Selection", fields, **options)
-    with pytest.raises(ConformanceError, match="captured interface"):
-        call_types.public_result(imported, binding)
+    kept = call_types.public_result(imported, replace(binding, python_result=None))
+    assert kept.python_result is None and kept.result is binding.result
 
 
 def test_public_result_conversion_preserves_tag_validation_and_native_grants(

@@ -73,11 +73,13 @@ from cozy_runtime.internal import (
     attention_sol,
     canonical,
     child_env,
+    effect_interfaces,
     model_config,
     package_interface,
     prepare_diagnostics,
     proctree,
     sandbox,
+    source_interfaces,
 )
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
@@ -1536,7 +1538,6 @@ class Executor:
         from cozy_runtime.internal.anima_optimization import (
             AnimaOptimizationRefusal,
             apply_anima_execution_plan,
-            fused_anima_capability_refusal,
         )
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
@@ -1954,7 +1955,7 @@ class Executor:
                 binding["model_binding_path"], model_cls, artifact, adapters=adapter_rows
             )
             stage("construct_and_fill")
-            optimization = apply_anima_execution_plan(
+            optimization, optimization_refusal = apply_anima_execution_plan(
                 model,
                 application=str(binding["application"]),
                 model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
@@ -2229,14 +2230,7 @@ class Executor:
             # WHY the fused lane was unavailable, when it was (cr-102 / proto-038). The
             # verdict itself already rode in `execution_optimization` below and nothing
             # rendered it; a `None` with no reason is the part an operator cannot act on.
-            "execution_optimization_refusal": (
-                ""
-                if optimization
-                else fused_anima_capability_refusal(
-                    application=str(binding["application"]),
-                    model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
-                )
-            ),
+            "execution_optimization_refusal": optimization_refusal,
             # The fused-glue plan's record (h3a-015): None where the class did not consent,
             # else what was substituted (or why nothing was) on this device.
             "execution_fusion": fused.document() if fused is not None else None,
@@ -2318,12 +2312,14 @@ class Executor:
         if (
             not isinstance(rows, list)
             or not 2 <= len(rows) <= 16
-            or any(not isinstance(row, dict) or set(row) != {"binding", "budgets"} for row in rows)
+            or any(
+                not isinstance(row, dict) or not {"binding", "budgets"} <= set(row) for row in rows
+            )
         ):
             return {
                 "ok": False,
                 "code": "model_binding_set_invalid",
-                "detail": "models must be a complete array of 2 through 16 closed binding rows",
+                "detail": "models must be an array of 2 through 16 binding rows with budgets",
             }
         paths = [str(row["binding"].get("model_binding_path", "")) for row in rows]
         parameters = [str(row["binding"].get("model_parameter_name", "")) for row in rows]
@@ -3160,7 +3156,7 @@ class Executor:
         rows = command.get("models")
         if rows is None:
             rows = {}
-        if not isinstance(rows, Mapping) or set(rows) != set(declared):
+        if not isinstance(rows, Mapping) or not set(declared) <= set(rows):
             carried = sorted(str(key) for key in rows) if isinstance(rows, Mapping) else []
             raise CapabilityError(
                 f"job declares Model parameters {sorted(declared) or 'none'} and the worker "
@@ -3481,23 +3477,16 @@ class Executor:
                 row["module"],
                 row["export"],
             )
-            if row.get("native_source"):
-                from cozy_runtime.internal import source_interfaces
-
-                if interface != source_interfaces.DIGEST or module != source_interfaces.MODULE:
-                    raise CapabilityError("native source interface changed", code="child_interface")
-                binding = source_interfaces.bindings()[(interface, module, export)]
-                bindings[(module, export)] = binding
-            elif row.get("native_effect"):
-                from cozy_runtime.internal import effect_interfaces
-
-                effect_binding = effect_interfaces.bindings().get((interface, module, export))
-                if effect_binding is None:
+            if row.get("native_source") or row.get("native_effect"):
+                # Runtime owns these services; a digest recorded by another Runtime is advisory.
+                service = source_interfaces if row.get("native_source") else effect_interfaces
+                native = service.bindings().get(("", module, export))
+                if native is None:
                     raise CapabilityError(
-                        "native effect interface differs from the fixed service",
+                        f"this Runtime offers no native operation {module}.{export}",
                         code="child_interface",
                     )
-                bindings[(module, export)] = effect_binding
+                bindings[(module, export)] = native
             elif row.get("builtin"):
                 import msgspec
 

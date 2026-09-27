@@ -13,7 +13,7 @@ _REQUEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
 _SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 
 
-class ObjectRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class ObjectRef(msgspec.Struct, frozen=True):
     digest: str
     length: int
 
@@ -30,7 +30,7 @@ class ObjectRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
             )
 
 
-class ModelArtifact(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class ModelArtifact(msgspec.Struct, frozen=True):
     """A produced model's original receipt provenance, independent of its current holder.
 
     Reusing it never rewrites the producer or receipt. The RecordOwner verifies
@@ -59,7 +59,7 @@ class ModelArtifact(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
             )
 
 
-class SourceArtifact(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class SourceArtifact(msgspec.Struct, frozen=True):
     """Exact retained raw source bytes. Identity never grants access by itself.
 
     The native source receipt preserves original producer history while each

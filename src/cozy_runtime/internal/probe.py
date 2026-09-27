@@ -594,7 +594,7 @@ class _RolePartLike:
     grid's shape to price its blocked representation rather than its raw byte count.
     """
 
-    __slots__ = ("shape", "nbytes")
+    __slots__ = ("nbytes", "shape")
 
     def __init__(self, shape: tuple[int, ...], nbytes: int) -> None:
         self.shape = shape

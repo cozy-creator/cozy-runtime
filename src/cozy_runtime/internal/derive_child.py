@@ -99,7 +99,7 @@ def read_request(raw: bytes) -> DeriveRequest:
         value = msgspec.msgpack.decode(raw)
     except msgspec.DecodeError as err:
         raise DeriveRefusal("derive_request_invalid", str(err)) from err
-    if not isinstance(value, dict) or set(value) != {"package", "slots"}:
+    if not isinstance(value, dict) or not {"package", "slots"} <= set(value):
         raise DeriveRefusal("derive_request_invalid", "request field set")
     package = value["package"]
     if not isinstance(package, dict) or len(package) != 1:
@@ -122,7 +122,9 @@ def read_request(raw: bytes) -> DeriveRequest:
         raise DeriveRefusal("derive_request_invalid", "slots is a non-empty array")
     slots: list[SlotRequest] = []
     for row in encoded_rows:
-        if not isinstance(row, dict) or set(row) != {"slot", "config", "assets", "tensor_dtypes"}:
+        if not isinstance(row, dict) or not {"slot", "config", "assets", "tensor_dtypes"} <= set(
+            row
+        ):
             raise DeriveRefusal("derive_request_invalid", "slot row field set")
         slot = row["slot"]
         config = row["config"]
@@ -219,16 +221,16 @@ def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements 
 def read_response(
     response: Mapping[str, Any], request: DeriveRequest
 ) -> tuple[TensorRequirements | SourceSlot, ...]:
-    if set(response) != {"requirements"} or not isinstance(response["requirements"], list):
+    if not isinstance(response.get("requirements"), list):
         raise DeriveRefusal("derive_child_invalid", "requirements field")
     out: list[TensorRequirements | SourceSlot] = []
     for answer in response["requirements"]:
-        if isinstance(answer, dict) and set(answer) == {"slot", "source"}:
-            if not isinstance(answer["slot"], str) or answer["source"] is not True:
+        if isinstance(answer, dict) and "source" in answer:
+            if not isinstance(answer.get("slot"), str) or answer["source"] is not True:
                 raise DeriveRefusal("derive_child_invalid", "source slot field value")
             out.append(SourceSlot(answer["slot"]))
             continue
-        if not isinstance(answer, dict) or set(answer) != {"slot", "components", "tensors"}:
+        if not isinstance(answer, dict) or not {"slot", "components", "tensors"} <= set(answer):
             raise DeriveRefusal("derive_child_invalid", "requirements row field set")
         components = answer["components"]
         tensors = answer["tensors"]
@@ -242,12 +244,9 @@ def read_response(
             raise DeriveRefusal("derive_child_invalid", "requirements shape")
         rows: list[RequirementRow] = []
         for tensor in tensors:
-            if not isinstance(tensor, dict) or set(tensor) != {
-                "component",
-                "key",
-                "dtype",
-                "shape",
-            }:
+            if not isinstance(tensor, dict) or not {"component", "key", "dtype", "shape"} <= set(
+                tensor
+            ):
                 raise DeriveRefusal("derive_child_invalid", "tensor row field set")
             component, key, dtype, shape = (
                 tensor["component"],
