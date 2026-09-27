@@ -1,1 +1,0 @@
-The `interface-wheel` verb streams the implementation wheel instead of holding it in memory: members are copied chunk by chunk into a staged file on the output disk, and the 256 MiB `MAX_IMPLEMENTATION_WHEEL` refusal is gone.
