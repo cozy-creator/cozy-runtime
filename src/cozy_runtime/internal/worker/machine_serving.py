@@ -57,15 +57,16 @@ def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
     if not target.serving_envelope:
         payload = {key: item for key, item in value.items() if key not in names}
         return canonical_json.encode(payload), value
+    # Envelope fields another generator adds are ignored; absent models select defaults.
+    models = value.get("models", {})
     if (
-        set(value) != {"payload", "models"}
-        or not isinstance(value["payload"], dict)
-        or not isinstance(value["models"], dict)
-        or not set(value["models"]) <= names
+        not isinstance(value.get("payload"), dict)
+        or not isinstance(models, dict)
+        or not set(models) <= names
     ):
         raise WorkspaceRefusal("generated serving call has invalid payload or Model slots")
     return canonical_json.encode(value["payload"]), {
-        name: model for name, model in value["models"].items() if model is not None
+        name: model for name, model in models.items() if model is not None
     }
 
 
