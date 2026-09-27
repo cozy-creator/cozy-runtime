@@ -338,7 +338,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
             inv.calls.finish()
     finally:
         if inv.calls is not None:
-            inv.calls.closed = True
+            inv.calls.close()
         _current.reset(token)
         handles.close()
 

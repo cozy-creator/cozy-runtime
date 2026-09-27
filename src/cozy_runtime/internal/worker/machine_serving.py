@@ -33,6 +33,7 @@ from . import (
     machine_model_defaults,
     machine_models,
     package_prepare,
+    store_gc,
 )
 from .machine_child_target import Target
 from .preparations import Preparations
@@ -76,6 +77,7 @@ class Prepared:
     placement: dict[str, Any]
     defaults: list[dict[str, Any]]
     access: contextlib.ExitStack
+    generation: int = 0  # `store_gc.generation` when its bytes were verified
 
 
 class Serving:
@@ -272,6 +274,7 @@ class Serving:
         )
 
         def load(cancelled: Callable[[], bool]) -> Prepared:
+            generation = store_gc.generation
             try:
                 if cancelled():
                     raise WorkspaceRefusal("model preparation canceled")
@@ -288,6 +291,7 @@ class Serving:
                 # Consumers acquire their own holds at actual admission. Shared
                 # preparation retains only immutable binding metadata on completion.
                 prepared.access.close()
+                prepared.generation = generation
                 return prepared
             finally:
                 assert self.worker.workspace is not None
@@ -299,7 +303,8 @@ class Serving:
             load,
             speculative=speculative,
             cancel=token.cancel,
-            refresh=not speculative,
+            # A hint's exact selection serves its demand unless the store collected since.
+            stale=lambda prepared: prepared.generation != store_gc.generation,
         )
 
     def drive(self, owner: str, call: Call, target: Target, request: pb.ChildCallRequest) -> None:
@@ -330,9 +335,11 @@ class Serving:
                 return  # a later drive pass starts it once a preparation completes
             _, models = arguments(target, request.request_canonical_bytes)
             future = self._shared(owner, call, target, request, models, speculative=False)
-            if future is not None:
-                self.pending[key] = future
-            return
+            if future is None:
+                return
+            self.pending[key] = future
+            # Admission continues on the drive pass its completion starts, not a later tick.
+            future.add_done_callback(lambda _: self.worker.drive_wake.set())
         if not future.done():
             return
         prepared = None
@@ -467,7 +474,13 @@ class Serving:
                 catalog = grants.model_inputs(
                     grants.bind(documents.read(raw, pb.InvocationSpec), offer.grant, identity)
                 )
-                machine_checkpoint_inputs.preflight(workspace, owner, offer, catalog)
+                machine_checkpoint_inputs.preflight(
+                    workspace,
+                    owner,
+                    offer,
+                    catalog,
+                    resident=self.worker.holds_construction(selected["entrypoint_binding_digest"]),
+                )
                 for entry in catalog.values():
                     machine_checkpoint_inputs.retain(workspace, owner, offer, entry)
                 executions.submit(

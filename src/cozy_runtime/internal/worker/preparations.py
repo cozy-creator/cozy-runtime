@@ -36,7 +36,7 @@ class Preparations[T]:
         *,
         speculative: bool,
         cancel: Callable[[], None] = lambda: None,
-        refresh: bool = False,
+        stale: Callable[[T], bool] = lambda _: False,
     ) -> Future[T] | None:
         with self.lock:
             if self.closed:
@@ -53,10 +53,10 @@ class Preparations[T]:
                 entry is not None
                 and entry.future.done()
                 and not speculative
-                and (refresh or entry.future.exception() is not None)
+                and (entry.future.exception() is not None or stale(entry.future.result()))
             ):
-                # A failed speculative attempt is not a permanent refusal. A
-                # demanded refresh also revalidates disk custody after cache GC.
+                # A failed speculative attempt is not a permanent refusal. Demand reuses
+                # an exact finished preparation unless `stale` says its custody may be gone.
                 entry = self.entries[key] = _Entry(load, cancel, interests=entry.interests.copy())
             if entry is None:
                 if speculative and len(self.entries) >= self.maximum - 1:

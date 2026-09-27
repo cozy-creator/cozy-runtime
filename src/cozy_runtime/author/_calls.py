@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
+import math
 import re
+import socket
+import time
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -28,6 +32,8 @@ R = TypeVar("R")
 MAX_ACTIVE_CALLS = 32
 MAX_CALL_INDEX = (1 << 32) - 1
 MAX_CALL_BYTES = 48 * 1024
+#: Only a worker that cannot nudge its parent (Runtime before child_events) is polled.
+_UNNOTIFIED_POLL_SECONDS = 0.05
 
 
 class ChildCallError(CapabilityError):
@@ -295,8 +301,15 @@ class _Broker:
         request_id: str,
         bindings: Mapping[tuple[str, str], _CallType],
         exchange: Callable[[str, dict[str, Any]], dict[str, Any]],
+        watch: Callable[[], int | None] | None = None,
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
+        #: Opens the worker's nudge socket once; None when no peer can nudge.
+        self.watch = watch
+        self.nudges: socket.socket | None = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.nudged = 0
+        self.nudge = asyncio.Event()
         self.calls: dict[int, PendingCall[Any]] = {}
         self.next_index = 0
         self.closed = False
@@ -403,6 +416,7 @@ class _Broker:
                         self._observe(ready, answer)
                         self._check(answer, ready.index)
                         self.activated.add(ready.index)
+                seen = self.nudged
                 answer = self.exchange("child_poll", {"call_index": call.index})
                 self._observe(call, answer)
                 self._check(answer, call.index)
@@ -440,7 +454,7 @@ class _Broker:
                             "child result differs from its interface",
                             call.index,
                         ) from exc
-                await asyncio.sleep(0.05)
+                await self._changed(seen, call.ctx.deadline)
         except asyncio.CancelledError:
             if call.index in self.activated and not self.closed:
                 self.exchange("child_cancel", {"call_index": call.index})
@@ -452,6 +466,47 @@ class _Broker:
             finally:
                 self.activated.discard(call.index)
                 self.calls.pop(call.index, None)
+
+    async def _changed(self, seen: int, deadline: float) -> None:
+        """Until the worker nudges this attempt after `seen`: a call moved or it was cancelled."""
+        if self.watch is not None:
+            watch, self.watch = self.watch, None
+            descriptor = watch()
+            if descriptor is not None:
+                self.nudges = socket.socket(fileno=descriptor)
+                self.nudges.setblocking(False)
+                self.loop = asyncio.get_running_loop()
+                self.loop.add_reader(self.nudges.fileno(), self._drain)
+        if self.nudges is None:
+            await asyncio.sleep(_UNNOTIFIED_POLL_SECONDS)
+            return
+        if self.nudged == seen:
+            remaining = deadline - time.monotonic()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self.nudge.wait(), None if math.isinf(remaining) else max(remaining, 0)
+                )
+
+    def _drain(self) -> None:
+        assert self.nudges is not None
+        try:
+            while self.nudges.recv(4096):
+                pass
+            self._unwatch()  # the worker closed the attempt's socket: poll from now on
+        except BlockingIOError:
+            pass
+        except OSError:
+            self._unwatch()
+        self.nudged += 1
+        nudge, self.nudge = self.nudge, asyncio.Event()
+        nudge.set()
+
+    def _unwatch(self) -> None:
+        if self.nudges is not None:
+            if self.loop is not None and not self.loop.is_closed():
+                self.loop.remove_reader(self.nudges.fileno())
+            self.nudges.close()
+            self.nudges = None
 
     @staticmethod
     def _observe(call: PendingCall[Any], answer: Mapping[str, Any]) -> None:
@@ -514,8 +569,12 @@ class _Broker:
                 str(answer.get("child_request_id", "")),
             )
 
-    def finish(self) -> None:
+    def close(self) -> None:
         self.closed = True
+        self._unwatch()
+
+    def finish(self) -> None:
+        self.close()
         missing = list(self.calls)
         if missing:
             raise ChildCallError(

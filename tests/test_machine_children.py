@@ -8,9 +8,10 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import grpc
 import pytest
@@ -19,6 +20,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
+from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -687,6 +689,19 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     assert thread.is_alive() and time.monotonic() < deadline
                     time.sleep(0.02)
                 assert len(worker.lanes.composition) == 3
+                # Two parents await a blocked leaf. They wait for a nudge, not a clock: a
+                # 50 ms poll made ~40 child_poll exchanges in this second.
+                exchanged: list[str] = []
+                handle = worker.calls.handle
+
+                def counted(attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
+                    exchanged.append(str(frame.get("kind")))
+                    return handle(attempt, frame)
+
+                worker.calls.handle = counted  # type: ignore[method-assign]
+                time.sleep(1)
+                worker.calls.handle = handle  # type: ignore[method-assign]
+                assert exchanged.count("child_poll") <= 2, exchanged
                 worker.control_execution(claim, "root", "pause-root", 1, "pause")
                 while True:
                     assert thread.is_alive() and time.monotonic() < deadline

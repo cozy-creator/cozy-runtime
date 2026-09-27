@@ -140,6 +140,7 @@ from cozy_runtime.internal.worker.plan import (
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import watch_calls as workspace_calls_watch
 from cozy_runtime.protocol import (
     CAPABILITY_UNAVAILABLE_CODE,
     MIN_COMPATIBLE_WIRE_MINOR,
@@ -985,6 +986,8 @@ class Worker:
         #: per placement: bindings digests of superseded documents -> {binding: construction}
         #: whose offers are still accepted when the binding and its construction are unchanged
         self._superseded: dict[str, dict[str, dict[str, str]]] = {}
+        #: `host_facts()`: measured once per boot, forgotten when an executor dies
+        self._host_facts: hostfacts.HostFacts | None = None
         self.root.mkdir(parents=True, exist_ok=True)
         _claim_descriptor_headroom()
         self.base = package_environment.observe_base(
@@ -1121,6 +1124,8 @@ class Worker:
             owner=options.triage_owner,
         )
         self.stop = threading.Event()
+        #: set by every machine event a drive pass acts on; the watchdog drives at once
+        self.drive_wake = threading.Event()
         from cozy_runtime.internal.worker.workspace import Workspace
         from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
 
@@ -1203,6 +1208,9 @@ class Worker:
         from .machine_effects import Effects
 
         self.machine_calls = MachineCalls(self) if self.workspace is not None else None
+        if self.executions is not None:
+            self.executions.changed = self._machine_changed
+            workspace_calls_watch(self.executions.workspace.store_root, self._machine_changed)
         self.gpu = GpuScheduler(len(self.lanes.entries))
         self.prespawns = prespawn.Prespawns(self)
         self._gpu_shapes: dict[str, machine_lanes.Shape] = {}
@@ -2127,11 +2135,32 @@ class Worker:
                 del self._published_interfaces[described]
             self.note("installation", f"collected superseded {installed.package} {identifier}")
 
+    def host_facts(self) -> hostfacts.HostFacts:
+        """This host's accelerator facts, measured once rather than one `nvidia-smi` per call.
+
+        The inventory is fixed for a boot. An unreadable accelerator is measured again at its
+        next use, and an executor death (the one device event a worker sees) forgets them.
+        """
+        facts = self._host_facts
+        if facts is None:
+            facts = hostfacts.measure(self.options.accelerator_backend)
+            if "gpu_name" not in facts.unreadable:
+                self._host_facts = facts
+        return facts
+
+    def holds_construction(self, binding: str) -> bool:
+        """A live executor has built this exact entrypoint binding: its models are resident."""
+        supervisions = [self.supervision, *(hosted.supervision for hosted in self.hosted.values())]
+        return any(
+            s.current is not None and s.current.alive() and binding in s.current.loaded_bindings()
+            for s in supervisions
+        )
+
     def numerical_environment(self) -> bytes:
         from cozy_runtime.internal.numerical_environment import fingerprint
 
         return fingerprint(
-            hostfacts.measure(self.options.accelerator_backend),
+            self.host_facts(),
             threads=self.options.threads,
             inherited=dict(self.config.child_base_env),
         )
@@ -2219,7 +2248,17 @@ class Worker:
         ):
             return None
         assert self.machine_calls is not None
-        return self.machine_calls.handle(attempt, request, action)
+        result = self.machine_calls.handle(attempt, request, action)
+        if action != "poll":
+            self.drive_wake.set()
+        return result
+
+    def _machine_changed(self, kind: str = "calls") -> None:
+        """A durable execution or call fact moved: waiting parents re-poll; the scheduler
+        drives (progress alone changes nothing it schedules)."""
+        self.calls.wake()
+        if kind != "progress":
+            self.drive_wake.set()
 
     def submit_execution(
         self,
@@ -3318,6 +3357,7 @@ class Worker:
                     and self.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
                 )
             )
+            self._host_facts = None
             if not self.supervision.invalidate(
                 executor,
                 f"executor epoch {executor.epoch} pid {executor.pid} exited",
@@ -4143,6 +4183,9 @@ class Worker:
         if disposition != "closed":
             return
         self.calls.close(acked.request_id, acked.attempt_ordinal)
+        # A closed child is its parent's result, and its devices are the next grant.
+        self.calls.wake()
+        self.drive_wake.set()
         from . import machine_slots
 
         machine_slots.release(self, acked.request_id, ordinal=acked.attempt_ordinal)
@@ -4174,6 +4217,7 @@ class Worker:
     def request_stop(self) -> None:
         """Wake every lane and the sender so the worker can leave; the host is the caller's."""
         self.stop.set()
+        self.drive_wake.set()
         self.outbound.put(None)
         for lane in self.lanes:
             lane.stage.put(None)
@@ -7701,7 +7745,13 @@ class Worker:
         warm. It is killed only when its frames stop against their own measured cadence
         (`AttemptRecord.cancel_stall`), never after a flat grace.
         """
-        while not self.stop.wait(0.05):
+        while not self.stop.is_set():
+            # A machine event starts the next drive pass at once. The cadence only samples
+            # deadlines and cancel stalls, which are clocks by nature.
+            self.drive_wake.wait(0.05)
+            self.drive_wake.clear()
+            if self.stop.is_set():
+                return
             self.drive_executions()
             for attempt in list(self.engine.live.values()):
                 if attempt.state == "staged":
@@ -7724,6 +7774,7 @@ class Worker:
                             self.engine.supervision_for(attempt).cooperative_cancel(
                                 executor, f"{attempt.request_id}#{attempt.attempt}"
                             )
+                            self.calls.wake()
                         attempt.cancel_started = time.monotonic()
                         deadline_expired = True
                 if deadline_expired:
@@ -7964,7 +8015,7 @@ class Worker:
         its launcher or supplied virtual), the same rows its workspace and readiness report.
         """
         gpus = self.options.gpus
-        facts = hostfacts.measure("none" if gpus else self.options.accelerator_backend)
+        facts = hostfacts.measure("none") if gpus else self.host_facts()
         if gpus:
             names = {gpu["device_name"] for gpu in gpus}
             memory = {gpu["memory_bytes"] for gpu in gpus}

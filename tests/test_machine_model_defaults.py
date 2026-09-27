@@ -69,6 +69,7 @@ def peer(capture: dict[str, Any]) -> Worker:
         SimpleNamespace(
             config=SimpleNamespace(bootstrap_credential="local-bootstrap"),
             options=SimpleNamespace(accelerator_backend="none"),
+            host_facts=lambda: hostfacts.measure("none"),
             model_transfer_lock=threading.Lock(),
             model_transfers={},
             executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
@@ -342,6 +343,20 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
             machine_checkpoint_inputs.preflight(worker.workspace, "owner", child, entries)
         with worker.workspace.locked() as db:
             assert not db.execute("SELECT 1 FROM execution_checkpoint_inputs").fetchone()
+        # A resident construction skips only the early check; retention refuses it the same.
+        with (
+            pytest.raises(WorkspaceRefusal, match=reason),
+            machine_checkpoint_inputs.admission(worker.workspace, "owner", "child"),
+        ):
+            machine_checkpoint_inputs.preflight(
+                worker.workspace, "owner", child, entries, resident=True
+            )
+            for entry in entries.values():
+                machine_checkpoint_inputs.retain(worker.workspace, "owner", child, entry)
+        with worker.workspace.locked() as db:
+            assert not db.execute(
+                "SELECT 1 FROM execution_checkpoint_inputs WHERE state<>'released'"
+            ).fetchone()
     finally:
         serving.close()
         worker.supervision.close()

@@ -10,7 +10,7 @@ from contextlib import AbstractContextManager, ExitStack, nullcontext
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from cozy_runtime.internal import fill, hostfacts
+from cozy_runtime.internal import fill
 from cozy_runtime.protocol import (
     CAPTURED_MODEL_DEFAULTS_WIRE_MINOR,
     MODEL_DEFAULT_GPU_COUNT_WIRE_MINOR,
@@ -150,7 +150,7 @@ def matches(selector: str, observed: str) -> bool:
 
 def fitter(worker: Worker) -> Callable[[Mapping[str, Any]], bool]:
     """Whether a rung's GPU selector and count fit this machine's devices."""
-    facts = hostfacts.measure(worker.options.accelerator_backend)
+    facts = worker.host_facts()
     if "gpu_name" in facts.unreadable:
         raise WorkspaceRefusal("captured Model default cannot select an unreadable accelerator")
     entries = getattr(getattr(worker, "lanes", None), "entries", None)
