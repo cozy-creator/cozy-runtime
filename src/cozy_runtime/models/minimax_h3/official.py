@@ -158,6 +158,11 @@ _ASSETS = Path(__file__).resolve().parent
 _WARM_ROWS = 8
 _WARM_VIDEO_TAG, _WARM_TEXT_TAG, _WARM_AUDIO_TAG = 0, 1, 2
 
+#: Elements per numerical-check reduction. Each chunk costs a fixed handful of launches, so
+#: the bound is the float32 transient (64 MiB), whatever the stored width. A 1M-element FP8
+#: bound split the fp8 DiT into ~34k chunks: ~2.6 s of launch overhead after every re-stage.
+_CHECK_CHUNK_ELEMENTS = 16 * 1024 * 1024
+
 # NVIDIA's H3 sparse policy protects conditioning and the initial sensitive work.
 # This supplies semantics only; backend selection still requires explicit policy.
 _DENSE_ATTENTION_PATHS = ("token_refiner", "transformer_blocks.0", "transformer_blocks.1")
@@ -742,11 +747,10 @@ class NumericalChecks:
                     # Stored FP8 reductions are not supported on every backend.
                     # Widen only this bounded observation, never the weight itself.
                     widen = tensor.element_size() == 1
-                    chunk_elements = 1024 * 1024 if widen else 16 * 1024 * 1024
                     chunks = [tensor.detach()]
                     while chunks:
                         part = chunks.pop()
-                        if part.numel() > chunk_elements:
+                        if part.numel() > _CHECK_CHUNK_ELEMENTS:
                             axis = max(range(part.ndim), key=lambda dim: part.shape[dim])
                             chunks.extend(part.split(max(1, part.shape[axis] // 2), dim=axis))
                             continue
@@ -757,8 +761,10 @@ class NumericalChecks:
                         if widen:
                             part = part.float()
                         observation.chunks.append((label, size))
-                        observation.nonfinite.append((~torch.isfinite(part)).sum())
-                        observation.absmax.append(part.abs().amax().float())
+                        observation.nonfinite.append(size - torch.isfinite(part).sum())
+                        observation.absmax.append(
+                            torch.linalg.vector_norm(part, ord=math.inf).float()
+                        )
         if required and not observation.elements:
             raise OutputError(
                 f"no resident floating tensor values to inspect at {stage}",
