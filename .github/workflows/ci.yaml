@@ -1,19 +1,29 @@
 name: ci
+# Automatic: one ~20 s job on master pushes that touch Python: syntax errors and undefined
+# names across the whole tree (Python has no compile step; targeted local tests only see
+# the modules they import).
+# On demand, before a release (lint, types, fences, wheel, pytest, handoff proof):
+#   gh workflow run ci.yaml -R cozy-creator/cozy-runtime --ref <branch>
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ["**.md", "docs/**", "changelog.d/**"]
   push:
     branches: [master]
-    paths-ignore: ["**.md", "docs/**", "changelog.d/**"]
+    paths: ["**.py", "pyproject.toml", ".github/workflows/ci.yaml"]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  compile:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uvx ruff@0.16.4 check --select E9,F63,F7,F82 .
+
   checks:
-    # Draft PRs are checkpoints; CI runs once the PR is ready for review.
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
