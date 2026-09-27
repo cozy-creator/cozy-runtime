@@ -28,6 +28,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR, _development, _run, _wheel_rows
 
 SOURCE = """from pathlib import Path
+import tempfile
 import time
 import msgspec
 from cozy_runtime.author import App, Context
@@ -35,10 +36,13 @@ app=App()
 class Request(msgspec.Struct):
     entered: str = ""
     gate: str = ""
+    temporary: str = ""
 class Result(msgspec.Struct):
     value: int
 @app.job
 def JOB(ctx: Context, payload: Request) -> Result:
+    if payload.temporary:
+        Path(payload.temporary).write_text(tempfile.gettempdir())
     if payload.entered:
         Path(payload.entered).write_text("entered")
         while not Path(payload.gate).exists():
