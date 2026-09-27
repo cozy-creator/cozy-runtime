@@ -1,7 +1,8 @@
 name: Publish to PyPI
 
 # Publication IS the tag push (cozy-eval's pattern). No local publish —
-# this workflow is the single release procedure.
+# this workflow is the single release procedure. Manual run for an existing tag:
+#   gh workflow run publish.yaml -R cozy-creator/cozy-runtime -f release_tag=vX.Y.Z
 on:
   workflow_dispatch:
     inputs:
