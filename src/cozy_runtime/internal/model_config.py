@@ -46,21 +46,18 @@ def construction_config(configs: object) -> bytes:
             raise ModelConfigRefusal("the CozyTensors header carries a malformed inline config")
         if name in RESERVED:
             continue
-        raw = value
         try:
-            document = json.loads(raw)
+            document = json.loads(value)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ModelConfigRefusal(f"config {name!r} is not JSON") from exc
         if not isinstance(document, dict):
             raise ModelConfigRefusal(f"config {name!r} is not an object")
         try:
-            normalized = canonical.write(document)
+            normalized = canonical.write(document)  # any writer's spelling, one identity
         except canonical.CanonicalError as exc:
-            raise ModelConfigRefusal(f"config {name!r} is not canonical JSON: {exc}") from exc
-        if normalized != raw:
-            raise ModelConfigRefusal(f"config {name!r} is not canonical JSON")
+            raise ModelConfigRefusal(f"config {name!r} has no canonical JSON form: {exc}") from exc
         decoded[name] = document
-        held.append(raw)
+        held.append(normalized)
     if not held:
         raise ModelConfigRefusal("the CozyTensors header declares no inline construction configs")
     if len(held) == 1:

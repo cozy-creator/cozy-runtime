@@ -25,6 +25,14 @@ def test_one_inline_config_is_the_constructor_document() -> None:
     assert model_config.construction_config({"transformer": raw}) == raw
 
 
+def test_a_noncanonical_writer_spelling_is_normalized_not_refused() -> None:
+    spelled = b'{ "layers": 32,\n  "hidden_size": 2048 }'
+
+    assert model_config.construction_config({"transformer": spelled}) == (
+        b'{"hidden_size":2048,"layers":32}'
+    )
+
+
 def test_named_inline_configs_form_one_canonical_constructor_document() -> None:
     document = model_config.construction_config(
         {
