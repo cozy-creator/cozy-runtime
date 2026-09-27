@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import math
 import sys
-import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -59,7 +59,7 @@ def _shared(
             Invocation(
                 host.attempt.request_id,
                 root,
-                time.monotonic() + 600,
+                math.inf,  # no stopwatch: a test attempt ends on its own outcome
                 models={"source": _derive_model(QuantizationSource, source.manifest.digest)},
                 tensorfs_source=host.client.source,
                 tensorfs_output=host.client.open_output,

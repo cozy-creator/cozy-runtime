@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-import time
+import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -180,7 +180,7 @@ def _run(
             Invocation(
                 host.attempt.request_id,
                 root,
-                time.monotonic() + 30,
+                math.inf,  # no stopwatch: a test attempt ends on its own outcome
                 models={"source": _derive_model(Source, source.manifest.digest)},
                 tensorfs_source=host.client.source,
                 tensorfs_output=host.client.open_output,
