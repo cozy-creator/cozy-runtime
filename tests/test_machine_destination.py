@@ -74,7 +74,9 @@ app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),))
 """
 
 
-def root_offer(request: str, binding: JobBinding, weights: list[dict[str, object]]) -> pb.AttemptOffer:
+def root_offer(
+    request: str, binding: JobBinding, weights: list[dict[str, object]]
+) -> pb.AttemptOffer:
     payload = canonical_json.encode({"n": 3})
     digest = documents.spell(hashlib.sha256(payload).digest())
     spec = pb.InvocationSpec(
@@ -165,112 +167,123 @@ def test_job_root_publishes_its_weights_output_to_the_granted_destination(
             assert worker.machine_effects is not None
             worker.machine_effects.allow_local = True  # the stand-in bucket is plain HTTP
             thread = threading.Thread(target=worker.run, daemon=True)
-            fixture.measure(worker, preparation)
-            installed = worker.prepare_local_package(preparation).installed_package
-            captured, capture_digest = documents.identity(
-                pb.MachineExecutionCapture(
-                    root_installation_id=installed.installation_id,
-                    installed_packages=[installed],
-                    bindings=[
-                        pb.MachineCallableBinding(
-                            caller_installation_id=installed.installation_id,
-                            callee_installation_id=installed.installation_id,
-                            module="prepare_convert",
-                            export="convert",
-                            entrypoint="convert",
-                        )
-                    ],
-                )
-            )
-            if worker.supervision.current is not None:
-                worker.supervision.retire_current(worker.supervision.current, "begin lifecycle")
-            plans = [
-                json.loads(path.read_bytes()) for path in (root / "home/job-plans").glob("*/*.json")
-            ]
-            binding = JobBinding.read(next(row for row in plans if row.get("job") == "convert"))
-            interface = json.loads(installed.package_interface)
-            weights = next(job for job in interface["jobs"] if job["name"] == "convert")[
-                "weights_outputs"
-            ]
-            thread.start()
-            deadline = time.monotonic() + 120
-            while not (root / "address").exists():
-                assert thread.is_alive() and time.monotonic() < deadline
-                time.sleep(0.02)
-            claim = pb.Claim(
-                record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b"offline"
-            )
-            worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda _: None)
-            client = rpc.WorkerControlStub(
-                grpc.insecure_channel((root / "address").read_text().strip())
-            )
-            workspace = client.GetMachineExecutionWorkspace(
-                pb.MachineExecutionWorkspaceQuery(claim=claim)
-            ).execution_workspace_id
-
-            def submit(request: str, authorization: str) -> None:
-                client.SubmitMachineExecution(
-                    pb.MachineExecutionSubmit(
-                        claim=claim,
-                        submission_id=request,
-                        capture_digest=capture_digest,
-                        capture_canonical_bytes=captured,
-                        offer=root_offer(request, binding, weights),
-                        prepared_state=pb.DesiredWorkerState(
-                            revision=1,
-                            wire_minor=WIRE_MINOR,
-                            posture=pb.POSTURE_ACCEPTING,
-                            job=pb.JobDirective(
-                                installation_id=binding.installation_id,
-                                job_descriptor_id=binding.job_descriptor_id,
-                                reclaim_on_terminal=True,
-                            ),
-                        ),
-                        payload_canonical_bytes=canonical_json.encode({"n": 3}),
-                        expected_execution_workspace_id=workspace,
-                        publication_authorization_id=authorization,
+            try:
+                fixture.measure(worker, preparation)
+                installed = worker.prepare_local_package(preparation).installed_package
+                captured, capture_digest = documents.identity(
+                    pb.MachineExecutionCapture(
+                        root_installation_id=installed.installation_id,
+                        installed_packages=[installed],
+                        bindings=[
+                            pb.MachineCallableBinding(
+                                caller_installation_id=installed.installation_id,
+                                callee_installation_id=installed.installation_id,
+                                module="prepare_convert",
+                                export="convert",
+                                entrypoint="convert",
+                            )
+                        ],
                     )
                 )
+                if worker.supervision.current is not None:
+                    worker.supervision.retire_current(worker.supervision.current, "begin lifecycle")
+                plans = [
+                    json.loads(path.read_bytes())
+                    for path in (root / "home/job-plans").glob("*/*.json")
+                ]
+                binding = JobBinding.read(next(row for row in plans if row.get("job") == "convert"))
+                interface = json.loads(installed.package_interface)
+                weights = next(job for job in interface["jobs"] if job["name"] == "convert")[
+                    "weights_outputs"
+                ]
+                thread.start()
+                deadline = time.monotonic() + 120
+                while not (root / "address").exists():
+                    assert thread.is_alive() and time.monotonic() < deadline
+                    time.sleep(0.02)
+                claim = pb.Claim(
+                    record_owner_id="owner",
+                    record_owner_epoch=1,
+                    wire_minor=WIRE_MINOR,
+                    proof=b"offline",
+                )
+                worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda _: None)
+                client = rpc.WorkerControlStub(
+                    grpc.insecure_channel((root / "address").read_text().strip())
+                )
+                workspace = client.GetMachineExecutionWorkspace(
+                    pb.MachineExecutionWorkspaceQuery(claim=claim)
+                ).execution_workspace_id
 
-            # A destination without its owner's publication grant is refused at intake.
-            with pytest.raises(grpc.RpcError, match="publication authority") as refused:
-                submit("ungranted", "")
-            assert refused.value.code() == grpc.StatusCode.FAILED_PRECONDITION
-            assert worker.executions is not None
-            assert not worker.executions.owns("owner", "ungranted")
+                def submit(request: str, authorization: str) -> None:
+                    client.SubmitMachineExecution(
+                        pb.MachineExecutionSubmit(
+                            claim=claim,
+                            submission_id=request,
+                            capture_digest=capture_digest,
+                            capture_canonical_bytes=captured,
+                            offer=root_offer(request, binding, weights),
+                            prepared_state=pb.DesiredWorkerState(
+                                revision=1,
+                                wire_minor=WIRE_MINOR,
+                                posture=pb.POSTURE_ACCEPTING,
+                                job=pb.JobDirective(
+                                    installation_id=binding.installation_id,
+                                    job_descriptor_id=binding.job_descriptor_id,
+                                    reclaim_on_terminal=True,
+                                ),
+                            ),
+                            payload_canonical_bytes=canonical_json.encode({"n": 3}),
+                            expected_execution_workspace_id=workspace,
+                            publication_authorization_id=authorization,
+                        )
+                    )
 
-            submit("root", AUTHORIZATION)
-            while (state := worker.execution_status(claim, "root").state) not in (
-                "succeeded",
-                "failed",
-            ):
-                assert thread.is_alive() and time.monotonic() < deadline
-                time.sleep(0.05)
-            body = documents.read(
-                worker.collect_execution(claim, "root").outcome_canonical_bytes,
-                pb.AttemptOutcomeBody,
-            )
-            assert state == "succeeded", body
-            (retained,) = body["result"]["retained_models"]
-            artifact = json.loads(base64.b64decode(retained["model_artifact_canonical_bytes"]))
-            manifest = artifact["manifest"]["digest"]
+                # A destination without its owner's publication grant is refused at intake.
+                with pytest.raises(grpc.RpcError, match="publication authority") as refused:
+                    submit("ungranted", "")
+                assert refused.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                assert worker.executions is not None
+                assert not worker.executions.owns("owner", "ungranted")
 
-            # The memoized root's own result reached the destination, every closure object.
-            assert set(hub.checkpoints) == {manifest}
-            closure = {manifest} | {
-                str(row["id"])
-                for row in tensorfs.Store.ensure(root / "store").walk_cozytensors(manifest)
-            }
-            assert set(bucket.objects) == closure
-            events = worker.executions.events("owner", "root").events
-            published = [json.loads(e.body) for e in events if e.kind == "checkpoint"]
-            assert published and all(
-                event
-                == {
-                    "destination": "alice/model",
-                    "checkpoint": manifest,
-                    "output_slot": "model",
-                    "observation": "acknowledged",
+                submit("root", AUTHORIZATION)
+                while (state := worker.execution_status(claim, "root").state) not in (
+                    "succeeded",
+                    "failed",
+                ):
+                    assert thread.is_alive() and time.monotonic() < deadline
+                    time.sleep(0.05)
+                body = documents.read(
+                    worker.collect_execution(claim, "root").outcome_canonical_bytes,
+                    pb.AttemptOutcomeBody,
+                )
+                assert state == "succeeded", body
+                (retained,) = body["result"]["retained_models"]
+                artifact = json.loads(base64.b64decode(retained["model_artifact_canonical_bytes"]))
+                manifest = artifact["manifest"]["digest"]
+
+                # The memoized root's own result reached the destination, every closure object.
+                assert set(hub.checkpoints) == {manifest}
+                closure = {manifest} | {
+                    str(row["id"])
+                    for row in tensorfs.Store.ensure(root / "store").walk_cozytensors(manifest)
                 }
-                for event in published
-            )
+                assert set(bucket.objects) == closure
+                events = worker.executions.events("owner", "root").events
+                published = [json.loads(e.body) for e in events if e.kind == "checkpoint"]
+                assert published and all(
+                    event
+                    == {
+                        "destination": "alice/model",
+                        "checkpoint": manifest,
+                        "output_slot": "model",
+                        "observation": "acknowledged",
+                    }
+                    for event in published
+                )
+            finally:
+                worker.request_stop()
+                worker.host.stop()
+                if thread.ident is not None:
+                    thread.join(30)
+                assert not thread.is_alive()
