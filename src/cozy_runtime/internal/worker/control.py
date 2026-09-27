@@ -29,6 +29,7 @@ import collections
 import os
 import queue
 import re
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from concurrent import futures
@@ -36,7 +37,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import grpc
-from tensorfs import errors as tensorfs_errors
 
 from cozy_runtime.internal.numerical_environment import NumericalEnvironmentRefusal
 from cozy_runtime.internal.worker.derived_retention import RetentionRefusal
@@ -351,7 +351,11 @@ def _custody_failure(
     busy or momentarily failing store, an OSError, or any unexpected failure is not: the
     owner retries with its own backoff. Details stay generic; the type names the fault.
     """
-    store_code = exc.code if isinstance(exc, tensorfs_errors.Refusal) else None
+    # A TensorFS refusal implies its module is loaded; the worker never imports TensorFS (cr-067).
+    store_errors = sys.modules.get("tensorfs.errors")
+    store_code = (
+        exc.code if store_errors is not None and isinstance(exc, store_errors.Refusal) else None
+    )
     if isinstance(exc, permanent) or (
         store_code is not None and store_code not in _TRANSIENT_STORE_CODES
     ):
