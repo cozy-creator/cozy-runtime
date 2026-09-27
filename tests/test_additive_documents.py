@@ -119,6 +119,12 @@ def test_prepare_and_desired_state_accept_additive_fields(tmp_path: Path) -> Non
     binding = JobBinding.read({**record, "scheduler_class": "batch"})
     assert binding.job == "main" and binding.application == "additive_fixture:app"
 
+    # One written before its optional members existed takes their defaults.
+    required = ("job_descriptor_id", "installation_id", "application", "package_interface")
+    older = JobBinding.read({key: record[key] for key in (*required, "python", "job")})
+    assert older.job == "main" and older.reclaim_on_terminal and not older.publishes
+    assert older.call_interfaces == binding.call_interfaces
+
 
 def test_missing_required_interface_fields_still_refuse() -> None:
     body = json.loads(_interface())

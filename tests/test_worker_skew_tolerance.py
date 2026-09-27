@@ -49,6 +49,7 @@ def test_unreadable_job_plan_latches_only_that_job(tmp_path: Path) -> None:
         assert worker.latched == "job_plan_unreadable"
         (fault,) = [row for row in worker.engine.faults if row.reason == "job_plan_unreadable"]
         assert fault.subject == DESCRIPTOR and "re-prepare" in fault.detail
+        assert "lacks application, package_interface, python, job" in fault.detail
         assert json.loads(job_plan.path(plans, INSTALLATION, DESCRIPTOR).read_text()) == record
     finally:
         worker.shutdown()

@@ -8,6 +8,7 @@ import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -31,7 +32,6 @@ def model_retention(
         raise WorkspaceRefusal("model hold recipient or output path exceeds its bound")
     digest = documents.raw(artifact.tensorfs_receipt_digest)
     manifest = documents.raw(artifact.manifest.digest)
-    value = canonical_json.encode(msgspec.to_builtins(artifact))
     with workspace.locked() as db:
         rows = db.execute(
             "SELECT id FROM weights WHERE owner=? AND request=? AND slot=? "
@@ -58,14 +58,18 @@ def model_retention(
             ).fetchone()
             if (
                 native is None
-                or native["result"] != value
+                or _stored(native["result"]) != artifact
                 or hashlib.sha256(native["native_receipt"]).digest() != digest
             ):
                 raise WorkspaceRefusal("model artifact has no exact owned producer provenance")
             receipt = canonical_json.decode(native["native_receipt"])
-            if receipt.get("transaction_id") != native["native_owner"] or receipt.get(
-                "manifest"
-            ) != {"sha256": artifact.manifest.digest[7:], "length": artifact.manifest.length}:
+            subject = receipt.get("manifest")
+            if (
+                receipt.get("transaction_id") != native["native_owner"]
+                or not isinstance(subject, dict)
+                or subject.get("sha256") != artifact.manifest.digest[7:]
+                or subject.get("length") != artifact.manifest.length
+            ):
                 raise WorkspaceRefusal("native model receipt changed its exact subject")
             transaction = str(native["native_owner"])
     documents.raw(transaction)  # One exact native transaction, never a caller path.
@@ -87,3 +91,11 @@ def model_retention(
         tensorfs_receipt_digest=digest,
         retention_id=hold_id,
     )
+
+
+def _stored(result: bytes) -> ModelArtifact | None:
+    """The members this reader consumes; another Runtime version's additions are ignored."""
+    try:
+        return msgspec.convert(canonical_json.decode(result), type=ModelArtifact)
+    except (ValueError, msgspec.ValidationError, ConformanceError):
+        return None
