@@ -220,7 +220,13 @@ def retain_root(
 
 
 def bind_root_grant(owner: str, offer: pb.AttemptOffer) -> None:
-    """Dispatch from the already-owned recipient; keep the submitted offer immutable."""
+    """Dispatch a job root from the recipient `retain_root` owns.
+
+    Only a job root's inputs are adopted at submission; a serving root dispatches from the
+    submitter's own hold, which the submitter keeps until the execution ends.
+    """
+    if "job" not in documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec):
+        return
     for item in offer.grant.inputs:
         if item.HasField("native_tree"):
             item.native_tree.retention_id = machine_models.byte_retention_id(

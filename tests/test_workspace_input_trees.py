@@ -311,3 +311,72 @@ def test_root_acceptance_and_intake_abort_have_one_durable_order(
             held = db.execute("SELECT state FROM holds WHERE id=?", (own.retention_id,)).fetchone()
             assert held["state"] == "released"
             assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 0
+
+
+def test_serving_root_dispatches_from_the_submitters_native_hold(tmp_path: Path) -> None:
+    from cozy_runtime.internal.worker import grants, machine_byte_inputs
+    from cozy_runtime.internal.worker.workspace_executions import Executions
+
+    workspace = Workspace(tmp_path)
+    executions = Executions(workspace)
+    header, frames, data = intake(paths=("payload",))
+    imported = receive(workspace, "owner", header, frames)
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    spec = pb.InvocationSpec(
+        serving=pb.ServingInvocationSpec(
+            entrypoint_binding_digest="sha256:" + "13" * 32,
+            attempt_binding_id="sha256:" + "13" * 32,
+            bindings_digest="sha256:" + "14" * 32,
+        ),
+        inputs=[
+            pb.InputBinding(
+                input_id="files", digest=digest, length=len(data), kind_mime="text/plain"
+            )
+        ],
+    )
+    raw, identity = documents.identity(spec)
+    submitted = pb.AttemptOffer(
+        request_id=header.request_id,
+        attempt_ordinal=1,
+        invocation_spec_digest=identity,
+        invocation_spec_canonical_bytes=raw,
+        grant=pb.DeliveryGrant(
+            invocation_spec_digest=identity,
+            inputs=[
+                pb.InputAccess(
+                    input_id="files",
+                    native_tree=pb.NativeByteRetentionRequest(
+                        source=imported.source, retention_id=imported.retention_id
+                    ),
+                )
+            ],
+        ),
+    )
+    executions.submit(
+        "owner",
+        "submission",
+        b"c" * 32,
+        submitted,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
+
+    def hydrate(spool: str) -> dict[str, Any]:
+        dispatch = executions.offer("owner", header.request_id)
+        machine_byte_inputs.bind_root_grant("owner", dispatch)
+        bound = grants.bind(spec_of(dispatch), dispatch.grant, dispatch.invocation_spec_digest)
+        return grants.hydrate_inputs(
+            bound, grants.Authorizer(), spool=tmp_path / spool, workspace=workspace, owner="owner"
+        )
+
+    def spec_of(offer: pb.AttemptOffer) -> Any:
+        return documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+
+    assert hydrate("first")["files"].local.read_bytes() == data
+    receive(
+        workspace,
+        "owner",
+        header,
+        [pb.InputTreeImportFrame(commit=pb.InputTreeImportCommit(abort=True))],
+    )
+    with pytest.raises(grants.GrantRefusal, match="no exact received retention"):
+        hydrate("released")
