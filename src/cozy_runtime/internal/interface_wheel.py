@@ -129,10 +129,13 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                         annotation = (
                             f"Annotated[{annotation}, msgspec.Meta(**{field['constraints']!r})]"
                         )
-                    if field.get("asset_bound"):
-                        annotation = (
-                            f"Annotated[{annotation}, AssetBound(**{field['asset_bound']!r})]"
-                        )
+                    bound = {
+                        name: limit
+                        for name, limit in field.get("asset_bound", {}).items()
+                        if name in package_interface.ASSET_BOUND_KEYS
+                    }
+                    if bound:
+                        annotation = f"Annotated[{annotation}, AssetBound(**{bound!r})]"
                     default = ""
                     if field_path in defaults:
                         value = defaults[field_path]
