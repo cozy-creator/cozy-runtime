@@ -253,6 +253,20 @@ def test_progress_compaction_reports_gaps_but_preserves_logs_and_days_of_retenti
     assert e.retention_required("owner")
 
 
+def test_deferred_telemetry_precedes_the_transition_that_follows_it(tmp_path: Path) -> None:
+    e = Executions(Workspace(tmp_path / "store"))
+    e.submit("owner", "s", b"c" * 32, offer(), expected_execution_workspace_id=e.workspace_id)
+    for index in range(50):
+        e.progress("owner", "root", 1, {"type": "log", "payload": {"line": index}})
+    e.progress("owner", "absent", 1, {"type": "log", "payload": "not held here"})
+    complete(e, "root")
+    events = e.events("owner", "root").events
+    assert [event.kind for event in events[-51:]] == ["log"] * 50 + ["outcome"]
+    assert [canonical_json.decode(event.body)["payload"]["line"] for event in events[-51:-1]] == [
+        *range(50)
+    ]
+
+
 CHILD = """
 import base64,sys
 from pathlib import Path
@@ -374,6 +388,8 @@ def test_native_result_has_separate_collection_and_consumer_custody(
     workspace.outcome("owner", terminal)
     assert e.collect("owner", "producer") == terminal
     replacement = Workspace(tmp_path / "replacement-store")
+    with workspace.locked() as db:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     shutil.copyfile(
         workspace.directory / "journal.sqlite3", replacement.directory / "journal.sqlite3"
     )

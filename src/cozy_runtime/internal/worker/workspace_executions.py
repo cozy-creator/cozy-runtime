@@ -254,7 +254,9 @@ class Executions:
             row["publication_authorization_id"],
         )
 
-    def _event(self, db: Journal, row: Row, kind: str, body: bytes) -> None:
+    def _event(
+        self, db: Journal, row: Row, kind: str, body: bytes, at_ms: int | None = None
+    ) -> None:
         if len(body) > MAX_EVENT_BYTES:
             raise WorkspaceRefusal("execution event exceeds its metadata bound")
         canonical_json.decode(body)
@@ -263,9 +265,10 @@ class Executions:
             "UPDATE executions SET sequence=? WHERE owner=? AND request=?",
             (sequence, row["owner"], row["request"]),
         )
+        at = self.clock_ms() if at_ms is None else at_ms
         db.execute(
             "INSERT INTO execution_events VALUES(?,?,?,?,?,?,?)",
-            (row["owner"], row["request"], sequence, row["ordinal"], self.clock_ms(), kind, body),
+            (row["owner"], row["request"], sequence, row["ordinal"], at, kind, body),
         )
         # Only live progress is lossy. Control, outcomes and authored log records remain.
         if kind == "progress":
@@ -843,13 +846,21 @@ class Executions:
             )
 
     def progress(self, owner: str, request: str, ordinal: int, document: dict[str, Any]) -> None:
+        """Telemetry for a held execution, if any; recorded with the next journal access."""
         raw = canonical_json.encode(document)
-        with self.workspace.locked() as db, transaction(db):
-            row = self._row(db, owner, request)
-            if row["ordinal"] == ordinal and row["state"] not in TERMINAL:
-                self._event(
-                    db, row, "progress" if document.get("type") == "progress" else "log", raw
-                )
+        if len(raw) > MAX_EVENT_BYTES:
+            raise WorkspaceRefusal("execution event exceeds its metadata bound")
+        kind = "progress" if document.get("type") == "progress" else "log"
+        at_ms = self.clock_ms()
+
+        def write(db: Journal) -> None:
+            row = db.execute(
+                "SELECT * FROM executions WHERE owner=? AND request=?", (owner, request)
+            ).fetchone()
+            if row is not None and row["ordinal"] == ordinal and row["state"] not in TERMINAL:
+                self._event(db, row, kind, raw, at_ms)
+
+        self.workspace.defer(write)
 
     def notice(self, owner: str, request: str, kind: str, document: dict[str, Any]) -> None:
         """A durable effect fact on the execution in any state: its owner acts on it."""

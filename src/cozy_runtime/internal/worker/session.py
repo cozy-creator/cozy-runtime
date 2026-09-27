@@ -3386,8 +3386,9 @@ class Worker:
     def emit_progress(self, request_id: str, attempt: int, frame: dict[str, Any]) -> None:
         """The LOSSY lane. Bounded per watch, oldest-first shed, worker-owned sequence."""
         key = (request_id, attempt)
-        if self.executions is not None and self.executions.owns(
-            self.fence.record_owner_id, request_id
+        # A load's positions are liveness for the monitor and watches; its start is history.
+        if self.executions is not None and not (
+            frame.get("kind") == "load" and frame.get("position")
         ):
             self.executions.progress(
                 self.fence.record_owner_id, request_id, attempt, _progress_document(frame)
