@@ -508,7 +508,10 @@ class SourceCalls:
         """Resolve, or stream the pinned source through conversion into its publication."""
         try:
             self._upload_steps(owner, command, row, arguments, phase, terminal)
-        except (upload_plan.UploadRefusal, AuthorError, PublicationRefusal) as exc:
+        except upload_plan.UploadRefusal as exc:
+            # Reviewed refusals name what the caller changes; their text holds no secret.
+            raise NativeSourceFailure(exc.code, str(exc)) from exc
+        except (AuthorError, PublicationRefusal) as exc:
             # A reviewed or Hub refusal keeps its stable code; its text stays private.
             raise NativeSourceFailure(exc.code) from exc
 
@@ -521,6 +524,7 @@ class SourceCalls:
         phase: str,
         terminal: Callable[..., None],
     ) -> None:
+        upload_plan.require_bindings(fill.tensorfs_module(), row["operation"])
         if self.publication is None:
             raise NativeSourceFailure("publication_authority_absent")
         call = command.parent_call

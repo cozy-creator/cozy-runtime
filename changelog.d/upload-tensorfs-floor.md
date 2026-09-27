@@ -1,0 +1,1 @@
+`upload_huggingface` and `upload_civitai` refuse when admitted, before any byte moves, with `tensorfs_capability_missing` ("<operation> needs tensorfs >= 0.3.60") on a TensorFS that predates their bindings, instead of failing inside the native child.

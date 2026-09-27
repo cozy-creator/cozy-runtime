@@ -11,6 +11,7 @@ _CIVITAI_MEMBER = re.compile(r"civitai/files/[1-9][0-9]*")
 # Upload refusals a caller can act on; everything else is a native TensorFS code or opaque.
 CODES = frozenset(
     {
+        "tensorfs_capability_missing",
         "model_ingestion_recipe_unavailable",
         "model_ingestion_revision",
         "model_source_profiles_invalid",
@@ -24,6 +25,24 @@ class UploadRefusal(ValueError):
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
         self.code = code
+
+
+# The TensorFS bindings an upload calls, and the first release that carries them all.
+BINDINGS = (
+    "read_source_heads",
+    "prepare_selected_source",
+    "record_model_source_custody",
+    "model_source_objects",
+)
+TENSORFS_FLOOR = "0.3.60"
+
+
+def require_bindings(tensorfs: Any, operation: str) -> None:
+    """Refuse before any byte moves when the installed TensorFS predates uploads."""
+    if not all(callable(getattr(tensorfs, name, None)) for name in BINDINGS):
+        raise UploadRefusal(
+            "tensorfs_capability_missing", f"{operation} needs tensorfs >= {TENSORFS_FLOOR}"
+        )
 
 
 def carrier(member: str) -> bool:
