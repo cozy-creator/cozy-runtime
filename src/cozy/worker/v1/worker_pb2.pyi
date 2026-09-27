@@ -2810,7 +2810,7 @@ class WeightsObjectSource(_message.Message):
     def __init__(self, object_id: _Optional[str] = ..., length: _Optional[int] = ..., source_ref: _Optional[str] = ...) -> None: ...
 
 class WeightsIntentFrame(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "tensorfs_declaration_digest", "requested_writer_epoch", "tensorfs_declaration_canonical_bytes", "weights_transaction_id")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "tensorfs_declaration_digest", "requested_writer_epoch", "tensorfs_declaration_canonical_bytes", "weights_transaction_id", "tensorfs_declaration_length")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -2822,6 +2822,7 @@ class WeightsIntentFrame(_message.Message):
     REQUESTED_WRITER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     TENSORFS_DECLARATION_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_DECLARATION_LENGTH_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -2833,7 +2834,8 @@ class WeightsIntentFrame(_message.Message):
     requested_writer_epoch: int
     tensorfs_declaration_canonical_bytes: bytes
     weights_transaction_id: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., requested_writer_epoch: _Optional[int] = ..., tensorfs_declaration_canonical_bytes: _Optional[bytes] = ..., weights_transaction_id: _Optional[str] = ...) -> None: ...
+    tensorfs_declaration_length: int
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., requested_writer_epoch: _Optional[int] = ..., tensorfs_declaration_canonical_bytes: _Optional[bytes] = ..., weights_transaction_id: _Optional[str] = ..., tensorfs_declaration_length: _Optional[int] = ...) -> None: ...
 
 class WeightsHostAck(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "weights_transaction_id", "writer_epoch", "tensorfs_declaration_digest", "stage", "outcome", "refusal", "weights_receipt", "manifest", "checkpoint")
