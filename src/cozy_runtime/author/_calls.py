@@ -310,6 +310,21 @@ class _Broker:
             raise CapabilityError("package broker escaped its attempt", code="escaped_handle")
         self.context = ctx
         self.telemetry = telemetry
+        ctx._release_gpus = self.release_gpus
+
+    def release_gpus(self) -> None:
+        """`ctx.release_gpus()` of this attempt: its root's GPU lease ends at the worker."""
+        if self.closed:
+            raise CapabilityError("GPU release escaped its attempt", code="escaped_handle")
+        answer = self.exchange("gpu_release", {})
+        # A worker that predates the release declines it; the lease then ends with the root.
+        if not answer.get("ok") and answer.get("code") not in (
+            "weights_host_unavailable",
+            "weights_operation_unknown",
+            "unknown_durable_request",
+            "no_durable_exchange",
+        ):
+            self._check(answer, 0)
 
     def reserve(
         self,

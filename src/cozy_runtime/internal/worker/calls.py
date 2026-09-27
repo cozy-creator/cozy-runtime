@@ -71,8 +71,10 @@ class Calls:
         | None = None,
         installed_bindings: Callable[[AttemptRecord], list[dict[str, Any]]] | None = None,
         prefetch: Callable[[AttemptRecord, Mapping[str, Any]], dict[str, Any]] | None = None,
+        release_gpus: Callable[[AttemptRecord], None] | None = None,
     ):
         self.prefetch = prefetch
+        self.release_gpus = release_gpus
         self.installed_bindings = installed_bindings
         self.send, self.stream, self.minor = send, stream, minor
         self.workspace, self.owner = workspace, owner
@@ -113,6 +115,15 @@ class Calls:
         return result
 
     def handle(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
+        if frame.get("kind") == "gpu_release":
+            # Worker-local and always safe: no owner capability, and a canceling attempt
+            # may release too.
+            try:
+                if self.release_gpus is not None:
+                    self.release_gpus(attempt)
+            except (OSError, ValueError) as exc:
+                return {"ok": False, "code": "gpu_release_refused", "detail": str(exc)[:1024]}
+            return {"ok": True}
         with self.lock:
             try:
                 if self.minor() < 44 or attempt.state != "running" or attempt.canceling:

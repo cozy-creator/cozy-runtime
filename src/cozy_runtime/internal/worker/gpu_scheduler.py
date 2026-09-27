@@ -2,10 +2,12 @@
 
 Policy only, no I/O. Every drive tick passes the open roots with their durable priority
 and every demand not yet released from its device; anything missing is gone, so a hold
-cannot leak. A root's lease grows only from free ordinals and ends only when the root
-stops, so the Python gap between two children never lets another root in. Priority orders
-the waiters: the oldest waiter that cannot start reserves the free ordinals, so a younger
-narrow demand never starves it. Nothing is revoked, lent or preempted.
+cannot leak. A root's lease grows only from free ordinals and ends when the root stops or
+says it is done with GPUs (`release_root`, the author's `ctx.release_gpus()`; a root that is
+itself the GPU call is done at its device exit), so the Python gap between two children
+never lets another root in. Priority orders the waiters: the oldest waiter that cannot start
+reserves the free ordinals, so a younger narrow demand never starves it. Nothing is revoked,
+lent or preempted.
 """
 
 from __future__ import annotations
@@ -64,6 +66,8 @@ class GpuScheduler:
         self.grants: dict[str, tuple[str, Ordinals]] = {}
         self.waiting: dict[str, tuple[str, int, tuple[str, ...]]] = {}
         self.released: set[str] = set()
+        #: roots done with GPUs -> why: their gap holds nothing until their next demand
+        self.yielded: dict[str, str] = {}
         self.events: list[tuple[str, str, dict[str, Any]]] = []
         self._arrival: dict[str, int] = {}
         self._counter = itertools.count()
@@ -79,7 +83,7 @@ class GpuScheduler:
             self.waiting = {k: v for k, v in self.waiting.items() if k in live}
             for root in [root for root in self.leases if root not in roots]:
                 self._lease(root, set(), "stopped")
-                del self.leases[root]
+            self.yielded = {r: c for r, c in self.yielded.items() if r in roots}
             self._arrival = {k: self._arrival.get(k, next(self._counter)) for k in live}
             busy = {o for _, ordinals in self.grants.values() for o in ordinals}
             stalled: set[str] = set()
@@ -87,6 +91,8 @@ class GpuScheduler:
                 (d for d in live.values() if d.key not in self.grants and d.root in roots),
                 key=lambda d: (roots[d.root], d.root, self._arrival[d.key]),
             )
+            for demand in pending:  # a GPU call after a release starts a new lease
+                self.yielded.pop(demand.root, None)
             for demand in pending:
                 if demand.root in stalled:
                     continue  # FIFO within a root: a later call never overtakes an earlier one
@@ -130,11 +136,25 @@ class GpuScheduler:
             return {key: ordinals for key, (_, ordinals) in self.grants.items()}
 
     def release(self, key: str, **facts: Any) -> None:
-        """Device exit: the ordinals return to the root's lease before the next tick."""
+        """Device exit: the ordinals return to the root's lease before the next tick. A root
+        that is itself this call (a direct serving or device-job root) has no GPU work after
+        it, so its lease ends here and its encode and output transfer hold no GPU."""
         with self.lock:
             self.released.add(key)
             if key in self.grants:
+                root = self.grants[key][0]
                 self._end(key, "exited", facts)
+                if key.rpartition("#")[0] == root:
+                    self._yield(root, "device_exit")
+
+    def release_root(self, root: str, cause: str = "released_by_root") -> None:
+        """`root` is done with GPUs: its lease ends now and returns to the pool.
+
+        A call still on its GPUs keeps them until its exit, and they return to the pool
+        then. The root's next demand waits at its own priority like any other and starts
+        a new lease; it never takes GPUs back from whoever was granted them. Idempotent."""
+        with self.lock:
+            self._yield(root, cause)
 
     def drain(self) -> list[tuple[str, str, dict[str, Any]]]:
         """Observations since the last drain, for the caller to journal outside any lock."""
@@ -200,8 +220,20 @@ class GpuScheduler:
         root, ordinals = self.grants.pop(key)
         body = {"key": key, "ordinals": list(ordinals), "cause": cause, **(facts or {})}
         self.events.append((root, "gpu.release", body))
+        if root in self.yielded:
+            self._lease(root, self.leases.get(root, set()) - set(ordinals), self.yielded[root])
+
+    def _yield(self, root: str, cause: str) -> None:
+        if root in self.yielded:
+            return
+        self.yielded[root] = cause
+        active = {o for r, ordinals in self.grants.values() if r == root for o in ordinals}
+        self._lease(root, active, cause)
 
     def _lease(self, root: str, ordinals: set[int], cause: str) -> None:
         if ordinals != self.leases.get(root, set()):
-            self.leases[root] = ordinals
             self.events.append((root, "gpu.lease", {"ordinals": sorted(ordinals), "cause": cause}))
+        if ordinals:
+            self.leases[root] = ordinals
+        else:
+            self.leases.pop(root, None)
