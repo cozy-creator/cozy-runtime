@@ -128,7 +128,7 @@ class _StagedPipeline(QwenImage21Pipeline):
 def prefix_cache_bytes(transformer: Any, prefix_tokens: int) -> int:
     """Bytes of the post-RoPE K and V the denoiser caches for every prefix token."""
     config = transformer.config
-    per_token = (
+    per_token = int(
         2 * config.num_attention_heads * config.attention_head_dim * transformer.dtype.itemsize
     )
     return int(prefix_tokens) * int(config.num_layers) * per_token
@@ -142,7 +142,7 @@ def _prefix_cache_fits(
     prefix = embeds.shape[1] + (0 if reference_latents is None else reference_latents.shape[1])
     free, _total = torch.cuda.mem_get_info(device)
     unused = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
-    return prefix_cache_bytes(transformer, prefix) < free + unused
+    return bool(prefix_cache_bytes(transformer, prefix) < free + unused)
 
 
 class QwenImage21Model(Model[QwenImage21Graph]):

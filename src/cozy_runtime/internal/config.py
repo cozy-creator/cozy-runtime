@@ -21,7 +21,7 @@ import binascii
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -196,6 +196,15 @@ def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """
     env = os.environ if environ is None else environ
     return {name: env.get(name, "") for name in sorted(child_env.ALLOWLIST)}
+
+
+def restore_seal(sealed: Mapping[str, str], names: Iterable[str]) -> None:
+    """Re-impose sealed values in this process; an empty sealed value means unset."""
+    for name in names:
+        if sealed.get(name, ""):
+            os.environ[name] = sealed[name]
+        else:
+            os.environ.pop(name, None)
 
 
 _read: bool = False
