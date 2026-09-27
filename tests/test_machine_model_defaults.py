@@ -288,7 +288,7 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
     }
     placement = _placement("registered")
     placement.document = document
-    worker.prepared_installations[(placement.placement_id, INSTALLATION)] = placement
+    worker.prepared_installations[placement.prepared_key] = placement
     selected = dataclasses.replace(
         target(),
         declaration={"models": [{"path": "generate.models.adapter"}]},

@@ -418,6 +418,12 @@ class Placement:
     #: re-acquiring bytes nothing on the pod still holds.
     installed: package_installation.InstalledEnvironment | None = None
 
+    @property
+    def prepared_key(self) -> tuple[str, str, bytes]:
+        """A prepared placement's exact identity: one release prepared for several model
+        selections holds one placement per selection, and none displaces another."""
+        return self.placement_id, self.installation_id, self.bindings_digest
+
 
 #: Attempt states between device entry and device release.
 ON_DEVICE = frozenset({"entering", "accepted", "running", "reclaiming", "finalizing"})
@@ -1062,7 +1068,7 @@ class Worker:
         # Exact code/interface/environment revisions prepared over the existing seam.
         # Captured machine executions persist their immutable receipt and restore this
         # same inventory after restart, independent of their code's publication origin.
-        self.prepared_installations: dict[tuple[str, str], Placement] = {}
+        self.prepared_installations: dict[tuple[str, str, bytes], Placement] = {}
         self.local_operations: dict[tuple[str, str], Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
@@ -1722,7 +1728,7 @@ class Worker:
                 "prepared Placement changed the installation ID",
             )
         self.local_operations[(request.operation_id, revision)] = stored
-        self.prepared_installations[(stored.placement_id, revision)] = stored
+        self.prepared_installations[stored.prepared_key] = stored
         return result
 
     def prepare_unpublished_placement(
@@ -1775,6 +1781,12 @@ class Worker:
                 raise package_prepare.PreparationRefusal(
                     "private_placement_result_invalid", revision
                 )
+            # A captured root names this model-bound placement, not the code-only one.
+            stored = self._placement_from_entry(
+                joined[0], result.placement_set.placement_set_digest
+            )
+            stored.installed = prepared.installed
+            self.prepared_installations[stored.prepared_key] = stored
             return result
 
     def _prepare_package(
@@ -2016,7 +2028,7 @@ class Worker:
             )
         stored = self._placement_from_entry(entries[0], result.placement_set.placement_set_digest)
         stored.installed = published[0]
-        self.prepared_installations[(stored.placement_id, stored.installation_id)] = stored
+        self.prepared_installations[stored.prepared_key] = stored
         self._collect_superseded_installations(published[0])
         return result
 
@@ -5081,10 +5093,15 @@ class Worker:
                 return None
         from .machine_capture import installation_identity
 
-        prepared = self.prepared_installations.get(
-            (placement.placement_id, installation_identity(placement.document))
+        prepared_environment = next(
+            (
+                prepared.installed
+                for prepared in self.prepared_installations.values()
+                if prepared.placement_id == placement.placement_id
+                and prepared.installation_id == installation_identity(placement.document)
+            ),
+            None,
         )
-        prepared_environment = prepared.installed if prepared is not None else None
         if (
             self.options.install_root is None and self.options.environment_python is None
         ) or self.options.tensorfs_root is None:

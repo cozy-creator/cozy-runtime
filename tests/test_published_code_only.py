@@ -262,8 +262,11 @@ async def generate(payload: Request, model: Reference) -> Reply:
             )
             result = worker.prepare_package_set(request)
             (placement,) = read_placement_set(result.placement_set)
-            key = (placement["placement_id"], placement["installation_id"])
-            retained = worker.prepared_installations[key]
+            retained = next(
+                value
+                for value in worker.prepared_installations.values()
+                if value.document == placement
+            )
             assert retained.installed is not None
             assert retained.models == retained.entrypoints == ()
             assert (retained.installed.site_packages / "serving_child.py").read_bytes() == source

@@ -100,9 +100,7 @@ class Builtins:
         )
         placement = worker._placement_from_entry(captured["placement"], b"")
         placement.installed = installed
-        worker.prepared_installations[(placement.placement_id, installed.installation_id)] = (
-            placement
-        )
+        worker.prepared_installations[placement.prepared_key] = placement
         interface = package_interface.read_bytes(placement.package_interface)
         export = intent["export"]
         declared = next(row for row in interface["jobs"] if row["name"] == export)
