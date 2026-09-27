@@ -1884,6 +1884,7 @@ class AttemptEngine:
             "placement": attempt.plan.placement,
             "headroom_bytes": attempt.plan.headroom_bytes,
             "scope_headroom_bytes": dict(attempt.plan.scope_headroom_bytes),
+            "measured_scopes": list(attempt.plan.measured_scopes),
             # cr-012: the VERIFIED inputs, by their stable identity. Paths into this
             # attempt's own spool and nothing else — no URL, no credential and no fetch
             # reaches the executor. What the executor CAN still do is dial one of its own,

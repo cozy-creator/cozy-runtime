@@ -99,6 +99,13 @@ class ComponentResidency:
     #: The same demand split by authored component-use method. A staged rung never combines
     #: one method's resident set with another method's scratch peak.
     scope_headrooms: dict[str, int] = field(default_factory=dict)
+    #: Methods whose scratch peak was MEASURED at this request's shape by a serve that
+    #: completed. Only these may keep other components beside them on a staged rung.
+    measured: frozenset[str] = frozenset()
+    #: Components this attempt has declared so far, and the set the previous one declared:
+    #: the reuse forecast victims are chosen by.
+    attempt_used: set[str] = field(default_factory=set)
+    previous_used: frozenset[str] = frozenset()
     #: THE ACTIVE SCOPE — (method, its declared set) — or None between scopes. Serial by
     #: law 8: a component is in this set or it is evictable (its fence permitting).
     active: tuple[str, frozenset[str]] | None = None
@@ -297,7 +304,11 @@ class ComponentResidency:
     # ------------------------------------------------------------------ the contract
 
     def open_attempt(
-        self, placement: str, headroom: int, scope_headrooms: dict[str, int] | None = None
+        self,
+        placement: str,
+        headroom: int,
+        scope_headrooms: dict[str, int] | None = None,
+        measured: tuple[str, ...] | frozenset[str] = (),
     ) -> None:
         """Apply the attempt's rung and ZERO the per-attempt transition counters.
 
@@ -310,6 +321,10 @@ class ComponentResidency:
         self.placement = placement
         self.headroom = headroom
         self.scope_headrooms = dict(scope_headrooms or {})
+        self.measured = frozenset(measured)
+        if self.attempt_used:
+            self.previous_used = frozenset(self.attempt_used)
+        self.attempt_used = set()
         self.last_shortfall = None
         self.allocator_delta_bytes = 0
         self.attempt_stages = 0
@@ -345,11 +360,9 @@ class ComponentResidency:
             )
             self.active = None
         # Under a staged rung, admission first frees ROOM FOR THE WORK, not just room for
-        # the weights: every evictable component this method does not declare goes, so the
-        # scope gets the whole card minus its own set. That is the difference between a
-        # rung that exists and one that helps — a 1024px VAE decode next to 6.46 GiB of
-        # resident weights runs out of memory INSIDE the kernel, where nothing can decide.
-        self._make_headroom(components)
+        # the weights — a 1024px VAE decode next to 6.46 GiB of resident weights runs out of
+        # memory INSIDE the kernel, where nothing can decide.
+        self._make_headroom(components, method)
         headroom = self.scope_headrooms.get(method, self.headroom)
         for name in components:
             if name in self.backend.paging and self._size(name) > self.backend.resident_budget:
@@ -416,6 +429,7 @@ class ComponentResidency:
         self.scope_baseline_bytes = self._allocated()
         accel.reset_peak(self.torch, self.kind)
         self.active = (method, frozenset(components))
+        self.attempt_used.update(components)
 
     def release(self, method: str, components: tuple[str, ...]) -> None:
         """Record the fence and close the active scope. Nothing is evicted here.
@@ -681,37 +695,34 @@ class ComponentResidency:
             return False
         return self.fences.get(name, Fence()).passed()
 
-    def _make_headroom(self, declared: tuple[str, ...]) -> None:
-        """Under a STAGED rung, the declared set is what is resident. Everything else goes.
+    def _make_headroom(self, declared: tuple[str, ...], method: str) -> None:
+        """Under a STAGED rung, free room for the scope's work before its weights move.
 
-        The first version freed only down to the plan's activation envelope, and that
-        envelope is an AUTHORED BOUND until a serve has been banked — so on a fresh
-        generation it is a guess, and a guess that is 1 GiB when a 1024px VAE decode wants
-        three is a kernel OOM with nothing left to decide. Measured exactly that: latents
-        healthy, `Tried to allocate 512.00 MiB` with 98 MiB free, twice.
+        A MEASURED scope keeps whatever fits beside it: its declared set plus the larger of
+        its own peak and the attempt's envelope. H3 on an H100 re-staged its 21 GB DiT and
+        both VAEs on every request because the 51.5 GB text encoder's scope freed the whole
+        card (run 1268: 6 stages, 14.7 s).
 
-        So the rung means what its name says: `component_staged` keeps the component-use set
-        resident AT A TIME, and every other evictable component is freed at admission. Each
-        scope gets the whole card minus its own declared set, which makes the memory
-        behaviour PREDICTABLE instead of dependent on an uncalibrated number. It is the
-        sequential plan, it is what an 8 GiB card can actually do with a 6.46 GiB pipeline,
-        and its price is measured rather than hidden: one component swap per scope change.
+        An unmeasured scope still frees EVERYTHING else. Its envelope is an authored guess,
+        and a guess that is 1 GiB when a 1024px VAE decode wants three is a kernel OOM with
+        nothing left to decide (measured: `Tried to allocate 512.00 MiB` with 98 MiB free).
 
-        `all_resident` frees NOTHING — that rung's whole claim is that it did not have to,
-        and a rung that quietly starts swapping is a rung whose price was a lie.
+        `all_resident` frees NOTHING — that rung's whole claim is that it did not have to.
         """
         if self.placement == "all_resident":
             return
-        # A scope release records a CUDA event rather than synchronizing the stream.  That
-        # is the right fast path when the next operation uses the same components, but a
-        # component switch can otherwise observe every old component as temporarily held
-        # and report a false device shortfall.  Scopes are serial by contract, so waiting
-        # for the prior scope here is safe: no user operation can be running while this
-        # admission is deciding which bytes to evict.  Do it only when a pending fence is
-        # actually blocking eviction; ordinary same-component calls remain asynchronous.
+        # A scope release records a CUDA event rather than synchronizing the stream.  A
+        # component switch can otherwise observe every old component as temporarily held and
+        # report a false device shortfall.  Scopes are serial, so waiting here cannot race
+        # user work; it happens only when a pending fence actually blocks eviction.
         self._wait_for_pending_victims(declared)
-        for victim in self._victims(declared):
-            self._evict(victim)
+        if method not in self.measured:
+            for victim in self._victims(declared):
+                self._evict(victim)
+            return
+        absent = sum(self._size(name) for name in declared if name not in self.backend.components)
+        headroom = max(self.scope_headrooms.get(method, self.headroom), self.headroom)
+        self._free(absent + headroom, declared)
 
     def _victims(self, declared: tuple[str, ...]) -> list[str]:
         """Every resident component the method does not declare, LRU first.
@@ -729,7 +740,7 @@ class ComponentResidency:
         return sorted(candidates, key=lambda n: self.fences.get(n, Fence()).last_used)
 
     def _make_room(self, wanted: str, declared: tuple[str, ...], headroom: int) -> None:
-        """Demand-pull eviction, LRU over evictable components whose fences have fired.
+        """Demand-pull eviction over evictable components whose fences have fired.
 
         `all_resident` evicts NOTHING: it is the rung that promised everything fits, and a
         rung that quietly starts swapping is a rung whose price was a lie. Under a staged
@@ -743,11 +754,37 @@ class ComponentResidency:
             # that is actually there and a shortage is a typed refusal with numbers.
             return
         self._wait_for_pending_victims(declared)
+        self._free(need, declared)
+
+    def _free(self, need: int, declared: tuple[str, ...]) -> None:
         while not self._fits(need):
-            victim = self._victim(declared)
+            victim = self._victim(declared, need)
             if victim is None:
                 return  # nothing left to give; the pre-mutation check refuses with numbers
             self._evict(victim)
+
+    def _victim(self, declared: tuple[str, ...], need: int) -> str | None:
+        """The victim whose next use is least likely to come soon, by the attempt's order.
+
+        Stale components (declared by neither this attempt nor the last) go first, then
+        those this attempt already used (a pipeline flows forward), least recent first.
+        Only then a component the last attempt used and this one has not reached yet: each
+        of those will be re-staged before the attempt ends, so the smallest one that
+        covers the shortfall goes (H3: a 0.6 GB VAE, not the 21 GB DiT).
+        """
+        victims = self._victims(declared)
+        stale = [n for n in victims if n not in self.attempt_used and n not in self.previous_used]
+        done = [n for n in victims if n in self.attempt_used]
+        if stale or done:
+            return (stale or done)[0]
+        shortfall = need - self._allocatable()
+        covering = [n for n in victims if self._charge(n) >= shortfall]
+        if covering:
+            return min(covering, key=self._charge)
+        return victims[0] if victims else None
+
+    def _charge(self, name: str) -> int:
+        return self.backend.vram_charge.get(name) or self._size(name)
 
     def _wait_for_pending_victims(self, declared: tuple[str, ...]) -> None:
         """Make a completed serial scope's components evictable before a lane switch.
@@ -801,14 +838,13 @@ class ComponentResidency:
         return sum(row.nbytes for row in self.backend.plan.values() if row.component == name)
 
     def _fits(self, need: int) -> bool:
+        return self._allocatable() >= need
+
+    def _allocatable(self) -> int:
         """ALLOCATABLE capacity, from the allocator's own view (§3.2), never arithmetic."""
         rows = accel.allocation(self.torch, self.kind)
         slack = rows["reserved_bytes"] - rows["allocated_bytes"]
-        return rows["driver_free_bytes"] + max(slack, 0) >= need
-
-    def _victim(self, declared: tuple[str, ...]) -> str | None:
-        victims = self._victims(declared)
-        return victims[0] if victims else None
+        return rows["driver_free_bytes"] + max(slack, 0)
 
     def _shortfall(
         self,
@@ -855,6 +891,7 @@ class ComponentResidency:
             "placement": self.placement,
             "headroom_bytes": self.headroom,
             "scope_headroom_bytes": dict(self.scope_headrooms),
+            "measured_scopes": sorted(self.measured),
             "admissions": self.admissions,
             "stages": self.stages,
             "evictions": self.evictions,

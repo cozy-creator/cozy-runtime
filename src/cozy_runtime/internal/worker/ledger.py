@@ -643,6 +643,17 @@ class Ledger:
             return dict(self.carried_activation_scopes_by_cell[widest])
         return {}
 
+    def measured_scopes(self, cell: str) -> frozenset[str]:
+        """Methods whose scratch peak was measured at exactly `cell`, applies on this card
+        now, and never ran out of room here: the scopes staged admission may keep other
+        components beside. Another cell's peak says nothing about this one's demand."""
+        if not cell or cell in self.carried_shortfall_by_cell:
+            return frozenset()
+        if not self.carried_conditions_apply(cell):
+            return frozenset()
+        exact = self.activation_scopes_by_cell.get(cell)
+        return frozenset(exact or self.carried_activation_scopes_by_cell.get(cell) or ())
+
     def observe_residency(self, residency: dict[str, Any]) -> None:
         """The attempt's DECLARED residency transition, from the plane that performed it."""
         self.residency_delta = int(residency.get("allocator_delta_bytes", 0))

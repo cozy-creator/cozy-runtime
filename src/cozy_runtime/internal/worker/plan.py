@@ -133,6 +133,9 @@ class AttemptPlan:
     scope_headroom_bytes: tuple[tuple[str, int], ...] = ()
     """Measured activation scratch by component-use method. The scalar headroom is its max;
     staged admission uses each method's own value so unrelated weight/scratch maxima never add."""
+    measured_scopes: tuple[str, ...] = ()
+    """The methods whose scratch was measured at exactly this shape cell by a completed serve.
+    Staged admission keeps other components beside these and frees everything for the rest."""
     activation_envelope_bytes: int = 0
     """What this shape has been OBSERVED to allocate, whether or not that observation may
     be enforced here (cr-100). `headroom_bytes` above is what the attempt is admitted
@@ -152,6 +155,7 @@ class AttemptPlan:
             "reserved_vram_bytes": self.reserved_vram_bytes,
             "headroom_bytes": self.headroom_bytes,
             "scope_headroom_bytes": dict(self.scope_headroom_bytes),
+            "measured_scopes": list(self.measured_scopes),
             "entrypoint_binding_digest": self.entrypoint_binding_digest,
             "constructed_model_digest": self.constructed_model_digest,
             "request_features_digest": self.request_features_digest,
@@ -879,6 +883,9 @@ class PlanChooser:
             "declared_scopes": {m: list(n) for m, n in self.ledger.declared_scopes.items()},
             "largest_declared_set_bytes": largest,
             "scope_headroom_bytes": dict(scope_headrooms),
+            "measured_scopes": sorted(
+                set(self.ledger.measured_scopes(cell)) & set(self.ledger.declared_scopes)
+            ),
             "scope_demand_bytes": dict(scope_demands),
             "rungs": rows,
             "shape_cell": cell,
@@ -1008,6 +1015,7 @@ class PlanChooser:
             headroom_bytes=int(walk["enforceable_headroom_bytes"]),
             activation_envelope_bytes=activations.value,
             scope_headroom_bytes=tuple(sorted(scope_headrooms.items())),
+            measured_scopes=tuple(walk["measured_scopes"]),
             entrypoint_binding_digest=declared.entrypoint_binding_digest,
             constructed_model_digest=prepared_model.constructed_model_digest,
             request_features_digest=prepared.features_digest,
