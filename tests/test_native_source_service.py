@@ -698,13 +698,15 @@ def test_several_reviewed_profiles_compose_one_model_and_memoize(tmp_path: Path)
             return messages.get(timeout=30).native_source_status
 
         profiles = ["fixture/first/1", "fixture/second/1"]
-        both = {"profiles": profiles}
+        both: dict[str, object] = {"profiles": profiles}
         composed = convert("compose", both)
         assert composed.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, composed.safe_code
         assert not composed.memo_hit
         store = tensorfs.Store.open(str(workspace.store_root))
         manifest = canonical_json.decode(composed.result_canonical_bytes)["manifest"]
-        header = tensorfs.parse_header(store.manifest(manifest["digest"])["header"])
+        header_bytes = store.manifest(manifest["digest"])["header"]
+        assert header_bytes is not None
+        header = tensorfs.parse_header(header_bytes)
         assert sorted(header["components"]) == ["decoder", "encoder"]
         assert sorted(served) == sorted(set(served)), "a carrier was downloaded twice"
         assert {path.rsplit("/", 1)[-1] for path in served} == {
