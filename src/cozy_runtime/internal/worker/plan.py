@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import canonical, installed_interfaces
 from cozy_runtime.internal.delivery import RUNGS_BY_NAME, DeliveryRefusal, cost_class
 from cozy_runtime.internal.resolution import ROUTE_KERNEL
 from cozy_runtime.internal.worker.ledger import Ledger
@@ -249,14 +249,26 @@ class JobBinding:
 
     @classmethod
     def read(cls, record: dict[str, Any]) -> JobBinding:
-        """Fields another Runtime version wrote and this one does not consume are ignored."""
-        from cozy_runtime.internal import installed_interfaces
-
+        """Unknown members are ignored and absent optional ones take their defaults."""
+        fields = dataclasses.fields(cls)
+        absent = [
+            field.name
+            for field in fields
+            if field.default is dataclasses.MISSING and field.name not in record
+        ]
+        if absent:
+            raise PlanRefusal(
+                "job_plan_incomplete",
+                f"job plan lacks {', '.join(absent)}; re-prepare the package",
+            )
+        captured = {
+            field.name: record[field.name]
+            for field in fields
+            if field.name in record and field.name != "call_interfaces"
+        }
         observed = installed_interfaces.for_job(
-            str(record.get("python", "")), str(record.get("installation_id", ""))
+            str(record["python"]), str(record["installation_id"])
         )
-        known = set(cls.__dataclass_fields__) - {"call_interfaces"}
-        captured = {key: value for key, value in record.items() if key in known}
         return cls(**captured, call_interfaces=tuple(observed))
 
 
