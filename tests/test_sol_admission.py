@@ -102,7 +102,7 @@ def test_native_sol_admission_separates_all_keys_from_sparse_policy() -> None:
         pytest.skip("requires the declared upstream sol-attn package")
     attention_sol.bind_dense(_dense, "test-native-dense")
     candidate = attention.BY_NAME["sol-attn"]
-    entry = attention.Ready(candidate, attention._member(candidate.backend))
+    entry = attention.Ready(candidate, attention._member(candidate))
     device = DeviceFacts(
         kind="cuda",
         name=torch.cuda.get_device_name(),

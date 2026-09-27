@@ -71,10 +71,12 @@ from cozy_runtime.internal import (
     accel,
     attention,
     attention_sol,
+    attention_ulysses,
     canonical,
     child_env,
     effect_interfaces,
     execution_evidence,
+    kernel_site,
     model_config,
     package_interface,
     prepare_diagnostics,
@@ -678,7 +680,12 @@ class Executor:
         return owner._identity
 
     def _execution(
-        self, pin: str, choices: attention.Applied | None, start_us: int, end_us: int
+        self,
+        pin: str,
+        choices: attention.Applied | None,
+        start_us: int,
+        end_us: int,
+        impl: str = "",
     ) -> dict[str, Any]:
         """The attempt's execution record: degree, every rank, and the setup it ran on."""
         ranks = [
@@ -688,7 +695,7 @@ class Executor:
                 start_us,
                 end_us,
                 execution_evidence.attention(
-                    pin, execution_evidence.observed(choices.hosts) if choices else ""
+                    pin, execution_evidence.observed(choices.hosts) if choices else "", impl
                 ),
             )
         ]
@@ -839,6 +846,7 @@ class Executor:
                 stack.enter_context(cp.gated_call())
                 stack.enter_context(wire.attention_context(command))
                 sol_counts = stack.enter_context(attention_sol.observing())
+                served = stack.enter_context(attention_ulysses.observing())
                 args, kwargs = wire.run_call(
                     command,
                     wire.TensorSpool(spool / "ranks", references),
@@ -875,7 +883,9 @@ class Executor:
                 self._rank_identity(),
                 started_us,
                 execution_evidence.now_us(),
-                execution_evidence.attention(observed=self._run_attention),
+                execution_evidence.attention(
+                    observed=self._run_attention, impl=attention.implementations(served)
+                ),
             ),
         }
 
@@ -2916,6 +2926,7 @@ class Executor:
         served_attention: attention.Applied | None = None
         sol_counts: dict[str, int] = {}
         sol_rank_counts: dict[int, dict[str, int]] = {}
+        served_impls: dict[str, set[str]] = {}
         capture = None
         capture_result: dict[str, Any] | None = None
         record: AuthorAttempt | None = None
@@ -2925,6 +2936,7 @@ class Executor:
                     self._attention_snapshot(), self._attention_roots(), swap, pin
                 ) as served_attention,
                 attention_sol.observing(ranks=sol_rank_counts) as sol_counts,
+                attention_ulysses.observing() as served_impls,
             ):
                 capture = self._capture_session(command, surface)
                 with capture if capture is not None else contextlib.nullcontext():
@@ -3045,7 +3057,13 @@ class Executor:
             "position": record.position,
             "outcome": terminal,
             "execution_observation": self._execution_observation(served_attention),
-            "execution": self._execution(pin, served_attention, started_us, released_us),
+            "execution": self._execution(
+                pin,
+                served_attention,
+                started_us,
+                released_us,
+                attention.implementations(served_impls),
+            ),
             "capture": capture_result,
             "quiescent": quiescent,
             **_env_document(),
@@ -4120,6 +4138,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--socket is required for rank 0")
 
     _capture_seal()
+    # Before any kernel import: the image's kernel site, only if its torch build is ours.
+    kernel_site.activate()
     # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
     # AF_UNIX exemption is exercised on every boot rather than asserted. It refuses
     # Python-level egress from package and job code; it is not a kernel bound and
@@ -4173,6 +4193,7 @@ def main(argv: list[str] | None = None) -> int:
                     "euid": os.geteuid(),
                     "sealed": dict(_SEALED),
                     "torch_loaded": "torch" in sys.modules,
+                    "kernel_site": kernel_site.current().document(),
                     "rss_bytes": _rss(),
                     "rank": executor.rank,
                     "world": executor.world,

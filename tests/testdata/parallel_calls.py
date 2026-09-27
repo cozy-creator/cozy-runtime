@@ -16,6 +16,8 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import Model, uses_components
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
+from cozy_runtime.internal import attention
+from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.parallel.cp import in_gated_call
 from cozy_runtime.internal.seam import Channel
@@ -209,7 +211,8 @@ def h3_model() -> H3Calls:
         time_embed_dim=8,
         rope_freq_dim=2,
     ).eval()
-    dit.set_attention_backend("native")
+    # Runtime's own selection: its SDPA runs through the Ulysses wrapper on sharded sites.
+    attention.install(attention.available(DeviceFacts("cpu", "CPU", 0, "", "", 0)), {"dit": dit})
 
     def no_grad(module: Any, args: Any) -> None:
         assert not torch.is_grad_enabled()

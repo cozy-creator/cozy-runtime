@@ -1,4 +1,8 @@
-"""Contract refusals on CPU; real upstream arithmetic only on explicitly opted-in GPUs."""
+"""Contract refusals on CPU; real upstream arithmetic only on explicitly opted-in GPUs.
+
+Adapters are LOCAL kernels: LSE and context parallelism belong to `attention_ulysses`, which
+wraps every one of them and is tested with the registered backend below.
+"""
 
 from __future__ import annotations
 
@@ -9,11 +13,12 @@ from typing import Any
 
 import pytest
 
+from cozy_runtime.internal import attention, attention_ulysses
 from cozy_runtime.internal import attention_upstream as upstream
 
 torch = pytest.importorskip("torch")
 
-ADAPTERS = [upstream.kitchen_int8_attention, upstream.flashinfer_mixed_attention]
+ADAPTERS = [upstream.kitchen_int8, upstream.flashinfer_mixed]
 
 
 @pytest.mark.parametrize("adapter", ADAPTERS)
@@ -24,8 +29,6 @@ ADAPTERS = [upstream.kitchen_int8_attention, upstream.flashinfer_mixed_attention
         ({"is_causal": True}, "noncausal"),
         ({"scale": float("nan")}, "finite"),
         ({"scale": float("inf")}, "finite"),
-        ({"return_lse": True}, "log-sum-exp"),
-        ({"_parallel_config": object()}, "context parallelism"),
     ],
 )
 def test_nondefault_unsupported_semantics_refuse(
@@ -34,6 +37,62 @@ def test_nondefault_unsupported_semantics_refuse(
     q = torch.zeros((1, 2, 2, 128), dtype=torch.bfloat16)
     with pytest.raises(ValueError, match=reason):
         adapter(q, q, q, **options)
+
+
+@pytest.mark.parametrize("name", ["kitchen-int8", "sageattention", "flash-attn3"])
+@pytest.mark.parametrize(
+    ("options", "reason"),
+    [({"return_lse": True}, "log-sum-exp"), ({"_parallel_config": object()}, "Ulysses")],
+)
+def test_the_wrapper_refuses_lse_and_anything_but_initialized_ulysses(
+    name: str, options: dict[str, Any], reason: str
+) -> None:
+    """Before any kernel or collective is reached: LSE is never returned, and a parallel
+    config that is not Runtime's initialized Ulysses group refuses."""
+    pytest.importorskip("diffusers")
+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+
+    member = attention._member(attention.BY_NAME[name])
+    backend = _AttentionBackendRegistry._backends[member]
+    q = torch.zeros((1, 2, 2, 128), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=reason):
+        backend(query=q, key=q, value=q, **options)
+
+
+def test_a_cross_head_kernel_refuses_ulysses_before_any_collective() -> None:
+    pytest.importorskip("diffusers")
+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+
+    member = attention._member(attention.BY_NAME["flashinfer-bf16-fp8"])
+    assert not _AttentionBackendRegistry._is_context_parallel_available(member)
+    q = torch.zeros((1, 2, 2, 128), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="across heads"):
+        _AttentionBackendRegistry._backends[member](
+            query=q, key=q, value=q, _parallel_config=object()
+        )
+
+
+def test_sdpa_names_the_backend_torch_dispatches_and_matches_it() -> None:
+    q = torch.randn((1, 16, 2, 64))
+    options = {
+        "attn_mask": None,
+        "dropout_p": 0.0,
+        "is_causal": False,
+        "scale": None,
+        "enable_gqa": False,
+    }
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        *(t.transpose(1, 2) for t in (q, q, q))
+    ).transpose(1, 2)
+    assert torch.equal(upstream.sdpa(q, q, q, **options), expected)
+    assert upstream.sdpa_impl(q, q, q, options) in {"flash", "efficient", "math", "cudnn"}
+    with attention_ulysses.observing() as seen:
+        member = attention._member(attention.BY_NAME["sdpa"])
+        pytest.importorskip("diffusers")
+        from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+        dispatch_attention_fn(q, q, q, backend=member)
+    assert attention.implementations(seen) == upstream.sdpa_impl(q, q, q, options)
 
 
 @pytest.mark.parametrize("adapter", ADAPTERS)
@@ -68,9 +127,9 @@ def test_upstream_output_contract_rejects_wrong_shape_dtype_or_non_tensor() -> N
 def test_mixed_backend_does_not_cast_qk_or_discard_padding() -> None:
     q = torch.zeros((1, 2, 2, 128), dtype=torch.float16)
     with pytest.raises(ValueError, match="requires BF16 inputs"):
-        upstream.flashinfer_mixed_attention(q, q, q)
+        upstream.flashinfer_mixed(q, q, q)
     with pytest.raises(ValueError, match="attention mask"):
-        upstream.flashinfer_mixed_attention(q, q, q, attn_mask=torch.ones((2, 2)))
+        upstream.flashinfer_mixed(q, q, q, attn_mask=torch.ones((2, 2)))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -99,7 +158,7 @@ def test_current_value_scale_preserves_inputs_and_zero_values(dtype: Any) -> Non
 def test_real_upstream_matches_sdpa_and_preserves_inputs(
     adapter: Callable[..., Any], grouped: bool
 ) -> None:
-    mixed = adapter is upstream.flashinfer_mixed_attention
+    mixed = adapter is upstream.flashinfer_mixed
     dependency = "flashinfer" if mixed else "comfy_kitchen"
     if importlib.util.find_spec(dependency) is None:
         pytest.skip(f"{dependency} is not installed")

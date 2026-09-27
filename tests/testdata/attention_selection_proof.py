@@ -90,13 +90,16 @@ def _selfcheck(out: dict[str, Any], device: DeviceFacts) -> None:
     # GREEN. Every kernel this device and image offer agrees with exact fp32 attention inside
     # its declared budget, measured here rather than asserted.
     measured: dict[str, float] = {}
+    floors: dict[str, float] = {}
     for name in ("sdpa", "cudnn"):
         candidate = attention.BY_NAME[name]
         if candidate.min_sm and device.sm < candidate.min_sm:
             continue
-        entry = attention._resolve(candidate, device)
-        measured[name] = _rel_l2(entry, device)
+        admission = attention._resolve(candidate, device).admission or {}
+        measured[name] = admission["rel_l2_to_exact"]
+        floors[name] = admission["rounding_floor"]
     out["selfcheck_rel_l2"] = measured
+    out["selfcheck_floor"] = floors
     out["selfcheck_budgets"] = {
         name: attention.BY_NAME[name].rel_l2_max for name in sorted(attention.BY_NAME)
     }
@@ -107,7 +110,7 @@ def _selfcheck(out: dict[str, Any], device: DeviceFacts) -> None:
             candidate = attention.BY_NAME[name]
             if candidate.min_sm and device.sm < candidate.min_sm:
                 continue
-            member = attention._member(candidate.backend)
+            member = attention._member(candidate)
             real = _AttentionBackendRegistry._backends[member]
             _AttentionBackendRegistry._backends[member] = _dead(kind)
             try:
@@ -125,28 +128,6 @@ def _selfcheck(out: dict[str, Any], device: DeviceFacts) -> None:
     # And the green arm again AFTER the plants are removed, so a passing red arm cannot be a
     # registry left broken.
     out["selfcheck_restored"] = [r.name for r in attention.available(device)]
-
-
-def _rel_l2(entry: Any, device: DeviceFacts) -> float:
-    from diffusers.models.attention_dispatch import dispatch_attention_fn
-
-    batch, sequence, heads, dim = attention.PROBE
-    seed = torch.Generator(device="cuda").manual_seed(0x5A6E)
-    q, k, v = (
-        (
-            torch.randn(
-                (batch, sequence, heads, dim), generator=seed, device="cuda", dtype=torch.float32
-            )
-            * 0.5
-        ).to(torch.bfloat16)
-        for _ in range(3)
-    )
-    with torch.no_grad():
-        got = dispatch_attention_fn(q, k, v, backend=entry.member).float()
-    exact = torch.nn.functional.scaled_dot_product_attention(
-        *(t.transpose(1, 2).float() for t in (q, k, v))
-    ).transpose(1, 2)
-    return float((got - exact).norm() / exact.norm())
 
 
 def main() -> None:
@@ -169,8 +150,8 @@ def main() -> None:
     applied = attention.select(device, roots)
     out["auto"] = applied.document()
     out["auto_backends"] = _backends(roots)
-    # AUTO on a placement sharded at degree 4 (cr-138): a site admits only a kernel diffusers
-    # can shard, so the fp8 rank — which does not — is never pinned where `cp.py` would refuse.
+    # AUTO on a placement sharded at degree 4 (cr-138): every ranked kernel is head-local, so
+    # the Ulysses wrapper shards the same choice.
     out["auto_degree4"] = attention.select(device, roots, degree=4).document()
 
     # PER-SITE ADMISSION. cuDNN serves head dim 128 and not 256, so one site takes it and
@@ -230,11 +211,7 @@ def main() -> None:
 
 def _fp8(device: DeviceFacts, dit: WanAttention) -> dict[str, Any]:
     """cr-136: the fp8 path through the real registry — refused by name where the snapshot is
-    absent, otherwise resolved, self-checked, pinned on a real site and run."""
-    from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY, AttentionBackendName
-
-    hub = _HUB_KERNELS_REGISTRY[AttentionBackendName._FLASH_3_HUB]
-    before = hub.kernel_fn
+    absent or where it is out of budget at production length, otherwise pinned and run."""
     try:
         ready = attention.pinned("flash-attn3-fp8", device)
     except attention.AttentionRefusal as exc:
@@ -245,14 +222,11 @@ def _fp8(device: DeviceFacts, dit: WanAttention) -> dict[str, Any]:
         result = dit(hidden)
     return {
         "code": "",
-        "rel_l2": _rel_l2(ready[0], device),
+        "rel_l2": (ready[0].admission or {})["rel_l2_to_exact"],
         "backend": _backends({"dit": dit})["dit"][0],
         "line": applied.line(),
         "forward": {"shape": list(result.shape), "dtype": str(result.dtype)},
-        "bf16_slot_untouched": hub.kernel_fn is before,
-        "sharded_pin": _refusal(
-            lambda: attention.install(ready, {"dit": dit}, "flash-attn3-fp8", degree=4)
-        ),
+        "sharded": attention.install(ready, {"dit": dit}, "flash-attn3-fp8", degree=4).totals(),
     }
 
 

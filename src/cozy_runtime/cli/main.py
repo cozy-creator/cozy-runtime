@@ -35,6 +35,7 @@ PRIVATE = (
     "image-preparation-profile",
     "python-interpreters",
     "python-ensure",
+    "attention-qualify",
 )
 HELP = """cozy-runtime — everything a single package venv can do alone
 
@@ -110,6 +111,7 @@ _OWNS_ARGS = (
     "serve",
     "development-placement",
     "prepare-package",
+    "attention-qualify",
 )
 
 
@@ -344,6 +346,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return hostfacts_verb.run(args, opts, config)
     if verb == "capability":
         return host_verbs.capability(config, args, opts)
+    if verb == "attention-qualify":
+        return host_verbs.attention_qualify(args)
     if verb == "doctor":
         if args:
             raise CliError(

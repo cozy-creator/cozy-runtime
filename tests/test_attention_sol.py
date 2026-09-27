@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
-from cozy_runtime.internal import attention_sol
+from cozy_runtime.internal import attention, attention_sol, attention_ulysses
 
 
 def test_layout_is_explicit_immutable_and_nested_scopes_restore() -> None:
@@ -133,8 +133,14 @@ def test_missing_semantics_and_cpu_execution_refuse() -> None:
                 attention_sol.sol_attention(q, q, q)
             with pytest.raises(ValueError, match="unmasked"):
                 attention_sol.sol_attention(q, q, q, attn_mask=torch.ones(4, 4))
-            with pytest.raises(ValueError, match="parallelism"):
-                attention_sol.sol_attention(q, q, q, _parallel_config=object())
+            pytest.importorskip("diffusers")
+            from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+
+            backend = _AttentionBackendRegistry._backends[
+                attention._member(attention.BY_NAME["sol-attn"])
+            ]
+            with pytest.raises(ValueError, match="Ulysses"):
+                backend(query=q, key=q, value=q, _parallel_config=object())
     finally:
         attention_sol._SITE.reset(token)
 
@@ -226,18 +232,17 @@ def test_sol_global_document_exchange_on_real_gloo(tmp_path: Path, degree: int) 
     assert len(report["cases"]) == 4
 
 
-@pytest.mark.parametrize("kind", ["ring", "degree8", "uninitialized", "no_cp"])
-def test_sol_refuses_unsupported_parallel_configuration_before_collectives(kind: str) -> None:
+@pytest.mark.parametrize("kind", ["ring", "uninitialized", "no_cp"])
+def test_the_ulysses_wrapper_refuses_other_parallel_configurations_before_collectives(
+    kind: str,
+) -> None:
     pytest.importorskip("diffusers")
     from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig
 
     cp = (
         None
         if kind == "no_cp"
-        else ContextParallelConfig(
-            ulysses_degree=8 if kind == "degree8" else 2,
-            ring_degree=2 if kind == "ring" else 1,
-        )
+        else ContextParallelConfig(ulysses_degree=2, ring_degree=2 if kind == "ring" else 1)
     )
     with pytest.raises(ValueError, match="Ulysses"):
-        attention_sol._parallel_group(ParallelConfig(context_parallel_config=cp))
+        attention_ulysses.group(ParallelConfig(context_parallel_config=cp))

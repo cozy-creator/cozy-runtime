@@ -36,7 +36,13 @@ from cozy_runtime.author._observations import (
 from cozy_runtime.cli import host
 from cozy_runtime.cli import run as cli_run
 from cozy_runtime.cli.io import CliError
-from cozy_runtime.internal import attention, attention_fp8, child_env, package_interface
+from cozy_runtime.internal import (
+    attention,
+    attention_fp8,
+    child_env,
+    kernel_site,
+    package_interface,
+)
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import DeviceFacts
@@ -91,7 +97,8 @@ def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
             assert candidate not in attention.CANDIDATES
             continue
         assert (budget <= 2e-2) is (candidate.name in exact), (candidate.name, budget)
-    assert attention.PROBE == (1, 256, 4, 128)
+    # One H3 rank's 10 s document: error grows with length (h3a-044), heads do not.
+    assert attention.PROBE == (1, 73_439, 2, 128)
 
 
 def test_fp8_admits_a_strict_subset_of_the_bf16_entrys_sites_so_no_floor_site_moves() -> None:
@@ -211,24 +218,25 @@ def test_every_candidate_states_the_architectures_it_serves_and_where_that_came_
     a binary's arch list is the thing that drifted. Everything else declares one, and a 0 is a
     CLAIM about a dispatcher that owns its own fallback, not a field nobody filled in."""
     for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
-        # A COMPILED artifact is bounded by its own metadata and may not restate it. A `jit`
-        # snapshot is source and has no metadata to be bounded by, so it MUST declare the
-        # ceiling instead — the one case where `baked` and `max_sm` belong together.
-        assert candidate.jit or not (candidate.baked and candidate.max_sm), candidate.name
+        # A COMPILED snapshot is bounded by its own metadata and may not restate it. A `jit`
+        # kernel is source with no metadata to be bounded by, so it MUST declare the ceiling.
+        assert candidate.jit or not (candidate.snapshot and candidate.max_sm), candidate.name
         assert not candidate.jit or candidate.max_sm, candidate.name
         assert not candidate.max_sm or candidate.max_sm >= candidate.min_sm, candidate.name
-    # The two shapes, named. `flash-attn3` is the artifact-bounded one; `sageattention` is
-    # bounded here because its architecture is IN ITS BACKEND NAME and so cannot drift; the
-    # two torch backends are unbounded because torch, not this image, builds them.
-    assert attention.BY_NAME["flash-attn3"].baked and not attention.BY_NAME["flash-attn3"].max_sm
-    # h3a-024. The third shape: a snapshot that is SOURCE. It declares a ceiling where
-    # `flash-attn3` may not, because there is no arch list to drift from — FA4 ships device
-    # code for no card and compiles for the one it finds.
+    # `flash-attn3` is the artifact-bounded one; `sageattention` is bounded here because its
+    # architecture is IN ITS ENTRY POINT and so cannot drift; the torch backends are unbounded
+    # because torch, not this image, builds them.
+    assert attention.BY_NAME["flash-attn3"].snapshot
+    assert not attention.BY_NAME["flash-attn3"].max_sm
+    # h3a-024. FA4 is SOURCE from the kernel site: it declares a ceiling where `flash-attn3`
+    # may not, because it ships device code for no card and compiles for the one it finds.
     fa4 = attention.BY_NAME["flash-attn4"]
-    assert fa4.jit and fa4.baked and (fa4.min_sm, fa4.max_sm) == (90, 110)
+    assert fa4.jit and not fa4.snapshot and (fa4.min_sm, fa4.max_sm) == (90, 110)
+    assert fa4.distribution == "flash-attn-4" and fa4.import_name == "flash_attn.cute"
     assert not attention.BY_NAME["flash-attn3"].jit
     assert attention.BY_NAME["sageattention"].max_sm == 90
     assert attention.BY_NAME["sageattention"].backend.endswith("sm90")
+    assert "sm90" in attention.upstream.SAGE_MODE
     assert attention.BY_NAME["cudnn"].max_sm == 0 and attention.BY_NAME["sdpa"].max_sm == 0
     # The floor may never be bounded above: a card it refused would hold no attention at all.
     assert attention.CANDIDATES[-1].name == "sdpa"
@@ -322,11 +330,11 @@ def test_a_baked_kernels_ceiling_is_read_from_the_artifact_and_refuses_the_card_
             }
         )
     )
-    real = attention.IMAGE_KERNELS_DIR
-    attention.IMAGE_KERNELS_DIR = tmp_path
+    real = kernel_site._ACTIVE
+    kernel_site._ACTIVE = kernel_site.KernelSite(str(tmp_path), reason="fixture")
     try:
         flash = attention.BY_NAME["flash-attn3"]
-        assert attention._baked_archs(flash) == {variant: ["8.0", "9.0a"]}
+        assert attention._snapshot_archs(flash) == {variant: ["8.0", "9.0a"]}
 
         # B200 and the 5090 rung of the published `paul/minimax-h3` ladder. Both are refused
         # by name, and neither reaches the kernel — which is the only outcome that helps,
@@ -351,12 +359,12 @@ def test_a_baked_kernels_ceiling_is_read_from_the_artifact_and_refuses_the_card_
         # SILENCE IS NOT ADMISSION. A baked variant that declares no architecture is refused
         # on every card, because a check that read nothing must not look like one that passed.
         (build / "metadata.json").write_text(json.dumps({"name": "flash-attn3", "version": 1}))
-        assert attention._baked_archs(flash) == {variant: []}
+        assert attention._snapshot_archs(flash) == {variant: []}
         assert _refusal(lambda: attention.pinned("flash-attn3", _device(90))).code == (
             "attention_kernel_unsupported"
         )
     finally:
-        attention.IMAGE_KERNELS_DIR = real
+        kernel_site._ACTIVE = real
     # And with no snapshot baked at all the answer is ABSENT, as it always was: an image that
     # ships no kernel is not an image that ships one for the wrong card.
     assert _refusal(lambda: attention.pinned("flash-attn3", _device(90))).code == (
@@ -490,7 +498,7 @@ def _ready(*names: str) -> list[attention.Ready]:
     members — the fp8 one registered into its registry on first use — without the device
     proof, which is the CUDA arm's to run."""
     return [
-        attention.Ready(attention.BY_NAME[name], attention._member(attention.BY_NAME[name].backend))
+        attention.Ready(attention.BY_NAME[name], attention._member(attention.BY_NAME[name]))
         for name in names
     ]
 
@@ -580,10 +588,10 @@ def test_auto_preserves_h3_attention_precision_and_explicit_fp8_remains_availabl
         "video_vae": {"sdpa": 21},
     }
     assert _backends(roots) == {
-        "audio_vae": ["native"],
-        "fl2va_dit": ["_flash_3_hub"],
-        "ref2va_dit": ["_flash_3_hub"],
-        "video_vae": ["native"],
+        "audio_vae": ["_cozy_sdpa"],
+        "fl2va_dit": ["_cozy_flash_attn3"],
+        "ref2va_dit": ["_cozy_flash_attn3"],
+        "video_vae": ["_cozy_sdpa"],
     }
     assert _AttentionBackendRegistry.get_active_backend() == active
     assert {
@@ -595,10 +603,10 @@ def test_auto_preserves_h3_attention_precision_and_explicit_fp8_remains_availabl
     dits = {name: roots[name] for name in ("fl2va_dit", "ref2va_dit")}
     pinned = attention.install(_ready("flash-attn3-fp8"), dits, "flash-attn3-fp8")
     assert pinned.totals() == {"flash-attn3-fp8": 104}
-    assert all(values == ["_flash_3_hub_fp8"] for values in _backends(dits).values())
+    assert all(values == ["_cozy_flash_attn3_fp8"] for values in _backends(dits).values())
     restored = attention.install(_ready(*RANKED), roots)
     assert restored.totals() == {"flash-attn3": 104, "sdpa": 37}
-    assert not any("_flash_3_hub_fp8" in values for values in _backends(roots).values())
+    assert not any("_cozy_flash_attn3_fp8" in values for values in _backends(roots).values())
 
 
 def test_per_request_swap_can_be_followed_by_auto_without_pin_leak() -> None:
@@ -612,10 +620,10 @@ def test_per_request_swap_can_be_followed_by_auto_without_pin_leak() -> None:
     device = _device(0, kind="cpu")
     attention.install(_ready("sdpa"), roots)
     attention.plan(device, roots, "sdpa").apply()
-    assert _backends(roots) == {"dit": ["native"]}
+    assert _backends(roots) == {"dit": ["_cozy_sdpa"]}
     # This is the exact reset Executor.invoke performs before an unpinned request.
     attention.select(device, roots, "")
-    assert _backends(roots) == {"dit": ["native"]}
+    assert _backends(roots) == {"dit": ["_cozy_sdpa"]}
 
 
 def test_explicit_fp8_refuses_unsupported_sites_while_auto_preserves_dtype() -> None:
@@ -643,9 +651,9 @@ def test_explicit_fp8_refuses_unsupported_sites_while_auto_preserves_dtype() -> 
         "— dit: flash-attn3; vae: sdpa; wide: flash-attn3"
     )
     assert _backends(roots) == {
-        "dit": ["_flash_3_hub"],
-        "wide": ["_flash_3_hub"],
-        "vae": ["native"],
+        "dit": ["_cozy_flash_attn3"],
+        "wide": ["_cozy_flash_attn3"],
+        "vae": ["_cozy_sdpa"],
     }
     # A PIN of fp8 on the 256-dim site is a typed refusal, never a quiet demotion.
     two = {"dit": roots["dit"], "wide": roots["wide"]}
@@ -689,12 +697,11 @@ def test_group_merge_preserves_automatic_precision_and_explicit_fp8() -> None:
     )
 
 
-def test_a_sharded_site_admits_only_a_kernel_diffusers_can_shard() -> None:
-    """The fp8 backend registers `supports_context_parallel=False` and `cp.py` refuses a
-    sharded site holding one — so at sequence-parallel degree > 1 auto falls through to the
-    bf16 entry at the pin, reading the capability off diffusers' registry rather than a row,
-    and a PIN naming fp8 refuses typed. Not only safe but measured: at degree 4 fp8 was no
-    faster than bf16 (decision #714g)."""
+def test_every_head_local_kernel_shards_and_a_cross_head_one_refuses() -> None:
+    """Runtime's Ulysses wrapper makes every head-local kernel context-parallel — the fp8,
+    FA4, Sage and Kitchen refusals were adapter plumbing (audit 2026-09-26 §1). A kernel with
+    a cross-head reduction (FlashInfer's global V amax) is registered without it, so a sharded
+    pin of it refuses typed, through the real registry's own answer."""
     why = _diffusers_skip()
     if why:
         pytest.skip(why)
@@ -705,16 +712,17 @@ def test_a_sharded_site_admits_only_a_kernel_diffusers_can_shard() -> None:
     sharded = attention.install(_ready(*RANKED), roots, degree=4)
     assert sharded.totals() == {"flash-attn3": 2}
     assert sharded.offered == tuple(RANKED)
-    assert _backends(roots) == {"dit": ["_flash_3_hub"]}
+    assert _backends(roots) == {"dit": ["_cozy_flash_attn3"]}
+    for name in ("flash-attn3-fp8", "flash-attn4", "sageattention", "kitchen-int8", "sol-attn"):
+        assert attention.install(_ready(name), roots, name, degree=4).totals() == {name: 2}
+        attention.admit(f"dit={name}", 4)
     refused = _refusal(
-        lambda: attention.install(_ready("flash-attn3-fp8"), roots, "flash-attn3-fp8", degree=4)
+        lambda: attention.install(
+            _ready("flashinfer-bf16-fp8"), roots, "flashinfer-bf16-fp8", degree=4
+        )
     )
     assert refused.code == "attention_kernel_unsupported"
     assert "degree 4" in str(refused) and "context parallelism" in str(refused)
-    # The bf16 entry and the floor shard, so a sharded pin of either is served.
-    assert attention.install(_ready("flash-attn3"), roots, "flash-attn3", degree=4).totals() == {
-        "flash-attn3": 2
-    }
 
 
 # ------------------------------------------------------------------------------ the CUDA arm
@@ -770,20 +778,20 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     if "flash-attn3" in out["offered"]:
         assert out["offered"] == RANKED
         assert out["auto"]["hosts"] == {"dit": {"flash-attn3": 1}, "vae": {"flash-attn3": 1}}
-    assert "flash-attn3-fp8" not in out["auto_degree4"]["kernels"]
+    assert out["auto_degree4"]["kernels"] == out["auto"]["kernels"]
     assert out["auto_degree4"]["offered"] == out["offered"]
 
     # PER-SITE ADMISSION on one construction: cuDNN serves head dim 128 and not 256, so the
     # two sites take different kernels and neither falls back per call.
     assert out["mixed"]["hosts"] == {"dit": {"cudnn": 1}, "vae": {"sdpa": 1}}
-    assert out["mixed_backends"] == {"dit": ["_native_cudnn"], "vae": ["native"]}
+    assert out["mixed_backends"] == {"dit": ["_cozy_cudnn"], "vae": ["_cozy_sdpa"]}
 
     # A PIN IS NEVER QUIETLY REPLACED. The same 256-dim site under a cuDNN-only pin refuses.
     assert out["pin_unserved"]["code"] == "attention_kernel_unsupported"
     assert "head dimension 256" in out["pin_unserved"]["detail"]
     assert out["pin_served"]["pin"] == "cudnn"
     assert out["pin_served"]["line"] == "cudnn x1 (PINNED cudnn) — dit: cudnn"
-    assert out["pin_backends"] == {"dit": ["_native_cudnn"]}
+    assert out["pin_backends"] == {"dit": ["_cozy_cudnn"]}
 
     # cr-135: the pin SURVIVES THE GROUP MERGE. Two real constructions pinned to cuDNN, read
     # back off their own processors, render PINNED from the one merged record; unpinned they
@@ -813,13 +821,13 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     # And the pin computes: one real forward through the pinned site.
     assert out["forward"] == {"shape": [1, 64, 1024], "dtype": "torch.bfloat16"}
 
-    # cr-127. Every kernel this card offers agrees with exact fp32 attention well inside its
-    # declared budget, and the number is the bf16 floor h3a-013 measured on an H100
-    # (2.32-2.33e-3) — the same arithmetic on a different card, so the budget is calibrated
-    # against a measurement rather than picked.
+    # cr-127. Every kernel this card offers agrees with exact attention over a production
+    # length well inside its declared budget, just above its own measured BF16 rounding
+    # floor (h3a-044 measured 0.0016-0.0017 for FA3/FA4/cuDNN at 109k rows on an H100).
     assert set(out["selfcheck_rel_l2"]) >= {"sdpa"}
     for name, disagreement in out["selfcheck_rel_l2"].items():
-        assert 1e-3 < disagreement < out["selfcheck_budgets"][name], (name, disagreement)
+        floor = out["selfcheck_floor"][name]
+        assert floor < disagreement < out["selfcheck_budgets"][name], (name, disagreement)
     assert all(budget > 0 for budget in out["selfcheck_budgets"].values())
 
     # THE PLANTED DEFECT, three shapes, through diffusers' own registry and dispatch. `empty`
@@ -837,32 +845,30 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
         assert out[f"dead_{kind}_auto"] == []
         assert "sdpa" not in out[f"dead_{kind}_image_kernels"]
     # The finite arm names the disagreement it measured, so triage reads a number.
-    assert "rel L2 15.99" in out["dead_wrong_sdpa_pin"]["detail"]
+    assert "rel L2 " in out["dead_wrong_sdpa_pin"]["detail"]
+    assert "past its declared budget" in out["dead_wrong_sdpa_pin"]["detail"]
     # And the green arm holds again once the plants are removed: a passing red arm is not a
     # registry left broken.
     assert out["selfcheck_restored"] == out["offered"]
 
     # cr-136. The fp8 path is NAMEABLE on any box, and what it does depends on what the box
-    # ships: without the baked snapshot the pin refuses `absent` by name; with it, the pin
-    # resolves through OUR registered backend, measures inside its budget (quantisation, not
-    # the 16 of a kernel that returns V), lands on a real 128-dim site and computes, and
-    # leaves the bf16 entry's Hub slot untouched.
+    # ships: below sm90 the device refuses it; without the snapshot, `absent`; with it, the
+    # production-length probe measures it and, at H3 length, refuses it OUT OF BUDGET by
+    # name (0.31 rel L2 at 109k rows, h3a-044) rather than calling it wrong or serving it.
     fp8 = out["fp8"]
     if fp8["code"]:
-        # Below sm90 the DEVICE refuses it by name; on a card it claims, the missing snapshot.
-        expected_code = (
-            "attention_kernel_unsupported" if out["sm"] < 90 else "attention_kernel_absent"
+        expected = (
+            {"attention_kernel_unsupported"}
+            if out["sm"] < 90
+            else {"attention_kernel_absent", "attention_kernel_out_of_budget"}
         )
-        assert fp8["code"] == expected_code and "flash-attn3-fp8" in fp8["detail"]
+        assert fp8["code"] in expected and "flash-attn3-fp8" in fp8["detail"], fp8
     else:
         assert 1e-2 < fp8["rel_l2"] < out["selfcheck_budgets"]["flash-attn3-fp8"]
-        assert fp8["backend"] == "_flash_3_hub_fp8"
+        assert fp8["backend"] == "_cozy_flash_attn3_fp8"
         assert fp8["line"] == "flash-attn3-fp8 x1 (PINNED flash-attn3-fp8) — dit: flash-attn3-fp8"
         assert fp8["forward"] == {"shape": [1, 64, 1024], "dtype": "torch.bfloat16"}
-        assert fp8["bf16_slot_untouched"] is True
-        # cr-138: a sharded pin of it refuses typed, through the real registry's own answer.
-        assert fp8["sharded_pin"]["code"] == "attention_kernel_unsupported"
-        assert "degree 4" in fp8["sharded_pin"]["detail"]
+        assert fp8["sharded"] == {"flash-attn3-fp8": 1}
 
 
 # ------------------------------------------------- the durable record is BOUNDED (cr-122)

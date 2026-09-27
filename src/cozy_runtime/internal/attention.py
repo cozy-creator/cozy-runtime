@@ -1,13 +1,12 @@
 """Select and install attention backends for constructed diffusers modules.
 
-Selection checks device architecture, installed artifacts, a numerical smoke test,
-site dtype/head dimension, and context-parallel support. Explicit pins refuse
-unsupported sites. Automatic selection preserves attention activation precision;
-quantizing those activations requires an explicit backend choice.
-
-The optional FP8 backend has an H100 kernel benchmark, including quantization.
-That result does not establish full-video speed or output quality; matched H3
-outputs exposed detail loss despite passing its numerical smoke test.
+Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) that
+`attention_ulysses` registers with Diffusers, so one wrapper serves every degree. Selection
+checks device architecture, the kernel's presence in this environment or the image's kernel
+site, a numerical probe of the served function at a production sequence length, site
+dtype/head dimension and context-parallel support. Explicit pins refuse unsupported sites.
+Automatic selection preserves attention activation precision; quantizing those activations
+requires an explicit backend choice.
 """
 
 from __future__ import annotations
@@ -19,25 +18,16 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from importlib import import_module, metadata
+from itertools import count
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from cozy_runtime.author._attention import AttentionContext
-from cozy_runtime.internal import attention_fp8, attention_sol, attention_upstream
+from cozy_runtime.internal import attention_sol, attention_ulysses, kernel_site
+from cozy_runtime.internal import attention_upstream as upstream
+from cozy_runtime.internal.attention_ulysses import Local
 from cozy_runtime.internal.encoding import DeviceFacts
-
-try:
-    from kernels import get_local_kernel
-except ImportError as _absent_kernels:  # pragma: no cover - exercised by the absent arm
-    KERNELS_ABSENT = f"does not import ({_absent_kernels})"
-else:
-    KERNELS_ABSENT = ""
-
-#: Where the worker image bakes `kernels` Hub snapshots (tensorhub's cu130 Dockerfile):
-#: `<distribution>/build/<variant>/` holds one built variant and its metadata. Nothing here is
-#: fetched — a pod's executor has no network for it.
-IMAGE_KERNELS_DIR = Path("/opt/cozy/kernels")
 
 
 class AttentionRefusal(RuntimeError):
@@ -54,45 +44,49 @@ class Candidate:
 
     name: str
     backend: str
+    local: Local
     min_sm: int  # CUDA capability, e.g. 90 for sm90; zero also admits CPU.
     dtypes: frozenset[str]  # Empty admits all dtypes.
     max_head_dim: int  # Zero is unbounded.
-    max_sm: int = 0  # Baked binaries use their artifact's architecture metadata instead.
-    baked: str = ""
+    max_sm: int = 0  # Snapshot binaries use their artifact's architecture metadata instead.
+    snapshot: str = ""  # A `kernels` build the image bakes beside its kernel site.
     distribution: str = ""
     jit: bool = False  # Source kernels use the declared device range, not binary metadata.
-    rel_l2_max: float = 0.0  # Numerical smoke-test threshold, not an output-quality guarantee.
+    rel_l2_max: float = 0.0  # Numerical probe threshold, not an output-quality guarantee.
     why: str = ""
     sms: frozenset[int] = frozenset()
     head_dims: frozenset[int] = frozenset()
     import_name: str = ""
 
 
+_HALF = frozenset({"bfloat16", "float16"})
+
 CANDIDATES: tuple[Candidate, ...] = (
     Candidate(
         name="flash-attn3",
-        backend="_flash_3_hub",
+        backend="_cozy_flash_attn3",
+        local=upstream.FA3,
         min_sm=90,
-        dtypes=frozenset({"bfloat16", "float16"}),
+        dtypes=_HALF,
         max_head_dim=256,
-        baked="flash-attn3",
-        rel_l2_max=2e-2,
+        snapshot="flash-attn3",
+        distribution="kernels",
+        rel_l2_max=1e-2,
         why=(
             "Quality-preserving default. H100 H3 N109104: FA3 BF16 about 506 ms, "
-            "FA4 about 501 ms, cuDNN about 616 ms; no consistent FA4 gain. "
-            "Retained: tracker/h3-acceleration/ATTENTION-UPSTREAM-2026-09-14.md; "
-            "outputs/h3-attention-oracle-20260914/ATTENTION-RESULTS.md. "
+            "FA4 about 501 ms, cuDNN about 616 ms; no consistent FA4 gain; all three "
+            "0.0017 rel L2 to FP32 (h3a-044). "
             "This is a curated H100 ranking, not a universal hardware winner."
         ),
     ),
     Candidate(
         name="sdpa",
-        backend="native",
+        backend="_cozy_sdpa",
+        local=upstream.SDPA,
         min_sm=0,
         dtypes=frozenset(),
         max_head_dim=0,
-        max_sm=0,
-        rel_l2_max=2e-2,
+        rel_l2_max=1e-2,
         why="PyTorch scaled_dot_product_attention; supports all site dtypes and head dimensions.",
     ),
 )
@@ -100,29 +94,32 @@ CANDIDATES: tuple[Candidate, ...] = (
 PINNABLE: tuple[Candidate, ...] = (
     Candidate(
         name="flash-attn3-fp8",
-        backend=attention_fp8.BACKEND,
+        backend="_cozy_flash_attn3_fp8",
+        local=upstream.FA3_FP8,
         min_sm=90,
-        dtypes=frozenset({"bfloat16", "float16"}),
+        dtypes=_HALF,
         max_head_dim=128,
-        baked="flash-attn3",
+        snapshot="flash-attn3",
+        distribution="kernels",
         rel_l2_max=6e-2,
         why=(
-            "Explicit experiment: matched H3 clips change. The corrected experimental "
-            "FA3 FP8 build took 781.3 s versus BF16 907.1 s for 15 s video; qualification "
-            "is specific to that build, not every FA3 FP8 binary. "
-            "Evidence: outputs/h3-kernel-quality-20260914/comparison15/REPORT.md."
+            "Explicit experiment, numerically out of its budget at H3 length: rel L2 0.31 "
+            "to FP32 at 109k rows versus BF16 0.0017 (h3a-044; long-sequence FP8 PV "
+            "accumulation). 781.3 s versus BF16 907.1 s for 15 s video."
         ),
     ),
     Candidate(
         name="flash-attn4",
-        backend="flash_4_hub",
+        backend="_cozy_flash_attn4",
+        local=upstream.FA4,
         min_sm=90,
-        dtypes=frozenset({"bfloat16", "float16"}),
+        dtypes=_HALF,
         max_head_dim=256,
         max_sm=110,
-        baked="flash-attn4",
+        distribution="flash-attn-4",
+        import_name="flash_attn.cute",
         jit=True,
-        rel_l2_max=2e-2,
+        rel_l2_max=1e-2,
         why=(
             "Unranked: matched H100 BF16 kernels showed no consistent FA4 gain over FA3. "
             "Evidence: outputs/h3-attention-oracle-20260914/"
@@ -131,44 +128,46 @@ PINNABLE: tuple[Candidate, ...] = (
     ),
     Candidate(
         name="cudnn",
-        backend="_native_cudnn",
+        backend="_cozy_cudnn",
+        local=upstream.CUDNN,
         min_sm=80,
-        dtypes=frozenset({"bfloat16", "float16"}),
+        dtypes=_HALF,
         max_head_dim=128,
-        max_sm=0,
-        rel_l2_max=2e-2,
-        why="H100 SXM reference: 34.99 s per DiT forward versus native dispatch 34.70 s; h3a-012.",
+        rel_l2_max=1e-2,
+        why="SDPA restricted to cuDNN; on H100 it is the kernel `sdpa` dispatches (h3a-012).",
     ),
     Candidate(
         name="sageattention",
-        backend="_sage_qk_int8_pv_fp8_cuda_sm90",
+        backend="_cozy_sage_sm90",
+        local=upstream.SAGE,
         min_sm=90,
-        dtypes=frozenset({"bfloat16", "float16"}),
+        dtypes=_HALF,
         max_head_dim=128,
         max_sm=90,
         distribution="sageattention",
-        rel_l2_max=2e-1,
+        rel_l2_max=1e-1,
         why=(
-            "Explicit experiment: H100 15 s/30-step H3 generation took 801.2 s versus "
-            "BF16 907.1 s; matched clips differ. No automatic quality approval. "
-            "Evidence: outputs/h3-kernel-quality-20260914/comparison15/REPORT.md."
+            "Explicit experiment: INT8 Q/K + FP8 P/V, 0.0096-0.066 rel L2 on H3 Q/K/V "
+            "(h3a-044); 801.2 s versus BF16 907.1 s for 15 s video; matched clips differ."
         ),
     ),
     Candidate(
         name="kitchen-int8",
-        backend=attention_upstream.KITCHEN_BACKEND,
+        backend="_cozy_kitchen_int8",
+        local=upstream.KITCHEN,
         min_sm=90,
         max_sm=103,
         sms=frozenset({90, 100, 103}),
-        dtypes=frozenset({"bfloat16", "float16"}),
+        dtypes=_HALF,
         max_head_dim=256,
         distribution="comfy-kitchen",
-        rel_l2_max=2e-1,
-        why="Explicit dense INT8 experiment; H3 quality/timing qualification pending (h3a-060).",
+        rel_l2_max=5e-2,
+        why="Explicit dense INT8 experiment; 0.014 rel L2 to FA3 on H3 Q/K/V (h3a-060).",
     ),
     Candidate(
         name="flashinfer-bf16-fp8",
-        backend=attention_upstream.FLASHINFER_BACKEND,
+        backend="_cozy_flashinfer_bf16_fp8",
+        local=upstream.FLASHINFER,
         min_sm=100,
         max_sm=103,
         sms=frozenset({100, 103}),
@@ -183,6 +182,7 @@ PINNABLE: tuple[Candidate, ...] = (
     Candidate(
         name="sol-attn",
         backend="_cozy_sol_bf16",
+        local=attention_sol.SOL,
         min_sm=90,
         max_sm=90,
         sms=frozenset({90}),
@@ -191,7 +191,7 @@ PINNABLE: tuple[Candidate, ...] = (
         head_dims=frozenset({128}),
         distribution="sol-attn",
         rel_l2_max=2e-2,  # Native all-keys arithmetic control, not sparse approximation error.
-        why="Explicit sparse experiment; eager model layout and optional Ulysses degrees 2/4.",
+        why="Explicit sparse experiment on its CuTe SM90 route; eager model layout.",
     ),
 )
 
@@ -231,24 +231,9 @@ def _registry() -> Any:
     return _AttentionBackendRegistry
 
 
-def _member(backend: str) -> Any:
-    if backend == attention_fp8.BACKEND:
-        # OURS, not diffusers': registered into its registry on first use (cr-136).
-        return attention_fp8.member()
-    upstream = {
-        "_cozy_sol_bf16": attention_sol.sol_attention,
-        attention_upstream.KITCHEN_BACKEND: attention_upstream.kitchen_int8_attention,
-        attention_upstream.FLASHINFER_BACKEND: attention_upstream.flashinfer_mixed_attention,
-    }
-    if backend in upstream:
-        from cozy_runtime.internal.attention_registry import register
-
-        return register(
-            backend, upstream[backend], supports_context_parallel=backend == "_cozy_sol_bf16"
-        )
-    from diffusers.models.attention_dispatch import AttentionBackendName
-
-    return AttentionBackendName(backend)
+def _member(candidate: Candidate) -> Any:
+    """The Diffusers member serving this candidate, registered on first use."""
+    return attention_ulysses.member(candidate.backend, candidate.local)
 
 
 def _capability(declared: str) -> tuple[int, int, str] | None:
@@ -294,22 +279,6 @@ def _declared_archs(variant: Path) -> list[str]:
     return [str(arch) for arch in archs] if isinstance(archs, list) else []
 
 
-def _snapshot_location(candidate: Candidate) -> Path:
-    """Prefer an ordinary dependency wheel; never hide a broken installed candidate."""
-    distribution = "cozy-kernel-" + candidate.baked
-    try:
-        installed = metadata.distribution(distribution)
-    except metadata.PackageNotFoundError:
-        return IMAGE_KERNELS_DIR / candidate.baked
-    package = distribution.replace("-", "_")
-    files = installed.files or ()
-    if not any(str(file).startswith(package + "/build/") for file in files):
-        raise AttentionRefusal(
-            "attention_kernel_absent", f"{distribution} carries no recorded kernel snapshot"
-        )
-    return Path(str(installed.locate_file(package)))
-
-
 def _artifact(distribution: str) -> dict[str, Any]:
     """Identify installed bytes using the wheel inventory already retained by the closure."""
     installed = metadata.distribution(distribution)
@@ -350,9 +319,9 @@ def _artifact(distribution: str) -> dict[str, Any]:
     return result
 
 
-def _baked_archs(candidate: Candidate) -> dict[str, list[str]]:
-    """Every installed or image variant, and the architectures each one declares."""
-    builds = _snapshot_location(candidate) / "build" if candidate.baked else None
+def _snapshot_archs(candidate: Candidate) -> dict[str, list[str]]:
+    """Every variant of the image snapshot, and the architectures each one declares."""
+    builds = kernel_site.snapshot(candidate.snapshot) / "build" if candidate.snapshot else None
     if builds is None or not builds.is_dir():
         return {}
     return {
@@ -363,7 +332,7 @@ def _baked_archs(candidate: Candidate) -> dict[str, list[str]]:
 
 
 def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: DeviceFacts) -> None:
-    """Refuse a card that none of these baked variants has device code for."""
+    """Refuse a card that none of these snapshot variants has device code for."""
     if candidate.jit:
         # NOTHING TO READ, so nothing is checked here and the static `max_sm` on the row is
         # the whole ceiling. A source snapshot declares no architectures because it carries
@@ -387,29 +356,17 @@ def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: Devic
     )
 
 
-def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
-    """Load the selected local snapshot into Diffusers' Hub slot without fetching."""
-    if KERNELS_ABSENT:
-        raise AttentionRefusal(
-            "attention_kernel_absent",
-            f"{candidate.name} loads through the `kernels` distribution, which {KERNELS_ABSENT}",
-        )
-    location = _snapshot_location(candidate)
+def _load_snapshot(candidate: Candidate, loader: Any, device: DeviceFacts) -> str:
+    """Load the image's `kernels` snapshot locally (never fetched) and bind its forward."""
+    location = kernel_site.snapshot(candidate.snapshot)
     builds = location / "build"
-    variants = (
-        sorted(p for p in builds.iterdir() if (p / "metadata.json").is_file())
-        if (builds.is_dir())
-        else []
-    )
-    if not variants:
+    if not builds.is_dir() or not any((p / "metadata.json").is_file() for p in builds.iterdir()):
         raise AttentionRefusal(
             "attention_kernel_absent",
-            f"{candidate.name} has no snapshot under {builds}; install the ordinary "
-            f"cozy-kernel-{candidate.baked} dependency before preparation. "
-            "This executor has no network to fetch it",
+            f"{candidate.name} has no snapshot under {builds}; this image does not bake it",
         )
     try:
-        module = get_local_kernel(location)
+        module = loader.get_local_kernel(location)
     except Exception as exc:
         # A snapshot this torch cannot load is an ABSENT kernel, not a crash: the image
         # baked a variant built for another ABI, and the floor still serves.
@@ -429,47 +386,31 @@ def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
             f"expected a variant under {builds}",
         )
     _admit_arch(candidate, {loaded.name: _declared_archs(loaded)}, device)
-    if candidate.backend == attention_fp8.BACKEND:
-        # The fp8 path binds the snapshot's forward to ITS OWN backend and leaves the bf16
-        # entry's Hub slot alone, so pinning one never rewires the other (cr-136).
-        return attention_fp8.bind(_lookup(module, "flash_attn_func", candidate.name)), str(loaded)
-    from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY
-
-    member = _member(candidate.backend)
-    if member not in _HUB_KERNELS_REGISTRY:
+    if getattr(module, "flash_attn_func", None) is None:
         raise AttentionRefusal(
-            "attention_kernel_absent",
-            f"diffusers does not resolve {candidate.backend!r} through its Hub-kernel "
-            "registry, so a baked snapshot cannot be placed in its slot",
+            "attention_kernel_absent", f"{candidate.name} does not expose flash_attn_func"
         )
-    config = _HUB_KERNELS_REGISTRY[member]
-    config.kernel_fn = _lookup(module, config.function_attr, candidate.name)
-    for attr, slot in (
-        ("wrapped_forward_attr", "wrapped_forward_fn"),
-        ("wrapped_backward_attr", "wrapped_backward_fn"),
-    ):
-        dotted = getattr(config, attr)
-        if dotted:
-            setattr(config, slot, _lookup(module, dotted, candidate.name))
-    return member, str(loaded)
+    upstream.bind_fa3(module, loaded.name)
+    return str(loaded)
 
 
-def _lookup(module: Any, dotted: str, name: str) -> Any:
-    entry: Any = module
-    for part in dotted.split("."):
-        entry = getattr(entry, part, None)
-        if entry is None:
-            raise AttentionRefusal("attention_kernel_absent", f"{name} does not expose {dotted}")
-    return entry
-
-
-#: The self-check's shape: (batch, sequence, heads, head dimension). This crosses two
-#: 128-row blocks. Sol adds a ragged row and padding; optional kernels may JIT on first use.
-PROBE: tuple[int, int, int, int] = (1, 256, 4, 128)
+#: The probe: one H3 rank's post-exchange document at 10 s (a measured packed length, odd so
+#: the last block is partial), because error grows with length: FA3 FP8 measured 0.10 rel L2
+#: at 16k rows and 0.31 at 109k where a 256-row probe passed it (h3a-044). Every probed
+#: kernel reduces within a head, so two heads keep it ~150 MB on any card. The sampled rows
+#: are held to exact float64 attention over every key.
+PROBE: tuple[int, int, int, int] = (1, 73_439, 2, 128)
+PROBE_ROWS = 64
+#: Torch's quadratic-memory math fallback cannot hold the production length and does not
+#: accumulate across keys, so it is probed here; so is Sol's policy contract.
+PROBE_SHORT: tuple[int, int, int, int] = (1, 256, 4, 128)
+#: A fresh problem per probe, so a kernel handing back a stale buffer that happens to hold the
+#: previous probe's correct answer cannot pass this one.
+_PROBE_SEEDS = count(0x5A6E)
 
 
 def _computes(entry: Ready, device: DeviceFacts) -> dict[str, Any] | None:
-    """PROVE the kernel computes attention on THIS device, or refuse it by name."""
+    """PROVE the served function computes attention on THIS device, or refuse it by name."""
     if device.kind != "cuda":
         # There is no device to prove anything on, and the only entry a CPU executor admits is
         # torch's own eager dispatch. Silence here is the honest answer, not a skipped gate.
@@ -477,32 +418,83 @@ def _computes(entry: Ready, device: DeviceFacts) -> dict[str, Any] | None:
     import torch
     from diffusers.models.attention_dispatch import dispatch_attention_fn
 
-    batch, sequence, heads, dim = PROBE
-    if entry.name == "sol-attn":
-        sequence += 1  # Exercise the sparse kernel's partial final block as well.
     dtype = (
         torch.bfloat16
         if not entry.candidate.dtypes or "bfloat16" in entry.candidate.dtypes
         else torch.float16
     )
     target = torch.device("cuda", device.index)
-    seed = torch.Generator(device=target).manual_seed(0x5A6E)
-    shape = (batch, sequence, heads, dim)
-    query, key, value = (
-        (torch.randn(shape, generator=seed, device=target, dtype=torch.float32) * 0.5).to(dtype)
-        for _ in range(3)
-    )
-    with torch.no_grad(), torch.cuda.device(target):
-        if entry.name == "sol-attn":
+    seed = torch.Generator(device=target).manual_seed(next(_PROBE_SEEDS))
+    if entry.name == "sol-attn":
+        batch, sequence, heads, dim = PROBE_SHORT
+        shape = (batch, sequence + 1, heads, dim)  # Sol's partial final block as well.
+        query, key, value = (
+            (torch.randn(shape, generator=seed, device=target) * 0.5).to(dtype) for _ in range(3)
+        )
+        with torch.no_grad(), torch.cuda.device(target):
             return _probe_sol(entry, device, query, key, value)
+    query, key, value = (
+        torch.randn(PROBE, generator=seed, device=target, dtype=dtype) for _ in range(3)
+    )
+    options = {
+        "attn_mask": None,
+        "dropout_p": 0.0,
+        "is_causal": False,
+        "scale": None,
+        "enable_gqa": False,
+    }
+    with torch.no_grad(), torch.cuda.device(target):
+        impl = entry.candidate.local.impl(query, key, value, options)
+        if impl == "math":
+            query, key, value = (t[:, : PROBE_SHORT[1]].contiguous() for t in (query, key, value))
         got = dispatch_attention_fn(query, key, value, backend=entry.member)
-    if isinstance(got, tuple):
-        got = got[0]
+        got = _validate_probe_contract(entry, device, got, query)
+        rows = torch.linspace(0, query.shape[1] - 1, PROBE_ROWS, device=target).long()
+        exact = _exact_rows(query, key, value, rows)
+        disagreement = float((got[:, rows].double() - exact).norm() / exact.norm())
+        floor = float((exact.to(dtype).double() - exact).norm() / exact.norm())
+    _gate(entry, device, disagreement, f"{len(rows)} sampled rows over {query.shape[1]} keys")
+    return {
+        "shape": list(query.shape),
+        "sampled_rows": len(rows),
+        "rel_l2_to_exact": disagreement,
+        "rounding_floor": floor,
+        "rel_l2_max": entry.candidate.rel_l2_max,
+        "impl": impl,
+    }
 
-    q_ref, k_ref, v_ref = (tensor.transpose(1, 2).float() for tensor in (query, key, value))
-    exact = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref).transpose(1, 2)
-    _validate_probe(entry, device, got, query, exact)
-    return None
+
+def _exact_rows(query: Any, key: Any, value: Any, rows: Any) -> Any:
+    """Exact float64 attention for `rows` of the query over every key, one head at a time."""
+    import torch
+
+    out = torch.empty(
+        (query.shape[0], len(rows), query.shape[2], query.shape[3]),
+        dtype=torch.float64,
+        device=query.device,
+    )
+    for head in range(query.shape[2]):
+        q = query[:, rows, head].double()
+        k, v = key[:, :, head].double(), value[:, :, head].double()
+        weights = (q @ k.transpose(1, 2) * q.shape[-1] ** -0.5).softmax(dim=-1)
+        out[:, :, head] = weights @ v
+    return out
+
+
+def _gate(entry: Ready, device: DeviceFacts, disagreement: float, where: str) -> None:
+    """Hold a finite result to its declared budget. Past rel L2 1 the output carries no
+    attention at all (a kernel returning its uninitialized buffer raises nothing and has the
+    right shape, h3a-013); below it, the kernel runs and is out of budget, said so by name."""
+    budget = entry.candidate.rel_l2_max
+    if disagreement <= budget:
+        return
+    code = "attention_kernel_wrong" if disagreement >= 1 else "attention_kernel_out_of_budget"
+    raise AttentionRefusal(
+        code,
+        f"{entry.name} disagrees with exact attention at rel L2 {disagreement:.4g} on "
+        f"{device.name} (sm{device.sm}) ({where}), past its declared budget of {budget:.4g}"
+        + ("" if code == "attention_kernel_wrong" else "; it runs, numerically out of budget"),
+    )
 
 
 def _probe_sol(
@@ -521,8 +513,10 @@ def _probe_sol(
     exact = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref).transpose(1, 2)
     # Public sink semantics keep all KV blocks exact inside the actual native
     # kernel. No Runtime dense-prefix overwrite can make this control pass.
-    native = attention_sol._native(query, key, value, None, sequence)
-    _validate_probe(entry, device, native, query, exact)
+    native = _validate_probe_contract(
+        entry, device, attention_sol._native(query, key, value, None, sequence), query
+    )
+    _gate(entry, device, float((native.float() - exact).norm() / exact.norm()), "all-keys")
     if any(
         not torch.equal(t.view(torch.uint8), old.view(torch.uint8))
         for t, old in zip(inputs, originals, strict=True)
@@ -545,7 +539,7 @@ def _probe_sol(
             repeated = probe(*padded)
     finally:
         attention_sol.remove_site(probe, "probe", "attention")
-    _validate_probe_contract(entry, device, sparse, padded[0], padded[0])
+    _validate_probe_contract(entry, device, sparse, padded[0])
     expected_prefix = attention_sol._dense(query[:, :prefix], key, value, None)
     if (
         not torch.equal(sparse[:, :prefix], expected_prefix)
@@ -578,40 +572,24 @@ def _probe_sol(
     }
 
 
-def _validate_probe(entry: Ready, device: DeviceFacts, got: Any, query: Any, exact: Any) -> None:
-    """Check a real result's contract and small numerical smoke, not model quality."""
-    got = _validate_probe_contract(entry, device, got, query, exact)
-    disagreement = float((got - exact).norm() / exact.norm())
-    if disagreement > entry.candidate.rel_l2_max:
-        raise AttentionRefusal(
-            "attention_kernel_wrong",
-            f"{entry.name} disagrees with exact fp32 attention at rel L2 {disagreement:.4g} on "
-            f"{device.name} (sm{device.sm}), past its declared budget of "
-            f"{entry.candidate.rel_l2_max:.4g}. A kernel that returns its uninitialized output "
-            "buffer raises nothing and has the right shape (h3a-013), so this is the only "
-            "thing that can tell the difference",
-        )
-
-
-def _validate_probe_contract(
-    entry: Ready, device: DeviceFacts, got: Any, query: Any, exact: Any
-) -> Any:
-    """Geometry and finite output are required even when approximation changes the answer."""
+def _validate_probe_contract(entry: Ready, device: DeviceFacts, got: Any, query: Any) -> Any:
+    """Geometry and finite output are required even when approximation changes the answer;
+    non-finite fails before any ratio, which a NaN would pass."""
     import torch
 
+    if isinstance(got, tuple):
+        got = got[0]
     if not isinstance(got, torch.Tensor) or got.dtype != query.dtype or got.device != query.device:
         raise AttentionRefusal(
             "attention_kernel_wrong",
             f"{entry.name} must return {query.dtype} on {query.device}, matching its input",
         )
-    if tuple(got.shape) != tuple(exact.shape):
+    if tuple(got.shape) != tuple(query.shape):
         raise AttentionRefusal(
             "attention_kernel_wrong",
             f"{entry.name} returned {tuple(got.shape)}; attention over "
-            f"{tuple(query.shape)} requires "
-            f"{tuple(exact.shape)}",
+            f"{tuple(query.shape)} requires {tuple(query.shape)}",
         )
-    got = got.float()
     if not bool(torch.isfinite(got).all()):
         raise AttentionRefusal(
             "attention_kernel_wrong",
@@ -621,59 +599,72 @@ def _validate_probe_contract(
     return got
 
 
-def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
-    """One candidate, proven present here AND proven to compute, or a typed refusal."""
-    _admit_arch(candidate, _baked_archs(candidate), device)
-    registry = _registry()
-    member = _member(candidate.backend)
-    if member not in registry._backends:
+def _import(candidate: Candidate) -> Any:
+    """The candidate's upstream module, from this environment or the image's kernel site."""
+    try:
+        installed = metadata.version(candidate.distribution)
+    except metadata.PackageNotFoundError as exc:
         raise AttentionRefusal(
             "attention_kernel_absent",
-            f"diffusers registers no backend {candidate.backend!r}",
-        )
-    if candidate.baked:
-        loaded_member, location = _load_baked(candidate, device)
-        try:
-            artifact = _artifact("cozy-kernel-" + candidate.baked)
-        except metadata.PackageNotFoundError:
-            artifact = None
-        ready = Ready(candidate, loaded_member, location, artifact=artifact)
-        return replace(ready, admission=_computes(ready, device))
-    if candidate.distribution:
-        try:
-            installed = metadata.version(candidate.distribution)
-        except metadata.PackageNotFoundError as exc:
-            raise AttentionRefusal(
-                "attention_kernel_absent",
-                f"{candidate.name} needs the {candidate.distribution} distribution, which "
-                "this environment does not install",
-            ) from exc
-        try:
-            import_module(candidate.import_name or candidate.distribution.replace("-", "_"))
-        except Exception as exc:
-            raise AttentionRefusal(
-                "attention_kernel_absent",
-                f"{candidate.distribution}=={installed} does not import: "
-                f"{type(exc).__name__}: {exc}",
-            ) from exc
-    if candidate.name == "sol-attn" and not attention_sol.dense_identity():
-        dense = next(
-            (entry for entry in available(device) if _admits(entry.candidate, "bfloat16", 128)),
-            None,
-        )
-        if dense is None:
-            raise AttentionRefusal(
-                "attention_kernel_absent", "Sol has no qualified dense reference"
-            )
-        attention_sol.bind_dense(
-            registry._backends[dense.member], dense.name + ":" + dense.location
-        )
-    ready = Ready(
-        candidate,
-        member,
-        artifact=_artifact(candidate.distribution) if candidate.distribution else None,
-    )
+            f"{candidate.name} needs the {candidate.distribution} distribution, which neither "
+            f"this package environment nor the image installs ({kernel_site.current().describe()})",
+        ) from exc
+    try:
+        return import_module(candidate.import_name or candidate.distribution.replace("-", "_"))
+    except Exception as exc:
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"{candidate.distribution}=={installed} does not import: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+def _snapshot_artifact(location: str) -> dict[str, Any]:
+    body = (Path(location) / "metadata.json").read_bytes()
+    declared = json.loads(body)
+    return {
+        "snapshot": Path(location).name,
+        "id": str(declared.get("id", "")),
+        "metadata_digest": "sha256:" + hashlib.sha256(body).hexdigest(),
+    }
+
+
+def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
+    """One candidate, proven present here AND proven to compute, or a typed refusal."""
+    _admit_arch(candidate, _snapshot_archs(candidate), device)
+    registry = _registry()
+    module = _import(candidate) if candidate.distribution else None
+    location, artifact = "", None
+    if candidate.snapshot:
+        location = _load_snapshot(candidate, module, device)
+        artifact = _snapshot_artifact(location)
+    elif candidate.distribution:
+        artifact = _artifact(candidate.distribution)
+    if candidate.name == "sol-attn":
+        _bind_sol_dense(device, registry)
+    ready = Ready(candidate, _member(candidate), location, artifact=artifact)
     return replace(ready, admission=_computes(ready, device))
+
+
+def _bind_sol_dense(device: DeviceFacts, registry: Any) -> None:
+    """Sol serves only its CuTe SM90 route (upstream silently falls back to Triton without
+    CuTe) and recomputes dense rows with the first ranked dense kernel on this rank."""
+    if device.kind == "cuda":
+        route = attention_sol.backend(device.index)
+        if route != "cute_sm90":
+            raise AttentionRefusal(
+                "attention_kernel_absent",
+                f"sol-attn selects its {route!r} route on {device.name}; only cute_sm90 is "
+                "served, which needs cutlass.cute and cuda.bindings from the kernel site",
+            )
+    if attention_sol.dense_identity():
+        return
+    dense = next(
+        (entry for entry in available(device) if _admits(entry.candidate, "bfloat16", 128)),
+        None,
+    )
+    if dense is None:
+        raise AttentionRefusal("attention_kernel_absent", "Sol has no qualified dense reference")
+    attention_sol.bind_dense(registry._backends[dense.member], dense.name + ":" + dense.location)
 
 
 def _device_admits(candidate: Candidate, device: DeviceFacts) -> str:
@@ -1028,10 +1019,10 @@ def _eligible(
     if _device_admits(candidate, device) or not _admits(candidate, dtype, head_dim):
         return False
     try:
-        _admit_arch(candidate, _baked_archs(candidate), device)
+        _admit_arch(candidate, _snapshot_archs(candidate), device)
         if candidate.distribution:
             metadata.version(candidate.distribution)
-        member = _member(candidate.backend)
+        member = _member(candidate)
         return member in _registry()._backends and (degree == 1 or _context_parallel(member))
     except Exception:
         return False
@@ -1188,15 +1179,10 @@ def observed(roots: Mapping[str, Any], pin: str = "") -> Applied:
     artifacts: dict[str, dict[str, Any]] = {}
     for name in {name for kernels in hosts.values() for name in kernels}:
         candidate = BY_NAME.get(name)
-        if candidate is None:
+        if candidate is None or not candidate.distribution or candidate.snapshot:
             continue
-        distribution = (
-            "cozy-kernel-" + candidate.baked if candidate.baked else candidate.distribution
-        )
-        if distribution:
-            # The image compatibility snapshot has no wheel distribution.
-            with suppress(metadata.PackageNotFoundError):
-                artifacts[name] = _artifact(distribution)
+        with suppress(metadata.PackageNotFoundError):
+            artifacts[name] = _artifact(candidate.distribution)
     return Applied(hosts, {}, (), pin, artifacts=artifacts or None)
 
 
@@ -1328,7 +1314,7 @@ def admit(pin: str, degree: int) -> None:
         )
     if degree > 1:
         _registry()
-        if not _context_parallel(_member(candidate.backend)):
+        if not _context_parallel(_member(candidate)):
             raise AttentionRefusal(
                 "attention_kernel_unsupported",
                 f"{name} does not support context parallelism, which this sequence-parallel "
@@ -1407,32 +1393,58 @@ def select(
     return install(ready, roots, pin, degree, device=device, choose=choose)
 
 
-def image_kernels(device: DeviceFacts) -> str:
-    """What this environment and device can run, for a refusal message (cr-125)."""
-    shipped: list[str] = []
+def capabilities(device: DeviceFacts) -> dict[str, Any]:
+    """This rank's attention capability document: its kernel site and, for every kernel this
+    runtime knows, whether it serves here — version, artifact and numeric probe when it does,
+    the typed refusal when it does not. Computed per rank; ranks may differ."""
+    kernels: dict[str, dict[str, Any]] = {}
     for candidate in (*CANDIDATES, *PINNABLE):
-        if _device_admits(candidate, device):
+        declared = {
+            "context_parallel": candidate.local.head_local,
+            "dtypes": sorted(candidate.dtypes),
+            "max_head_dim": candidate.max_head_dim,
+            "rel_l2_max": candidate.rel_l2_max,
+        }
+        unsupported = _device_admits(candidate, device)
+        if unsupported:
+            kernels[candidate.name] = {
+                **declared,
+                "status": "attention_kernel_unsupported",
+                "detail": unsupported,
+            }
             continue
         try:
-            _resolve(candidate, device)
-        except Exception:
+            ready = _resolve(candidate, device)
+        except Exception as exc:
+            kernels[candidate.name] = {
+                **declared,
+                "status": getattr(exc, "code", "attention_kernel_absent"),
+                "detail": f"{type(exc).__name__}: {exc}"[:600],
+            }
             continue
-        shipped.append(candidate.name)
-    return ", ".join(shipped) or "none"
+        kernels[candidate.name] = {
+            **declared,
+            "status": "ready",
+            **({"artifact": ready.artifact} if ready.artifact else {}),
+            **({"location": ready.location} if ready.location else {}),
+            **({"admission": ready.admission} if ready.admission else {}),
+        }
+    return {
+        "device": {"kind": device.kind, "name": device.name, "sm": device.sm},
+        "kernel_site": kernel_site.current().document(),
+        "kernels": kernels,
+    }
 
 
-def baked_variants() -> dict[str, Any]:
-    """The baked snapshots under `IMAGE_KERNELS_DIR`, for the boot record and for triage."""
-    out: dict[str, Any] = {}
-    for candidate in (*CANDIDATES, *PINNABLE):
-        builds = IMAGE_KERNELS_DIR / candidate.baked / "build" if candidate.baked else None
-        if builds is None or not builds.is_dir():
-            continue
-        for variant in sorted(builds.iterdir()):
-            metadata_file = variant / "metadata.json"
-            if metadata_file.is_file():
-                out[candidate.name] = {
-                    "variant": variant.name,
-                    **json.loads(metadata_file.read_text()),
-                }
-    return out
+def image_kernels(device: DeviceFacts) -> str:
+    """What this environment and device can run, for a refusal message (cr-125)."""
+    ready = [
+        name for name, row in capabilities(device)["kernels"].items() if row["status"] == "ready"
+    ]
+    return ", ".join(ready) or "none"
+
+
+def implementations(seen: Mapping[str, set[str]]) -> str:
+    """The implementation line for what served in an `attention_ulysses.observing` scope."""
+    names = {candidate.backend: candidate.name for candidate in BY_NAME.values()}
+    return attention_ulysses.describe(dict(seen), names)
