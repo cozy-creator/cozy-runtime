@@ -321,8 +321,6 @@ class AttemptRecord:
     executor_pid: int = 0
     placement_id: str = ""
     """The immutable routing identity this attempt was accepted against."""
-    admission_epoch: int = 0
-    """The worker admission epoch echoed by the offer that created this record."""
     kind: str = "serving"
     """`serving` or `job`. It SURVIVES compaction, because what an attempt was is still a
     fact about it after its heavy state is gone — the run-once recycle disposition and the
@@ -668,7 +666,6 @@ class AttemptEngine:
             # Capture the offered value itself; rereading the worker's live placement during
             # admission can observe a concurrently converging successor placement.
             placement_id=offered.placement_id,
-            admission_epoch=offered.admission_epoch,
         )
 
     def _bind(self, spec: Mapping[str, Any], offered: pb.AttemptOffer) -> grants.BoundGrant:
