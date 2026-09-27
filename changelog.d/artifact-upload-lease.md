@@ -1,0 +1,1 @@
+Host-driven artifact uploads lease only the object each command sends and reuse the closure inventory across an effect's commands, instead of opening every closure object for every object sent (quadratic in closure size).
