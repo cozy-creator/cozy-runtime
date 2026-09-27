@@ -182,7 +182,7 @@ class Upload:
         arguments: dict[str, Any],
         envelope: dict[str, Any],
         registry: bytes | None,
-        client: PublicationClient,
+        client: PublicationClient | None,
         hooks: Hooks,
         allow_local: bool,
         directory: Path,
@@ -197,6 +197,11 @@ class Upload:
         self.recipe = upload_plan.recipe_of(arguments, operation)
         self.slots = upload_plan.slots(arguments, self.recipe)
         self.passes = 0
+
+    @property
+    def publisher(self) -> PublicationClient:
+        assert self.client is not None, "a local conversion publishes nothing"
+        return self.client
 
     # ------------------------------------------------------------------ steps
 
@@ -237,6 +242,13 @@ class Upload:
     def run(
         self, selection: dict[str, Any], content: dict[str, Any], computation: str, epoch: int
     ) -> CheckpointRef:
+        return self._publish(self.convert(selection, content, computation, epoch))
+
+    def convert(
+        self, selection: dict[str, Any], content: dict[str, Any], computation: str, epoch: int
+    ) -> dict[str, Any]:
+        """The composed model. With no publication client it stays on this machine: only
+        spent source is evicted, never converted output."""
         # A recipe names its metadata; otherwise every non-carrier (Diffusers configs) is.
         metadata_names = (
             set(self.recipe.metadata)
@@ -308,11 +320,13 @@ class Upload:
             self.hooks.progress(
                 STAGE, sum(row[2] for row in self.carriers if row[0] in spent), total
             )
-            self._custody()
+            if self.client is not None:
+                self._custody()
             answer = self._next(answer["facts"])
         self.hooks.progress(STAGE, total, total)
-        self.model = answer["model"]
-        return self._publish(self.model)
+        model: dict[str, Any] = dict(answer["model"])
+        self.model = model
+        return model
 
     def _advance(
         self,
@@ -511,7 +525,7 @@ class Upload:
             self._retry(
                 partial(
                     retain_objects,
-                    self.client,
+                    self.publisher,
                     destination=self.destination,
                     operation=operation,
                     objects=batch,
@@ -559,7 +573,7 @@ class Upload:
         )
         return self._retry(
             lambda: upload_checkpoint(
-                self.client,
+                self.publisher,
                 operation=self.service_id,
                 checkpoint=checkpoint,
                 objects=objects,
@@ -592,7 +606,7 @@ class Upload:
             self._retry(
                 partial(
                     abandon_publication,
-                    self.client,
+                    self.publisher,
                     destination=self.destination,
                     operation=operation,
                 )
