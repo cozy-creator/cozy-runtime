@@ -545,8 +545,8 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
     RECOMPUTE `sha256(placement_set_canonical_bytes)` and compare BEFORE parsing a single
     field. The frozen wire "digest-addressed" the set by an ECHOED claim, which is a
     statement the sender makes about bytes it also sent; this is a fence the receiver
-    computes. Only on a match is the document parsed, under unknown-field REFUSAL — at every
-    depth. There is no additive versioning inside a digest-fenced document.
+    computes. Only on a match is the document parsed. Fields this worker does not consume
+    are ignored at every depth, and the nested binding digests are the producer's names.
 
     Raises `documents.DocumentError`; the caller turns that into the typed fault and leaves
     the previous set serving.
@@ -581,10 +581,15 @@ SEMVER = re.compile(
 )
 
 
-def _closed_document(value: object, fields: set[str], name: str) -> dict[str, Any]:
-    if not isinstance(value, dict) or not set(value).issubset(fields):
-        raise documents.DocumentError("unknown_field", f"{name} has a non-closed field set")
+def _document(value: object, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise documents.DocumentError("wrong_type", f"{name} is a JSON object")
     return value
+
+
+def _unique(values: list[str], name: str) -> None:
+    if len(values) != len(set(values)):
+        raise documents.DocumentError("duplicate_entry", f"{name} repeats an entry")
 
 
 def _required(value: Mapping[str, Any], fields: set[str], name: str) -> None:
@@ -594,7 +599,7 @@ def _required(value: Mapping[str, Any], fields: set[str], name: str) -> None:
 
 
 def _exact_ref(value: object, name: str) -> dict[str, Any]:
-    row = _closed_document(value, {"digest", "length"}, name)
+    row = _document(value, name)
     _required(row, {"digest", "length"}, name)
     digest = row["digest"]
     length = row["length"]
@@ -617,20 +622,14 @@ def _identifier(value: object, name: str) -> str:
     return value
 
 
-def _sorted_unique_strings(value: object, name: str) -> list[str]:
-    if (
-        not isinstance(value, list)
-        or any(not isinstance(item, str) for item in value)
-        or value != sorted(set(value))
-    ):
-        raise documents.DocumentError("sort_order", f"{name} is not sorted unique")
+def _strings(value: object, name: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise documents.DocumentError("wrong_type", f"{name} is a list of strings")
     return value
 
 
 def _wheel_fact(value: object, name: str) -> dict[str, Any]:
-    row = _closed_document(
-        value, {"ref", "distribution", "version", "filename", "import_roots", "tags"}, name
-    )
+    row = _document(value, name)
     _required(row, {"ref", "distribution", "version", "filename"}, name)
     _exact_ref(row["ref"], f"{name}.ref")
     distribution = _identifier(row["distribution"], f"{name}.distribution")
@@ -640,23 +639,23 @@ def _wheel_fact(value: object, name: str) -> dict[str, Any]:
         raise documents.DocumentError("wheel_fact_invalid", f"{name}.distribution")
     _identifier(row["version"], f"{name}.version")
     _identifier(row["filename"], f"{name}.filename")
-    _sorted_unique_strings(row.get("import_roots", []), f"{name}.import_roots")
-    _sorted_unique_strings(row.get("tags", []), f"{name}.tags")
+    _strings(row.get("import_roots", []), f"{name}.import_roots")
+    _strings(row.get("tags", []), f"{name}.tags")
     return row
 
 
 def _package_selection(value: object) -> dict[str, Any]:
-    row = _closed_document(value, {"package", "release"}, "PackageSelection")
+    row = _document(value, "PackageSelection")
     _required(row, {"package", "release"}, "PackageSelection")
     package = _identifier(row["package"], "PackageSelection.package")
-    release = _identifier(row["release"], "PackageSelection.release")
-    if package.count("/") != 1 or not all(package.split("/")) or SEMVER.fullmatch(release) is None:
-        raise documents.DocumentError("package_invalid", "package identity or release is invalid")
+    _identifier(row["release"], "PackageSelection.release")
+    if package.count("/") != 1 or not all(package.split("/")):
+        raise documents.DocumentError("package_invalid", "package identity is invalid")
     return row
 
 
 def _development_package(value: object) -> dict[str, Any]:
-    row = _closed_document(value, {"package", "release", "installation_id"}, "DevelopmentPackage")
+    row = _document(value, "DevelopmentPackage")
     _required(row, {"package", "release", "installation_id"}, "DevelopmentPackage")
     _identifier(row["package"], "DevelopmentPackage.package")
     _identifier(row["release"], "DevelopmentPackage.release")
@@ -665,9 +664,6 @@ def _development_package(value: object) -> dict[str, Any]:
 
 
 def _placement_profile(entry: dict[str, Any]) -> None:
-    fields = {"placement_id", "package", "development", "installation_id", "package_interface",
-              "bindings_digest", "models", "entrypoints"}
-    _closed_document(entry, fields, "Placement")
     _required(entry, {"placement_id", "installation_id", "package_interface",
                       "bindings_digest", "entrypoints"}, "Placement")
     _identifier(entry["placement_id"], "Placement.placement_id")
@@ -693,7 +689,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         raise documents.DocumentError("wrong_type", "Placement.models")
     model_ids: list[str] = []
     for index, value in enumerate(models):
-        model = _closed_document(value, {"id", "repo", "version", "lane", "manifest"}, "Model")
+        model = _document(value, "Model")
         _required(model, {"id", "repo", "manifest"}, "Model")
         model_ids.append(_identifier(model["id"], f"models[{index}].id"))
         _identifier(model["repo"], f"models[{index}].repo")
@@ -702,8 +698,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         if "lane" in model:
             _identifier(model["lane"], f"models[{index}].lane")
         _exact_ref(model["manifest"], f"models[{index}].manifest")
-    if model_ids != sorted(set(model_ids)):
-        raise documents.DocumentError("sort_order", "Placement.models")
+    _unique(model_ids, "Placement.models")
     known_models = set(model_ids)
 
     entrypoints = entry["entrypoints"]
@@ -711,9 +706,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         raise documents.DocumentError("wrong_type", "Placement.entrypoints")
     entrypoint_names: list[str] = []
     for entrypoint_index, value in enumerate(entrypoints):
-        entrypoint = _closed_document(
-            value, {"name", "entrypoint_binding_digest", "slots"}, "Entrypoint"
-        )
+        entrypoint = _document(value, "Entrypoint")
         _required(entrypoint, {"name", "entrypoint_binding_digest"}, "Entrypoint")
         entrypoint_names.append(
             _identifier(entrypoint["name"], f"entrypoints[{entrypoint_index}].name")
@@ -723,18 +716,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
             raise documents.DocumentError("wrong_type", "Entrypoint.slots")
         slot_names: list[str] = []
         for slot_index, value in enumerate(slots):
-            slot = _closed_document(
-                value,
-                {
-                    "slot",
-                    "reference_model_id",
-                    "components",
-                    "model_construction_contract",
-                    "stamps",
-                    "adapters",
-                },
-                "Slot",
-            )
+            slot = _document(value, "Slot")
             _required(slot, {"slot", "reference_model_id"}, "Slot")
             # THE DELETED PLANE (model-code-fit D1, D12; the proto reserves both at
             # xs-010). `stamps` is `[]` on every wire document — the canonical writer spells
@@ -763,20 +745,17 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 raise documents.DocumentError("wrong_type", "Slot.components")
             component_names: list[str] = []
             for value in components:
-                component = _closed_document(value, {"component", "model_id"}, "Component")
+                component = _document(value, "Component")
                 _required(component, {"component", "model_id"}, "Component")
                 component_names.append(_identifier(component["component"], "Component.component"))
                 if component["model_id"] not in known_models:
                     raise documents.DocumentError("unknown_model", "Component.model_id")
-            if len(component_names) != len(set(component_names)):
-                raise documents.DocumentError("sort_order", "Slot.components")
+            _unique(component_names, "Slot.components")
             adapters = slot.get("adapters", [])
             if not isinstance(adapters, list):
                 raise documents.DocumentError("wrong_type", "Slot.adapters")
             for adapter in adapters:
-                row = _closed_document(
-                    adapter, {"component", "model_id", "source_component", "scale"}, "ModelAdapter"
-                )
+                row = _document(adapter, "ModelAdapter")
                 _required(row, {"component", "model_id", "source_component", "scale"}, "ModelAdapter")
                 if row["model_id"] not in known_models:
                     raise documents.DocumentError("unknown_model", "ModelAdapter.model_id")
@@ -784,31 +763,13 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 _identifier(row["source_component"], "ModelAdapter.source_component")
                 if not isinstance(row["scale"], str) or not row["scale"].strip():
                     raise documents.DocumentError("invalid_scale", "ModelAdapter.scale")
-        if slot_names != sorted(set(slot_names)):
-            raise documents.DocumentError("sort_order", "Entrypoint.slots")
-        expected_entrypoint = (
-            "sha256:"
-            + hashlib.sha256(
-                canonical.write({"name": entrypoint["name"], "slots": slots})
-            ).hexdigest()
-        )
-        if entrypoint["entrypoint_binding_digest"] != expected_entrypoint:
+        _unique(slot_names, "Entrypoint.slots")
+        digest = entrypoint["entrypoint_binding_digest"]
+        if not isinstance(digest, str) or HASH_ENTRY.fullmatch(digest) is None:
             raise documents.DocumentError(
-                "entrypoint_binding_digest_mismatch", str(entrypoint["name"])
+                "malformed_digest", "Entrypoint.entrypoint_binding_digest"
             )
-    if entrypoint_names != sorted(set(entrypoint_names)):
-        raise documents.DocumentError("sort_order", "Placement.entrypoints")
-    expected_bindings = (
-        "sha256:"
-        + hashlib.sha256(
-            canonical.write({"entrypoints": entrypoints, "models": models})
-        ).hexdigest()
-    )
-    if entry["bindings_digest"] != expected_bindings:
-        raise documents.DocumentError(
-            "bindings_digest_mismatch",
-            f"measured {expected_bindings}, expected {entry['bindings_digest']}",
-        )
+    _unique(entrypoint_names, "Placement.entrypoints")
 
 
 def _rank_degree(lane: DeviceLane, bindings: Iterable[DeclaredBinding]) -> int:

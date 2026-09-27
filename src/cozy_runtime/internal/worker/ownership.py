@@ -12,6 +12,9 @@ from cozy_runtime.internal.refusal import LaunchRefusal
 
 _MAX_BYTES = 4096
 _MAX_COUNTER = (1 << 64) - 1
+_FIELDS = frozenset(
+    {"worker_boot_id", "record_owner_epoch", "record_owner_id", "control_stream_epoch"}
+)
 
 
 def read(path: Path, boot_id: str, *, required: bool) -> tuple[int, str, int]:
@@ -37,16 +40,9 @@ def read(path: Path, boot_id: str, *, required: bool) -> tuple[int, str, int]:
             ):
                 raise ValueError("control history must be a private owned regular file")
             raw = stream.read(_MAX_BYTES + 1)
-        value: Any = json.loads(raw)
-        if (
-            len(raw) > _MAX_BYTES
-            or not isinstance(value, dict)
-            or set(value)
-            != {"worker_boot_id", "record_owner_epoch", "record_owner_id", "control_stream_epoch"}
-        ):
+        value: Any = json.loads(raw, object_pairs_hook=_unambiguous)
+        if len(raw) > _MAX_BYTES or not isinstance(value, dict) or not _FIELDS.issubset(value):
             raise ValueError("control history fields or size are invalid")
-        if _encode(value) != raw:
-            raise ValueError("control history is not its exact unambiguous encoding")
         if value["worker_boot_id"] != boot_id:
             raise ValueError("control history belongs to another pod boot")
         owner, identity, stream_epoch = (
@@ -108,3 +104,10 @@ def _validate(owner: Any, identity: Any, stream_epoch: Any) -> None:
 
 def _encode(value: dict[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def _unambiguous(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError("control history repeats a field")
+    return value

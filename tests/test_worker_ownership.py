@@ -129,10 +129,14 @@ def test_missing_corrupt_and_wrong_boot_history_refuse(tmp_path: Path) -> None:
     held = path.read_bytes()
     assert _run(tmp_path, "wrong-boot")["startup_refusal"] == "worker_ownership_invalid"
     assert path.read_bytes() == held
-    for corrupt in (b"", b"{}", held + b"\n"):
+    repeated = held[:-1] + b',"control_stream_epoch":0}'
+    for corrupt in (b"", b"{}", repeated):
         path.write_bytes(corrupt)
         assert _run(tmp_path, "same")["startup_refusal"] == "worker_ownership_invalid"
         assert path.read_bytes() == corrupt
+    # Formatting and additive fields from another Runtime version are not corruption.
+    path.write_bytes(held[:-1] + b',"written_by":"newer"}\n')
+    assert _run(tmp_path, "same")["accepted"]
 
 
 def test_failed_counter_write_never_accepts_claim(tmp_path: Path) -> None:

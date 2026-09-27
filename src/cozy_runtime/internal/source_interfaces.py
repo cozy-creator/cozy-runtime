@@ -16,7 +16,7 @@ from cozy_runtime.internal import schema
 MODULE = "cozy_runtime.author.sources"
 
 
-class HuggingFace(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class HuggingFace(msgspec.Struct, frozen=True):
     repository: str
     revision: str
     profiles: tuple[str, ...] = ()
@@ -24,21 +24,21 @@ class HuggingFace(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     files: tuple[str, ...] = ()
 
 
-class Civitai(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class Civitai(msgspec.Struct, frozen=True):
     version: int
     file: str = ""
 
 
-class Convert(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class Convert(msgspec.Struct, frozen=True):
     source: SourceArtifact
     profile: str
 
 
-class SourceFiles(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class SourceFiles(msgspec.Struct, frozen=True):
     source: SourceArtifact
 
 
-class CommitFile(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class CommitFile(msgspec.Struct, frozen=True):
     slot: str
     digest: str
     size_bytes: int

@@ -161,9 +161,7 @@ def test_canonical_documents() -> None:
         assert documents.doc_format(message.DESCRIPTOR.full_name) == row["document"], (
             f"{name}: format tag differs from the frozen document tag"
         )
-        # The reading half accepts what the writer produced — and, by the unknown-field
-        # law, would refuse this same document the moment the corpus carries a field the
-        # vendored schema does not know (#409's class, from the reader's side).
+        # The reading half accepts what the writer produced.
         documents.read(frozen, cls)
         arms += 1
     assert arms == len(canonical_rows) and arms > 0, (
@@ -171,18 +169,16 @@ def test_canonical_documents() -> None:
     )
 
 
-def test_red_twins_refuse() -> None:
-    """Every frozen semantic twin — one document, exactly one rule broken — refuses.
+def test_red_twins_refuse_ambiguous_bytes_but_not_additive_keys() -> None:
+    """Duplicate keys and non-canonical bytes refuse; an additive key is read and ignored.
 
-    Runtime's canonical layer is JCS (floats admitted, for package interfaces), wider than
-    the protocol profile, so ``twin_float`` — an unknown key carrying a float — refuses at
-    the unknown-key law here rather than at the number profile. Refusal, not the code path,
-    is the contract: an ACCEPTED twin means a planted field was ignored.
+    ``twin_float`` is an additive key carrying a float, which Runtime's JCS layer admits.
     """
+    for name in ("twin_float", "twin_unknown_key"):
+        body = (CORPUS / "red" / f"{name}.json").read_bytes()
+        assert documents.read(body, worker_pb2.InvocationSpec)
     for name, want_code in {
         "twin_duplicate_key": "duplicate_key",
-        "twin_float": "unknown_field",
-        "twin_unknown_key": "unknown_field",
         "twin_whitespace": "noncanonical_encoding",
     }.items():
         body = (CORPUS / "red" / f"{name}.json").read_bytes()
