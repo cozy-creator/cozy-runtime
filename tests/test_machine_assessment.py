@@ -79,28 +79,26 @@ def test_serving_association_uses_only_the_selected_exact_placement() -> None:
     entry = next(row for row in placement["entrypoints"] if row["name"] == "upscale")
     artifact = next(row["manifest"] for row in placement["models"] if row["id"] == "upscaler")
     checkpoint = artifact["digest"]
-    intent = {
-        "interface_digest": placement["package_interface"]["digest"],
-        "request": {"upscaler": {"manifest": artifact}, "seed": 1234},
-    }
+    intent = {"request": {"upscaler": {"manifest": artifact}, "seed": 1234}}
     spec = {
         "payload_digest": documents.spell(
             hashlib.sha256(canonical_json.encode(intent["request"])).digest()
         ),
-        "environment_digest": placement["environment_digest"],
+        "installation_id": placement["installation_id"],
         "serving": {
             "bindings_digest": placement["bindings_digest"],
             "entrypoint_binding_digest": entry["entrypoint_binding_digest"],
         },
     }
-    preparation = canonical_json.encode({"revisions": {"revision": {"placement": placement}}})
+    installation = placement["installation_id"]
+    preparation = canonical_json.encode({"installations": {installation: {"placement": placement}}})
     call = canonical_json.encode(
-        {"kind": "serving", "revision": "revision", "entrypoint": "upscale"}
+        {"kind": "serving", "installation_id": installation, "entrypoint": "upscale"}
     )
     assert machine_assessment.render_arguments(spec, intent, preparation, call, checkpoint) == {
         "seed": 1234
     }
-    # The same retained revision also contains H3. A report cannot substitute that
+    # The same retained installation also contains H3. A report cannot substitute that
     # unselected model, change the admitted bindings, or hide a mixed-model slot.
     with pytest.raises(PublicationRefusal, match="binding_mismatch"):
         machine_assessment.render_arguments(
@@ -110,6 +108,10 @@ def test_serving_association_uses_only_the_selected_exact_placement() -> None:
     changed["serving"]["bindings_digest"] = "sha256:" + "11" * 32
     with pytest.raises(PublicationRefusal, match="binding_mismatch"):
         machine_assessment.render_arguments(changed, intent, preparation, call, checkpoint)
+    changed = deepcopy(spec)
+    changed["installation_id"] = "install-other"
+    with pytest.raises(PublicationRefusal, match="binding_mismatch"):
+        machine_assessment.render_arguments(changed, intent, preparation, call, checkpoint)
     changed_intent = deepcopy(intent)
     changed_intent["request"]["seed"] = 1235
     with pytest.raises(PublicationRefusal, match="binding_mismatch"):
@@ -117,6 +119,8 @@ def test_serving_association_uses_only_the_selected_exact_placement() -> None:
     changed_placement = deepcopy(placement)
     selected = next(row for row in changed_placement["entrypoints"] if row["name"] == "upscale")
     selected["slots"][0]["components"][0]["model_id"] = "h3"
-    mixed = canonical_json.encode({"revisions": {"revision": {"placement": changed_placement}}})
+    mixed = canonical_json.encode(
+        {"installations": {installation: {"placement": changed_placement}}}
+    )
     with pytest.raises(PublicationRefusal, match="binding_mismatch"):
         machine_assessment.render_arguments(spec, intent, mixed, call, checkpoint)

@@ -29,7 +29,7 @@ from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents,worker_pb2 as pb
 root=Path(sys.argv[1]);store=tensorfs.Store.ensure(root);workspace=Workspace(root)
 invocation,spec=documents.identity(pb.InvocationSpec(job=pb.JobInvocationSpec(
-    build_id='sha256:'+'11'*32,job_descriptor_id='sha256:'+'12'*32),
+    installation_id='local-'+'11'*16,job_descriptor_id='sha256:'+'12'*32),
     outputs=[pb.OutputBinding(output_id='model',mime_type='application/vnd.cozy.model-manifest',max_bytes=4096)]))
 workspace.accept('owner',pb.AttemptOffer(request_id='interrupted',attempt_ordinal=1,
     invocation_spec_digest=spec,invocation_spec_canonical_bytes=invocation))

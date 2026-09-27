@@ -1,4 +1,4 @@
-"""The real machine builtin prepares through a live supervisor admission channel."""
+"""A rented worker captures builtins from the Runtime's own installation under storage admission."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ from pathlib import Path
 
 import pytest
 
+from test_end_to_end import NO_EXECUTOR
 
-@pytest.mark.skipif(sys.platform != "linux", reason="supervisor descriptor-four transport is Linux")
-def test_rented_builtin_keeps_frozen_sdk_and_generic_snapshot_refusal(tmp_path: Path) -> None:
+
+@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+def test_rented_builtin_captures_the_runtime_installation(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     wheels = tmp_path / "wheels"
     subprocess.run(

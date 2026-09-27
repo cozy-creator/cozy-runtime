@@ -105,6 +105,7 @@ def test_modeled_invocable_serving_has_one_model_plane_for_self_and_generated_ca
         path = output / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+    # Generated caller types are open (#690): an additive field is dropped, not refused.
     check = """import asyncio,inspect,json,sys
 sys.path.insert(0,sys.argv[1])
 import serving_fixture as client
@@ -128,9 +129,14 @@ token=_current.set(broker)
 async def run():
     call=client.generate(payload=client.Request(prompt="typed"))
     assert isinstance(call,PendingCall) and (await call).value==7
-    for invalid in ({"payload":{"prompt":5}},
-                    {"payload":{"prompt":"typed","unknown":1}},
-                    {"payload":client.Request(prompt="typed"),"model":"not an artifact"}):
+    additive={"payload":{"prompt":"typed","unknown":1}}
+    invalid_calls=[{"payload":{"prompt":5}},
+                   {"payload":client.Request(prompt="typed"),"model":"not an artifact"}]
+    if sys.argv[2]=="self":invalid_calls.append(additive)
+    else:
+        assert (await client.generate(**additive)).value==7
+        assert sent.pop()["payload"]==sent[0]["payload"]
+    for invalid in invalid_calls:
         try:await client.generate(**invalid)
         except (TypeError,ValueError,ConformanceError):pass
         else:raise AssertionError("invalid request reached inference: "+repr(invalid))
