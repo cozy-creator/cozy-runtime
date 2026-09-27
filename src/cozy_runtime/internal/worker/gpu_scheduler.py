@@ -40,15 +40,19 @@ def model_degrees(models: Iterable[Any]) -> list[set[int]]:
     return rows
 
 
-def width_for(degrees: Iterable[Iterable[int]], devices: int) -> int:
+def width_for(degrees: Iterable[Iterable[int]], devices: int, exact: int = 0) -> int:
     """The largest device count every model slot declares, capped by the machine.
 
     One device is always declared. Authored rung GPU counts are a renting decision and
-    never narrow this on a machine that is already wider.
+    never narrow this on a machine that is already wider. An `exact` count the owner
+    submitted is the width itself when every slot declares it and the machine forms it;
+    otherwise there is no width (0).
     """
     common = set(range(1, max(devices, 1) + 1))
     for declared in degrees:
         common &= {1, *declared}
+    if exact:
+        return exact if exact in common else 0
     return max(common)
 
 

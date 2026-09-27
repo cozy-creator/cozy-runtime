@@ -58,6 +58,9 @@ MARCO = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
 def test_width_is_the_largest_declared_degree_the_machine_forms() -> None:
     # base + LoRA both (2,4,7,8): never an undeclared width; the rest of the cards stay free
     assert [width_for(model_degrees(H3), n) for n in range(1, 10)] == [1, 2, 2, 4, 4, 4, 7, 8, 8]
+    # an exact count is the width when declared and formed, else none
+    exact = [width_for(model_degrees(H3), 4, count) for count in range(1, 9)]
+    assert exact == [1, 2, 0, 4, 0, 0, 0, 0]
     assert width_for(model_degrees([{}]), 4) == 1  # no declaration is its declared truth
     assert width_for(model_degrees([{"sequence_parallel": {"degrees": "2"}}]), 4) == 1
 
@@ -275,6 +278,7 @@ class Machine:
             proof=b"test-bootstrap",
         )
         assert self.worker.accept_claim(claim, lambda frame: None)[0] >= 1
+        self.claim = claim
         assert self.worker.executions is not None and self.worker.machine_calls is not None
         self.executions = self.worker.executions
         self.calls = self.worker.machine_calls
@@ -359,6 +363,12 @@ class Machine:
         )
         request.intent_digest = hashlib.sha256(canonical_intent(request)).digest()
         call = self.calls.journal.accept(OWNER, request)
+        self.serving(call.child_request, kind)
+        return call.child_request
+
+    def serving(self, request: str, kind: str, gpus: int = 0) -> None:
+        """A serving execution of `kind` against its prepared template, as Creator submits
+        a rented root: `gpus` is the exact group width it names, zero for none."""
         digest = "sha256:" + hashlib.sha256(kind.encode()).hexdigest()
         template = {
             "placement_id": "tmpl-" + kind,
@@ -381,10 +391,11 @@ class Machine:
             placement_set=pb.DesiredPlacementSet(
                 placement_set_digest=hashlib.sha256(raw).digest(),
                 placement_set_canonical_bytes=raw,
+                execution_gpus=gpus,
             ),
         )
         self.submit(
-            call.child_request,
+            request,
             pb.InvocationSpec(
                 installation_id="inst-" + kind,
                 serving=pb.ServingInvocationSpec(
@@ -396,7 +407,6 @@ class Machine:
             {"installations": {}, "state": base64.b64encode(state.SerializeToString()).decode()},
             placement="tmpl-" + kind,
         )
-        return call.child_request
 
     def finish(self, request: str, status: pb.OutcomeStatus = pb.OUTCOME_STATUS_SUCCEEDED) -> None:
         """Record the attempt's outcome; a child whose replica could not activate here
@@ -501,7 +511,7 @@ class Machine:
 
     def _all(self) -> list[tuple[int, str, dict[str, Any]]]:
         rows = []
-        for root in ("A", "B", "C", "J"):
+        for root in ("A", "B", "C", "D", "J"):
             if self.executions.owns(OWNER, root):
                 rows.extend(self.journal(root))
         return rows
@@ -616,6 +626,27 @@ def test_cancel_while_waiting_takes_no_grant_and_the_next_root_starts(machine: M
     machine.finish(a1, pb.OUTCOME_STATUS_CANCELED)
     machine.tick()
     assert machine.granted(c1) == [0]
+
+
+def test_a_submitted_exact_width_is_the_group_and_leaves_the_rest_free(machine: Machine) -> None:
+    """An explicit model GPU count reaches Runtime as `execution_gpus`: 2 of 4 GPUs is a
+    2-GPU group, never the widest declared degree, and a count no slot declares or the
+    machine cannot form is refused typed."""
+    query = pb.MachineExecutionWorkspaceQuery(claim=machine.claim)
+    workspace = MachineExecutionRPC(machine.worker).GetMachineExecutionWorkspace(query, None)
+    assert workspace.exact_execution_gpus  # what Creator reads before sending a count
+    machine.serving("A", "h3", gpus=2)
+    machine.serving("B", "h3", gpus=2)
+    machine.serving("C", "h3", gpus=3)
+    machine.serving("D", "h3", gpus=8)
+    view = machine.tick()
+    assert machine.granted("A") == [0, 1] and machine.granted("B") == [2, 3]
+    assert view["leases"] == {"A": [0, 1], "B": [2, 3]} and not view["waiting"]
+    for refused, gpus in (("C", 3), ("D", 8)):
+        assert machine.executions.status(OWNER, refused).state == "failed"
+        outcome = machine.executions.collect(OWNER, refused).outcome_canonical_bytes
+        message = documents.read(outcome, pb.AttemptOutcomeBody)["safe_message"]
+        assert message.startswith("gpu_count_unavailable") and f"exactly {gpus} GPUs" in message
 
 
 def test_an_unreadable_gpu_leaves_the_inventory_and_the_group_narrows(machine: Machine) -> None:

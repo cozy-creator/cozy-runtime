@@ -2453,7 +2453,14 @@ class Worker:
                     )
                     continue
                 exclude.update(set(range(width)) - set(readable))
-                width = width_for(shape.degrees, len(readable))
+                width = width_for(shape.degrees, len(readable), shape.gpus)
+                if not width:
+                    self._gpu_shapes[request] = dataclasses.replace(
+                        shape,
+                        refusal=f"gpu_count_unavailable: exactly {shape.gpus} GPUs is not a "
+                        f"group every model slot declares on {len(readable)} readable GPUs",
+                    )
+                    continue
             demands.append(
                 Demand(key, shape.root, width, self._warm(shape.template), tuple(sorted(exclude)))
             )

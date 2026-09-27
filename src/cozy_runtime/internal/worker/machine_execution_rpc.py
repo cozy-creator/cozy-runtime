@@ -106,6 +106,7 @@ class MachineExecutionRPC:
                 else "",
                 executor_uid_isolation=options.executor_uid >= 0,
                 cpu_slot_model_inputs=machine_slots.MODEL_INPUTS,
+                exact_execution_gpus=True,
             )
 
         return self._call(request.claim, context, get)

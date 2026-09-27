@@ -662,7 +662,7 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -670,6 +670,7 @@ class MachineExecutionWorkspace(_message.Message):
     ACCELERATOR_BACKEND_FIELD_NUMBER: _ClassVar[int]
     EXECUTOR_UID_ISOLATION_FIELD_NUMBER: _ClassVar[int]
     CPU_SLOT_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
+    EXACT_EXECUTION_GPUS_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -677,7 +678,8 @@ class MachineExecutionWorkspace(_message.Message):
     accelerator_backend: str
     executor_uid_isolation: bool
     cpu_slot_model_inputs: bool
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ...) -> None: ...
+    exact_execution_gpus: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ...) -> None: ...
 
 class MachineDevice(_message.Message):
     __slots__ = ("ordinal", "name", "uuid", "memory_bytes", "pci_bus_id", "driver_version")
@@ -2216,16 +2218,18 @@ class LocalPackageFileRef(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ...) -> None: ...
 
 class DesiredPlacementSet(_message.Message):
-    __slots__ = ("placement_set_digest", "placement_set_canonical_bytes", "device_pins", "orchestration_parent")
+    __slots__ = ("placement_set_digest", "placement_set_canonical_bytes", "device_pins", "orchestration_parent", "execution_gpus")
     PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PLACEMENT_SET_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     DEVICE_PINS_FIELD_NUMBER: _ClassVar[int]
     ORCHESTRATION_PARENT_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_GPUS_FIELD_NUMBER: _ClassVar[int]
     placement_set_digest: bytes
     placement_set_canonical_bytes: bytes
     device_pins: _containers.RepeatedCompositeFieldContainer[PlacementDevicePin]
     orchestration_parent: JobDirective
-    def __init__(self, placement_set_digest: _Optional[bytes] = ..., placement_set_canonical_bytes: _Optional[bytes] = ..., device_pins: _Optional[_Iterable[_Union[PlacementDevicePin, _Mapping]]] = ..., orchestration_parent: _Optional[_Union[JobDirective, _Mapping]] = ...) -> None: ...
+    execution_gpus: int
+    def __init__(self, placement_set_digest: _Optional[bytes] = ..., placement_set_canonical_bytes: _Optional[bytes] = ..., device_pins: _Optional[_Iterable[_Union[PlacementDevicePin, _Mapping]]] = ..., orchestration_parent: _Optional[_Union[JobDirective, _Mapping]] = ..., execution_gpus: _Optional[int] = ...) -> None: ...
 
 class PlacementDevicePin(_message.Message):
     __slots__ = ("placement_id", "device_ordinals")
