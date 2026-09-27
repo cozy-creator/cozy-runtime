@@ -366,12 +366,10 @@ def _receive_objects(
             if committed or kind not in ("blob", "commit"):
                 raise WorkspaceRefusal("input tree stream changed its header or final commit")
             if kind == "commit":
-                if (
-                    frame.commit.abort
-                    or output is not None
-                    or (not complete and seen != set(objects))
-                ):
+                if frame.commit.abort or output is not None:
                     raise WorkspaceRefusal("input tree commit omitted a complete declared object")
+                if not complete and seen != set(objects):
+                    _reuse(workspace, owner, identity, set(objects) - seen, stage)
                 committed = True
                 continue
             blob = frame.blob
@@ -408,6 +406,45 @@ def _receive_objects(
     finally:
         if output is not None:
             output.close()
+
+
+def _reuse(workspace: Workspace, owner: str, identity: str, wanted: set[str], stage: Path) -> None:
+    """Stage objects the commit omitted from this owner's earlier inputs holding them.
+
+    Only the same owner's own intakes are searched, so a commit never learns whether another
+    owner holds some bytes. An object no earlier input still holds is refused typed, and the
+    sender sends its bytes."""
+    store = fill.store(workspace.store_root)
+    for digest in sorted(wanted):
+        with workspace.locked() as db:
+            rows = db.execute(
+                "SELECT manifest,manifest_body FROM input_tree_intakes WHERE owner=? AND id<>? "
+                "AND instr(manifest_body,?)>0 ORDER BY rowid DESC LIMIT 8",
+                (owner, identity, digest.encode()),
+            ).fetchall()
+        staged = stage / digest
+        for row in rows:
+            member = next(
+                (
+                    entry
+                    for entry in canonical_json.decode(row["manifest_body"])["entries"]
+                    if entry["blob"]["sha256"] == digest
+                ),
+                None,
+            )
+            if member is None:
+                continue
+            try:
+                store.materialize(bytes(row["manifest"]).hex(), member["path"], staged)
+            except Exception:  # an earlier input released and collected: try another
+                staged.unlink(missing_ok=True)
+                continue
+            with staged.open("rb") as source:
+                if hashlib.file_digest(source, "sha256").hexdigest() == digest:
+                    break
+            staged.unlink()
+        else:
+            raise WorkspaceRefusal(f"input_objects_absent: {len(wanted)} object(s) must be sent")
 
 
 def verify_adoption(db: Journal, owner: str, offer: pb.AttemptOffer) -> None:

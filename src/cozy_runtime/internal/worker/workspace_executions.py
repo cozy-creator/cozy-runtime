@@ -190,6 +190,22 @@ class Executions:
         with self.workspace.locked() as db:
             self.require_workspace_in(db, expected)
 
+    def accepted(
+        self, owner: str, submission_id: str, request: str, expected: str
+    ) -> Receipt | None:
+        """The receipt of an execution this submission already created, or None."""
+        with self.workspace.locked() as db:
+            workspace_id = self.require_workspace_in(db, expected)
+            row = db.execute(
+                "SELECT * FROM executions WHERE owner=? AND (submission=? OR request=?)",
+                (owner, submission_id, request),
+            ).fetchone()
+            if row is None:
+                return None
+            if (row["submission"], row["request"]) != (submission_id, request):
+                raise WorkspaceRefusal("execution submission identity changed")
+            return self._receipt(row, workspace_id)
+
     def submission_absent(self, owner: str, request: str, expected: str) -> bool:
         """Only the pinned journal can establish that this submission was not accepted."""
         with self.workspace.locked() as db:
@@ -854,6 +870,22 @@ class Executions:
         raw = canonical_json.encode(document)
         with self.workspace.locked() as db, transaction(db):
             self._event(db, self._row(db, owner, request), kind, raw)
+
+    def wait_events(
+        self, owner: str, request: str, after: int, limit: int, gone: Callable[[], bool]
+    ) -> EventPage:
+        """The next page after `after`, waiting for one while the caller is here. A terminal
+        execution answers at once: its observer reads what it has and collects."""
+        changes = self.workspace.changes()
+        while True:
+            with changes.condition:
+                version = changes.version
+            page = self.events(owner, request, after, limit)
+            if page.events or gone() or self.status(owner, request).state in TERMINAL:
+                return page
+            with changes.condition:
+                while changes.version == version and not gone():
+                    changes.condition.wait()
 
     def events(self, owner: str, request: str, after: int = 0, limit: int = MAX_PAGE) -> EventPage:
         if not 0 <= after < 1 << 63 or not 1 <= limit <= MAX_PAGE:

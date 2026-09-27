@@ -44,6 +44,9 @@ class Calls:
 
         self.builtins = Builtins(worker)
         self.deferred = Deferred(worker)
+        from .machine_release_roots import ReleaseRoots
+
+        self.release_roots = ReleaseRoots(worker)
 
     def close(self) -> None:
         self.builtins.close()

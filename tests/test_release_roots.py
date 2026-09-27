@@ -1,0 +1,377 @@
+"""A root named by its published release: the machine installs, resolves and prepares it.
+
+Real: the Worker, SubmitMachineExecution, the release-root preparation, model resolution
+against an HTTP catalog, the serving model placement, the durable journal and a TensorFS
+store holding the model. Fakes (test_same_release_placements.Machine): the uv install, the
+describe and census derives, device memory; and the host facts naming four H100s.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import tempfile
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+import tensorfs
+
+from cozy_runtime import canonical_json
+from cozy_runtime.internal import canonical, hostfacts
+from cozy_runtime.internal.worker import machine_model_defaults
+from cozy_runtime.internal.worker.machine_child_target import Target
+from cozy_runtime.internal.worker.session import Worker
+from cozy_runtime.internal.worker.workspace_calls import Call
+from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
+from test_same_release_placements import LANE, LOCKED, OWNER, PACKAGE, RELEASE, Machine
+
+SLOT = "touch.models.model"
+
+
+class Refused(Exception):
+    def __init__(self, code: Any, detail: str, trailers: tuple[tuple[str, str], ...]) -> None:
+        super().__init__(detail)
+        self.code, self.trailers = code, dict(trailers)
+        self.absent = [value for key, value in trailers if key == "cozy-absent-release"]
+
+
+class Context:
+    def __init__(self) -> None:
+        self.trailers: tuple[tuple[str, str], ...] = ()
+
+    def abort(self, code: Any, detail: str) -> None:
+        raise Refused(code, detail, self.trailers)
+
+    def set_trailing_metadata(self, metadata: tuple[tuple[str, str], ...]) -> None:
+        self.trailers = metadata
+
+
+class Catalog:
+    """The owner's binding and one lane resolution, counted."""
+
+    def __init__(self, manifest: str, length: int, ladder: list[dict[str, Any]]) -> None:
+        self.reads: list[str] = []
+        catalog = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                catalog.reads.append(self.path)
+                url = urlsplit(self.path)
+                if url.path == "/v1/packages/cozytest/tenant/bindings":
+                    body: Any = {
+                        "bindings": [
+                            {"slot": SLOT, "model": PACKAGE, "release": RELEASE, "ladder": ladder}
+                        ]
+                    }
+                elif url.path == "/v1/models/resolve":
+                    query = parse_qs(url.query)
+                    assert query == {"ref": [f"{PACKAGE}@{RELEASE}"], "lane": [LANE]}, query
+                    body = {
+                        "model": PACKAGE,
+                        "release": RELEASE,
+                        "lane": LANE,
+                        "manifest_id": manifest,
+                        "manifest_length": length,
+                    }
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                raw = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.origin = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def published(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
+    # Short: an executor's control socket lives under it and `sun_path` holds 108 bytes.
+    with tempfile.TemporaryDirectory(prefix="cz-root.", dir="/tmp") as root:
+        machine = Machine(Path(root), monkeypatch, "published")
+        try:
+            yield machine
+        finally:
+            machine.worker.shutdown()
+
+
+CALLEE = "cozytest/callee"
+
+
+def facts(machine: Machine, package: str = PACKAGE) -> pb.DeferredInstallation:
+    return pb.DeferredInstallation(
+        key=f"{package}@{RELEASE}",
+        package=package,
+        release=RELEASE,
+        preparation=pb.PreparePackageSetRequest(
+            download_delegation=canonical.write(
+                {
+                    "format": "cozy.worker.v1.DownloadDelegation/1",
+                    "packages": [{"package": package, "release": RELEASE}],
+                    "models": [],
+                }
+            ),
+            application="tenant_workflow:app",
+            locked_requirements=LOCKED,
+            package_interface=machine.interface,
+        ),
+    )
+
+
+def submission(
+    machine: Machine, request: str, origin: str, *installs: Any
+) -> pb.MachineExecutionSubmit:
+    return pb.MachineExecutionSubmit(
+        claim=machine.claim,
+        submission_id=request,
+        offer=pb.AttemptOffer(request_id=request),
+        payload_canonical_bytes=canonical_json.encode({"seed": 3}),
+        expected_execution_workspace_id=machine.executions.workspace_id,
+        release_root=pb.ReleaseRoot(
+            package=PACKAGE,
+            release=RELEASE,
+            entrypoint="touch",
+            installations=installs,
+            catalog_origin=origin,
+            # A published callee the root may call: installed on its first selection.
+            callees=[pb.ReleaseEdge(caller=f"{PACKAGE}@{RELEASE}", callee=f"{CALLEE}@{RELEASE}")],
+        ),
+    )
+
+
+def submit(
+    machine: Machine, request: pb.MachineExecutionSubmit
+) -> tuple[pb.MachineExecutionReceipt, list[str]]:
+    """Replay the identical submission until the machine answers a receipt."""
+    progress: list[str] = []
+    while True:
+        try:
+            return machine.rpc.SubmitMachineExecution(request, Context()), progress
+        except Refused as refused:
+            if refused.trailers.get("cozy-error-code") != "release_root_preparing":
+                raise
+            progress.append(str(refused))
+
+
+def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    length = len(
+        tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+    )
+    catalog = Catalog(
+        machine.manifest,
+        length,
+        [
+            {"gpu": "B200", "lane": "fp4"},
+            {"gpu": "H100", "gpus": 2, "lane": "two"},  # the slot declares no 2-GPU group
+            {"gpu": "H100", "lane": LANE},
+            {"gpu": "*", "lane": "cpu"},
+        ],
+    )
+    installs: list[pb.PreparePackageSetRequest] = []
+    prepare = machine.worker.prepare_package_set
+
+    def counted(request: pb.PreparePackageSetRequest) -> Any:
+        installs.append(request)
+        return prepare(request)
+
+    monkeypatch.setattr(machine.worker, "prepare_package_set", counted)
+    try:
+        # A machine holding no installation names the release whose facts it needs.
+        with pytest.raises(Refused) as absent:
+            machine.rpc.SubmitMachineExecution(
+                submission(machine, "first", catalog.origin), Context()
+            )
+        assert absent.value.trailers["cozy-error-code"] == "release_root_installations_absent"
+        assert absent.value.absent == [f"{CALLEE}@{RELEASE}", f"{PACKAGE}@{RELEASE}"]
+        assert catalog.reads == []
+
+        receipt, progress = submit(
+            machine,
+            submission(machine, "first", catalog.origin, facts(machine, CALLEE), facts(machine)),
+        )
+        assert receipt.request_id == "first" and len(installs) == 1
+        assert progress and progress[0].startswith("installing ")
+        # The owner's binding chose the H100 rung the slot can form; one lane was resolved.
+        assert [urlsplit(path).path for path in catalog.reads] == [
+            "/v1/packages/cozytest/tenant/bindings",
+            "/v1/models/resolve",
+        ]
+        state = machine.executions.status(OWNER, "first")
+        assert state.state == "queued"
+        # The callee is captured deferred: installed only if the root selects it.
+        capture = machine.executions.capture(OWNER, "first")
+        assert [row["key"] for row in capture["deferred_installations"]] == [f"{CALLEE}@{RELEASE}"]
+        assert {row.get("callee_deferred_key") for row in capture["bindings"]} == {
+            None,
+            f"{CALLEE}@{RELEASE}",
+        }
+        assert capture["catalog_origin"] == catalog.origin and "model_defaults" not in capture
+        resolved = [
+            canonical_json.decode(event.body)
+            for event in machine.executions.events(OWNER, "first").events
+            if event.kind == "resolved"
+        ]
+        assert resolved == [
+            {
+                "installation_id": state_installation(machine, "first"),
+                "models": [
+                    {
+                        "gpus": 0,
+                        "lane": LANE,
+                        "manifest": {"digest": machine.manifest, "length": length},
+                        "parameter": "model",
+                        "release": RELEASE,
+                        "repository": PACKAGE,
+                    }
+                ],
+                "package": PACKAGE,
+                "release": RELEASE,
+            }
+        ]
+        preparation = machine.executions.preparation(OWNER, "first")
+        desired = pb.DesiredWorkerState.FromString(base64.b64decode(preparation["state"]))
+        assert desired.placement_set.execution_gpus == 0
+
+        # The identical warm root: no facts (the callee's are remembered), no install, one call.
+        catalog.reads.clear()
+        receipt = machine.rpc.SubmitMachineExecution(
+            submission(machine, "second", catalog.origin), Context()
+        )
+        assert receipt.request_id == "second" and len(installs) == 1
+        assert len(catalog.reads) == 2
+        replay = machine.rpc.SubmitMachineExecution(
+            submission(machine, "second", catalog.origin), Context()
+        )
+        assert replay == receipt
+        # An observer holds one read open until the next event, instead of polling.
+        head = machine.executions.events(OWNER, "second").head_sequence
+        query = pb.MachineExecutionEventsQuery(
+            execution=pb.MachineExecutionQuery(
+                claim=machine.claim,
+                request_id="second",
+                expected_execution_workspace_id=machine.executions.workspace_id,
+            ),
+            after=head,
+            wait=True,
+        )
+        answered: list[pb.MachineExecutionEventPage] = []
+        reader = threading.Thread(
+            target=lambda: answered.append(machine.rpc.ListMachineExecutionEvents(query, Context()))
+        )
+        reader.start()
+        reader.join(0.5)
+        assert reader.is_alive() and not answered
+        machine.executions.record(OWNER, "second", "observed", {"note": 1})
+        reader.join(30)
+        assert [event.kind for event in answered[0].events] == ["observed"]
+        machine.tick()
+        events = [
+            (event.kind, canonical_json.decode(event.body))
+            for event in machine.executions.events(OWNER, "first").events
+        ]
+        if machine.executions.status(OWNER, "first").state == "failed":
+            body = documents.read(
+                machine.executions.collect(OWNER, "first").outcome_canonical_bytes,
+                pb.AttemptOutcomeBody,
+            )
+            raise AssertionError(body.get("safe_message"), body.get("cause"))
+        assert machine.executions.status(OWNER, "first").state in ("queued", "running"), events
+    finally:
+        catalog.close()
+
+
+def state_installation(machine: Machine, request: str) -> str:
+    offer = machine.executions.offer(OWNER, request)
+    spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+    return str(spec["installation_id"])
+
+
+def test_an_open_child_slot_is_resolved_by_the_machine_at_the_capture_origin() -> None:
+    manifest = "sha256:" + "22" * 32
+    catalog = Catalog(manifest, 321, [{"gpu": "*", "lane": LANE}])
+    try:
+        worker = cast(
+            Worker,
+            SimpleNamespace(
+                options=SimpleNamespace(accelerator_backend="none"),
+                executions=SimpleNamespace(
+                    capture_root=lambda *_: "root",
+                    capture=lambda *_: {"catalog_origin": catalog.origin, "model_defaults": []},
+                ),
+            ),
+        )
+        call = cast(Call, SimpleNamespace(parent_request="root"))
+
+        def child(package: str) -> Target:
+            model = {
+                "path": SLOT,
+                "default_ladder": [{"gpu": "*", "lane": f"tenant@{RELEASE}/{LANE}"}],
+            }
+            return Target(
+                "installation",
+                "touch",
+                {"models": [model]},
+                {"placement": {"package": {"package": package, "release": RELEASE}}},
+                None,
+                "",
+            )
+
+        expected = {
+            "parameter": "model",
+            "public_origin": catalog.origin,
+            "gpu": "*",
+            "gpus": 0,
+            "repository": PACKAGE,
+            "manifest": {"digest": manifest, "length": 321},
+            "release": RELEASE,
+            "lane": LANE,
+        }
+        # The owner's binding of the callee's slot.
+        assert machine_model_defaults.select(worker, "owner", call, child(PACKAGE), {}) == [
+            expected
+        ]
+        # No binding on the catalog: the callee's authored default, its org its owner's.
+        catalog.reads.clear()
+        assert machine_model_defaults.select(
+            worker, "owner", call, child("cozytest/other"), {}
+        ) == [expected]
+        assert [urlsplit(path).path for path in catalog.reads] == [
+            "/v1/packages/cozytest/other/bindings",
+            "/v1/models/resolve",
+        ]
+        # A supplied Model is never resolved.
+        catalog.reads.clear()
+        assert (
+            machine_model_defaults.select(worker, "owner", call, child(PACKAGE), {"model": {}})
+            == []
+        )
+        assert catalog.reads == []
+    finally:
+        catalog.close()

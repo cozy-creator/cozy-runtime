@@ -14,6 +14,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -63,6 +64,23 @@ def artifact_identity(value: Any) -> tuple[Any, ...] | None:
 
 
 _authority: ContextVar[Callable[[], None]] = ContextVar("workspace_authority", default=lambda: None)
+
+
+class Changes:
+    """Counts committed journal writes, so a reader can wait for the next one."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.version = 0
+
+    def bump(self) -> None:
+        with self.condition:
+            self.version += 1
+            self.condition.notify_all()
+
+
+_changes: dict[Path, Changes] = {}
+_changes_lock = threading.Lock()
 Row = sqlite3.Row
 
 
@@ -183,6 +201,7 @@ class Workspace:
     def locked(self, *, allow_frozen: bool = False, blocking: bool = True) -> Iterator[Journal]:
         lock = os.open(self.directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         db: Journal | None = None
+        baseline = 0
         try:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
@@ -263,11 +282,20 @@ class Workspace:
                 != "active"
             ):
                 raise WorkspaceInactive("workspace authority transfer is not active")
+            baseline = db.total_changes
             yield db
         finally:
+            changed = db is not None and db.total_changes != baseline
             if db is not None:
                 db.close()
             os.close(lock)
+            if changed:
+                self.changes().bump()
+
+    def changes(self) -> Changes:
+        """This journal's change counter, shared by every Workspace opened on it."""
+        with _changes_lock:
+            return _changes.setdefault(self.directory.resolve(), Changes())
 
     @contextmanager
     def authorized(self, guard: Callable[[], None]) -> Iterator[None]:
