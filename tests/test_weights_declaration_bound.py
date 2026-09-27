@@ -7,6 +7,7 @@ the native writer open.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import struct
 from pathlib import Path
@@ -77,8 +78,11 @@ def test_a_large_declaration_is_journaled_and_opens_its_writer(
         if shape == "additions":
             writer.add_part("unet", keys[0], "value", struct.pack("<4e", 0, 1, 2, 3))
         (intent,) = [f.weights_intent for f in owner.frames if f.HasField("weights_intent")]
-        declaration = intent.tensorfs_declaration_canonical_bytes
-        assert len(declaration) > above
         assert owner.owner.workspace is not None
         row = owner.owner.workspace.weights_row("package-proof", intent.weights_transaction_id)
-        assert row["declaration"] == declaration
+        declaration = row["declaration"]
+        assert len(declaration) > above
+        # Over the Host's inline bound the frame names the journaled declaration by reference.
+        assert not intent.tensorfs_declaration_canonical_bytes
+        assert intent.tensorfs_declaration_length == len(declaration)
+        assert intent.tensorfs_declaration_digest == hashlib.sha256(declaration).digest()

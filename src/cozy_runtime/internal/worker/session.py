@@ -3825,6 +3825,20 @@ class Worker:
             f"{pb.WeightsHostStage.Name(refused.stage)} "
             f"({pb.WeightsHostRefusal.Name(refused.refusal)}): {refused.safe_detail}"
         )
+        size = len(row["declaration"])
+        if (
+            refused.stage == pb.WEIGHTS_HOST_STAGE_INTENT
+            and refused.refusal == pb.WEIGHTS_HOST_REFUSAL_INTENT_CONFLICT
+            and size > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
+        ):
+            # A Host that predates by-reference intents refuses every declaration over its
+            # inline bound; only a newer worker image carries one that accepts it.
+            detail = safe(
+                f"output {refused.output_slot!r}: its weights declaration is {size} bytes, over "
+                f"this pod Host's {weights_limits.MAX_WEIGHTS_DECLARATION_BYTES}-byte inline "
+                "limit; the machine needs a worker image whose Host takes declarations by "
+                "reference"
+            )
         attempt = self.engine.history.get((refused.request_id, refused.attempt_ordinal))
         if attempt is not None and attempt.state not in ("outcome", "closed"):
             attempt.weights_refused = detail

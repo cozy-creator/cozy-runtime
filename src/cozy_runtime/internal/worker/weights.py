@@ -348,11 +348,16 @@ class WeightsExchange:
             weights_transaction_id=transaction_id,
             tensorfs_declaration_digest=declaration_digest,
             tensorfs_declaration_canonical_bytes=declaration,
+            tensorfs_declaration_length=len(declaration),
         )
         try:
             row = self.workspace.begin_weights(self.owner_scope(), intent)
             epoch = int(row["epoch"])
             intent.requested_writer_epoch = epoch
+            if len(declaration) > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES:
+                # Over the Host's inline bound the declaration rides by reference: its
+                # digest and length; the workspace journal above holds the bytes.
+                intent.ClearField("tensorfs_declaration_canonical_bytes")
             # One FIFO carries the projection and its eventual outcome. The
             # native writer is authorized by Workspace, never by a Host ACK.
             self.send(pb.WorkerFrame(weights_intent=intent))
