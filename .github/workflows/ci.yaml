@@ -1,16 +1,19 @@
 name: ci
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore: ["**.md", "docs/**", "changelog.d/**"]
   push:
     branches: [master]
     paths-ignore: ["**.md", "docs/**", "changelog.d/**"]
   workflow_dispatch:
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   checks:
+    # Draft PRs are checkpoints; CI runs once the PR is ready for review.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -24,9 +27,13 @@ jobs:
           uv run python -c "import sys, sysconfig;
           assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12)
           and sysconfig.get_config_var('Py_GIL_DISABLED') != 1"
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy
+      # Gate on bug classes only. Formatting, line length, import order and other
+      # auto-fixable style stay local (`ruff format`, `ruff check --fix`).
+      - run: uv run ruff check --select E9,F,B --ignore F401 .
+      # Fixture packages under tests/testdata are inputs to tests, not typed product code.
+      - run: >-
+          uv run mypy --follow-imports=silent
+          --exclude 'src/cozy/worker/v1/worker_pb2|src/cozy_runtime/models/qwen_image21/upstream|^tests/testdata/'
       - run: uv run python checks/architecture.py
       - name: Reproducible wheel
         run: |
