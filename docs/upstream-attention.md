@@ -9,6 +9,8 @@ matched output comparisons qualify their precision on the selected environment.
 |---|---|---|---|
 | `kitchen_int8_attention` | INT8 Q/K/V/P; FP32 accumulation | BF16/FP16, D1–256 | SM90, SM100, SM103 |
 | `flashinfer_mixed_attention` | BF16 Q/K, E4M3 V/P, BF16 output | BF16, D128 | SM100, SM103 |
+| `sageattention` | INT8 Q/K per thread, smoothed K; E4M3 P/V, FP32+FP32 accumulation | BF16/FP16, D≤128 | SM90 |
+| `sageattention-fp16pv` | INT8 Q/K per thread, smoothed K; FP16 P/V, FP32 accumulation | BF16/FP16, D≤128 | SM90 (image builds upstream's SM80 kernel sm_90a; not upstream-qualified there) |
 
 Kitchen supports more architectures upstream; this initial adapter deliberately
 admits only the Hopper/datacenter Blackwell scope under investigation. Neither
