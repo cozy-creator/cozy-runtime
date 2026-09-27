@@ -57,6 +57,14 @@ def landed_bytes(store: Any, root: Path, owner: str, members: Sequence[Sequence[
     return present
 
 
+def reports_progress(function: Any) -> bool:
+    """Whether a binding declares the download progress callback (TensorFS > 0.3.57)."""
+    try:
+        return "progress" in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def materialize(store: Any, command: dict[str, Any]) -> dict[str, Any]:
     selected = command["selection"]
     members = [tuple(member) for member in selected["members"]]
@@ -67,9 +75,11 @@ def materialize(store: Any, command: dict[str, Any]) -> dict[str, Any]:
         "credential": command.get("credential", ""),
         "allow_local": command.get("allow_local", False),
     }
-    if "progress" in inspect.signature(store.materialize_source).parameters:
+    produced: dict[str, Any]
+    if reports_progress(store.materialize_source):
         options["progress"] = lambda present, whole: report("download", present, whole)
-        return store.materialize_source(command["native_owner"], members, **options)
+        produced = store.materialize_source(command["native_owner"], members, **options)
+        return produced
     stopped = threading.Event()
 
     def sample() -> None:
@@ -84,10 +94,11 @@ def materialize(store: Any, command: dict[str, Any]) -> dict[str, Any]:
     sampler = threading.Thread(target=sample, daemon=True, name="source-progress")
     sampler.start()
     try:
-        return store.materialize_source(command["native_owner"], members, **options)
+        produced = store.materialize_source(command["native_owner"], members, **options)
     finally:
         stopped.set()
         sampler.join()
+    return produced
 
 
 class ConversionRefusal(ValueError):
@@ -205,9 +216,9 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
             if command.get("registry")
             else None
         )
-        source = store.tree_root(command["source_owner"])
-        total = sum(int(row["length"]) for row in store.walk(source["manifest_digest"]))
-        converted = 0
+        retained = store.tree_root(command["source_owner"])
+        total = sum(int(row["length"]) for row in store.walk(retained["manifest_digest"]))
+        written = 0
         report("convert", 0, total)
         while True:
             prepared = store.prepare_source_artifact(
@@ -219,13 +230,13 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
                 registry=registry,
             )
             adopt = None
-            converted += int(prepared["converted_bytes"])
+            written += int(prepared["converted_bytes"])
             if prepared["complete"]:
                 report("convert", total, total)
                 break
             # Checkpoint heads carry resumed work; this process's passes carry the rest.
             durable = sum(int(row["bytes"]) for row in prepared["checkpoints"])
-            report("convert", min(max(durable, converted), total), total)
+            report("convert", min(max(durable, written), total), total)
             checkpoints = [
                 (row["slot"], row["head"], row["head_length"]) for row in prepared["checkpoints"]
             ]
