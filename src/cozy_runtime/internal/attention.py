@@ -1315,6 +1315,27 @@ def _is_selected(defaults: Snapshot, roots: Mapping[str, Any], pin: str) -> bool
     )
 
 
+def admit(pin: str, degree: int) -> None:
+    """Refuse a pin no construction here could serve before anything is constructed."""
+    _, name = _pin_parts(pin)
+    if not name:
+        return
+    candidate = BY_NAME.get(name)
+    if candidate is None:
+        raise AttentionRefusal(
+            "attention_kernel_unknown",
+            f"unknown attention kernel {name!r}; this runtime knows {sorted(BY_NAME)}",
+        )
+    if degree > 1:
+        _registry()
+        if not _context_parallel(_member(candidate.backend)):
+            raise AttentionRefusal(
+                "attention_kernel_unsupported",
+                f"{name} does not support context parallelism, which this sequence-parallel "
+                f"degree {degree} construction requires",
+            )
+
+
 def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Candidate:
     scope, backend = _pin_parts(name)
     candidate = BY_NAME.get(backend)

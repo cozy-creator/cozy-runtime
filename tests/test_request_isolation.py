@@ -1,0 +1,128 @@
+"""A request's refusal, cancel or bad pin stays with it; healthy generations keep serving."""
+
+from __future__ import annotations
+
+import socket
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from cozy_runtime.internal import attention, package_interface
+from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.executor import _SEALED, Executor
+from cozy_runtime.internal.seam import Channel
+
+MODULE = "request_isolation_fixture"
+SOURCE = """
+import msgspec
+from cozy_runtime.author import App, Context, InvalidRequest
+
+app = App()
+
+
+class Request(msgspec.Struct):
+    mode: str = "ok"
+
+
+class Result(msgspec.Struct):
+    value: int
+
+
+@app.entrypoint
+def generate(ctx: Context, payload: Request) -> Result:
+    if payload.mode == "refuse":
+        raise InvalidRequest("the handler refused this request", code="mode_refused")
+    if payload.mode == "cancel":
+        ctx.raise_if_cancelled()
+    if payload.mode == "fail":
+        raise RuntimeError("handler state is now unknown")
+    return Result(7)
+"""
+
+
+@pytest.fixture
+def host(tmp_path: Path) -> Iterator[tuple[Executor, dict[str, Any]]]:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / f"{MODULE}.py").write_text(SOURCE)
+    (project / "package.toml").write_text(f'[application]\nobject = "{MODULE}:app"\n')
+    interface = tmp_path / "package-interface.json"
+    interface.write_bytes(
+        package_interface.canonical_bytes(package_interface.build(discover(project)))
+    )
+    binding = {
+        "application": f"{MODULE}:app",
+        "package_interface": str(interface),
+        "development_project": str(project),
+    }
+    devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
+    left, right = socket.socketpair()
+    with left, right:
+        executor = Executor(Channel(left), tmp_path / "root")
+        (tmp_path / "root").mkdir()
+        started = executor.start({**binding, "devices": devices})
+        assert started["ok"], started
+        yield executor, {"devices": devices, "binding": binding, "budgets": {}}
+    sys.modules.pop(MODULE, None)
+
+
+def _serve(executor: Executor, request_id: str, mode: str) -> dict[str, Any]:
+    prepared = executor.serve_request(
+        {"request_id": request_id, "entrypoint": "generate", "payload": {"mode": mode}}
+    )
+    assert prepared["ok"], prepared
+    spool = executor.root / request_id
+    spool.mkdir()
+    if mode == "cancel":
+        (executor.root / "executor.cancel").write_text(request_id)
+    return executor.serve_invoke(
+        {"request_id": request_id, "entrypoint": "generate", "spool": str(spool), "deadline_s": 30}
+    )
+
+
+def test_handler_refusals_and_cancels_keep_the_generation_ready(
+    host: tuple[Executor, dict[str, Any]],
+) -> None:
+    executor, load = host
+    assert executor.load({**load, "construction": "a"})["ok"]
+    assert executor.activate({"construction": "a"})["ok"]
+
+    refused = _serve(executor, "refused", "refuse")
+    assert (refused["outcome"]["terminal"], refused["outcome"]["code"]) == (
+        "refused",
+        "mode_refused",
+    )
+    canceled = _serve(executor, "canceled", "cancel")
+    assert canceled["outcome"]["terminal"] == "canceled"
+    assert not executor.poisoned and not refused["poisoned"] and not canceled["poisoned"]
+    assert _serve(executor, "served", "ok")["outcome"]["terminal"] == "succeeded"
+
+    failed = _serve(executor, "failed", "fail")
+    assert failed["outcome"]["terminal"] == "failed" and failed["poisoned"]
+
+
+def test_a_refused_load_leaves_loaded_constructions_serving(
+    host: tuple[Executor, dict[str, Any]],
+) -> None:
+    executor, load = host
+    assert executor.load({**load, "construction": "a"})["ok"]
+    refused = executor.load({**load, "construction": "b", "attention_pin": "sdpa"})
+    assert refused["code"] == "attention_kernel_unsupported", refused
+    assert not executor.poisoned and "b" not in executor.constructions
+    assert executor.activate({"construction": "a"})["ok"]
+    assert _serve(executor, "after", "ok")["outcome"]["terminal"] == "succeeded"
+
+
+def test_a_pin_no_parallel_group_can_run_refuses_before_construction() -> None:
+    pytest.importorskip("diffusers.models.attention_dispatch")
+    with pytest.raises(attention.AttentionRefusal, match="context parallelism") as refused:
+        attention.admit("model/dit=sageattention", 4)
+    assert refused.value.code == "attention_kernel_unsupported"
+    with pytest.raises(attention.AttentionRefusal) as unknown:
+        attention.admit("dit=not-a-kernel", 1)
+    assert unknown.value.code == "attention_kernel_unknown"
+    attention.admit("dit=flash-attn3", 4)
+    attention.admit("dit=sageattention", 1)

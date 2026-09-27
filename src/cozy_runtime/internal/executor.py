@@ -1090,8 +1090,9 @@ class Executor:
         The worker names the key (its construction key) and assigns the process-wide
         ceiling: `authorized_device_limit_bytes` bounds everything this process holds, so a
         construction fits under it less what the others already hold, after parking the
-        least recently used of them if that is what makes room. Poison semantics are the
-        prepare's: a refused or raised load poisons the process.
+        least recently used of them if that is what makes room. A load refused before it
+        touched the process leaves the other constructions serving; one that allocated,
+        commanded followers or raised poisons the process.
         """
         if self.rank > 0:
             return self._follower_load(command)
@@ -1117,9 +1118,9 @@ class Executor:
             self._close_after({})
             raise
         if not reply.get("ok"):
-            self.poisoned = (
-                self.poisoned or child.poisoned or f"load refused: {reply.get('code', 'unknown')}"
-            )
+            if not child.poisoned:
+                return reply  # refused before touching the process: other constructions serve
+            self.poisoned = self.poisoned or child.poisoned
             return self._close_after(reply)
         self._register(key, child, reply)
         return self._load_reply(key, child, reused=False)
@@ -1486,7 +1487,6 @@ class Executor:
                 # nothing and therefore holds no attention site, so there is nowhere to put
                 # the kernel that was named — and a run that reported success while serving
                 # no pin at all is the same lie as one that quietly served another kernel.
-                self.poisoned = "attention pin on a weightless binding"
                 return {
                     "ok": False,
                     "code": "attention_kernel_unsupported",
@@ -1495,7 +1495,7 @@ class Executor:
                 }
             return self._prepare_weightless(binding, started)
         try:
-            _local_attention_pin(pin, _model_parameter_names(binding))
+            attention.admit(_local_attention_pin(pin, _model_parameter_names(binding)), self.world)
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)}
         if "authorized_device_limit_bytes" not in command:
@@ -1513,6 +1513,7 @@ class Executor:
 
         changed = _env_changes()
         if changed:
+            self.poisoned = "env seal broken before Torch import"
             return {
                 "ok": False,
                 "code": "env_seal_broken",
@@ -1529,6 +1530,7 @@ class Executor:
         # establish the selected device before loading those modules.
         refused = self._initialize_device(torch)
         if refused is not None:
+            self.poisoned = f"prepare refused: {refused['code']}"
             return refused
         cuda_ms = (time.perf_counter() - started) * 1000
         stage("cuda_init")
@@ -1568,6 +1570,7 @@ class Executor:
         stage("runtime_imports")
         changed = _env_changes()
         if changed:
+            self.poisoned = "env seal broken before CUDA init"
             return {
                 "ok": False,
                 "code": "env_seal_broken",
@@ -2199,6 +2202,8 @@ class Executor:
         if "sol-attn" in applied.totals():
             frozen = attention._baked_in({**backend.components, **backend.parked})
             if frozen:
+                backend.poison(())
+                self.poisoned = "attention refused: attention_kernel_frozen"
                 return {
                     "ok": False,
                     "code": "attention_kernel_frozen",
@@ -2346,6 +2351,7 @@ class Executor:
         aggregate_pin = str(command.get("attention_pin", ""))
         try:
             scope, _ = attention._pin_parts(aggregate_pin)
+            attention.admit(aggregate_pin, self.world)
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)}
         declared_parameters = tuple(
@@ -2916,9 +2922,9 @@ class Executor:
         quiescent = self._quiescent() if torch is not None else True
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        # A typed refusal before handler entry leaves a Ready executor untouched. This is
-        # an observed phase bit, not a refusal-code allowlist that drifts as validation grows.
-        if outcome.terminal != "succeeded" and record.entered:
+        # Only a failure inside the handler leaves package state unknown. A request refusal
+        # or a cooperative cancel/deadline stops at a safe point and keeps the generation Ready.
+        if outcome.terminal == "failed" and record.entered:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         terminal = {
             "terminal": outcome.terminal,
@@ -3378,7 +3384,7 @@ class Executor:
             peak_vram = accel.peak_allocated(self.torch, self.device_kind)
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        if outcome.terminal != "succeeded" and record.entered:
+        if outcome.terminal == "failed" and record.entered:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         return {
             "ok": True,
