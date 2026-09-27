@@ -320,6 +320,33 @@ def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], typ
     return decorate
 
 
+def placeable(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
+    """Declare components the runtime may host on another rank of this Model's group.
+
+    The author's statement: every use of each named component is a module call (its root or
+    a submodule) whose arguments and result are tensors, JSON values or model outputs, with
+    no effect beside that result. When rank 0 cannot hold every component, the runtime may
+    then keep one resident on a follower instead of re-staging it for every request.
+    """
+    if not names or any(
+        not isinstance(name, str) or not name.replace("_", "").isalnum() for name in names
+    ):
+        raise ConformanceError(
+            f"@placeable{names!r}: name one or more components by plain identifier",
+            code="placeable_components",
+        )
+
+    def decorate(cls: type[ModelT]) -> type[ModelT]:
+        if not (inspect.isclass(cls) and issubclass(cls, Model)):
+            raise ConformanceError(
+                "@placeable decorates a Model class", code="placeable_components"
+            )
+        cls.__placeable__ = tuple(dict.fromkeys(names))
+        return cls
+
+    return decorate
+
+
 def _is_async(fn: Callable[..., object]) -> bool:
     return inspect.iscoroutinefunction(inspect.unwrap(fn))
 
@@ -389,6 +416,9 @@ class Model[PipelineT]:
     __sequence_parallel__: tuple[int, ...] = ()
     """`@sequence_parallel(degrees=...)`: the degrees this class shards at. Empty is the
     honest default - a class that said nothing is never sharded."""
+
+    __placeable__: tuple[str, ...] = ()
+    """`@placeable(...)`: components the runtime may host on another rank of the group."""
 
     __encoded_leaves__: str = "refuse"
     """The class's `encoded_leaves=` declaration, defaulted to the conservative answer.

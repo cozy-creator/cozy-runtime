@@ -205,3 +205,22 @@ def test_only_an_exact_cell_measurement_under_current_room_may_keep_components()
     assert ledger.measured_scopes(CELL) == frozenset(SCOPES)
     ledger.observe_device_shortfall(CELL, 70 << 30)
     assert ledger.measured_scopes(CELL) == frozenset()
+
+
+def test_a_hosted_text_encoder_leaves_rank_0_nothing_to_move(device: Device) -> None:
+    # The follower keeps the conditioner (`mirror.hosting_plan`); rank 0 frees it once, and
+    # its fully hosted scope never clears the card even before anything is measured.
+    residency, backend = plane(device, ("text_encoder", "ref2va_dit", "video_vae", "audio_vae"))
+    residency.host("text_encoder")
+    assert "text_encoder" not in backend.components
+    residency.open_attempt("component_staged", ENVELOPE, dict(SCOPES))
+    residency.admit("condition_text", ("text_encoder",))
+    residency.release("condition_text", ("text_encoder",))
+    assert residency.attempt_evictions == 0 and backend.staged == []
+    for _ in range(3):
+        served = serve(residency, backend, measured=True)
+    assert served["resident"] == ["audio_vae", "ref2va_dit", "video_vae"]
+    assert served["staged"] == [] and served["evictions"] == 0
+    document = residency.document()
+    assert document["hosted"] == ["text_encoder"]
+    assert "text_encoder" not in document["evicted"]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import socket
 import struct
 from pathlib import Path
@@ -13,8 +14,9 @@ from typing import Any
 import torch
 from tensorfs.derived import Config as NativeConfig
 from tensorfs.derived import Derivation, Part, Target, Tensor
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
-from cozy_runtime.author import Model, uses_components
+from cozy_runtime.author import Model, placeable, uses_components
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
 from cozy_runtime.internal import attention
 from cozy_runtime.internal.encoding import DeviceFacts
@@ -227,6 +229,40 @@ def h3_model() -> H3Calls:
     return H3Calls.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4))
 
 
+#: component bytes for the hosting plan: rank 0's ceiling holds the DiT and one of the
+#: other two, a follower holds the conditioner beside its DiT shard
+HOSTED_SIZES = {"dit": 100, "text_encoder": 60, "vae": 30}
+HOSTED_BUDGET = 170
+
+
+class Conditioner(torch.nn.Module):  # type: ignore[misc]
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = torch.nn.Linear(4, 4)
+
+    def forward(self, x: Any) -> Any:
+        # The process that computed it rides along, so the caller can tell where it ran.
+        return BaseModelOutputWithPast(
+            last_hidden_state=self.proj(x), hidden_states=(torch.tensor([os.getpid()]),)
+        )
+
+
+@placeable("text_encoder")
+class HostedCalls(H3Calls):
+    vae: Any
+
+    @uses_components("text_encoder")
+    def encode(self, x: Any) -> Any:
+        with torch.no_grad():
+            return self.text_encoder(x)
+
+
+def hosted_model() -> HostedCalls:
+    base = h3_model()
+    torch.manual_seed(7)
+    return HostedCalls.for_test(dit=base.dit, text_encoder=Conditioner(), vae=torch.nn.Linear(2, 2))
+
+
 def h3_batch(*, mixed_lengths: bool = False) -> dict[str, Any]:
     # Interleaved modalities exercise packed indices across each shard. Gloo cannot
     # gather uneven tensor sizes, so both packings are 56 rows, which every declared degree
@@ -274,25 +310,33 @@ def main() -> None:
     parser.add_argument("--leader")
     parser.add_argument("--h3", action="store_true")
     parser.add_argument("--staged", action="store_true")
+    parser.add_argument("--hosted", action="store_true")
     args = parser.parse_args()
+    args.h3 = args.h3 or args.hosted
     torch.set_num_threads(1)
     _capture_seal()
     channel = Channel(socket.socket(fileno=args.rank_fd))
     executor: Any = Executor(channel, args.root, rank=args.rank, world=args.world)
     executor.device_kind = "cpu"
     model: Any = (
-        h3_model()
+        hosted_model()
+        if args.hosted
+        else h3_model()
         if args.h3
         else collective_model(args.root / f"rank-{args.rank}" if args.staged else None)
     )
     executor.residency = model._cozy_residency
     executor._group_model_key = "fixture"
     roots = (
-        {"dit": model.dit, "text_encoder": model.text_encoder}
+        {"dit": model.dit, "text_encoder": model.text_encoder, "vae": model.vae}
+        if args.hosted
+        else {"dit": model.dit, "text_encoder": model.text_encoder}
         if args.h3
         else {"block": model.block, "overlay": model.overlay, "spare": model.spare}
     )
-    executor.backend = SimpleNamespace(components=roots, parked={})
+    executor.backend = SimpleNamespace(
+        components=roots, parked={}, component_bytes=HOSTED_SIZES if args.hosted else {}
+    )
     executor.torch = torch
     executor.ready = True
     if not args.h3:
@@ -305,7 +349,7 @@ def main() -> None:
         if name == "join":
             reply = executor.join(command)
             if args.h3 and reply.get("ok"):
-                refused = executor._install_group(torch, model)
+                refused = executor._install_group(torch, model, HOSTED_BUDGET)
                 assert refused is None, refused
         elif name == "run":
             reply = executor.run(command)

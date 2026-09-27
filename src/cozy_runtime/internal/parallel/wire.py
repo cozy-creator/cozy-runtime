@@ -9,7 +9,10 @@ of a prepared component root whose owning scope is active on every rank.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import math
+import sys
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -99,6 +102,15 @@ def marshal(value: Any, spool: TensorSpool, *, path: str = "") -> Any:
                 f"{path or 'argument'} is not a prepared component in an active model scope"
             )
         return {_TAG: "component", _VAL: list(key)}
+    if isinstance(value, OrderedDict) and dataclasses.is_dataclass(value):
+        # A model output (transformers' `ModelOutput`): its class crosses by name and is
+        # rebuilt only from a module the receiving rank has already imported.
+        kind = type(value)
+        return {
+            _TAG: "output",
+            "class": f"{kind.__module__}:{kind.__qualname__}",
+            _VAL: {k: marshal(v, spool, path=f"{path}.{k}") for k, v in value.items()},
+        }
     if isinstance(value, tuple):
         return {
             _TAG: "tuple",
@@ -153,6 +165,18 @@ def unmarshal(value: Any, spool: TensorSpool, *, device: Any) -> Any:
             return spool.components[(payload[0], payload[1])]
         if tag == "tuple" and isinstance(payload, list):
             return tuple(unmarshal(v, spool, device=device) for v in payload)
+        if tag == "output" and isinstance(payload, dict):
+            module, _, qualname = str(value.get("class", "")).partition(":")
+            kind = getattr(sys.modules.get(module), qualname, None)
+            if not (
+                isinstance(kind, type)
+                and issubclass(kind, OrderedDict)
+                and dataclasses.is_dataclass(kind)
+            ):
+                raise UncrossableArgument(
+                    f"model output class {value.get('class')!r} is not loaded"
+                )
+            return kind(**{k: unmarshal(v, spool, device=device) for k, v in payload.items()})
         raise UncrossableArgument(
             f"malformed wire envelope: tag={tag!r} payload={type(payload).__name__}"
         )

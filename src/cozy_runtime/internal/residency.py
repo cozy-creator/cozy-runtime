@@ -106,6 +106,9 @@ class ComponentResidency:
     #: the reuse forecast victims are chosen by.
     attempt_used: set[str] = field(default_factory=set)
     previous_used: frozenset[str] = frozenset()
+    #: Components another rank of the group keeps resident (`mirror.host_component`): never
+    #: staged, restored or priced here.
+    hosted: frozenset[str] = frozenset()
     #: THE ACTIVE SCOPE — (method, its declared set) — or None between scopes. Serial by
     #: law 8: a component is in this set or it is evictable (its fence permitting).
     active: tuple[str, frozenset[str]] | None = None
@@ -362,9 +365,11 @@ class ComponentResidency:
         # Under a staged rung, admission first frees ROOM FOR THE WORK, not just room for
         # the weights — a 1024px VAE decode next to 6.46 GiB of resident weights runs out of
         # memory INSIDE the kernel, where nothing can decide.
-        self._make_headroom(components, method)
+        local = tuple(name for name in components if name not in self.hosted)
+        if local:
+            self._make_headroom(local, method)
         headroom = self.scope_headrooms.get(method, self.headroom)
-        for name in components:
+        for name in local:
             if name in self.backend.paging and self._size(name) > self.backend.resident_budget:
                 raise ResidencyRefusal(
                     "device_shortfall",
@@ -456,7 +461,9 @@ class ComponentResidency:
                     f"{method}({', '.join(components)}) released while the active scope is "
                     f"{held_method}({', '.join(sorted(held_set))})",
                 )
-        unknown = sorted(n for n in components if n not in self.backend.components)
+        unknown = sorted(
+            n for n in components if n not in self.backend.components and n not in self.hosted
+        )
         if unknown:
             self._fault(
                 "scope_release_unknown",
@@ -598,7 +605,7 @@ class ComponentResidency:
         objects: dict[str, int] = {}
         read_before = block_read_bytes()
         for name in wanted:
-            if name in self.backend.components:
+            if name in self.backend.components or name in self.hosted:
                 continue
             if name not in self.backend.checkpoints:
                 held[name] = "this generation has no checkpoint for it"
@@ -694,6 +701,25 @@ class ComponentResidency:
         if self.active is not None and name in self.active[1]:
             return False
         return self.fences.get(name, Fence()).passed()
+
+    def host(self, name: str) -> None:
+        """`name` is kept resident by another rank of the group: free it here for good."""
+        if name in self.backend.components:
+            self._evict(name)
+        self.hosted = self.hosted | {name}
+
+    def observe_remote(self, method: str, working_bytes: int) -> None:
+        """A hosted call's scratch on its home rank is this scope's demand there."""
+        peaks = self.attempt_activation_peaks
+        peaks[method] = max(peaks.get(method, 0), int(working_bytes))
+
+    def shed(self) -> None:
+        """Free every component outside the active scope: the retry after an OOM in a call
+        with no effect beside its result (a hosted component's)."""
+        declared = tuple(self.active[1]) if self.active is not None else ()
+        self._wait_for_pending_victims(declared)
+        for victim in self._victims(declared):
+            self._evict(victim)
 
     def _make_headroom(self, declared: tuple[str, ...], method: str) -> None:
         """Under a STAGED rung, free room for the scope's work before its weights move.
@@ -913,7 +939,8 @@ class ComponentResidency:
             # planner cannot price, and pricing a rung against a residency map that says the
             # absent weights are free is exactly how `all_resident` came to "fit" on a card
             # holding one 167 MB VAE out of a 6.46 GiB pipeline.
-            "evicted": {n: self._size(n) for n in self.backend.parked},
+            "evicted": {n: self._size(n) for n in self.backend.parked if n not in self.hosted},
+            "hosted": sorted(self.hosted),
             "active": (
                 {"method": self.active[0], "components": sorted(self.active[1])}
                 if self.active is not None

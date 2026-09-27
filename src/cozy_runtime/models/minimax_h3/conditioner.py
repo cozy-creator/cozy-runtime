@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any, cast
 
 import torch
@@ -16,20 +16,53 @@ _SOURCE_LAYERS = 64
 _RETAINED_LAYERS = 50
 
 
-@contextmanager
-def conditioning_scope(conditioner: Any) -> Iterator[None]:
-    """Release Qwen's autoregressive position cache after H3's complete forward.
+def release_position_cache(conditioner: Any) -> Any:
+    """Release Qwen's autoregressive position cache after every forward of `conditioner`.
 
-    Diffusers requests hidden states with ``use_cache=False``. Qwen3VLModel still
-    stores ``rope_deltas`` on its first image input; no later H3 call consumes it.
-    Its one int64 allocation kept 512 CUDA bytes after the second long-form shot,
-    correctly tripping Runtime's strict ledger and rebuilding the entire group.
-    Clear the unused cache on failures too, without changing any returned tensor.
+    Diffusers requests hidden states with ``use_cache=False``. Qwen3VLModel still stores
+    ``rope_deltas`` on its first image input; no later H3 call consumes it. Its one int64
+    allocation kept 512 CUDA bytes after the second long-form shot, correctly tripping
+    Runtime's strict ledger and rebuilding the entire group. A hook rather than a caller's
+    scope, so it runs wherever the conditioner runs, including a group rank that hosts it,
+    and on a failing forward too.
     """
-    try:
-        yield
-    finally:
-        conditioner.model.rope_deltas = None
+    return conditioner.model.register_forward_hook(_forget_rope_deltas, always_call=True)
+
+
+def _forget_rope_deltas(module: Any, _args: Any, _output: Any) -> None:
+    module.rope_deltas = None
+
+
+class FinalHiddenState:
+    """The conditioner as Diffusers' H3 text block calls it, computing one hidden state.
+
+    The block reads ``hidden_states[50]`` of a stack truncated to exactly 50 layers with an
+    identity final norm, and transformers ties the last captured state to
+    ``last_hidden_state``: the same tensor. Asking for all 51 kept ~1.5 GB of activations
+    alive and, for a conditioner hosted on another rank, sent them all back.
+    """
+
+    def __init__(self, conditioner: Any) -> None:
+        self._conditioner = conditioner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conditioner, name)
+
+    @property
+    def device(self) -> Any:
+        """Where the call's inputs and result live: the conditioner's device, or this
+        process's current one when another group rank hosts it and the local copy is a
+        shell without bytes."""
+        device = self._conditioner.device
+        if device.type != "meta":
+            return device
+        if torch.cuda.is_available():
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
+
+    def model(self, **kwargs: Any) -> Any:
+        outputs = self._conditioner.model(**{**kwargs, "output_hidden_states": False})
+        return SimpleNamespace(hidden_states={_RETAINED_LAYERS: outputs.last_hidden_state})
 
 
 def text_conditioner_config() -> dict[str, object]:
@@ -86,6 +119,7 @@ def build_text_conditioner(config: Mapping[str, object]) -> Any:
         parameter.data = parameter.data.to(dtype=torch.bfloat16)
     model.eval()
     _validate_census(model, language, torch)
+    release_position_cache(model)
     return model
 
 
