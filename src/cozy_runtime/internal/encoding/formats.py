@@ -626,6 +626,13 @@ class MicroScaledDequant:
         dtype = destination.dtype
         rows, cols = int(destination.shape[0]), int(destination.shape[1])
         blocks = int(scale.shape[-1])
+        if dtype == torch.float16:
+            # f16's exponent range cannot hold every block scale (2**-31 narrows to 0), so
+            # the product is formed in f32, where it is exact, and rounded once.
+            wide = data.view(destination.shape).to(torch.float32)
+            mult = self._multiplier(torch, scale, torch.float32)
+            destination.copy_(wide * mult.repeat_interleave(MX_BLOCK, dim=-1)[..., :cols])
+            return
         mult = self._multiplier(torch, scale, dtype)
         if cols == blocks * MX_BLOCK and destination.is_contiguous():
             # THE PATH EVERY WHOLE-BLOCK ARTIFACT TAKES. A 3-D view over both sides

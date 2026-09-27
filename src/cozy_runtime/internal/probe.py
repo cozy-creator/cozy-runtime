@@ -674,9 +674,7 @@ def case_dtype(case: Mapping[str, Any]) -> str | None:
     return TORCH_DTYPES.get(str((case.get("logical") or {}).get("dtype")))
 
 
-def _spec_vectors(
-    torch: Any, provider: Any, device: Any, dtype: Any, dtype_name: str
-) -> dict[str, Any]:
+def _spec_vectors(torch: Any, provider: Any, device: Any) -> dict[str, Any]:
     """Decode the REVIEWED SPEC's own producer-mined cases, BIT-FOR-BIT (#549.4).
 
     The synthetic oracles above sweep a format's whole domain against arithmetic written from
@@ -692,10 +690,15 @@ def _spec_vectors(
     multiplying in f32 by a full ulp on 132 of 512 bf16 elements). A tolerance here would
     admit exactly the drift the vectors were mined to catch.
 
-    A spec with no vendored document, or a document with no case at this output dtype, is
-    reported as SKIPPED and neither passes nor fails: it must not mint a record on the
-    strength of a check that did not run, and it must not fail a provider for a case the
-    producer never emitted.
+    Every mined case runs at the producer's own logical dtype, whatever output dtype the fill
+    asked about: the vectors prove the layout, which no output dtype changes, and the
+    synthetic oracle proves the arithmetic at the requested dtype. Filtering cases by the
+    requested dtype skipped the whole check for a float16-only fill (SDXL) because the
+    fp8-rowwise and mxfp8 documents mine f32 and bf16 cases only, `_reportable` dropped the
+    skip, and `tensorfs.fit` refused `encoding_unqualified` on every card (run 1312).
+
+    A spec with no vendored document is reported as SKIPPED and neither passes nor fails: it
+    must not mint a record on the strength of a check that did not run.
 
     A document whose cases declare NO dtype this runtime reads is neither of those things —
     it is a reader that stopped matching the bytes, and it FAILS. Skipping there is how the
@@ -723,7 +726,8 @@ def _spec_vectors(
             "the reader and the mined bytes have to agree before a case can run",
         }
     for case in mined:
-        if case_dtype(case) != dtype_name:
+        logical_dtype = case_dtype(case)
+        if logical_dtype is None:
             continue
         logical = case["logical"]
         roles = {role: vector_tensor(torch, blob, device) for role, blob in case["roles"].items()}
@@ -745,7 +749,7 @@ def _spec_vectors(
         if why:
             cases.append({"name": case.get("name"), "skipped": True, "why": why, "passed": True})
             continue
-        destination = torch.empty(*shape, dtype=dtype, device=device)
+        destination = torch.empty(*shape, dtype=getattr(torch, logical_dtype), device=device)
         provider.decode(torch, roles, destination)
         want = vector_tensor(torch, {**logical, "bits": case["expect_logical_bits"]}, device)
         got_bits = destination.reshape(-1).view(torch.uint8).cpu()
@@ -763,7 +767,7 @@ def _spec_vectors(
         return {
             "kind": "spec-vectors",
             "skipped": True,
-            "note": f"the vendored document carries no {dtype_name} case",
+            "note": "the vendored document carries no case",
             "passed": True,
         }
     vector_ref = SPEC_VECTORS.get(str(provider.encoding))
@@ -972,9 +976,7 @@ def qualify(
                         # bit-for-bit. The synthetic sweep proves the arithmetic; this proves
                         # the provider reads the layout a real producer emits at the rank and
                         # stride THIS digest pins. Both must pass to mint.
-                        evidence["spec_vectors"] = _spec_vectors(
-                            torch, provider, target, dtype, name
-                        )
+                        evidence["spec_vectors"] = _spec_vectors(torch, provider, target)
                         evidence["micro_bench"] = _micro_bench(torch, provider, target, dtype)
                         evidence["passed"] = bool(
                             evidence["numerics"]["passed"] and evidence["spec_vectors"]["passed"]
