@@ -41,6 +41,14 @@ class PublicationRefusal(Exception):
         self.code, self.status = code, status
 
 
+class PublicationUncommitted(PublicationRefusal):
+    """Hub durably answered that a sent commit did not land; nothing is left to reconcile."""
+
+
+# Statuses that promise nothing about the request; retry. Other 4xx answers are final.
+_RETRYABLE = frozenset({408, 425, 429})
+
+
 class PublicationClient(Protocol):
     def request(self, method: str, path: str, body: bytes | None = None) -> bytes: ...
 
@@ -310,21 +318,9 @@ def apply_release(
     return ReleaseReceipt(destination, release, expected + 1, desired, "acknowledged")
 
 
-def upload_checkpoint(
-    client: PublicationClient,
-    *,
-    operation: str,
-    checkpoint: CheckpointRef,
-    objects: Mapping[str, int],
-    before_write: Callable[[], None],
-    push: Callable[[str, int, str], None],
-) -> CheckpointRef:
-    """Reconcile one exact retained closure; native TensorFS performs each push.
-
-    The caller freezes the closure and holds its native lease before invoking
-    this function. ``push`` receives only an admitted member and its signed grant.
-    """
-    destination = destination_path(checkpoint.destination)
+def _checkpoint_inputs(
+    operation: str, checkpoint: CheckpointRef, objects: Mapping[str, int]
+) -> tuple[str, ObjectRef]:
     manifest = checkpoint.manifest
     _require(
         checkpoint.checkpoint == manifest.digest and objects.get(manifest.digest) == manifest.length
@@ -336,14 +332,108 @@ def upload_checkpoint(
             for key, size in objects.items()
         )
     )
+    path = destination_path(checkpoint.destination) + "/publications/" + quote(operation, safe="")
+    return path, manifest
 
-    def observe() -> CheckpointRef | None:
-        try:
-            raw = client.request("GET", destination + "/checkpoints/" + manifest.digest)
-        except PublicationRefusal as exc:
-            if exc.status != 404:
-                raise
-            return None
+
+def _checkpointed(
+    result: object, operation: str, checkpoint: CheckpointRef, objects: Mapping[str, int]
+) -> CheckpointRef:
+    manifest = checkpoint.manifest
+    _require(
+        isinstance(result, dict)
+        and result.get("publish_id") == operation
+        and result.get("checkpoint_id") == manifest.digest
+        and result.get("manifest") == {"sha256": manifest.digest[7:], "length": manifest.length}
+        and result.get("state") == "checkpointed"
+        and result.get("objects") == len(objects) - 1
+        and result.get("bytes") == sum(objects.values()) - manifest.length,
+        "publication.checkpoint_changed",
+    )
+    return CheckpointRef(
+        checkpoint.destination, manifest.digest, manifest, operation, "acknowledged"
+    )
+
+
+def _settle(
+    view: dict[str, Any],
+    path: str,
+    operation: str,
+    checkpoint: CheckpointRef,
+    objects: Mapping[str, int],
+) -> CheckpointRef:
+    """Hub's durable finalization job is the commit's only authority."""
+    _require(
+        view.get("operation") == operation and view.get("status_url") == path + "/finalization",
+        "publication.checkpoint_changed",
+    )
+    state = view.get("state")
+    if state in {"queued", "running"}:
+        raise PublicationRefusal("publication.finalization_pending", status=503)
+    if state == "failed":
+        error = view.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        raise PublicationUncommitted(
+            code
+            if isinstance(code, str) and _LABEL.fullmatch(code)
+            else "publication.finalization_failed"
+        )
+    _require(state == "completed", "publication.checkpoint_changed")
+    return _checkpointed(view.get("result"), operation, checkpoint, objects)
+
+
+def reconcile_checkpoint(
+    client: PublicationClient,
+    *,
+    operation: str,
+    checkpoint: CheckpointRef,
+    objects: Mapping[str, int],
+) -> CheckpointRef | None:
+    """Settle a sent finalize from Hub's finalization status; None if it never arrived.
+
+    Pending raises a transient refusal, a failed job raises ``PublicationUncommitted``.
+    The public checkpoint read cannot decide this: a private checkpoint answers 404.
+    """
+    path, _ = _checkpoint_inputs(operation, checkpoint, objects)
+    try:
+        view = _object(client.request("GET", path + "/finalization"))
+    except PublicationRefusal as exc:
+        if exc.status != 404:
+            raise
+        return None
+    return _settle(view, path, operation, checkpoint, objects)
+
+
+def upload_checkpoint(
+    client: PublicationClient,
+    *,
+    operation: str,
+    checkpoint: CheckpointRef,
+    objects: Mapping[str, int],
+    before_stage: Callable[[], None],
+    before_write: Callable[[], None],
+    push: Callable[[str, int, str], None],
+    landed: Callable[[int], None],
+) -> CheckpointRef:
+    """Stage one exact retained closure and commit it; native TensorFS performs each push.
+
+    The caller freezes the closure and holds its native lease before invoking
+    this function. ``push`` receives only an admitted member and its signed grant.
+    Opening, granting and pushing only stage bytes under the frozen operation, so
+    ``before_stage`` fences them without a send marker; retrying them re-grants only
+    objects the Hub does not hold. ``before_write`` records the one commit, finalize.
+    ``landed`` receives the count of closure objects the Hub is known to hold.
+    """
+    path, manifest = _checkpoint_inputs(operation, checkpoint, objects)
+    try:
+        raw = client.request(
+            "GET", destination_path(checkpoint.destination) + "/checkpoints/" + manifest.digest
+        )
+    except PublicationRefusal as exc:
+        if exc.status != 404:
+            raise
+    else:
+        # Another operation already made this exact checkpoint public.
         _require(
             len(raw) == manifest.length
             and "sha256:" + hashlib.sha256(raw).hexdigest() == manifest.digest
@@ -351,12 +441,7 @@ def upload_checkpoint(
         return CheckpointRef(
             checkpoint.destination, manifest.digest, manifest, operation, "observed_convergence"
         )
-
-    observed_checkpoint = observe()
-    if observed_checkpoint is not None:
-        return observed_checkpoint
-    path = destination + "/publications/" + quote(operation, safe="")
-    before_write()
+    before_stage()
     try:
         opened = _object(
             client.request(
@@ -373,31 +458,13 @@ def upload_checkpoint(
             )
         )
     except PublicationRefusal as exc:
+        # A finalize this operation sent may have closed the publication.
         if exc.status == 409:
-            # Async finalization can commit between the initial read and the
-            # open/claim transaction. Only exact public readback proves success.
-            observed_checkpoint = observe()
-            if observed_checkpoint is not None:
-                return observed_checkpoint
-            try:
-                finalization = _object(client.request("GET", path + "/finalization"))
-            except PublicationRefusal as status_error:
-                if status_error.status != 404:
-                    raise
-            else:
-                _require(
-                    finalization.get("operation") == operation
-                    and finalization.get("status_url") == path + "/finalization",
-                    "publication.checkpoint_changed",
-                )
-                if finalization.get("state") in {"queued", "running"}:
-                    raise PublicationRefusal(
-                        "publication.finalization_pending", status=503
-                    ) from exc
-                if finalization.get("state") == "completed":
-                    observed_checkpoint = observe()
-                    if observed_checkpoint is not None:
-                        return observed_checkpoint
+            settled = reconcile_checkpoint(
+                client, operation=operation, checkpoint=checkpoint, objects=objects
+            )
+            if settled is not None:
+                return settled
         raise
     publication = opened.get("publication")
     if not isinstance(publication, dict):
@@ -419,12 +486,23 @@ def upload_checkpoint(
         if state not in {"accepted", "verifying"}:
             pending.append(key)
     pending.sort()
+    held_count = len(objects) - len(pending)
+    count_lock = threading.Lock()
+    landed(held_count)
+
+    def pushed(key: str, length: int, grant: str) -> None:
+        nonlocal held_count
+        push(key, length, grant)
+        with count_lock:
+            held_count += 1
+            landed(held_count)
+
     # Every native push finishes before this scope exits, including after a failed
     # sibling, so the caller's retained native lease outlives all in-flight bytes.
     with ThreadPoolExecutor(max_workers=_PUBLICATION_UPLOADS) as pool:
         for offset in range(0, len(pending), _PUBLICATION_UPLOADS):
             selected = pending[offset : offset + _PUBLICATION_UPLOADS]
-            before_write()
+            before_stage()
             granted = _object(
                 client.request(
                     "POST", path + "/grants", canonical_json.encode({"object_ids": selected})
@@ -447,6 +525,10 @@ def upload_checkpoint(
             _require(seen == set(selected))
             for item in held:
                 _require(item.get("state") in {"accepted", "verifying"})
+            if held:
+                with count_lock:
+                    held_count += len(held)
+                    landed(held_count)
             for item in grants:
                 key = item["object_id"]
                 required = {
@@ -476,47 +558,34 @@ def upload_checkpoint(
             # push leaves the same frozen operation for ordinary remote readback.
             futures = []
             for upload in uploads:
-                before_write()
-                futures.append(pool.submit(push, *upload))
+                before_stage()
+                futures.append(pool.submit(pushed, *upload))
             for future in futures:
                 future.result()
     before_write()
-    result = _object(
-        client.request(
-            "POST",
-            path + "/finalize",
-            canonical_json.encode(
-                {"manifest_id": manifest.digest, "manifest_length": manifest.length}
-            ),
+    try:
+        answer = _object(
+            client.request(
+                "POST",
+                path + "/finalize",
+                canonical_json.encode(
+                    {"manifest_id": manifest.digest, "manifest_length": manifest.length}
+                ),
+            )
         )
-    )
-    if "operation" in result:
-        _require(
-            result.get("operation") == operation
-            and result.get("status_url") == path + "/finalization"
-            and result.get("state") in {"queued", "running", "completed"},
-            "publication.checkpoint_changed",
+    except PublicationRefusal as exc:
+        if exc.status in _RETRYABLE or exc.status >= 500:
+            raise
+        # Hub refused this commit request. Only an earlier durable job can still land.
+        settled = reconcile_checkpoint(
+            client, operation=operation, checkpoint=checkpoint, objects=objects
         )
-        if result["state"] != "completed":
-            # Hub owns a durable finalization job. Yield to the existing effect
-            # reconciler; its next exact checkpoint read proves completion.
-            raise PublicationRefusal("publication.finalization_pending", status=503)
-        completed = result.get("result")
-        if not isinstance(completed, dict):
-            raise PublicationRefusal("publication.checkpoint_changed")
-        result = completed
-    _require(
-        result.get("publish_id") == operation
-        and result.get("checkpoint_id") == manifest.digest
-        and result.get("manifest") == {"sha256": manifest.digest[7:], "length": manifest.length}
-        and result.get("state") == "checkpointed"
-        and result.get("objects") == len(objects) - 1
-        and result.get("bytes") == sum(objects.values()) - manifest.length,
-        "publication.checkpoint_changed",
-    )
-    return CheckpointRef(
-        checkpoint.destination, manifest.digest, manifest, operation, "acknowledged"
-    )
+        if settled is None:
+            raise PublicationUncommitted(exc.code, status=exc.status) from exc
+        return settled
+    if "operation" in answer:
+        return _settle(answer, path, operation, checkpoint, objects)
+    return _checkpointed(answer, operation, checkpoint, objects)
 
 
 def attach_assessment(
