@@ -213,7 +213,7 @@ class Workspace:
                     + _MIGRATION_3
                     + "PRAGMA user_version=3; COMMIT;"
                 )
-            elif version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+            elif version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if version <= 3:
                 from .workspace_sources import SCHEMA4
@@ -251,6 +251,12 @@ class Workspace:
                 from .workspace_partial import SCHEMA12
 
                 db.executescript("BEGIN IMMEDIATE;" + SCHEMA12 + "PRAGMA user_version=12; COMMIT;")
+            if version <= 12:
+                # Providers an execution was given a credential for; never a credential value.
+                db.executescript(
+                    "BEGIN IMMEDIATE;ALTER TABLE executions ADD COLUMN source_providers TEXT "
+                    "NOT NULL DEFAULT '';PRAGMA user_version=13; COMMIT;"
+                )
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]

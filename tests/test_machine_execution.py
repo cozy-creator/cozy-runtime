@@ -543,7 +543,7 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
         "owner", "new", b"c" * 32, offer("new"), expected_execution_workspace_id=e.workspace_id
     )
     with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 13
         assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
 
 

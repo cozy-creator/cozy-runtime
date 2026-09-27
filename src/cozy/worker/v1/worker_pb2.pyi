@@ -664,7 +664,7 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus", "owner_publication_reconciliation")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus", "owner_publication_reconciliation", "source_credentials")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -674,6 +674,7 @@ class MachineExecutionWorkspace(_message.Message):
     CPU_SLOT_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
     EXACT_EXECUTION_GPUS_FIELD_NUMBER: _ClassVar[int]
     OWNER_PUBLICATION_RECONCILIATION_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -683,7 +684,8 @@ class MachineExecutionWorkspace(_message.Message):
     cpu_slot_model_inputs: bool
     exact_execution_gpus: bool
     owner_publication_reconciliation: bool
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ..., owner_publication_reconciliation: bool = ...) -> None: ...
+    source_credentials: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ..., owner_publication_reconciliation: bool = ..., source_credentials: bool = ...) -> None: ...
 
 class MachineDevice(_message.Message):
     __slots__ = ("ordinal", "name", "uuid", "memory_bytes", "pci_bus_id", "driver_version")
@@ -702,7 +704,7 @@ class MachineDevice(_message.Message):
     def __init__(self, ordinal: _Optional[int] = ..., name: _Optional[str] = ..., uuid: _Optional[str] = ..., memory_bytes: _Optional[int] = ..., pci_bus_id: _Optional[str] = ..., driver_version: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionSubmit(_message.Message):
-    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id")
+    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id", "source_credentials")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -714,6 +716,7 @@ class MachineExecutionSubmit(_message.Message):
     PAYLOAD_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     PUBLICATION_AUTHORIZATION_ID_FIELD_NUMBER: _ClassVar[int]
     EXPECTED_EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     submission_id: str
     capture_digest: bytes
@@ -725,7 +728,16 @@ class MachineExecutionSubmit(_message.Message):
     payload_canonical_bytes: bytes
     publication_authorization_id: str
     expected_execution_workspace_id: str
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ...) -> None: ...
+    source_credentials: _containers.RepeatedCompositeFieldContainer[SourceCredential]
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ...) -> None: ...
+
+class SourceCredential(_message.Message):
+    __slots__ = ("provider", "credential")
+    PROVIDER_FIELD_NUMBER: _ClassVar[int]
+    CREDENTIAL_FIELD_NUMBER: _ClassVar[int]
+    provider: NativeSourceOperation
+    credential: str
+    def __init__(self, provider: _Optional[_Union[NativeSourceOperation, str]] = ..., credential: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionReceipt(_message.Message):
     __slots__ = ("request_id", "submission_id", "capture_digest", "invocation_spec_digest", "accepted_at_ms", "worker_id", "worker_boot_id", "execution_workspace_id", "publication_authorization_id")
@@ -760,7 +772,7 @@ class MachineExecutionQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionState(_message.Message):
-    __slots__ = ("request_id", "attempt_ordinal", "generation", "state", "collected", "sequence", "worker_id", "worker_boot_id", "execution_workspace_id", "gpu")
+    __slots__ = ("request_id", "attempt_ordinal", "generation", "state", "collected", "sequence", "worker_id", "worker_boot_id", "execution_workspace_id", "gpu", "awaiting_source_credentials")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
     GENERATION_FIELD_NUMBER: _ClassVar[int]
@@ -771,6 +783,7 @@ class MachineExecutionState(_message.Message):
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
     GPU_FIELD_NUMBER: _ClassVar[int]
+    AWAITING_SOURCE_CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     attempt_ordinal: int
     generation: int
@@ -781,7 +794,8 @@ class MachineExecutionState(_message.Message):
     worker_boot_id: str
     execution_workspace_id: str
     gpu: MachineExecutionGpu
-    def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., generation: _Optional[int] = ..., state: _Optional[str] = ..., collected: bool = ..., sequence: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., gpu: _Optional[_Union[MachineExecutionGpu, _Mapping]] = ...) -> None: ...
+    awaiting_source_credentials: _containers.RepeatedScalarFieldContainer[NativeSourceOperation]
+    def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., generation: _Optional[int] = ..., state: _Optional[str] = ..., collected: bool = ..., sequence: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., gpu: _Optional[_Union[MachineExecutionGpu, _Mapping]] = ..., awaiting_source_credentials: _Optional[_Iterable[_Union[NativeSourceOperation, str]]] = ...) -> None: ...
 
 class MachineExecutionGpu(_message.Message):
     __slots__ = ("phase", "width", "ordinals", "blocked_by")

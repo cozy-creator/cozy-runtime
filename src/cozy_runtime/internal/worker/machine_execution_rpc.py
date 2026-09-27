@@ -16,6 +16,7 @@ from cozy_runtime.internal.worker import machine_capture, machine_slots, triage
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import (
+    TERMINAL,
     ExecutionWorkspaceRefusal,
     StaleExecutionGeneration,
 )
@@ -108,6 +109,7 @@ class MachineExecutionRPC:
                 owner_publication_reconciliation=self.worker.machine_effects is not None,
                 cpu_slot_model_inputs=machine_slots.MODEL_INPUTS,
                 exact_execution_gpus=True,
+                source_credentials=True,
             )
 
         return self._call(request.claim, context, get)
@@ -120,6 +122,11 @@ class MachineExecutionRPC:
             worker_boot_id=self.worker.fence.worker_boot_id,
             execution_workspace_id=self.worker.executions.workspace_id,
             gpu=self.worker.gpu_status(state.request_id),
+            awaiting_source_credentials=[]
+            if state.state in TERMINAL
+            else self.worker.machine_sources.awaiting(
+                self.worker.fence.record_owner_id, state.request_id
+            ),
         )
 
     def SubmitMachineExecution(self, request: pb.MachineExecutionSubmit, context: Any) -> Any:
@@ -150,6 +157,8 @@ class MachineExecutionRPC:
             inputs[0].url = "data:application/json;base64," + base64.b64encode(payload).decode()
             executions = self.worker.executions
             owner = self.worker.authorize_workspace(request.claim)
+            # Held before acceptance so no source call runs without them; never journaled.
+            self.worker.machine_sources.hold(owner, offered.request_id, request.source_credentials)
             if executions.owns(owner, offered.request_id):
                 # Reconcile lost acceptance replies from the durable record itself,
                 # even after the worker's in-memory prepared registry disappeared.
@@ -183,7 +192,7 @@ class MachineExecutionRPC:
                     publication_authorization_id=request.publication_authorization_id,
                     arguments=value,
                 )
-            assert self.worker.executions is not None
+            self.worker.machine_sources.declare(owner, offered.request_id)
             return pb.MachineExecutionReceipt(**dataclasses.asdict(receipt))
 
         def checked_submit() -> pb.MachineExecutionReceipt:
@@ -336,10 +345,12 @@ class MachineExecutionRPC:
             self._query(request.execution)
             if request.outcome.request_id != request.execution.request_id:
                 raise WorkspaceRefusal("collection acknowledgment names another request")
-            return self._state(
-                self.worker.acknowledge_execution_collection(
-                    request.execution.claim, request.outcome
-                )
+            state = self.worker.acknowledge_execution_collection(
+                request.execution.claim, request.outcome
             )
+            self.worker.machine_sources.forget(
+                request.execution.claim.record_owner_id, request.execution.request_id
+            )
+            return self._state(state)
 
         return self._call(request.execution.claim, context, acknowledge)

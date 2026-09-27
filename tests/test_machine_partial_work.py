@@ -218,7 +218,9 @@ class Machine:
     def wait(self, what: str, done: Callable[[], bool], seconds: float) -> None:
         wait(what, done, self.thread.is_alive, seconds)
 
-    def submit(self, request: str) -> None:
+    def submit(
+        self, request: str, credentials: tuple[pb.SourceCredential, ...] = ()
+    ) -> pb.MachineExecutionSubmit:
         generator = LocalRecordOwner(
             LocalRequest(
                 entrypoint="nested",
@@ -239,21 +241,22 @@ class Machine:
         assert offered is not None
         state = generator._desired_state()
         state.job.orchestration = True
-        self.client.SubmitMachineExecution(
-            pb.MachineExecutionSubmit(
-                claim=self.claim,
-                submission_id=request,
-                capture_digest=self.capture_digest,
-                capture_canonical_bytes=self.captured,
-                offer=offered.attempt_offer,
-                prepared_state=state,
-                payload_canonical_bytes=canonical_json.encode({}),
-                max_attempts=1,
-                expected_execution_workspace_id=self.client.GetMachineExecutionWorkspace(
-                    pb.MachineExecutionWorkspaceQuery(claim=self.claim)
-                ).execution_workspace_id,
-            )
+        submission = pb.MachineExecutionSubmit(
+            claim=self.claim,
+            submission_id=request,
+            capture_digest=self.capture_digest,
+            capture_canonical_bytes=self.captured,
+            offer=offered.attempt_offer,
+            prepared_state=state,
+            payload_canonical_bytes=canonical_json.encode({}),
+            max_attempts=1,
+            expected_execution_workspace_id=self.client.GetMachineExecutionWorkspace(
+                pb.MachineExecutionWorkspaceQuery(claim=self.claim)
+            ).execution_workspace_id,
+            source_credentials=credentials,
         )
+        self.client.SubmitMachineExecution(submission)
+        return submission
 
     def state(self, request: str) -> str:
         return self.worker.execution_status(self.claim, request).state
