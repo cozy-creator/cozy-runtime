@@ -137,14 +137,10 @@ def upload_huggingface(
     """Download, convert and publish one checkpoint within the machine's free disk.
 
     Reviewed profiles select and convert the source; carriers narrow the selection to
-    exact members instead. With neither, the model's reviewed recipe decides both and
-    attaches its metadata. Bodies stream through a window sized to the observed disk.
+    exact members. With no profile, the model's reviewed recipe decides and attaches its
+    metadata, or the machine's TensorFS selects the profile the headers match. Bodies
+    stream through a window sized to the observed disk.
     """
-    if carriers and not profiles:
-        raise UnsupportedInput(
-            "carriers need the reviewed profiles that convert them",
-            code="model_source_profiles_invalid",
-        )
     return cast(
         Awaitable[CheckpointRef],
         _call(
@@ -161,13 +157,12 @@ def upload_huggingface(
 
 
 def upload_civitai(
-    version: int, *, destination: str, profiles: tuple[str, ...], file: str = ""
+    version: int, *, destination: str, profiles: tuple[str, ...] = (), file: str = ""
 ) -> Awaitable[CheckpointRef]:
-    """Download, convert and publish one Civitai file within the machine's free disk."""
-    if not profiles:
-        raise UnsupportedInput(
-            "a Civitai upload names its reviewed profiles", code="model_source_profiles_invalid"
-        )
+    """Download, convert and publish one Civitai file within the machine's free disk.
+
+    With no profile, the machine's TensorFS selects the one the file's header matches.
+    """
     return cast(
         Awaitable[CheckpointRef],
         _call(

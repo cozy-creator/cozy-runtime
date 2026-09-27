@@ -1,0 +1,1 @@
+`upload_huggingface` and `upload_civitai` no longer need a profile: with none named and no reviewed recipe, the machine's TensorFS selects the profile from the source headers and narrows the source to its members, and the chosen profile joins the conversion id and the memo key. Requires TensorFS 0.3.68.

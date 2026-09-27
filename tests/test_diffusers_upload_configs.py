@@ -136,20 +136,27 @@ def isolated_admission(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(storage_admission, "_reclaimers", WeakValueDictionary())
 
 
-@pytest.mark.parametrize("modular", [False, True], ids=["model_index", "modular_model_index"])
+NAMED = {
+    "carriers": [f"{name}/diffusion_pytorch_model.safetensors" for name in ("decoder", "encoder")],
+    "profiles": [PROFILE],
+}
+
+
+@pytest.mark.parametrize(
+    ("modular", "named"),
+    [(False, NAMED), (True, NAMED), (False, {})],
+    ids=["model_index", "modular_model_index", "profile_selected_on_the_machine"],
+)
 def test_a_diffusers_upload_carries_each_components_config_and_prepares(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, modular: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, modular: bool, named: dict[str, object]
 ) -> None:
     files = _repository(modular)
     request = {
         "repository": "example/diffusers",
         "revision": "c" * 40,
         "destination": "example/diffusers-model",
-        # The reviewed test profile is not built into TensorFS, so its carriers are named.
-        "carriers": [
-            f"{name}/diffusion_pytorch_model.safetensors" for name in ("decoder", "encoder")
-        ],
-        "profiles": [PROFILE],
+        # With nothing named, the machine's TensorFS selects the profile from the headers.
+        **named,
     }
     origin, hub, root = HuggingFace(files), Hub(), tmp_path / "machine"
     with origin.running() as hf, hub.running(), Supervisor(root, 1 << 30, 0).running() as channel:
@@ -173,6 +180,7 @@ def test_a_diffusers_upload_carries_each_components_config_and_prepares(
         selected = {row.member for row in resolved.selection.members}
         assert {"encoder/config.json", "scheduler/scheduler_config.json"} <= selected
         assert not any(member.startswith("tokenizer/") for member in selected)
+        assert {m for m in selected if m.endswith(".safetensors")} == set(NAMED["carriers"])
         command.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         command.selection.CopyFrom(resolved.selection)
         calls.handle(command)

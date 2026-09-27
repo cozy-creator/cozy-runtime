@@ -215,10 +215,22 @@ class Upload:
             if lease is not None:
                 lease.close()
 
+    def _registry(self) -> dict[str, str]:
+        return {"registry": base64.b64encode(self.registry).decode()} if self.registry else {}
+
     def resolve(self) -> dict[str, Any]:
         lease = storage_admission.acquire(storage_admission.native_write(self.store_root))
-        selection: dict[str, Any] = self._step({"step": "resolve"}, lease)["selection"]
+        selection: dict[str, Any] = self._step({"step": "resolve", **self._registry()}, lease)[
+            "selection"
+        ]
         return selection
+
+    def select(self, selection: dict[str, Any]) -> None:
+        """No profile named: this machine's TensorFS selects one from the pinned headers."""
+        carriers = [list(row) for row in selection["members"] if upload_plan.carrier(row[0])]
+        lease = storage_admission.acquire(storage_admission.native_write(self.store_root))
+        step = {"step": "select", "members": carriers, **self._registry()}
+        self.slots = [("model", str(self._step(step, lease)["profile"]))]
 
     # ------------------------------------------------------------------ the run
 
