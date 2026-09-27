@@ -1,4 +1,7 @@
-"""Source-authored model selection metadata; names are resolved by the granting host."""
+"""Source-authored model selection metadata; names are resolved by the granting host.
+
+A lane may omit its org (`model@release/lane`): it names a model of the package's own
+account. The publishing host writes that account into the published interface."""
 
 from __future__ import annotations
 
@@ -10,7 +13,7 @@ from cozy_runtime.author._errors import ConformanceError
 # These are declaration shapes, not a catalog client or a GPU matching implementation.
 _SLUG = r"[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?"
 _REFERENCE = re.compile(
-    rf"(?P<model>{_SLUG}/{_SLUG})@(?P<release>[A-Za-z0-9][A-Za-z0-9._+!-]{{0,63}})"
+    rf"(?P<model>(?:{_SLUG}/)?{_SLUG})@(?P<release>[A-Za-z0-9][A-Za-z0-9._+!-]{{0,63}})"
     r"/(?P<lane>[A-Za-z0-9][A-Za-z0-9._+!-]{0,127})"
 )
 _DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -59,7 +62,7 @@ def default_ladder(value: object) -> DefaultLadder:
         reference = _REFERENCE.fullmatch(lane) if isinstance(lane, str) else None
         if reference is None or _DIGEST.fullmatch(reference["release"]):
             raise ConformanceError(
-                "default lane must name org/model@release/lane with an explicit release and lane",
+                "default lane must name [org/]model@release/lane with an explicit release and lane",
                 code="model_defaults",
             )
         current = reference["model"], reference["release"]
