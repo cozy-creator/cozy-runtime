@@ -15,7 +15,7 @@ def test_h3_encoder_block_floor_reaches_the_attempt_planner(degree: int) -> None
     # shape facts, not a claimed activation peak or a full-video fit certificate.
     nominal, working = 51_506_192_132, 2_898_621_988
     lanes = LaneSet.from_envelope(",".join(str(rank) for rank in range(degree)), worker_pid=1)
-    lane = lanes.fuse(tuple(range(degree))) if degree > 1 else lanes.lanes[0]
+    lane = lanes.group(tuple(range(degree))) if degree > 1 else lanes.lanes[0]
     ledger = lane.row("fixture").ledger
     ledger.begin_generation(1)
     ledger.observe_construction(

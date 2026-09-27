@@ -1423,7 +1423,6 @@ class Worker:
             for ordinal, entry in enumerate(self.lanes.entries):
                 measured[ordinal] = accel.device_memory(entry, kind)
         pin = placement.device_pin
-        revision = self.lanes.revision
         try:
             if placement.placement_id.startswith(machine_lanes.REPLICA):
                 ordinals = pin or ()  # its scheduler grant exactly; none for weightless work
@@ -1459,35 +1458,27 @@ class Worker:
         row.model_bearing = model_bearing
         row.supervision = supervision
         row.ledger.observe_devices(lane.device_facts(measured))
-        tenants = [slot for slot in lane.model_bearing_slots() if slot != placement.placement_id]
+        tenants = sorted(
+            slot for slot, _row in self.lanes.tenants(lane) if slot != placement.placement_id
+        )
         self.note(
             "materialization",
             f"{placement.placement_id!r} assigned to {lane.lane_id} "
             f"(CUDA_VISIBLE_DEVICES={lane.devices!r}; "
             + ("model-bearing" if model_bearing else "weightless")
             + (f"; a {lane.degree}-device GROUP, one seat" if lane.group else "")
-            + (f"; shares the device with {tenants} by residency arbitration" if tenants else "")
+            + (f"; shares its devices with {tenants} by residency arbitration" if tenants else "")
             + ")",
         )
-        if not lane.ordinals:
-            self._sync_lane_consumers()
-        if self.lanes.revision != revision:
-            self._sync_lane_consumers()
-            self.bump_admission(
-                f"{lane.lane_id} fused from {list(lane.ordinals)} for {placement.placement_id!r}"
-            )
+        self._sync_lane_consumers()
         return True
 
     def _release_lane(self, placement_id: str) -> None:
         placement = self._placement_by_id(placement_id)
         if placement is not None:
             placement.lane_id = ""
-        revision = self.lanes.revision
         if self.lanes.release(placement_id):
             self._sync_lane_consumers()
-        if self.lanes.revision != revision:
-            self._sync_lane_consumers()
-            self.bump_admission(f"a group lane split when {placement_id!r} left it")
 
     def lane_documents(self) -> list[dict[str, Any]]:
         """`lanes[]` (proto-024): every device or group lane of the envelope with its seats
@@ -1610,15 +1601,14 @@ class Worker:
             lane.row(placement_id).ledger.begin_generation(executor.pid if executor else 0)
 
     def _lane_phases(self, lane: DeviceLane) -> tuple[int, int]:
-        """(attempts queued for or on the device, released attempts awaiting ack) on ONE
-        lane."""
+        """(attempts queued for or on the lane's DEVICES, from any lane over them; released
+        attempts awaiting ack on ONE lane)."""
+        sharing = {other.lane_id for other in self.lanes.sharing(lane)}
         seated = released = 0
         for held in list(self.engine.history.values()):
-            if held.lane_id != lane.lane_id:
-                continue
-            if held.state in self.engine.PRE_RELEASE:
+            if held.lane_id in sharing and held.state in self.engine.PRE_RELEASE:
                 seated += 1
-            elif held.state in self.engine.RELEASED:
+            elif held.lane_id == lane.lane_id and held.state in self.engine.RELEASED:
                 released += 1
         return seated, released
 
@@ -2627,7 +2617,8 @@ class Worker:
 
         No desired-state revision is written, so replicas on other GPUs activate at once
         and a failed one refuses only its own demand (the next demand starts it afresh).
-        Replicas on the granted devices leave first; while one holds an attempt this waits.
+        Replicas already on the granted devices stay: a device holds several tenants and
+        residency arbitration, not activation, decides whose weights are on the card.
         """
         (row,) = read_placement_set(desired.placement_set)
         pins = desired.placement_set.device_pins
@@ -2655,18 +2646,6 @@ class Worker:
                 raise WorkspaceRefusal(f"model preparation failed: {detail or placement_id}")
             self._revive(placement_id)
             return False
-        overlap = [
-            other
-            for other, held in self.hosted.items()
-            if other.startswith(machine_lanes.REPLICA)
-            and set(held.placement.device_pin or ()) & set(pin or ())
-        ]
-        if any(
-            attempt.placement_id in overlap
-            and attempt.state in (*self.engine.PRE_RELEASE, *self.engine.HELD)
-            for attempt in self.engine.history.values()
-        ):
-            return False
         machine_capture.restore(self, preparation)
         placement = self._placement_from_entry(row, desired.placement_set.placement_set_digest)
         placement.device_pin = pin
@@ -2678,7 +2657,7 @@ class Worker:
             self.lanes.envelope.forget("")
             self.job_slots.pop("envelope", None)
         self.accepted.mode = "serving"
-        self._lifecycle(placement_id, self._activate_replica, hosted, overlap, job)
+        self._lifecycle(placement_id, self._activate_replica, hosted, job)
         return False
 
     def _lifecycle(self, placement_id: str, body: Callable[..., Any], *args: Any) -> None:
@@ -2689,15 +2668,12 @@ class Worker:
         self._activating[placement_id] = thread
         thread.start()
 
-    def _activate_replica(self, hosted: HostedPlacement, overlap: list[str], job: bool) -> None:
-        """Free the granted devices, then acquire, bind and start this replica's executor."""
+    def _activate_replica(self, hosted: HostedPlacement, job: bool) -> None:
+        """Acquire, bind and start this replica's executor; a device job's leaves first."""
         try:
             current = self.supervision.current
             if job and current is not None:
                 self.supervision.retire_current(current, "a machine replica takes the devices")
-            for placement_id in overlap:
-                if not self._retire_one(placement_id):
-                    raise ExecutorGone(f"{placement_id} could not be reclaimed")
             self._activate_hosted(hosted, None)
         except Exception as exc:
             hosted.latched = f"replica_activation_failed: {type(exc).__name__}: {exc}"[:200]
@@ -5877,8 +5853,8 @@ class Worker:
 
     def _process_ceiling(self, lane: DeviceLane, slot: str) -> int:
         """The PROCESS ceiling for a load or an activation: the lane's measured capacity
-        less what every co-tenant on it holds. The executor fits under it less what it
-        already holds, verified against what its own allocator can get."""
+        less the most its co-tenants hold on any one of its devices. The executor fits under
+        it less what it already holds, verified against what its own allocator can get."""
         measured = lane.measure(accel.host_backend_family())
         memory = fold_memory(measured)
         if memory.state != "measured":
@@ -5896,11 +5872,7 @@ class Worker:
             )
         row = lane.row(slot)
         row.ledger.observe_devices(lane.device_facts(measured))
-        others = sum(
-            other.resident_bytes()
-            for name, other in lane.rows.items()
-            if name != slot and other.model_bearing
-        )
+        others = self.lanes.beside(lane, slot)
         row.ledger.authorized_device_limit_bytes = max(int(memory.total_bytes) - others, 0)
         return row.ledger.authorized_device_limit_bytes
 
@@ -6544,7 +6516,7 @@ class Worker:
         is not evidence about a different, smaller one.
         """
         signature = row.oom_signatures.get(invocation, "")
-        if not signature or signature != lane.residency_signature():
+        if not signature or signature != self.lanes.signature(lane):
             return
         self.note(
             "residency",
@@ -6554,7 +6526,7 @@ class Worker:
         )
         # Never the chooser's `fits`: its verdict is what admitted the attempt that OOMed.
         self._make_room(lane, slot, lambda _memory: False, f"{why} after a device OOM")
-        if signature != lane.residency_signature():
+        if signature != self.lanes.signature(lane):
             row.oom_signatures.pop(invocation, None)
             return
         kind = accel.host_backend_family()
@@ -6578,34 +6550,41 @@ class Worker:
         fits: Callable[[accel.DeviceMemory], bool],
         why: str,
     ) -> None:
-        """RESIDENCY ARBITRATION on one lane: vacate co-tenants, LRU-first, until `fits`.
+        """RESIDENCY ARBITRATION on a lane's devices: vacate co-tenants of its TIGHTEST
+        device, LRU-first, until `fits`.
 
         `fits` reads the lane as the driver measures it NOW (cr-066's NVML reading, the
         same meter ceilings are assigned from) and says whether `slot`'s demand holds. It is
-        asked before anything moves and again after each vacate. A lane the driver cannot
-        read is left alone: the prepare or the plan refuses typed on the same fact. A
-        victim's process stays — only its residency changes, so its executor epoch and its
-        placement's serving state do not move; its next attempt re-stages on demand.
+        asked before anything moves and again after each vacate. Co-tenants come from every
+        lane over that device (a group's ranks, other singletons), and only from the
+        tightest one: freeing another device cannot raise the lane's MIN. A lane the driver
+        cannot read is left alone: the prepare or the plan refuses typed on the same fact.
+        A victim's process stays — only its residency changes, so its executor epoch and
+        its placement's serving state do not move; its next attempt re-stages on demand.
         """
         kind = accel.host_backend_family()
-        memory = lane.memory(kind)
-        if memory.state != "measured" or fits(memory):
-            return
-        for victim, row in lane.victims(slot):
+        tried: set[str] = set()
+        while True:
+            measured = lane.measure(kind)
+            memory = fold_memory(measured)
+            if memory.state != "measured" or fits(memory):
+                return
+            tightest = min(measured, key=lambda ordinal: measured[ordinal].free_bytes)
+            found = [v for v in self.lanes.victims(lane, slot, tightest) if v[0] not in tried]
+            if not found:
+                break
+            victim, row = found[0]
+            tried.add(victim)
             executor = row.executor()
             if executor is None:
                 continue
-            before = memory.free_bytes
             freed, took = self._vacate(victim, row, executor, why)
-            memory = lane.memory(kind)
             self.note(
                 "residency",
                 f"{lane.lane_id}: {victim!r} (epoch {executor.epoch} pid {executor.pid}) "
-                f"vacated {freed} B in {took:.0f} ms for {slot!r} on {why}; the driver "
-                f"reports {before} -> {memory.free_bytes} B free",
+                f"vacated {freed} B in {took:.0f} ms from device {tightest} for {slot!r} on "
+                f"{why}; the driver reported {memory.free_bytes} B free before",
             )
-            if memory.state != "measured" or fits(memory):
-                return
         self.note(
             "residency",
             f"{lane.lane_id}: no co-tenant of {slot!r} holds bytes the driver could give "
@@ -7386,7 +7365,7 @@ class Worker:
             row.oom_signatures.pop(attempt.digest, None)
             return
         if str(outcome.get("code", "")) in DEVICE_SHORTFALL_CODES:
-            signature = lane.residency_signature()
+            signature = self.lanes.signature(lane)
             # An entry under another picture describes a lane that no longer exists.
             row.oom_signatures = {
                 invocation: seen
