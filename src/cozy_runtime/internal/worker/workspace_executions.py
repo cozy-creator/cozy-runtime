@@ -886,7 +886,9 @@ class Executions:
             if previous is not None:
                 if previous["intent"] != intent:
                     raise WorkspaceRefusal("execution command identity changed")
-                return State(**canonical_json.decode(previous["response"]))
+                answered = canonical_json.decode(previous["response"])
+                known = State.__dataclass_fields__
+                return State(**{k: v for k, v in answered.items() if k in known})
             if row["generation"] != expected_generation:
                 raise StaleExecutionGeneration("execution command generation is stale")
             state, ordinal, desired = row["state"], row["ordinal"], row["desired"]

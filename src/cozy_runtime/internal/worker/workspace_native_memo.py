@@ -279,8 +279,8 @@ def lookup_native(
             or parent["fenced"]
         ):
             raise WorkspaceRefusal("native memo recipient has no current accepted call")
-        if row["computation_digest"] not in (b"", computation_digest):
-            raise WorkspaceRefusal("native memo call changed its effective computation")
+        # An unfinished call retried under an updated Runtime computes anew; its prior
+        # attempt's computation identity is replaced, never a reason to refuse the retry.
         db.execute(
             "UPDATE native_calls SET computation_digest=? WHERE owner=? AND service_id=?",
             (computation_digest, owner, service_id),

@@ -59,7 +59,7 @@ class _EntrypointDeclaration(TypedDict):
     internal: NotRequired[bool]
 
 
-class _ArtifactReference(msgspec.Struct, forbid_unknown_fields=True):
+class _ArtifactReference(msgspec.Struct):
     digest: str
     length: int
 

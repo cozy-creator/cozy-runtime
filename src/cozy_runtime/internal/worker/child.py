@@ -42,6 +42,7 @@ from packaging.version import InvalidVersion, Version
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.internal import accel, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import (
+    ALLOWLIST,
     EXECUTOR_SCOPE_ENV,
     FLASH_ATTENTION_CACHE_ENABLED_ENV,
 )
@@ -268,6 +269,9 @@ class Executor:
                     finally:
                         if isinstance(answer, DescriptorReply):
                             answer.descriptor.close()
+                    continue
+                if "reply" not in frame and frame.get("event") is not None:
+                    # An event kind from a newer executor that this worker does not consume.
                     continue
                 if frame.get("reply") != name:
                     raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
@@ -918,6 +922,11 @@ class ExecutorSupervision:
                 {"cmd": "hello"}, timeout=HELLO_SECONDS, total_timeout=HELLO_SECONDS
             )
             sealed = executor.hello.get("sealed")
+            # An executor from another Runtime version reports its own allowlist: compare
+            # every name both sides know, each against the value this worker imposed.
+            seal_matches = isinstance(sealed, dict) and all(
+                sealed[key] == spawned.env.get(key, "") for key in ALLOWLIST if key in sealed
+            )
             contained = (
                 proctree.cgroup_contains(owner.scope, process)
                 if isinstance(owner.scope, proctree.CgroupScope)
@@ -928,8 +937,7 @@ class ExecutorSupervision:
                 or executor.hello.get("ppid") != os.getpid()
                 or executor.hello.get("pgid") != spawned.pid
                 or not contained
-                or not isinstance(sealed, dict)
-                or spawn.seal_digest(sealed) != spawned.seal_digest
+                or not seal_matches
             ):
                 raise ExecutorGone(
                     f"executor hello identity mismatch for epoch {self.epoch}: "

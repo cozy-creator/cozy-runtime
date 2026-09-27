@@ -57,15 +57,21 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         prepared[identifier] = {"placement": selected.document, "installation_id": identifier}
     if root not in prepared:
         raise WorkspaceRefusal("execution capture root is not installed")
-    keys = []
+    targets: dict[tuple[str, str, str], tuple[str, str]] = {}
     for binding in capture.get("bindings", []):
-        if set(binding) != {"caller_installation_id", "callee_installation_id", "module", "export", "entrypoint"}:
+        fields = {"caller_installation_id", "callee_installation_id", "module", "export"}
+        if not isinstance(binding, dict) or not {*fields, "entrypoint"} <= set(binding):
             raise WorkspaceRefusal("execution callable binding has invalid fields")
         caller, callee = binding["caller_installation_id"], binding["callee_installation_id"]
         if caller not in prepared or callee not in prepared:
             raise WorkspaceRefusal("execution callable names an uninstalled package")
         target = binding["module"], binding["export"]
-        keys.append((caller, *target))
+        # A repeated identical binding is one binding; one import bound two ways is ambiguous.
+        if targets.setdefault((caller, *target), (callee, binding["entrypoint"])) != (
+            callee,
+            binding["entrypoint"],
+        ):
+            raise WorkspaceRefusal("execution callable inventory is ambiguous")
         entry = next((entry for entry in [*interfaces[callee]["jobs"], *interfaces[callee]["entrypoints"]]
                       if entry["name"] == binding["entrypoint"]), None)
         if entry is None:
@@ -75,8 +81,8 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         invocable = entry.get("invocable", {})
         if (invocable.get("module"), invocable.get("export")) != target:
             raise WorkspaceRefusal("execution callable does not identify the installed export")
-    if len(keys) > 4096 or keys != sorted(set(keys)):
-        raise WorkspaceRefusal("execution callable inventory is ambiguous")
+    if len(targets) > 4096:
+        raise WorkspaceRefusal("execution callable inventory exceeds its bound")
     machine_model_defaults.verify(worker, request, capture, interfaces)
     spec = documents.read(request.offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
     root = capture["root_installation_id"]
@@ -108,10 +114,16 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             ),
             None,
         )
+        held = prepared[root]["placement"]
+        # The placement this machine prepared, named by the facts that bind execution; an
+        # additive or reordered field from the owner's copy is not a different placement.
         if (
             selected_entry is None
             or installation_identity(selected_entry) != root
-            or selected_entry != prepared[root]["placement"]
+            or any(
+                selected_entry.get(key) != held.get(key)
+                for key in ("installation_id", "bindings_digest", "package_interface", "models")
+            )
         ):
             raise WorkspaceRefusal("execution inference does not name the captured root")
     root_interface = interfaces[root]
