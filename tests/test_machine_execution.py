@@ -35,7 +35,7 @@ def offer(request: str = "root", *, job: bool = True) -> pb.AttemptOffer:
     invocation, digest = documents.identity(
         pb.InvocationSpec(
             job=pb.JobInvocationSpec(
-                build_id="sha256:" + "11" * 32, job_descriptor_id="sha256:" + "12" * 32
+                installation_id="local-" + "11" * 16, job_descriptor_id="sha256:" + "12" * 32
             )
         )
         if job
@@ -674,7 +674,7 @@ def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path
     submitted = offer("expired")
     spec = pb.InvocationSpec(
         job=pb.JobInvocationSpec(
-            build_id="sha256:" + "11" * 32, job_descriptor_id="sha256:" + "12" * 32
+            installation_id="local-" + "11" * 16, job_descriptor_id="sha256:" + "12" * 32
         ),
         deadline_unix_ms=1000,
     )
@@ -736,8 +736,8 @@ def serve(payload: Request) -> Result:
         assert uv is not None
         wheels = environment / ".stage/offline/wheels"
         _run(uv, "build", "--wheel", "--out-dir", str(wheels), str(project))
-        preparation.ClearField("wheels")
-        preparation.wheels.extend(_wheel_rows(list(wheels.glob("*.whl"))))
+        preparation.ClearField("files")
+        preparation.files.extend(_wheel_rows(list(wheels.glob("*.whl"))))
         sdk_python = None
         if origin == "published-sdk":
             sdk = root / "sdk"
@@ -785,17 +785,29 @@ def serve(payload: Request) -> Result:
                     measure(worker, current_preparation)
                     prepared = worker.prepare_local_package(current_preparation)
                 else:
-                    wheel = Path(current_preparation.wheels[0].path)
+                    wheel, runtime = (
+                        next(
+                            Path(row.path)
+                            for row in current_preparation.files
+                            if row.filename.startswith(prefix)
+                        )
+                        for prefix in ("prepare_", "cozy_runtime-")
+                    )
                     package_name = "published/" + wheel.name.split("-")[0].replace("_", "-")
                     index = _SimpleIndex(
-                        root / ("index-" + current_preparation.operation_id), [wheel]
+                        root / ("index-" + current_preparation.operation_id), [wheel, runtime]
                     )
                     indexes.append(index)
+                    # The complete locked closure: this release, its Runtime, and their
+                    # registry dependencies. The loopback index has priority over PyPI.
                     locked = (
-                        f"--index-url {index.url}\n"
+                        "--index-url https://pypi.org/simple\n"
+                        f"--extra-index-url {index.url}\n"
                         f"{package_name.split('/')[1]}==1.0.0 "
                         f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n"
-                    ).encode()
+                        f"cozy-runtime=={runtime.name.split('-')[1]} "
+                        f"--hash=sha256:{hashlib.sha256(runtime.read_bytes()).hexdigest()}\n"
+                    ).encode() + bytes(current_preparation.dependency_requirements)
                     project_root = root / ("project_" + current_preparation.operation_id)
                     (project_root / "package.toml").write_text(
                         '[application]\nobject="prepare_'
@@ -825,55 +837,21 @@ def serve(payload: Request) -> Result:
                             ),
                         )
                     )
-                    # proto-061 C: a published prepare spawns no describe executor.
-                    assert not (root / "worker" / "placements" / "prepare").exists()
                 placement_body = documents.read(
                     prepared.placement_set.placement_set_canonical_bytes, pb.PlacementSet
                 )["placements"][0]
-                revision = pb.LocalPackageRevision(
-                    package=current_preparation.package.package,
-                    release=current_preparation.package.release,
-                    source_digest=current_preparation.package.source_digest,
-                    package_interface=pb.Ref(
-                        digest=documents.raw(placement_body["package_interface"]["digest"]),
-                        length=placement_body["package_interface"]["length"],
-                    ),
-                    files=[
-                        pb.LocalPackageFileRef(
-                            filename=w.filename, digest=w.digest, length=w.length
-                        )
-                        for w in current_preparation.wheels
-                    ],
-                )
-                revision_digest = (
-                    current_preparation.package.local_revision_digest
-                    if origin == "private"
-                    else documents.raw(placement_body["environment_digest"])
-                )
-                public_revision = None
-                if origin != "private":
-                    public_revision = pb.PublishedPackageRevision()
-                    locked_ref = placement_body["environment"]["locked_requirements"]
-                    public_revision.environment.locked_requirements.CopyFrom(
-                        pb.Ref(
-                            digest=documents.raw(locked_ref["digest"]), length=locked_ref["length"]
-                        )
-                    )
-                    public_revision.package.package = package_name
-                    public_revision.package.release = "1.0.0"
-                    public_revision.package_interface.CopyFrom(revision.package_interface)
+                installation_id = placement_body["installation_id"]
+                assert prepared.installed_package.installation_id == installation_id
                 capture, capture_digest = documents.identity(
                     pb.MachineExecutionCapture(
-                        root_revision_digest=revision_digest,
-                        revisions=[revision] if origin == "private" else [],
-                        published_revisions=[public_revision] if public_revision else [],
+                        root_installation_id=installation_id,
+                        installed_packages=[prepared.installed_package],
                         bindings=[
                             pb.MachineCallableBinding(
-                                caller_revision_digest=revision_digest,
-                                interface_digest=revision.package_interface.digest,
+                                caller_installation_id=installation_id,
                                 module="prepare_offline",
                                 export="helper",
-                                callee_revision_digest=revision_digest,
+                                callee_installation_id=installation_id,
                                 entrypoint="helper",
                             )
                         ]
@@ -920,7 +898,7 @@ def serve(payload: Request) -> Result:
                 timeout_ms=60_000,
             )
             generator = LocalRecordOwner(
-                request, {}, root / "grants-first", package_code_digest=binding.build_id
+                request, {}, root / "grants-first", package_installation_id=binding.installation_id
             )
             worker._apply_desired_state(generator._desired_state())
             while not worker.job_ready:
@@ -974,7 +952,7 @@ def serve(payload: Request) -> Result:
                     ),
                     {},
                     root / ("grants-" + identifier),
-                    package_code_digest=selected.build_id,
+                    package_installation_id=selected.installation_id,
                 )
                 generator.host.inbound.get_nowait()  # helper's Claim is not transmitted
                 generator._dispatch()
@@ -1010,7 +988,7 @@ def serve(payload: Request) -> Result:
                         ),
                         {},
                         root / "internal-grants",
-                        package_code_digest=helper.build_id,
+                        package_installation_id=helper.installation_id,
                     )
                     internal_generator.host.inbound.get_nowait()
                     internal_generator._dispatch()
@@ -1063,20 +1041,16 @@ def serve(payload: Request) -> Result:
                         assert ungranted.value.code() == grpc.StatusCode.FAILED_PRECONDITION
                         assert detail in ungranted.value.details()
                         assert not worker.executions.owns("owner", invalid.offer.request_id)
-                if identifier == "first" and origin != "private":
-                    for field in ("package", "environment", "duplicate"):
+                if identifier == "first":
+                    for field in ("uninstalled", "duplicate"):
                         invalid.CopyFrom(submission)
                         invalid.offer.request_id = "rejected-capture-" + field
                         invalid.submission_id = invalid.offer.request_id
                         damaged = documents.read(capture, pb.MachineExecutionCapture)
-                        if field == "package":
-                            damaged["published_revisions"][0]["package"]["release"] = "2.0.0"
-                        elif field == "environment":
-                            damaged["published_revisions"][0]["environment"]["locked_requirements"][
-                                "digest"
-                            ] = "sha256:" + "01" * 32
+                        if field == "uninstalled":
+                            damaged["installed_packages"][0]["installation_id"] = "local-absent"
                         else:
-                            damaged["published_revisions"] *= 2
+                            damaged["installed_packages"] *= 2
                         invalid.capture_canonical_bytes = canonical_json.encode(damaged)
                         invalid.capture_digest = documents.digest_of(
                             invalid.capture_canonical_bytes
@@ -1190,7 +1164,7 @@ def serve(payload: Request) -> Result:
                 payload_digest = documents.spell(documents.digest_of(payload))
                 serving_spec, serving_digest = documents.identity(
                     pb.InvocationSpec(
-                        environment_digest=serving_placement["environment_digest"],
+                        installation_id=serving_placement["installation_id"],
                         payload_digest=payload_digest,
                         inputs=[
                             pb.InputBinding(
@@ -1276,7 +1250,7 @@ def serve(payload: Request) -> Result:
             indexes.clear()
             (root / "control.addr").unlink()
             worker = Worker(config, options, GrpcControlHost("127.0.0.1:0", root / "control.addr"))
-            assert not worker.prepared_revisions and not worker.engine.jobs
+            assert not worker.prepared_installations and not worker.engine.jobs
             thread = threading.Thread(target=worker.run, daemon=True)
             thread.start()
             while not (root / "control.addr").exists():
@@ -1287,7 +1261,7 @@ def serve(payload: Request) -> Result:
             client = rpc.WorkerControlStub(channel)
             query.expected_execution_workspace_id = receipt.execution_workspace_id
             assert client.SubmitMachineExecution(submission, timeout=5) == receipt
-            assert not worker.prepared_revisions and not worker.engine.jobs
+            assert not worker.prepared_installations and not worker.engine.jobs
             query.request_id = "second"
             assert (
                 client.CollectMachineExecution(
@@ -1330,7 +1304,7 @@ def serve(payload: Request) -> Result:
                 ]
             assert client.GetMachineExecution(query, timeout=5).state == "succeeded", child_failures
             assert client.ControlMachineExecution(resume, timeout=5) == resumed
-            assert worker.prepared_revisions and worker.engine.jobs
+            assert worker.prepared_installations and worker.engine.jobs
             assert not worker.connected.is_set() and not worker.fence.dispatch_open
             channel.close()
         finally:
@@ -1354,6 +1328,7 @@ def test_queued_offer_prevents_preparation_switch_before_lane_accepts() -> None:
     # No lane consumer has accepted this offer yet. A second captured package must
     # leave the first package's preparation and admission epoch intact during that gap.
     worker = SimpleNamespace(
+        phase=pb.WorkerPhase.WORKER_PHASE_ONLINE,
         accepted=SimpleNamespace(accepted_desired_state_revision=1, desired_state_body=b"first"),
         engine=SimpleNamespace(
             history={("first", 1): SimpleNamespace(state="queued", lane_id="")},
@@ -1361,7 +1336,7 @@ def test_queued_offer_prevents_preparation_switch_before_lane_accepts() -> None:
             HELD=AttemptEngine.HELD,
         ),
     )
-    state = pb.DesiredWorkerState(job=pb.JobDirective(build_id="different"))
+    state = pb.DesiredWorkerState(job=pb.JobDirective(installation_id="different"))
     preparation = {"state": base64.b64encode(state.SerializeToString()).decode()}
     assert Worker._prepare_execution(worker, preparation) is False  # type: ignore[arg-type]
 

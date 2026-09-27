@@ -5,13 +5,22 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.internal import interface_wheel, package_interface, static_interface
+from cozy_runtime.internal import (
+    installed_interfaces,
+    interface_wheel,
+    package_interface,
+    static_interface,
+)
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.package_installation import InstalledEnvironment
+from cozy_runtime.internal.worker.calls import Calls
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.machine_serving import arguments
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
@@ -113,8 +122,7 @@ sent=[]
 def exchange(kind,frame):
     if kind=="child_call":sent.append(frame)
     return {"ok":True,"state":"succeeded","result":'{"value":7}',"child_request_id":"child"}
-broker=_Broker("root",{(binding.interface_digest,binding.module,binding.export):binding,
-                      ("",binding.module,binding.export):binding},exchange)
+broker=_Broker("root",{(binding.module,binding.export):binding},exchange)
 broker.bind(fake_context(request_id="root"))
 token=_current.set(broker)
 async def run():
@@ -132,7 +140,7 @@ finally:_current.reset(token)
 assert len(sent)==1
 print(sent[0]["payload"])
 """
-    target = Target("revision", "generate", "interface", entry, {}, None, "digest")
+    target = Target("installation", "generate", entry, {}, None, "digest")
     expected = None
     from dataclasses import replace
 
@@ -275,7 +283,11 @@ def test_deterministic_serving_measurement_explicitly_opts_into_memoization(tmp_
         )
     )
     doc = static_interface.build(root)
-    assert doc == package_interface.build(discover(root))
+    imported = package_interface.build(discover(root))
+    # Only imported code can name the memo implementation; it is not a source fence.
+    generate = next(row for row in imported["entrypoints"] if row["name"] == "generate")
+    identity = generate["invocable"].pop("operation_identity")
+    assert identity.startswith("sha256:") and doc == imported
     rows = {row["name"]: row for row in doc["entrypoints"]}
     assert rows["generate"]["invocable"]["memoize"] is True
     assert rows["echo"]["invocable"]["memoize"] is False
@@ -308,7 +320,7 @@ def exchange(kind, frame):
         sent.append(frame)
     return {"ok": True, "state": "succeeded", "result": '{"value":7}',
             "child_request_id": "child-"+str(index)}
-key = (binding.interface_digest, binding.module, binding.export)
+key = (binding.module, binding.export)
 broker = _Broker("parent", {key:binding}, exchange)
 broker.bind(fake_context(request_id="parent"))
 model = ModelArtifact("producer", "model", ObjectRef("sha256:"+"11"*32, 321), "sha256:"+"22"*32)
@@ -353,9 +365,7 @@ Path(sys.argv[2]).write_text(sent[0]["payload"])
     entry = next(
         row for row in static_interface.build(root)["entrypoints"] if row["name"] == "generate"
     )
-    target = Target(
-        "revision", "generate", "interface", entry, {}, None, "digest", serving_envelope=True
-    )
+    target = Target("installation", "generate", entry, {}, None, "digest", serving_envelope=True)
     frozen = (tmp_path / "serving-call.json").read_bytes()
     payload, models = arguments(target, frozen)
     assert canonical_json.decode(payload) == {
@@ -433,7 +443,6 @@ def test_caller_overlay_preserves_helpers_assets_and_dependencies(tmp_path: Path
         raw,
         distribution="serving-fixture",
         version="0.1.0",
-        implementation_digest="sha256:" + "11" * 32,
         implementation_wheel=original.getvalue(),
         implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
     )
@@ -441,7 +450,6 @@ def test_caller_overlay_preserves_helpers_assets_and_dependencies(tmp_path: Path
         raw,
         distribution="serving-fixture",
         version="0.1.0",
-        implementation_digest="sha256:" + "11" * 32,
         implementation_wheel=original.getvalue(),
         implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
     ) == (filename, wheel)
@@ -451,13 +459,10 @@ def test_caller_overlay_preserves_helpers_assets_and_dependencies(tmp_path: Path
         assert b"Requires-Dist: numpy>=1.26\n" in metadata
         assert metadata.endswith(b"\n\nDescription.\n")
         assert archive.read("serving_fixture_data/defaults.json") == b'{"width":512}'
-    from cozy_runtime.internal.installed_interfaces import read
-    from cozy_runtime.internal.package_environment import InstalledEnvironment
-
     installed = InstalledEnvironment(
-        tmp_path, tmp_path / "overlay", Path(sys.executable), b"", "", "sha256:" + "22" * 32, True
+        "install-overlay", tmp_path, tmp_path / "overlay", Path(sys.executable), "", "", True
     )
-    assert {row["export"] for row in read(installed)} == {"generate", "echo"}
+    assert {row["export"] for row in installed_interfaces.read(installed)} == {"generate", "echo"}
     check = """import inspect, sys
 sys.path.insert(0, sys.argv[1])
 import serving_fixture as lib
@@ -474,10 +479,10 @@ assert "generate" in lib.__cozy_bindings__
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+    # uv owns installed bytes; discovery reads declarations and never re-generates source.
     companion = next((tmp_path / "overlay").glob("_cozy_callers_*.py"))
     companion.write_bytes(companion.read_bytes() + b"# changed\n")
-    with pytest.raises(ConformanceError, match="trusted generator"):
-        read(installed)
+    assert {row["export"] for row in installed_interfaces.read(installed)} == {"generate", "echo"}
 
 
 def test_one_published_wheel_keeps_direct_serving_and_imported_callers(tmp_path: Path) -> None:
@@ -516,14 +521,10 @@ def secret(ctx: Context, payload: Request) -> Result:
             "dual_fixture-0.1.0.dist-info/WHEEL",
             "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         )
-    import hashlib
-
-    source_digest = "sha256:" + hashlib.sha256(original.getvalue()).hexdigest()
     _, wheel = interface_wheel.build(
         raw,
         distribution="dual-fixture",
         version="0.1.0",
-        implementation_digest=source_digest,
         implementation_wheel=original.getvalue(),
         implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
@@ -531,7 +532,6 @@ def secret(ctx: Context, payload: Request) -> Result:
         raw,
         distribution="dual-fixture",
         version="0.1.0",
-        implementation_digest=source_digest,
         implementation_wheel=wheel,
         implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
@@ -540,7 +540,6 @@ def secret(ctx: Context, payload: Request) -> Result:
         raw,
         distribution="dual-fixture",
         version="0.1.0",
-        implementation_digest="sha256:" + "33" * 32,
         implementation_wheel=wheel,
         implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
@@ -556,32 +555,28 @@ def secret(ctx: Context, payload: Request) -> Result:
             if name.startswith("_cozy_callers_"):
                 body += b"# tampered\n"
             altered.writestr(name, body)
-    with pytest.raises(ConformanceError, match="generated source changed"):
-        interface_wheel.build(
-            raw,
-            distribution="dual-fixture",
-            version="0.1.0",
-            implementation_digest=source_digest,
-            implementation_wheel=corrupted.getvalue(),
-            implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
-        )
+    # Recapture replaces the reserved companions instead of comparing their bytes.
+    _, recaptured = interface_wheel.build(
+        raw,
+        distribution="dual-fixture",
+        version="0.1.0",
+        implementation_wheel=corrupted.getvalue(),
+        implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
+    )
+    with (
+        zipfile.ZipFile(io.BytesIO(wheel)) as clean,
+        zipfile.ZipFile(io.BytesIO(recaptured)) as rebuilt,
+    ):
+        assert {name: rebuilt.read(name) for name in rebuilt.namelist()} == {
+            name: clean.read(name) for name in clean.namelist()
+        }
     with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
         archive.extractall(tmp_path / "sealed")
-    from cozy_runtime.internal.installed_interfaces import read
-    from cozy_runtime.internal.package_environment import InstalledEnvironment
-
     installed = InstalledEnvironment(
-        tmp_path, tmp_path / "sealed", Path(sys.executable), b"", "", "sha256:" + "22" * 32, True
+        "install-sealed", tmp_path, tmp_path / "sealed", Path(sys.executable), "", "", True
     )
-    inventory = read(installed)
-    assert [(row["export"], row["implementation_digest"]) for row in inventory] == [
-        ("generate", source_digest)
-    ]
-    from types import SimpleNamespace
-    from typing import Any, cast
-
-    from cozy_runtime.internal.worker.calls import Calls
-
+    inventory = installed_interfaces.read(installed)
+    assert [row["export"] for row in inventory] == ["generate"]
     interface_path = tmp_path / "package-interface.json"
     interface_path.write_bytes(raw)
     parent = SimpleNamespace(
@@ -589,10 +584,11 @@ def secret(ctx: Context, payload: Request) -> Result:
             call_interfaces=tuple(inventory),
             python=sys.executable,
             package_interface=str(interface_path),
-            build_id="sha256:" + "44" * 32,
+            installation_id="install-sealed",
         )
     )
-    bindings = [row for row in Calls.bindings(cast(Any, parent)) if row["module"] == "dual_fixture"]
+    calls = Calls(lambda _frame: None, lambda: 0, lambda: 0)
+    bindings = [row for row in calls.bindings(cast(Any, parent)) if row["module"] == "dual_fixture"]
     assert [(row["export"], row.get("self", False)) for row in bindings] == [
         ("generate", False),
         ("secret", True),
@@ -616,7 +612,7 @@ def exchange(kind,body):
         sent.append(json.loads(body["payload"]))
         return {"ok":True,"child_request_id":"child"}
     return {"ok":True,"state":"succeeded","result":'{"value":21}'}
-broker=_Broker(ctx.request_id,{(binding.interface_digest,binding.module,binding.export):binding},exchange)
+broker=_Broker(ctx.request_id,{(binding.module,binding.export):binding},exchange)
 broker.bind(ctx)
 token=_current.set(broker)
 async def run():
@@ -668,7 +664,6 @@ def test_source_overlay_preserves_platform_build_metadata_and_native_bytes(
     options = dict(
         distribution="serving-fixture",
         version="0.1.0",
-        implementation_digest="sha256:" + "11" * 32,
         implementation_filename=filename,
     )
     actual_filename, overlay = interface_wheel.build(
@@ -689,7 +684,6 @@ def test_source_overlay_preserves_platform_build_metadata_and_native_bytes(
             raw,
             distribution="serving-fixture",
             version="0.1.0",
-            implementation_digest="sha256:" + "11" * 32,
             implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
             implementation_wheel=original.getvalue(),
         )

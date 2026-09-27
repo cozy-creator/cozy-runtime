@@ -7,8 +7,10 @@ import importlib.util
 import io
 import struct
 import sys
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from types import ModuleType
+from typing import Any, cast
 
 import pytest
 import tensorfs
@@ -36,12 +38,18 @@ async def calculate(ctx: Context, *, value: int) -> int:
     return module
 
 
+def implementation(fn: Callable[..., object]) -> Callable[..., Coroutine[Any, Any, Any]]:
+    exported = _export(fn)
+    assert exported is not None
+    return cast(Callable[..., Coroutine[Any, Any, Any]], exported.implementation)
+
+
 def test_sdk_only_scope_reuses_but_changed_helper_rejects_partial_and_complete_parts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     before = algorithm(tmp_path / "before.py", 1, monkeypatch)
-    original = _export(before.calculate).implementation
+    original = implementation(before.calculate)
     identity = describe(original)["operation_identity"]
     original_value = asyncio.run(original(None, value=2))
     assert original_value == 3
@@ -64,20 +72,21 @@ def test_sdk_only_scope_reuses_but_changed_helper_rejects_partial_and_complete_p
     }
     targets = {"model": {"add": {"a": tensor, "b": tensor}, "drop": []}}
     order = [("model", "a"), ("model", "b")]
-    args = ({}, targets, {}, order, 4096)
+    args: tuple[Any, ...] = ({}, targets, {}, order, 4096)
     declaration = store.derived_declaration(*args, work_fingerprint=work)
     first, caller, changed = ("sha256:" + byte * 64 for byte in ("1", "2", "3"))
     writer = store.begin_derived(first, 1, *args, work_fingerprint=work)
     old_bytes = struct.pack("<f", original_value) * 512
     writer.add_part("model", "a", "value", io.BytesIO(old_bytes))
     checkpoint = writer.checkpoint("first", "model")
+    head, head_length = cast(str, checkpoint["head"]), cast(int, checkpoint["head_length"])
     writer.fence()
     adopted = store.adopt_derived_checkpoint(
         caller,
         first,
         declaration,
-        checkpoint["head"],
-        checkpoint["head_length"],
+        head,
+        head_length,
         operation_id="caller",
         slot="model",
     )
@@ -93,7 +102,7 @@ def test_sdk_only_scope_reuses_but_changed_helper_rejects_partial_and_complete_p
     complete = resumed.commit()
 
     after = algorithm(tmp_path / "after.py", 2, monkeypatch)
-    corrected = _export(after.calculate).implementation
+    corrected = implementation(after.calculate)
     changed_identity = describe(corrected)["operation_identity"]
     assert changed_identity != identity
     changed_work = work_fingerprint(spec, policy, operation_identity=changed_identity)
@@ -104,8 +113,8 @@ def test_sdk_only_scope_reuses_but_changed_helper_rejects_partial_and_complete_p
             changed,
             first,
             changed_declaration,
-            checkpoint["head"],
-            checkpoint["head_length"],
+            head,
+            head_length,
             operation_id="changed",
             slot="model",
         )

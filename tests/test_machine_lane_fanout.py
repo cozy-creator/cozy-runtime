@@ -37,6 +37,14 @@ def desired(placement: dict[str, Any], ordinals: tuple[int, ...]) -> pb.DesiredW
     )
 
 
+def replica(
+    worker: Worker, placement: dict[str, Any], models: list[dict[str, Any]]
+) -> tuple[dict[str, Any], list[pb.PlacementDevicePin]]:
+    reserved = machine_lanes.replica(worker, "owner", placement, models)
+    assert reserved is not None
+    return reserved
+
+
 @pytest.mark.parametrize("width", [2, 4])
 def test_eight_durable_children_spread_then_reuse_exact_replicas(
     tmp_path: Path, width: int
@@ -51,12 +59,12 @@ def test_eight_durable_children_spread_then_reuse_exact_replicas(
         worker.executions = Executions(workspace)
         placement = {
             "placement_id": "prepared",
-            "environment_digest": "sha256:" + "a" * 64,
+            "installation_id": "install-prepared",
             "bindings_digest": "sha256:" + "b" * 64,
         }
         identities = []
         for index in range(8):
-            selected, pins = machine_lanes.replica(worker, "owner", placement, [{}])
+            selected, pins = replica(worker, placement, [{}])
             ordinals = tuple(pins[0].device_ordinals)
             assert ordinals == (index % width,)
             identities.append(selected["placement_id"])
@@ -78,19 +86,17 @@ def test_eight_durable_children_spread_then_reuse_exact_replicas(
         assert identities[:width] == identities[width : 2 * width]
         for index in range(8):
             complete(worker.executions, f"child-{index}", status=pb.OUTCOME_STATUS_CANCELED)
-        selected, pins = machine_lanes.replica(worker, "owner", placement, [{}])
+        selected, pins = replica(worker, placement, [{}])
         assert selected["placement_id"] == identities[0]
         assert list(pins[0].device_ordinals) == [0]
-        group, pins = machine_lanes.replica(
-            worker, "owner", placement, [{"sequence_parallel": {"degrees": [2, 4]}}]
-        )
+        group, pins = replica(worker, placement, [{"sequence_parallel": {"degrees": [2, 4]}}])
         assert tuple(pins[0].device_ordinals) == tuple(range(width))
         assert group["placement_id"] not in identities
         # A direct or prior-owner offer is not in this owner's execution journal.
         # It still occupies a physical device, so the next child uses a free one.
         external = AttemptRecord("external", 1, b"", {}, lane_id="lane-0", state="running")
         worker.engine.history[(external.request_id, 1)] = external
-        selected, pins = machine_lanes.replica(worker, "owner", placement, [{}])
+        selected, pins = replica(worker, placement, [{}])
         assert tuple(pins[0].device_ordinals) == (1,)
         external.state = "closed"
     finally:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import time
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import msgspec
 import pytest
@@ -42,7 +42,7 @@ async def produce_image(ctx: Context, *, out: Outputs) -> ImageReport:
 
 def _result(decoded: int, media: str = "image/png") -> type:
     bound = AssetBound(max_bytes=4096, max_decoded_bytes=decoded, media_types=(media,))
-    return msgspec.defstruct("Forwarded", [("value", Annotated[ImageAsset, bound])])
+    return msgspec.defstruct("Forwarded", [("value", cast(type, Annotated[ImageAsset, bound]))])
 
 
 def _forwarding_parent(tmp_path: Path, result_type: type) -> tuple[Any, Any, list[str]]:
@@ -52,7 +52,7 @@ def _forwarding_parent(tmp_path: Path, result_type: type) -> tuple[Any, Any, lis
     parent = App()
 
     async def main(ctx: Context, payload: Empty) -> Any:
-        return result_type((await produce_image()).image)
+        return result_type((await cast(Any, produce_image)()).image)
 
     main.__annotations__["return"] = result_type
     parent.job(main)
@@ -98,11 +98,11 @@ def _forwarding_parent(tmp_path: Path, result_type: type) -> tuple[Any, Any, lis
     broker = _Broker(
         "parent",
         {
-            ("", __name__, "produce_image"): _CallType(
+            (__name__, "produce_image"): _CallType(
                 "sha256:" + "21" * 32,
                 __name__,
                 "produce_image",
-                surface.payload_type,
+                cast(type[msgspec.Struct], surface.payload_type),
                 ImageReport,
             )
         },

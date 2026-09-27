@@ -1,57 +1,58 @@
+import copy
 from types import SimpleNamespace
+from typing import Any, cast
 
-from cozy_runtime.internal.worker import machine_lanes
+import pytest
+
+from cozy_runtime.internal import hostfacts
+from cozy_runtime.internal.worker import machine_lanes, machine_model_defaults
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.protocol import worker_pb2 as pb
 
 
-def test_counted_child_reserves_exact_group_and_old_capture_keeps_prior_behavior():
+def _pins(worker: Any, *args: Any) -> list[pb.PlacementDevicePin]:
+    reserved = machine_lanes.replica(worker, "owner", *args)
+    assert reserved is not None
+    return reserved[1]
+
+
+def test_counted_child_reserves_exact_group_and_old_capture_keeps_prior_behavior() -> None:
     worker = SimpleNamespace(
         lanes=SimpleNamespace(wide=True, entries=[0, 1, 2, 3], by_id={}),
         executions=SimpleNamespace(pending=lambda owner: []),
         engine=SimpleNamespace(history={}),
     )
     placement = {"installation_id": "test-install", "bindings_digest": "sha256:" + "a" * 64}
-    h3 = [{"sequence_parallel": {"degrees": [2, 4]}}]
-    _, pins = machine_lanes.replica(worker, "owner", placement, h3, [{"gpus": 2}])
-    assert list(pins[0].device_ordinals) == [0, 1]
-    _, pins = machine_lanes.replica(worker, "owner", placement, [{}], [{"gpus": 1}])
-    assert list(pins[0].device_ordinals) == [0]
-    _, pins = machine_lanes.replica(worker, "owner", placement, h3)
-    assert list(pins[0].device_ordinals) == [0, 1, 2, 3]
+    h3: list[dict[str, Any]] = [{"sequence_parallel": {"degrees": [2, 4]}}]
+    assert list(_pins(worker, placement, h3, [{"gpus": 2}])[0].device_ordinals) == [0, 1]
+    assert list(_pins(worker, placement, [{}], [{"gpus": 1}])[0].device_ordinals) == [0]
+    assert list(_pins(worker, placement, h3)[0].device_ordinals) == [0, 1, 2, 3]
 
 
-def test_counted_group_cannot_exceed_granted_pool_even_on_a_larger_host():
-    import pytest
-
-    from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-
+def test_counted_group_cannot_exceed_granted_pool_even_on_a_larger_host() -> None:
     worker = SimpleNamespace(lanes=SimpleNamespace(wide=False, entries=[0]))
     with pytest.raises(WorkspaceRefusal, match="granted device pool"):
         machine_lanes.replica(
-            worker, "owner", {}, [{"sequence_parallel": {"degrees": [2, 4]}}], [{"gpus": 2}]
+            cast(Any, worker),
+            "owner",
+            {},
+            [{"sequence_parallel": {"degrees": [2, 4]}}],
+            [{"gpus": 2}],
         )
 
 
-def test_counted_capture_needs_feature63_but_old_capture_accepts62():
-    import copy
-
-    import pytest
-
-    from cozy_runtime.internal.worker import machine_model_defaults
-    from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-    from cozy_runtime.protocol import worker_pb2 as pb
-
-    row = {
+def test_counted_capture_needs_feature63_but_old_capture_accepts62() -> None:
+    rung: dict[str, Any] = {
+        "gpu": "H100",
+        "repository": "proof/h3",
+        "manifest": {"digest": "sha256:" + "a" * 64, "length": 1},
+    }
+    row: dict[str, Any] = {
         "callee_installation_id": "installed",
         "entrypoint": "run",
         "parameter": "model",
         "public_origin": "https://hub.example",
-        "rungs": [
-            {
-                "gpu": "H100",
-                "repository": "proof/h3",
-                "manifest": {"digest": "sha256:" + "a" * 64, "length": 1},
-            }
-        ],
+        "rungs": [rung],
     }
     capture = {
         "bindings": [{"callee_installation_id": "installed", "entrypoint": "run"}],
@@ -60,11 +61,11 @@ def test_counted_capture_needs_feature63_but_old_capture_accepts62():
     interfaces = {
         "installed": {"entrypoints": [{"name": "run", "models": [{"path": "run.models.model"}]}]}
     }
-    worker = SimpleNamespace(config=SimpleNamespace(bootstrap_credential=""))
+    worker = cast(Any, SimpleNamespace(config=SimpleNamespace(bootstrap_credential="")))
     request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=62))
     machine_model_defaults.verify(worker, request, capture, interfaces)
-    row["rungs"][0]["gpus"] = 2
-    second = copy.deepcopy(row["rungs"][0])
+    rung["gpus"] = 2
+    second = copy.deepcopy(rung)
     second["gpus"] = 4
     row["rungs"].append(second)
     with pytest.raises(WorkspaceRefusal, match="require wire63"):
@@ -73,14 +74,10 @@ def test_counted_capture_needs_feature63_but_old_capture_accepts62():
     machine_model_defaults.verify(worker, request, capture, interfaces)
 
 
-def test_selection_uses_granted_pool_and_old_rows_do_not_need_count_probe(monkeypatch):
-    import pytest
-
-    from cozy_runtime.internal import hostfacts
-    from cozy_runtime.internal.worker import machine_model_defaults as defaults
-    from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-
-    row = {
+def test_selection_uses_granted_pool_and_old_rows_do_not_need_count_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row: dict[str, Any] = {
         "callee_installation_id": "installed",
         "entrypoint": "run",
         "parameter": "model",
@@ -93,22 +90,26 @@ def test_selection_uses_granted_pool_and_old_rows_do_not_need_count_probe(monkey
             capture_root=lambda *_: "root", capture=lambda *_: {"model_defaults": [row]}
         ),
     )
-    target = SimpleNamespace(
-        installation_id="installed",
-        entrypoint="run",
-        declaration={"models": [{"path": "run.models.model"}]},
+    target = cast(
+        Any,
+        SimpleNamespace(
+            installation_id="installed",
+            entrypoint="run",
+            declaration={"models": [{"path": "run.models.model"}]},
+        ),
     )
-    call = SimpleNamespace(parent_request="parent")
+    call = cast(Any, SimpleNamespace(parent_request="parent"))
     monkeypatch.setattr(
-        defaults.hostfacts,
+        hostfacts,
         "measure",
         lambda _: hostfacts.HostFacts(
             gpu_name="NVIDIA H100", gpu_count=4, unreadable=("gpu_count",)
         ),
     )
-    assert "gpus" not in defaults.select(worker, "owner", call, target, {})[0]
+    select = machine_model_defaults.select
+    assert "gpus" not in select(cast(Any, worker), "owner", call, target, {})[0]
     row["rungs"] = [{"gpu": "H100", "gpus": 4}, {"gpu": "H100", "gpus": 2}]
     with pytest.raises(WorkspaceRefusal, match="readable granted GPU count"):
-        defaults.select(worker, "owner", call, target, {})
+        select(cast(Any, worker), "owner", call, target, {})
     worker.lanes = SimpleNamespace(entries=[0, 1])
-    assert defaults.select(worker, "owner", call, target, {})[0]["gpus"] == 2
+    assert select(cast(Any, worker), "owner", call, target, {})[0]["gpus"] == 2

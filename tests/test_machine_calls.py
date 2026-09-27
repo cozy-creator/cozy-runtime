@@ -11,7 +11,6 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
-from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_machine_execution import complete, offer
 
@@ -31,9 +30,7 @@ def running(executions: Executions, request: str = "parent") -> pb.AttemptOffer:
 def request(
     parent: pb.AttemptOffer, *, value: int = 1, module: str = "library"
 ) -> pb.ChildCallRequest:
-    interface = b"i" * 32
     intent = {
-        "interface_digest": documents.spell(interface),
         "module": module,
         "export": "publish",
         "request": {"value": value},
@@ -43,7 +40,6 @@ def request(
         parent_attempt_ordinal=parent.attempt_ordinal,
         parent_invocation_spec_digest=parent.invocation_spec_digest,
         call_index=0,
-        interface_digest=interface,
         module=module,
         export="publish",
         request_canonical_bytes=canonical_json.encode({"value": value}),

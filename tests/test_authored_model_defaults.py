@@ -130,8 +130,9 @@ def test_defaults_do_not_open_other_fixed_point_locations(tmp_path: Path) -> Non
         package_interface.assemble(
             str(body["application"]), [("entrypoint", body["entrypoints"][0])], {}
         )
-    with pytest.raises(ConformanceError):
-        package_interface.read_bytes(package_interface.canonical_bytes(body))
+    # A reader ignores fields another Runtime wrote; only the author surface refuses.
+    read = package_interface.read_bytes(package_interface.canonical_bytes(body))
+    assert read["entrypoints"][0]["name"] == body["entrypoints"][0]["name"]
 
 
 def test_conflicting_decorator_declarations_refuse(tmp_path: Path) -> None:
@@ -176,22 +177,15 @@ def test_explicit_gpu_count_is_preserved_and_validated() -> None:
 
 def test_gpu_count_requires_the_models_declared_group() -> None:
     defaults = default_ladder([{"gpu": "H100", "gpus": 2, "lane": "paul/minimax-h3@1.0.0/fp8"}])
-    kwargs = dict(
-        path="run.models.model",
-        class_name="Demo",
-        encoded_leaves="refuse",
-        fusion="refuse",
-        components={},
-        defaults=defaults,
-    )
-    assert (
-        package_interface.model_slot(sequence_parallel=[2, 4], **kwargs)["default_ladder"][0][
-            "gpus"
-        ]
-        == 2
-    )
+
+    def slot(sequence_parallel: list[int]) -> Any:
+        return package_interface.model_slot(
+            "run.models.model", "Demo", "refuse", "refuse", {}, sequence_parallel, defaults=defaults
+        )
+
+    assert slot([2, 4])["default_ladder"][0]["gpus"] == 2
     with pytest.raises(ConformanceError):
-        package_interface.model_slot(sequence_parallel=[4], **kwargs)
+        slot([4])
 
 
 def test_counted_artifact_with_malformed_parallel_contract_refuses_typed(tmp_path: Path) -> None:

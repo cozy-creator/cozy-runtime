@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import copy
 import json
+from typing import Any
 
 import pytest
 
 from cozy_runtime.internal import base_observation, image_inventory
 
 
-def test_observation_accepts_additions_but_retains_required_facts_and_types():
+def test_observation_accepts_additions_but_retains_required_facts_and_types() -> None:
     current = base_observation.Observation(
         python_abi="cp312",
         os_arch="linux/amd64",
@@ -41,8 +42,8 @@ def test_observation_accepts_additions_but_retains_required_facts_and_types():
             base_observation._parse({**extended, name: invalid})
 
 
-def test_image_inventory_accepts_additive_metadata_but_not_missing_or_invalid_facts():
-    body = {
+def test_image_inventory_accepts_additive_metadata_but_not_missing_or_invalid_facts() -> None:
+    body: dict[str, Any] = {
         "format": image_inventory.INVENTORY_FORMAT,
         "profile": "cpu",
         "python": "3.12.12",
