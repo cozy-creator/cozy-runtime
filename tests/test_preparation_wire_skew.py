@@ -1,4 +1,4 @@
-"""Both supported prepare shapes install with uv and describe only without metadata."""
+"""Both supported prepare shapes install with uv and describe once, only without metadata."""
 
 from __future__ import annotations
 
@@ -179,7 +179,8 @@ def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata
                         assert not compatibility.refusal_code and not compatibility.refusal_detail
                         legacy = client.PreparePackageSet(request)
                         assert _placement(legacy) == _placement(modern)
-                        assert len(worker.descriptions) == 3 * described
+                        # One immutable installation is described once per worker.
+                        assert len(worker.descriptions) == described
                         worker.assert_describes_reaped()
                         # One release and lock is one reused environment.
                         installations = (root / "installs/installations").glob("release-*")
@@ -191,7 +192,7 @@ def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata
                         request.model_slot_paths.append("serve.models.unexpected")
                         request.package_interface = b"{}"
                         assert _placement(client.PreparePackageSet(request)) == _placement(modern)
-                        assert len(worker.descriptions) == 4 * described
+                        assert len(worker.descriptions) == described
                         # Failure also returns only after the dedicated executor is reaped.
                         installed = next(iter(worker.prepared_installations.values())).installed
                         assert installed is not None
