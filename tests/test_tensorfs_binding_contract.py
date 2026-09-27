@@ -63,6 +63,7 @@ CALLED: dict[str, str] = {
         "sample_seconds=None, cancellation=None, progress=None)"
     ),
     "PullCancellation": "()",
+    "transfer_streams": "(wanted)",
     "PullCancellation.cancel": "(self, /)",
     "gc": "(root, dry_run=False, *, evict_cached=False, keep_manifests=Ellipsis)",
     "fit": (
@@ -88,7 +89,7 @@ CALLED: dict[str, str] = {
     ),
     "Store.materialize_source": (
         "(self, /, owner, members, *, allowed_hosts, credential_hosts=Ellipsis, "
-        "credential=Ellipsis, allow_local=False)"
+        "credential=Ellipsis, allow_local=False, progress=None)"
     ),
     "Store.prepare_source_artifact": (
         "(self, /, source_owner, operation_id, profiles, *, checkpoints=Ellipsis, "

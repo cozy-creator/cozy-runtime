@@ -143,10 +143,9 @@ def test_download_and_conversion_report_bytes_rate_and_stage_timings(tmp_path: P
     assert download[0] == {"kind": "progress", "stage": "Downloading source"}
     samples = [frame for frame in download if frame["kind"] == "progress" and "total" in frame]
     assert all(frame["unit"] == "bytes" and frame["total"] == len(body) for frame in samples)
+    # TensorFS reports bytes as they become durable: at each 64 MiB checkpoint and when a run
+    # ends. This carrier is one short run; a mid-body report is the resume test's subject.
     assert samples[-1]["position"] == len(body)
-    # The spaced origin writes are observed as they land, each with its measured rate.
-    middle = [frame for frame in samples if 0 < frame["position"] < len(body)]
-    assert middle and any(frame.get("rate", 0) > 0 for frame in middle), samples
     ended = download[-1]
     assert ended["kind"] == "log" and ended["value"] == "info"
     fields = ended["fields"]

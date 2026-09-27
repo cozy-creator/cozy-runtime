@@ -7,20 +7,15 @@ The parent owns acceptance and memoization; this child owns only bounded native 
 from __future__ import annotations
 
 import base64
-import contextlib
 import faulthandler
 import hashlib
-import inspect
 import os
 import sys
 import threading
-from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill
-from cozy_runtime.internal.worker.stage_progress import SAMPLE_SECONDS
 
 MAX_COMMAND = 2 << 20
 _STDOUT = threading.Lock()
@@ -36,68 +31,18 @@ def report(stage: str, position: int, total: int) -> None:
         sys.stdout.buffer.flush()
 
 
-def landed_bytes(store: Any, root: Path, owner: str, members: Sequence[Sequence[Any]]) -> int:
-    """Bytes of a selection present locally: complete objects plus their durable prefixes.
-
-    Only for a binding without a download progress callback. Allocated blocks bound a
-    sparse part, so a preallocated or out-of-order part never overstates progress.
-    """
-    present = 0
-    for digest, length in {str(row[1]): int(row[2]) for row in members}.items():
-        hex_digest = digest.removeprefix("sha256:")
-        if store.contains(hex_digest):
-            present += length
-            continue
-        part = root / "roots/source-downloads" / owner.removeprefix("sha256:") / hex_digest
-        try:
-            stat = (part / "bytes.part").stat()
-        except FileNotFoundError:
-            continue
-        present += min(stat.st_size, stat.st_blocks * 512, length)
-    return present
-
-
-def reports_progress(function: Any) -> bool:
-    """Whether a binding declares the download progress callback (TensorFS > 0.3.57)."""
-    try:
-        return "progress" in inspect.signature(function).parameters
-    except (TypeError, ValueError):
-        return False
-
-
 def materialize(store: Any, command: dict[str, Any]) -> dict[str, Any]:
     selected = command["selection"]
     members = [tuple(member) for member in selected["members"]]
-    total = sum({str(row[1]): int(row[2]) for row in members}.values())
-    options: dict[str, Any] = {
-        "allowed_hosts": selected["allowed_hosts"],
-        "credential_hosts": selected["credential_hosts"],
-        "credential": command.get("credential", ""),
-        "allow_local": command.get("allow_local", False),
-    }
-    produced: dict[str, Any]
-    if reports_progress(store.materialize_source):
-        options["progress"] = lambda present, whole: report("download", present, whole)
-        produced = store.materialize_source(command["native_owner"], members, **options)
-        return produced
-    stopped = threading.Event()
-
-    def sample() -> None:
-        root, owner = Path(command["store"]), command["native_owner"]
-        while True:
-            # Optional narration: an unreadable sample is skipped, never a download failure.
-            with contextlib.suppress(Exception):
-                report("download", landed_bytes(store, root, owner, members), total)
-            if stopped.wait(SAMPLE_SECONDS):
-                return
-
-    sampler = threading.Thread(target=sample, daemon=True, name="source-progress")
-    sampler.start()
-    try:
-        produced = store.materialize_source(command["native_owner"], members, **options)
-    finally:
-        stopped.set()
-        sampler.join()
+    produced: dict[str, Any] = store.materialize_source(
+        command["native_owner"],
+        members,
+        allowed_hosts=selected["allowed_hosts"],
+        credential_hosts=selected["credential_hosts"],
+        credential=command.get("credential", ""),
+        allow_local=command.get("allow_local", False),
+        progress=lambda present, whole: report("download", present, whole),
+    )
     return produced
 
 
