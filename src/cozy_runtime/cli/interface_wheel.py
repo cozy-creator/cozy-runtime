@@ -25,7 +25,7 @@ def run(args: list[str]) -> Result:
         raw = sys.stdin.buffer.read((64 << 10) + 1)
         if len(raw) > 64 << 10:
             raise ValueError("interface generation input exceeds 64 KiB")
-        request = canonical.parse_canonical(raw.rstrip(b"\n"))
+        request = canonical.parse(raw.rstrip(b"\n"))
         fields = {
             "interface_path",
             "distribution",
@@ -34,12 +34,10 @@ def run(args: list[str]) -> Result:
             "implementation_wheel",
             "implementation_wheel_digest",
         }
-        if (
-            not isinstance(request, dict)
-            or set(request) != fields
-            or not all(isinstance(value, str) and value for value in request.values())
+        if not isinstance(request, dict) or not all(
+            isinstance(request.get(name), str) and request[name] for name in fields
         ):
-            raise ValueError("interface generation input has unknown/missing fields")
+            raise ValueError("interface generation input is missing a field")
         path = Path(request["interface_path"])
         if not path.is_file():
             raise ValueError("interface input is not a regular file")
