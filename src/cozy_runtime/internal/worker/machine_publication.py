@@ -34,6 +34,9 @@ _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 _MAX_METADATA = 8 << 20
 # Most pushes in flight; the caller narrows it to the memory the pod can use.
 PUBLICATION_UPLOADS = 16
+# Hub's per-request object selection bound, and the progress-publication object bound.
+_PUBLICATION_WINDOW = 128
+_PUBLICATION_OBJECTS = 4096
 
 
 class PublicationRefusal(Exception):
@@ -181,8 +184,9 @@ class MachinePublicationClient:
 
     def request(self, method: str, path: str, body: bytes | None = None) -> bytes:
         _require(
-            method in {"GET", "POST", "PUT"}
+            method in {"GET", "POST", "PUT", "DELETE"}
             and path.startswith("/v1/models/")
+            and (method != "DELETE" or "/publications/" in path)
             and not any(c in path for c in "\r\n?#"),
             "publication.route_forbidden",
         )
@@ -488,7 +492,49 @@ def upload_checkpoint(
         observed[key] = length
         if state not in {"accepted", "verifying"}:
             pending.append(key)
-    pending.sort()
+    stage_objects(client, path, objects, pending, before_stage, push, landed, window)
+    before_write()
+    try:
+        answer = _object(
+            client.request(
+                "POST",
+                path + "/finalize",
+                canonical_json.encode(
+                    {"manifest_id": manifest.digest, "manifest_length": manifest.length}
+                ),
+            )
+        )
+    except PublicationRefusal as exc:
+        if exc.status in _RETRYABLE or exc.status >= 500:
+            raise
+        # Hub refused this commit request. Only an earlier durable job can still land.
+        settled = reconcile_checkpoint(
+            client, operation=operation, checkpoint=checkpoint, objects=objects
+        )
+        if settled is None:
+            raise PublicationUncommitted(exc.code, status=exc.status) from exc
+        return settled
+    if "operation" in answer:
+        return _settle(answer, path, operation, checkpoint, objects)
+    return _checkpointed(answer, operation, checkpoint, objects)
+
+
+def stage_objects(
+    client: PublicationClient,
+    path: str,
+    objects: Mapping[str, int],
+    pending: list[str],
+    before_stage: Callable[[], None],
+    push: Callable[[str, int, str], None],
+    landed: Callable[[int, int], None],
+    window: int,
+) -> None:
+    """Grant and push the claimed members of one open publication the Hub does not hold.
+
+    ``landed`` receives the count and bytes of ``objects`` the Hub is known to hold;
+    ``window`` bounds the pushes in flight.
+    """
+    pending = sorted(pending)
     held_count = len(objects) - len(pending)
     held_bytes = sum(objects.values()) - sum(objects[key] for key in pending)
     count_lock = threading.Lock()
@@ -584,30 +630,92 @@ def upload_checkpoint(
             for future in done:
                 if failure is None:
                     failure = future.exception()
-    before_write()
-    try:
-        answer = _object(
+
+
+def retain_objects(
+    client: PublicationClient,
+    *,
+    destination: str,
+    operation: str,
+    objects: Mapping[str, int],
+    before_stage: Callable[[], None],
+    push: Callable[[str, int, str], None],
+    window: int,
+) -> None:
+    """Put exact objects in Hub custody under an open publication that never finalizes.
+
+    Returns once Hub has verified every one. A later checkpoint naming them claims them
+    without their bytes; ``abandon_publication`` releases this hold after it commits.
+    """
+    _require(0 < len(objects) <= _PUBLICATION_OBJECTS and bool(operation))
+    _require(
+        all(
+            _DIGEST.fullmatch(key) and type(size) is int and size > 0
+            for key, size in objects.items()
+        )
+    )
+    path = destination_path(destination) + "/publications/" + quote(operation, safe="")
+    before_stage()
+    opened = _object(
+        client.request(
+            "PUT",
+            path,
+            canonical_json.encode(
+                {
+                    "objects": [
+                        {"object_id": key, "length": size} for key, size in sorted(objects.items())
+                    ]
+                }
+            ),
+        )
+    )
+    publication = opened.get("publication")
+    if not isinstance(publication, dict) or not isinstance(publication.get("objects"), list):
+        raise PublicationRefusal("publication.response_invalid")
+    _require(
+        publication.get("operation") == operation
+        and publication.get("state") == "open"
+        and len(publication["objects"]) == len(objects),
+        "publication.response_invalid",
+    )
+    pending: list[str] = []
+    for row in publication["objects"]:
+        _require(isinstance(row, dict), "publication.response_invalid")
+        key, state = row.get("object_id"), row.get("state")
+        _require(key in objects and row.get("length") == objects[key])
+        _require(state in {"accepted", "verifying", "claimed", "transferring"})
+        if state not in {"accepted", "verifying"}:
+            pending.append(key)
+    stage_objects(client, path, objects, pending, before_stage, push, lambda _n, _b: None, window)
+    keys = sorted(objects)
+    for offset in range(0, len(keys), _PUBLICATION_WINDOW):
+        selected = keys[offset : offset + _PUBLICATION_WINDOW]
+        before_stage()
+        verified = _object(
             client.request(
-                "POST",
-                path + "/finalize",
-                canonical_json.encode(
-                    {"manifest_id": manifest.digest, "manifest_length": manifest.length}
-                ),
+                "POST", path + "/verify", canonical_json.encode({"object_ids": selected})
             )
+        ).get("publication")
+        if not isinstance(verified, dict) or not isinstance(verified.get("objects"), list):
+            raise PublicationRefusal("publication.response_invalid")
+        accepted = {
+            row.get("object_id")
+            for row in verified["objects"]
+            if isinstance(row, dict) and row.get("state") == "accepted"
+        }
+        _require(accepted >= set(selected), "publication.custody_unverified")
+
+
+def abandon_publication(client: PublicationClient, *, destination: str, operation: str) -> None:
+    """Release an open publication's holds; one already gone is already released."""
+    try:
+        client.request(
+            "DELETE",
+            destination_path(destination) + "/publications/" + quote(operation, safe=""),
         )
     except PublicationRefusal as exc:
-        if exc.status in _RETRYABLE or exc.status >= 500:
+        if exc.status != 404:
             raise
-        # Hub refused this commit request. Only an earlier durable job can still land.
-        settled = reconcile_checkpoint(
-            client, operation=operation, checkpoint=checkpoint, objects=objects
-        )
-        if settled is None:
-            raise PublicationUncommitted(exc.code, status=exc.status) from exc
-        return settled
-    if "operation" in answer:
-        return _settle(answer, path, operation, checkpoint, objects)
-    return _checkpointed(answer, operation, checkpoint, objects)
 
 
 def attach_assessment(

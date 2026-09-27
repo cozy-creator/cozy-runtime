@@ -149,7 +149,12 @@ class Lease:
                 self._context = None
 
 
-def acquire(*writes: Write) -> Lease:
+def acquire(*writes: Write, recover: bool = True) -> Lease:
+    """Admit the writes, reclaiming workspace cache once on a refusal when ``recover``.
+
+    Without ``recover`` a refusal is a pure observation: its facts measure the disk and
+    nothing is evicted for a request the caller may shrink instead.
+    """
     if not pressure_enabled():
         return Lease()
     if _held.get():
@@ -184,7 +189,7 @@ def acquire(*writes: Write) -> Lease:
     except StorageRefusal as exc:
         # The failed exchange/exclusion is closed before native recovery. A single
         # retry re-observes real capacity; a busy collector cannot fabricate space.
-        if not _recover(writes, exc.facts):
+        if not recover or not _recover(writes, exc.facts):
             raise
         context = admission()
         context.__enter__()

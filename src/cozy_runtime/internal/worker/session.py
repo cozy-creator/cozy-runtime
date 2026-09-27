@@ -1223,6 +1223,9 @@ class Worker:
                 ),
                 spool_root=self.engine.spool_root,
                 progress=self.native_progress,
+                publication=(
+                    self.machine_effects.source_client if self.machine_effects is not None else None
+                ),
             )
             if self.workspace is not None
             else None

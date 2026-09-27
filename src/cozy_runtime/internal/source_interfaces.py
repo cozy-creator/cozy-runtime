@@ -10,6 +10,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, SourceArtifact
 from cozy_runtime.author._calls import _CallType
 from cozy_runtime.author._output_commit import CommittedFile
+from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.author.sources import _SourceFilesResult
 from cozy_runtime.internal import schema
 
@@ -35,6 +36,21 @@ class Convert(msgspec.Struct, frozen=True):
     profiles: tuple[str, ...] = ()
 
 
+class UploadHuggingFace(msgspec.Struct, frozen=True):
+    repository: str
+    revision: str
+    destination: str
+    profiles: tuple[str, ...] = ()
+    carriers: tuple[str, ...] = ()
+
+
+class UploadCivitai(msgspec.Struct, frozen=True):
+    version: int
+    destination: str
+    profiles: tuple[str, ...]
+    file: str = ""
+
+
 class SourceFiles(msgspec.Struct, frozen=True):
     source: SourceArtifact
 
@@ -52,7 +68,11 @@ _TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
     "convert_cozytensors": (Convert, ModelArtifact),
     "source_files": (SourceFiles, _SourceFilesResult),
     "commit_file": (CommitFile, CommittedFile),
+    "upload_huggingface": (UploadHuggingFace, CheckpointRef),
+    "upload_civitai": (UploadCivitai, CheckpointRef),
 }
+#: Operations that stream a provider source through conversion into a publication.
+UPLOADS = ("upload_huggingface", "upload_civitai")
 #: Each operation's output semantics, bumped by hand when the same inputs would produce
 #: a different result. Native source memo keys carry this, never a source-tree hash.
 OPERATION_VERSIONS: dict[str, int] = {name: 1 for name in _TYPES}

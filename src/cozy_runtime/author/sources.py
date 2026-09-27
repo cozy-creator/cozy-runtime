@@ -1,7 +1,8 @@
 """Awaitable native source operations for ordinary private Python scripts.
 
 The admitted deployment adapter owns credentials and source acceptance. Calls use
-TensorFS locally or on the private worker and never publish the script or its sources.
+TensorFS locally or on the private worker and never publish the script or its sources;
+an upload publishes only its converted checkpoint to the admitted destination.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from cozy_runtime.author._assets import Tree
 from cozy_runtime.author._calls import _current
 from cozy_runtime.author._errors import CapabilityError, UnsupportedInput
 from cozy_runtime.author._markers import AssetBound
+from cozy_runtime.author.publication import CheckpointRef
 
 SOURCE_FILES_MAX_BYTES = 64 << 20
 
@@ -114,3 +116,67 @@ async def ingest_huggingface(repository: str, *, revision: str) -> ModelArtifact
     # declares the Model that Runtime injects from that receipt at admission.
     prepare = cast(Callable[..., Awaitable[ModelArtifact]], prepare_model)
     return await prepare(source=model, metadata=await source_files(metadata), recipe=recipe.name)
+
+
+def _profiles(profiles: tuple[str, ...]) -> tuple[str, ...]:
+    if len(set(profiles)) != len(profiles):
+        raise UnsupportedInput(
+            "source profiles must be distinct", code="model_source_profiles_invalid"
+        )
+    return profiles
+
+
+def upload_huggingface(
+    repository: str,
+    *,
+    revision: str,
+    destination: str,
+    profiles: tuple[str, ...] = (),
+    carriers: tuple[str, ...] = (),
+) -> Awaitable[CheckpointRef]:
+    """Download, convert and publish one checkpoint within the machine's free disk.
+
+    Reviewed profiles select and convert the source; carriers narrow the selection to
+    exact members instead. With neither, the model's reviewed recipe decides both and
+    attaches its metadata. Bodies stream through a window sized to the observed disk.
+    """
+    if carriers and not profiles:
+        raise UnsupportedInput(
+            "carriers need the reviewed profiles that convert them",
+            code="model_source_profiles_invalid",
+        )
+    return cast(
+        Awaitable[CheckpointRef],
+        _call(
+            "upload_huggingface",
+            {
+                "repository": repository,
+                "revision": revision,
+                "destination": destination,
+                "profiles": _profiles(profiles),
+                "carriers": carriers,
+            },
+        ),
+    )
+
+
+def upload_civitai(
+    version: int, *, destination: str, profiles: tuple[str, ...], file: str = ""
+) -> Awaitable[CheckpointRef]:
+    """Download, convert and publish one Civitai file within the machine's free disk."""
+    if not profiles:
+        raise UnsupportedInput(
+            "a Civitai upload names its reviewed profiles", code="model_source_profiles_invalid"
+        )
+    return cast(
+        Awaitable[CheckpointRef],
+        _call(
+            "upload_civitai",
+            {
+                "version": version,
+                "destination": destination,
+                "profiles": _profiles(profiles),
+                "file": file,
+            },
+        ),
+    )

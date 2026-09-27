@@ -175,6 +175,20 @@ class Effects:
             self.stages[key] = stage
         return stage
 
+    def source_client(self, owner: str, request: str, ordinal: int) -> PublicationClient:
+        """An upload source operation publishes under the same gates as an effect call."""
+        with self.workspace.locked() as db:
+            pure = db.execute(
+                "SELECT memoize FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                (owner, request, ordinal),
+            ).fetchone()
+        if pure is None or pure["memoize"]:
+            raise PublicationRefusal("publication.impure_call_forbidden")
+        grant = self.executions.publication_authorization(owner, request)
+        if not grant or self.authority is None:
+            raise PublicationRefusal("publication.authority_absent", status=403)
+        return self.authority.client(grant)
+
     def _before_stage(self, owner: str, call: Call) -> None:
         with self.lock:
             if self.stopped:
