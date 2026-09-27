@@ -28,15 +28,27 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
+import tensorfs
 
+from cozy_runtime.derive import plan
 from cozy_runtime.internal import canonical
-from cozy_runtime.internal.encoding import SPEC_VECTORS
+from cozy_runtime.internal.encoding import (
+    SPEC_MXFP8,
+    SPEC_ROWWISE,
+    SPEC_ROWWISE_KEEPDIM,
+    SPEC_VECTORS,
+    DeviceFacts,
+    launch_providers,
+)
 from cozy_runtime.internal.probe import (
     case_dtype,
     observed_capability_records,
+    qualify,
     spec_vector_document,
 )
+from test_derive_quantize_facade import mint, run
 
 #: The exact keys TensorFS's `CapabilityRecords::parse_observed` requires, all of them, on
 #: every record. It reads with unknown fields refused, so a surplus key and a missing key are
@@ -268,7 +280,42 @@ def test_the_mined_cases_actually_run_against_the_shipped_decoder() -> None:
     from cozy_runtime.internal.probe import _spec_vectors
 
     provider = RowwiseDequant(SPEC_ROWWISE)
-    report = _spec_vectors(torch, provider, torch.device("cpu"), torch.bfloat16, "bfloat16")
+    report = _spec_vectors(torch, provider, torch.device("cpu"))
     assert not report.get("skipped"), report
     assert report["passed"], report
     assert report["cases"], "the bf16 case the mined document carries has to have run"
+
+
+@needs_torch
+def test_a_float16_fp8_lane_fits_the_card_its_decode_qualified_on(tmp_path: Path) -> None:
+    """Run 1312: an fp8-rowwise SDXL lane on an RTX 3090 refused `encoding_unqualified ...
+    no qualification observation on cuda.sm86 (qualified on: cpu)`. SDXL fills float16 and
+    the rowwise and mxfp8 documents mine f32 and bf16 cases, so filtering the mined cases by
+    the requested dtype skipped the vector check, `_reportable` dropped the skip, and TensorFS
+    received no record. The decode floors are `any`: the real suite runs here on CPU, and its
+    observations are keyed to sm86 because the decode arithmetic is the card's."""
+    import torch
+
+    values = np.arange(256, dtype="<f2").reshape(8, 32) / 256
+    store, source = mint(tmp_path, {"unet": {"a.weight": ("f16", (8, 32), values.tobytes())}})
+    _, lane = run(tmp_path, store, source, plan(("unet",), "fp8-rowwise/1"))
+    header = store.manifest(lane.manifest.digest)["header"]
+
+    cpu = DeviceFacts("cpu", "cpu", 0, "", "default")
+    _, result = qualify(torch, launch_providers(), cpu, ["float16"], release="test")
+    result["device_predicate"] = "cuda.sm86"
+    for observation in result["observations"]:
+        observation["device_predicate"] = "cuda.sm86"
+    document = observed_capability_records(result)
+    reported = {r["encoding"] for r in document["records"]}
+    assert {SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM, SPEC_MXFP8} <= reported
+
+    verdict = tensorfs.fit(
+        [tensorfs.TensorRequirement("unet", "a.weight", [8, 32], None)],
+        header,
+        custody="canonical",
+        encoded_leaves=True,
+        device="cuda.sm86",
+        observations=canonical.write(document),
+    )
+    assert verdict["ok"], verdict
