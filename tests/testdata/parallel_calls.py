@@ -24,6 +24,7 @@ from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.parallel.cp import in_gated_call
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.weights_sink import weights_transaction_id
+from cozy_runtime.models.minimax_h3.vae_tiles import TileBatchedVideoVAE
 
 
 class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in the base checking env
@@ -263,6 +264,38 @@ def hosted_model() -> HostedCalls:
     return HostedCalls.for_test(dit=base.dit, text_encoder=Conditioner(), vae=torch.nn.Linear(2, 2))
 
 
+class SpreadCalls(H3Calls):
+    vae: Any
+
+    @uses_components("vae")
+    def decode(self, z: Any) -> Any:
+        with torch.no_grad():
+            return torch.cat(list(self.vae.decode_chunks(z)), dim=2)
+
+
+def tiny_vae() -> Any:
+    """H3's video VAE at a few thousand parameters: the same temporal clips and cross-fade."""
+    torch.manual_seed(3)
+    return TileBatchedVideoVAE(
+        latent_channels=4,
+        block_out_channels=(8,) * 6,
+        layers_per_block=1,
+        norm_num_groups=4,
+        decoder_num_layers=1,
+        decoder_num_attention_heads=2,
+        decoder_attention_head_dim=8,
+        decoder_num_register_tokens=1,
+        decoder_ffn_mult=1,
+        latents_mean=(0.0,) * 4,
+        latents_std=(1.0,) * 4,
+    ).eval()
+
+
+def spread_model() -> SpreadCalls:
+    base = h3_model()
+    return SpreadCalls.for_test(dit=base.dit, text_encoder=base.text_encoder, vae=tiny_vae())
+
+
 def h3_batch(*, mixed_lengths: bool = False) -> dict[str, Any]:
     # Interleaved modalities exercise packed indices across each shard. Gloo cannot
     # gather uneven tensor sizes, so both packings are 56 rows, which every declared degree
@@ -311,8 +344,9 @@ def main() -> None:
     parser.add_argument("--h3", action="store_true")
     parser.add_argument("--staged", action="store_true")
     parser.add_argument("--hosted", action="store_true")
+    parser.add_argument("--spread", action="store_true")
     args = parser.parse_args()
-    args.h3 = args.h3 or args.hosted
+    args.h3 = args.h3 or args.hosted or args.spread
     torch.set_num_threads(1)
     _capture_seal()
     channel = Channel(socket.socket(fileno=args.rank_fd))
@@ -321,6 +355,8 @@ def main() -> None:
     model: Any = (
         hosted_model()
         if args.hosted
+        else spread_model()
+        if args.spread
         else h3_model()
         if args.h3
         else collective_model(args.root / f"rank-{args.rank}" if args.staged else None)
@@ -329,7 +365,7 @@ def main() -> None:
     executor._group_model_key = "fixture"
     roots = (
         {"dit": model.dit, "text_encoder": model.text_encoder, "vae": model.vae}
-        if args.hosted
+        if args.hosted or args.spread
         else {"dit": model.dit, "text_encoder": model.text_encoder}
         if args.h3
         else {"block": model.block, "overlay": model.overlay, "spare": model.spare}

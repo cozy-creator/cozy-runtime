@@ -5,7 +5,8 @@ The sampler and its Python state stay on rank 0."""
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Mapping
+import itertools
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +116,49 @@ def _hosted(
     return hosted
 
 
+def install_spread(
+    component: Any,
+    *,
+    name: tuple[str, str],
+    prepared: Mapping[tuple[str, str], tuple[Any, Any]],
+    group: RankGroup,
+    spool: Callable[[], Path | None],
+    ranks: tuple[int, ...],
+    device: Any,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> None:
+    """Let `author.spread` run `component`'s pure method calls on `ranks` (rank 0 first)."""
+
+    def spread(method: str, arguments: Iterator[tuple[Any, ...]]) -> Iterator[Any]:
+        local = getattr(component, method)
+        if prepared[name][0]._cozy_active is None:
+            # Outside a component scope no follower may stage it: run here.
+            yield from (local(*args) for args in arguments)
+            return
+        while batch := list(itertools.islice(arguments, len(ranks))):
+            sent: list[tuple[int, wire.TensorSpool]] = []
+            try:
+                for rank, args in zip(ranks[1:], batch[1:], strict=False):
+                    command, payloads = _command(
+                        name, prepared, group, spool, args, {}, cancelled, f"ranks-{rank}"
+                    )
+                    sent.append((rank, payloads))
+                    group.send_one(rank, {**command, "method": method, "p2p": True})
+                results = [local(*batch[0])]
+                for rank, _payloads in sent:
+                    results.append(wire.recv_tensor(rank, group.pg, device))
+                    _accept(name, group, group.reply_one(rank, "run"))
+            except BaseException:
+                group._break(f"spread {name!r}.{method} failed")
+                raise
+            finally:
+                for _rank, payloads in sent:
+                    payloads.clear()
+            yield from results
+
+    object.__setattr__(component, "_cozy_spread", spread)
+
+
 def hosting_plan(
     *,
     placeable: tuple[str, ...],
@@ -155,12 +199,13 @@ def _command(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     cancelled: Callable[[], bool],
+    payloads_dir: str = "ranks",
 ) -> tuple[dict[str, Any], wire.TensorSpool]:
     """The `run` command for one component call under the leader's active scopes.
 
     Scope admission has already happened on the leader. Followers receive that same
-    complete scope, including any overlay weights used by component hooks. A cancelled
-    attempt raises here, before any rank is commanded.
+    complete scope, including any overlay weights used by component hooks, and the same
+    autocast. A cancelled attempt raises here, before any rank is commanded.
     """
     import torch
 
@@ -193,14 +238,20 @@ def _command(
                 measured_scopes=sorted(residency.measured),
             )
         scopes.append(scope)
-    payloads = wire.TensorSpool(directory / "ranks", references)
+    payloads = wire.TensorSpool(directory / payloads_dir, references)
     command = {
         **wire.run_command(args, kwargs, payloads),
         "component": list(name),
         "spool": str(directory),
+        "payloads": payloads_dir,
         "scopes": scopes,
         "grad_enabled": torch.is_grad_enabled(),
         "inference_mode": torch.is_inference_mode_enabled(),
+        "autocast": {
+            kind: str(torch.get_autocast_dtype(kind)).removeprefix("torch.")
+            for kind in ("cuda", "cpu")
+            if torch.is_autocast_enabled(kind)
+        },
     }
     return command, payloads
 

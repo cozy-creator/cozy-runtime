@@ -796,7 +796,8 @@ class Executor:
         name = (named[0], named[1])
         target = self.group_components.get(name)
         hosted = self.group_hosted.get(name) == self.rank
-        if target is None or not (hosted or name in self.group_sharded):
+        spread = "method" in command
+        if target is None or not (hosted or spread or name in self.group_sharded):
             self.poisoned = "mirrored call names no prepared sharded component"
             return {
                 "ok": False,
@@ -859,17 +860,25 @@ class Executor:
                 # Stage the same scopes before allocating the incoming activations.
                 stack.enter_context(self.torch.inference_mode(command["inference_mode"]))
                 stack.enter_context(self.torch.set_grad_enabled(command["grad_enabled"]))
-                if not hosted:
+                if not (hosted or spread):
                     stack.enter_context(cp.gated_call())
+                for kind, dtype in (command.get("autocast") or {}).items():
+                    stack.enter_context(
+                        self.torch.autocast(device_type=kind, dtype=getattr(self.torch, dtype))
+                    )
                 stack.enter_context(wire.attention_context(command))
                 sol_counts = stack.enter_context(attention_sol.observing())
                 served = stack.enter_context(attention_ulysses.observing())
                 args, kwargs = wire.run_call(
                     command,
-                    wire.TensorSpool(spool / "ranks", references),
+                    wire.TensorSpool(spool / str(command.get("payloads", "ranks")), references),
                     device=self._rank_device(self.torch),
                 )
-                if hosted:
+                if spread:
+                    # A pure method call whose one tensor result goes straight to rank 0.
+                    output = getattr(component, str(command["method"]))(*args, **kwargs)
+                    wire.send_tensor(output, 0, self.pg)
+                elif hosted:
                     plane = models[name[0]]._cozy_residency
                     call = component.get_submodule(str(command.get("module", "")))
                     try:
@@ -1001,11 +1010,33 @@ class Executor:
                         and _cancelled(owner.root, owner._attempt_request)
                     ),
                 )
+        homes = {rank for rank in owner.group_hosted.values()}
+        spreading = (0, *(rank for rank in range(1, self.world) if rank not in homes))
+        if self.rank == 0 and len(spreading) > 1:
+            assert self.group is not None
+            for component_name, root in roots.items():
+                name = (self._group_model_key, component_name)
+                if name in owner.group_sharded or name in owner.group_hosted:
+                    continue
+                mirror.install_spread(
+                    root,
+                    name=name,
+                    prepared=owner.group_components,
+                    group=self.group,
+                    spool=lambda: owner._attempt_spool,
+                    ranks=spreading,
+                    device=self._rank_device(torch),
+                    cancelled=lambda: (
+                        bool(owner._attempt_request)
+                        and _cancelled(owner.root, owner._attempt_request)
+                    ),
+                )
         self.facts["sequence_parallel"] = {
             "degree": self.world,
             "rank": self.rank,
             "components": list(installed),
             "hosted": hosted,
+            "spread_ranks": list(spreading),
             "followers": list(self.group.pids()) if self.group is not None else [],
         }
         return None

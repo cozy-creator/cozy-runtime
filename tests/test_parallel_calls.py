@@ -43,6 +43,7 @@ from testdata.parallel_calls import (  # noqa: E402
     h3_batch,
     h3_model,
     hosted_model,
+    spread_model,
 )
 
 
@@ -384,6 +385,53 @@ def test_a_placeable_component_runs_on_its_follower(tmp_path: Path, degree: int)
         batch = h3_batch()
         with torch.no_grad():
             model.compute(batch, h3_model().dit(**batch))
+    finally:
+        group.close()
+        ours.close()
+        theirs.close()
+    assert not torch.distributed.is_initialized()
+
+
+@pytest.mark.parametrize("degree", [2, 4])
+def test_h3_vae_clips_spread_over_the_group_decode_bitwise_as_one_rank(
+    tmp_path: Path, degree: int
+) -> None:
+    """Each temporal clip decodes on some rank from its own latent window; rank 0 cross-fades
+    them in order. The frames must equal a single-rank decode exactly."""
+    pytest.importorskip("diffusers")
+    fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
+
+    def launch(module_argv: list[str], fd: int) -> spawn.Child:
+        return spawn.spawn_follower(
+            python=sys.executable,
+            module_argv=[str(fixture), *module_argv[2:], "--spread"],
+            inherit_fd=fd,
+            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        )
+
+    group = RankGroup(degree=degree, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    model: Any = spread_model()
+    # 33 latent frames are 7 clips: rounds of `degree`, the last one partial.
+    z = torch.randn(1, 4, 33, 2, 3, generator=torch.Generator().manual_seed(5))
+    expected = model.decode(z)
+    ours, theirs = socket.socketpair()
+    leader: Any = Executor(Channel(ours), tmp_path, world=degree)
+    leader.device_kind = "cpu"
+    leader.group = group
+    leader._group_model_key = "fixture"
+    roots = {"dit": model.dit, "text_encoder": model.text_encoder, "vae": model.vae}
+    leader.backend = SimpleNamespace(components=roots, parked={})
+    try:
+        group.spawn()
+        group.form(torch, {})
+        leader.pg = group.pg
+        assert leader._install_group(torch, model, HOSTED_BUDGET) is None
+        assert leader.facts["sequence_parallel"]["spread_ranks"] == list(range(degree))
+        leader._attempt_spool = tmp_path / "attempt"
+        actual = model.decode(z)
+        assert torch.equal(actual, expected)
+        assert sorted(group.rank_records) == list(range(1, degree))
+        assert not list((tmp_path / "attempt").rglob("tensor-*.raw"))
     finally:
         group.close()
         ours.close()

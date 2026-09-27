@@ -185,6 +185,38 @@ def unmarshal(value: Any, spool: TensorSpool, *, device: Any) -> Any:
     return value
 
 
+#: dtypes a point-to-point result may carry, by position in its header
+_P2P_DTYPES = ("float32", "float16", "bfloat16", "float64", "int64", "int32", "uint8", "bool")
+_P2P_RANK = 8
+
+
+def send_tensor(tensor: Any, dst: int, pg: Any) -> None:
+    """One tensor to rank `dst` over the group: a fixed header (dtype, shape), then the data.
+    A decoded video clip is ~200 MB; the attempt spool would copy it through the host twice."""
+    import torch
+
+    dtype = str(tensor.dtype).removeprefix("torch.")
+    if dtype not in _P2P_DTYPES or tensor.ndim > _P2P_RANK:
+        raise UncrossableArgument(f"a {dtype} tensor of rank {tensor.ndim} has no p2p header")
+    head = [_P2P_DTYPES.index(dtype), tensor.ndim, *tensor.shape]
+    head += [0] * (_P2P_RANK + 2 - len(head))
+    torch.distributed.send(
+        torch.tensor(head, dtype=torch.int64, device=tensor.device), dst=dst, group=pg
+    )
+    torch.distributed.send(tensor.contiguous(), dst=dst, group=pg)
+
+
+def recv_tensor(src: int, pg: Any, device: Any) -> Any:
+    import torch
+
+    head = torch.empty(_P2P_RANK + 2, dtype=torch.int64, device=device)
+    torch.distributed.recv(head, src=src, group=pg)
+    code, ndim, *shape = head.tolist()
+    out = torch.empty(shape[:ndim], dtype=getattr(torch, _P2P_DTYPES[code]), device=device)
+    torch.distributed.recv(out, src=src, group=pg)
+    return out
+
+
 def run_command(
     args: tuple[Any, ...], kwargs: Mapping[str, Any], spool: TensorSpool
 ) -> dict[str, Any]:
