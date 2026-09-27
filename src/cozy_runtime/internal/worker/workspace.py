@@ -41,6 +41,27 @@ class WorkspaceBusy(WorkspaceRefusal):
     """A foreground custody transition takes precedence over optional collection."""
 
 
+def same_ref(value: Any, digest: str, length: int) -> bool:
+    """A ``{digest, length}`` reference; members another version added are ignored."""
+    return (
+        isinstance(value, dict) and value.get("digest") == digest and value.get("length") == length
+    )
+
+
+def artifact_identity(value: Any) -> tuple[Any, ...] | None:
+    """The provenance members artifact readers consume; additive members are ignored."""
+    if not isinstance(value, dict) or not isinstance(value.get("manifest"), dict):
+        return None
+    identity = (
+        value.get("producer_request_id"),
+        value.get("output_slot"),
+        value["manifest"].get("digest"),
+        value["manifest"].get("length"),
+        value.get("tensorfs_receipt_digest"),
+    )
+    return None if None in identity else identity
+
+
 _authority: ContextVar[Callable[[], None]] = ContextVar("workspace_authority", default=lambda: None)
 Row = sqlite3.Row
 

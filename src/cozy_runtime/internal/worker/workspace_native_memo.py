@@ -9,7 +9,13 @@ from typing import Any
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill
 from cozy_runtime.internal.worker import derived_retention
-from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import (
+    Journal,
+    Workspace,
+    WorkspaceRefusal,
+    artifact_identity,
+    same_ref,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -125,7 +131,10 @@ def _payload(db: Journal, owner: str, service: str, *, releasing: bool = False) 
         "digest": "sha256:" + receipt["manifest"]["sha256"],
         "length": receipt["manifest"]["length"],
     }
-    if value.get("manifest") != manifest or value.get("tensorfs_receipt_digest") != digest:
+    if (
+        not same_ref(value.get("manifest"), manifest["digest"], manifest["length"])
+        or value.get("tensorfs_receipt_digest") != digest
+    ):
         raise WorkspaceRefusal("native memo result differs from its admitted receipt")
     return {
         "source": {
@@ -154,12 +163,13 @@ def _payload(db: Journal, owner: str, service: str, *, releasing: bool = False) 
 
 def compare_native(payload: dict[str, Any]) -> bytes:
     value = canonical_json.decode(base64.b64decode(payload["source"]["result"], validate=True))
-    if set(value) != {"producer_request_id", "output_slot", "manifest", "tensorfs_receipt_digest"}:
-        raise WorkspaceRefusal("native memo result is not a closed artifact value")
+    if artifact_identity(value) is None:
+        raise WorkspaceRefusal("native memo result is not an artifact value")
     (hold,) = payload["holds"]
-    if value["manifest"] != {"digest": hold["manifest_digest"], "length": hold["manifest_length"]}:
+    manifest = {"digest": hold["manifest_digest"], "length": hold["manifest_length"]}
+    if not same_ref(value["manifest"], manifest["digest"], manifest["length"]):
         raise WorkspaceRefusal("native memo artifact changed its manifest")
-    return canonical_json.encode({"kind": hold["kind"], "manifest": value["manifest"]})
+    return canonical_json.encode({"kind": hold["kind"], "manifest": manifest})
 
 
 def record_native(workspace: Workspace, owner: str, service_id: str) -> bool:

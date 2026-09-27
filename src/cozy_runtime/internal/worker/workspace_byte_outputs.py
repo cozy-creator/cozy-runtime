@@ -10,7 +10,7 @@ from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, storage_admission
-from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal, same_ref
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -138,23 +138,17 @@ def recorded_native(
         return False
     args = canonical_json.decode(call["accepted"])
     if call["operation"] == "source_files":
-        if args["source"]["manifest"] != {
-            "digest": documents.spell(hashlib.sha256(row["manifest_body"]).digest()),
-            "length": len(row["manifest_body"]),
-        }:
+        if not same_ref(
+            args["source"]["manifest"],
+            documents.spell(hashlib.sha256(row["manifest_body"]).digest()),
+            len(row["manifest_body"]),
+        ):
             return False
-    elif canonical_json.decode(row["manifest_body"]) != {
-        "entries": [
-            {
-                "path": "payload",
-                "kind": "file",
-                "blob": {
-                    "sha256": args["digest"].removeprefix("sha256:"),
-                    "length": args["size_bytes"],
-                },
-            }
-        ]
-    }:
+    elif not _single_payload(
+        canonical_json.decode(row["manifest_body"]),
+        args["digest"].removeprefix("sha256:"),
+        args["size_bytes"],
+    ):
         return False
     if not complete:
         return True
@@ -163,9 +157,46 @@ def recorded_native(
         row["state"] in states
         and call["state"] in states
         and call["native_receipt"] == row["receipt"]
-        and call["result"]
-        == canonical_json.encode(native_value(row, call["operation"], call["accepted"]))
+        and same_result(call["result"], native_value(row, call["operation"], call["accepted"]))
     )
+
+
+def _single_payload(body: Any, sha256: str, length: int) -> bool:
+    """One ``payload`` file of the accepted blob; additive manifest members are ignored."""
+    entries = body.get("entries") if isinstance(body, dict) else None
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+        return False
+    entry = entries[0]
+    blob = entry.get("blob")
+    return (
+        entry.get("path") == "payload"
+        and entry.get("kind") == "file"
+        and isinstance(blob, dict)
+        and blob.get("sha256") == sha256
+        and blob.get("length") == length
+    )
+
+
+_RESULT_IDENTITY = ("kind", "digest", "size_bytes")
+
+
+def same_result(stored: bytes, expected: Mapping[str, Any]) -> bool:
+    """Equal on every member both versions write, with the byte identity always present."""
+    try:
+        value = canonical_json.decode(stored)
+    except ValueError:
+        return False
+    if not isinstance(value, dict):
+        return False
+    for name, want in expected.items():
+        got = value.get(name)
+        if (
+            not isinstance(got, dict)
+            or any(key not in got for key in _RESULT_IDENTITY)
+            or any(got[key] != want[key] for key in got.keys() & want.keys())
+        ):
+            return False
+    return True
 
 
 def reserve_native(
@@ -254,8 +285,7 @@ def complete_native(
             row is None
             or row["state"] not in ("intent", "complete")
             or not recorded_native(db, row, complete=False)
-            or result
-            != canonical_json.encode(native_value(row, call["operation"], call["accepted"]))
+            or not same_result(result, native_value(row, call["operation"], call["accepted"]))
             or len(computation) != 32
             or call["computation_digest"] != computation
             or not 0 < len(receipt) <= 1 << 20

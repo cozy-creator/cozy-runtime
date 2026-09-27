@@ -12,7 +12,13 @@ from typing import TYPE_CHECKING, Any
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.local_storage_admission import POLICY
 from cozy_runtime.internal.worker import store_gc
-from cozy_runtime.internal.worker.workspace import _ID, Journal, WorkspaceBusy, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import (
+    _ID,
+    Journal,
+    WorkspaceBusy,
+    WorkspaceRefusal,
+    same_ref,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -204,7 +210,9 @@ def _typed_result(
         if (
             receipt is None
             or value.get("tensorfs_receipt_digest") != receipt["native_digest"]
-            or value.get("manifest") != receipt["manifest"]
+            or not same_ref(
+                value.get("manifest"), receipt["manifest"]["digest"], receipt["manifest"]["length"]
+            )
         ):
             raise WorkspaceRefusal("typed model result differs from its native receipt")
         return {"manifest": receipt["manifest"]}
