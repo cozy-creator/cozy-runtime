@@ -2395,7 +2395,9 @@ class AttemptEngine:
             return None, encode_error
         entries = []
         native = (
-            self.tensorfs_root is not None and self.calls is not None and self.calls.minor() >= 43
+            self.tensorfs_root is not None
+            and self.calls is not None
+            and self.calls.minor(attempt.request_id) >= 43
         )
         try:
             if len(rows) + bool(reply.get("capture")) > 32:
@@ -2797,7 +2799,8 @@ class AttemptEngine:
                         )
                         if records and (
                             self.calls is None
-                            or self.calls.minor() < RETAINED_MODEL_RESULTS_WIRE_MINOR
+                            or self.calls.minor(attempt.request_id)
+                            < RETAINED_MODEL_RESULTS_WIRE_MINOR
                         ):
                             raise ValueError("native Model collection requires wire53")
                         for pointer, artifact, retention in records:

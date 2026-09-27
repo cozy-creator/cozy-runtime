@@ -12,7 +12,7 @@ from cozy_runtime.internal import (
     package_interface,
 )
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import machine_deferred, machine_model_defaults
@@ -186,7 +186,12 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         raise WorkspaceRefusal(
             "internal_callable: an internal callable cannot be an execution root"
         )
-    preparation: dict[str, Any] = {"installations": prepared, "state": state_identity(state)}
+    preparation: dict[str, Any] = {
+        "installations": prepared,
+        "state": state_identity(state),
+        # The minor this root and its descendants run under, whatever later streams say.
+        "wire_minor": min(WIRE_MINOR, request.claim.wire_minor),
+    }
     assert worker.machine_calls is not None
     if sdk := worker.machine_calls.builtins.capture():
         preparation["runtime_builtin"] = sdk

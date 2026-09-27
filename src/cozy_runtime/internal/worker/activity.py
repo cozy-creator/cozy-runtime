@@ -45,6 +45,9 @@ class ActivityFile:
         self.path = path
         self.owner = owner
         self.sequence = 0
+        # The reporter and a submission's strict publish share one staged name; a second
+        # writer reopening the first's 0400 file is EACCES, which refused the submission.
+        self._lock = threading.Lock()
 
     def publish(
         self,
@@ -54,6 +57,19 @@ class ActivityFile:
         meter: str | None,
         active_work: bool,
         execution_retention_required: bool = False,
+    ) -> None:
+        with self._lock:
+            self._publish(
+                owner_attached, attempts_in_flight, meter, active_work, execution_retention_required
+            )
+
+    def _publish(
+        self,
+        owner_attached: bool,
+        attempts_in_flight: int,
+        meter: str | None,
+        active_work: bool,
+        execution_retention_required: bool,
     ) -> None:
         self.sequence += 1
         document: dict[str, Any] = {
@@ -73,6 +89,8 @@ class ActivityFile:
         }
         payload = (json.dumps(document, sort_keys=True) + "\n").encode()
         staged = self.path.parent / f".activity-{os.getpid()}"
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(staged)  # a crashed predecessor's 0400 file under a reused pod pid
         descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)
         try:
             with os.fdopen(descriptor, "wb") as handle:

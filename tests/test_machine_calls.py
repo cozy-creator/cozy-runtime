@@ -126,7 +126,7 @@ def test_child_progress_poll_reuses_journal_and_fences_owner_parent_and_attempt(
         incoming, 1, local=True, result=pb.ChildCallResult(child_request_id=child.child_request)
     )
     transport = Transport(
-        lambda _: None, lambda: 1, lambda: 57, workspace=Workspace(root), owner=lambda: "owner"
+        lambda _: None, lambda: 1, lambda _: 57, workspace=Workspace(root), owner=lambda: "owner"
     )
     observed = transport._progress(pending)
     assert observed["child_request_id"] == child.child_request
@@ -194,7 +194,7 @@ def test_optional_child_progress_cannot_turn_a_valid_result_into_failure(
         ),
         byte_grants=[],
     )
-    broker = transport.Calls(lambda _: None, lambda: 1, lambda: 57)
+    broker = transport.Calls(lambda _: None, lambda: 1, lambda _: 57)
     broker.pending[("parent", 1, 0)] = held
     expected = {
         "ok": True,

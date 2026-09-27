@@ -154,6 +154,36 @@ def test_each_publish_replaces_the_file_atomically_and_advances_the_tick() -> No
         assert [p.name for p in root.iterdir() if p.name.startswith(".activity")] == []
 
 
+def test_concurrent_publishers_and_a_stale_staged_file_never_refuse_a_publish() -> None:
+    """The reporter and a submission's strict publish run on different threads of one
+    worker; neither may meet the other's read-only staged file, nor a crashed one's."""
+    import threading
+
+    with _short_tmp() as root:
+        published = activity.ActivityFile(root / "activity")
+        stale = root / f".activity-{os.getpid()}"
+        stale.write_bytes(b"")
+        stale.chmod(0o400)
+        failures: list[BaseException] = []
+
+        def publish() -> None:
+            try:
+                for _ in range(200):
+                    published.publish(
+                        owner_attached=False, attempts_in_flight=0, active_work=False, meter="0"
+                    )
+            except BaseException as exc:
+                failures.append(exc)
+
+        threads = [threading.Thread(target=publish) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert failures == []
+        assert json.loads((root / "activity").read_bytes())["sequence"] == 800
+
+
 def test_active_work_excludes_connected_owners_and_retained_outcomes() -> None:
     from cozy_runtime.internal.worker.attempts import AttemptRecord
 

@@ -380,7 +380,7 @@ class Calls:
                 offer.grant.inputs.extend(model_access)
                 offer.grant.inputs.extend(byte_access)
                 desired = pb.DesiredWorkerState(
-                    wire_minor=self.worker.fence.wire_minor,
+                    wire_minor=executions.wire_minor(owner, parent.request_id),
                     posture=pb.POSTURE_ACCEPTING,
                     job=pb.JobDirective(
                         installation_id=target.installation_id,

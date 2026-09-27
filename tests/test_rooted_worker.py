@@ -116,24 +116,30 @@ class Machine:
             ),
             "TENSORHUB_OBJECT_STORAGE_HOSTS": "",
         }
+        self.env = env
+        self.image, self.gpus = image, gpus
+        self.log = (root / "worker.log").open("ab")
+        self._launch()
+        self.claim, self.ack = self._claim()
+
+    def _launch(self) -> None:
         read, self.stop = os.pipe()
         # ExtraFiles[0] is fd 3, as the Host passes it.
         redirect = f"3<&{read} {read}<&-"
-        if gpus is None:
-            worker = root / "opt/cozy/bin/cozy-runtime-worker"
+        if self.gpus is None:
+            worker = self.root / "opt/cozy/bin/cozy-runtime-worker"
             argv = ["/bin/bash", "-c", f'exec "$0" {redirect}', str(worker)]
         else:
             argv = [
                 "/bin/bash",
                 "-c",
                 f'exec "$0" -c "$1" "$2" {redirect}',
-                str(image),
+                str(self.image),
                 LAUNCH_VIRTUAL,
-                json.dumps(gpus),
+                json.dumps(self.gpus),
             ]
-        self.log = (root / "worker.log").open("wb")
         self.process = subprocess.Popen(
-            argv, env=env, pass_fds=(read,), stdout=self.log, stderr=subprocess.STDOUT
+            argv, env=self.env, pass_fds=(read,), stdout=self.log, stderr=subprocess.STDOUT
         )
         os.close(read)
         self.payload = self._await_readiness()
@@ -147,7 +153,14 @@ class Machine:
         )
         self.control = rpc.WorkerControlStub(self.channel)
         self.preparation = rpc.RuntimePreparationStub(self.channel)
-        self.claim = self._claim()
+
+    def restart(self) -> int:
+        """Stop this Runtime and launch it again on the same root and boot, as its Host does
+        after a Host or Runtime restart. Nothing claims the relaunched worker."""
+        code = self._stop()
+        (self.root / "run/cozy/bootstrap/readiness-payload").unlink()
+        self._launch()
+        return code
 
     def _await_readiness(self) -> dict[str, Any]:
         payload = self.root / "run/cozy/bootstrap/readiness-payload"
@@ -159,7 +172,7 @@ class Machine:
         value: dict[str, Any] = json.loads(payload.read_bytes())
         return value
 
-    def _claim(self) -> pb.Claim:
+    def _claim(self) -> tuple[pb.Claim, pb.ClaimAck]:
         boot = self.payload["pod_boot_id"]
         claim = pb.Claim(
             record_owner_epoch=1,
@@ -186,24 +199,28 @@ class Machine:
         ack = next(stream).claim_ack
         assert ack.accepted, (ack, self.output())
         stream.cancel()
-        return claim
+        return claim, ack
 
     def output(self) -> str:
         self.log.flush()
         return (self.root / "worker.log").read_text(errors="replace")[-6000:]
 
-    def close(self) -> int:
+    def _stop(self) -> int:
         self.channel.close()
         os.close(self.stop)  # EOF on fd 3: the Host's one stop signal
         try:
-            code = self.process.wait(timeout=BOOT_BOUND)
+            return self.process.wait(timeout=BOOT_BOUND)
         finally:
             if self.process.poll() is None:
                 self.process.kill()
                 self.process.wait()
+
+    def close(self) -> int:
+        try:
+            return self._stop()
+        finally:
             self.media.shutdown()
             self.log.close()
-        return code
 
 
 def _certificate() -> tuple[bytes, bytes]:
@@ -273,14 +290,23 @@ def _media_stand_in(certificate: bytes, key: bytes) -> tuple[_Media, int]:
     return _Media(listener), int(listener.getsockname()[1])
 
 
-def _run_job(machine: Machine, scratch: Path) -> tuple[str, pb.AttemptOutcome]:
-    """Prepare a CPU fixture package and run one job through the machine calls."""
+def _run_job(
+    machine: Machine,
+    scratch: Path,
+    staged: tuple[Path, pb.PrepareLocalPackageRequest] | None = None,
+    request_id: str = "rooted-1",
+    orchestration: bool = False,
+) -> tuple[str, pb.AttemptOutcome]:
+    """Prepare a CPU fixture package and run one job through the machine calls; an
+    orchestration job takes the CPU slot, as Creator submits a job granted no device."""
     installs = machine.root / "var/lib/cozy/installs"
-    scratch.mkdir()
-    staged_environment, request = package(scratch, "rooted")
+    if staged is None:
+        scratch.mkdir()
+        staged = package(scratch, "rooted")
+    staged_environment, request = staged
     stage = installs / ".stage/rooted/wheels"
-    stage.parent.mkdir(parents=True)
-    shutil.copytree(staged_environment / ".stage/rooted/wheels", stage)
+    stage.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(staged_environment / ".stage/rooted/wheels", stage, dirs_exist_ok=True)
     for row in request.files:
         row.path = str(stage / Path(row.path).name)
     request.install_root = str(installs)
@@ -324,11 +350,11 @@ def _run_job(machine: Machine, scratch: Path) -> tuple[str, pb.AttemptOutcome]:
     machine.control.SubmitMachineExecution(
         pb.MachineExecutionSubmit(
             claim=machine.claim,
-            submission_id="rooted-1",
+            submission_id=request_id,
             capture_digest=capture_digest,
             capture_canonical_bytes=capture,
             offer=pb.AttemptOffer(
-                request_id="rooted-1",
+                request_id=request_id,
                 attempt_ordinal=1,
                 invocation_spec_digest=spec_digest,
                 invocation_spec_canonical_bytes=spec,
@@ -350,6 +376,7 @@ def _run_job(machine: Machine, scratch: Path) -> tuple[str, pb.AttemptOutcome]:
                 job=pb.JobDirective(
                     installation_id=binding.installation_id,
                     job_descriptor_id=binding.job_descriptor_id,
+                    orchestration=orchestration,
                     resource_caps=pb.ResourceCaps(device_required=False),
                     publication_contract=pb.PublicationContract(grant_id="local/_job-rooted"),
                     reclaim_on_terminal=True,
@@ -361,7 +388,7 @@ def _run_job(machine: Machine, scratch: Path) -> tuple[str, pb.AttemptOutcome]:
         timeout=120,
     )
     query = pb.MachineExecutionQuery(
-        claim=machine.claim, request_id="rooted-1", expected_execution_workspace_id=workspace
+        claim=machine.claim, request_id=request_id, expected_execution_workspace_id=workspace
     )
     until = time.monotonic() + 900
     while (state := machine.control.GetMachineExecution(query)).state not in {
@@ -371,10 +398,9 @@ def _run_job(machine: Machine, scratch: Path) -> tuple[str, pb.AttemptOutcome]:
     }:
         assert machine.process.poll() is None and time.monotonic() < until, machine.output()
         time.sleep(0.2)
-    assert state.state == "succeeded", machine.output()
-    return workspace, machine.control.CollectMachineExecution(
-        pb.MachineExecutionCollect(execution=query)
-    )
+    outcome = machine.control.CollectMachineExecution(pb.MachineExecutionCollect(execution=query))
+    assert state.state == "succeeded", outcome.outcome_canonical_bytes[:2000]
+    return workspace, outcome
 
 
 def _files_outside(root: Path) -> list[str]:
@@ -477,6 +503,35 @@ def test_user_worker_measures_this_machines_driver_inventory() -> None:
             assert [device.uuid for device in observed.devices] == uuids
             assert observed.accelerator_backend == ("cuda" if uuids else "none")
             assert not observed.executor_uid_isolation
+        finally:
+            code = machine.close()
+        assert code == 0, machine.output()
+
+
+def test_restarted_worker_runs_its_owners_next_submission_without_another_claim() -> None:
+    """A Host or Runtime restart forgets every control stream. The owner's next submission
+    carries its Claim, and runs at the minor that Claim negotiated: no Control Claim first.
+    The one Claim the owner did make reads back the inventory this worker schedules on."""
+    with tempfile.TemporaryDirectory(prefix="cz-restart.") as raw:
+        root = Path(raw) / "machine"
+        root.mkdir()
+        machine = Machine(root, VIRTUAL_GPUS)
+        try:
+            resources = machine.ack.resources
+            assert (
+                resources.backend,
+                resources.device_count,
+                resources.device_name,
+                resources.device_memory_total_bytes,
+                resources.driver_version,
+            ) == ("cuda", 4, "Virtual Accelerator", 8 << 30, "0.0")
+            scratch = Path(raw) / "scratch"
+            scratch.mkdir()
+            staged = package(scratch, "rooted")
+            _run_job(machine, scratch, staged, "before-restart", orchestration=True)
+            assert machine.restart() == 0, machine.output()
+            _, outcome = _run_job(machine, scratch, staged, "after-restart", orchestration=True)
+            assert outcome.request_id == "after-restart"
         finally:
             code = machine.close()
         assert code == 0, machine.output()
