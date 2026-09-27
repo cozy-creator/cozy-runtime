@@ -16,7 +16,8 @@ import signal
 import socket
 import sys
 import threading
-from collections.abc import Callable, Mapping
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -211,7 +212,16 @@ class RankGroup:
         self.working_peaks: dict[int, int] = {}
         #: per follower rank, its `execution_evidence` record folded over this attempt's calls
         self.rank_records: dict[int, dict[str, Any]] = {}
+        #: per spread method this attempt, the calls each rank ran and why a rank declined
+        self.spread_log: dict[str, dict[str, Any]] = {}
         self._readers: list[threading.Thread] = []
+        #: Followers with a command in flight. A follower answers one command at a time, so
+        #: every caller that sends one holds its rank until the reply is read: calls made
+        #: from overlapped threads (`author.concurrently`) never interleave on one seam.
+        self._busy: set[int] = set()
+        #: ranks homing a component whose remote scope is open: kept free for its calls
+        self._reserved: Counter[int] = Counter()
+        self._leases = threading.Condition()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -357,8 +367,43 @@ class RankGroup:
 
     def call_one(self, rank: int, command: dict[str, Any]) -> dict[str, Any]:
         """One command to ONE follower and its reply: a hosted component's call."""
-        self.send_one(rank, command)
-        return self.reply_one(rank, str(command["cmd"]))
+        with self.hold((rank,)):
+            self.send_one(rank, command)
+            return self.reply_one(rank, str(command["cmd"]))
+
+    @contextlib.contextmanager
+    def hold(self, ranks: Iterable[int]) -> Iterator[None]:
+        """Wait until every rank in `ranks` is free, then keep them until the block ends."""
+        wanted = frozenset(ranks)
+        with self._leases:
+            self._leases.wait_for(lambda: not wanted & self._busy)
+            self._busy |= wanted
+        try:
+            yield
+        finally:
+            self.give(wanted)
+
+    def take(self, ranks: Iterable[int]) -> tuple[int, ...]:
+        """The ranks among `ranks` that are free and not reserved, now kept by the caller.
+        Never waits: a spread round runs on whoever is idle."""
+        with self._leases:
+            taken = tuple(r for r in ranks if r not in self._busy and not self._reserved[r])
+            self._busy.update(taken)
+        return taken
+
+    def give(self, ranks: Iterable[int]) -> None:
+        with self._leases:
+            self._busy.difference_update(ranks)
+            self._leases.notify_all()
+
+    def reserve(self, ranks: Iterable[int]) -> None:
+        """Keep `ranks` out of spread rounds while a remote scope homed there is open."""
+        with self._leases:
+            self._reserved.update(ranks)
+
+    def unreserve(self, ranks: Iterable[int]) -> None:
+        with self._leases:
+            self._reserved.subtract(ranks)
 
     def send_one(self, rank: int, command: dict[str, Any]) -> None:
         self.check_alive()

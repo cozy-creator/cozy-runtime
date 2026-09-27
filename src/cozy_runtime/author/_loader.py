@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import io
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -480,8 +481,9 @@ class DerivedCache:
 
     MEMORY-ONLY and declared-bounded: entries die with the generation, `get` is legal only
     inside an active component-use scope, and there is no persistence surface to declare
-    (durable derived tables live in pruned-DiT artifacts produced by jobs, §1.3). cr-008b owns the
-    ledger accounting and lease mechanics.
+    (durable derived tables live in pruned-DiT artifacts produced by jobs, §1.3). At its
+    bound the least recently used entries leave to admit a new one; an entry larger than
+    the whole bound refuses. cr-008b owns the ledger accounting and lease mechanics.
     """
 
     __slots__ = ("_bytes", "_entries", "_owner", "max_bytes", "max_entries", "name")
@@ -490,7 +492,7 @@ class DerivedCache:
         self.name = name
         self.max_entries = max_entries
         self.max_bytes = max_bytes
-        self._entries: dict[object, object] = {}
+        self._entries: OrderedDict[object, tuple[object, int]] = OrderedDict()
         self._bytes = 0
         self._owner = owner
 
@@ -499,6 +501,9 @@ class DerivedCache:
             f"DerivedCache({self.name!r}, entries={len(self._entries)}/{self.max_entries}, "
             f"bytes={self._bytes}/{self.max_bytes})"
         )
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._entries
 
     @property
     def entries(self) -> int:
@@ -516,19 +521,21 @@ class DerivedCache:
                 code="cache_key",
             ) from None
         if key in self._entries:
-            return cast(V, self._entries[key])
+            self._entries.move_to_end(key)
+            return cast(V, self._entries[key][0])
         value = build()
         _require_immutable(self.name, value)
         size = _entry_bytes(value)
-        if len(self._entries) >= self.max_entries or self._bytes + size > self.max_bytes:
+        if size > self.max_bytes or self.max_entries < 1:
             raise CapabilityError(
-                f"cache {self.name!r} is over its declared bound "
-                f"({len(self._entries) + 1} entries, {self._bytes + size} bytes vs "
-                f"{self.max_entries}/{self.max_bytes}) — an unbounded entry poisons the "
-                "generation rather than growing silently",
+                f"cache {self.name!r}: one {size} B entry exceeds its declared bound "
+                f"({self.max_entries} entries, {self.max_bytes} bytes)",
                 code="cache_bound",
             )
-        self._entries[key] = value
+        while len(self._entries) >= self.max_entries or self._bytes + size > self.max_bytes:
+            _, (_, dropped) = self._entries.popitem(last=False)
+            self._bytes -= dropped
+        self._entries[key] = (value, size)
         self._bytes += size
         return value
 

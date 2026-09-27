@@ -148,3 +148,40 @@ class TileBatchedVideoVAE(AutoencoderKLMiniMaxH3):  # type: ignore[misc]
         columns = len(x_indices)
         rows = [decoded[row * columns : (row + 1) * columns] for row in range(len(y_indices))]
         return self._stitch_tiles(rows, y_overlaps, x_overlaps)
+
+    def encode_condition(
+        self,
+        pixels: torch.Tensor,
+        pixel_mean: tuple[float, float, float],
+        pixel_std: tuple[float, float, float],
+        seed: int,
+    ) -> torch.Tensor:
+        """`encode_condition` as this component's method, so `author.spread` can run it on
+        another rank of the group."""
+        return encode_condition(self, pixels, pixel_mean, pixel_std, seed)
+
+
+def encode_condition(
+    vae: AutoencoderKLMiniMaxH3,
+    pixels: torch.Tensor,
+    pixel_mean: tuple[float, float, float],
+    pixel_std: tuple[float, float, float],
+    seed: int,
+) -> torch.Tensor:
+    """Diffusers' `encode_vae_condition` for one reference, up to its `.cpu()`: the sampled
+    latents rounded to float16, on the VAE's device, so a group rank can hand them back over
+    the collective. `pixels` are the reference's uint8 pixels as the official step reads
+    them, `(H, W, 3)` for an image or `(T, H, W, 3)` for a video, laid out on the device
+    exactly as that step lays them out."""
+    device = next(vae.parameters()).device
+    pixels = pixels.to(device)
+    if pixels.ndim == 3:
+        pixels = pixels.permute(2, 0, 1)[None, :, None]
+    else:
+        pixels = pixels.permute(3, 0, 1, 2)[None]
+    mean = torch.tensor(pixel_mean, device=pixels.device).view(1, -1, 1, 1, 1)
+    std = torch.tensor(pixel_std, device=pixels.device).view(1, -1, 1, 1, 1)
+    pixels = (pixels.to(torch.float32).div(255.0) - mean) / std
+    posterior = vae.encode(pixels, return_dict=False)[0]
+    latents = posterior.sample(generator=torch.Generator().manual_seed(seed))
+    return latents.to(torch.float16).float()

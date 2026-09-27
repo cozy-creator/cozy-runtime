@@ -1,16 +1,19 @@
-"""Group component calls: sharded forwards run on every rank, hosted ones on their home rank.
+"""Group component calls: sharded forwards run on every rank, hosted ones on their home rank,
+spread ones on whichever ranks are idle and have room.
 
 The sampler and its Python state stay on rank 0."""
 
 from __future__ import annotations
 
+import contextlib
 import functools
-import itertools
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._errors import Cancelled
+from cozy_runtime.author._model import remote_scope
 from cozy_runtime.internal import attention_sol, execution_evidence
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
@@ -47,17 +50,19 @@ def mirror_component(
             return call(*args, **kwargs)
         command, payloads = _command(name, prepared, group, spool, args, kwargs, cancelled)
         try:
-            try:
-                group.broadcast(command)
-                with cp.gated_call():
-                    result = call(*args, **kwargs)
-                for reply in group.collect("run"):
-                    _accept(name, group, reply)
-                    attention_sol.record_rank(reply["rank"], reply["sol_calls"])
-                return result
-            except BaseException:
-                group._break(f"mirrored component {name!r} failed")
-                raise
+            # Every follower joins the collective: none may be answering an overlapped call.
+            with group.hold(range(1, group.degree)):
+                try:
+                    group.broadcast(command)
+                    with cp.gated_call():
+                        result = call(*args, **kwargs)
+                    for reply in group.collect("run"):
+                        _accept(name, group, reply)
+                        attention_sol.record_rank(reply["rank"], reply["sol_calls"])
+                    return result
+                except BaseException:
+                    group._break(f"mirrored component {name!r} failed")
+                    raise
         finally:
             payloads.clear()
 
@@ -95,19 +100,24 @@ def _hosted(
     cancelled: Callable[[], bool],
 ) -> Callable[..., Any]:
     def hosted(*args: Any, **kwargs: Any) -> Any:
-        command, payloads = _command(name, prepared, group, spool, args, kwargs, cancelled)
-        results = wire.TensorSpool(Path(command["spool"]) / "hosted")
+        command, payloads = _command(
+            name, prepared, group, spool, args, kwargs, cancelled, f"ranks-{rank}", only=True
+        )
+        # Per-rank directories: calls to different ranks may be in flight at once.
+        results = wire.TensorSpool(Path(command["spool"]) / f"hosted-{rank}")
         try:
             try:
-                reply = group.call_one(rank, {**command, "module": path})
+                reply = group.call_one(
+                    rank, {**command, "module": path, "results": f"hosted-{rank}"}
+                )
                 _accept(name, group, reply)
             except BaseException:
                 group._break(f"hosted component {name!r} failed")
                 raise
-            model = prepared[name][0]
-            residency, active = model._cozy_residency, model._cozy_active
-            if residency is not None and active is not None:
-                residency.observe_remote(active[0], int(reply.get("working_peak_bytes", 0)))
+            residency = prepared[name][0]._cozy_residency
+            if residency is not None:
+                (scope,) = command["scopes"]
+                residency.observe_remote(scope["method"], int(reply.get("working_peak_bytes", 0)))
             return wire.unmarshal(reply["result"], results, device=device)
         finally:
             payloads.clear()
@@ -123,40 +133,149 @@ def install_spread(
     prepared: Mapping[tuple[str, str], tuple[Any, Any]],
     group: RankGroup,
     spool: Callable[[], Path | None],
-    ranks: tuple[int, ...],
     device: Any,
     cancelled: Callable[[], bool] = lambda: False,
 ) -> None:
-    """Let `author.spread` run `component`'s pure method calls on `ranks` (rank 0 first)."""
+    """Let `author.spread` run `component`'s pure method calls on the idle ranks.
 
-    def spread(method: str, arguments: Iterator[tuple[Any, ...]]) -> Iterator[Any]:
+    Each round offers one call to every follower that is idle (no call in flight from
+    another thread, no open remote scope homed there) and has not declined this spread, and
+    runs one here. A follower that cannot take its call without freeing something it may not
+    free declines it; the call goes back to the queue and that follower sits out the rest.
+    Results are handed out in argument order.
+    """
+    followers = tuple(range(1, group.degree))
+
+    def spread(method: str, arguments: Iterator[tuple[Any, ...]], spare: bool) -> Iterator[Any]:
         local = getattr(component, method)
         if prepared[name][0]._cozy_active is None:
             # Outside a component scope no follower may stage it: run here.
             yield from (local(*args) for args in arguments)
             return
-        while batch := list(itertools.islice(arguments, len(ranks))):
-            sent: list[tuple[int, wire.TensorSpool]] = []
+        # This call's decliners sit out its remaining rounds; the attempt's log sums calls.
+        declined: dict[str, str] = {}
+        queue: deque[tuple[int, tuple[Any, ...]]] = deque()
+        pending = enumerate(arguments)
+        finished: dict[int, Any] = {}
+        emitted = 0
+        exhausted = False
+        while True:
+            taken = group.take(r for r in followers if str(r) not in declined)
             try:
-                for rank, args in zip(ranks[1:], batch[1:], strict=False):
-                    command, payloads = _command(
-                        name, prepared, group, spool, args, {}, cancelled, f"ranks-{rank}"
-                    )
-                    sent.append((rank, payloads))
-                    group.send_one(rank, {**command, "method": method, "p2p": True})
-                results = [local(*batch[0])]
-                for rank, _payloads in sent:
-                    results.append(wire.recv_tensor(rank, group.pg, device))
-                    _accept(name, group, group.reply_one(rank, "run"))
-            except BaseException:
-                group._break(f"spread {name!r}.{method} failed")
-                raise
+                batch: list[tuple[int, tuple[Any, ...]]] = []
+                while len(batch) < 1 + len(taken):
+                    if queue:
+                        batch.append(queue.popleft())
+                    elif not exhausted and (item := next(pending, None)) is not None:
+                        batch.append(item)
+                    else:
+                        exhausted = True
+                        break
+                if not batch:
+                    break
+                # String keys: the log crosses the seam as JSON.
+                log = group.spread_log.setdefault(
+                    f"{name[1]}.{method}", {"calls": {}, "declined": {}, "spare": spare}
+                )
+                _round(batch, taken, finished, queue, declined, log, method, spare)
             finally:
-                for _rank, payloads in sent:
-                    payloads.clear()
-            yield from results
+                group.give(taken)
+            while emitted in finished:
+                yield finished.pop(emitted)
+                emitted += 1
+
+    def _round(
+        batch: list[tuple[int, tuple[Any, ...]]],
+        taken: tuple[int, ...],
+        finished: dict[int, Any],
+        queue: deque[tuple[int, tuple[Any, ...]]],
+        declined: dict[str, str],
+        log: dict[str, Any],
+        method: str,
+        spare: bool,
+    ) -> None:
+        sent: list[tuple[int, int, tuple[Any, ...], wire.TensorSpool]] = []
+        calls: dict[str, int] = log["calls"]
+        try:
+            for rank, (index, args) in zip(taken, batch[1:], strict=False):
+                command, payloads = _command(
+                    name, prepared, group, spool, args, {}, cancelled, f"ranks-{rank}", only=True
+                )
+                sent.append((rank, index, args, payloads))
+                group.send_one(rank, {**command, "method": method, "p2p": True, "spare": spare})
+            index, args = batch[0]
+            finished[index] = getattr(component, method)(*args)
+            calls["0"] = calls.get("0", 0) + 1
+            for rank, index, args, _payloads in sent:
+                result = wire.recv_tensor(rank, group.pg, device)
+                reply = group.reply_one(rank, "run")
+                _accept(name, group, reply)
+                if result is None:
+                    declined[str(rank)] = str(reply.get("declined") or "declined")[:300]
+                    log["declined"][str(rank)] = declined[str(rank)]
+                    queue.append((index, args))
+                else:
+                    finished[index] = result
+                    calls[str(rank)] = calls.get(str(rank), 0) + 1
+        except BaseException:
+            group._break(f"spread {name!r}.{method} failed")
+            raise
+        finally:
+            for _rank, _index, _args, payloads in sent:
+                payloads.clear()
 
     object.__setattr__(component, "_cozy_spread", spread)
+
+
+class GroupPlacement:
+    """Rank 0's `author.Placement`: which of one model's components live on which follower.
+
+    A remote scope reserves its components' home ranks, so no spread round takes them while
+    the scope's calls may still arrive there.
+    """
+
+    def __init__(self, hosted: Mapping[str, int], group: RankGroup, torch: Any) -> None:
+        self.hosted = dict(hosted)
+        self.group = group
+        self.torch = torch
+
+    def remote(self, components: tuple[str, ...]) -> bool:
+        return bool(components) and all(name in self.hosted for name in components)
+
+    def enter(self, components: tuple[str, ...]) -> None:
+        self.group.reserve(self.hosted[name] for name in components)
+
+    def leave(self, components: tuple[str, ...]) -> None:
+        self.group.unreserve(self.hosted[name] for name in components)
+
+    def carry[T](self, call: Callable[[], T], components: tuple[str, ...]) -> Callable[[], T]:
+        """`call` under this thread's autograd, inference and autocast modes and device:
+        torch keeps all four per thread, and a new thread starts with none of them. The
+        home ranks are reserved from here, before the thread runs, so a spread the caller
+        starts next never takes them."""
+        torch = self.torch
+        self.enter(components)
+        grad = torch.is_grad_enabled()
+        inference = torch.is_inference_mode_enabled()
+        autocast = [
+            (kind, torch.get_autocast_dtype(kind))
+            for kind in ("cuda", "cpu")
+            if torch.is_autocast_enabled(kind)
+        ]
+        cuda = torch.cuda.current_device() if torch.cuda.is_initialized() else None
+
+        def carried() -> T:
+            with contextlib.ExitStack() as stack:
+                stack.callback(self.leave, components)
+                if cuda is not None:
+                    stack.enter_context(torch.cuda.device(cuda))
+                stack.enter_context(torch.inference_mode(inference))
+                stack.enter_context(torch.set_grad_enabled(grad))
+                for kind, dtype in autocast:
+                    stack.enter_context(torch.autocast(device_type=kind, dtype=dtype))
+                return call()
+
+        return carried
 
 
 def hosting_plan(
@@ -200,12 +319,17 @@ def _command(
     kwargs: dict[str, Any],
     cancelled: Callable[[], bool],
     payloads_dir: str = "ranks",
+    *,
+    only: bool = False,
 ) -> tuple[dict[str, Any], wire.TensorSpool]:
     """The `run` command for one component call under the leader's active scopes.
 
     Scope admission has already happened on the leader. Followers receive that same
     complete scope, including any overlay weights used by component hooks, and the same
-    autocast. A cancelled attempt raises here, before any rank is commanded.
+    autocast. A call made inside a remote scope carries that scope alone. `only`: the call
+    touches its own component and nothing else (a hosted module call, a spread method), so
+    the follower admits just that component under the scope's method. A cancelled attempt
+    raises here, before any rank is commanded.
     """
     import torch
 
@@ -213,6 +337,11 @@ def _command(
     active = {
         key: model._cozy_active for key, model in models.items() if model._cozy_active is not None
     }
+    remote = remote_scope(models[name[0]])
+    if remote is not None:
+        active = {name[0]: remote}
+    if only and name[0] in active:
+        active = {name[0]: (active[name[0]][0], (name[1],))}
     directory = spool()
     if name[0] not in active or directory is None:
         raise cp.UngatedShardedForward(

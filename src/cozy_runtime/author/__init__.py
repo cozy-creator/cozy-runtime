@@ -41,6 +41,7 @@ from cozy_runtime.author._capture import (
     ExecutionEnvironment,
     ExecutionObservation,
 )
+from cozy_runtime.author._concurrent import concurrently
 from cozy_runtime.author._context import (
     AdapterRef,
     Context,
@@ -300,6 +301,7 @@ __all__ = [
     "attention_scope",
     "canonical_json",
     "classify",
+    "concurrently",
     "data_values",
     "decode_request",
     "describe",

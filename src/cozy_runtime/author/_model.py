@@ -15,6 +15,7 @@ generation; unequal ones stay distinct instances with independent lifecycle and 
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import inspect
 import json
@@ -224,6 +225,43 @@ class Residency(Protocol):
     def admit(self, method: str, components: tuple[str, ...]) -> None: ...
 
     def release(self, method: str, components: tuple[str, ...]) -> None: ...
+
+
+class Placement(Protocol):
+    """Where a generation's components live across the ranks of its group, installed by the
+    runtime on rank 0 of a group that hosts a `placeable` component elsewhere.
+
+    A scope whose declared components ALL live on other ranks holds nothing on this device:
+    its module calls run on their home ranks. Such a REMOTE scope is admitted there, not
+    here, and may be open beside this rank's one serial scope (`author.concurrently`).
+    """
+
+    def remote(self, components: tuple[str, ...]) -> bool: ...
+
+    def enter(self, components: tuple[str, ...]) -> None: ...
+
+    def leave(self, components: tuple[str, ...]) -> None: ...
+
+    def carry[T](self, call: Callable[[], T], components: tuple[str, ...]) -> Callable[[], T]:
+        """`call`, to run on another thread under this thread's device and autograd modes.
+        Its components' home ranks are reserved from now until it returns."""
+        ...
+
+
+#: The remote scopes open in this context, innermost last: (model, method, components).
+#: Per context rather than per model, so a remote scope on a helper thread is visible to that
+#: thread's hosted calls and to nothing else.
+_REMOTE_SCOPES: contextvars.ContextVar[tuple[tuple[Model[Any], str, tuple[str, ...]], ...]] = (
+    contextvars.ContextVar("cozy_remote_scopes", default=())
+)
+
+
+def remote_scope(model: object) -> tuple[str, tuple[str, ...]] | None:
+    """The remote scope of `model` open in this context, if any: (method, components)."""
+    for owner, method, components in reversed(_REMOTE_SCOPES.get()):
+        if owner is model:
+            return method, components
+    return None
 
 
 def uses_components(
@@ -451,6 +489,8 @@ class Model[PipelineT]:
     _cozy_residency: Residency | None = None
     """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
+    _cozy_placement: Placement | None = None
+    """Runtime-installed on rank 0 of a group that hosts a component on a follower."""
 
     def __init_subclass__(cls, /, **keywords: str) -> None:
         """The class-keyword plane is exactly `encoded_leaves` and `fusion` (model-code-fit
@@ -628,7 +668,7 @@ class Model[PipelineT]:
     def _cozy_require_scope(self, what: str) -> None:
         """A derived-cache entry is legal only inside an active component-use scope."""
         self._cozy_require_ready(what)
-        if self._cozy_active is None:
+        if self._cozy_active is None and remote_scope(self) is None:
             raise CapabilityError(
                 f"{what} outside an active component-use scope: the runtime joins the entry's "
                 "lease to the scope, and there is nowhere for it to live otherwise (§1.3)",
@@ -737,18 +777,39 @@ def _derive_model[M: Model[Any]](cls: type[M], checkpoint_ref: str) -> M:
 @final
 class _ComponentScope:
     """ONE public scope is active at a time per instance (§1.1). A composite operation
-    declares its components together on one method; concurrent scopes are a deferred door."""
+    declares its components together on one method.
 
-    __slots__ = ("_components", "_method", "_model")
+    The one exception holds nothing here: a REMOTE scope, whose every declared component the
+    runtime keeps on another rank of the group (`Placement.remote`). It admits nothing on
+    this device and marks this context, not the instance, so it may be open beside the one
+    local scope (`author.concurrently` overlaps the two)."""
+
+    __slots__ = ("_components", "_method", "_model", "_remote")
 
     def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
         self._model = model
         self._method = method
         self._components = components
+        self._remote: contextvars.Token[Any] | None = None
 
     def __enter__(self) -> None:
         model = self._model
         model._cozy_require_ready(self._method)
+        placement = model._cozy_placement
+        if placement is not None and placement.remote(self._components):
+            if remote_scope(model) is not None:
+                raise CapabilityError(
+                    f"{type(model).__name__}.{self._method} entered inside another remote "
+                    "scope of the same instance in this context (§1.1)",
+                    code="concurrent_scope",
+                )
+            placement.enter(self._components)
+            self._remote = _REMOTE_SCOPES.set(
+                (*_REMOTE_SCOPES.get(), (model, self._method, self._components))
+            )
+            if model._cozy_harness is not None:
+                model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
+            return
         if model._cozy_active is not None:
             raise CapabilityError(
                 f"{type(model).__name__}.{self._method} entered while "
@@ -769,6 +830,13 @@ class _ComponentScope:
 
     def __exit__(self, *exc: object) -> None:
         model = self._model
+        if self._remote is not None:
+            _REMOTE_SCOPES.reset(self._remote)
+            self._remote = None
+            placement = model._cozy_placement
+            if placement is not None:
+                placement.leave(self._components)
+            return
         object.__setattr__(model, "_cozy_active", None)
         # RELEASE MAKES BYTES EVICTABLE; it does not evict, and it imposes no global scope
         # sequence (§3.2). The lease ends at the completion event, not at this statement.
