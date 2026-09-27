@@ -1,0 +1,1 @@
+A callable's optional top-level request fields carry the author's default as an additive `default` member, for jobs as well as entrypoints, so clients can show it (`size: int (default = 64)`). Nested types render unchanged, and defaults with no static JSON spelling (computed factories) are omitted.

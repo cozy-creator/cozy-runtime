@@ -291,6 +291,65 @@ def test_explicit_registration_by_call_matches_decorators(tmp_path: Path) -> Non
     assert _static(project) == _static(RICH)
 
 
+DEFAULTS_SOURCE = """import msgspec
+from typing import Annotated
+from cozy_runtime.author import App
+app = App()
+def seeds() -> list[int]:
+    return [1]
+class Style(msgspec.Struct):
+    weight: float = 1.0
+class Request(msgspec.Struct):
+    prompt: str
+    style: Style = msgspec.field(default_factory=Style)
+    size: Annotated[int, msgspec.Meta(ge=8, le=256)] = 64
+    scale: float = 7.5
+    tags: list[str] = msgspec.field(default_factory=list)
+    seeds: list[int] = msgspec.field(default_factory=seeds)
+class Result(msgspec.Struct):
+    size: int
+@app.job
+def render(payload: Request) -> Result:
+    return Result(payload.size)
+@app.entrypoint
+def preview(payload: Request) -> Result:
+    return Result(payload.size)
+"""
+
+
+def test_every_callable_publishes_its_field_defaults(tmp_path: Path) -> None:
+    """A job's author defaults reach clients on its request fields, exactly as a serving one's."""
+    project = tmp_path / "defaults"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[project]\nname="defaults"\nversion="0.1.0"\n')
+    (project / "package.toml").write_text('[application]\nobject="defaults_package:app"\n')
+    (project / "defaults_package.py").write_text(DEFAULTS_SOURCE)
+    described = json.loads(
+        _run(
+            str(Path(sys.executable).with_name("cozy-runtime")),
+            "--json",
+            "--dir",
+            str(project),
+            "describe",
+        ).stdout
+    )
+    for kind in ("jobs", "entrypoints"):
+        (entry,) = described[kind]
+        fields = {field["name"]: field for field in entry["request"]["fields"]}
+        assert "default" not in fields["prompt"]
+        assert {name: fields[name].get("default") for name in fields if name != "prompt"} == {
+            "size": 64,
+            "scale": 7.5,
+            "tags": [],
+            "seeds": None,  # a computed factory has no static spelling
+            "style": None,
+        }
+        assert "default" not in fields["seeds"]
+        # Nested types render unchanged: readers compare them by value.
+        assert "default" not in fields["style"]["type"]["fields"][0]
+    assert _static(project) == _imported(project)
+
+
 @pytest.fixture(scope="module")
 def torch_free() -> Iterator[Path]:
     """The wheel installed into a venv with nothing heavy: no torch, no diffusers."""

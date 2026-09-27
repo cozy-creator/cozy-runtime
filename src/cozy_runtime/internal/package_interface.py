@@ -133,7 +133,7 @@ def callable_doc(
     """One callable's document from plain facts — the import and static readers meet here."""
     doc: dict[str, Json] = {
         "name": name,
-        "request": schema.render(payload_type),
+        "request": schema.request(payload_type),
         "result": schema.render(result_type, decoded_bounds=True),
     }
     if internal:
