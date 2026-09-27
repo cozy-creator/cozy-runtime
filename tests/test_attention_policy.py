@@ -146,8 +146,7 @@ def test_model_scope_and_restore_use_actual_executor_roots(
         planned = parent._attention_plan(pin)
         assert planned is not None and len(planned.sites) == count
     with pytest.raises(attention.AttentionRefusal, match="matches no"):
-        parent._attention_check("absent/dit=sdpa")
-    parent._attention_check("model0/dit=sdpa")
+        parent._attention_plan("absent/dit=sdpa")
     swap = parent._attention_plan("model0/dit=sdpa")
     with attention.override(
         parent._attention_snapshot(), all_roots, swap, "model0/dit=sdpa"
@@ -171,8 +170,7 @@ def test_scoped_pin_preserves_compiled_and_parallel_fences() -> None:
         attention.plan(_device(), roots, "dit=sdpa")
     assert exc.value.code == "attention_kernel_frozen"
     attention.plan(_device(), roots, "vae=sdpa")
-    with pytest.raises(attention.AttentionRefusal, match="context-parallel"):
-        attention.plan(_device(), roots, "vae=sdpa", "a context-parallel group is installed")
+    attention.plan(_device(), roots, "vae=sdpa", 2)  # a group swaps per request too
 
 
 def test_a_compiled_construction_serves_the_pin_it_was_prepared_with(tmp_path: Path) -> None:
@@ -183,10 +181,9 @@ def test_a_compiled_construction_serves_the_pin_it_was_prepared_with(tmp_path: P
     executor.attention_defaults = attention.snapshot(roots)
     executor.device_facts = _device()
     executor.backend = SimpleNamespace(components=roots, parked={})
-    executor._attention_check("dit=sdpa")
     assert executor._attention_plan("dit=sdpa") is None
-    with pytest.raises(attention.AttentionRefusal, match="pinned construction") as refused:
-        executor._attention_check("dit=flash-attn3")
+    with pytest.raises(attention.AttentionRefusal, match="before compilation") as refused:
+        executor._attention_plan("dit=flash-attn3")
     assert refused.value.code == "attention_kernel_frozen"
 
 

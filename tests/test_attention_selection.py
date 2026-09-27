@@ -49,11 +49,7 @@ from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.local import LocalRequest, run_slice
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.plan import DeclaredBinding, ModelBinding
-from cozy_runtime.internal.worker.session import (
-    WorkerOptions,
-    _attention_construction_key,
-    executor_load_command,
-)
+from cozy_runtime.internal.worker.session import WorkerOptions, executor_load_command
 from test_end_to_end import NO_EXECUTOR
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
@@ -975,21 +971,6 @@ def test_a_pinned_prepare_names_one_kernel_for_every_model_of_the_construction()
     # to every child prepare, the way it hands them one device authorization.
     assert group["attention_pin"] == "sageattention"
     assert all("attention_pin" not in row["binding"] for row in group["models"])
-
-
-def test_request_attention_pin_gets_a_distinct_cached_construction_variant() -> None:
-    """A remote request pin must reach load-time selection before group construction.
-
-    The executor refuses post-context-parallel swaps by design.  The worker therefore
-    keys a pinned load separately, allowing the normal construction and each development
-    pin to be prepared and reused independently.
-    """
-    base = "sha256:" + "a" * 64
-    assert _attention_construction_key(base, "") == base
-    first = _attention_construction_key(base, "ref2va_dit=flash-attn4")
-    second = _attention_construction_key(base, "ref2va_dit=sageattention")
-    assert first != base and second != base and first != second
-    assert first == _attention_construction_key(base, "ref2va_dit=flash-attn4")
 
 
 @pytest.mark.parametrize(

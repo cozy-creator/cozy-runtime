@@ -90,7 +90,6 @@ def test_cold_model_queue_validates_without_loading_or_losing_faults(tmp_path: P
     )
     try:
         assert not worker.bindings[BINDING].weightless
-        assert not worker.prepared_models
         for index in range(5):
             attempt = worker.engine.offer(offer(f"cold-{index}", seed=index))
             worker._bind_attempt_slot(attempt)
@@ -100,7 +99,7 @@ def test_cold_model_queue_validates_without_loading_or_losing_faults(tmp_path: P
             assert attempt.state == "staged" and attempt.payload == {"seed": index}
             assert attempt.prepared_model is None and attempt.executor is None
             assert attempt.spool is not None and attempt.spool.is_dir()
-        assert worker.supervision.current is None and not worker.prepared_models
+        assert worker.supervision.current is None
         # A queue acceptance is not permission to execute without construction.
         assert worker.engine.claim_staged(attempt)
         with pytest.raises(AttemptRefusal) as unloaded:

@@ -47,7 +47,7 @@ import resource
 import socket
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -56,7 +56,7 @@ from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
-from cozy_runtime.author._errors import CapabilityError, Outcome, classify
+from cozy_runtime.author._errors import CapabilityError, InvalidRequest, Outcome, classify
 from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
@@ -590,6 +590,8 @@ class Executor:
         self.attention_defaults = attention.Snapshot(())
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: Any = None
+        #: a follower's hold of rank 0's attention selection for the current attempt
+        self._attention_hold = contextlib.ExitStack()
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
@@ -2811,7 +2813,7 @@ class Executor:
         pin = str(command.get("attention_kernel", ""))
         if pin:
             try:
-                self._attention_check(pin)
+                self._attention_plan(pin)
             except attention.AttentionRefusal as exc:
                 return {
                     "ok": False,
@@ -2935,6 +2937,7 @@ class Executor:
                 attention.override(
                     self._attention_snapshot(), self._attention_roots(), swap, pin
                 ) as served_attention,
+                self._ranks_attention(pin, served_attention),
                 attention_sol.observing(ranks=sol_rank_counts) as sol_counts,
                 attention_ulysses.observing() as served_impls,
             ):
@@ -3167,29 +3170,63 @@ class Executor:
             )
         return device
 
-    def _attention_frozen(self) -> str:
-        return (
-            "a context-parallel group is installed"
-            if self.group is not None or self.world > 1
-            else ""
-        )
-
-    def _attention_check(self, pin: str) -> None:
-        self._attention_plan(pin, apply=False)
-
-    def _attention_plan(self, pin: str, *, apply: bool = True) -> attention.Swap | None:
-        """A pin this construction already prepared (the worker's pinned variant) serves as
-        is, compiled or grouped; any other pin is planned or refused with the variant path."""
-        roots, frozen = self._attention_roots(), self._attention_frozen()
-        if (frozen or attention._baked_in(roots)) and attention._is_selected(
+    def _attention_plan(self, pin: str) -> attention.Swap | None:
+        """This rank's swap for one request's pin, admitted by every site, the device and
+        the group degree; none when a compiled construction already holds exactly it."""
+        roots = self._attention_roots()
+        if attention._baked_in(roots) and attention._is_selected(
             self._attention_snapshot(), roots, pin
         ):
             return None
-        device = self._attention_device(pin)
-        if not apply:
-            attention.check(device, roots, pin, frozen)
-            return None
-        return attention.plan(device, roots, pin, frozen)
+        return attention.plan(self._attention_device(pin), roots, pin, self.world)
+
+    def select_attention(self, command: dict[str, Any]) -> dict[str, Any]:
+        """A FOLLOWER restores its prepared selection and, given rank 0's `pin` for the next
+        attempt (empty is the prepared one), holds it and answers what its sites now hold."""
+        self._attention_hold.close()
+        if "pin" not in command:
+            return {"ok": True, "rank": self.rank}
+        target = self.constructions.get(str(command.get("construction") or ""))
+        if self.rank == 0 or target is None:
+            return {"ok": False, "code": "rank_divergence", "detail": "no such construction"}
+        pin = str(command["pin"])
+        try:
+            swap = target._attention_plan(pin) if pin else None
+            held = self._attention_hold.enter_context(
+                attention.override(
+                    target._attention_snapshot(), target._attention_roots(), swap, pin
+                )
+            )
+        except attention.AttentionRefusal as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
+        return {"ok": True, "rank": self.rank, "hosts": held.hosts}
+
+    def _followers_attention(self, **command: Any) -> list[dict[str, Any]]:
+        assert self.group is not None
+        self.group.broadcast({"cmd": "attention", "construction": self.construction, **command})
+        replies = self.group.collect("attention")
+        for reply in (reply for reply in replies if not reply.get("ok")):
+            detail = f"rank {reply.get('rank')}: {reply.get('detail', '')}"[:900]
+            raise InvalidRequest(detail, code=str(reply.get("code")))
+        return replies
+
+    @contextlib.contextmanager
+    def _ranks_attention(self, pin: str, applied: attention.Applied) -> Iterator[None]:
+        """Every follower serves this attempt's selection and restores its prepared one
+        after. Diffusers reads a processor's backend and parallel config on every call, so a
+        group swaps per attempt as one process does; rank 0 refuses what a rank does not hold.
+        """
+        if self.group is None:
+            yield
+            return
+        try:
+            held = {r["rank"]: r["hosts"] for r in self._followers_attention(pin=pin)}
+            if diverged := sorted(r for r, hosts in held.items() if hosts != applied.hosts):
+                detail = f"ranks {diverged} do not hold rank 0's {applied.hosts}"[:900]
+                raise InvalidRequest(detail, code="attention_rank_divergence")
+            yield
+        finally:
+            self._followers_attention()
 
     @staticmethod
     def _capture_options(command: Mapping[str, Any], surface: Any) -> ActivationCapture | None:
@@ -4101,6 +4138,7 @@ _FOLLOWER_COMMANDS = frozenset(
         "activate",
         "unload",
         "run",
+        "attention",
         "vacate",
         "restore",
         "probe",
@@ -4209,6 +4247,8 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.join(command)
             elif name == "run":
                 reply = executor.run(command)
+            elif name == "attention":
+                reply = executor.select_attention(command)
             elif name == "describe_installed":
                 reply = executor.describe_installed(command)
             elif name == "start":

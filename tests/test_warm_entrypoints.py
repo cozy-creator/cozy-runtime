@@ -182,7 +182,6 @@ def test_adding_the_second_entrypoint_reuses_the_prepared_executor(
                 step for _k, step in booted.notes
             ]
             booted.load("retouch")
-            assert set(booted.worker.prepared_models) == set(booted.staged.declared_bindings)
             assert executor.loaded_bindings() == set(booted.staged.declared_bindings)
             assert not booted.steps(r"replacing the device executor"), booted.notes
             # ONE fill for the construction: the second load answered from what was built.

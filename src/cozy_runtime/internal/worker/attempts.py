@@ -81,8 +81,8 @@ def safe(text: str, cap: int = 1024) -> str:
     return ascii_only[:cap]
 
 
-def _attention_pin(spec: Mapping[str, Any]) -> dict[str, str]:
-    kernel = str(spec.get("attention_kernel") or "")
+def _attention_pin(spec: Mapping[str, Any], default: str) -> dict[str, str]:
+    kernel = str(spec.get("attention_kernel") or default)
     return {"attention_kernel": kernel} if kernel else {}
 
 
@@ -275,7 +275,6 @@ class AttemptSlot:
     ledger: Ledger
     chooser: Any
     bindings: Mapping[str, DeclaredBinding]
-    prepared_models: Mapping[str, PreparedModel]
     failed_bindings: Mapping[str, str]
     lane_id: str
     #: what the executor on this slot was sealed to see (`CUDA_VISIBLE_DEVICES`)
@@ -495,6 +494,7 @@ class AttemptEngine:
         owner_scope: Callable[[], str] = lambda: "",
         tensorfs_root: Path | None = None,
         work_fingerprint: Callable[[AttemptRecord], str] | None = None,
+        attention_pin: str = "",
     ) -> None:
         self.records = records
         self.authorizer = authorizer
@@ -503,6 +503,8 @@ class AttemptEngine:
         self.job_device_count = 0
         self.spool_root = spool_root
         self.instance_id = instance_id
+        #: the dev-mode attention pin of a request that names none (`WorkerOptions`)
+        self.attention_pin = attention_pin
         self.send = send
         self.progress = progress
         self.live: dict[str, AttemptRecord] = {}  # request_id -> the attempt held right now
@@ -775,7 +777,7 @@ class AttemptEngine:
                     "entrypoint": declared.entrypoint,
                     "payload": attempt.payload,
                     **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
-                    **_attention_pin(attempt.spec),
+                    **_attention_pin(attempt.spec, self.attention_pin),
                     "input_metadata": {
                         name: {
                             "input_id": name,
@@ -1215,21 +1217,6 @@ class AttemptEngine:
             )
         return declared
 
-    def _resolve_binding(self, attempt: AttemptRecord) -> tuple[DeclaredBinding, PreparedModel]:
-        """Device entry requires the construction that the worker has just loaded."""
-        declared = self._resolve_declared_binding(attempt)
-        prepared_model = self.slot_of(attempt).prepared_models.get(
-            declared.entrypoint_binding_digest
-        )
-        if prepared_model is None:
-            raise AttemptRefusal(
-                "construction_not_loaded",
-                f"entrypoint {declared.entrypoint!r} is selected but its construction "
-                "has not loaded on this executor",
-                cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-            )
-        return declared, prepared_model
-
     def claim_staged(self, attempt: AttemptRecord) -> bool:
         """Take a STAGED attempt out of the queue — for device entry or for a cancel. Exactly
         one caller wins; the loser finds it gone."""
@@ -1249,12 +1236,19 @@ class AttemptEngine:
         placement as it stands now. A refusal here is typed and nothing reached the device.
         """
         slot = self.slot_of(attempt)
-        declared, prepared_model = self._resolve_binding(attempt)
-        attempt.declared = declared
-        attempt.prepared_model = prepared_model
+        declared = attempt.declared = self._resolve_declared_binding(attempt)
         plan_id = declared.entrypoint_binding_digest
         supervision = slot.supervision
         executor = supervision.current
+        loaded = executor.loaded.get(declared.construction_key()) if executor else None
+        if loaded is None or plan_id not in loaded.bindings:
+            raise AttemptRefusal(
+                "construction_not_loaded",
+                f"entrypoint {declared.entrypoint!r} is selected but its construction "
+                "has not loaded on this executor",
+                cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+            )
+        attempt.prepared_model = loaded.prepared_model
         if executor is None or not executor.alive():
             raise AttemptRefusal(
                 "executor_absent",
@@ -1296,7 +1290,7 @@ class AttemptEngine:
         if before_plan is not None:
             before_plan()
         try:
-            plan = slot.chooser.choose(declared, prepared_model, prepared)
+            plan = slot.chooser.choose(declared, loaded.prepared_model, prepared)
         except PlanRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
@@ -1841,7 +1835,7 @@ class AttemptEngine:
             "cmd": "invoke",
             "construction": attempt.declared.construction_key(),
             **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
-            **_attention_pin(attempt.spec),
+            **_attention_pin(attempt.spec, self.attention_pin),
             "request_id": key,
             "entrypoint": attempt.declared.entrypoint,
             "deadline_s": seconds,
