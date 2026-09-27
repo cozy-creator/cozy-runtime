@@ -71,7 +71,7 @@ def verify(
         raise WorkspaceRefusal("captured Model defaults require wire56")
     expected: set[tuple[str, str, str]] = set()
     for binding in capture["bindings"]:
-        revision, entrypoint = binding["callee_installation_id"], binding["entrypoint"]
+        revision, entrypoint = callee(binding), binding["entrypoint"]
         for entry in interfaces[revision]["entrypoints"]:
             if entry["name"] == entrypoint:
                 expected.update(
@@ -80,9 +80,9 @@ def verify(
                 )
     keys = []
     for row in rows:
-        if not {"callee_installation_id", "entrypoint", "parameter"} <= row.keys():
+        if not callee(row) or not {"entrypoint", "parameter"} <= row.keys():
             raise WorkspaceRefusal("captured Model default has no exact slot identity")
-        key = row["callee_installation_id"], row["entrypoint"], row["parameter"]
+        key = callee(row), row["entrypoint"], row["parameter"]
         keys.append(key)
         rungs, unavailable = row.get("rungs", []), row.get("unavailable_code", "")
         if unavailable:
@@ -131,6 +131,11 @@ def verify(
         raise WorkspaceRefusal("captured Model default inventory is incomplete or ambiguous")
 
 
+def callee(row: dict[str, Any]) -> str:
+    """A binding or default row's callee: its installation, or a deferred release key."""
+    return str(row.get("callee_installation_id") or row.get("callee_deferred_key") or "")
+
+
 def matches(selector: str, observed: str) -> bool:
     """The existing Creator GPU ladder's case-insensitive token subsequence rule."""
     if selector == "*":
@@ -156,8 +161,8 @@ def select(
     defaults = {
         row["parameter"]: row
         for row in rows
-        if (row["callee_installation_id"], row["entrypoint"])
-        == (target.installation_id, target.entrypoint)
+        if (callee(row), row["entrypoint"])
+        == (target.callee or target.installation_id, target.entrypoint)
     }
     for parameter in sorted(missing):
         row = defaults.get(parameter)

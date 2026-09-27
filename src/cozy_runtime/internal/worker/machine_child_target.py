@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import builtin_operations, job_plan, package_interface
+from cozy_runtime.internal.worker import machine_deferred
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
@@ -28,6 +29,7 @@ class Target:
     binding: JobBinding | None
     operation_identity: str
     serving_envelope: bool = False
+    callee: str = ""  # the capture's name for it: an installation id or a deferred key
 
 
 def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
@@ -49,21 +51,36 @@ def resolve_export(worker: Worker, parent: AttemptRecord, module: str, export: s
     capture = worker.executions.capture(owner, root)
     intent = {"module": module, "export": export}
     caller = parent.job.installation_id
+    callers = {caller, _deferred_key(worker, caller)}
     selected = next(
         (
             binding
             for binding in capture["bindings"]
-            if (binding["caller_installation_id"], binding["module"], binding["export"])
-            == (caller, intent["module"], intent["export"])
+            if (
+                binding.get("caller_installation_id") or binding.get("caller_deferred_key"),
+                binding["module"],
+                binding["export"],
+            )
+            in {(name, intent["module"], intent["export"]) for name in callers}
         ),
         None,
     )
     if selected is None:
         raise WorkspaceRefusal("child callable is absent from the accepted installation bindings")
-    identifier, entrypoint = selected["callee_installation_id"], selected["entrypoint"]
-    prepared = worker.executions.preparation(owner, root)["installations"].get(identifier)
+    callee, entrypoint = (
+        selected.get("callee_installation_id") or selected.get("callee_deferred_key", ""),
+        selected["entrypoint"],
+    )
+    if selected.get("callee_deferred_key"):
+        row = machine_deferred.rows(capture).get(callee)
+        if row is None or worker.machine_calls is None:
+            raise WorkspaceRefusal("child callable names an undeclared deferred installation")
+        prepared = worker.machine_calls.deferred.prepared(row)
+    else:
+        prepared = worker.executions.preparation(owner, root)["installations"].get(callee)
     if prepared is None:
         raise WorkspaceRefusal("child installation is not retained")
+    identifier = prepared["installation_id"]
     import base64
 
     raw = base64.b64decode(prepared["placement"]["package_interface"], validate=True)
@@ -117,7 +134,16 @@ def resolve_export(worker: Worker, parent: AttemptRecord, module: str, export: s
         binding,
         operation_identity,
         binding is None and caller != identifier,
+        callee,
     )
+
+
+def _deferred_key(worker: Worker, installation: str) -> str:
+    """A running deferred callee's key, from its installed package and release."""
+    for placement in worker.prepared_installations.values():
+        if placement.installation_id == installation:
+            return f"{placement.package.get('package', '')}@{placement.package.get('release', '')}"
+    return ""
 
 
 def computation(

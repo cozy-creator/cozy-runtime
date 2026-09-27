@@ -110,6 +110,7 @@ class MachineExecutionRPC:
                 cpu_slot_model_inputs=machine_slots.MODEL_INPUTS,
                 exact_execution_gpus=True,
                 source_credentials=True,
+                deferred_installations=self.worker.machine_calls is not None,
             )
 
         return self._call(request.claim, context, get)
