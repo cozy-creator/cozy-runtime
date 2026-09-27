@@ -13,6 +13,8 @@ from typing import Any, cast
 
 import tensorfs
 
+from cozy_runtime.internal import hostfacts
+from cozy_runtime.internal.worker import store_gc
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.machine_serving import Serving
 from cozy_runtime.internal.worker.session import Worker
@@ -117,6 +119,7 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             workspace=Workspace(store_root),
             executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
             options=SimpleNamespace(accelerator_backend="none"),
+            host_facts=lambda: hostfacts.measure("none"),
             config=SimpleNamespace(
                 bootstrap_credential="local", object_storage_hosts=("127.0.0.1",)
             ),
@@ -165,13 +168,16 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             row.get("position") == row.get("total") and row.get("total", 0) > 0
             for row in observations
         )
+        # The exact finished selection serves every demand; nothing is prepared again.
         again = serving._shared("owner", call, target, request, {}, speculative=False)
-        assert again is not None and again.result(5).placement == placement
+        assert again is not None and again is first
+        assert again.result(5).placement == placement
         assert len(fetched) == len(bodies)
-        # No persistent read lease prevents legitimate cache eviction. Demanding
-        # the completed metadata again must refill bytes, not fail child admission.
-        tensorfs.gc(str(store_root), evict_cached=True)
+        # No persistent read lease prevents legitimate cache eviction. Demanding the
+        # completed metadata after a collection must refill bytes, not fail admission.
+        store_gc.collect(store_root, keep_manifests=[])
         refilled = serving._shared("owner", call, target, request, {}, speculative=False)
+        assert refilled is not first
         assert refilled is not None and refilled.result(5).placement == placement
         store.verify_checkpoint_source("proof/model", manifest, length)
         assert len(fetched) > len(bodies)

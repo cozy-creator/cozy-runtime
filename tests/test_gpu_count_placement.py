@@ -55,6 +55,7 @@ def test_selection_uses_granted_pool_and_old_rows_do_not_need_count_probe(
     }
     worker = SimpleNamespace(
         options=SimpleNamespace(accelerator_backend="cuda"),
+        host_facts=lambda: hostfacts.measure("cuda"),
         executions=SimpleNamespace(
             capture_root=lambda *_: "root", capture=lambda *_: {"model_defaults": [row]}
         ),
@@ -63,6 +64,8 @@ def test_selection_uses_granted_pool_and_old_rows_do_not_need_count_probe(
         Any,
         SimpleNamespace(
             installation_id="installed",
+            callee="",
+            prepared_installation={},
             entrypoint="run",
             declaration={"models": [{"path": "run.models.model"}]},
         ),

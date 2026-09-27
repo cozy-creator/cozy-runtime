@@ -25,8 +25,10 @@ streams. TensorFS owns bytes, object verification, cache, credentials, and nativ
 cancellation. Different manifests sharing individual objects are not guaranteed
 to share an in-flight network request; they still reuse verified cached objects.
 
-Actual invocation joins unfinished preparation. If a hint already finished, demand
-revalidates source custody, restoring bytes evicted from the cache. A failed hint
+Actual invocation joins unfinished preparation and reuses a finished one with the same
+exact selection. Once this worker's store collector has run since, demand revalidates
+source custody instead, restoring evicted bytes; each child's admission still retains
+and natively verifies its own inputs. A failed hint
 does not fail unrelated work; a later demand can retry the same selection. Native
 input holds belong to each actual child. Temporary preparation holds and read
 leases are released when preparation ends; interrupted temporary holds are cleaned

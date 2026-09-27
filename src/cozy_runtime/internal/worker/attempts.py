@@ -1606,6 +1606,7 @@ class AttemptEngine:
             "child_poll",
             "child_cancel",
             "child_forget",
+            "child_events",
             "model_prefetch",
             "gpu_release",
         ):
@@ -3142,6 +3143,8 @@ class AttemptEngine:
                 executor, f"{held.request_id}#{held.attempt}"
             ):
                 return "executor already gone or cooperative marker unavailable"
+            if self.calls is not None:
+                self.calls.wake()  # a parent awaiting children reads its marker now
             return f"cooperative cancel marked ({held.canceling})"
 
     def escalate(self, attempt: AttemptRecord, stall: Mapping[str, float]) -> dict[str, Any]:

@@ -4070,7 +4070,12 @@ class Executor:
                 bindings[(module, export)] = binding
         for module, export in own.keys() - bindings.keys():
             bindings[(module, export)] = native_interfaces.unserved(module, export)
-        return _Broker(str(command["request_id"]), bindings, self._durable)
+        return _Broker(str(command["request_id"]), bindings, self._durable, self._child_events)
+
+    def _child_events(self) -> int | None:
+        """The worker's nudge socket for this attempt's calls; None from an older worker."""
+        answer = self._durable("child_events", {}, descriptor=True)
+        return int(answer["descriptor"]) if answer.get("ok") is True else None
 
     def _durable(
         self, kind: str, body: dict[str, Any], *, descriptor: bool = False

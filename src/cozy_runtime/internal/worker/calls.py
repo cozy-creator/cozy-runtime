@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import socket
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -24,7 +26,7 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.capture_observation import document as observation_document
-from cozy_runtime.internal.seam import MAX_FRAME
+from cozy_runtime.internal.seam import MAX_FRAME, DescriptorReply
 from cozy_runtime.internal.worker import byte_inputs, child_byte_results
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
@@ -82,6 +84,8 @@ class Calls:
         self.pending: dict[tuple[str, int, int], _Pending] = {}
         self.materialized: dict[tuple[str, int], tuple[Path, int]] = {}
         self.received: dict[tuple[str, int], dict[str, _Received]] = {}
+        #: per parent attempt: the socket a nudge is written to when its calls may have moved
+        self.watchers: dict[tuple[str, int], socket.socket] = {}
         self.lock = threading.RLock()
 
     def bindings(self, attempt: AttemptRecord) -> list[dict[str, Any]]:
@@ -136,6 +140,8 @@ class Calls:
                     if self.prefetch is None:
                         return {"ok": True, "scheduled": False}
                     return self.prefetch(attempt, frame)
+                if frame.get("kind") == "child_events":
+                    return self._watch(attempt)
                 index = frame.get("call_index")
                 if type(index) is not int or not 0 <= index <= MAX_CALL_INDEX:
                     raise ValueError("parent call index exceeds its bound")
@@ -266,6 +272,25 @@ class Calls:
                 documents.DocumentError,
             ) as exc:
                 return {"ok": False, "code": "child_call_refused", "detail": str(exc)[:1024]}
+
+    def _watch(self, attempt: AttemptRecord) -> DescriptorReply:
+        """The parent's wakeup: it awaits a nudge instead of polling on a clock."""
+        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        ours.setblocking(False)
+        previous = self.watchers.pop((attempt.request_id, attempt.attempt), None)
+        if previous is not None:
+            previous.close()
+        self.watchers[(attempt.request_id, attempt.attempt)] = ours
+        return DescriptorReply({"ok": True}, theirs)
+
+    def wake(self) -> None:
+        """A call result, child progress or a cancel may have moved: every parent re-polls.
+
+        Lock-free, so any journal writer may call it; a nudge already queued is enough.
+        """
+        for watcher in tuple(self.watchers.values()):
+            with contextlib.suppress(OSError):
+                watcher.send(b"\0")
 
     def _progress(self, pending: _Pending) -> dict[str, Any]:
         """Reuse the child's existing journal; polling progress does not change call identity."""
@@ -402,6 +427,7 @@ class Calls:
                 del self.pending[
                     (result.parent_request_id, result.parent_attempt_ordinal, result.call_index)
                 ]
+            self.wake()
             return True
 
     def _materialize(self, attempt: AttemptRecord, pending: _Pending) -> list[dict[str, Any]]:
@@ -497,6 +523,8 @@ class Calls:
 
     def close(self, request_id: str, attempt: int) -> None:
         with self.lock:
+            if watcher := self.watchers.pop((request_id, attempt), None):
+                watcher.close()
             self.received.pop((request_id, attempt), None)
             if held := self.materialized.pop((request_id, attempt), None):
                 byte_inputs.remove_checkout(held[0] / "child-results")

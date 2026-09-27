@@ -321,6 +321,7 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_the_capture_origin() -
             Worker,
             SimpleNamespace(
                 options=SimpleNamespace(accelerator_backend="none"),
+                host_facts=lambda: hostfacts.measure("none"),
                 executions=SimpleNamespace(
                     capture_root=lambda *_: "root",
                     capture=lambda *_: {"catalog_origin": catalog.origin, "model_defaults": []},

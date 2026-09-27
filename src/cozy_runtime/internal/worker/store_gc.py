@@ -12,6 +12,15 @@ from cozy_runtime.internal import fill
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+#: Collections run by this process: bytes verified at one generation are still here while
+#: it holds. Another process's eviction still meets admission's native checks.
+generation = 0
+
+
+def _collected() -> None:
+    global generation
+    generation += 1
+
 
 def collect(
     tensorfs_root: Path, *, keep_manifests: list[str] | None = None
@@ -28,7 +37,9 @@ def collect(
     except Exception as exc:
         if getattr(exc, "code", None) == "STORE_BUSY":
             return pb.CollectStoreGarbageResult(store_busy=True)
+        _collected()  # a failed pass may still have removed objects
         raise
+    _collected()
     # Collection already ran; unreadable accounting reports nothing reclaimed.
     reclaimed = result.get("reclaimed_bytes") if isinstance(result, dict) else None
     return pb.CollectStoreGarbageResult(

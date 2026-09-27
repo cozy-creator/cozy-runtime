@@ -347,6 +347,20 @@ ALTER TABLE weights ADD COLUMN adoption_checkpoint BLOB NOT NULL DEFAULT x'';
 """
 
 
+#: Per store: told after a transaction writes a table a parent's call poll reads.
+_call_watchers: dict[Path, Callable[[], None]] = {}
+
+
+def watch_calls(store_root: Path, watcher: Callable[[], None]) -> None:
+    """One worker per store wakes its parents when any call result or refusal is written."""
+    _call_watchers[store_root.resolve()] = watcher
+
+
+def _writes_calls(sql: str) -> bool:
+    head = sql.lstrip()[:6].upper()
+    return head in ("UPDATE", "INSERT") and ("execution_calls" in sql or "native_calls" in sql)
+
+
 class Workspace:
     def __init__(self, store_root: Path):
         if not store_root.is_absolute() or store_root == Path("/"):
@@ -375,6 +389,12 @@ class Workspace:
             raise WorkspaceBusy("foreground workspace transition is active")
         lock = -1
         changed = False
+        wrote_calls = False
+
+        def trace(sql: str) -> None:
+            nonlocal wrote_calls
+            wrote_calls = wrote_calls or _writes_calls(sql)
+
         try:
             lock = os.open(self.directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
             try:
@@ -396,8 +416,10 @@ class Workspace:
                     raise WorkspaceInactive("workspace authority transfer is not active")
                 if active:
                     handle.drain(db)
+                db.set_trace_callback(trace)
                 yield db
             finally:
+                db.set_trace_callback(None)
                 if db.in_transaction:
                     db.execute("ROLLBACK")
                 changed = db.total_changes != baseline
@@ -407,6 +429,8 @@ class Workspace:
             handle.mutex.release()
             if changed:
                 self.changes().bump()
+            if wrote_calls and (watcher := _call_watchers.get(self.store_root)) is not None:
+                watcher()
 
     def defer(self, write: Callable[[Journal], None]) -> None:
         """Record lossy telemetry with the next journal access, never on the caller's path."""

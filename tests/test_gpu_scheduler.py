@@ -85,6 +85,7 @@ def test_default_ladder_picks_the_widest_rung_so_h3_is_one_four_gpu_group(
     ]
     worker = SimpleNamespace(
         options=SimpleNamespace(accelerator_backend="cuda"),
+        host_facts=lambda: hostfacts.measure("cuda"),
         executions=SimpleNamespace(
             capture_root=lambda *_: "root", capture=lambda *_: {"model_defaults": rows}
         ),
@@ -92,6 +93,8 @@ def test_default_ladder_picks_the_widest_rung_so_h3_is_one_four_gpu_group(
     )
     target = SimpleNamespace(
         installation_id="h3",
+        callee="",
+        prepared_installation={},
         entrypoint="ref2va_turbo",
         declaration={
             "models": [{"path": "ref2va_turbo.models." + n} for n in ("base_model", "turbo_lora")]

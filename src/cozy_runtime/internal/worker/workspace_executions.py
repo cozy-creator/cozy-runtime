@@ -159,6 +159,8 @@ class Executions:
     def __init__(self, workspace: Workspace, *, clock_ms: Callable[[], int] | None = None):
         self.workspace = workspace
         self.clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        #: told each non-log event's kind as it is journaled; must not block or take locks
+        self.changed: Callable[[str], None] = lambda kind: None
 
     @property
     def workspace_id(self) -> str:
@@ -270,6 +272,8 @@ class Executions:
             "INSERT INTO execution_events VALUES(?,?,?,?,?,?,?)",
             (row["owner"], row["request"], sequence, row["ordinal"], at, kind, body),
         )
+        if kind != "log":
+            self.changed(kind)
         # Only live progress is lossy. Control, outcomes and authored log records remain.
         if kind == "progress":
             obsolete = db.execute(

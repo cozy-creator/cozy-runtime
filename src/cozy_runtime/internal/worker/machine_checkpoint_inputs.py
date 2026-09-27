@@ -84,9 +84,18 @@ def _native_identity(root: Mapping[str, Any], row: Row, *, released: bool) -> No
 
 
 def preflight(
-    workspace: Workspace, owner: str, offer: pb.AttemptOffer, entries: Mapping[str, BoundInput]
+    workspace: Workspace,
+    owner: str,
+    offer: pb.AttemptOffer,
+    entries: Mapping[str, BoundInput],
+    *,
+    resident: bool = False,
 ) -> None:
-    """Validate every new catalog source before any new recipient root is created."""
+    """Validate every new catalog source before any new recipient root is created.
+
+    `resident`: a live executor already built this exact construction from these sources,
+    so only `retain`'s own native verification checks them again.
+    """
     store = fill.store(workspace.store_root)
     for entry in entries.values():
         with workspace.locked() as db:
@@ -115,6 +124,8 @@ def preflight(
                         continue
                     if row["state"] == "held":
                         raise WorkspaceRefusal("accepted catalog input lost its native root")
+            if resident:
+                continue
             _native(
                 db,
                 partial(
