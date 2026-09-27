@@ -21,7 +21,7 @@ from test_derived_config_runtime import _released_source
 def _request() -> pb.WeightsFinalizeRequest:
     raw, digest = documents.identity(
         pb.InvocationSpec(
-            environment_digest="sha256:" + "e" * 64,
+            installation_id="local-" + "e" * 32,
             payload_digest="sha256:" + "d" * 64,
             outputs=[
                 pb.OutputBinding(
@@ -30,7 +30,9 @@ def _request() -> pb.WeightsFinalizeRequest:
                     max_bytes=1 << 20,
                 )
             ],
-            job=pb.JobInvocationSpec(build_id="b" * 64, job_descriptor_id="c" * 64),
+            job=pb.JobInvocationSpec(
+                installation_id="local-" + "b" * 32, job_descriptor_id="c" * 64
+            ),
         )
     )
     return pb.WeightsFinalizeRequest(
@@ -159,6 +161,11 @@ def test_history_loss_does_not_authorize_fencing_an_existing_writer(tmp_path: Pa
     assert writer.commit()["transaction_id"] == _transaction(request)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="worker-protocol scripts/fixtures.py freezes weights_transaction_id for the pre-wire-62 "
+    "job_spec digest; fix the vector upstream, re-vendor, then drop this marker",
+)
 def test_transaction_identity_matches_the_shared_protocol_vector() -> None:
     import json
 

@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from typing import Any
 import pytest
 
 from conftest import sample_python
+from cozy.worker.v1.wire_version import MIN_COMPATIBLE_WIRE_MINOR
 from cozy_runtime.internal import accel, child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
@@ -35,7 +37,6 @@ from cozy_runtime.internal.local import (
     LocalRecordOwner,
     LocalRequest,
     SliceOutcome,
-    development_source_digest,
     run_slice,
 )
 from cozy_runtime.internal.worker import lane_wire, lanes
@@ -89,7 +90,7 @@ def _slice(
     body = package_interface.build(found)
     workspace = root / "run"
     workspace.mkdir(parents=True, exist_ok=True)
-    revision = development_source_digest(PACKAGE)
+    installation_id = "local-" + uuid.uuid4().hex
     job_records: list[dict[str, Any]] = []
     descriptor_id = ""
     if kind == "job":
@@ -100,11 +101,10 @@ def _slice(
         job_records.append(
             {
                 "job_descriptor_id": descriptor_id,
-                "build_id": revision,
+                "installation_id": installation_id,
                 "application": str(body["application"]),
                 "package_interface": str(interface_path),
                 "python": str(sample_python()),
-                "environment_content_digest": revision,
                 "job": "marco_job",
                 "publishes": False,
                 "emits_media": False,
@@ -146,7 +146,7 @@ def _slice(
             request,
             job_records=job_records,
             workspace=workspace,
-            package_code_digest=revision,
+            package_installation_id=installation_id,
             package_interface_document=body if kind == "entrypoint" else None,
             project=PACKAGE,
             development_tensorfs_root=config.cozy_home / "tensorfs",
@@ -175,13 +175,13 @@ def test_previous_minor_owner_runs_inference_on_current_worker() -> None:
     def previous(owner: LocalRecordOwner) -> None:
         queued = owner.host.inbound.get_nowait()
         assert queued is not None and queued.WhichOneof("msg") == "claim"
-        queued.claim.wire_minor = 60
+        queued.claim.wire_minor = MIN_COMPATIBLE_WIRE_MINOR
         owner.host.deliver(queued)
         make_desired = owner._desired_state
 
         def desired() -> pb.DesiredWorkerState:
             directive = make_desired()
-            directive.wire_minor = 60
+            directive.wire_minor = MIN_COMPATIBLE_WIRE_MINOR
             return directive
 
         owner._desired_state = desired  # type: ignore[method-assign]
@@ -436,12 +436,11 @@ def test_one_lane_worker_seats_and_a_two_lane_worker_sum() -> None:
                 placement_set_digest=b"",
                 package={},
                 development={},
-                environment_digest=b"",
-                package_interface=("", 0),
+                installation_id="",
+                package_interface=b"",
                 bindings_digest=b"",
                 models=(),
                 entrypoints=(),
-                environment={},
                 document={},
                 serving=pb.ServingState.SERVING_STATE_DISPATCHABLE,
             )
@@ -499,12 +498,11 @@ def test_the_ledger_row_survives_a_switch_to_another_placement() -> None:
                 placement_set_digest=b"",
                 package={},
                 development={},
-                environment_digest=b"",
-                package_interface=("", 0),
+                installation_id="",
+                package_interface=b"",
                 bindings_digest=b"b" * 32,
                 models=(),
                 entrypoints=(),
-                environment={},
                 document={},
                 lane_id="lane-0",
             )

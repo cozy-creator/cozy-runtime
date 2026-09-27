@@ -126,7 +126,9 @@ def child(executions: Executions, parent: str, index: int, pins: tuple[int, ...]
     return call.child_request
 
 
-def finish(executions: Executions, request: str, status: int = pb.OUTCOME_STATUS_SUCCEEDED) -> None:
+def finish(
+    executions: Executions, request: str, status: pb.OutcomeStatus = pb.OUTCOME_STATUS_SUCCEEDED
+) -> None:
     offer = executions.offer(OWNER, request)
     raw, identity = documents.identity(
         pb.AttemptOutcomeBody(
@@ -376,9 +378,7 @@ def test_serving_roots_without_preparation_pin_still_reserve_their_group(tmp_pat
     """
     host, groups, executions = worker(tmp_path, 4)
     cast(Any, host)._placement_by_id = lambda placement_id: (
-        SimpleNamespace(device_pin=(0, 1, 2, 3))
-        if placement_id == "h3-placement"
-        else None
+        SimpleNamespace(device_pin=(0, 1, 2, 3)) if placement_id == "h3-placement" else None
     )
     first = submit_serving(executions, "serving-first")
     second = submit_serving(executions, "serving-second")
@@ -459,7 +459,7 @@ def test_impossible_retained_pin_refuses_instead_of_waiting_forever(tmp_path: Pa
 
 @pytest.mark.parametrize("status", [pb.OUTCOME_STATUS_SUCCEEDED, pb.OUTCOME_STATUS_FAILED])
 def test_finished_root_does_not_keep_a_group_for_its_cached_models(
-    tmp_path: Path, status: int
+    tmp_path: Path, status: pb.OutcomeStatus
 ) -> None:
     _, groups, executions = worker(tmp_path)
     assert groups.available(OWNER, "older", 2) == (0, 1)

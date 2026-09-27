@@ -36,7 +36,7 @@ def test_job_only_project_produces_a_development_placement(tmp_path: Path) -> No
         interface,
         package="local/only-job",
         release="0.0.0",
-        source_digest="sha256:" + "a" * 64,
+        installation_id="local-only-job",
         project=tmp_path,
     )
     assert not result.placement.entrypoints
@@ -52,7 +52,7 @@ def test_empty_interface_still_refuses() -> None:
             {"entrypoints": [], "jobs": []},
             package="local/empty",
             release="0.0.0",
-            source_digest="sha256:" + "a" * 64,
+            installation_id="local-empty",
         )
 
 
@@ -90,8 +90,8 @@ def test_metadata_placement_never_imports_source(tmp_path: Path, kind: str) -> N
             "local/no-import",
             "--release",
             "0.0.0",
-            "--source-digest",
-            "sha256:" + "a" * 64,
+            "--installation-id",
+            "local-no-import",
             "--tensorfs-root",
             str(tmp_path / "store"),
         ],

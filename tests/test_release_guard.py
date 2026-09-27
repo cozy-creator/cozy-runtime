@@ -79,7 +79,7 @@ def release(
             }
         )
     )
-    monkeypatch.setattr(guard, "ROOT", repo)
+    monkeypatch.setattr(sys, "argv", [str(GUARD), "--source", str(repo)])
     monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
     monkeypatch.setenv("GITHUB_REF", "refs/tags/v1.2.3")
     monkeypatch.setenv("GITHUB_SHA", head)
@@ -140,9 +140,24 @@ def test_existing_or_deleted_tag_event_cannot_publish(
     event = json.loads(event_path.read_text())
     event[field] = value
     event_path.write_text(json.dumps(event))
-    with pytest.raises(ValueError, match="newly created"):
+    with pytest.raises(ValueError, match="new tag push or an explicit manual tag"):
         guard.main()
     assert registry.requests == []
+
+
+def test_manual_dispatch_publishes_only_an_existing_version_tag(
+    release: ReleaseFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard, _, event_path, registry = release
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/master")
+    event_path.write_text(json.dumps({"inputs": {"release_tag": "v1.2.3"}}))
+    assert guard.main() == 0
+    assert registry.requests == ["/pypi/cozy-runtime/1.2.3/json"]
+    event_path.write_text(json.dumps({"inputs": {"release_tag": "master"}}))
+    with pytest.raises(ValueError, match="manual publication requires an existing version tag"):
+        guard.main()
+    assert len(registry.requests) == 1
 
 
 def test_tag_must_match_declared_version(
@@ -220,10 +235,17 @@ def test_unavailable_index_does_not_mean_unpublished(release: ReleaseFixture, st
         guard.main()
 
 
-def test_publication_command_refuses_a_source_pr() -> None:
+def test_publication_command_refuses_a_source_pr(tmp_path: Path) -> None:
+    event = tmp_path / "pull_request.json"
+    event.write_text(json.dumps({"number": 1}))
     result = subprocess.run(
         [sys.executable, str(GUARD)],
-        env={**os.environ, "GITHUB_EVENT_NAME": "pull_request"},
+        env={
+            **os.environ,
+            "GITHUB_EVENT_NAME": "pull_request",
+            "GITHUB_EVENT_PATH": str(event),
+            "GITHUB_REF": "refs/pull/1/merge",
+        },
         capture_output=True,
         text=True,
     )

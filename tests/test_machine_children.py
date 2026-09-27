@@ -955,7 +955,7 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
     target = cast(
         Target,
         SimpleNamespace(
-            revision="different",
+            installation_id="different",
             binding=SimpleNamespace(job_descriptor_id="different"),
             declaration={},
         ),

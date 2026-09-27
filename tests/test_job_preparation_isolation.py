@@ -140,7 +140,7 @@ def test_job_only_worker_preparation_preserves_running_job_and_exact_readiness()
             request_id="first-root",
             timeout_ms=60000,
         )
-        owner = LocalRecordOwner(request, {}, root / "run", package_code_digest="")
+        owner = LocalRecordOwner(request, {}, root / "run", package_installation_id="")
         worker = Worker(
             config,
             WorkerOptions(
@@ -169,7 +169,7 @@ def test_job_only_worker_preparation_preserves_running_job_and_exact_readiness()
         plan = next(row for row in records if row.get("job") == "first")
         binding = JobBinding.read(plan)
         owner.request = dataclasses.replace(request, job_descriptor_id=binding.job_descriptor_id)
-        owner.package_code_digest = binding.build_id
+        owner.package_installation_id = binding.installation_id
         observed: dict[str, Any] = {}
         failures: list[BaseException] = []
 
@@ -197,15 +197,11 @@ def test_job_only_worker_preparation_preserves_running_job_and_exact_readiness()
                     pb.JobDirective(), changed, worker.supervision, worker.lanes.envelope
                 )
                 assert not wrong.ready(), "a live process is not the newly selected code"
-                worker.supervision.use_environment(
-                    changed.python, changed.environment_content_digest
-                )
+                worker.supervision.use_environment(changed.python, changed.installation_id)
                 assert slot.ready() and not wrong.ready(), (
                     "readiness read mutable next-spawn selection"
                 )
-                worker.supervision.use_environment(
-                    binding.python, binding.environment_content_digest
-                )
+                worker.supervision.use_environment(binding.python, binding.installation_id)
                 observed.update(epoch=before[0], pid=before[1], unchanged=True)
             except BaseException as exc:
                 failures.append(exc)

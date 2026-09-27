@@ -15,6 +15,7 @@ import math
 import os
 import socket
 import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -31,7 +32,7 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE
 from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.executor import main as executor_main
-from cozy_runtime.internal.local import development_source_digest, stage_development_placement
+from cozy_runtime.internal.local import stage_development_placement
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
 from cozy_runtime.internal.weights_sink import weights_transaction_id
@@ -284,7 +285,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         interface,
         package="test/dual-model-package",
         release="0.0.1",
-        source_digest=development_source_digest(PACKAGE),
+        installation_id="local-" + uuid.uuid4().hex,
         artifact_cache=root / "cache",
         tensorfs_root=store,
         project=PACKAGE,
@@ -360,7 +361,9 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         warm_observation = [{"spare_device": "meta", "scope": "plain", "active": ["dit"]}]
         assert executor.models["base"].pipe.warm_observations == warm_observation
         assert set(executor.model_executors[0].facts["resident"]) == {"dit"}
-        assert executor.model_executors[0].facts["parked"] == ["spare"]
+        # Warm staged `spare` out; construction fitted it, so it is evicted, not parked (#615).
+        assert executor.model_executors[0].facts["parked"] == []
+        assert set(executor.model_executors[0].facts["evicted"]) == {"spare"}
         for remote in group.call({"cmd": "probe"}) if group is not None else []:
             assert list(remote["warm_observations"].values()) == [warm_observation], remote
         # Cross the real admission boundary before calling either model directly.

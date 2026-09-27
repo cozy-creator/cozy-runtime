@@ -24,7 +24,6 @@ These arms run the real thing.
 
 from __future__ import annotations
 
-import hashlib
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -103,7 +102,7 @@ def test_compile_leaves_the_seal_intact_under_the_imposed_jit_scope(
     """ARM: the environment a worker actually seals today survives a real compile."""
     scope = jit_cache.scope(
         tmp_path,
-        "sha256:" + hashlib.sha256(b"cr-086-arm").hexdigest(),
+        "local-cr-086-arm",
         pod_scope="cr-086-arm",
     )
     assert set(scope.environment) == set(JIT_NAMES)
@@ -194,7 +193,7 @@ def test_construction_refuses_compile_and_names_itself() -> None:
 def test_the_worker_imposes_the_jit_scope_for_every_executor(tmp_path: Path) -> None:
     """The production guarantee the red arm above depends on.
 
-    An UNBOUND executor (no environment content digest — a Runtime-only spawn) is the case
+    An UNBOUND executor (no environment installation — a Runtime-only spawn) is the case
     that used to return `{}` and hand torch an absent `TORCHINDUCTOR_CACHE_DIR`. Every
     executor now gets the full set, absolute, so torch's own lazy write is a no-op.
     """
@@ -207,7 +206,7 @@ def test_the_worker_imposes_the_jit_scope_for_every_executor(tmp_path: Path) -> 
         cozy_home=tmp_path / "home",
     )
     try:
-        assert supervision.environment_content_digest == ""
+        assert supervision.environment_installation_id == ""
         imposed = supervision._prepare_jit_cache()
     finally:
         supervision.close()

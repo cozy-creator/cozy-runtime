@@ -106,7 +106,8 @@ def resolve_export(worker: Worker, parent: AttemptRecord, module: str, export: s
     if invocable.get("memoize") and not operation_identity:
         worker.note(
             "memoization",
-            f"{intent['module']}.{intent['export']} runs uncached: callable implementation identity is unavailable",
+            f"{intent['module']}.{intent['export']} runs uncached: "
+            "callable implementation identity is unavailable",
         )
     return Target(
         identifier,

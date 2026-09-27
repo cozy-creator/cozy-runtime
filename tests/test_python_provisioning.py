@@ -302,12 +302,14 @@ def test_private_preparation_observes_cancellation_before_wheel_access(tmp_path:
         python_requires=">=3.13",
         python_version="3.13.8",
         package=pb.DevelopmentPackage(
-            package="local/cancelled",
-            release="1.0",
-            source_digest=b"s" * 32,
-            local_revision_digest=b"r" * 32,
+            package="local/cancelled", release="1.0", installation_id="local-cancelled"
         ),
-        wheels=[pb.LocalPackageWheel(filename="cancelled-1.0-py3-none-any.whl")],
+        files=[
+            pb.LocalPackageFile(
+                filename="cancelled-1.0-py3-none-any.whl",
+                path=str(root / ".stage/cancelled/wheels/cancelled-1.0-py3-none-any.whl"),
+            )
+        ],
     )
     with pytest.raises(package_prepare.PreparationRefusal, match="cancelled"):
         package_prepare.prepare_local_package(
@@ -553,6 +555,7 @@ def test_cli_and_local_worker_share_one_managed_interpreter_root(
         ),
         stop=threading.Event(),
         note=lambda *a: None,
+        _describe_installed=lambda *a, **k: b"",
     )
     with pytest.raises(package_prepare.PreparationRefusal, match="selected"):
         Worker._prepare_published(cast(Worker, worker), pb.PreparePackageSetRequest())

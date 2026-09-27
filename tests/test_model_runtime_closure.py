@@ -256,8 +256,6 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         "jobs": [],
     }
     interface_bytes = package_interface.canonical_bytes(body)
-    interface_digest = "sha256:" + hashlib.sha256(interface_bytes).hexdigest()
-    (acquirer.cache_root / interface_digest.removeprefix("sha256:")).write_bytes(interface_bytes)
     slot = {
         "slot": "model",
         "reference_model_id": "model-0000",
@@ -268,7 +266,7 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         + hashlib.sha256(canonical.write({"name": "generate", "slots": [slot]})).hexdigest()
     )
     placement = SimpleNamespace(
-        package_interface=(interface_digest, len(interface_bytes)),
+        package_interface=interface_bytes,
         models=(
             {
                 "id": "model-0000",
@@ -283,7 +281,7 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         ),
         package={"package": "example/package", "release": "1"},
         development={},
-        environment_digest=b"\x33" * 32,
+        installation_id="local-" + "33" * 16,
     )
 
     assert acquirer._models(placement) == 1
@@ -375,15 +373,16 @@ def test_checkpoint_selection_refuses_partial_release_or_incomplete_model(
 def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path) -> None:
     root, manifest, length, _store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
     selection = _checkpoint_selection(manifest, release="", lane="")
-    for wrong_length in (-1, length + 1):
-        with pytest.raises(PreparationRefusal, match="model_manifest_mismatch"):
-            _selected_models(
-                "example/package",
-                [dict(selection, manifest_length=wrong_length)],
-                root,
-                lambda *_args: None,
-                construction_slots={selection["slot"]},
-            )
+    # The digest is the identity; the length comes from the held bytes, not the selection.
+    for declared_length in (-1, length + 1):
+        prepared = _selected_models(
+            "example/package",
+            [dict(selection, manifest_length=declared_length)],
+            root,
+            lambda *_args: None,
+            construction_slots={selection["slot"]},
+        )
+        assert prepared[selection["slot"]]["manifest_length"] == length
     with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
         _selected_models(
             "other/package",

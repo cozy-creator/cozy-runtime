@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 
 import pytest
 
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.session import Worker, WorkerOptions, desired_state_body
+from cozy_runtime.internal.worker.session import (
+    HostedPlacement,
+    Worker,
+    WorkerOptions,
+    desired_state_body,
+)
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config, _workspace
 from test_group_lanes import _placement
+from test_machine_calls import request, running
+from test_machine_execution import offer
 
 
 def test_failed_machine_preparation_is_not_an_endless_capacity_wait() -> None:
@@ -52,18 +61,11 @@ def test_failed_machine_preparation_is_not_an_endless_capacity_wait() -> None:
 @pytest.mark.parametrize("hosted", [False, True])
 @pytest.mark.parametrize(
     "fault_kind",
-    ["selected", "sibling", "old-environment", "old-bindings", "absent-identity", "preparing"],
+    ["selected", "sibling", "old-installation", "old-bindings", "absent-identity", "preparing"],
 )
 def test_queued_child_receives_only_its_exact_preparation_failure(
     hosted: bool, fault_kind: str
 ) -> None:
-    from dataclasses import replace
-
-    from cozy_runtime.internal.worker.session import HostedPlacement
-    from cozy_runtime.protocol import WIRE_MINOR, documents
-    from test_machine_calls import request, running
-    from test_machine_execution import offer
-
     with _workspace() as root:
         worker = Worker(
             replace(_config(root / "home"), bootstrap_credential="test-bootstrap"),
@@ -91,7 +93,7 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
             incoming = request(running(executions))
             child = calls.journal.accept("owner", incoming)
             placement = _placement("gpu")
-            placement.environment_digest = b"e" * 32
+            placement.installation_id = "local-current"
             placement.bindings_digest = b"b" * 32
             placement.materialization = pb.MATERIALIZATION_STATE_STAGED
             placement.serving = pb.SERVING_STATE_OFFLINE
@@ -108,11 +110,9 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
                 )
             raw, digest = documents.identity(
                 pb.InvocationSpec(
-                    environment_digest=documents.spell(
-                        b"o" * 32
-                        if fault_kind == "old-environment"
-                        else placement.environment_digest
-                    ),
+                    installation_id="local-old"
+                    if fault_kind == "old-installation"
+                    else placement.installation_id,
                     serving=pb.ServingInvocationSpec(
                         entrypoint_binding_digest=selected,
                         attempt_binding_id=selected,
@@ -131,7 +131,7 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
                 grant=pb.DeliveryGrant(invocation_spec_digest=digest),
             )
             if fault_kind == "absent-identity":
-                placement.environment_digest = b""
+                placement.installation_id = ""
                 placement.bindings_digest = b""
             executions.submit(
                 "owner",
@@ -168,12 +168,6 @@ def test_managed_child_waits_for_its_new_placement_despite_old_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A warm previous package is not readiness for the package being switched in."""
-    from dataclasses import replace
-
-    from cozy_runtime.protocol import WIRE_MINOR, documents
-    from test_machine_calls import request, running
-    from test_machine_execution import offer
-
     with _workspace() as root:
         worker = Worker(
             replace(_config(root / "home"), bootstrap_credential="test-bootstrap"),
@@ -207,7 +201,7 @@ def test_managed_child_waits_for_its_new_placement_despite_old_capacity(
             monkeypatch.setattr(worker, "_lane_slots", lambda *_args, **_kwargs: 1)
             raw, digest = documents.identity(
                 pb.InvocationSpec(
-                    environment_digest=documents.spell(b"e" * 32),
+                    installation_id="local-new",
                     serving=pb.ServingInvocationSpec(
                         entrypoint_binding_digest=documents.spell(b"s" * 32),
                         attempt_binding_id=documents.spell(b"s" * 32),

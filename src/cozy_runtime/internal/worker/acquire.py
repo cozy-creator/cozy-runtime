@@ -9,8 +9,6 @@ environment-specification, object-set, or binding documents.
 
 from __future__ import annotations
 
-from cozy_runtime.internal import package_installation
-
 import hashlib
 import os
 import time
@@ -28,6 +26,7 @@ from cozy_runtime.internal import (
     base_observation,
     fill,
     package_environment,
+    package_installation,
     package_interface,
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
@@ -46,12 +45,15 @@ class _SequenceParallel(TypedDict):
     degrees: list[int]
 
 
-_ModelDeclaration = TypedDict("_ModelDeclaration", {
-    "path": str,
-    "class": str,
-    "component_use": NotRequired[dict[str, list[str]]],
-    "sequence_parallel": NotRequired[_SequenceParallel],
-})
+_ModelDeclaration = TypedDict(
+    "_ModelDeclaration",
+    {
+        "path": str,
+        "class": str,
+        "component_use": NotRequired[dict[str, list[str]]],
+        "sequence_parallel": NotRequired[_SequenceParallel],
+    },
+)
 
 
 class _EntrypointDeclaration(TypedDict):
@@ -307,7 +309,9 @@ def preinstalled_development(
             "the accepted Placement does not equal the launch Runtime's local derivation",
         )
 
-    interface_path = cache_root / "installed-interfaces" / placement.installation_id / "package-interface.json"
+    interface_path = (
+        cache_root / "installed-interfaces" / placement.installation_id / "package-interface.json"
+    )
     interface_path.parent.mkdir(parents=True, exist_ok=True)
     interface_path.write_bytes(placement.package_interface)
     try:
@@ -502,7 +506,9 @@ class Acquirer:
         """
 
         try:
-            return package_installation.open_installation(self.install_root, placement.installation_id)
+            return package_installation.open_installation(
+                self.install_root, placement.installation_id
+            )
         except AcquisitionRefusal:
             raise
         except (LaunchRefusal, package_environment.EnvironmentRefusal) as exc:
@@ -659,9 +665,7 @@ class Acquirer:
                     ) from exc
                 sequence_parallel = declared.get("sequence_parallel")
                 degrees = (
-                    tuple(sequence_parallel["degrees"])
-                    if sequence_parallel is not None
-                    else ()
+                    tuple(sequence_parallel["degrees"]) if sequence_parallel is not None else ()
                 )
                 members.append(
                     ModelBinding(
@@ -819,7 +823,8 @@ def _ref(value: object, name: str) -> tuple[str, int]:
         reference = msgspec.convert(value, type=_ArtifactReference)
         if (
             not reference.digest.startswith("sha256:")
-            or len(reference.digest) != 71 or reference.length <= 0
+            or len(reference.digest) != 71
+            or reference.length <= 0
         ):
             raise ValueError("invalid reference")
     except (msgspec.ValidationError, ValueError) as exc:

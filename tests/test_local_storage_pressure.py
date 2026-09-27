@@ -112,7 +112,7 @@ def test_filesystem_without_inode_table_is_admitted_on_bytes(
         fields[5:8] = [0, 0, 0]
         return os.statvfs_result(fields)
 
-    monkeypatch.setattr(local.os, "statvfs", btrfs)
+    monkeypatch.setattr(os, "statvfs", btrfs)
     registration = storage.register_workspace(root, lambda _target: None)
     assert storage.pressure_enabled() and local.pressure_target(root) >= 0
     with storage.admit(storage.Write(root / "blob", 1 << 20, 4)):

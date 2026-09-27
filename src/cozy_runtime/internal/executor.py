@@ -82,7 +82,7 @@ from cozy_runtime.internal import (
     sandbox,
     source_interfaces,
 )
-from cozy_runtime.internal.config import seal_snapshot
+from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.parallel import cp, wire
@@ -175,11 +175,7 @@ def _restore_seal() -> tuple[str, ...]:
     configuration it runs. A package's change is a no-op either way: warn, never refuse.
     """
     changed = _env_changes()
-    for name in changed:
-        if _SEALED[name]:
-            os.environ[name] = _SEALED[name]
-        else:
-            os.environ.pop(name, None)
+    restore_seal(_SEALED, changed)
     if changed:
         print(
             f"[executor] restored sealed environment names changed by package code: "

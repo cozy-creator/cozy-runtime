@@ -92,7 +92,7 @@ def test_interface_reader_rejects_nonboolean_internal(tmp_path: Path, value: obj
         package_interface.read_bytes(canonical_json.encode(document))
 
 
-def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_revisions(
+def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_installations(
     tmp_path: Path,
 ) -> None:
     workspace = Workspace(tmp_path / "store")
@@ -107,11 +107,11 @@ def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_
     )
     calls = Calls(workspace)
     call = calls.accept("owner", request(running(executions)))
-    revision = "sha256:" + "11" * 32
+    installation = "local-" + "11" * 16
     calls.freeze(
         "owner",
         call,
-        canonical_json.encode({"revision": revision, "entrypoint": "segment"}),
+        canonical_json.encode({"installation_id": installation, "entrypoint": "segment"}),
     )
     child = offer(call.child_request)
     executions.submit(
@@ -122,31 +122,31 @@ def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_
         expected_execution_workspace_id=executions.workspace_id,
     )
     reopened = Workspace(tmp_path / "store")
-    require_child(reopened, "owner", child, revision, "segment", machine_owned=True)
-    for selected, owner, requested_revision, name, machine_owned in (
-        (child, "owner", revision, "segment", False),
-        (parent, "owner", revision, "segment", True),
-        (child, "another-owner", revision, "segment", True),
-        (child, "owner", "sha256:" + "22" * 32, "segment", True),
-        (child, "owner", revision, "another-helper", True),
+    require_child(reopened, "owner", child, installation, "segment", machine_owned=True)
+    for selected, owner, requested_installation, name, machine_owned in (
+        (child, "owner", installation, "segment", False),
+        (parent, "owner", installation, "segment", True),
+        (child, "another-owner", installation, "segment", True),
+        (child, "owner", "local-" + "22" * 16, "segment", True),
+        (child, "owner", installation, "another-helper", True),
     ):
         with pytest.raises(WorkspaceRefusal, match="internal_callable"):
             require_child(
                 reopened,
                 owner,
                 selected,
-                requested_revision,
+                requested_installation,
                 name,
                 machine_owned=machine_owned,
             )
     foreign_request = request(running(executions))
     foreign_request.call_index = 1
     foreign_call = calls.accept("owner", foreign_request)
-    foreign_revision = "sha256:" + "22" * 32
+    foreign_installation = "local-" + "22" * 16
     calls.freeze(
         "owner",
         foreign_call,
-        canonical_json.encode({"revision": foreign_revision, "entrypoint": "segment"}),
+        canonical_json.encode({"installation_id": foreign_installation, "entrypoint": "segment"}),
     )
     foreign_child = offer(foreign_call.child_request)
     executions.submit(
@@ -161,7 +161,7 @@ def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_
             reopened,
             "owner",
             foreign_child,
-            foreign_revision,
+            foreign_installation,
             "segment",
             machine_owned=True,
         )
@@ -169,4 +169,4 @@ def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_
     altered.CopyFrom(child)
     altered.invocation_spec_digest = b"x" * 32
     with pytest.raises(WorkspaceRefusal, match="internal_callable"):
-        require_child(reopened, "owner", altered, revision, "segment", machine_owned=True)
+        require_child(reopened, "owner", altered, installation, "segment", machine_owned=True)

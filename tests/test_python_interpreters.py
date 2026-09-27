@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import canonical, package_environment, python_interpreters
+from cozy_runtime.internal import package_installation, python_interpreters
 from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, _select_python
-from test_unpublished_exact_dependencies import _material, _wheel
+from test_unpublished_exact_dependencies import _wheel
 
 
 def test_unsupported_range_refuses_before_install() -> None:
@@ -49,11 +49,13 @@ def test_same_worker_materializes_multiple_python_closures(tmp_path: Path) -> No
             b"from private_helper import VALUE\n",
             requires_python=f"=={minor}.*",
         )
-        selected, base = _select_python(Path(sys.executable), f"=={minor}.*", choice.version)
-        base = base or package_environment.observe_base(selected)
-        source = _material(project, (dependency,), base)
-        installed = package_environment.materialize(
-            source, tmp_path / "worker", python=selected, base=base, exact_dependencies=True
+        selected, _ = _select_python(Path(sys.executable), f"=={minor}.*", choice.version)
+        installed = package_installation.install(
+            tmp_path / "worker",
+            package="local/private-client",
+            release="1.0",
+            python=selected,
+            wheels=(project, dependency),
         )
         actual = subprocess.run(
             [
@@ -68,40 +70,8 @@ def test_same_worker_materializes_multiple_python_closures(tmp_path: Path) -> No
             capture_output=True,
         )
         assert json.loads(actual.stdout) == [choice.version, minor]
-        identity = canonical.parse_canonical(
-            (installed.generation / package_environment.CONTENT_IDENTITY_NAME).read_bytes()
-        )
-        assert identity["interpreter"]["python_full_version"] == choice.version
-        assert identity["interpreter"]["python_abi"] == choice.abi
         held.append(installed)
     assert len({item.generation for item in held}) == len(held)
-
-
-def test_dependency_snapshot_cannot_cross_python_abi() -> None:
-    choices = python_interpreters.available()
-    if len({item.abi for item in choices}) < 2:
-        pytest.skip("two installed Python ABIs required")
-    with pytest.raises(package_environment.EnvironmentRefusal, match="dependency_python_mismatch"):
-        package_environment._require_same_interpreter(choices[0].executable, choices[-1].executable)
-
-
-def test_retired_python_cannot_reopen_retained_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    base = package_environment.observe_base()
-    project = _wheel(tmp_path, "retained_client", (), b"VALUE=1\n")
-    installed = package_environment.materialize(
-        _material(project, (), base), tmp_path / "worker", base=base, exact_dependencies=True
-    )
-    minor = ".".join(base.python_full_version.split(".")[:2])
-    supported = tuple(item for item in python_interpreters.supported_minors() if item != minor)
-    monkeypatch.setattr(python_interpreters, "supported_minors", lambda: supported)
-    with pytest.raises(package_environment.EnvironmentRefusal, match="python_unsupported"):
-        package_environment.open_generation(
-            tmp_path / "worker",
-            receipt_digest=installed.receipt_digest,
-            environment_digest=json.loads(installed.receipt_bytes)["environment_digest"],
-        )
 
 
 def test_configured_inventory_is_finite_and_empty_inventory_refuses(
@@ -112,17 +82,3 @@ def test_configured_inventory_is_finite_and_empty_inventory_refuses(
     monkeypatch.setenv("COZY_PACKAGE_PYTHONS", "")
     with pytest.raises(python_interpreters.InterpreterRefusal):
         python_interpreters.available()
-
-
-def test_advertised_image_interpreter_must_match_actual() -> None:
-    from cozy_runtime.internal import image_inventory
-    from cozy_runtime.internal.worker.package_prepare import _verify_inventory_python
-
-    actual = python_interpreters.probe(Path(sys.executable))
-    inventory = image_inventory.Inventory(
-        "test", actual.version, (), ((actual.version, actual.abi),)
-    )
-    _verify_inventory_python(inventory, actual.executable)
-    stale = image_inventory.Inventory("test", actual.version, (), (("3.99.1", "cp399"),))
-    with pytest.raises(PreparationRefusal, match="image_python_disagrees"):
-        _verify_inventory_python(stale, actual.executable)

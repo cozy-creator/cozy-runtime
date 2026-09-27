@@ -11,8 +11,7 @@ For a custom deterministic operation, declare the implementation contract:
     memo_version="convert/1",
     memo_dependencies=(convert_tensor, "my_tools.tensor_layout"),
 )
-async def convert(ctx, *, source):
-    ...
+async def convert(ctx, *, source): ...
 ```
 
 The worker discovers the operation's own function and the declared helpers in the

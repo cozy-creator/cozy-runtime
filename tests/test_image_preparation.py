@@ -142,12 +142,15 @@ def test_preparation_descriptor_is_argument_metadata(tmp_path: Path) -> None:
         {"profile": "image-fit/1", "max_edge": True},
         {"profile": "image-fit/1", "max_pixels": 1.5},
         {"profile": "image-fit/1", "max_pixels": None},
-        {"profile": "image-fit/1", "max_edge": 512, "crop": True},
     ):
         invalid = json.loads(encoded)
         invalid["entrypoints"][0]["assets"]["kinds"][0]["prepare"] = policy
         with pytest.raises(ConformanceError):
             package_interface.read_bytes(json.dumps(invalid).encode())
+    additive = json.loads(encoded)
+    additive["entrypoints"][0]["assets"]["kinds"][0]["prepare"]["crop"] = True
+    read = package_interface.read_bytes(json.dumps(additive).encode())
+    assert read["entrypoints"][0]["assets"]["kinds"][0]["prepare"]["max_edge"] == 512
     for cap in (0, -1, True, 1.5):
         with pytest.raises(ConformanceError, match="positive"):
             ImagePreparation(max_edge=cap)  # type: ignore[arg-type]

@@ -1,17 +1,14 @@
 """Publication absence refuses before a send, without polluting another call."""
 
-import hashlib
 import time
 from pathlib import Path
 
-from cozy_runtime import canonical_json
 from cozy_runtime.internal import effect_interfaces
 from cozy_runtime.internal.worker.machine_effects import Effects
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
-from cozy_runtime.protocol import documents
 from test_machine_calls import request, running
 from test_machine_execution import offer
 
@@ -83,17 +80,6 @@ def test_invalid_worker_authority_is_visible_and_background_threads_are_pollers(
         expected_execution_workspace_id=executions.workspace_id,
     )
     call = request(running(executions), module=effect_interfaces.MODULE)
-    call.interface_digest = documents.raw(effect_interfaces.DIGEST)
-    call.intent_digest = hashlib.sha256(
-        canonical_json.encode(
-            {
-                "interface_digest": effect_interfaces.DIGEST,
-                "module": call.module,
-                "export": call.export,
-                "request": {"value": 1},
-            }
-        )
-    ).digest()
     calls = Calls(workspace)
     calls.accept("owner", call)
     effects = Effects(

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 
 import pytest
 
@@ -83,11 +81,6 @@ def test_frameworks_remain_in_the_complete_locked_dependencies() -> None:
     assert rows == list(locked.rows)
     # Importability in an unrelated parent venv is not inherited platform custody.
     assert _filtered_rows("paul/ranged-marco", "1.0.4", locked) == list(locked.rows)
-
-
-def test_actual_interpreter_layout_distinguishes_managed_venv_from_base() -> None:
-    assert not package_environment.is_base_interpreter(Path(sys.executable))
-    assert package_environment.is_base_interpreter(Path(sys.base_prefix) / "bin/python3.12")
 
 
 def test_image_inventory_document_reader_is_the_exact_writer_rule() -> None:

@@ -10,8 +10,8 @@ import subprocess
 import sys
 import tarfile
 import uuid
-from contextlib import contextmanager
 from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict
@@ -56,26 +56,42 @@ def open_installation(root: Path, installation_id: str) -> InstalledEnvironment:
     directory = _directory(root, installation_id)
     try:
         record = msgspec.json.decode(
-            (directory / "installation.json").read_bytes(), type=InstallationRecord,
+            (directory / "installation.json").read_bytes(),
+            type=InstallationRecord,
         )
         python = Path(record.get("python", directory / "venv" / "bin" / "python"))
         generation = Path(record.get("generation", python.parent.parent))
-        sites = ([Path(record["site_packages"])] if "site_packages" in record
-                 else list((generation / "lib").glob("python*/site-packages")))
+        sites = (
+            [Path(record["site_packages"])]
+            if "site_packages" in record
+            else list((generation / "lib").glob("python*/site-packages"))
+        )
         if len(sites) != 1 or not python.is_file():
             raise ValueError("venv is incomplete")
         return InstalledEnvironment(
-            installation_id, generation, sites[0], python,
-            record["package"], record["release"], True,
+            installation_id,
+            generation,
+            sites[0],
+            python,
+            record["package"],
+            record["release"],
+            True,
         )
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise EnvironmentRefusal("package_installation_absent", installation_id) from exc
 
 
-def _run(command: list[str], *, directory: Path, environment: dict[str, str], lock_fd: int = -1) -> None:
+def _run(
+    command: list[str], *, directory: Path, environment: dict[str, str], lock_fd: int = -1
+) -> None:
     result = subprocess.run(
-        command, cwd=directory, env=environment, stdin=subprocess.DEVNULL,
-        capture_output=True, text=True, check=False,
+        command,
+        cwd=directory,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
         pass_fds=(lock_fd,) if sys.platform != "win32" and lock_fd >= 0 else (),
     )
     if result.returncode:
@@ -96,15 +112,20 @@ def _extract(archive: Path, destination: Path) -> None:
         for member in source:
             name = PurePosixPath(member.name)
             if (
-                name.is_absolute() or not name.parts or any(p in {".", ".."} for p in name.parts)
-                or "\\" in member.name or member.name in seen
+                name.is_absolute()
+                or not name.parts
+                or any(p in {".", ".."} for p in name.parts)
+                or "\\" in member.name
+                or member.name in seen
                 or not (member.isfile() or member.isdir())
             ):
                 raise EnvironmentRefusal("package_source_invalid", "unsafe source member")
             count += 1
             total += member.size
             if count > MAX_SOURCE_FILES or total > MAX_SOURCE_BYTES:
-                raise EnvironmentRefusal("package_source_invalid", "source inventory exceeds bounds")
+                raise EnvironmentRefusal(
+                    "package_source_invalid", "source inventory exceeds bounds"
+                )
             seen.add(member.name)
             target = destination.joinpath(*name.parts)
             if member.isdir():
@@ -118,14 +139,23 @@ def _extract(archive: Path, destination: Path) -> None:
                 shutil.copyfileobj(incoming, output)
             target.chmod(0o644 | (member.mode & 0o111))
     if not (destination / "pyproject.toml").is_file() or not (destination / "uv.lock").is_file():
-        raise EnvironmentRefusal("package_source_invalid", "source requires pyproject.toml and uv.lock")
+        raise EnvironmentRefusal(
+            "package_source_invalid", "source requires pyproject.toml and uv.lock"
+        )
 
 
 def _install(
-    root: Path, *, package: str, release: str, python: Path,
-    installation_id: str = "", source_archive: Path | None = None,
-    requirements: bytes = b"", wheels: tuple[Path, ...] = (),
-    cache: Path | None = None, lock_fd: int = -1,
+    root: Path,
+    *,
+    package: str,
+    release: str,
+    python: Path,
+    installation_id: str = "",
+    source_archive: Path | None = None,
+    requirements: bytes = b"",
+    wheels: tuple[Path, ...] = (),
+    cache: Path | None = None,
+    lock_fd: int = -1,
 ) -> InstalledEnvironment:
     """Create a venv without package fingerprints; existing IDs are operation replays only."""
     identifier = installation_id or "install-" + uuid.uuid4().hex
@@ -134,7 +164,8 @@ def _install(
         installed = open_installation(root, identifier)
         if (installed.package, installed.release) != (package, release):
             raise EnvironmentRefusal(
-                "package_installation_conflict", "installation ID belongs to another package release"
+                "package_installation_conflict",
+                "installation ID belongs to another package release",
             )
         return installed
     directory.parent.mkdir(parents=True, exist_ok=True, mode=0o711)
@@ -163,33 +194,72 @@ def _install(
                 _extract(source_archive, staged_source)
                 os.replace(staged_source, source)
             _run(
-                [uv, "sync", "--frozen", "--no-dev", "--no-python-downloads",
-                 "--project", str(source), "--python", str(python)],
-                directory=source, environment=environment, lock_fd=lock_fd,
+                [
+                    uv,
+                    "sync",
+                    "--frozen",
+                    "--no-dev",
+                    "--no-python-downloads",
+                    "--project",
+                    str(source),
+                    "--python",
+                    str(python),
+                ],
+                directory=source,
+                environment=environment,
+                lock_fd=lock_fd,
             )
         else:
             if not (directory / "venv" / "bin" / "python").is_file():
                 if (directory / "venv").exists():
                     shutil.rmtree(directory / "venv")
                 _run(
-                    [uv, "venv", "--no-project", "--no-config", "--no-python-downloads",
-                     "--python", str(python), str(directory / "venv")],
-                    directory=directory, environment=environment, lock_fd=lock_fd,
+                    [
+                        uv,
+                        "venv",
+                        "--no-project",
+                        "--no-config",
+                        "--no-python-downloads",
+                        "--python",
+                        str(python),
+                        str(directory / "venv"),
+                    ],
+                    directory=directory,
+                    environment=environment,
+                    lock_fd=lock_fd,
                 )
-            command = [uv, "pip", "install", "--no-config", "--python",
-                       str(directory / "venv" / "bin" / "python")]
+            command = [
+                uv,
+                "pip",
+                "install",
+                "--no-config",
+                "--python",
+                str(directory / "venv" / "bin" / "python"),
+            ]
             if requirements:
                 locked = directory / "requirements.txt"
                 locked.write_bytes(requirements)
-                _run(command + ["--require-hashes", "--no-deps", "--requirements", str(locked)],
-                     directory=directory, environment=environment, lock_fd=lock_fd)
+                _run(
+                    [*command, "--require-hashes", "--no-deps", "--requirements", str(locked)],
+                    directory=directory,
+                    environment=environment,
+                    lock_fd=lock_fd,
+                )
             if wheels:
-                _run(command + ["--no-deps", *[str(wheel) for wheel in wheels]],
-                     directory=directory, environment=environment, lock_fd=lock_fd)
+                _run(
+                    [*command, "--no-deps", *[str(wheel) for wheel in wheels]],
+                    directory=directory,
+                    environment=environment,
+                    lock_fd=lock_fd,
+                )
             elif not requirements:
                 distribution = package.rsplit("/", 1)[-1]
-                _run(command + [f"{distribution}=={release}"],
-                     directory=directory, environment=environment, lock_fd=lock_fd)
+                _run(
+                    [*command, f"{distribution}=={release}"],
+                    directory=directory,
+                    environment=environment,
+                    lock_fd=lock_fd,
+                )
         record = directory / "installation.json"
         temporary = directory / ".installation.json"
         temporary.write_text(json.dumps({"package": package, "release": release}) + "\n")
@@ -200,13 +270,21 @@ def _install(
         raise
     installed = open_installation(root, identifier)
     return InstalledEnvironment(
-        installed.installation_id, installed.generation, installed.site_packages,
-        installed.python, installed.package, installed.release,
+        installed.installation_id,
+        installed.generation,
+        installed.site_packages,
+        installed.python,
+        installed.package,
+        installed.release,
     )
 
 
 def open_existing_environment(
-    python: Path, installation_id: str, *, package: str = "", release: str = "",
+    python: Path,
+    installation_id: str,
+    *,
+    package: str = "",
+    release: str = "",
 ) -> InstalledEnvironment:
     """Adopt a normal same-user uv venv for its invocation lifetime."""
     from cozy_runtime.internal.package_environment import interpreter_layout
@@ -215,29 +293,47 @@ def open_existing_environment(
         raise EnvironmentRefusal("package_installation_invalid", "invalid local installation")
     generation = python.parent.parent
     if not (generation / "pyvenv.cfg").is_file():
-        raise EnvironmentRefusal("package_installation_invalid", "a uv virtual environment is required")
+        raise EnvironmentRefusal(
+            "package_installation_invalid", "a uv virtual environment is required"
+        )
     layout = interpreter_layout(python)
     site = Path(layout["purelib"])
     if layout["prefix"] != str(generation) or not site.is_relative_to(generation):
-        raise EnvironmentRefusal("package_installation_invalid", "Python does not belong to its venv")
+        raise EnvironmentRefusal(
+            "package_installation_invalid", "Python does not belong to its venv"
+        )
     return InstalledEnvironment(installation_id, generation, site, python, package, release, True)
 
 
 def retain_environment(
-    root: Path, python: Path, *, package: str, release: str,
+    root: Path,
+    python: Path,
+    *,
+    package: str,
+    release: str,
 ) -> InstalledEnvironment:
     """Retain the Runtime package's existing uv environment without copying its files."""
     identifier = "install-" + uuid.uuid4().hex
     from cozy_runtime.internal.package_environment import interpreter_layout
+
     layout = interpreter_layout(python)
-    held = InstalledEnvironment(identifier, Path(layout["prefix"]), Path(layout["purelib"]),
-                                python, package, release, True)
+    held = InstalledEnvironment(
+        identifier, Path(layout["prefix"]), Path(layout["purelib"]), python, package, release, True
+    )
     directory = _directory(root, identifier)
     directory.mkdir(parents=True, mode=0o711)
-    (directory / "installation.json").write_text(json.dumps({
-        "package": package, "release": release, "python": str(python),
-        "generation": str(held.generation), "site_packages": str(held.site_packages),
-    }) + "\n")
+    (directory / "installation.json").write_text(
+        json.dumps(
+            {
+                "package": package,
+                "release": release,
+                "python": str(python),
+                "generation": str(held.generation),
+                "site_packages": str(held.site_packages),
+            }
+        )
+        + "\n"
+    )
     return held
 
 
@@ -249,6 +345,7 @@ def _installation_lock(root: Path, identifier: str) -> Generator[int, None, None
     with (locks / (identifier + ".lock")).open("a+b") as held:
         if sys.platform == "win32":
             import msvcrt
+
             held.write(b"0")
             held.flush()
             held.seek(0)
@@ -260,6 +357,7 @@ def _installation_lock(root: Path, identifier: str) -> Generator[int, None, None
                 msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
+
             fcntl.flock(held.fileno(), fcntl.LOCK_EX)
             try:
                 yield held.fileno()
@@ -268,14 +366,28 @@ def _installation_lock(root: Path, identifier: str) -> Generator[int, None, None
 
 
 def install(
-    root: Path, *, package: str, release: str, python: Path,
-    installation_id: str = "", source_archive: Path | None = None,
-    requirements: bytes = b"", wheels: tuple[Path, ...] = (), cache: Path | None = None,
+    root: Path,
+    *,
+    package: str,
+    release: str,
+    python: Path,
+    installation_id: str = "",
+    source_archive: Path | None = None,
+    requirements: bytes = b"",
+    wheels: tuple[Path, ...] = (),
+    cache: Path | None = None,
 ) -> InstalledEnvironment:
     identifier = installation_id or "install-" + uuid.uuid4().hex
     with _installation_lock(root, identifier) as lock_fd:
         return _install(
-            root, package=package, release=release, python=python,
-            installation_id=identifier, source_archive=source_archive,
-            requirements=requirements, wheels=wheels, cache=cache, lock_fd=lock_fd,
+            root,
+            package=package,
+            release=release,
+            python=python,
+            installation_id=identifier,
+            source_archive=source_archive,
+            requirements=requirements,
+            wheels=wheels,
+            cache=cache,
+            lock_fd=lock_fd,
         )

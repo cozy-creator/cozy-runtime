@@ -29,8 +29,6 @@ RUNNING process's loaded modules and mapped libraries, not against the import gr
 
 from __future__ import annotations
 
-from cozy_runtime.internal import package_installation
-
 import argparse
 import base64
 import contextlib
@@ -60,6 +58,7 @@ from cozy_runtime.internal import (
     fill,
     hostfacts,
     package_environment,
+    package_installation,
     prepare_diagnostics,
     proctree,
     weights_sink,
@@ -702,8 +701,11 @@ def _placement_profile(entry: dict[str, Any]) -> None:
             "this placement set was prepared by an older Runtime; prepare the package set "
             "again on this worker",
         )
-    _required(entry, {"placement_id", "installation_id", "package_interface",
-                      "bindings_digest", "entrypoints"}, "Placement")
+    _required(
+        entry,
+        {"placement_id", "installation_id", "package_interface", "bindings_digest", "entrypoints"},
+        "Placement",
+    )
     _identifier(entry["placement_id"], "Placement.placement_id")
     _identifier(entry["installation_id"], "Placement.installation_id")
     try:
@@ -711,8 +713,13 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         if not 0 < len(interface) <= canonical.DOC_MAX_BYTES:
             raise ValueError("interface bound")
     except (ValueError, TypeError) as exc:
-        raise documents.DocumentError("package_interface_invalid", "invalid interface bytes") from exc
-    if not isinstance(entry["bindings_digest"], str) or HASH_ENTRY.fullmatch(entry["bindings_digest"]) is None:
+        raise documents.DocumentError(
+            "package_interface_invalid", "invalid interface bytes"
+        ) from exc
+    if (
+        not isinstance(entry["bindings_digest"], str)
+        or HASH_ENTRY.fullmatch(entry["bindings_digest"]) is None
+    ):
         raise documents.DocumentError("malformed_digest", "Placement.bindings_digest")
     published, development = "package" in entry, "development" in entry
     if published == development:
@@ -777,7 +784,9 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 raise documents.DocumentError("wrong_type", "Slot.adapters")
             for adapter in adapters:
                 row = _document(adapter, "ModelAdapter")
-                _required(row, {"component", "model_id", "source_component", "scale"}, "ModelAdapter")
+                _required(
+                    row, {"component", "model_id", "source_component", "scale"}, "ModelAdapter"
+                )
                 if row["model_id"] not in known_models:
                     raise documents.DocumentError("unknown_model", "ModelAdapter.model_id")
                 _identifier(row["component"], "ModelAdapter.component")
@@ -1157,8 +1166,10 @@ class Worker:
                 self.numerical_environment(),
                 operation_identity=(
                     self.engine._job_declaration(attempt.job, attempt.job.job_descriptor_id)
-                    .get("invocable", {}).get("operation_identity", "")
-                    if attempt.job else ""
+                    .get("invocable", {})
+                    .get("operation_identity", "")
+                    if attempt.job
+                    else ""
                 ),
             ),
         )
@@ -1770,10 +1781,7 @@ class Worker:
                 if request.native_models:
                     self.authorize_workspace(request.claim)
             joined = read_placement_set(result.placement_set)
-            if (
-                len(joined) != 1
-                or joined[0].get("installation_id") != revision
-            ):
+            if len(joined) != 1 or joined[0].get("installation_id") != revision:
                 raise package_prepare.PreparationRefusal(
                     "private_placement_result_invalid", revision
                 )
@@ -1809,9 +1817,13 @@ class Worker:
             return self._prepare_local_in(request)
 
     def _installed_call_bindings(self, attempt: AttemptRecord) -> list[dict[str, Any]]:
-        if self.executions is None or attempt.job is None:
-            return []
         owner = self.fence.record_owner_id
+        if (
+            self.executions is None
+            or attempt.job is None
+            or not self.executions.owns(owner, attempt.request_id)
+        ):
+            return []
         root = self.executions.capture_root(owner, attempt.request_id)
         capture = self.executions.capture(owner, root)
         prepared = self.executions.preparation(owner, root)["installations"]
@@ -1824,10 +1836,17 @@ class Worker:
             placement = prepared[identifier]["placement"]
             raw = base64.b64decode(placement["package_interface"], validate=True)
             from cozy_runtime.internal import package_interface
+
             body = package_interface.read_bytes(raw)
-            kind = "job" if any(row["name"] == binding["entrypoint"] for row in body["jobs"]) else "entrypoint"
+            kind = (
+                "job"
+                if any(row["name"] == binding["entrypoint"] for row in body["jobs"])
+                else "entrypoint"
+            )
             row: dict[str, Any] = {
-                "module": binding["module"], "export": binding["export"], "kind": kind,
+                "module": binding["module"],
+                "export": binding["export"],
+                "kind": kind,
             }
             if identifier == attempt.job.installation_id:
                 row["self"] = True
@@ -1844,7 +1863,8 @@ class Worker:
                     **body,
                     **{
                         collection: [
-                            entry for entry in body[collection]
+                            entry
+                            for entry in body[collection]
                             if entry.get("invocable", {}).get("module") == binding["module"]
                         ]
                         for collection in ("jobs", "entrypoints")
@@ -1882,8 +1902,11 @@ class Worker:
         return supervision
 
     def _describe_installed(
-        self, installed: package_installation.InstalledEnvironment, distribution: str,
-        *, application: str = "",
+        self,
+        installed: package_installation.InstalledEnvironment,
+        distribution: str,
+        *,
+        application: str = "",
     ) -> bytes:
         """Import package code only inside a dedicated preparation executor."""
         from cozy_runtime.internal.worker import package_prepare
@@ -2003,9 +2026,7 @@ class Worker:
             )
         stored = self._placement_from_entry(entries[0], result.placement_set.placement_set_digest)
         stored.installed = published[0]
-        self.prepared_installations[
-            (stored.placement_id, stored.installation_id)
-        ] = stored
+        self.prepared_installations[(stored.placement_id, stored.installation_id)] = stored
         return result
 
     def numerical_environment(self) -> bytes:
@@ -4880,7 +4901,8 @@ class Worker:
                 and self.options.environment_python is not None
             ):
                 installed_environment = package_installation.open_existing_environment(
-                    self.options.environment_python, placement.installation_id,
+                    self.options.environment_python,
+                    placement.installation_id,
                     package=(placement.package or placement.development).get("package", ""),
                     release=(placement.package or placement.development).get("release", ""),
                 )
@@ -5025,7 +5047,9 @@ class Worker:
                 from cozy_runtime.internal import job_plan
 
                 record = job_plan.path(
-                    self.config.cozy_home / "job-plans", parent.installation_id, parent.job_descriptor_id
+                    self.config.cozy_home / "job-plans",
+                    parent.installation_id,
+                    parent.job_descriptor_id,
                 )
                 binding = JobBinding.read(json.loads(record.read_text()))
                 declaration = self.engine._job_declaration(binding, parent.job_descriptor_id)
@@ -5592,9 +5616,7 @@ class Worker:
                 or not executor.alive()
             ):
                 return  # admission refuses it with the real reason
-            attention_pin = str(
-                attempt.spec.get("attention_kernel") or self.options.attention_pin
-            )
+            attention_pin = str(attempt.spec.get("attention_kernel") or self.options.attention_pin)
             base_key = declared.construction_key()
             key = _attention_construction_key(base_key, attention_pin)
             group = [
@@ -5834,7 +5856,7 @@ class Worker:
         request_attention_refusal = code.startswith("attention_kernel_")
         with self.control_lock:
             current = self._current_tenant(tenant)
-            for member in (group if not request_attention_refusal else ()):
+            for member in group if not request_attention_refusal else ():
                 # PER-BINDING (#572d), and it OUTLIVES the rebuild the refusal causes: the
                 # process is replaced, but this construction is not tried again until the
                 # desired state changes.
@@ -6513,7 +6535,9 @@ class Worker:
                 from . import internal_calls, machine_capture
 
                 placement = self._placement_by_id(offered.placement_id)
-                revision = machine_capture.installation_identity(placement.document) if placement else ""
+                revision = (
+                    machine_capture.installation_identity(placement.document) if placement else ""
+                )
                 try:
                     internal_calls.require_child(
                         self.workspace,
@@ -6545,7 +6569,10 @@ class Worker:
                     if child_slot is not None
                     else self.engine.jobs.get(descriptor)
                 )
-                if binding is None or binding.installation_id != attempt.spec["job"]["installation_id"]:
+                if (
+                    binding is None
+                    or binding.installation_id != attempt.spec["job"]["installation_id"]
+                ):
                     self.refuse(
                         offered,
                         "job_binding_unavailable",
@@ -7810,7 +7837,8 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         args.development_package.count("/") != 1
         or not all(args.development_package.split("/"))
         or SEMVER.fullmatch(args.development_release) is None
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", args.development_installation_id) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", args.development_installation_id)
+        is None
     ):
         print(
             "[worker] development package identity, semantic release, or source digest is invalid",

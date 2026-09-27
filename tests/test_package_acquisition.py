@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
+import base64
 import json
 import stat
 from collections.abc import Mapping
@@ -18,6 +18,7 @@ from cozy_runtime.internal import (
     canonical,
     derive_child,
     package_environment,
+    package_installation,
     package_interface,
     static_interface,
 )
@@ -27,7 +28,6 @@ from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Placement, read_placement_set
 from cozy_runtime.protocol import documents
-from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def _schema() -> dict[str, Json]:
@@ -61,10 +61,8 @@ def _bindings(
     prepared: Placement | None = None,
 ) -> tuple[Mapping[str, DeclaredBinding], int]:
     raw = canonical.write(body)
-    digest = canonical.digest(body)
     cache = tmp_path / "cache"
     cache.mkdir()
-    (cache / digest.removeprefix("sha256:")).write_bytes(raw)
     for name in ("environment", "selection", "store"):
         (tmp_path / name).mkdir()
     acquirer = Acquirer(
@@ -78,12 +76,12 @@ def _bindings(
     placement = Placement(
         placement_id="package-job-only",
         placement_set_digest=b"\x11" * 32,
-        package={}
+        package={} if development else {"package": "proof/job-only", "release": "1.0.0"},
+        development={"package": "local/job-only", "release": "0.0.0", "installation_id": "local-1"}
         if development
-        else {"project_wheel": {"ref": {"digest": "sha256:" + "22" * 32}}},
-        development={"source_digest": "sha256:" + "22" * 32} if development else {},
-        environment_digest=b"\x33" * 32,
-        package_interface=(digest, len(raw)),
+        else {},
+        installation_id="local-1" if development else "install-1",
+        package_interface=raw,
         bindings_digest=documents.digest_of(canonical.write({"entrypoints": [], "models": []})),
         models=models,
         entrypoints=tuple(
@@ -94,7 +92,6 @@ def _bindings(
             }
             for name in selected
         ),
-        environment={},
         document={},
     )
     return acquirer._bindings(prepared or placement)
@@ -155,41 +152,22 @@ def test_package_set_refuses_empty_or_unknown_selection(
 
 
 def test_h3_prepared_code_only_set_has_no_executable_bindings(tmp_path: Path) -> None:
-    fixture = Path(__file__).parent / "testdata" / "h3-code-only"
-    raw = (fixture / "placement-set.json").read_bytes()
-    assert hashlib.sha256(raw).hexdigest() == (
-        "384edb7272a8b760fa30b5c500b282c6726aede1613be17c9c52f5f3c6257991"
-    )
-    desired = pb.DesiredPlacementSet(
-        placement_set_digest=documents.digest_of(raw), placement_set_canonical_bytes=raw
-    )
-    (entry,) = read_placement_set(desired)
-    assert entry["development"]["local_revision_digest"] == (
-        "sha256:2b96d8193a4933d9a62a4bdc51d9fdd2f8d80695025142e103c284f578a095aa"
-    )
-    assert entry["entrypoints"] == entry["models"] == []
-    interface = (fixture / "package-interface.json").read_bytes()
-    assert entry["package_interface"] == {
-        "digest": "sha256:" + hashlib.sha256(interface).hexdigest(),
-        "length": len(interface),
-    }
+    interface = (
+        Path(__file__).parent / "testdata/h3-code-only/package-interface.json"
+    ).read_bytes()
     body = json.loads(interface)
-    assert all(row["models"] for row in body["entrypoints"])
+    assert body["entrypoints"] and all(row["models"] for row in body["entrypoints"])
     placement = Placement(
-        placement_id=entry["placement_id"],
-        placement_set_digest=desired.placement_set_digest,
+        placement_id="package-h3",
+        placement_set_digest=b"\x11" * 32,
         package={},
-        development=entry["development"],
-        environment_digest=documents.raw(entry["environment_digest"]),
-        package_interface=(
-            entry["package_interface"]["digest"],
-            entry["package_interface"]["length"],
-        ),
-        bindings_digest=documents.raw(entry["bindings_digest"]),
-        models=tuple(entry["models"]),
-        entrypoints=tuple(entry["entrypoints"]),
-        environment=entry["environment"],
-        document=entry,
+        development={"package": "local/h3", "release": "0.0.0", "installation_id": "local-h3"},
+        installation_id="local-h3",
+        package_interface=interface,
+        bindings_digest=documents.digest_of(canonical.write({"entrypoints": [], "models": []})),
+        models=(),
+        entrypoints=(),
+        document={},
     )
     bindings, count = _bindings(tmp_path, body, prepared=placement)
     assert bindings == {} and count == 1
@@ -309,7 +287,7 @@ TOKENIZED = "tokenized.models.model"
 
 @dataclass(frozen=True)
 class ModeledRelease:
-    installed: package_environment.InstalledEnvironment
+    installed: package_installation.InstalledEnvironment
     interface: bytes
     store: Path
     manifest: str
@@ -346,9 +324,7 @@ def modeled(tmp_path_factory: pytest.TempPathFactory) -> ModeledRelease:
     _run("uv", "pip", "install", "--python", str(python), str(runtime), str(project))
     store, manifest, length, _held = _snapshot(root, include_asset=True, checkpoint_only=True)
     return ModeledRelease(
-        installed=package_environment.open_existing_environment(
-            python, "sha256:" + hashlib.sha256(b"modeled-environment").hexdigest()
-        ),
+        installed=package_installation.open_existing_environment(python, "modeled-environment"),
         interface=package_interface.canonical_bytes(static_interface.build(project)),
         store=store,
         manifest=manifest,
@@ -360,8 +336,6 @@ def _prepare_modeled(release: ModeledRelease, root: Path, slots: tuple[str, ...]
     result = package_prepare._prepare_published(
         package_name=MODELED,
         release="1.0.0",
-        application="modeled_package:app",
-        model_slot_paths=(GENERATE, TOKENIZED, TURBO, WIDE),
         locked=package_environment.read_locked_requirements(
             b"--index-url https://pypi.org/simple\nmodeled==1.0.0 --hash=sha256:"
             + b"a" * 64
@@ -396,15 +370,11 @@ def _placement(body: dict[str, Any], digest: bytes) -> Placement:
         placement_set_digest=digest,
         package=body["package"],
         development={},
-        environment_digest=documents.raw(body["environment_digest"]),
-        package_interface=(
-            body["package_interface"]["digest"],
-            body["package_interface"]["length"],
-        ),
+        installation_id=body["installation_id"],
+        package_interface=base64.b64decode(body["package_interface"]),
         bindings_digest=documents.raw(body["bindings_digest"]),
         models=tuple(body["models"]),
         entrypoints=tuple(body["entrypoints"]),
-        environment=body["environment"],
         document=body,
     )
 
@@ -481,11 +451,11 @@ def test_a_census_miss_loads_checkpoint_assets_in_the_fenced_child_without_a_wri
 def test_a_warm_prepare_and_acquire_walk_each_manifest_once(
     modeled: ModeledRelease, tmp_path: Path
 ) -> None:
-    cold = dict(tensorfs.stats())
+    cold = tensorfs.stats()
     body = _prepare_modeled(modeled, tmp_path, (GENERATE, TURBO))
-    before = dict(tensorfs.stats())
+    before = tensorfs.stats()
     body = _prepare_modeled(modeled, tmp_path, (GENERATE, TURBO))
-    prepared = dict(tensorfs.stats())
+    prepared = tensorfs.stats()
     acquirer = Acquirer(
         cache_root=tmp_path / "artifacts",
         install_root=tmp_path / "install",
@@ -497,7 +467,7 @@ def test_a_warm_prepare_and_acquire_walk_each_manifest_once(
     )
     raw = canonical.write({"format": "cozy.worker.v1.PlacementSet/1", "placements": [body]})
     acquired = acquirer.acquire(_placement(body, documents.digest_of(raw)))
-    after = dict(tensorfs.stats())
+    after = tensorfs.stats()
     assert acquired.manifests == 1 and len(acquired.bindings) == 2
     # A census hit takes no closure lease; acquisition walks the one distinct manifest once.
     assert prepared["presence_passes"] == before["presence_passes"]

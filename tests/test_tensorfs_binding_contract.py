@@ -60,8 +60,10 @@ CALLED: dict[str, str] = {
     "pull": (
         "(store, hub, refspec, *, lane=Ellipsis, credential=Ellipsis, timeout=None, "
         "session=Ellipsis, streams=Ellipsis, allowed_hosts=Ellipsis, allow_local=False, "
-        "sample_seconds=None)"
+        "sample_seconds=None, cancellation=None, progress=None)"
     ),
+    "PullCancellation": "()",
+    "PullCancellation.cancel": "(self, /)",
     "gc": "(root, dry_run=False, *, evict_cached=False, keep_manifests=Ellipsis)",
     "fit": (
         "(requirements: 'Sequence[TensorRequirement]', header: 'bytes', *, custody: 'str', "

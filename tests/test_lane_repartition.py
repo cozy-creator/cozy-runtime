@@ -238,7 +238,7 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
             with workers[0].control_lock:
                 return workers[0]._prepare_execution(
                     {
-                        "revisions": {},
+                        "installations": {},
                         "state": base64.b64encode(selected_state.SerializeToString()).decode(),
                     },
                     "managed-proof",

@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,7 @@ from cozy_runtime.internal import attention, attention_fp8, child_env, package_i
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import DeviceFacts
-from cozy_runtime.internal.local import LocalRequest, development_source_digest, run_slice
+from cozy_runtime.internal.local import LocalRequest, run_slice
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.plan import DeclaredBinding, ModelBinding
 from cozy_runtime.internal.worker.session import (
@@ -1048,7 +1049,7 @@ def test_a_pin_that_cannot_be_honoured_refuses_through_the_whole_real_path() -> 
                     kind="entrypoint",
                 ),
                 workspace=workspace,
-                package_code_digest=development_source_digest(PACKAGE),
+                package_installation_id="local-" + uuid.uuid4().hex,
                 package_interface_document=body,
                 project=PACKAGE,
                 development_tensorfs_root=config.cozy_home / "tensorfs",
@@ -1058,7 +1059,10 @@ def test_a_pin_that_cannot_be_honoured_refuses_through_the_whole_real_path() -> 
                     attention_pin="sageattention",
                 ),
             )
-    reasons = [fault["reason"] for fault in outcome.faults]
-    assert "attention_kernel_unsupported" in reasons, outcome.faults
+    # A request-scoped pin refusal terminates the attempt; it does not fault the binding (#678).
+    assert outcome.status == "OUTCOME_STATUS_REFUSED", outcome.terminal
+    message = str(outcome.terminal.get("safe_message", ""))
+    assert message.startswith("attention_kernel_unsupported"), outcome.terminal
+    assert "sageattention" in message
     assert outcome.result is None, outcome.result
-    assert any("sageattention" in str(fault["detail"]) for fault in outcome.faults)
+    assert not any(fault["reason"] == "attention_kernel_unsupported" for fault in outcome.faults)

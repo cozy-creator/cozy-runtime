@@ -241,8 +241,15 @@ _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
 _ENTRYPOINT_KEYWORDS = frozenset(
     {
-        "name", "preflight", "demand", "hidden", "memoize", "memo_version",
-        "memo_dependencies", "defaults", "internal",
+        "name",
+        "preflight",
+        "demand",
+        "hidden",
+        "memoize",
+        "memo_version",
+        "memo_dependencies",
+        "defaults",
+        "internal",
     }
 )
 _JOB_KEYWORDS = frozenset(
@@ -1188,6 +1195,7 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
             code="static_distribution",
         )
     metadata = matches[0]
+
     def read(name: str) -> str:
         path = metadata / name
         if metadata.is_symlink() or path.is_symlink() or not path.is_file():

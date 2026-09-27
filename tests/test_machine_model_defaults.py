@@ -34,16 +34,17 @@ from test_group_lanes import _placement
 from test_machine_execution import ack, complete, offer
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
-REVISION = "sha256:" + "11" * 32
+INSTALLATION = "local-" + "11" * 16
+BINDING = "sha256:" + "11" * 32
 MANIFEST = {"digest": "sha256:" + "22" * 32, "length": 321}
 
 
 def captured() -> dict[str, Any]:
     return {
-        "bindings": [{"callee_revision_digest": REVISION, "entrypoint": "generate"}],
+        "bindings": [{"callee_installation_id": INSTALLATION, "entrypoint": "generate"}],
         "model_defaults": [
             {
-                "callee_revision_digest": REVISION,
+                "callee_installation_id": INSTALLATION,
                 "entrypoint": "generate",
                 "parameter": "adapter",
                 "public_origin": "https://catalog.example",
@@ -53,7 +54,7 @@ def captured() -> dict[str, Any]:
                 ],
             },
             {
-                "callee_revision_digest": REVISION,
+                "callee_installation_id": INSTALLATION,
                 "entrypoint": "generate",
                 "parameter": "model",
                 "unavailable_code": "model_default_unbound",
@@ -68,6 +69,8 @@ def peer(capture: dict[str, Any]) -> Worker:
         SimpleNamespace(
             config=SimpleNamespace(bootstrap_credential="local-bootstrap"),
             options=SimpleNamespace(accelerator_backend="none"),
+            model_transfer_lock=threading.Lock(),
+            model_transfers={},
             executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
         ),
     )
@@ -75,21 +78,20 @@ def peer(capture: dict[str, Any]) -> Worker:
 
 def target() -> Target:
     return Target(
-        revision=REVISION,
+        installation_id=INSTALLATION,
         entrypoint="generate",
-        interface_digest=REVISION,
         declaration={
             "models": [{"path": "generate.models.adapter"}, {"path": "generate.models.model"}]
         },
-        prepared_revision={},
+        prepared_installation={},
         binding=None,
-        digest=REVISION,
+        operation_identity="",
     )
 
 
 def test_default_capture_requires_complete_exact_inventory_and_capable_peer() -> None:
     body = captured()
-    interfaces = {REVISION: {"entrypoints": [{"name": "generate", **target().declaration}]}}
+    interfaces = {INSTALLATION: {"entrypoints": [{"name": "generate", **target().declaration}]}}
     request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=56))
     defaults.verify(peer(body), request, body, interfaces)
     mutations: list[Callable[[dict[str, Any]], Any]] = [
@@ -174,9 +176,9 @@ def test_serving_default_uses_real_catalog_input_pin_without_derived_provenance(
         spec = pb.InvocationSpec(
             inputs=bindings,
             serving=pb.ServingInvocationSpec(
-                entrypoint_binding_digest=REVISION,
-                attempt_binding_id=REVISION,
-                bindings_digest=REVISION,
+                entrypoint_binding_digest=BINDING,
+                attempt_binding_id=BINDING,
+                bindings_digest=BINDING,
             ),
         )
         raw, digest = documents.identity(spec)
@@ -254,10 +256,10 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
     assert worker.executions is not None
     source = {"digest": manifest, "length": length}
     capture = captured()
-    capture["format"] = "cozy.worker.v1.MachineExecutionCapture/1"
+    capture["format"] = "cozy.worker.v1.MachineExecutionCapture/2"
     capture["model_defaults"] = [
         {
-            "callee_revision_digest": REVISION,
+            "callee_installation_id": INSTALLATION,
             "entrypoint": "generate",
             "parameter": "adapter",
             "public_origin": "https://unreachable.example",
@@ -273,9 +275,9 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
         expected_execution_workspace_id=worker.executions.workspace_id,
     )
     document = {
-        "development": {"local_revision_digest": REVISION},
-        "environment_digest": REVISION,
-        "package_interface": MANIFEST,
+        "development": {"installation_id": INSTALLATION},
+        "installation_id": INSTALLATION,
+        "package_interface": "e30=",
         "models": [{"id": "default", "manifest": source}],
         "entrypoints": [
             {
@@ -286,11 +288,11 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
     }
     placement = _placement("registered")
     placement.document = document
-    worker.prepared_revisions[(placement.placement_id, REVISION)] = placement
+    worker.prepared_installations[(placement.placement_id, INSTALLATION)] = placement
     selected = dataclasses.replace(
         target(),
         declaration={"models": [{"path": "generate.models.adapter"}]},
-        prepared_revision={"placement": document},
+        prepared_installation={"placement": document},
     )
     call = Call("root", 0, 1, 1, b"i" * 32, b"{}", "child", b"", False, b"", "", "")
     request = pb.ChildCallRequest(
@@ -307,9 +309,9 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
         spec = pb.InvocationSpec(
             inputs=bindings,
             serving=pb.ServingInvocationSpec(
-                entrypoint_binding_digest=REVISION,
-                attempt_binding_id=REVISION,
-                bindings_digest=REVISION,
+                entrypoint_binding_digest=BINDING,
+                attempt_binding_id=BINDING,
+                bindings_digest=BINDING,
             ),
         )
         raw, digest = documents.identity(spec)

@@ -128,15 +128,18 @@ class Serving:
         stage = f"{label} / {name}"[:120] if label else name
         self._progress(call, request, {"kind": "progress", "stage": stage})
         succeeded = False
-        groups = getattr(self.worker, "machine_groups", None)
-        transferring = groups is not None and name == "Downloading model weights"
-        if transferring:
+        groups = (
+            getattr(self.worker, "machine_groups", None)
+            if name == "Downloading model weights"
+            else None
+        )
+        if groups is not None:
             groups.transfer(self.worker.fence.record_owner_id, call.parent_request, 1)
         try:
             yield
             succeeded = True
         finally:
-            if transferring:
+            if groups is not None:
                 groups.transfer(self.worker.fence.record_owner_id, call.parent_request, -1)
             self._progress(
                 call,

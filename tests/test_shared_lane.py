@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -47,7 +48,6 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import (
     LocalRecordOwner,
     LocalRequest,
-    development_source_digest,
     stage_development_placement,
 )
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -317,7 +317,7 @@ class TwoTenantOwner(LocalRecordOwner):
         bindings: dict[str, str],
         workspace: Path,
         *,
-        package_code_digest: str,
+        package_installation_id: str,
         placements: list[pb.Placement],
         worker: Callable[[], Worker],
     ) -> None:
@@ -325,7 +325,7 @@ class TwoTenantOwner(LocalRecordOwner):
             turns[0].request,
             bindings,
             workspace,
-            package_code_digest=package_code_digest,
+            package_installation_id=package_installation_id,
             placement=placements[0],
         )
         self.placements = placements
@@ -394,7 +394,11 @@ class TwoTenantOwner(LocalRecordOwner):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         body = canonical.write(self.request.payload)
         spec = pb.InvocationSpec(
-            environment_digest="",
+            installation_id=next(
+                placement.installation_id
+                for placement in self.placements
+                if placement.placement_id == placement_id
+            ),
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),
@@ -509,13 +513,12 @@ def _drive(
     body = package_interface.build(found)
     workspace = root / "run"
     workspace.mkdir(parents=True, exist_ok=True)
-    source_digest = development_source_digest(package)
     staged = stage_development_placement(
         config.cozy_home,
         body,
         package="local/development-package",
         release="0.0.0",
-        source_digest=source_digest,
+        installation_id="local-" + uuid.uuid4().hex,
         artifact_cache=workspace / "artifact-cache",
         tensorfs_root=store.root,
         project=package,
@@ -531,7 +534,7 @@ def _drive(
         turns,
         dict(staged.bindings),
         workspace,
-        package_code_digest=documents.spell(staged.placement.development.source_digest),
+        package_installation_id=staged.placement.development.installation_id,
         placements=placements,
         worker=lambda: holder[0],
     )
@@ -544,7 +547,7 @@ def _drive(
         development_project=package,
         development_package=staged.placement.development.package,
         development_release=staged.placement.development.release,
-        development_source_digest=documents.spell(staged.placement.development.source_digest),
+        development_installation_id=staged.placement.development.installation_id,
     )
     worker = Worker(config, options, owner.host)
     holder.append(worker)
@@ -810,13 +813,12 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
         config = _config(root / "home")
         found = discover(PACKAGE)
         body = package_interface.build(found)
-        source_digest = development_source_digest(PACKAGE)
         staged = stage_development_placement(
             config.cozy_home,
             body,
             package="local/development-package",
             release="0.0.0",
-            source_digest=source_digest,
+            installation_id="local-" + uuid.uuid4().hex,
             artifact_cache=root / "artifact-cache",
             tensorfs_root=store.root,
             project=PACKAGE,
@@ -829,7 +831,7 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             development_project=PACKAGE,
             development_package=staged.placement.development.package,
             development_release=staged.placement.development.release,
-            development_source_digest=documents.spell(staged.placement.development.source_digest),
+            development_installation_id=staged.placement.development.installation_id,
         )
         worker = Worker(config, options, InMemoryControlHost())
         seals: list[str] = []
@@ -1037,13 +1039,14 @@ def _growth_revisions(
     found = discover(PACKAGE)
     body = package_interface.build(found)
     placements, first = [], None
+    installation_id = "local-" + uuid.uuid4().hex
     for index, override in enumerate(GROWTH_OVERRIDES):
         staged = stage_development_placement(
             config.cozy_home,
             body,
             package="local/development-package",
             release="0.0.0",
-            source_digest=development_source_digest(PACKAGE),
+            installation_id=installation_id,
             artifact_cache=workspace / "artifact-cache",
             tensorfs_root=twin.root,
             project=PACKAGE,
@@ -1091,7 +1094,7 @@ def test_a_growing_placement_keeps_its_process_and_its_admission(twin: TwinStore
             turns,
             dict(staged.bindings),
             workspace,
-            package_code_digest=documents.spell(staged.placement.development.source_digest),
+            package_installation_id=staged.placement.development.installation_id,
             worker=lambda: holder[0],
             revisions=revisions,
             overrides=GROWTH_OVERRIDES,
@@ -1108,7 +1111,7 @@ def test_a_growing_placement_keeps_its_process_and_its_admission(twin: TwinStore
             development_project=PACKAGE,
             development_package=staged.placement.development.package,
             development_release=staged.placement.development.release,
-            development_source_digest=documents.spell(staged.placement.development.source_digest),
+            development_installation_id=staged.placement.development.installation_id,
         )
         worker = Worker(config, options, owner.host)
         holder.append(worker)

@@ -15,13 +15,13 @@ from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import (
-    package_installation,
     base_observation,
     canonical,
     config,
     jit_cache,
     native_wheel,
     package_environment,
+    package_installation,
     spawn,
 )
 from cozy_runtime.internal.exits import Exit
@@ -56,7 +56,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         evidence_path = _fresh_output(_absolute(args[1], "evidence"))
         request = _request(request_path)
         base = package_environment.observe_base(request.python)
-        installed = package_installation.open_installation(request.install_root, request.installation_id)
+        installed = package_installation.open_installation(
+            request.install_root, request.installation_id
+        )
         inspection = native_wheel.inspect_installed(installed.site_packages)
         runtime_config = config.read_config()
         base_environment = spawn.seal(runtime_config.child_base_env, {})

@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,7 +23,7 @@ pytest.importorskip("tensorfs")
 FIXTURE = Path(__file__).parent / "testdata" / "multi_construction.py"
 
 
-def _run(tmp_path: Path, *args: str) -> dict[str, object]:
+def _run(tmp_path: Path, *args: str) -> dict[str, Any]:
     env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
     result = subprocess.run(
         [sys.executable, str(FIXTURE), "--root", str(tmp_path), *args],
@@ -42,7 +43,7 @@ def test_one_process_loads_serves_unloads_and_reloads_two_constructions(
 ) -> None:
     pytest.importorskip("diffusers")
     facts = _run(tmp_path, "--arm", "two-models", "--degree", str(degree))
-    assert len(facts["pids"]) == degree  # type: ignore[arg-type]
+    assert len(facts["pids"]) == degree
 
 
 def test_activate_parks_the_least_recently_used_construction_under_the_ceiling(
@@ -51,7 +52,7 @@ def test_activate_parks_the_least_recently_used_construction_under_the_ceiling(
     if not torch.cuda.is_available():
         pytest.skip("device residency is measured on a CUDA card")
     facts = _run(tmp_path, "--arm", "sized-blocks", "--size", "8192")
-    assert len(facts["activate_ms"]) == 3  # type: ignore[arg-type]
+    assert len(facts["activate_ms"]) == 3
 
 
 def test_loads_refused_before_holding_device_bytes_keep_the_process_serving(

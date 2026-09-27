@@ -163,25 +163,30 @@ def test_shared_configured_manifest_derives_only_its_serving_slot(tmp_path: Path
     ]
 
 
-@pytest.mark.parametrize("failure", ["length", "undeclared"])
-def test_job_source_retains_manifest_closure_and_declared_slot_guards(
-    tmp_path: Path, failure: str
-) -> None:
-    root, manifest, length, _payload = checkpoint(tmp_path)
-    chosen = selection(manifest, "main.models.source", manifest_length=length)
-    if failure == "length":
-        chosen["manifest_length"] = length + 1
-    else:
-        chosen["slot"] = "missing.models.source"
+def test_job_source_retains_the_declared_slot_guard(tmp_path: Path) -> None:
+    root, manifest, _length, _payload = checkpoint(tmp_path)
     with pytest.raises(PreparationRefusal):
         _entrypoints(
             interface(),
             package_name="example/convert",
-            selections=[chosen],
+            selections=[selection(manifest, "missing.models.source")],
             tensorfs_root=root,
             verified=lambda *_args: None,
             census=None,
         )
+
+
+def test_job_source_length_comes_from_the_held_manifest(tmp_path: Path) -> None:
+    root, manifest, length, _payload = checkpoint(tmp_path)
+    models, _ = _entrypoints(
+        interface(),
+        package_name="example/convert",
+        selections=[selection(manifest, "main.models.source", manifest_length=length + 1)],
+        tensorfs_root=root,
+        verified=lambda *_args: None,
+        census=None,
+    )
+    assert models[0].manifest.length == length
 
 
 def test_a_corrupt_closure_is_refused_by_the_one_acquisition_walk(tmp_path: Path) -> None:

@@ -30,7 +30,7 @@ def test_delayed_native_validation_cannot_replace_committed_checkpoint(
     invocation = documents.canonical_bytes(
         pb.InvocationSpec(
             job=pb.JobInvocationSpec(
-                build_id="sha256:" + "11" * 32, job_descriptor_id="sha256:" + "12" * 32
+                installation_id="local-" + "11" * 16, job_descriptor_id="sha256:" + "12" * 32
             )
         )
     )

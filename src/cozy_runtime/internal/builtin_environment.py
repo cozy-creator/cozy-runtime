@@ -31,10 +31,15 @@ class Preparation:
 
 
 def prepare(
-    root: Path, *, dependency_cache: Path | None = None,
+    root: Path,
+    *,
+    dependency_cache: Path | None = None,
 ) -> Preparation:
     sdk = sdk_identity()
     installed = package_installation.retain_environment(
-        root, Path(sys.executable), package="runtime/operations", release=sdk["runtime_version"],
+        root,
+        Path(sys.executable),
+        package="runtime/operations",
+        release=sdk["runtime_version"],
     )
     return Preparation(installed, sdk)

@@ -20,7 +20,7 @@ def model_offer(manifest: str, length: int) -> pb.AttemptOffer:
     offered = offer()
     spec = pb.InvocationSpec.FromString(b"")
     documents_doc = documents.read(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
-    spec.job.build_id = documents_doc["job"]["build_id"]
+    spec.job.installation_id = documents_doc["job"]["installation_id"]
     spec.job.job_descriptor_id = documents_doc["job"]["job_descriptor_id"]
     spec.payload_digest = documents.spell(documents.digest_of(b"{}"))
     spec.inputs.extend(

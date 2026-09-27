@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ from cozy_runtime.author import Config
 from cozy_runtime.internal import accel, package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import main as executor_main
-from cozy_runtime.internal.local import development_source_digest, stage_development_placement
+from cozy_runtime.internal.local import stage_development_placement
 from cozy_runtime.internal.parallel import group as group_module
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, listener
 from cozy_runtime.internal.worker.session import executor_load_command
@@ -156,7 +157,7 @@ def _stage(root: Path, project: Path, name: str, overrides: dict[str, str], stor
         interface,
         package=f"test/{project.name.replace('_', '-')}",
         release="0.0.1",
-        source_digest=development_source_digest(project),
+        installation_id="local-" + uuid.uuid4().hex,
         artifact_cache=root / f"cache-{name}",
         tensorfs_root=store,
         project=project,

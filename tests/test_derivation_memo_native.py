@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -12,12 +13,18 @@ from cozy_runtime.derive.operations import prepare_model, quantize
 from cozy_runtime.internal.memo_implementation import describe
 
 
+def identity(fn: Callable[..., object]) -> dict[str, str]:
+    exported = _export(fn)
+    assert exported is not None
+    return describe(exported.implementation)
+
+
 @pytest.mark.parametrize("distribution_name", ["tensorfs", "numpy", "msgspec"])
 def test_derivation_native_version_invalidates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, distribution_name: str
 ) -> None:
     functions = (quantize,) if distribution_name == "numpy" else (quantize, prepare_model)
-    original = [describe(_export(fn).implementation) for fn in functions]
+    original = [identity(fn) for fn in functions]
     assert all(row.get("operation_identity") for row in original), original
     installed = importlib.metadata.distribution(distribution_name)
     metadata = installed.read_text("METADATA")
@@ -30,6 +37,6 @@ def test_derivation_native_version_invalidates(
     )
     (shadow / "WHEEL").write_text(wheel)
     monkeypatch.syspath_prepend(str(tmp_path))
-    changed = [describe(_export(fn).implementation) for fn in functions]
+    changed = [identity(fn) for fn in functions]
     assert all(row.get("operation_identity") for row in changed), changed
     assert all(first != second for first, second in zip(original, changed, strict=True))

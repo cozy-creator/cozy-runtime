@@ -224,7 +224,7 @@ def test_root_acceptance_and_intake_abort_have_one_durable_order(
     source = imported.source
     spec = pb.InvocationSpec(
         job=pb.JobInvocationSpec(
-            build_id="sha256:" + "11" * 32, job_descriptor_id="sha256:" + "12" * 32
+            installation_id="local-" + "11" * 16, job_descriptor_id="sha256:" + "12" * 32
         ),
         inputs=[
             pb.InputBinding(

@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,14 +30,24 @@ from typing import Any
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import census_cache, package_environment, package_interface
+from cozy_runtime.internal import (
+    base_observation,
+    canonical,
+    census_cache,
+    package_environment,
+    package_installation,
+    package_interface,
+)
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.worker.acquire import Acquirer
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     _entrypoints,
     _prepare_published,
     _slot_paths,
 )
+from cozy_runtime.internal.worker.session import Placement, read_placement_set
+from cozy_runtime.protocol import documents
 
 ROOT = Path(__file__).resolve().parent.parent
 TENANT = ROOT / "corpus" / "tenant"
@@ -140,22 +151,14 @@ def _selection(slot: str, manifest: str) -> dict[str, Any]:
     }
 
 
-def _installed(tmp_path: Path) -> package_environment.InstalledEnvironment:
-    """A metadata-backed tenant overlay using the real test interpreter and SDK."""
-    import subprocess
-
-    from conftest import authored_python
-    from cozy_runtime.internal import _installed_dependencies
-
+def _installed(tmp_path: Path) -> package_installation.InstalledEnvironment:
+    """A metadata-backed tenant install in a real uv venv."""
     generation = tmp_path / "generation"
     subprocess.run(
         ["uv", "venv", "--python", sys.executable, str(generation)], check=True, capture_output=True
     )
     python = generation / "bin/python"
     (site_packages,) = generation.glob("lib/python*/site-packages")
-    _installed_dependencies.snapshot(
-        authored_python(), generation, {"tenant"}, cache=tmp_path.parent / "sdk-cache"
-    )
     metadata = site_packages / "tenant-1.0.0.dist-info"
     metadata.mkdir(parents=True)
     (metadata / "METADATA").write_text(
@@ -163,14 +166,13 @@ def _installed(tmp_path: Path) -> package_environment.InstalledEnvironment:
         "Requires-Python: >=3.12\nRequires-Dist: cozy-runtime\nRequires-Dist: msgspec\n"
     )
     (site_packages / "tenant_job.py").write_text((TENANT / "tiny_tenant.py").read_text() + JOB)
-    return package_environment.InstalledEnvironment(
+    return package_installation.InstalledEnvironment(
+        installation_id="install-tenant",
         generation=generation,
         site_packages=site_packages,
         python=python,
-        receipt_bytes=b"{}",
-        receipt_digest="sha256:" + "0" * 64,
-        content_digest="sha256:" + "1" * 64,
-        reused=False,
+        package=PACKAGE,
+        release=RELEASE,
     )
 
 
@@ -208,7 +210,7 @@ def test_a_job_shaped_selection_prepares(
         package_name=PACKAGE,
         release=RELEASE,
         locked=package_environment.read_locked_requirements(
-            b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
+            b"--index-url https://pypi.org/simple\ntenant==1.0.0 --hash=sha256:" + b"a" * 64 + b"\n"
         ),
         models=[selection],
         artifact_cache=tmp_path / "artifacts",
@@ -224,8 +226,6 @@ def test_a_job_shaped_selection_prepares(
     placement = json.loads(result.placement_set.placement_set_canonical_bytes)["placements"][0]
     assert placement["entrypoints"] == []
     assert [row["repo"] for row in placement["models"]] == [PACKAGE]
-    from cozy_runtime.internal.worker.session import read_placement_set
-
     assert read_placement_set(result.placement_set)[0] == placement
     assert placement["models"][0].get("version", "") == ("" if checkpoint_only else RELEASE)
     assert placement["models"][0].get("lane", "") == ("" if checkpoint_only else LANE)
@@ -274,17 +274,8 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
     assert [row.repo for row in models] == [PACKAGE]
     assert constructed == [ENTRYPOINT_SLOT]
 
-    from cozy_runtime.internal import base_observation, canonical
-    from cozy_runtime.internal.worker.acquire import Acquirer
-    from cozy_runtime.internal.worker.session import Placement
-    from cozy_runtime.protocol import documents
-
-    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-    cache = tmp_path / "cache"
-    cache.mkdir()
-    (cache / digest[7:]).write_bytes(raw)
     acquired = Acquirer(
-        cache_root=cache,
+        cache_root=tmp_path / "cache",
         install_root=tmp_path / "environment",
         selection_root=tmp_path / "selection",
         tensorfs_root=store_root,
@@ -298,14 +289,13 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
         placement_set_digest=b"a" * 32,
         package={"package": PACKAGE, "release": RELEASE},
         development={},
-        environment_digest=b"b" * 32,
-        package_interface=(digest, len(raw)),
+        installation_id="install-modeled",
+        package_interface=raw,
         bindings_digest=documents.digest_of(
             canonical.write({"models": list(model_rows), "entrypoints": list(entry_rows)})
         ),
         models=model_rows,
         entrypoints=entry_rows,
-        environment={},
         document={},
     )
     assert acquired._models(placement) == 1

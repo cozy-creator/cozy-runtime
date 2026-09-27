@@ -136,7 +136,7 @@ def test_serving_memo_dependencies_are_installed_metadata_not_executed_source(
     tmp_path: Path,
 ) -> None:
     root = project(tmp_path)
-    (root / "ast_operations/__init__.py").write_text('''
+    (root / "ast_operations/__init__.py").write_text("""
 import msgspec
 from cozy_runtime.author import App, Context, MemoDistribution, MemoResource
 raise AssertionError("the static reader must never execute this module")
@@ -152,7 +152,7 @@ app = App()
 app.entrypoint(measure, memoize=True, memo_version=helper(), memo_dependencies=(
     helper, MemoResource("uninstalled", "plan.json"), MemoDistribution("uninstalled"),
 ))
-''')
+""")
     document = static_interface.build(root)
     rows = cast(list[dict[str, Any]], document["entrypoints"])
     assert len(rows) == 1

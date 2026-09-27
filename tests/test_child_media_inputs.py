@@ -116,7 +116,7 @@ def test_broker_serializes_verified_nested_media_and_refuses_unhydrated_forgery(
     broker = _Broker(
         "parent",
         {
-            ("", __name__, "score"): _CallType(
+            (__name__, "score"): _CallType(
                 "sha256:" + "21" * 32,
                 __name__,
                 "score",
@@ -228,7 +228,7 @@ def test_broker_forwards_only_this_attempts_verified_tree(tmp_path: Path, forwar
     broker = _Broker(
         "parent",
         {
-            ("", __name__, "score_tree"): _CallType(
+            (__name__, "score_tree"): _CallType(
                 "sha256:" + "21" * 32,
                 __name__,
                 "score_tree",

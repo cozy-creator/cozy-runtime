@@ -27,9 +27,7 @@ def run(
     values = _values(args[1:], {"--out"}, set())
     root = Path(values["--out"][0]).absolute()
     try:
-        prepared = builtin_environment.prepare(
-            root, dependency_cache=dependency_cache
-        )
+        prepared = builtin_environment.prepare(root, dependency_cache=dependency_cache)
         return Result(document=prepared.document())
     except (
         ConformanceError,

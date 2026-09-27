@@ -15,12 +15,14 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import canonical, package_interface
+from cozy_runtime.internal import canonical, package_installation, package_interface
 from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package_set
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
-def test_real_install_ignores_advisory_inventory_and_application_but_checks_wheel(tmp_path):
+def test_real_install_ignores_advisory_inventory_and_application_but_checks_wheel(
+    tmp_path: Path,
+) -> None:
     interface = canonical.write(
         {
             "application": "inventory_fixture:app",
@@ -53,9 +55,15 @@ def test_real_install_ignores_advisory_inventory_and_application_but_checks_whee
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    installed = []
+    installed: list[package_installation.InstalledEnvironment] = []
 
-    def prepare(case, inventory, *, wheel_hash=digest, application="inventory_fixture:app"):
+    def prepare(
+        case: str,
+        inventory: pb.ImageInventory | None,
+        *,
+        wheel_hash: str = digest,
+        application: str = "inventory_fixture:app",
+    ) -> pb.PreparePackageSetResult:
         root = tmp_path / case
         return prepare_package_set(
             pb.PreparePackageSetRequest(

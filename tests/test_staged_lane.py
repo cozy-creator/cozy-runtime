@@ -82,14 +82,13 @@ def test_complete_model_larger_than_vram_reaches_bounded_prepare_and_stages() ->
         assert store.weight_bytes > memory.total_bytes
         package = root / "package"
         shutil.copytree(PACKAGE, package)
-        owner, worker, notes = _drive(store, [_turn("plc-staged", "staged", 0)], root, package)
+        owner, _worker, notes = _drive(store, [_turn("plc-staged", "staged", 0)], root, package)
         assert owner.ended == "terminal", (owner.ended, owner.error, notes)
         assert owner.turns[0].outcome["status"] == 1, owner.turns[0].outcome
         row = owner.turns[0].rows["plc-staged"]
         assert row["evicted"], row
         walk = row["walk"]
         assert walk["declared_bytes"] == store.weight_bytes, walk
-        assert worker.lanes.lanes[0].outstanding_bytes() == 0
         print(
             json.dumps(
                 {

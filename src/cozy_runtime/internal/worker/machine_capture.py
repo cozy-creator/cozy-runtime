@@ -28,7 +28,10 @@ def installation_identity(placement: dict[str, Any]) -> str:
 
 def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
     raw = request.capture_canonical_bytes
-    if not 0 < len(raw) <= canonical.DOC_MAX_BYTES or documents.digest_of(raw) != request.capture_digest:
+    if (
+        not 0 < len(raw) <= canonical.DOC_MAX_BYTES
+        or documents.digest_of(raw) != request.capture_digest
+    ):
         raise WorkspaceRefusal("execution capture does not bind its bounded canonical bytes")
     capture = documents.read(raw, pb.MachineExecutionCapture)
     inventory = capture.get("installed_packages", [])
@@ -41,18 +44,23 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         identifier = package.get("installation_id", "")
         if not identifier or identifier in prepared:
             raise WorkspaceRefusal("execution capture repeats or omits an installation ID")
-        candidates = [value for (_, selected), value in worker.prepared_installations.items()
-                      if selected == identifier]
+        candidates = [
+            value
+            for (_, selected), value in worker.prepared_installations.items()
+            if selected == identifier
+        ]
         if not candidates:
             raise WorkspaceRefusal("execution package has not been installed on this machine")
         selected = candidates[0]
         selected.installed = selected.installed or package_installation.open_installation(
-            Path(worker.options.install_root or ""), identifier,
+            Path(worker.options.install_root or ""),
+            identifier,
         )
         # Worker-owned installed metadata is authoritative. The received interface is
         # a caller convenience, never a second implementation reading to compare.
         interfaces[identifier] = package_interface.read_bytes(
-            selected.package_interface, "installed package",
+            selected.package_interface,
+            "installed package",
         )
         prepared[identifier] = {"placement": selected.document, "installation_id": identifier}
     if root not in prepared:
@@ -72,8 +80,14 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             binding["entrypoint"],
         ):
             raise WorkspaceRefusal("execution callable inventory is ambiguous")
-        entry = next((entry for entry in [*interfaces[callee]["jobs"], *interfaces[callee]["entrypoints"]]
-                      if entry["name"] == binding["entrypoint"]), None)
+        entry = next(
+            (
+                entry
+                for entry in [*interfaces[callee]["jobs"], *interfaces[callee]["entrypoints"]]
+                if entry["name"] == binding["entrypoint"]
+            ),
+            None,
+        )
         if entry is None:
             raise WorkspaceRefusal("execution callable is absent from the installed package")
         if entry.get("internal", False) and caller != callee:
@@ -180,7 +194,8 @@ def restore(worker: Worker, preparation: dict[str, Any]) -> pb.DesiredWorkerStat
     for identifier, row in preparation["installations"].items():
         placement = worker._placement_from_entry(row["placement"], b"")
         placement.installed = package_installation.open_installation(
-            Path(worker.options.install_root or ""), identifier,
+            Path(worker.options.install_root or ""),
+            identifier,
         )
         worker.prepared_installations[(placement.placement_id, identifier)] = placement
     return pb.DesiredWorkerState.FromString(base64.b64decode(preparation["state"], validate=True))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -27,13 +28,12 @@ def test_only_a_new_current_ordinary_terminal_ack_can_recycle(tmp_path: Path, mo
     )
     try:
         job = JobBinding(
-            "sha256:" + "11" * 32,
-            "sha256:" + "12" * 32,
-            "unpublished_job:app",
-            str(tmp_path / "interface.json"),
-            sys.executable,
-            "sha256:" + "13" * 32,
-            "compute",
+            job_descriptor_id="sha256:" + "11" * 32,
+            installation_id="local-" + "12" * 16,
+            application="unpublished_job:app",
+            package_interface=str(tmp_path / "interface.json"),
+            python=sys.executable,
+            job="compute",
         )
         worker.jobs[job.job_descriptor_id] = job
         worker.reclaim_on_terminal = True
@@ -60,14 +60,8 @@ def test_only_a_new_current_ordinary_terminal_ack_can_recycle(tmp_path: Path, mo
             assert record.state == "closed" and not worker.stop.is_set()
             ack.retain_work = False
         if mode == "replacement":
-            worker.jobs[job.job_descriptor_id] = JobBinding(
-                job.job_descriptor_id,
-                "sha256:" + "15" * 32,
-                job.application,
-                job.package_interface,
-                job.python,
-                job.environment_content_digest,
-                job.job,
+            worker.jobs[job.job_descriptor_id] = dataclasses.replace(
+                job, installation_id="local-" + "15" * 16
             )
         if mode == "managed":
             worker.job_slots["envelope"] = JobSlot(

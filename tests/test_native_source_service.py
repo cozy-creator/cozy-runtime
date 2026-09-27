@@ -9,10 +9,13 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from weakref import WeakValueDictionary
 
+import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
+from cozy_runtime.internal import storage_admission
 from cozy_runtime.internal.worker import workspace_memo
 from cozy_runtime.internal.worker.source_calls import SourceCalls
 from cozy_runtime.internal.worker.workspace import Workspace
@@ -225,7 +228,12 @@ def test_real_retained_source_conversion_reuses_and_registry_edit_invalidates(
         thread.join()
 
 
-def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(tmp_path: Path) -> None:
+def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This SourceCalls has no Worker admission owner; a Worker leaked by another test would
+    # otherwise hold local write admission for the whole download and block the resolve.
+    monkeypatch.setattr(storage_admission, "_reclaimers", WeakValueDictionary())
     block = 64 << 20
     chunk = bytes(range(256)) * 4096
     length = block + len(chunk)

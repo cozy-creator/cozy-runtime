@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import sys
 from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import canonical, package_interface
+from cozy_runtime.internal import canonical, package_installation, package_interface
 from cozy_runtime.internal import package_environment as environments
 from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package_set
 from cozy_runtime.internal.worker.session import read_placement_set
@@ -21,13 +22,6 @@ from test_unpublished_exact_dependencies import _wheel
 def test_published_serving_code_prepares_without_models_or_executable_bindings(
     tmp_path: Path, declared: bool
 ) -> None:
-    wheel = _wheel(
-        tmp_path, "serving_child", ("cozy-runtime>=0.1",), b"VALUE=42\n", version="1.0.0"
-    )
-    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n", version="1.0.0")
-    index = _SimpleIndex(tmp_path / "index", [wheel, runtime])
-    base = environments.observe_base()
-    root = tmp_path / "installs"
     slots = ["generate.models.model"] if declared else []
     interface = canonical.write(
         {
@@ -46,7 +40,19 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
             "jobs": [],
         }
     )
-    retained: list[environments.InstalledEnvironment] = []
+    wheel = _wheel(
+        tmp_path,
+        "serving_child",
+        ("cozy-runtime>=0.1",),
+        b"VALUE=42\n",
+        version="1.0.0",
+        resources={"serving_child-1.0.0.dist-info/package-interface.json": interface},
+    )
+    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n", version="1.0.0")
+    index = _SimpleIndex(tmp_path / "index", [wheel, runtime])
+    base = environments.observe_base()
+    root = tmp_path / "installs"
+    retained: list[package_installation.InstalledEnvironment] = []
 
     try:
         locked = environments.read_locked_requirements(
@@ -107,16 +113,14 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
         (placement,) = read_placement_set(result.placement_set)
         assert placement["entrypoints"] == placement["models"] == []
         assert placement["package"] == {"package": "proof/serving-child", "release": "1.0.0"}
-        assert len(retained) == 1 and retained[0].receipt_digest
+        assert len(retained) == 1
+        assert placement["installation_id"] == retained[0].installation_id
         assert (retained[0].site_packages / "serving_child.py").is_file()
-        reopened = environments.open_generation(
-            root,
-            receipt_digest=retained[0].receipt_digest,
-            environment_digest=placement["environment_digest"],
-            python=Path(sys.executable),
-        )
-        assert reopened.content_digest == retained[0].content_digest
-        assert prepare().placement_set == result.placement_set
+        reopened = package_installation.open_installation(root, retained[0].installation_id)
+        assert reopened.site_packages == retained[0].site_packages
+        again = read_placement_set(prepare().placement_set)[0]
+        assert again["installation_id"] != placement["installation_id"]
+        assert again["placement_id"] == placement["placement_id"]
     finally:
         index.close()
 
@@ -132,8 +136,11 @@ def test_real_worker_retains_published_serving_only_child_without_loading_model(
     from cozy_runtime.internal.worker.acquire import Acquirer
     from cozy_runtime.internal.worker.control import InMemoryControlHost
     from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-    from cozy_runtime.protocol import documents
+    from test_end_to_end import NO_EXECUTOR
     from test_publish_derivation import _closure_rows
+
+    if NO_EXECUTOR:
+        pytest.skip(NO_EXECUTOR)
 
     python = image_python()
     runtime = next(python.parent.parent.parent.glob("wheels/cozy_runtime-*.whl"))
@@ -254,23 +261,19 @@ async def generate(payload: Request, model: Reference) -> Reply:
             )
             result = worker.prepare_package_set(request)
             (placement,) = read_placement_set(result.placement_set)
-            key = (placement["placement_id"], placement["environment_digest"])
-            retained = worker.prepared_revisions[key]
-            assert retained.installed is not None and retained.installed.receipt_digest
+            key = (placement["placement_id"], placement["installation_id"])
+            retained = worker.prepared_installations[key]
+            assert retained.installed is not None
             assert retained.models == retained.entrypoints == ()
             assert (retained.installed.site_packages / "serving_child.py").read_bytes() == source
-            reopened = environments.open_generation(
-                root / "installs",
-                receipt_digest=retained.installed.receipt_digest,
-                environment_digest=placement["environment_digest"],
-                python=python,
+            reopened = package_installation.open_installation(
+                root / "installs", retained.installed.installation_id
             )
-            assert reopened.content_digest == retained.installed.content_digest
-            raw_interface = (
-                root / "artifacts" / documents.raw(placement["package_interface"]["digest"]).hex()
-            ).read_bytes()
-            assert raw_interface == request.package_interface
-            interface = package_interface.read_bytes(raw_interface)
+            assert reopened.site_packages == retained.installed.site_packages
+            # The worker described the installed code; the request's copy is advisory.
+            interface = package_interface.read_bytes(
+                base64.b64decode(placement["package_interface"])
+            )
             assert interface["jobs"] == [] and interface["entrypoints"][0]["name"] == "generate"
             acquirer = Acquirer(
                 cache_root=root / "artifacts",
@@ -282,11 +285,9 @@ async def generate(payload: Request, model: Reference) -> Reply:
             )
             bindings, count = acquirer._bindings(retained)
             assert bindings == {} and count == 1
-            assert worker.prepare_package_set(request).placement_set == result.placement_set
-            repeated = worker.prepared_revisions[key].installed
-            assert repeated is not None and repeated.reused
-            assert repeated.receipt_digest == retained.installed.receipt_digest
-            assert repeated.content_digest == retained.installed.content_digest
+            (repeated,) = read_placement_set(worker.prepare_package_set(request).placement_set)
+            assert repeated["placement_id"] == placement["placement_id"]
+            assert repeated["entrypoints"] == repeated["models"] == []
         finally:
             worker.shutdown()
             index.close()

@@ -354,12 +354,11 @@ def _placement(placement_id: str, lane_id: str = "") -> Placement:
         placement_set_digest=b"",
         package={},
         development={},
-        environment_digest=b"",
-        package_interface=("", 0),
+        installation_id="",
+        package_interface=b"",
         bindings_digest=b"",
         models=(),
         entrypoints=(),
-        environment={},
         document={},
         serving=pb.ServingState.SERVING_STATE_DISPATCHABLE,
         lane_id=lane_id,
@@ -739,7 +738,7 @@ def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
         for model in surface.get("models", [])
     )
     # the closed scan over REAL interface bytes: a well-formed slot reads back, a
-    # malformed one refuses by path, an unknown key inside the slot refuses
+    # malformed one refuses by path, an unknown key inside the slot is ignored
     import copy
 
     def with_slot(slot: dict[str, Any]) -> dict[str, Any]:
@@ -772,12 +771,12 @@ def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
         package_interface.read_bytes(
             package_interface.canonical_bytes(with_slot({"sequence_parallel": {"x": 1}}))
         )
-    with pytest.raises(package_interface.StalePackageInterface):
-        package_interface.read_bytes(
-            package_interface.canonical_bytes(
-                with_slot({"sequence_parallel": {"degrees": [2], "x": 1}})
-            )
+    tolerated = package_interface.read_bytes(
+        package_interface.canonical_bytes(
+            with_slot({"sequence_parallel": {"degrees": [2], "x": 1}})
         )
+    )
+    assert tolerated["entrypoints"][0]["models"][0]["sequence_parallel"]["degrees"] == [2]
     # the worker-side binding: the degrees every slot declares, intersected
     two = dataclasses.replace(_binding(), models=())
     assert two.sequence_parallel_degrees() == ()

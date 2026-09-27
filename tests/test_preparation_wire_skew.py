@@ -1,4 +1,4 @@
-"""Both supported prepare shapes use one immutable install and one optional sandbox import."""
+"""Both supported prepare shapes install with uv and describe only without metadata."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import grpc
 import pytest
 
 from cozy_runtime.internal import (
     canonical,
-    package_environment,
+    package_installation,
     package_interface,
     proctree,
     static_interface,
@@ -57,10 +58,14 @@ class ObservedWorker(Worker):
         return supervision
 
     def _describe_installed(
-        self, installed: package_environment.InstalledEnvironment, distribution: str
+        self,
+        installed: package_installation.InstalledEnvironment,
+        distribution: str,
+        *,
+        application: str = "",
     ) -> bytes:
-        self.descriptions.append(installed.content_digest)
-        return super()._describe_installed(installed, distribution)
+        self.descriptions.append(installed.installation_id)
+        return super()._describe_installed(installed, distribution, application=application)
 
     def assert_describes_reaped(self) -> None:
         for executor in self.describe_executors:
@@ -69,6 +74,12 @@ class ObservedWorker(Worker):
         for supervision in self.describe_supervisions:
             assert supervision.current is None and supervision._read_owner() is None
             assert not Path(supervision.socket_path).exists()
+
+
+def _placement(result: pb.PreparePackageSetResult) -> dict[str, Any]:
+    (placement,) = read_placement_set(result.placement_set)
+    assert placement.pop("installation_id") == result.installed_package.installation_id
+    return placement
 
 
 @needs_executor
@@ -159,36 +170,30 @@ def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata
                 try:
                     with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
                         client = rpc.RuntimePreparationStub(channel)
+                        described = 0 if metadata else 1
                         modern = client.PreparePackageSet(request)
-                        assert not worker.descriptions
+                        assert len(worker.descriptions) == described
                         # Field 12 did not exist at minor 60; this is its actual wire shape.
                         request.ClearField("package_interface")
                         compatibility = client.CheckPackageSetCompatibility(request)
                         assert not compatibility.refusal_code and not compatibility.refusal_detail
                         legacy = client.PreparePackageSet(request)
-                        repeated = client.PreparePackageSet(request)
-                        assert legacy == repeated == modern
-                        assert len(worker.descriptions) == (0 if metadata else 1)
+                        assert _placement(legacy) == _placement(modern)
+                        assert len(worker.descriptions) == 3 * described
                         worker.assert_describes_reaped()
-                        assert len(list((root / "installs/contents").iterdir())) == 1
-                        assert len(list((root / "artifacts/installed-interfaces").iterdir())) == 1
+                        # Each preparation is its own installation lifetime.
+                        installations = (root / "installs/installations").glob("install-*")
+                        assert len(list(installations)) == 3
                         (placement,) = read_placement_set(legacy.placement_set)
                         assert placement["entrypoints"][0]["name"] == "serve"
                         # Caller copies of installed facts are advisory.
                         request.application = "compat_package:wrong"
                         request.model_slot_paths.append("serve.models.unexpected")
-                        assert not client.CheckPackageSetCompatibility(request).refusal_code
-                        assert client.PreparePackageSet(request) == modern
-                        request.application = "compat_package:app"
-                        request.ClearField("model_slot_paths")
                         request.package_interface = b"{}"
-                        refused = client.CheckPackageSetCompatibility(request)
-                        assert refused.refusal_code == "package_prepare_interface_invalid"
-                        with pytest.raises(grpc.RpcError, match="interface_invalid"):
-                            client.PreparePackageSet(request)
-                        assert len(worker.descriptions) == (0 if metadata else 1)
+                        assert _placement(client.PreparePackageSet(request)) == _placement(modern)
+                        assert len(worker.descriptions) == 4 * described
                         # Failure also returns only after the dedicated executor is reaped.
-                        installed = next(iter(worker.prepared_revisions.values())).installed
+                        installed = next(iter(worker.prepared_installations.values())).installed
                         assert installed is not None
                         with pytest.raises(PreparationRefusal, match="interface_failed"):
                             worker._describe_installed(installed, "absent-distribution")

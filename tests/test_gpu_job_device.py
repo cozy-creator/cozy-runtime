@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,12 +20,12 @@ REAL_GPU = os.environ.get("COZY_TEST_GPU_JOB_DEVICE") == "1"
 
 
 def probe(mode: str, root: Path, *, script: Path = PROBE) -> dict[str, Any]:
-    # The fresh child gets the same erase/impose boundary and content-scoped
+    # The fresh child gets the same erase/impose boundary and installation-scoped
     # compiler cache as a worker. Cold upstream imports must not invent cache
     # variables after the child's real _capture_seal() snapshot.
     cache = jit_cache.scope(
         root.resolve(),
-        "sha256:" + hashlib.sha256(script.read_bytes()).hexdigest(),
+        "local-" + uuid.uuid4().hex,
         pod_scope=str(root.resolve()),
     )
     visible = "" if mode in {"cpu", "cpu-order"} else os.environ.get("CUDA_VISIBLE_DEVICES", "0")

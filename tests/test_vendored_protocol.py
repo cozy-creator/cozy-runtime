@@ -25,7 +25,7 @@ from cozy_runtime.protocol import WIRE_MINOR
 #: The vendored tree, and the manifest that pins it.
 VENDOR_DIR = Path(__file__).resolve().parents[1] / "src" / "cozy" / "worker" / "v1"
 SOURCE = VENDOR_DIR / "SOURCE"
-WANT_REPOSITORY = "https://github.com/cozy-creator/worker-protocol-v2"
+WANT_REPOSITORY = "https://github.com/cozy-creator/worker-protocol"
 #: What a re-vendor is, in one line, on every failure below.
 REMEDY = (
     "re-vendor: copy gen/python/cozy/worker/v1/* from the worker-protocol commit into "

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from cozy_runtime.internal import package_installation
-
 import base64
 import hashlib
 import json
@@ -13,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import canonical, package_environment
+from cozy_runtime.internal import package_environment, package_installation
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.child import (
@@ -25,8 +23,6 @@ from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     prepare_published_local,
 )
-from cozy_runtime.protocol import documents
-from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options) -> Result:
@@ -57,7 +53,9 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     try:
         installed_environment = package_installation.open_existing_environment(
             environment_python,
-            "local-" + uuid.uuid4().hex, package=package, release=release,
+            "local-" + uuid.uuid4().hex,
+            package=package,
+            release=release,
         )
     except package_environment.EnvironmentRefusal as exc:
         raise CliError(
@@ -147,14 +145,15 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         shutil.rmtree(scratch, ignore_errors=True)
 
     placement_bytes = result.placement_set.placement_set_canonical_bytes
-    placement = documents.read(placement_bytes, pb.PlacementSet)["placements"][0]
     return Result(
         rows=(("package", package), ("release", release)),
         document={
             "package": package,
             "release": release,
             "installation_id": result.installed_package.installation_id,
-            "package_interface": base64.b64encode(result.installed_package.package_interface).decode(),
+            "package_interface": base64.b64encode(
+                result.installed_package.package_interface
+            ).decode(),
             "placement_set": _exact(placement_bytes),
         },
     )

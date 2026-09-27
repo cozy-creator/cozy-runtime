@@ -373,8 +373,7 @@ def build(
     files[dist + "/METADATA"] = (
         header.rstrip(b"\n")
         + (
-            f"\nCozy-Interface-Generator: {GENERATOR_ABI}\n"
-            f"Cozy-Interface-Layout: {layout}\n\n"
+            f"\nCozy-Interface-Generator: {GENERATOR_ABI}\nCozy-Interface-Layout: {layout}\n\n"
         ).encode()
         + description
     )
