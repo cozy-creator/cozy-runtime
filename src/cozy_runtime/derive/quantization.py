@@ -8,6 +8,7 @@ Publication belongs to Tensorhub's production transaction.
 from __future__ import annotations
 
 import math
+import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from importlib.resources import files
 from typing import Any, NamedTuple
@@ -128,7 +129,6 @@ _ARTIFACT_SPECS = {
 PLAIN_SPEC = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"
 _MAX_ARTIFACT_PLAN_BYTES = 8 << 20
 _SOURCE_READ_CHUNK = 32 << 20
-_MAX_SOURCE_TENSOR_BYTES = 1 << 30
 MAX_OUTPUT_BYTES = 32 << 30
 
 
@@ -300,31 +300,41 @@ def write_bf16(
             worst = None
             tel.progress(done / len(selected), stage="bf16")
             continue
-        values, length = _read_values(
-            transaction,
-            source=source,
-            component=tensor.component,
-            key=tensor.key,
-            role=tensor.source_role,
-            logical_dtype=tensor.source_dtype,
-            shape=tensor.shape,
-        )
-        raw = st.from_f32(values, "BF16")
-        error = np.abs(values - st.to_f32(raw, "BF16", list(tensor.shape)))
-        bound = float(np.max(np.abs(values))) * BF16_ROUND_TRIP_BOUND
-        if float(np.max(error)) > bound:
-            raise UnsupportedInput(
-                f"{tensor.component}.{tensor.key}: bf16 round-trip error "
-                f"{float(np.max(error)):.4g} exceeds the representational bound {bound:.4g}",
-                code="quantization_tripwire",
-            )
-        norm = float(np.linalg.norm(values))
-        relative = float(np.linalg.norm(error)) / norm if norm else 0.0
-        worst = max(worst, relative) if worst is not None else None
-        transaction.add_part(tensor.component, tensor.key, "value", raw)
+        amax = max_error = sse = energy = 0.0
+        length = size = 0
+        with tempfile.TemporaryFile() as spill:
+            for values in _read_chunks(
+                transaction,
+                source=source,
+                component=tensor.component,
+                key=tensor.key,
+                role=tensor.source_role,
+                logical_dtype=tensor.source_dtype,
+                shape=tensor.shape,
+            ):
+                raw = st.from_f32(values, "BF16")
+                error = np.abs(values - st.to_f32(raw, "BF16", list(values.shape)))
+                if values.size:
+                    amax = max(amax, float(np.max(np.abs(values))))
+                    max_error = max(max_error, float(np.max(error)))
+                sse += float(np.sum(error.astype(np.float64) ** 2))
+                energy += float(np.sum(values.astype(np.float64) ** 2))
+                length += values.size * {"bf16": 2, "f16": 2, "f32": 4}[tensor.source_dtype]
+                size += spill.write(raw)
+            bound = amax * BF16_ROUND_TRIP_BOUND
+            if max_error > bound:
+                raise UnsupportedInput(
+                    f"{tensor.component}.{tensor.key}: bf16 round-trip error "
+                    f"{max_error:.4g} exceeds the representational bound {bound:.4g}",
+                    code="quantization_tripwire",
+                )
+            relative = math.sqrt(sse / energy) if energy else 0.0
+            worst = max(worst, relative) if worst is not None else None
+            spill.seek(0)
+            transaction.add_part(tensor.component, tensor.key, "value", spill)
         transaction.checkpoint()
         read += length
-        written += len(raw)
+        written += size
         tel.log(
             "normalized tensor",
             level="info",
@@ -336,7 +346,6 @@ def write_bf16(
             total=len(selected),
         )
         tel.progress(done / len(selected), stage="bf16")
-        del values, raw, error
     return Bf16Stats(
         converted_keys=len(selected),
         source_bytes_read=read,
@@ -407,50 +416,84 @@ def quantize_component_into(
             reused += 1
             tel.progress(done / total, stage=f"{encoding}-{target_component}")
             continue
-        values, read = _source_values(
-            transaction, tensor, source=source, source_component=source_component
-        )
-        encoded = encoder.encode(tensor.key, values)
-        bound = float(np.max(np.abs(values))) * encoder.round_trip_bound
-        if encoded.max_abs_err > bound:
-            raise UnsupportedInput(
-                f"{source_component}.{tensor.key}: round-trip error "
-                f"{encoded.max_abs_err:.4g} exceeds the {encoding} bound {bound:.4g}",
-                code="quantization_tripwire",
-            )
-        if len(encoded.companions) != 1:
-            raise UnsupportedInput(f"{encoding} emitted an unexpected companion set")
-        scale = encoded.companions[0]
-        expected_scale = (
+        scale_expected = (
             ("U8", [tensor.shape[0], tensor.shape[1] // 32])
             if encoding == "mxfp8/1"
             else ("F32", [tensor.shape[0]])
         )
-        if (
-            encoded.payload_dtype != "F8_E4M3"
-            or encoded.payload_shape != list(tensor.shape)
-            or (scale.dtype, scale.shape) != expected_scale
-        ):
-            raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
-        relative = encoded.relative_frobenius()
-        if payload.max_relative_frobenius is not None and relative > payload.max_relative_frobenius:
-            raise UnsupportedInput(
-                f"{source_component}.{tensor.key}: relative Frobenius {relative:.6f} exceeds "
-                f"the declared tripwire {payload.max_relative_frobenius}",
-                code="quantization_tripwire",
-            )
-        # A role becomes resumable only after every numerical acceptance check. A
-        # half-written group is recomputed; TensorFS accepts only identical role replay.
-        written = 0
-        for role, raw in (("data", encoded.payload), ("scale", scale.raw)):
-            transaction.add_part(target_component, tensor.key, role, raw)
-            if (target_component, tensor.key, role) not in completed:
-                written += len(raw)
+        amax = max_error = sse = energy = 0.0
+        read = rows = tensor_saturated = 0
+        scales: list[bytes] = []
+        with tempfile.TemporaryFile() as spill:
+            for values in _read_chunks(
+                transaction,
+                source=source,
+                component=source_component,
+                key=tensor.key,
+                role=tensor.source_role,
+                logical_dtype=tensor.logical_dtype,
+                shape=tensor.shape,
+            ):
+                encoded = encoder.encode(tensor.key, values)
+                if len(encoded.companions) != 1:
+                    raise UnsupportedInput(f"{encoding} emitted an unexpected companion set")
+                scale = encoded.companions[0]
+                count = values.shape[0]
+                if (
+                    encoded.payload_dtype != "F8_E4M3"
+                    or encoded.payload_shape != [count, tensor.shape[1]]
+                    or (scale.dtype, scale.shape)
+                    != (scale_expected[0], [count, *scale_expected[1][1:]])
+                ):
+                    raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
+                if values.size:
+                    amax = max(amax, float(np.max(np.abs(values))))
+                max_error = max(max_error, encoded.max_abs_err)
+                sse += encoded.sse
+                energy += encoded.energy
+                tensor_saturated += encoded.saturated
+                read += values.size * {"bf16": 2, "f16": 2, "f32": 4}[tensor.logical_dtype]
+                rows += count
+                spill.write(encoded.payload)
+                scales.append(scale.raw)
+                del values, encoded
+            bound = amax * encoder.round_trip_bound
+            if max_error > bound:
+                raise UnsupportedInput(
+                    f"{source_component}.{tensor.key}: round-trip error "
+                    f"{max_error:.4g} exceeds the {encoding} bound {bound:.4g}",
+                    code="quantization_tripwire",
+                )
+            if rows != tensor.shape[0]:
+                raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
+            relative = math.sqrt(sse / energy) if energy > 0 else 0.0
+            if (
+                payload.max_relative_frobenius is not None
+                and relative > payload.max_relative_frobenius
+            ):
+                raise UnsupportedInput(
+                    f"{source_component}.{tensor.key}: relative Frobenius {relative:.6f} "
+                    f"exceeds the declared tripwire {payload.max_relative_frobenius}",
+                    code="quantization_tripwire",
+                )
+            # A role becomes resumable only after every numerical acceptance check. A
+            # half-written group is recomputed; TensorFS accepts only identical role replay.
+            written = 0
+            data_bytes = spill.tell()
+            spill.seek(0)
+            scale_raw = b"".join(scales)
+            for role, part, part_bytes in (
+                ("data", spill, data_bytes),
+                ("scale", scale_raw, len(scale_raw)),
+            ):
+                transaction.add_part(target_component, tensor.key, role, part)
+                if (target_component, tensor.key, role) not in completed:
+                    written += part_bytes
         transaction.checkpoint()
         worst = max(worst, relative)
         source_bytes += read
         new_bytes += written
-        saturated += encoded.saturated
+        saturated += tensor_saturated
         tel.log(
             "quantized tensor",
             level="info",
@@ -461,7 +504,6 @@ def quantize_component_into(
             total=total,
         )
         tel.progress(done / total, stage=f"{encoding}-{target_component}")
-        del values, encoded, scale
 
     return QuantizationStats(
         encoded_keys=total - reused,
@@ -544,25 +586,7 @@ def _artifact_tensor(
     )
 
 
-def _source_values(
-    transaction: DerivedTransaction,
-    tensor: QuantizationTensor,
-    *,
-    source: str,
-    source_component: str,
-) -> tuple[np.ndarray, int]:
-    return _read_values(
-        transaction,
-        source=source,
-        component=source_component,
-        key=tensor.key,
-        role=tensor.source_role,
-        logical_dtype=tensor.logical_dtype,
-        shape=tensor.shape,
-    )
-
-
-def _read_values(
+def _read_chunks(
     transaction: DerivedTransaction,
     *,
     source: str,
@@ -571,29 +595,34 @@ def _read_values(
     role: str,
     logical_dtype: str,
     shape: tuple[int, ...],
-) -> tuple[np.ndarray, int]:
+) -> Iterator[np.ndarray]:
+    """Whole rows of float32 values, about `_SOURCE_READ_CHUNK` source bytes at a time.
+
+    Host memory stays one chunk whatever the tensor's size; one row is the smallest unit.
+    """
     itemsize = {"bf16": 2, "f16": 2, "f32": 4}[logical_dtype]
-    length = math.prod(shape) * itemsize
-    if length > _MAX_SOURCE_TENSOR_BYTES:
-        raise UnsupportedInput(
-            f"source {component}.{key} is {length} bytes; the per-tensor "
-            f"quantization bound is {_MAX_SOURCE_TENSOR_BYTES}"
-        )
-    raw = bytearray(length)
-    view = memoryview(raw)
-    for offset in range(0, length, _SOURCE_READ_CHUNK):
-        transaction.source_read_into(
-            source,
-            component,
-            key,
-            role,
-            offset,
-            view[offset : min(offset + _SOURCE_READ_CHUNK, length)],
-        )
-    values = st.to_f32(raw, logical_dtype.upper(), list(shape))
-    if not bool(np.isfinite(values).all()):
-        raise UnsupportedInput(f"source {component}.{key} contains non-finite weights")
-    return values, length
+    rows, tail = (shape[0], shape[1:]) if shape else (1, ())
+    row_bytes = math.prod(tail) * itemsize
+    step = max(1, _SOURCE_READ_CHUNK // max(row_bytes, 1))
+    for first in range(0, rows, step):
+        count = min(step, rows - first)
+        raw = bytearray(count * row_bytes)
+        view = memoryview(raw)
+        base = first * row_bytes
+        for offset in range(0, len(raw), _SOURCE_READ_CHUNK):
+            transaction.source_read_into(
+                source,
+                component,
+                key,
+                role,
+                base + offset,
+                view[offset : min(offset + _SOURCE_READ_CHUNK, len(raw))],
+            )
+        chunk_shape = [count, *tail] if shape else []
+        values = st.to_f32(raw, logical_dtype.upper(), chunk_shape)
+        if not bool(np.isfinite(values).all()):
+            raise UnsupportedInput(f"source {component}.{key} contains non-finite weights")
+        yield values
 
 
 def _plain_source_role(tensor: Any) -> str:
