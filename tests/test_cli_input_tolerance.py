@@ -14,7 +14,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from cozy_runtime.internal import package_interface, static_interface
+from cozy_runtime.internal import interface_wheel, package_interface, static_interface
 from test_image_prepare_cli import request, run
 from test_serving_interfaces import project
 
@@ -71,3 +71,57 @@ def test_interface_wheel_accepts_ordinary_json_with_additive_fields(tmp_path: Pa
     assert built.name == wheel.name and built.parent == tmp_path / "out"
     with zipfile.ZipFile(built) as archive:
         assert "serving_fixture.py" in archive.namelist()
+
+
+def test_recapture_rebinds_a_caller_wheel_from_another_generator(tmp_path: Path) -> None:
+    root = project(tmp_path)
+    raw = package_interface.canonical_bytes(static_interface.build(root))
+    implementation = io.BytesIO()
+    with zipfile.ZipFile(implementation, "w") as archive:
+        archive.writestr("serving_fixture.py", (root / "serving_fixture.py").read_text())
+        archive.writestr(
+            "serving_fixture-0.1.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\nName: serving-fixture\nVersion: 0.1.0\n",
+        )
+        archive.writestr(
+            "serving_fixture-0.1.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    filename, published = interface_wheel.build(
+        raw,
+        distribution="serving-fixture",
+        version="0.1.0",
+        implementation_wheel=implementation.getvalue(),
+        implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
+    )
+    # The same wheel as an older generator wrote it.
+    older = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(published)) as source, zipfile.ZipFile(older, "w") as target:
+        for name in source.namelist():
+            body = source.read(name)
+            if name.endswith("METADATA"):
+                body = body.replace(
+                    interface_wheel.GENERATOR_ABI.encode(), b"cozy.interface-generator/7"
+                )
+            elif "_cozy_callers_" in name:
+                body = b"# an older generator's caller layout\n" + body
+            target.writestr(name, body)
+    # The installed source re-described by a newer Runtime with an additive field.
+    body = json.loads(raw)
+    body["generator"] = "a newer describe"
+    newer = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    _, rebound = interface_wheel.build(
+        newer,
+        distribution="serving-fixture",
+        version="0.1.0",
+        implementation_wheel=older.getvalue(),
+        implementation_filename=filename,
+    )
+    fresh = dict(interface_wheel.overlay_sources(newer, {"serving_fixture.py"}))
+    ((generated, companion, suffix),) = fresh.values()
+    with zipfile.ZipFile(io.BytesIO(rebound)) as archive:
+        module = archive.read("serving_fixture.py")
+        assert module.count(b"from _cozy_callers_") == 1 and module.endswith(suffix)
+        assert archive.read(generated) == companion
+        companions = [name for name in archive.namelist() if "_cozy_callers_" in name]
+        assert companions == [generated]
