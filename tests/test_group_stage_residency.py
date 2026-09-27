@@ -118,13 +118,12 @@ def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> Decla
 
 def assign(resolved: DeclaredBinding, degree: int = 2, room: int = HEADROOM) -> DeviceLane:
     lanes = LaneSet.from_envelope(",".join(str(i) for i in range(degree)), worker_pid=os.getpid())
-    return lanes.assign(
+    assert degree in resolved.sequence_parallel_degrees()
+    return lanes.bind(
         "h3",
+        tuple(range(degree)),
         model_bearing=True,
-        declared_bytes=resolved.group_weight_bytes(),
         measured={i: accel.DeviceMemory("measured", room, room) for i in range(degree)},
-        pin=tuple(range(degree)),
-        degrees=resolved.sequence_parallel_degrees(),
     )
 
 

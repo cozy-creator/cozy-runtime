@@ -26,6 +26,7 @@ from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDiv
 from cozy_runtime.internal.worker import lane_wire, lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.gpu_scheduler import width_for
 from cozy_runtime.internal.worker.ledger import DeviceFacts, Ledger
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
@@ -109,124 +110,83 @@ def test_fuse_and_split_are_typed_and_bump_the_revision() -> None:
     assert lanes_.revision == 2 and "lane-0+1" not in lanes_.by_id
 
 
-def test_a_group_pin_refuses_typed_then_fuses() -> None:
+def test_a_group_binds_exactly_or_refuses_typed() -> None:
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
     with pytest.raises(lanes.LaneRefusal) as blind:
-        lanes_.assign("t", model_bearing=True, declared_bytes=GiB, measured=MEASURED, pin=(2,))
+        lanes_.bind("t", (2,), model_bearing=True, measured=MEASURED)
     assert blind.value.code == "device_pin_infeasible" and "unreadable" in blind.value.detail
-    tenant = lanes_.assign("t", model_bearing=True, declared_bytes=GiB, measured=MEASURED, pin=(1,))
+    tenant = lanes_.bind("t", (1,), model_bearing=True, measured=MEASURED)
     assert tenant.lane_id == "lane-1"
-    lanes_.lanes[1].row("t").model_bearing = True
 
-    def refused(pin: tuple[int, ...], **kwargs: Any) -> lanes.LaneRefusal:
-        placement_id = kwargs.pop("placement_id", "g")
+    def refused(ordinals: tuple[int, ...], placement_id: str = "g") -> lanes.LaneRefusal:
         revision = lanes_.revision
         with pytest.raises(lanes.LaneRefusal) as caught:
-            lanes_.assign(
-                placement_id,
-                model_bearing=True,
-                declared_bytes=kwargs.pop("declared", GiB),
-                measured=kwargs.pop("measured", MEASURED),
-                pin=pin,
-                degrees=kwargs.pop("degrees", (2,)),
-            )
+            lanes_.bind(placement_id, ordinals, model_bearing=True, measured=MEASURED)
         assert lanes_.lane_of(placement_id) is None
-        assert lanes_.lane_of("t") is (
-            lanes_.lanes[1] if "t" in lanes_.lanes[1].placements else None
-        )
-        assert lanes_.revision == revision, "a refused pin fused nothing"
+        assert lanes_.revision == revision, "a refused bind fused nothing"
         return caught.value
 
-    # 1. envelope and occupancy
-    assert refused((0, 3)).code == "device_pin_infeasible"
+    assert refused((0, 3)).code == "device_pin_infeasible"  # outside the envelope
     occupied = refused((0, 1))
-    assert occupied.code == "device_pin_infeasible" and "{'lane-1': ['t']}" in occupied.detail
+    assert occupied.code == "device_pin_infeasible" and "lane-1 holds ['t']" in occupied.detail
     assert refused((1, 0)).code == "device_pin_infeasible"  # sorted unique only
-    # 2. readable capacity: every rank must receive a measured prepare ceiling
     unreadable = refused((0, 2))
     assert unreadable.code == "device_group_infeasible"
     assert "ordinal 2 ('2') free bytes unreadable" in unreadable.detail
     lanes_.release("t")
-    # a weightless placement shards nothing
     with pytest.raises(lanes.LaneRefusal) as weightless:
-        lanes_.assign("w", model_bearing=False, declared_bytes=0, measured={}, pin=(0, 1))
+        lanes_.bind("w", (0, 1), model_bearing=False, measured={})
     assert weightless.value.code == "device_group_unsupported"
-    # Estimated weights exceed both cards: bounded construction, not assignment,
-    # discovers paging and decides the executable working set.
-    # Then the fuse: one lane, both devices, one row per device when measured
-    group = lanes_.assign(
-        "g",
-        model_bearing=True,
-        declared_bytes=50 * GiB,
-        measured=MEASURED,
-        pin=(0, 1),
-        degrees=(2,),
-    )
+    group = lanes_.bind("g", (0, 1), model_bearing=True, measured=MEASURED)
     assert group.lane_id == "lane-0+1" and group.placements == {"g"} and lanes_.revision == 1
-    assert lanes_.lane_of("g") is group
-    # the same placement asks again: its lane, unchanged
-    assert lanes_.assign("g", model_bearing=True, declared_bytes=GiB, measured=MEASURED) is group
-    # a later pin over the group's devices refuses; the group leaves and the lanes split
-    later = refused((0,), degrees=(), placement_id="h")
-    assert later.code == "device_pin_infeasible" and "held by group lane-0+1" in later.detail
+    assert lanes_.bind("g", (0, 1), model_bearing=True, measured=MEASURED) is group
+    later = refused((0,), placement_id="h")
+    assert later.code == "device_pin_infeasible" and "lane-0+1" in later.detail
     lanes_.release("g")
     assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-1", "lane-2"]
     assert lanes_.revision == 2
 
 
-def _pin(
+def _place(
     envelope: str, pin: tuple[int, ...] | None, degrees: tuple[int, ...]
 ) -> tuple[lanes.LaneSet, lanes.DeviceLane]:
+    """An owner-placed placement, as `_assign_lane` places one without a scheduler grant."""
     lanes_ = lanes.LaneSet.from_envelope(envelope, worker_pid=os.getpid())
     measured = {
         ordinal: accel.DeviceMemory("measured", 6 * GiB, 8 * GiB)
         for ordinal in range(len(lanes_.entries))
     }
-    lane = lanes_.assign(
-        "p", model_bearing=True, declared_bytes=GiB, measured=measured, pin=pin, degrees=degrees
-    )
-    return lanes_, lane
-
-
-def test_a_pin_wider_than_every_declared_degree_runs_at_the_largest_that_fits() -> None:
-    """Owner ruling: any GPU count may be rented. A K-device pin runs at the largest
-    declared degree <= K; the devices it leaves out stay free device lanes, and a note says
-    so. Only a pin that matches a declared degree is noteless."""
-    lanes_, lane = _pin("0,1,2", (0, 1, 2), (2, 4))
-    assert lane.ordinals == (0, 1) and lane.placements == {"p"}
-    assert [other.lane_id for other in lanes_.lanes] == ["lane-0+1", "lane-2"]
-    assert not lanes_.lanes[1].placements
-    note = lanes_.notes["p"]
-    assert "degree 2 on GPUs [0, 1] of pin [0, 1, 2]" in note and "[2, 4]" in note
-    assert "1 GPU(s) unused" in note
-    other = lanes_.assign(
-        "q",
+    candidates = pin or tuple(range(len(lanes_.entries)))
+    ordinals = lanes_.choose(
+        candidates,
+        width_for([degrees], len(candidates)),
         model_bearing=True,
         declared_bytes=GiB,
+        measured=measured,
+    )
+    return lanes_, lanes_.bind("p", ordinals, model_bearing=True, measured=measured)
+
+
+def test_an_owner_pin_runs_at_the_largest_declared_degree_it_forms() -> None:
+    """A K-device pin runs at the largest declared degree <= K, the declared truth; the
+    devices it leaves out stay free device lanes."""
+    lanes_, lane = _place("0,1,2", (0, 1, 2), (2, 4))
+    assert lane.ordinals == (0, 1) and lane.placements == {"p"}
+    assert [other.lane_id for other in lanes_.lanes] == ["lane-0+1", "lane-2"]
+    other = lanes_.bind(
+        "q",
+        (2,),
+        model_bearing=True,
         measured={2: accel.DeviceMemory("measured", 6 * GiB, 8 * GiB)},
-        pin=(2,),
     )
     assert other.lane_id == "lane-2", "the left-out device serves another placement"
     lanes_.release("p")
-    assert "p" not in lanes_.notes
     assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-1", "lane-2"]
-
-    lanes_, lane = _pin("0,1,2", (0, 1, 2), ())
-    assert lane.ordinals == (0,) and not lane.group
-    assert "degree 1 on GPUs [0]" in lanes_.notes["p"] and "declares none" in lanes_.notes["p"]
-    assert all(not other.group for other in lanes_.lanes) and lanes_.revision == 0
-
-    lanes_, lane = _pin("0,1,2,3", (0, 1, 2, 3), (2,))
-    assert lane.ordinals == (0, 1)
-    assert [other.lane_id for other in lanes_.lanes] == ["lane-0+1", "lane-2", "lane-3"]
-    assert "2 GPU(s) unused" in lanes_.notes["p"]
-
-    lanes_, lane = _pin("0,1", (0, 1), (2,))
-    assert lane.ordinals == (0, 1) and lanes_.notes == {}
-
-    # an unpinned placement on an EMPTY wide envelope is placed as pinned to all of it
-    lanes_, lane = _pin("0,1,2", None, (2, 4))
-    assert lane.ordinals == (0, 1) and "of pin [0, 1, 2]" in lanes_.notes["p"]
+    lanes_, lane = _place("0,1,2", (0, 1, 2), ())
+    assert lane.ordinals == (0,) and not lane.group and lanes_.revision == 0
+    assert _place("0,1,2,3", (0, 1, 2, 3), (2,))[1].ordinals == (0, 1)
+    assert _place("0,1", (0, 1), (2,))[1].ordinals == (0, 1)
+    assert _place("0,1,2", None, (2, 4))[1].ordinals == (0, 1)
 
 
 def test_per_device_rows_and_the_min_ceiling() -> None:
@@ -457,7 +417,7 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             assert observed.available_attempt_slots == 2
             (status,) = observed.placements
             assert status.device_lane_id == "lane-0+1"
-            assert worker.admission_epoch == epoch, "fusing by hand bumps nothing; assign does"
+            assert worker.admission_epoch == epoch, "fusing by hand bumps nothing; binding does"
             # release SPLITS the group and bumps the admission epoch once
             worker._release_lane("p0")
             assert [lane.lane_id for lane in worker.lanes.lanes] == ["lane-0", "lane-1"]
@@ -635,7 +595,7 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
 
 
 def test_device_pins_are_read_as_sent() -> None:
-    """`DesiredPlacementSet.device_pins` reaches `LaneSet.assign` exactly as the
+    """`DesiredPlacementSet.device_pins` reaches `LaneSet.bind` exactly as the
     RecordOwner sent it; the worker validates, never normalizes, a pin."""
     desired_set = pb.DesiredPlacementSet(
         device_pins=[
@@ -648,9 +608,7 @@ def test_device_pins_are_read_as_sent() -> None:
     assert lane_wire.read_device_pins(pb.DesiredPlacementSet()) == {}
     lane_set = lanes.LaneSet.from_envelope("0,1", worker_pid=os.getpid())
     with pytest.raises(lanes.LaneRefusal) as refused:
-        lane_set.assign(
-            "bad", model_bearing=True, declared_bytes=1, measured=MEASURED, pin=(1, 0, 1)
-        )
+        lane_set.bind("bad", (1, 0, 1), model_bearing=True, measured=MEASURED)
     assert refused.value.code == "device_pin_infeasible"
     assert [lane.lane_id for lane in lane_set.lanes] == ["lane-0", "lane-1"]
 

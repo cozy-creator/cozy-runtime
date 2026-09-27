@@ -348,14 +348,12 @@ def test_a_load_without_an_assigned_ceiling_is_a_worker_defect() -> None:
 
 
 def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
-    """Fit is arithmetic over MEASURED bytes, in three steps (cr-066, then cr-022): a
+    """Fit is arithmetic over MEASURED bytes, in steps (cr-066, then cr-022): a
     model-bearing placement takes a lane with room and no other model-bearing tenant; else
     a lane with measured headroom BESIDE its tenants (co-residency); else a lane whose
-    measured TOTAL holds it alone (time-sliced sharing). A lane the driver cannot read is
-    never chosen. Weights larger than VRAM proceed to bounded preparation, which retains
-    the working-set fit decision. Assignment itself authorizes no bytes. On a
-    WIDE envelope the candidate lane is the placement's PIN (cr-068): the worker validates,
-    it never chooses which paid card to idle."""
+    measured TOTAL holds it alone (time-sliced sharing); else any readable lane (bounded
+    preparation). A lane the driver cannot read is never chosen. Choosing authorizes no
+    bytes, and binding takes exactly the chosen ordinals."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
     assert len(lanes_) == 3 and lanes_.envelope.ordinals == (0, 1, 2) and lanes_.wide
     measured = {
@@ -363,57 +361,32 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
         1: accel.DeviceMemory("measured", 16 << 30, 24 << 30),
         2: accel.DeviceMemory("unreadable"),
     }
-    big = lanes_.assign(
-        "big", model_bearing=True, declared_bytes=8 << 30, measured=measured, pin=(1,)
-    )
-    assert big.lane_id == "lane-1"
-    lanes_.lanes[1].row("big").model_bearing = True
-    small = lanes_.assign(
-        "small", model_bearing=True, declared_bytes=2 << 30, measured=measured, pin=(0,)
-    )
-    assert small.lane_id == "lane-0"
-    lanes_.lanes[0].row("small").model_bearing = True
-    # step 2: lane-0 has a tenant; its measured headroom still covers 1 GiB beside it
-    beside = lanes_.assign(
-        "beside", model_bearing=True, declared_bytes=1 << 30, measured=measured, pin=(0,)
-    )
-    assert beside.lane_id == "lane-0"
-    lanes_.lanes[0].row("beside").model_bearing = True
-    # step 3: lane-0 has no 6 GiB of headroom; its 8 GiB total holds it alone (time-sliced)
-    shared = lanes_.assign(
-        "shared", model_bearing=True, declared_bytes=6 << 30, measured=measured, pin=(0,)
-    )
-    assert shared.lane_id == "lane-0"
-    lanes_.lanes[0].row("shared").model_bearing = True
-    huge = lanes_.assign(
-        "huge", model_bearing=True, declared_bytes=32 << 30, measured=measured, pin=(1,)
-    )
-    assert huge.lane_id == "lane-1"
-    with pytest.raises(lanes.LaneRefusal) as refused:
-        lanes_.assign(
-            "blind", model_bearing=True, declared_bytes=1 << 20, measured=measured, pin=(2,)
+
+    def place(name: str, declared: int, candidates: tuple[int, ...] = (0, 1, 2)) -> str:
+        ordinals = lanes_.choose(
+            candidates, 1, model_bearing=True, declared_bytes=declared, measured=measured
         )
-    assert refused.value.code == "device_pin_infeasible"
-    assert "lane-2 free bytes unreadable" in refused.value.detail
-    # NO PIN on a wide envelope: refused typed (ruling 3), nothing moved
+        lane = lanes_.bind(name, ordinals, model_bearing=True, measured=measured)
+        lane.row(name).model_bearing = True
+        return lane.lane_id
+
+    assert place("big", 8 << 30) == "lane-1"  # step 1: the only empty lane with room
+    assert place("small", 2 << 30) == "lane-0"  # step 1 again: lane-0 is still empty
+    assert place("beside", 1 << 30) == "lane-0"  # step 2: headroom beside a tenant
+    assert place("shared", 6 << 30, (0,)) == "lane-0"  # step 3: its total holds it alone
+    assert place("huge", 32 << 30) == "lane-1"  # step 4: bounded preparation, fewest tenants
     with pytest.raises(lanes.LaneRefusal) as refused:
-        lanes_.assign("unpinned", model_bearing=True, declared_bytes=1 << 20, measured=measured)
-    assert refused.value.code == "device_group_unsupported"
-    assert "carries no device pin on a 3-device envelope" in refused.value.detail
-    assert lanes_.lane_of("huge") is huge and lanes_.lane_of("unpinned") is None
-    assert lanes_.lane_of("big") is lanes_.lanes[1] and lanes_.lane_of("small") is lanes_.lanes[0]
+        lanes_.choose((2,), 1, model_bearing=True, declared_bytes=1 << 20, measured=measured)
+    assert refused.value.code == "device_lane_infeasible"
+    with pytest.raises(lanes.LaneRefusal) as refused:
+        lanes_.bind("blind", (2,), model_bearing=True, measured=measured)
+    assert refused.value.code == "device_pin_infeasible"
+    assert "ordinal 2 ('2') free bytes unreadable" in refused.value.detail
+    assert lanes_.lane_of("blind") is None
     # weightless placements spread over the lanes with the fewest tenants
-    weightless = lanes_.assign("w1", model_bearing=False, declared_bytes=0, measured={})
-    assert weightless is lanes_.lanes[2]
+    assert lanes_.choose((0, 1, 2), 1, model_bearing=False, declared_bytes=0, measured={}) == (2,)
     lanes_.release("big")
     assert lanes_.lane_of("big") is None and "big" not in lanes_.lanes[1].rows
-    # a ONE-device envelope needs no pin: the worker's one lane is the candidate
-    one = lanes.LaneSet.from_envelope("0", worker_pid=os.getpid())
-    assert not one.wide
-    alone = one.assign(
-        "solo", model_bearing=True, declared_bytes=1 << 30, measured={0: measured[0]}
-    )
-    assert alone is one.lanes[0]
 
 
 def test_one_lane_worker_seats_and_a_two_lane_worker_sum() -> None:

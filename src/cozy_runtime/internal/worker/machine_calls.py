@@ -209,14 +209,13 @@ class Calls:
         self._stop_descendants(owner)
         with self.lock:
             requests = list(self.pending.values())
-        groups = self.worker.machine_groups
-        if groups is not None:
-            requests.sort(
-                key=lambda request: (
-                    groups.priority(owner, request.parent_request_id),
-                    request.call_index,
-                )
+        roots = executions.scheduling_roots(owner)
+        requests.sort(
+            key=lambda request: (
+                roots.get(executions.scheduling_root(owner, request.parent_request_id)[0], 0),
+                request.call_index,
             )
+        )
         for request in requests:
             parent = self.worker.engine.live.get(request.parent_request_id)
             if (

@@ -1,0 +1,166 @@
+"""GPU scheduling policy: one lease per root, exact device sets, level-triggered.
+
+Policy only, no I/O. Every drive tick passes the open roots with their durable priority
+and every demand not yet released from its device; anything missing is gone, so a hold
+cannot leak. A root's lease grows only from free ordinals and ends only when the root
+stops, so the Python gap between two children never lets another root in. Priority orders
+the waiters: the oldest waiter that cannot start reserves the free ordinals, so a younger
+narrow demand never starves it. Nothing is revoked, lent or preempted.
+"""
+
+from __future__ import annotations
+
+import itertools
+import threading
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+Ordinals = tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class Demand:
+    """One GPU phase of an execution attempt: `key` is `request#attempt`."""
+
+    key: str
+    root: str
+    width: int
+    warm: Ordinals = ()  # where this exact placement is already resident
+    exclude: Ordinals = ()  # ordinals it must not take
+
+
+def model_degrees(models: Iterable[Any]) -> list[set[int]]:
+    """Declared `sequence_parallel.degrees` per model slot; an unreadable field is none."""
+    rows = []
+    for model in models:
+        parallel = model.get("sequence_parallel") if isinstance(model, dict) else None
+        degrees = parallel.get("degrees") if isinstance(parallel, dict) else None
+        rows.append({d for d in degrees if type(d) is int} if isinstance(degrees, list) else set())
+    return rows
+
+
+def width_for(degrees: Iterable[Iterable[int]], devices: int) -> int:
+    """The largest device count every model slot declares, capped by the machine.
+
+    One device is always declared. Authored rung GPU counts are a renting decision and
+    never narrow this on a machine that is already wider.
+    """
+    common = set(range(1, max(devices, 1) + 1))
+    for declared in degrees:
+        common &= {1, *declared}
+    return max(common)
+
+
+class GpuScheduler:
+    def __init__(self, devices: int) -> None:
+        self.devices = devices
+        self.lock = threading.Lock()
+        self.leases: dict[str, set[int]] = {}
+        self.grants: dict[str, tuple[str, Ordinals]] = {}
+        self.waiting: dict[str, tuple[str, ...]] = {}
+        self.released: set[str] = set()
+        self.events: list[tuple[str, str, dict[str, Any]]] = []
+        self._arrival: dict[str, int] = {}
+        self._counter = itertools.count()
+
+    def sync(self, roots: Mapping[str, int], demands: Sequence[Demand]) -> dict[str, Ordinals]:
+        """Reconcile to this tick's roots (name -> priority) and demands; return grants."""
+        with self.lock:
+            # A stopped root's attempt keeps its grant until it leaves the device.
+            live = {d.key: d for d in demands if d.key not in self.released}
+            self.released &= {d.key for d in demands}
+            for key in [key for key in self.grants if key not in live]:
+                self._end(key, "gone")
+            self.waiting = {k: v for k, v in self.waiting.items() if k in live}
+            for root in [root for root in self.leases if root not in roots]:
+                self._lease(root, set(), "stopped")
+                del self.leases[root]
+            self._arrival = {k: self._arrival.get(k, next(self._counter)) for k in live}
+            busy = {o for _, ordinals in self.grants.values() for o in ordinals}
+            stalled: set[str] = set()
+            pending = sorted(
+                (d for d in live.values() if d.key not in self.grants and d.root in roots),
+                key=lambda d: (roots[d.root], d.root, self._arrival[d.key]),
+            )
+            for demand in pending:
+                if demand.root in stalled:
+                    continue  # FIFO within a root: a later call never overtakes an earlier one
+                lease = self.leases.get(demand.root, set())
+                taken = {o for held in self.leases.values() for o in held}
+                usable = [
+                    o
+                    for o in range(self.devices)
+                    if o not in busy and o not in demand.exclude and (o in lease or o not in taken)
+                ]
+                if len(usable) >= demand.width:
+                    ranked = sorted(usable, key=lambda o: (o not in demand.warm, o not in lease, o))
+                    chosen = tuple(sorted(ranked[: demand.width]))
+                    self.grants[demand.key] = (demand.root, chosen)
+                    self.waiting.pop(demand.key, None)
+                    busy.update(chosen)
+                    self._lease(demand.root, lease | set(chosen), f"granted {demand.key}")
+                    self.events.append(
+                        (demand.root, "gpu.grant", {"key": demand.key, "ordinals": list(chosen)})
+                    )
+                    continue
+                if not stalled:
+                    # The head of the line reserves what is free; nothing else moves.
+                    self._lease(demand.root, lease | set(usable), f"reserved for {demand.key}")
+                stalled.add(demand.root)
+                blocked = tuple(
+                    sorted(
+                        {r for r, _ in self.grants.values()}
+                        | {r for r, held in self.leases.items() if held and r != demand.root}
+                    )
+                )
+                if self.waiting.get(demand.key) != blocked:
+                    self.waiting[demand.key] = blocked
+                    self.events.append(
+                        (
+                            demand.root,
+                            "gpu.wait",
+                            {"key": demand.key, "width": demand.width, "blocked_by": list(blocked)},
+                        )
+                    )
+            return {key: ordinals for key, (_, ordinals) in self.grants.items()}
+
+    def release(self, key: str, **facts: Any) -> None:
+        """Device exit: the ordinals return to the root's lease before the next tick."""
+        with self.lock:
+            self.released.add(key)
+            if key in self.grants:
+                self._end(key, "exited", facts)
+
+    def drain(self) -> list[tuple[str, str, dict[str, Any]]]:
+        """Observations since the last drain, for the caller to journal outside any lock."""
+        with self.lock:
+            events, self.events = self.events, []
+            return events
+
+    def phase(self, key: str) -> dict[str, Any]:
+        with self.lock:
+            if key in self.grants:
+                ordinals = self.grants[key][1]
+                return {"phase": "granted", "width": len(ordinals), "ordinals": list(ordinals)}
+            if key in self.waiting:
+                return {"phase": "waiting", "blocked_by": list(self.waiting[key])}
+            return {"phase": "none"}
+
+    def view(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "leases": {root: sorted(held) for root, held in self.leases.items()},
+                "grants": {key: [root, list(o)] for key, (root, o) in self.grants.items()},
+                "waiting": {key: list(blocked) for key, blocked in self.waiting.items()},
+            }
+
+    def _end(self, key: str, cause: str, facts: dict[str, Any] | None = None) -> None:
+        root, ordinals = self.grants.pop(key)
+        body = {"key": key, "ordinals": list(ordinals), "cause": cause, **(facts or {})}
+        self.events.append((root, "gpu.release", body))
+
+    def _lease(self, root: str, ordinals: set[int], cause: str) -> None:
+        if ordinals != self.leases.get(root, set()):
+            self.leases[root] = ordinals
+            self.events.append((root, "gpu.lease", {"ordinals": sorted(ordinals), "cause": cause}))

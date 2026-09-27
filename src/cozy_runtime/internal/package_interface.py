@@ -134,6 +134,13 @@ def callable_doc(
     if internal:
         doc["internal"] = True
     if models:
+        degrees = [set(model.get("sequence_parallel", {}).get("degrees", [])) for model in models]
+        if any(degrees) and not set.intersection(*degrees):
+            raise ConformanceError(
+                f"{name}: its Model slots declare @sequence_parallel degrees {degrees} with "
+                "none in common; a group shards every slot, so each must share a degree",
+                code="sequence_parallel_declaration_conflict",
+            )
         doc["models"] = list(models)
     if assets:
         kinds: list[Json] = []

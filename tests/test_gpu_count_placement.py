@@ -5,40 +5,9 @@ from typing import Any, cast
 import pytest
 
 from cozy_runtime.internal import hostfacts
-from cozy_runtime.internal.worker import machine_lanes, machine_model_defaults
+from cozy_runtime.internal.worker import machine_model_defaults
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import worker_pb2 as pb
-
-
-def _pins(worker: Any, *args: Any) -> list[pb.PlacementDevicePin]:
-    reserved = machine_lanes.replica(worker, "owner", *args)
-    assert reserved is not None
-    return reserved[1]
-
-
-def test_counted_child_reserves_exact_group_and_old_capture_keeps_prior_behavior() -> None:
-    worker = SimpleNamespace(
-        lanes=SimpleNamespace(wide=True, entries=[0, 1, 2, 3], by_id={}),
-        executions=SimpleNamespace(pending=lambda owner: []),
-        engine=SimpleNamespace(history={}),
-    )
-    placement = {"installation_id": "test-install", "bindings_digest": "sha256:" + "a" * 64}
-    h3: list[dict[str, Any]] = [{"sequence_parallel": {"degrees": [2, 4]}}]
-    assert list(_pins(worker, placement, h3, [{"gpus": 2}])[0].device_ordinals) == [0, 1]
-    assert list(_pins(worker, placement, [{}], [{"gpus": 1}])[0].device_ordinals) == [0]
-    assert list(_pins(worker, placement, h3)[0].device_ordinals) == [0, 1, 2, 3]
-
-
-def test_counted_group_cannot_exceed_granted_pool_even_on_a_larger_host() -> None:
-    worker = SimpleNamespace(lanes=SimpleNamespace(wide=False, entries=[0]))
-    with pytest.raises(WorkspaceRefusal, match="granted device pool"):
-        machine_lanes.replica(
-            cast(Any, worker),
-            "owner",
-            {},
-            [{"sequence_parallel": {"degrees": [2, 4]}}],
-            [{"gpus": 2}],
-        )
 
 
 def test_counted_capture_needs_feature63_but_old_capture_accepts62() -> None:
