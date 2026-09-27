@@ -34,6 +34,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.gpu_scheduler import Demand
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
@@ -99,7 +100,7 @@ class Origin:
         source = root / "origin"
         source.mkdir()
         _, manifest, length, store = _snapshot(source, include_asset=True, checkpoint_only=True)
-        self.checkpoint = {"digest": manifest, "length": length}
+        self.checkpoint: dict[str, Any] = {"digest": manifest, "length": length}
         bodies = {hashlib.sha256(body).hexdigest(): body for body in (_HEADER, _ASSET)}
         objects = [{"length": len(b), "sha256": d} for d, b in sorted(bodies.items())]
         bodies[manifest[7:]] = store.manifest(manifest)["manifest"]
@@ -591,3 +592,35 @@ def test_h3_states_its_attention_length_at_intake_exactly(video: bool) -> None:
     pipe.condition_media("ref2va", state)
     pipe._run("ref2va", "denoise.prepare_layout", state)
     assert tokens == state.get("token_tags").numel() > 0
+
+
+@needs_gpu
+def test_probes_wait_while_a_call_runs_on_the_card_and_follow_when_it_leaves(
+    warm: Callable[..., Warm],
+) -> None:
+    """The root's own call holds the card: its process may start there (the root holds it),
+    but no probe runs beside a call on the device; the pass that sees the card released
+    starts them. The scheduler is driven directly, so the call's grant lasts exactly as
+    long as the test says."""
+    machine = warm()
+    machine.submit_root("A")
+    gpu, prespawns = machine.worker.gpu, machine.worker.prespawns
+    roots = {"A": 1}
+    assert gpu.sync(roots, [Demand("A-call#1", "A", 1)]) == {"A-call#1": (0,)}
+    emitted: list[dict[str, Any]] = []
+    target = machine.target({"digest": "sha256:" + "0" * 64, "length": 1})
+    prespawns.request(OWNER, "A", target, emitted.append)
+    (slot,) = prespawns.slots.values()
+    assert slot.started.wait(120) and slot.executor is not None and slot.executor.started
+    for _ in range(20):
+        prespawns.reconcile(roots, gpu.view())
+        time.sleep(0.05)
+    assert [frame["fields"]["phase"] for frame in emitted] == ["Starting model executor"]
+    gpu.release("A-call#1")
+    gpu.sync(roots, [])
+    released = time.time()
+    prespawns.reconcile(roots, gpu.view())
+    assert slot.finished.wait(120)
+    probes = emitted[-1]["fields"]
+    assert probes["phase"] == "Proving attention kernels" and probes["completed"], probes
+    assert probes["started_unix_ms"] >= int(released * 1000)

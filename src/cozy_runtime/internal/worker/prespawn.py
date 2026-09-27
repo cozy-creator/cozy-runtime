@@ -52,6 +52,8 @@ class Slot:
     claimed: threading.Event = field(default_factory=threading.Event)
     #: set when the warm thread has nothing more to send this process
     finished: threading.Event = field(default_factory=threading.Event)
+    #: set by every scheduling pass, claim and drop: the warm thread looks again
+    nudge: threading.Event = field(default_factory=threading.Event)
     executor: Executor | None = None
 
 
@@ -174,11 +176,14 @@ class Prespawns:
             self._drop(slot)
             return
         worker.note("warm", f"prespawned {slot.installation} on {list(slot.ordinals)}: {legs}")
-        if slot.claimed.is_set() or self._busy(slot.ordinals):
-            return  # a request is ready: its construction proves what it needs itself
-        with self.lock:
-            if self.slots.get((slot.installation, slot.ordinals)) is not slot:
-                return  # yielded
+        # Probes wait for idle cards; a request that is ready first proves what it selects.
+        while self._busy(slot.ordinals):
+            slot.nudge.wait()
+            slot.nudge.clear()
+            if slot.claimed.is_set() or not self._held(slot):
+                return
+        if slot.claimed.is_set() or not self._held(slot):
+            return
         started, began = time.time(), time.perf_counter()
         try:
             reply = executor.call({"cmd": "warm"}, timeout=None)
@@ -214,6 +219,10 @@ class Prespawns:
             }
         )
 
+    def _held(self, slot: Slot) -> bool:
+        with self.lock:
+            return self.slots.get((slot.installation, slot.ordinals)) is slot
+
     def _busy(self, ordinals: Ordinals) -> bool:
         grants = self.worker.gpu.view()["grants"]
         return any(set(held) & set(ordinals) for _root, held in grants.values())
@@ -235,6 +244,7 @@ class Prespawns:
             self._drop(other)
         if slot is not None:
             slot.claimed.set()
+            slot.nudge.set()
             if slot.executor is not None:
                 _nice(slot.executor, _WORKER)
         return slot
@@ -274,6 +284,8 @@ class Prespawns:
                 if slot.root not in roots
                 or any(taken.get(o, set()) - {slot.root} for o in slot.ordinals)
             ]
+            for slot in self.slots.values():
+                slot.nudge.set()
         for slot in leaving:
             self.worker.note("warm", f"prespawn on {list(slot.ordinals)} yields its cards")
             self._drop(slot)
@@ -283,6 +295,7 @@ class Prespawns:
         with self.lock:
             if self.slots.get((slot.installation, slot.ordinals)) is slot:
                 del self.slots[(slot.installation, slot.ordinals)]
+        slot.nudge.set()
         threading.Thread(target=self._retire, args=(slot,), daemon=True).start()
 
     def _retire(self, slot: Slot) -> None:
@@ -302,6 +315,7 @@ class Prespawns:
         with self.lock:
             slots, self.slots = list(self.slots.values()), {}
         for slot in slots:
+            slot.nudge.set()
             self._retire(slot)
 
 
