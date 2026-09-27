@@ -34,6 +34,7 @@ class Shape:
     degrees: tuple[frozenset[int], ...] = ()
     template: tuple[str, str] = ("", "")
     refusal: str = ""
+    gpus: int = 0  # the exact group width the owner submitted; 0 lets the scheduler choose
 
 
 def shape(worker: Worker, owner: str, request: str) -> Shape:
@@ -58,7 +59,8 @@ def shape(worker: Worker, owner: str, request: str) -> Shape:
         models = next(e for e in interface["entrypoints"] if e["name"] == name).get("models", [])
         template = (machine_capture.installation_identity(row), row["bindings_digest"])
         degrees = tuple(frozenset(d) for d in model_degrees(models))
-        found = Shape(root, "serving" if models else "cpu", degrees, template)
+        gpus = desired.placement_set.execution_gpus
+        found = Shape(root, "serving" if models else "cpu", degrees, template, gpus=gpus)
     else:
         return Shape(root, "cpu")  # an owner-placed serving root already has its lane
     held = worker.engine.live.get(parent) if parent else None
