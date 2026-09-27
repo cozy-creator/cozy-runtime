@@ -996,7 +996,7 @@ class WorkspaceActivationCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ...) -> None: ...
 
 class ProtocolInfoResult(_message.Message):
-    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery", "supports_local_installation_reuse", "supports_rental_keepalive", "supports_weights_transaction_refusal", "supports_machine_execution_triage")
+    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery", "supports_local_installation_reuse", "supports_rental_keepalive", "supports_weights_transaction_refusal", "supports_machine_execution_triage", "supports_prepare_while_landing")
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_MIXED_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
@@ -1005,6 +1005,7 @@ class ProtocolInfoResult(_message.Message):
     SUPPORTS_RENTAL_KEEPALIVE_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_WEIGHTS_TRANSACTION_REFUSAL_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_MACHINE_EXECUTION_TRIAGE_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_PREPARE_WHILE_LANDING_FIELD_NUMBER: _ClassVar[int]
     wire_minor: int
     minimum_wire_minor: int
     supports_mixed_model_inputs: bool
@@ -1013,7 +1014,8 @@ class ProtocolInfoResult(_message.Message):
     supports_rental_keepalive: bool
     supports_weights_transaction_refusal: bool
     supports_machine_execution_triage: bool
-    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ..., supports_rental_keepalive: bool = ..., supports_weights_transaction_refusal: bool = ..., supports_machine_execution_triage: bool = ...) -> None: ...
+    supports_prepare_while_landing: bool
+    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ..., supports_rental_keepalive: bool = ..., supports_weights_transaction_refusal: bool = ..., supports_machine_execution_triage: bool = ..., supports_prepare_while_landing: bool = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
     __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "supports_model_materialization_recovery", "python_requires", "python_version", "package_interface")
@@ -1390,7 +1392,7 @@ class WeightsTransferCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ...) -> None: ...
 
 class PreparePackageSetRequest(_message.Message):
-    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root", "download_delegation_signature", "python_requires", "python_version", "package_interface")
+    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root", "download_delegation_signature", "python_requires", "python_version", "package_interface", "models_landing")
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     APPLICATION_FIELD_NUMBER: _ClassVar[int]
     MODEL_SLOT_PATHS_FIELD_NUMBER: _ClassVar[int]
@@ -1401,6 +1403,7 @@ class PreparePackageSetRequest(_message.Message):
     PYTHON_REQUIRES_FIELD_NUMBER: _ClassVar[int]
     PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
+    MODELS_LANDING_FIELD_NUMBER: _ClassVar[int]
     download_delegation: bytes
     application: str
     model_slot_paths: _containers.RepeatedScalarFieldContainer[str]
@@ -1411,7 +1414,8 @@ class PreparePackageSetRequest(_message.Message):
     python_requires: str
     python_version: str
     package_interface: bytes
-    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ..., download_delegation_signature: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ...) -> None: ...
+    models_landing: bool
+    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ..., download_delegation_signature: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ..., models_landing: bool = ...) -> None: ...
 
 class ImageInventory(_message.Message):
     __slots__ = ("profile", "python", "distributions", "interpreters")

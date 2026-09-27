@@ -276,6 +276,48 @@ class Warm(Machine):
             models[0]["sequence_parallel"] = {"degrees": list(degrees)}  # type: ignore[assignment]
         return Target(INSTALLATION, "marco", {"models": models}, {"placement": placement}, None, "")
 
+    def direct_root(self, name: str) -> None:
+        """A serving root as Creator submits a rented direct root once the Host's preparation
+        answers: its template names the installed fixture, and no call asked for it before."""
+        placement = {
+            **self.target({"digest": "sha256:" + "0" * 64, "length": 1}).prepared_installation[
+                "placement"
+            ],
+            "package": {"package": "t/m", "release": "1"},
+            "models": [
+                {
+                    "id": "model",
+                    "repo": "proof/model",
+                    "manifest": {"digest": "sha256:" + "0" * 64, "length": 1},
+                }
+            ],
+        }
+        raw = canonical_json.encode(
+            {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
+        )
+        state = pb.DesiredWorkerState(
+            wire_minor=WIRE_MINOR,
+            posture=pb.POSTURE_ACCEPTING,
+            placement_set=pb.DesiredPlacementSet(
+                placement_set_digest=hashlib.sha256(raw).digest(),
+                placement_set_canonical_bytes=raw,
+            ),
+        )
+        digest = placement["bindings_digest"]
+        self.submit(
+            name,
+            pb.InvocationSpec(
+                installation_id=INSTALLATION,
+                serving=pb.ServingInvocationSpec(
+                    entrypoint_binding_digest=digest,
+                    attempt_binding_id=digest,
+                    bindings_digest=digest,
+                ),
+            ),
+            {"installations": {}, "state": base64.b64encode(state.SerializeToString()).decode()},
+            placement=placement["placement_id"],
+        )
+
     def phases(self, root: str) -> dict[str, dict[str, Any]]:
         """The root's journaled phase records, by name: what `cozy run show` renders."""
         found: dict[str, dict[str, Any]] = {}
@@ -624,3 +666,66 @@ def test_probes_wait_while_a_call_runs_on_the_card_and_follow_when_it_leaves(
     probes = emitted[-1]["fields"]
     assert probes["phase"] == "Proving attention kernels" and probes["completed"], probes
     assert probes["started_unix_ms"] >= int(released * 1000)
+
+
+@needs_gpu
+def test_a_host_started_warm_is_adopted_by_the_direct_root_granted_its_card(
+    warm: Callable[..., Warm],
+) -> None:
+    """h3a-089: the Host's preparation starts the installation's executor while it lands the
+    weights of a root nobody has submitted yet. The process starts and proves its kernels on
+    a free card with its rows waiting in the slot; the direct root submitted afterwards is
+    granted that card, adopts that very process, and its journal carries both phases with
+    the times they actually ran."""
+    machine = warm()
+    prespawns = machine.worker.prespawns
+    prespawns.request_landing(INSTALLATION, _interface(), [{"path": "marco.models.model"}])
+    (slot,) = prespawns.slots.values()
+    assert slot.root == "" and slot.ordinals == (0,)
+    assert slot.finished.wait(300)
+    assert [frame["fields"]["phase"] for frame in slot.frames] == [
+        "Starting model executor",
+        "Proving attention kernels",
+    ]
+    assert all(frame["fields"]["completed"] for frame in slot.frames), slot.frames
+    # A second landing preparation of the same installation starts nothing more.
+    prespawns.request_landing(INSTALLATION, _interface(), [{"path": "marco.models.model"}])
+    assert list(prespawns.slots.values()) == [slot]
+    executor = slot.executor
+    assert executor is not None and executor.alive()
+
+    submitted = time.time()
+    machine.direct_root("D")
+    machine.tick()
+    assert machine.granted("D") == [0]
+    (hosted,) = machine.worker.hosted.values()
+    assert hosted.supervision is slot.supervision and slot.root == "D"
+    assert prespawns.slots == {} and slot.frames == []
+    phases = machine.phases("D")
+    started = phases["Starting model executor"]
+    probes = phases["Proving attention kernels"]
+    assert started["completed"] and "sdpa ready" in probes["detail"], phases
+    assert started["ordinals"] == probes["ordinals"] == [0]
+    assert probes["started_unix_ms"] + probes["elapsed_ms"] < submitted * 1000
+
+
+@needs_gpu
+def test_a_host_started_warm_yields_to_a_root_of_another_installation(
+    warm: Callable[..., Warm],
+) -> None:
+    """A process nobody adopted is not a reservation: another installation's root granted
+    its card takes it in the same scheduling pass."""
+    machine = warm()
+    prespawns = machine.worker.prespawns
+    prespawns.request_landing(INSTALLATION, _interface(), [{"path": "marco.models.model"}])
+    (slot,) = prespawns.slots.values()
+    assert slot.started.wait(300) and slot.executor is not None
+    executor = slot.executor
+    machine.serving("B", "qwen")
+    machine.tick()
+    assert machine.granted("B") == [0]
+    assert prespawns.slots == {} and slot.root == ""
+    _wait(
+        lambda: not executor.alive() and slot.supervision.current is None,
+        "the unadopted prespawn reclaimed off B's card",
+    )
