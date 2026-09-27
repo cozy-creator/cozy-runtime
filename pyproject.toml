@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.18.60"
+version = "0.18.61"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
