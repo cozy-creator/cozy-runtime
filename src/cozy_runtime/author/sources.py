@@ -6,6 +6,7 @@ TensorFS locally or on the private worker and never publish the script or its so
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Annotated, cast
 
@@ -101,9 +102,13 @@ async def ingest_huggingface(repository: str, *, revision: str) -> ModelArtifact
     source = await download_huggingface(
         recipe.repository, revision=recipe.revision, carriers=recipe.carriers
     )
-    model = await convert_cozytensors(source, profile=recipe.profile)
-    metadata = await download_huggingface(
-        recipe.repository, revision=recipe.revision, files=tuple(recipe.metadata)
+    # The metadata never depends on the conversion, so both run at once. They are
+    # reserved in the same order as before, so their call indices are unchanged.
+    model, metadata = await asyncio.gather(
+        convert_cozytensors(source, profile=recipe.profile),
+        download_huggingface(
+            recipe.repository, revision=recipe.revision, files=tuple(recipe.metadata)
+        ),
     )
     # The managed caller accepts a receipt; the execution signature deliberately
     # declares the Model that Runtime injects from that receipt at admission.
