@@ -1,7 +1,0 @@
-An unrelated Runtime wheel update invalidated every managed memo result because the numerical salt hashed the complete protected SDK distribution RECORD, in addition to the callee's implementation key.
-
-Remove distribution discovery, RECORD hashing, interpreter subprocess probes, SDK versions, and allocator/diagnostic settings from that salt. Keep only measured backend/architecture/driver and imposed numerical execution flags. Explicit callee MemoDistribution declarations continue to identify the native libraries actually used by each operation.
-
-Six focused CPU checks pass: real shared-quantizer computation keys survive Runtime metadata/version/RECORD edits, missing SDK RECORD, and editable SDK provenance; a changed declared TensorFS version changes the key; GPU backend/architecture/driver and precision/determinism policy changes invalidate it; unrelated diagnostic/capacity details do not. Existing TensorFS/NumPy/msgspec derivation-key controls and the bounded numerical-environment RPC refusal check also pass. Targeted Ruff and diff checks pass.
-
-The numerical-key format advances to version3, so existing version2 mappings safely miss once; retained native artifacts are not deleted. Current normal-CLI H3 and Eval qualification on the previous installed candidate remains separately recorded and is not represented as this new source's live qualification. No live environment was changed by this PR.
