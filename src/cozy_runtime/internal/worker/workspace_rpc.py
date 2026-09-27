@@ -136,8 +136,8 @@ class WorkspaceRPC:
             def guard() -> None:
                 if not context.is_active():
                     raise WorkspaceRefusal("ordinary artifact read was canceled")
-                service.authorize(request.claim)
 
+            # One proof per stream: the held closure cannot change under the lease.
             owner = service.authorize(request.claim)
             with (
                 service.workspace.authorized(guard),
