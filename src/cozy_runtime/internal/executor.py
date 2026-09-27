@@ -548,11 +548,12 @@ class Executor:
         self.load_parked: list[str] = []
         #: follower only: the attempt spool and allocator bytes at its first mirrored call
         self._run_entry: tuple[Path, int] | None = None
-        #: follower only: the attention its processors held at that first call
+        #: follower only: the attention its processors held at that first call, and its kernels
         self._run_attention = ""
+        self._run_served: tuple[str, ...] = ()
         #: HOST ONLY: this process's start, for the execution record (wall ms and its legs)
         self.boot: dict[str, Any] = {}
-        #: HOST ONLY: this rank's pid, host ordinal and GPU uuid, read once after device init
+        #: HOST ONLY: this rank's pid, host ordinal, GPU uuid and arch, read once after device init
         self._identity: dict[str, Any] | None = None
         #: THIS process's rank in its generation's group and the group's size (cr-068). A
         #: plain executor is rank 0 of a world of 1 and forms nothing; rank 0 of a wider
@@ -706,7 +707,10 @@ class Executor:
                 start_us,
                 end_us,
                 execution_evidence.attention(
-                    pin, execution_evidence.observed(choices.hosts) if choices else "", impl
+                    pin,
+                    execution_evidence.observed(choices.hosts) if choices else "",
+                    impl,
+                    attention.evidence(choices.totals() if choices else ()),
                 ),
             )
         ]
@@ -817,11 +821,11 @@ class Executor:
             if self._run_entry is None or self._run_entry[0] != spool:
                 accel.reset_peak(self.torch, self.device_kind)
                 self._run_entry = (spool, accel.allocated(self.torch, self.device_kind))
-                self._run_attention = execution_evidence.observed(
-                    attention.observed(
-                        {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
-                    ).hosts
+                held = attention.observed(
+                    {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
                 )
+                self._run_attention = execution_evidence.observed(held.hosts)
+                self._run_served = tuple(held.totals())
             scopes = command["scopes"]
             if not isinstance(scopes, list) or not 1 <= len(scopes) <= len(models):
                 raise GroupRefusal("mirrored scope set is not a bounded prepared model set")
@@ -928,7 +932,9 @@ class Executor:
                 started_us,
                 execution_evidence.now_us(),
                 execution_evidence.attention(
-                    observed=self._run_attention, impl=attention.implementations(served)
+                    observed=self._run_attention,
+                    impl=attention.implementations(served),
+                    probed=attention.evidence(self._run_served),
                 ),
             ),
         }
@@ -3395,7 +3401,8 @@ class Executor:
             self._attention_snapshot(), roots, pin
         ):
             return None
-        return attention.plan(self._attention_device(pin), roots, pin, self.world)
+        with attention.measuring("request"):
+            return attention.plan(self._attention_device(pin), roots, pin, self.world)
 
     def _agree_attention(self, applied: attention.Applied) -> dict[str, Any] | None:
         """THE GROUP SERVES RANK 0'S PREPARED SELECTION. Each rank selected beside rank 0

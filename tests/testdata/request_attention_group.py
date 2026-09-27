@@ -24,9 +24,10 @@ from cozy_runtime.author import Config
 DEVICES = "cpu0,cpu1"
 
 
-def ranks(execution: dict[str, Any]) -> dict[int, dict[str, str]]:
-    """rank -> requested, observed and dispatched attention, from the execution record."""
-    return {row["rank"]: row["attention"] for row in execution["ranks"]}
+def ranks(execution: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """rank -> requested, observed and dispatched attention with its probes, and the rank's
+    device arch, from the execution record."""
+    return {row["rank"]: {**row["attention"], "arch": row["arch"]} for row in execution["ranks"]}
 
 
 def _serve(driver: Any, root: Path, key: str, name: str, pin: str) -> dict[str, Any]:

@@ -3,15 +3,22 @@
 ONE shape, shared by the attempt's triage `measurements.execution.ranks`, the attention
 observation and the GPU scheduler's enter/exit events. Fields are added, never changed:
 
-    {"rank": int, "pid": int, "ordinal": int, "uuid": str, "start_us": int, "end_us": int,
-     "attention": {"requested": str, "observed": str, "impl": str}}
+    {"rank": int, "pid": int, "ordinal": int, "uuid": str, "arch": str,
+     "start_us": int, "end_us": int,
+     "attention": {"requested": str, "observed": str, "impl": str,
+                   "probes"?: [probe], "skipped"?: [probe]}}
+    probe = {"kernel": str, "status": str, "source": str, "shape": [int],
+             "rel_l2_by_rows": {group: float}, "budget": float, "budget_state": str}
 
-`ordinal` is the host CUDA ordinal (-1 without one), `uuid` the NVML `GPU-…` identity ("" off
-CUDA). `start_us`/`end_us` are wall-clock unix MICROseconds bounding the rank's work for the
-attempt, 0 for a rank that did none: nanoseconds since the epoch exceed the ±2^53 integer range
-canonical JSON (and every JSON reader) admits. `attention.requested` is the request's pin
-("" = automatic), `observed` what the rank's processors held, in the pin grammar, and `impl`
-the kernel implementation under that backend when one was observed.
+`ordinal` is the host CUDA ordinal (-1 without one), `uuid` the NVML `GPU-…` identity and
+`arch` its `sm_XY` ("" off CUDA). `start_us`/`end_us` are wall-clock unix MICROseconds bounding
+the rank's work for the attempt, 0 for a rank that did none: nanoseconds since the epoch exceed
+the ±2^53 integer range canonical JSON (and every JSON reader) admits. `attention.requested` is
+the request's pin ("" = automatic), `observed` what the rank's processors held, in the pin
+grammar, and `impl` the kernel implementation under that backend when one was observed.
+`probes` is the rank's numeric probe of each kernel it served, `skipped` each kernel its probe
+refused (`status` the refusal code); `source` is when it was measured (warm, prepare, request)
+and `budget_state` whether `budget` was calibrated on this architecture.
 """
 
 from __future__ import annotations
@@ -23,19 +30,26 @@ from typing import Any
 
 
 def identity(torch: Any, cuda: bool, local: int, sealed: Sequence[str]) -> dict[str, Any]:
-    """This process's `pid`, host `ordinal` and `uuid` for device `local` of its seal."""
+    """This process's `pid`, host `ordinal`, `uuid` and `arch` for device `local` of its seal."""
     if not cuda:
-        return {"pid": os.getpid(), "ordinal": -1, "uuid": ""}
+        return {"pid": os.getpid(), "ordinal": -1, "uuid": "", "arch": ""}
     entry = sealed[local] if local < len(sealed) else str(local)
     try:
-        uuid = f"GPU-{torch.cuda.get_device_properties(local).uuid}"
+        properties = torch.cuda.get_device_properties(local)
+        uuid, arch = f"GPU-{properties.uuid}", f"sm_{properties.major}{properties.minor}"
     except Exception:  # identity is observation: it never fails the attempt
-        uuid = ""
-    return {"pid": os.getpid(), "ordinal": int(entry) if entry.isdigit() else -1, "uuid": uuid}
+        uuid, arch = "", ""
+    ordinal = int(entry) if entry.isdigit() else -1
+    return {"pid": os.getpid(), "ordinal": ordinal, "uuid": uuid, "arch": arch}
 
 
-def attention(requested: str = "", observed: str = "", impl: str = "") -> dict[str, str]:
-    return {"requested": requested, "observed": observed, "impl": impl}
+def attention(
+    requested: str = "",
+    observed: str = "",
+    impl: str = "",
+    probed: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {"requested": requested, "observed": observed, "impl": impl, **(probed or {})}
 
 
 def observed(hosts: Mapping[str, Mapping[str, int]]) -> str:
@@ -72,6 +86,7 @@ def record(
         "pid": int(who.get("pid", 0)),
         "ordinal": int(who.get("ordinal", -1)),
         "uuid": str(who.get("uuid", "")),
+        "arch": str(who.get("arch", "")),
         "start_us": start_us,
         "end_us": end_us,
         "attention": dict(seen or attention()),
