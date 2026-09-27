@@ -57,6 +57,8 @@ class Candidate:
     sms: frozenset[int] = frozenset()
     head_dims: frozenset[int] = frozenset()
     import_name: str = ""
+    #: SMs where `rel_l2_max` is provisional: no probe has measured it on that hardware yet.
+    uncalibrated: frozenset[int] = frozenset()
 
 
 _HALF = frozenset({"bfloat16", "float16"})
@@ -109,6 +111,26 @@ PINNABLE: tuple[Candidate, ...] = (
         ),
     ),
     Candidate(
+        name="flash-attn4-fp8",
+        backend="_cozy_flash_attn4_fp8",
+        local=upstream.FA4_FP8,
+        min_sm=100,
+        max_sm=103,
+        sms=frozenset({100, 103}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        distribution="flash-attn-4",
+        import_name="flash_attn.cute",
+        jit=True,
+        rel_l2_max=6e-2,
+        uncalibrated=frozenset({100, 103}),
+        why=(
+            "Explicit experiment: FA4's SM100-only e4m3 forward with per-head descales. "
+            "Hopper's 0.31 (h3a-044) is its FP8 MMA accumulator; Blackwell accumulates in "
+            "FP32, so the dequantised-input control (0.027) is the expectation. Unmeasured."
+        ),
+    ),
+    Candidate(
         name="flash-attn4",
         backend="_cozy_flash_attn4",
         local=upstream.FA4,
@@ -138,17 +160,20 @@ PINNABLE: tuple[Candidate, ...] = (
     ),
     Candidate(
         name="sageattention",
-        backend="_cozy_sage_sm90",
+        backend="_cozy_sage_int8_fp8",
         local=upstream.SAGE,
-        min_sm=90,
+        min_sm=89,
         dtypes=_HALF,
         max_head_dim=128,
-        max_sm=90,
+        max_sm=120,
+        sms=frozenset({89, 90, 120}),
         distribution="sageattention",
         rel_l2_max=1e-1,
+        uncalibrated=frozenset({89, 120}),
         why=(
             "Explicit experiment: INT8 Q/K + FP8 P/V, 0.0096-0.066 rel L2 on H3 Q/K/V "
-            "(h3a-044); 801.2 s versus BF16 907.1 s for 15 s video; matched clips differ."
+            "(h3a-044); 801.2 s versus BF16 907.1 s for 15 s video; matched clips differ. "
+            "SM89/SM120 run upstream's SM89 kernel: 0.038 rel L2 standalone on SM120 (h3a-022)."
         ),
     ),
     Candidate(
@@ -173,12 +198,13 @@ PINNABLE: tuple[Candidate, ...] = (
         backend="_cozy_kitchen_int8",
         local=upstream.KITCHEN,
         min_sm=90,
-        max_sm=103,
-        sms=frozenset({90, 100, 103}),
+        max_sm=121,
+        sms=frozenset(major * 10 + minor for major, minor in upstream.KITCHEN_SMS),
         dtypes=_HALF,
         max_head_dim=256,
         distribution="comfy-kitchen",
         rel_l2_max=5e-2,
+        uncalibrated=frozenset({100, 103, 120, 121}),
         why="Explicit dense INT8 experiment; 0.014 rel L2 to FA3 on H3 Q/K/V (h3a-060).",
     ),
     Candidate(
@@ -193,8 +219,29 @@ PINNABLE: tuple[Candidate, ...] = (
         head_dims=frozenset({128}),
         distribution="flashinfer-python",
         import_name="flashinfer",
+        jit=True,
         rel_l2_max=2e-1,
+        uncalibrated=frozenset({100, 103}),
         why="Explicit BF16 Q/K + FP8 P/V experiment; H3 qualification pending (h3a-060).",
+    ),
+    Candidate(
+        name="sageattention3-fp4",
+        backend="_cozy_sage3_fp4",
+        local=upstream.SAGE3,
+        min_sm=120,
+        max_sm=120,
+        sms=frozenset({120}),
+        dtypes=_HALF,
+        max_head_dim=128,
+        head_dims=frozenset({64, 128}),
+        distribution="sageattn3",
+        rel_l2_max=2e-1,
+        uncalibrated=frozenset({120}),
+        why=(
+            "Explicit FP4 experiment, consumer Blackwell only upstream. Standalone on an RTX "
+            "PRO 6000 at H3 geometry: 0.145 rel L2 to FP32, 704 TF/s, 0.98x H100 FA3 BF16 "
+            "(h3a-022)."
+        ),
     ),
     Candidate(
         name="sol-attn",
@@ -348,8 +395,27 @@ def _snapshot_archs(candidate: Candidate) -> dict[str, list[str]]:
     }
 
 
+def _site_archs(candidate: Candidate) -> dict[str, list[str]]:
+    """What the bake gate proved the kernel site's build of this candidate carries, only when
+    the distribution this process imports IS the site's: a package's own copy says nothing
+    here. A source (`jit`) kernel carries no device code to declare."""
+    declared = kernel_site.arches(candidate.name)
+    if candidate.jit or not candidate.distribution or not declared:
+        return {}
+    try:
+        location = Path(str(metadata.distribution(candidate.distribution).locate_file("")))
+    except metadata.PackageNotFoundError:
+        return {}
+    site = Path(kernel_site.current().path)
+    return {"kernel site": declared} if location.resolve() == site.resolve() else {}
+
+
+def _baked_archs(candidate: Candidate) -> dict[str, list[str]]:
+    return _snapshot_archs(candidate) or _site_archs(candidate)
+
+
 def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: DeviceFacts) -> None:
-    """Refuse a card that none of these snapshot variants has device code for."""
+    """Refuse a card that none of these baked builds has device code for."""
     if candidate.jit:
         # NOTHING TO READ, so nothing is checked here and the static `max_sm` on the row is
         # the whole ceiling. A source snapshot declares no architectures because it carries
@@ -477,6 +543,7 @@ def _computes(entry: Ready, device: DeviceFacts) -> dict[str, Any] | None:
         "rel_l2_to_exact": disagreement,
         "rounding_floor": floor,
         "rel_l2_max": entry.candidate.rel_l2_max,
+        **({"budget": "uncalibrated"} if device.sm in entry.candidate.uncalibrated else {}),
         "impl": impl,
     }
 
@@ -647,7 +714,7 @@ def _snapshot_artifact(location: str) -> dict[str, Any]:
 
 def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     """One candidate, proven present here AND proven to compute, or a typed refusal."""
-    _admit_arch(candidate, _snapshot_archs(candidate), device)
+    _admit_arch(candidate, _baked_archs(candidate), device)
     registry = _registry()
     module = _import(candidate) if candidate.distribution else None
     location, artifact = "", None
@@ -1045,7 +1112,7 @@ def _eligible(
     if _device_admits(candidate, device) or not _admits(candidate, dtype, head_dim):
         return False
     try:
-        _admit_arch(candidate, _snapshot_archs(candidate), device)
+        _admit_arch(candidate, _baked_archs(candidate), device)
         if candidate.distribution:
             metadata.version(candidate.distribution)
         member = _member(candidate)
@@ -1428,6 +1495,7 @@ def capabilities(device: DeviceFacts) -> dict[str, Any]:
             "dtypes": sorted(candidate.dtypes),
             "max_head_dim": candidate.max_head_dim,
             "rel_l2_max": candidate.rel_l2_max,
+            **({"budget": "uncalibrated"} if device.sm in candidate.uncalibrated else {}),
         }
         unsupported = _device_admits(candidate, device)
         if unsupported:

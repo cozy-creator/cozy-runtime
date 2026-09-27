@@ -228,10 +228,18 @@ def test_registration_is_idempotent_local_and_dispatches_real_cpu_attention() ->
 
 
 def test_new_approximate_backends_remain_explicit_and_architecture_exact() -> None:
-    for name, sms in [("kitchen-int8", {90, 100, 103}), ("flashinfer-bf16-fp8", {100, 103})]:
+    for name, sms in [
+        ("kitchen-int8", {90, 100, 103, 120, 121}),
+        ("flashinfer-bf16-fp8", {100, 103}),
+        ("flash-attn4-fp8", {100, 103}),
+        ("sageattention3-fp4", {120}),
+        ("sageattention", {89, 90, 120}),
+    ]:
         candidate = attention.BY_NAME[name]
         assert candidate in attention.PINNABLE and candidate not in attention.CANDIDATES
         assert candidate.sms == sms
+        # A Blackwell budget nobody has measured says so in every admission it appears in.
+        assert candidate.uncalibrated & {100, 103, 120, 121} == sms & {100, 103, 120, 121}
     assert not attention._admits(attention.BY_NAME["flashinfer-bf16-fp8"], "bfloat16", 64)
     assert attention._admits(attention.BY_NAME["flashinfer-bf16-fp8"], "bfloat16", 128)
 
