@@ -110,7 +110,9 @@ def test_gpu_execution_policy_changes_keys_without_capacity_or_diagnostic_noise(
     )
     assert key(HostFacts(backend="cpu")) != first
     assert key(replace(device, gpu_sm=90)) != first
-    assert key(replace(device, driver_version="590.1")) != first
+    # A provider's host driver update is not a numerical change.
+    assert key(replace(device, driver_version="590.1")) == first
+    assert key(replace(device, driver_version="")) == first
     assert key(NVIDIA_TF32_OVERRIDE="0") != first
     assert key(CUBLAS_WORKSPACE_CONFIG=":4096:8") != first
     assert key(threads=1) != first
