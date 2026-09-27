@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import fill, weights_writer
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 from cozy_runtime.internal.worker import derived_retention
 from cozy_runtime.protocol import documents
@@ -743,7 +743,7 @@ class Workspace:
         declaration = intent.tensorfs_declaration_canonical_bytes
         if (
             not declaration
-            or len(declaration) > 16 << 20
+            or len(declaration) > weights_writer.declaration_bound()
             or hashlib.sha256(declaration).digest() != intent.tensorfs_declaration_digest
             or _ID.fullmatch(intent.output_slot) is None
             or intent.weights_transaction_id

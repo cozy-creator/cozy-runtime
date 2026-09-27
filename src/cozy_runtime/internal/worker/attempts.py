@@ -46,7 +46,15 @@ from typing import Any, cast
 from cozy_runtime.author import _codec
 from cozy_runtime.author._errors import DEVICE_OOM, OutputError
 from cozy_runtime.author._observations import EventRing, Observation
-from cozy_runtime.internal import canonical, fill, liveness, output_budget, package_interface, seam
+from cozy_runtime.internal import (
+    canonical,
+    fill,
+    liveness,
+    output_budget,
+    package_interface,
+    seam,
+    weights_writer,
+)
 from cozy_runtime.internal import weights_sink as weights_bridge
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
@@ -122,7 +130,7 @@ UNVERIFIABLE = (
 def weights_exchange_bytes(spool: Path, output_slot: str, kind: str, expected_length: int) -> bytes:
     """Read one worker-chosen immutable spool file; the child never supplies a path."""
     cap = (
-        weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
+        weights_writer.declaration_bound()
         if kind == "declaration"
         else weights_limits.MAX_WEIGHTS_RECEIPT_BYTES
     )

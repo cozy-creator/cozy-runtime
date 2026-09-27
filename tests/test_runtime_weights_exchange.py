@@ -518,6 +518,9 @@ def test_restored_native_checkpoint_is_validated_before_writer_adoption(
         return
     verdict = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
     assert verdict.valid and verdict.checkpoint == checkpoint
+    # Omitted bytes name the journaled declaration by its digest, whatever its size.
+    by_reference = pb.ValidateWeightsCheckpointRequest(intent=request.intent)
+    assert rig.preparation.ValidateWeightsCheckpoint(by_reference, timeout=WAIT).valid
     assert rig.store.derived_lookup(TRANSACTION)["state"] == "absent"
     assert not rig.exchange.writer_broker.bindings
     for mutation in ("counter", "declaration", "scope"):
