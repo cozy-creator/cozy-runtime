@@ -19,6 +19,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from cozy_runtime.author._assets import Asset
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import AXES, Shape
 from cozy_runtime.author._walker import Node, field_values, value_domain, walk
@@ -116,6 +117,10 @@ def normalize(payload: object) -> RequestFeatures:
         shape = node.marker(Shape)
         if shape is not None and value is not None:
             values.update(shape.resolve(value))
+        if isinstance(value, (list, tuple)) and any(isinstance(item, Asset) for item in value):
+            # Each listed input (a reference image, a clip) adds tokens and memory, so
+            # their count is a demand axis: 1 and 10 references are different cells.
+            values["assets"] = values.get("assets", 0) + len(value)
     if "pixels" not in values and "width" in values and "height" in values:
         values["pixels"] = values["width"] * values["height"]
     canonical = json.dumps(dict(sorted(values.items())), separators=(",", ":"))

@@ -21,7 +21,7 @@ K = TypeVar("K")
 
 #: The complete demand-axis vocabulary. A `Shape` cannot name anything else — the kwarg
 #: names ARE the axes, so an underivable axis is unspellable rather than unchecked (§1.2).
-AXES: tuple[str, ...] = ("width", "height", "pixels", "frames", "steps")
+AXES: tuple[str, ...] = ("width", "height", "pixels", "frames", "steps", "assets")
 
 
 class _Marker:
