@@ -162,6 +162,21 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "credential-unwritable container cgroup cannot supply a delegated child subtree",
     ),
     ProjectedVar(
+        "COZY_KERNEL_CACHE",
+        "config.kernel_cache",
+        "this executor's uid namespace of the machine kernel store (h3a-087): compiled "
+        "Runtime-served kernel objects keyed by every compile input, kept across worker "
+        "boots, package versions and Runtime updates. A location, not a switch: unset, a "
+        "kernel compiles in-process exactly as it would with an empty store",
+    ),
+    ProjectedVar(
+        "COZY_KERNEL_CACHE_TRUSTED",
+        "config.kernel_cache",
+        "the worker's own namespace of the same store, read-only to an isolated executor, "
+        "so objects the Runtime built are shared without any placement writing where "
+        "another placement reads",
+    ),
+    ProjectedVar(
         FILL_FORENSICS_DIR,
         "config.fill_forensics_dir",
         "where the fill plane writes its per-boundary memory captures. The FILL runs in "

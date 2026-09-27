@@ -1025,6 +1025,7 @@ class Worker:
             executor_uid=options.executor_uid,
             executor_gid=options.executor_gid,
             jit_pod_scope=self.fence.worker_boot_id,
+            kernel_cache=config.kernel_cache,
         )
         # ExecutorSupervision already holds the process-lifetime worker-root lease.
         # Restore only under that lease so two processes cannot allocate one stream.
@@ -1340,6 +1341,7 @@ class Worker:
             executor_uid=self._slot_executor_uid(placement_id),
             executor_gid=self.options.executor_gid,
             jit_pod_scope=f"{self.fence.worker_boot_id}-{key}",
+            kernel_cache=self.config.kernel_cache,
         )
         supervision.on_invalidate = lambda why: self._hosted_capacity_dropped(placement_id, why)
         supervision.on_exit = lambda executor: self._hosted_executor_exited(placement_id, executor)
@@ -1896,6 +1898,7 @@ class Worker:
             executor_uid=self._slot_executor_uid("prepare"),
             executor_gid=self.options.executor_gid,
             jit_pod_scope=f"{self.fence.worker_boot_id}-prepare",
+            kernel_cache=self.config.kernel_cache,
         )
         supervision.on_lane_failure = self.fail_machine
         killed = supervision.sweep_orphans()
@@ -5404,6 +5407,7 @@ class Worker:
             executor_uid=self._slot_executor_uid("orchestration"),
             executor_gid=self.options.executor_gid,
             jit_pod_scope=f"{self.fence.worker_boot_id}-orchestration",
+            kernel_cache=self.config.kernel_cache,
         )
         supervision.on_change = lambda executor: self.lanes.orchestration.row(
             ""

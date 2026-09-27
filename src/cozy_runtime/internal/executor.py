@@ -2940,6 +2940,7 @@ class Executor:
         served_attention: attention.Applied | None = None
         sol_counts: dict[str, int] = {}
         sol_rank_counts: dict[int, dict[str, int]] = {}
+        sol_kernels: list[dict[str, Any]] = []
         served_impls: dict[str, set[str]] = {}
         capture = None
         capture_result: dict[str, Any] | None = None
@@ -2950,7 +2951,7 @@ class Executor:
                     self._attention_snapshot(), self._attention_roots(), swap, pin
                 ) as served_attention,
                 self._ranks_attention(pin, served_attention),
-                attention_sol.observing(ranks=sol_rank_counts) as sol_counts,
+                attention_sol.observing(ranks=sol_rank_counts, kernels=sol_kernels) as sol_counts,
                 attention_ulysses.observing() as served_impls,
             ):
                 capture = self._capture_session(command, surface)
@@ -3008,6 +3009,13 @@ class Executor:
                         world=self.world,
                         **counts,
                     )
+            # Where this request's Sol kernel came from (h3a-087): loaded from the machine
+            # store, waited for behind a builder, or compiled here, and how long each took.
+            for row in sol_kernels:
+                fields = dict(row)
+                record.emit(
+                    "confession", "attention.sol.kernel", fields.pop("source"), rank=0, **fields
+                )
         self._emit_attention(
             record, attention.observed(self._attention_roots()), "attention.restored"
         )

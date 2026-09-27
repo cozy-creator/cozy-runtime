@@ -46,6 +46,12 @@ class Layout:
         return self._at("var/lib/cozy/dependencies")
 
     @property
+    def kernel_cache(self) -> Path:
+        """Compiled kernel objects keyed by every compile input (`internal/kernel_cache.py`):
+        persistent machine state, unlike the per-boot JIT scopes under `run/cozy`."""
+        return self._at("var/lib/cozy/kernels")
+
+    @property
     def media_root(self) -> Path:
         return self._at("var/lib/cozy/media")
 

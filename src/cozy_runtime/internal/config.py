@@ -108,6 +108,10 @@ class RuntimeConfig:
     python_root: Path | None = None
     """Host-owned interpreter cache override; local roles share cozy_home/python."""
 
+    kernel_cache: Path | None = None
+    """The machine's persistent compiled-kernel store (`internal/kernel_cache.py`); none
+    outside a rooted worker, where kernels compile in-process as before."""
+
     @property
     def managed_python_root(self) -> Path:
         return self.python_root or self.cozy_home / "python"
@@ -559,6 +563,7 @@ def runtime_config_from_host(host: WorkerHostConfig) -> RuntimeConfig:
         object_storage_hosts=host.object_storage_hosts,
         dependency_cache=host.layout.dependency_cache,
         python_root=host.layout.install_root / "python",
+        kernel_cache=host.layout.kernel_cache,
     )
 
 
