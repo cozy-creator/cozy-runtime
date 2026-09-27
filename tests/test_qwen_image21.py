@@ -137,8 +137,10 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Pat
     }
     rebuilt = build_processor(processor_bundle)
     assert rebuilt.tokenizer.encode("blue jacket") == processor.tokenizer.encode("blue jacket")
+    extended = build_processor(dict(processor_bundle, added_by_a_newer_ingester=True))
+    assert extended.tokenizer.encode("blue jacket") == processor.tokenizer.encode("blue jacket")
     for invalid in (
-        dict(processor_bundle, unexpected=True),
+        {key: value for key, value in processor_bundle.items() if key != "chat_template"},
         dict(processor_bundle, tokenizer="invalid"),
         dict(
             processor_bundle,
@@ -187,6 +189,17 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Pat
         generator=torch.Generator().manual_seed(44),
         output_type="pt",
     ).images
+    # Without the prefix KV cache (a card too small to hold it) the image is the same.
+    uncached = pipe(
+        prompt="a person in a blue jacket",
+        width=32,
+        height=32,
+        num_inference_steps=2,
+        generator=torch.Generator().manual_seed(44),
+        output_type="pt",
+        use_kv_cache=False,
+    ).images
+    torch.testing.assert_close(uncached, expected, rtol=0, atol=0)
     actual = (actual / 2 + 0.5).clamp(0, 1)
     assert actual.shape == (1, 4, 32, 32)
     assert torch.isfinite(actual).all()
