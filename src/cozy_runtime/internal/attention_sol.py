@@ -230,10 +230,11 @@ _KEYS: dict[tuple[int, int], str] = {}
 _CONSIDERED: set[tuple[int, int]] = set()
 _BUILDERS: dict[tuple[int, int], _Builder] = {}
 _PINNED: list[bool] = []
-#: The builder is `kernel_compile.main` under this process's own import path, isolated from
-#: the environment's startup hooks.
+#: The builder is `kernel_compile.main` under this process's own import path and bytecode
+#: cache (`-I` drops the PYTHON* variables that carried the latter).
 _BUILDER_BOOT = (
-    "import json, sys; sys.path[:] = json.loads(sys.argv.pop(1)); "
+    "import json, sys; boot = json.loads(sys.argv.pop(1)); sys.path[:] = boot['path']; "
+    "sys.pycache_prefix = boot['pycache_prefix']; "
     "from cozy_runtime.internal.kernel_compile import main; raise SystemExit(main(sys.argv[1:]))"
 )
 
@@ -320,7 +321,7 @@ def builder_command(
         "-I",
         "-c",
         _BUILDER_BOOT,
-        json.dumps(sys.path),
+        json.dumps({"path": sys.path, "pycache_prefix": sys.pycache_prefix}),
         "--tokens",
         str(tokens),
         "--kv-splits",
