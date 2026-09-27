@@ -1736,7 +1736,7 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
     except author.ConformanceError as exc:
         reader.refuse(module, module.tree.body[0] if module.tree.body else call, str(exc))
     try:
-        defaults, weights = declarations(module.source.encode())
+        defaults, weights, accelerator = declarations(module.source.encode())
     except (ValueError, TypeError) as exc:
         reader.refuse(module, fn, f"invalid script metadata: {exc}")
     models: list[dict[str, Json]] = []
@@ -1833,4 +1833,5 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         assets=None,
         publishes=False,
         weights_outputs=weights,
+        accelerator=accelerator,
     )

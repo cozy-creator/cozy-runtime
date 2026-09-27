@@ -2536,7 +2536,7 @@ class Worker:
                 lane.work.put(ExecutorDeath(executor, placement_id, granted=True))
 
     def _cpu_job(self, job: pb.JobDirective) -> bool:
-        """An orchestration job that declares no device, Model or weights holds no GPU."""
+        """An orchestration job granted no device holds no GPU (`machine_slots.admits`)."""
         if not job.orchestration:
             return False
         binding = JobBinding.read(
@@ -2547,13 +2547,7 @@ class Worker:
             )
         )
         declaration = self.engine._job_declaration(binding, binding.job_descriptor_id)
-        return not (
-            job.device_count
-            or job.resource_caps.device_required
-            or job.resource_caps.max_device_memory_bytes
-            or declaration.get("models")
-            or declaration.get("weights_outputs")
-        )
+        return machine_slots.admits(job, declaration)
 
     def _failed_execution_binding(self, attempt: AttemptRecord) -> str | None:
         """A known construction refusal is terminal before waiting for a GPU seat.
