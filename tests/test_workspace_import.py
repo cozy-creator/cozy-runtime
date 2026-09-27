@@ -351,7 +351,7 @@ def test_running_writer_is_fenced_and_its_partial_checkpoint_resumes(tmp_path: P
     invocation = documents.canonical_bytes(
         pb.InvocationSpec(
             job=pb.JobInvocationSpec(
-                build_id="sha256:" + "22" * 32, job_descriptor_id="sha256:" + "33" * 32
+                installation_id="local-" + "22" * 16, job_descriptor_id="sha256:" + "33" * 32
             )
         )
     )

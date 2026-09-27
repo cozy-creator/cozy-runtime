@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,6 @@ from cozy_runtime.internal.encoding import SPEC_PLAIN
 from cozy_runtime.internal.local import (
     LOCAL_PLACEMENT,
     LocalRequest,
-    development_source_digest,
     run_slice,
 )
 from cozy_runtime.internal.weights_sink import weights_transaction_id
@@ -172,7 +172,7 @@ def main() -> None:
     )
     found = discover(PACKAGE)
     body = package_interface.build(found)
-    digest = development_source_digest(PACKAGE)
+    installation_id = "local-" + uuid.uuid4().hex
 
     def pin_devices(owner: Any, _worker: Any) -> None:
         original = owner._desired_state
@@ -191,13 +191,12 @@ def main() -> None:
             config,
             LocalRequest("generate", {"value": 1}, outputs=(), request_id="h3a093"),
             workspace=root / "run",
-            package_code_digest=digest,
+            package_installation_id=installation_id,
             package_interface_document=body,
             project=PACKAGE,
             development_tensorfs_root=store,
             options=WorkerOptions(
                 root=root / "run" / "worker",
-                release_id=digest,
                 devices=",".join(str(i) for i in range(args.degree)),
                 accelerator_backend="cuda",
                 executor_uid=65533,

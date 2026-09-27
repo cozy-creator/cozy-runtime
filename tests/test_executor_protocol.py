@@ -57,7 +57,8 @@ raise SystemExit(executor.main(sys.argv[1:]))
         if accepted:
             require_executor_protocol(hello)
             channel.send({"cmd": "shutdown"})
-            assert channel.recv(timeout=15)["ok"]
+            shutdown = channel.recv(timeout=15)
+            assert shutdown is not None and shutdown["ok"]
         else:
             with pytest.raises(ExecutorProtocolMismatch):
                 require_executor_protocol(hello)
@@ -81,6 +82,6 @@ def test_protocol_rejects_malformed_or_unreviewed_hello() -> None:
             require_executor_protocol(
                 {"executor_protocol_revision": revision, "runtime_version": "0.18.33"}
             )
-    for version in ("", "unknown", "0.18.32", "0.18.34"):
+    for version in ("", "unknown", "0.18.29", "0.18.34"):
         with pytest.raises(ExecutorProtocolMismatch):
             require_executor_protocol({"runtime_version": version})

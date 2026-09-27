@@ -69,7 +69,7 @@ def test_base_model_without_overlay_stays_pristine() -> None:
 
 
 def test_model_without_composer_refuses_typed() -> None:
-    model = Model.for_test()
+    model: Model[object] = Model.for_test()
     with pytest.raises(CapabilityError, match="adapter_composition_unsupported"):
         model.prepare_adapters((adapter("a", 0.5),))
 

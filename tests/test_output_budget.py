@@ -136,7 +136,6 @@ def test_native_file_commit_uses_the_recorded_parent_budget(
         }
         intent = canonical_json.encode(
             {
-                "interface_digest": source_interfaces.DIGEST,
                 "module": source_interfaces.MODULE,
                 "export": "commit_file",
                 "request": arguments,
@@ -150,7 +149,6 @@ def test_native_file_commit_uses_the_recorded_parent_budget(
                 parent_attempt_ordinal=1,
                 parent_invocation_spec_digest=digest,
                 call_index=index,
-                interface_digest=documents.raw(source_interfaces.DIGEST),
                 module=source_interfaces.MODULE,
                 export="commit_file",
                 request_canonical_bytes=canonical_json.encode(arguments),
@@ -180,7 +178,9 @@ def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_pat
         job=None,
         spec=spec_for(7, 11),
         trees={},
-        declared=SimpleNamespace(entrypoint="report", max_input_bytes=64 << 20),
+        declared=SimpleNamespace(
+            entrypoint="report", max_input_bytes=64 << 20, construction_key=lambda: "report"
+        ),
         plan=SimpleNamespace(placement="cpu", headroom_bytes=0, scope_headroom_bytes={}),
     )
     command = AttemptEngine._command(

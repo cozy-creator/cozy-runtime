@@ -15,7 +15,11 @@ from test_workspace_memo import completed
 def test_scalar_ack_retires_execution_bodies_without_erasing_memo_result(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     invocation, spec = documents.identity(
-        pb.InvocationSpec(job=pb.JobInvocationSpec(build_id="11" * 32, job_descriptor_id="12" * 32))
+        pb.InvocationSpec(
+            job=pb.JobInvocationSpec(
+                installation_id="local-" + "11" * 16, job_descriptor_id="12" * 32
+            )
+        )
     )
     workspace.accept(
         "owner",

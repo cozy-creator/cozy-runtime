@@ -8,6 +8,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -23,7 +24,6 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import (
     LocalRecordOwner,
     LocalRequest,
-    development_source_digest,
     run_slice,
 )
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -191,7 +191,7 @@ def main() -> None:
             capture=ActivationCapture(("alpha", "zeta"), (0, 2)) if args.capture else None,
         ),
         workspace=root / key,
-        package_code_digest=development_source_digest(project),
+        package_installation_id="local-" + uuid.uuid4().hex,
         package_interface_document=interface,
         project=project,
         development_tensorfs_root=root / "tensorfs",

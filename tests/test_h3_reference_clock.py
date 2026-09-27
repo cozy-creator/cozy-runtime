@@ -63,5 +63,6 @@ def test_a_soundtrack_off_the_sample_grid_snaps_to_the_nearest_sample() -> None:
     )
     video = _video(tuple(range(24)), (1,) * 24, soundtrack=audio)
     aligned = _aligned_soundtrack(video)
+    assert aligned is not None
     assert tuple(aligned.shape) == (1, rate)
     assert float(aligned[0, 0]) == 0.0 and float(aligned[0, -1]) == rate - 1

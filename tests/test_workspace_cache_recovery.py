@@ -67,7 +67,7 @@ def native_outputs(
     invocation = documents.canonical_bytes(
         pb.InvocationSpec(
             job=pb.JobInvocationSpec(
-                build_id="sha256:" + "11" * 32, job_descriptor_id="sha256:" + "12" * 32
+                installation_id="local-" + "11" * 16, job_descriptor_id="sha256:" + "12" * 32
             ),
             outputs=[
                 {
@@ -300,7 +300,7 @@ def scalar(
     raw = documents.canonical_bytes(
         pb.InvocationSpec(
             job=pb.JobInvocationSpec(
-                build_id="sha256:" + "11" * 32, job_descriptor_id="sha256:" + "12" * 32
+                installation_id="local-" + "11" * 16, job_descriptor_id="sha256:" + "12" * 32
             )
         )
     )

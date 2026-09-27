@@ -53,7 +53,7 @@ else:
 left, right = socket.socketpair()
 with left, right:
     _send_reply(Channel(left), {
-        "reply": "prepare", "ok": False, "code": "warm_failed", "detail": detail,
+        "reply": "load", "ok": False, "code": "warm_failed", "detail": detail,
         "traceback": trace, "envelope": "x" * 100000,
     })
     reply = Channel(right).recv(timeout=2)
