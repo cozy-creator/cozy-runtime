@@ -12,13 +12,14 @@ import pytest
 import tensorfs
 
 from cozy_runtime.internal.weights_sink import weights_transaction_id
+from cozy_runtime.internal.worker import workspace_finalize, workspace_memo
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
-def accepted(workspace: Workspace, request: str, *, memoize: bool = True) -> tuple[bytes, str]:
-    raw = documents.canonical_bytes(
+def spec_bytes() -> bytes:
+    return documents.canonical_bytes(
         pb.InvocationSpec(
             outputs=[
                 pb.OutputBinding(
@@ -33,6 +34,10 @@ def accepted(workspace: Workspace, request: str, *, memoize: bool = True) -> tup
             ),
         )
     )
+
+
+def accepted(workspace: Workspace, request: str, *, memoize: bool = True) -> tuple[bytes, str]:
+    raw = spec_bytes()
     spec = hashlib.sha256(raw).digest()
     workspace.accept(
         "owner",
@@ -61,13 +66,18 @@ def intent(
     )
 
 
-def failed(workspace: Workspace, request: str, spec: bytes) -> None:
+def failed(
+    workspace: Workspace,
+    request: str,
+    spec: bytes,
+    status: pb.OutcomeStatus = pb.OUTCOME_STATUS_FAILED,
+) -> pb.AttemptOutcomeAck:
     body = documents.canonical_bytes(
         pb.AttemptOutcomeBody(
             request_id=request,
             attempt_ordinal=1,
             invocation_spec_digest=documents.spell(spec),
-            status=pb.OUTCOME_STATUS_FAILED,
+            status=status,
         )
     )
     workspace.outcome(
@@ -81,32 +91,65 @@ def failed(workspace: Workspace, request: str, spec: bytes) -> None:
             outcome_digest=hashlib.sha256(body).digest(),
         ),
     )
-
-
-def fixture(
-    tmp_path: Path, *, memoize: bool = True, fingerprint: str = "sha256:" + "45" * 32
-) -> tuple[Any, ...]:
-    store = tensorfs.Store.init(tmp_path / "store")
-    workspace = Workspace(Path(store.root))
-    spec, transaction = accepted(workspace, "first", memoize=memoize)
-    plain = next(value for alias, value in tensorfs.seed_digests() if alias == "plain/1")
-    tensor = {
-        "logical_dtype": "f32",
-        "shape": [512],
-        "encoding": plain,
-        "parts": {"value": {"dtype": "f32", "shape": [512]}},
-    }
-    targets = {"model": {"add": {"a": tensor, "b": tensor}, "drop": []}}
-    order = [("model", "a"), ("model", "b")]
-    declaration = store.derived_declaration(
-        {}, targets, {}, order, 4096, work_fingerprint=fingerprint
+    return pb.AttemptOutcomeAck(
+        request_id=request,
+        attempt_ordinal=1,
+        invocation_spec_digest=spec,
+        outcome_id="failed-" + request,
+        outcome_digest=hashlib.sha256(body).digest(),
+        retain_work=False,
     )
-    workspace.begin_weights("owner", intent("first", spec, transaction, declaration))
+
+
+def released(workspace: Workspace, request: str, spec: bytes, status: pb.OutcomeStatus) -> None:
+    """The owner's ordinary end of a stopped attempt: abandon its output, release it."""
+    ack = failed(workspace, request, spec, status)
+    workspace_finalize.finalize(
+        workspace,
+        "owner",
+        pb.WeightsFinalizeRequest(
+            owner_authority_scope="owner",
+            request_id=request,
+            invocation_spec_digest=spec,
+            invocation_spec_canonical_bytes=spec_bytes(),
+            output_slot="model",
+            disposition=pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED,
+        ),
+    )
+    workspace.acknowledge("owner", ack)
+
+
+TARGETS = {
+    "model": {
+        "add": {
+            name: {
+                "logical_dtype": "f32",
+                "shape": [512],
+                "encoding": next(v for alias, v in tensorfs.seed_digests() if alias == "plain/1"),
+                "parts": {"value": {"dtype": "f32", "shape": [512]}},
+            }
+            for name in ("a", "b")
+        },
+        "drop": [],
+    }
+}
+ORDER = [("model", "a"), ("model", "b")]
+
+
+def checkpointed(
+    store: Any, workspace: Workspace, request: str, *, memoize: bool, fingerprint: str
+) -> tuple[bytes, str, bytes]:
+    """A real native writer that checkpointed part a and then stopped."""
+    spec, transaction = accepted(workspace, request, memoize=memoize)
+    declaration = store.derived_declaration(
+        {}, TARGETS, {}, ORDER, 4096, work_fingerprint=fingerprint
+    )
+    workspace.begin_weights("owner", intent(request, spec, transaction, declaration))
     writer = store.begin_derived(
-        transaction, 1, {}, targets, {}, order, 4096, work_fingerprint=fingerprint
+        transaction, 1, {}, TARGETS, {}, ORDER, 4096, work_fingerprint=fingerprint
     )
     writer.add_part("model", "a", "value", io.BytesIO(b"\x31" * 2048))
-    facts = writer.checkpoint("first", "model")
+    facts = writer.checkpoint(request, "model")
     length, index, stored = facts["head_length"], facts["index"], facts["bytes"]
     assert isinstance(length, int) and isinstance(index, int) and isinstance(stored, int)
     checkpoint = pb.CheckpointRef(
@@ -118,7 +161,7 @@ def fixture(
     workspace.checkpoint(
         "owner",
         pb.WeightsCheckpointFrame(
-            request_id="first",
+            request_id=request,
             attempt_ordinal=1,
             invocation_spec_digest=spec,
             output_slot="model",
@@ -129,7 +172,18 @@ def fixture(
         ),
     )
     writer.fence()
-    return store, workspace, spec, transaction, declaration, targets, order, fingerprint
+    return spec, transaction, declaration
+
+
+def fixture(
+    tmp_path: Path, *, memoize: bool = True, fingerprint: str = "sha256:" + "45" * 32
+) -> tuple[Any, ...]:
+    store = tensorfs.Store.init(tmp_path / "store")
+    workspace = Workspace(Path(store.root))
+    spec, transaction, declaration = checkpointed(
+        store, workspace, "first", memoize=memoize, fingerprint=fingerprint
+    )
+    return store, workspace, spec, transaction, declaration, TARGETS, ORDER, fingerprint
 
 
 def test_fresh_script_adopts_stopped_work_and_keeps_independent_custody(tmp_path: Path) -> None:
@@ -242,13 +296,69 @@ def test_schema_two_migrates_conservatively_and_future_schema_refuses(tmp_path: 
         db.execute("DROP TABLE source_access")
         db.execute("ALTER TABLE holds DROP COLUMN kind")
         db.execute("ALTER TABLE attempts DROP COLUMN memoize")
-        for column in ("adoption_source", "adoption_epoch", "adoption_checkpoint"):
+        for column in ("adoption_source", "adoption_epoch", "adoption_checkpoint", "retired_ms"):
             db.execute(f"ALTER TABLE weights DROP COLUMN {column}")
         db.execute("PRAGMA user_version=2")
     with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 12
         assert "memoize" in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}
     with sqlite3.connect(workspace.directory / "journal.sqlite3") as db:
         db.execute("PRAGMA user_version=99")
     with pytest.raises(WorkspaceRefusal, match="schema"), workspace.locked():
         pass
+
+
+@pytest.mark.parametrize("status", [pb.OUTCOME_STATUS_CANCELED, pb.OUTCOME_STATUS_FAILED])
+def test_released_memoized_work_is_retired_and_a_rerun_adopts_it(
+    tmp_path: Path, status: pb.OutcomeStatus
+) -> None:
+    store, workspace, spec, first, declaration, targets, order, fingerprint = fixture(tmp_path)
+    released(workspace, "first", spec, status)
+    # The owner holds nothing, yet the checkpointed part survives the release.
+    assert store.derived_lookup(first)["state"] == "open"
+    tensorfs.gc(str(store.root))
+    spec, second = accepted(workspace, "second")
+    row = workspace.begin_weights("owner", intent("second", spec, second, declaration))
+    checkpoint = pb.CheckpointRef.FromString(row["checkpoint"])
+    assert row["adoption_source"] == first and checkpoint.head.length > 0
+    # Adoption spends the retired donor; the recipient keeps its own copy.
+    assert store.derived_lookup(first)["state"] != "open"
+    with workspace.locked() as db:
+        assert db.execute("SELECT state FROM weights WHERE id=?", (first,)).fetchone()[0] == (
+            "released"
+        )
+    tensorfs.gc(str(store.root))
+    writer = store.begin_derived(
+        second,
+        1,
+        {},
+        targets,
+        {},
+        order,
+        4096,
+        work_fingerprint=fingerprint,
+        checkpoint=(documents.spell(checkpoint.head.digest), checkpoint.head.length),
+    )
+    assert writer.completed_parts() == [("model", "a", "value")]
+
+
+def test_released_unmemoized_work_is_destroyed(tmp_path: Path) -> None:
+    store, workspace, spec, first, declaration, _, _, _ = fixture(tmp_path, memoize=False)
+    released(workspace, "first", spec, pb.OUTCOME_STATUS_CANCELED)
+    assert store.derived_lookup(first)["state"] != "open"
+    spec, second = accepted(workspace, "second")
+    row = workspace.begin_weights("owner", intent("second", spec, second, declaration))
+    assert row["adoption_source"] == "" and row["checkpoint"] == b""
+
+
+def test_storage_pressure_evicts_the_oldest_retired_work_first(tmp_path: Path) -> None:
+    store, workspace, spec, first, _, _, _, _ = fixture(tmp_path)
+    released(workspace, "first", spec, pb.OUTCOME_STATUS_CANCELED)
+    spec, newer, _ = checkpointed(
+        store, workspace, "newer", memoize=True, fingerprint="sha256:" + "46" * 32
+    )
+    released(workspace, "newer", spec, pb.OUTCOME_STATUS_CANCELED)
+    result = workspace_memo.reclaim_unused(workspace, target_bytes=1)
+    assert result.removed_entries >= 1 and result.reclaimed_bytes > 0
+    assert store.derived_lookup(first)["state"] != "open"
+    assert store.derived_lookup(newer)["state"] == "open"

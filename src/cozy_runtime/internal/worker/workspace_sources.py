@@ -7,6 +7,7 @@ execution, exact pin and custody; they do not schedule jobs or define a retry qu
 from __future__ import annotations
 
 import hashlib
+import time
 from functools import partial
 from typing import Any
 
@@ -288,14 +289,15 @@ def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -
         if current is None or current["operation"] == "convert_cozytensors":
             return False
         candidates = db.execute(
-            "SELECT n.native_owner FROM native_calls n JOIN attempts a "
+            "SELECT n.native_owner,n.service_id FROM native_calls n LEFT JOIN attempts a "
             "ON a.owner=n.owner AND a.request=n.parent_request AND a.ordinal=n.parent_ordinal "
             "WHERE n.owner=? AND n.service_id<>? AND n.computation_digest=? AND n.operation=? "
-            "AND length(n.result)=0 AND (n.state IN ('failed','stopped') OR a.fenced=1 "
-            "OR a.state IN ('outcome','released')) ORDER BY n.service_id",
+            "AND length(n.result)=0 AND n.state<>'released' AND (n.state IN ('failed','stopped') "
+            "OR a.fenced=1 OR a.state IN ('outcome','released')) ORDER BY n.service_id",
             (owner, service_id, current["computation_digest"], current["operation"]),
         ).fetchall()
         store = fill.store(workspace.store_root)
+        adopted = ""
         for candidate in candidates:
             try:
                 db.native(
@@ -314,8 +316,13 @@ def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -
                 }:
                     continue
                 raise
-            return True
+            adopted = str(candidate["service_id"])
+            break
+    if not adopted:
         return False
+    # The recipient now retains the progress independently; a retired partial is spent.
+    consume_partial(workspace, owner, adopted)
+    return True
 
 
 def conversion_predecessor(workspace: Workspace, owner: str, service_id: str) -> str | None:
@@ -327,10 +334,10 @@ def conversion_predecessor(workspace: Workspace, owner: str, service_id: str) ->
         if current is None or current["operation"] != "convert_cozytensors":
             return None
         candidates = db.execute(
-            "SELECT n.service_id FROM native_calls n JOIN attempts a "
+            "SELECT n.service_id FROM native_calls n LEFT JOIN attempts a "
             "ON a.owner=n.owner AND a.request=n.parent_request AND a.ordinal=n.parent_ordinal "
             "WHERE n.owner=? AND n.service_id<>? AND n.computation_digest=? "
-            "AND n.operation='convert_cozytensors' AND length(n.result)=0 "
+            "AND n.operation='convert_cozytensors' AND length(n.result)=0 AND n.state<>'released' "
             "AND (n.state IN ('failed','stopped') OR a.fenced=1 "
             "OR a.state IN ('outcome','released')) "
             "ORDER BY n.service_id",
@@ -394,6 +401,45 @@ def release_intent(db: Journal, owner: str, ack: pb.AttemptOutcomeAck) -> list[s
     return [str(row["service_id"]) for row in rows]
 
 
+# Incomplete progress of these calls is keyed only by its exact pinned computation, so it
+# outlives its released parent as a retired partial (workspace_partial) for a later
+# identical call to adopt.
+_PARTIAL_OPERATIONS = ("download_huggingface", "download_civitai", "convert_cozytensors")
+
+PARTIALS = (
+    "SELECT n.* FROM native_calls n WHERE n.state='stopped' AND n.retired_ms>0 "
+    "AND length(n.result)=0"
+)
+
+
+def now_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def _has_progress(store: Any, row: dict[str, Any]) -> bool:
+    if row["operation"] == "convert_cozytensors":
+        return row["service_id"] in store.model_source_operations()
+    root = store.tree_root(row["native_owner"])
+    return root is not None and not root.get("released") and not root.get("complete")
+
+
+def _release_native(store: Any, owner: str, row: dict[str, Any]) -> None:
+    if row["native_owner"] != native_owner(owner, row["service_id"]):
+        return
+    if row["operation"] == "convert_cozytensors":
+        state = store.derived_lookup(row["native_owner"])
+        if state.get("state") == "committed":
+            store.derived_dispose(row["native_owner"])
+        elif state.get("state") == "open":
+            epoch = state.get("writer_session_id")
+            if epoch:
+                store.derived_fence(row["native_owner"], epoch)
+            store.derived_abandon(row["native_owner"])
+        store.release_model_source(row["service_id"])
+    elif store.tree_root(row["native_owner"]) is not None:
+        store.release_tree_root(row["native_owner"])
+
+
 def release(workspace: Workspace, owner: str, service_id: str) -> None:
     from . import workspace_memo
 
@@ -410,6 +456,7 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         workspace_memo.release_native_result(workspace, owner, service_id)
         workspace_memo.release_native_lookup(workspace, owner, service_id)
     store = fill.store(workspace.store_root)
+    final = "released"
     if row["operation"] == "commit_file":
         from . import workspace_byte_outputs
 
@@ -418,22 +465,39 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         from . import source_views
 
         source_views.release_service(workspace, owner, row)
-    elif row["native_owner"] == native_owner(owner, service_id):
-        if row["operation"] == "convert_cozytensors":
-            state = store.derived_lookup(row["native_owner"])
-            if state.get("state") == "committed":
-                store.derived_dispose(row["native_owner"])
-            elif state.get("state") == "open":
-                epoch = state.get("writer_session_id")
-                if epoch:
-                    store.derived_fence(row["native_owner"], epoch)
-                store.derived_abandon(row["native_owner"])
-            store.release_model_source(service_id)
-        elif store.tree_root(row["native_owner"]) is not None:
-            store.release_tree_root(row["native_owner"])
+    elif (
+        row["operation"] in _PARTIAL_OPERATIONS
+        and not row["result"]
+        and row["computation_digest"]
+        and _has_progress(store, row)
+    ):
+        final = "stopped"
+    else:
+        _release_native(store, owner, row)
     with workspace.locked() as db:
         db.execute(
-            "UPDATE native_calls SET state='released' WHERE owner=? AND service_id=? "
+            "UPDATE native_calls SET state=?,retired_ms=CASE WHEN ?<>'stopped' THEN 0 "
+            "WHEN retired_ms>0 THEN retired_ms ELSE ? END WHERE owner=? AND service_id=? "
             "AND state='releasing'",
-            (owner, service_id),
+            (final, final, now_ms(), owner, service_id),
         )
+
+
+def spend(db: Journal, workspace: Workspace, row: dict[str, Any]) -> None:
+    db.native(partial(_release_native, fill.store(workspace.store_root), row["owner"], row))
+    db.execute(
+        "UPDATE native_calls SET state='released' WHERE owner=? AND service_id=? "
+        "AND state='stopped'",
+        (row["owner"], row["service_id"]),
+    )
+
+
+def consume_partial(workspace: Workspace, owner: str, service_id: str) -> bool:
+    """Spend a retired partial that a later call adopted."""
+    with workspace.locked() as db:
+        row = db.execute(PARTIALS + " AND n.owner=? AND n.service_id=?", (owner, service_id))
+        found = row.fetchone()
+        if found is None:
+            return False
+        spend(db, workspace, dict(found))
+    return True
