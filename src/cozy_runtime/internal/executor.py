@@ -2610,6 +2610,7 @@ class Executor:
         self.facts = {
             "cuda_init_ms": sum(float(facts.get("cuda_init_ms", 0)) for _, facts in facts_rows),
             "prepare_ms": sum(float(facts.get("prepare_ms", 0)) for _, facts in facts_rows),
+            "prepared_unix_ms": int(time.time() * 1000),
             # THE SEGMENT LEDGER AND THE SUBSTRATE CENSUS, FOR A MANY-MODEL PREPARE TOO
             # (cr-130). cr-102 added both to `_prepare_first` and nowhere else, so a
             # placement with two or more models reported one summed `prepare_ms` and no
