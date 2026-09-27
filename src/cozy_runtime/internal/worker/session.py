@@ -5670,10 +5670,17 @@ class Worker:
         took = (time.perf_counter() - began) * 1000
         if not reply.get("ok"):
             self._load_refused(tenant, executor, group, label, reply, took)
+            code = str(reply.get("code") or "construction_load_refused")
             raise AttemptRefusal(
-                str(reply.get("code") or "construction_load_refused"),
+                code,
                 f"construction {label} could not be loaded: {str(reply.get('detail'))[:512]}",
-                cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                # A load refused before it touched the process is this request's constraint
+                # (a pin, a fit, the device's free bytes); a poisoned one is the executor's.
+                cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT
+                if reply.get("poisoned", "unreported")
+                else CAUSE.CAUSE_CODE_INVALID_REQUEST
+                if code.startswith("attention_kernel_")
+                else CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
             )
         self.monitor.end(subject, "filled")
         facts = dict(reply.get("facts") or {})
@@ -5742,21 +5749,26 @@ class Worker:
         reply: Mapping[str, Any],
         took: float,
     ) -> None:
-        """A load refusal faults its construction's bindings and replaces the process."""
+        """A load refusal fails its request; only a poisoned process is replaced.
+
+        The executor reports `poisoned` on every refused load: empty when the load was
+        refused before it touched the process (a plan, fit or device-shortfall refusal on one
+        rank), so its other constructions keep serving and the next request tries again. An
+        older executor that does not report it is treated as poisoned.
+        """
         placement_id = tenant.placement.placement_id
         first = group[0]
-        self.monitor.end(f"load:{label}", str(reply.get("code")))
+        code = str(reply.get("code"))
+        self.monitor.end(f"load:{label}", code)
         self.boot.step(
             "load",
             "refused",
             took,
             component=first.components[0] if first.components else "",
-            code=str(reply.get("code")),
+            code=code,
         )
         detail = str(reply.get("detail"))[:1024]
-        request_attention_refusal = str(reply.get("code") or "").startswith(
-            "attention_kernel_"
-        )
+        poisoned = str(reply.get("poisoned", "unreported"))
         shortfall = reply.get("shortfall") or {}
         if shortfall:
             detail = (
@@ -5764,35 +5776,48 @@ class Worker:
                 f"needed {shortfall['needed_bytes']} B, "
                 f"{shortfall['available_bytes']} B free (measured) - {detail}"
             )[:1024]
+        for line in prepare_diagnostics.activity_lines(reply.get("traceback")):
+            self.note("boot", f"load traceback {label}: {line}")
+        if not poisoned:
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
+                    subject=first.entrypoint_binding_digest,
+                    reason=code,
+                    detail=safe(detail),
+                )
+            )
+            self.note(
+                "boot",
+                f"{placement_id!r} load of construction {label} REFUSED for this request: "
+                f"{code} - {detail}. The executor held nothing for it and keeps serving",
+            )
+            return
+        request_attention_refusal = code.startswith("attention_kernel_")
         with self.control_lock:
             current = self._current_tenant(tenant)
             for member in (group if not request_attention_refusal else ()):
                 # PER-BINDING (#572d), and it OUTLIVES the rebuild the refusal causes: the
                 # process is replaced, but this construction is not tried again until the
                 # desired state changes.
-                current.failed_bindings[member.entrypoint_binding_digest] = (
-                    f"{reply.get('code')}: {detail}"
-                )
+                current.failed_bindings[member.entrypoint_binding_digest] = f"{code}: {detail}"
                 executor.ready_bindings.discard(member.entrypoint_binding_digest)
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=member.entrypoint_binding_digest,
-                        reason=str(reply.get("code")),
+                        reason=code,
                         detail=safe(detail),
                     )
                 )
         self.note(
             "boot",
-            f"{placement_id!r} load of construction {label} REFUSED: "
-            f"{reply.get('code')} - {detail} "
+            f"{placement_id!r} load of construction {label} REFUSED: {code} - {detail} "
             f"[{prepare_diagnostics.memory_summary(dict(reply))}. The executor is poisoned "
-            "and replaced; the card returns with the process (#613)]",
+            f"({poisoned}) and replaced; the card returns with the process (#613)]",
         )
-        for line in prepare_diagnostics.activity_lines(reply.get("traceback")):
-            self.note("boot", f"load traceback {label}: {line}")
         try:
-            tenant.supervision.retire_current(executor, f"load refused: {reply.get('code')}")
+            tenant.supervision.retire_current(executor, f"load refused: {code}")
         except ExecutorGone as exc:
             self.note("recovery", f"load refusal reclaim failed: {exc}")
 
