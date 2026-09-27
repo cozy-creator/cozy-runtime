@@ -60,8 +60,10 @@ MODELS = "/v1/models/alice/model"
 class Bucket:
     """Immutable content-addressed keys; ``failing`` answers 403 until the Hub reopens.
 
-    Each PUT takes ``seconds`` (``slow`` for one key), standing in for transfer time. A PUT
-    arriving after its grant's expiry is refused (403) and counted in ``expired``.
+    Each PUT takes ``seconds`` (``slow`` for one key), standing in for transfer time; past
+    ``capacity`` concurrent PUTs (0: unbounded) a link is congested and each takes longer
+    with the square of its overload. ``starts`` records the PUTs in flight as each began.
+    A PUT arriving after its grant's expiry is refused (403) and counted in ``expired``.
     """
 
     def __init__(self) -> None:
@@ -72,6 +74,8 @@ class Bucket:
         self.reopened = threading.Event()
         self.seconds = 0.0
         self.slow: tuple[str, float] = ("", 0.0)
+        self.capacity = 0
+        self.starts: list[int] = []
         self.active = self.peak = self.expired = 0
 
 
@@ -94,6 +98,9 @@ class Hub:
         self.checkpoints: dict[str, str] = {}
         self.refuse_grants = 0
         self.grant_batches: list[int] = []
+        self.verify_batches: list[int] = []
+        # Objects the commit itself had to verify: none when staging verified them.
+        self.unverified_at_finalize: list[int] = []
         self.finalize_seconds = 0.3
         self.fail_finalization = ""
         self.lose_finalize = False
@@ -219,9 +226,24 @@ class Hub:
                     "held": held,
                     "server_time_unix": int(time.time()),
                 }
+            if method == "POST" and action == "verify":
+                selected = request["object_ids"]
+                assert 0 < len(selected) <= 128 and len(set(selected)) == len(selected)
+                self.verify_batches.append(len(selected))
+                accepted.update(key for key in selected if self.held(key))
+                rows = [
+                    {
+                        "object_id": key,
+                        "length": declared[key],
+                        "state": "accepted" if key in accepted else "claimed",
+                    }
+                    for key in selected
+                ]
+                return 200, {"publication": {"operation": operation, "objects": rows}}
             if method == "POST" and action == "finalize":
                 if self.lose_finalize:
                     return None
+                self.unverified_at_finalize.append(len(set(declared) - accepted))
                 manifest, length = request["manifest_id"], request["manifest_length"]
                 if declared.get(manifest) != length or not all(map(self.held, declared)):
                     return 409, {"code": "publication.objects_unverified"}
@@ -308,7 +330,10 @@ def bucket_handler(bucket: Bucket) -> Callable[[BaseHTTPRequestHandler, str], No
         with bucket.lock:
             bucket.active += 1
             bucket.peak = max(bucket.peak, bucket.active)
-        time.sleep(bucket.slow[1] if key == bucket.slow[0] else bucket.seconds)
+            bucket.starts.append(bucket.active)
+            overload = bucket.active / bucket.capacity if bucket.capacity else 1.0
+        seconds = bucket.slow[1] if key == bucket.slow[0] else bucket.seconds
+        time.sleep(seconds * max(1.0, overload) ** 2)
         with bucket.lock:
             bucket.active -= 1
             bucket.puts[key] += 1
@@ -522,19 +547,38 @@ def test_push_failure_retries_the_frozen_operation_without_repushing(
     assert not staged.calls.has_unsettled_effects("owner", "parent")
 
 
-def test_pushes_slide_through_a_full_window_with_grants_fetched_ahead(
+def test_pushes_in_flight_grow_while_they_land_faster(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """An uncongested link: more pushes land more bytes, so the window keeps doubling."""
     with staging(tmp_path, monkeypatch.setenv, parts=100) as (staged, hub, effects):
         hub.bucket.seconds = 0.2
         call = settle(staged, effects)
         assert not call.safe_code and canonical_json.decode(call.result)["observation"] == (
             "acknowledged"
         )
-        # 102 objects: every one pushed once, sixteen in flight, grants 32 at a time.
         assert len(hub.bucket.objects) == 102 and set(hub.bucket.puts.values()) == {1}
-        assert hub.bucket.peak == 16
-        assert hub.grant_batches == [32, 32, 32, 6]
+        # Sixteen first, then more once sixteen had landed faster than none.
+        assert max(hub.bucket.starts[:17]) <= 16 and hub.bucket.peak >= 32
+        # Grants were fetched two windows ahead, within the Hub's bound per request.
+        assert hub.grant_batches[0] == 32 and max(hub.grant_batches) <= 128
+        assert sum(hub.grant_batches) == 102
+        # Staging verified every pushed object; the commit verified none itself.
+        assert sum(hub.verify_batches) == 102 and hub.unverified_at_finalize == [0]
+
+
+def test_pushes_in_flight_settle_where_the_link_stops_landing_faster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the link's capacity, twice the pushes land slower: the best level holds."""
+    with staging(tmp_path, monkeypatch.setenv, parts=200) as (staged, hub, effects):
+        hub.bucket.seconds, hub.bucket.capacity = 0.5, 16
+        call = settle(staged, effects)
+        assert not call.safe_code and call.result
+        assert len(hub.bucket.objects) == 202 and set(hub.bucket.puts.values()) == {1}
+        # Thirty-two were tried once, then the window returned to sixteen for good.
+        assert 16 < hub.bucket.peak <= 32
+        assert max(hub.bucket.starts[-64:]) <= 16
 
 
 def test_upload_reports_held_bytes_then_publication_with_stage_timings(
@@ -681,7 +725,7 @@ def upload(staged: Stage, effects: Effects, window: int) -> CheckpointRef:
             before_write=lambda: None,
             push=push,
             landed=lambda count, held: None,
-            window=window,
+            streams=window,
         )
     except PublicationRefusal as exc:
         assert exc.code == "publication.finalization_pending"
@@ -710,6 +754,7 @@ def test_a_narrow_window_still_uploads_everything(
         # Grants are fetched two windows ahead.
         batch = 2 * window
         assert hub.grant_batches == [batch] * (22 // batch) + ([22 % batch] if 22 % batch else [])
+        assert sum(hub.verify_batches) == 22 and hub.unverified_at_finalize == [0]
 
 
 def test_a_grant_gone_cold_in_the_queue_is_asked_for_again(

@@ -30,7 +30,6 @@ PRIVATE = (
     "builtin-prepare",
     "development-placement",
     "prepare-package",
-    "interface-wheel",
     "image-prepare",
     "image-preparation-profile",
     "python-interpreters",
@@ -303,7 +302,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
     from cozy_runtime.cli import host as host_verbs
     from cozy_runtime.cli import hostfacts as hostfacts_verb
     from cozy_runtime.cli import image_prepare as image_prepare_verb
-    from cozy_runtime.cli import interface_wheel as interface_wheel_verb
     from cozy_runtime.cli import new as new_verb
     from cozy_runtime.cli import package_prepare as package_prepare_verbs
     from cozy_runtime.cli import run as run_verb
@@ -336,8 +334,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return host_verbs.development_placement(config, args, opts)
     if verb == "prepare-package":
         return package_prepare_verbs.prepare_local_package(config, args, opts)
-    if verb == "interface-wheel":
-        return interface_wheel_verb.run(args)
     if verb == "image-prepare":
         return image_prepare_verb.run(args)
     if verb == "image-preparation-profile":
