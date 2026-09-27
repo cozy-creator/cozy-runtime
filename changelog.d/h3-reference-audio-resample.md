@@ -1,0 +1,1 @@
+MiniMax-H3 audio references and video soundtracks at any sample rate reach the official pipeline already at the audio VAE rate. The pipeline resampled other rates with torchaudio, which has no release for the served Torch, so a 24 kHz voice reference failed with ImportError. The resampler is a bit-identical port of torchaudio's default Resample.
