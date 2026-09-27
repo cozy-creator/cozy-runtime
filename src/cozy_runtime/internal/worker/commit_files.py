@@ -12,13 +12,34 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._calls import RUNTIME_UPDATE
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
-from cozy_runtime.internal import output_budget
+from cozy_runtime.internal import output_budget, source_interfaces
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+
+REQUEST_FIELDS = frozenset(source_interfaces.CommitFile.__struct_fields__)
+
+
+class UnsupportedCommitRequest(WorkspaceRefusal):
+    """A newer SDK asked this commit for behaviour this Runtime does not implement."""
+
+    code = "commit_request_unsupported"
+
+
+def unsupported_detail(accepted: bytes) -> str:
+    """Name the options a commit request carries that this Runtime does not serve."""
+    try:
+        args = canonical_json.decode(accepted)
+    except ValueError:
+        return ""
+    unknown = sorted(set(args) - REQUEST_FIELDS) if isinstance(args, dict) else []
+    if not unknown:
+        return ""
+    return f"commit_file does not support {', '.join(unknown)}: {RUNTIME_UPDATE}"[:1024]
 
 
 def prepare(
@@ -36,12 +57,15 @@ def prepare(
             (owner, call.parent_request_id, call.parent_attempt_ordinal),
         ).fetchone()
         budget = output_budget.intermediate(documents.read(parent["invocation"], pb.InvocationSpec))
+        if detail := unsupported_detail(native["accepted"]):
+            # Dropping an unknown option could write a different output; only this call fails.
+            raise UnsupportedCommitRequest(detail)
         args = canonical_json.decode(native["accepted"])
         slot = args.get("slot")
         tail = str(slot).removeprefix("file/")
         if (
             spool_root is None
-            or set(args) != {"slot", "digest", "size_bytes", "media_type"}
+            or set(args) != REQUEST_FIELDS
             or not isinstance(slot, str)
             or not slot.startswith("file/")
             or not re.fullmatch(r"[0-9]{4,16}", tail)

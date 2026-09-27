@@ -184,7 +184,7 @@ def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_pat
         plan=SimpleNamespace(placement="cpu", headroom_bytes=0, scope_headroom_bytes={}),
     )
     command = AttemptEngine._command(
-        cast(AttemptEngine, SimpleNamespace()),
+        cast(AttemptEngine, SimpleNamespace(attention_pin="")),
         cast(AttemptRecord, parent),
         "report#1",
         tmp_path,

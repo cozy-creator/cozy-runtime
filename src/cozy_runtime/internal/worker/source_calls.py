@@ -755,10 +755,23 @@ class SourceCalls:
             # private. A child's redacted exit status and stderr tail is its diagnosis.
             code = (
                 exc.code
-                if isinstance(exc, (NativeSourceFailure, storage_admission.StorageRefusal))
+                if isinstance(
+                    exc,
+                    (
+                        NativeSourceFailure,
+                        storage_admission.StorageRefusal,
+                        commit_files.UnsupportedCommitRequest,
+                    ),
+                )
                 else "native_source_failed"
             )
-            detail = exc.detail if isinstance(exc, NativeSourceFailure) else ""
+            detail = (
+                exc.detail
+                if isinstance(exc, NativeSourceFailure)
+                else str(exc)
+                if isinstance(exc, commit_files.UnsupportedCommitRequest)
+                else ""
+            )
             with self.workspace.locked() as db:
                 db.execute(
                     "UPDATE native_calls SET state='failed',native_error=? "
