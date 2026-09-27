@@ -121,6 +121,12 @@ def _diffusers_members(store: Any, uri: str, command: dict[str, Any]) -> dict[st
     return _pinned(store, uri, [index, *sorted(set(diffusers_configs(body).values()))], command)
 
 
+def _registry(command: dict[str, Any]) -> dict[str, bytes]:
+    """An operator registry, passed only when set so an older TensorFS still resolves."""
+    raw = command.get("registry")
+    return {"registry": base64.b64decode(raw, validate=True)} if raw else {}
+
+
 def resolve(store: Any, command: dict[str, Any]) -> dict[str, Any]:
     operation, arguments = command["operation"], command["arguments"]
     recipe = recipe_of(arguments, operation)
@@ -133,8 +139,12 @@ def resolve(store: Any, command: dict[str, Any]) -> dict[str, Any]:
     elif arguments["carriers"]:
         selection = store.resolve_source(uri, list(arguments["carriers"]), **_endpoints(command))
     else:
+        # No profile named: TensorFS selects one from the provider headers and narrows.
         selection = store.resolve_source(
-            uri, profiles=list(arguments["profiles"]), **_endpoints(command)
+            uri,
+            profiles=list(arguments["profiles"]),
+            **_endpoints(command),
+            **_registry(command),
         )
     if recipe is not None:
         # Reviewed metadata rides in the same pin; its bytes are named by the recipe.
@@ -146,6 +156,19 @@ def resolve(store: Any, command: dict[str, Any]) -> dict[str, Any]:
         # A Diffusers repository's components are constructed from its own configs.
         _merge(selection, _diffusers_members(store, uri, command))
     return {"selection": selection}
+
+
+def select(store: Any, command: dict[str, Any]) -> dict[str, Any]:
+    """The profile the pinned carriers' headers select, on this machine's registry."""
+    tensorfs = fill.tensorfs_module()
+    members = [tuple(row) for row in command["members"]]
+    heads = dict(
+        tensorfs.read_source_heads(
+            source_uri(command["operation"], command["arguments"]), members, **_endpoints(command)
+        )
+    )
+    rows = [(name, length, heads[name]) for name, _, length, _ in members]
+    return {"profile": tensorfs.select_source_profile(store, rows, **_registry(command))}
 
 
 def heads(command: dict[str, Any]) -> dict[str, Any]:
@@ -344,6 +367,8 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
     step = command["step"]
     if step == "resolve":
         return resolve(store, command)
+    if step == "select":
+        return select(store, command)
     if step == "heads":
         return heads(command)
     if step == "advance":

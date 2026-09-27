@@ -575,6 +575,8 @@ class SourceCalls:
                 terminal(command, pb.NATIVE_SOURCE_STATE_RESOLVED, selection=resolved)
                 return
             content = workspace_sources.selection_content(command.selection)
+            if not upload.slots:
+                upload.select(_native_selection(command.selection))
             effective = {
                 "source": content["content_manifest"],
                 "slots": upload.slots,

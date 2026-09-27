@@ -45,7 +45,7 @@ class UploadHuggingFace(msgspec.Struct, frozen=True):
 class UploadCivitai(msgspec.Struct, frozen=True):
     version: int
     destination: str
-    profiles: tuple[str, ...]
+    profiles: tuple[str, ...] = ()
     file: str = ""
 
 

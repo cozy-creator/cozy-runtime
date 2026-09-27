@@ -12,7 +12,6 @@ _CIVITAI_MEMBER = re.compile(r"civitai/files/[1-9][0-9]*")
 CODES = frozenset(
     {
         "tensorfs_capability_missing",
-        "model_ingestion_recipe_unavailable",
         "model_ingestion_revision",
         "model_source_profiles_invalid",
         "model_source_components_overlap",
@@ -57,19 +56,16 @@ def recipe_of(arguments: dict[str, Any], operation: str) -> Recipe | None:
     if operation != "upload_huggingface" or arguments["profiles"] or arguments["carriers"]:
         return None
     # An unreviewed revision of a reviewed repository refuses with its own code.
-    recipe = huggingface_recipe(arguments["repository"], arguments["revision"])
-    if recipe is None:
-        raise UploadRefusal(
-            "model_ingestion_recipe_unavailable",
-            f"no reviewed recipe or profile converts {arguments['repository']}",
-        )
-    return recipe
+    return huggingface_recipe(arguments["repository"], arguments["revision"])
 
 
 def slots(arguments: dict[str, Any], recipe: Recipe | None) -> list[tuple[str, str]]:
-    """One reviewed profile converts into ``model``; several compose ``part<i>`` slots."""
+    """One reviewed profile converts into ``model``; several compose ``part<i>`` slots.
+
+    None named and no recipe is empty: the machine selects the profile from the headers.
+    """
     profiles = (recipe.profile,) if recipe is not None else tuple(arguments["profiles"])
-    if not profiles or len(set(profiles)) != len(profiles):
+    if len(set(profiles)) != len(profiles):
         raise UploadRefusal("model_source_profiles_invalid", "name distinct reviewed profiles")
     if len(profiles) == 1:
         return [("model", profiles[0])]

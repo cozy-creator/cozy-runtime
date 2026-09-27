@@ -59,8 +59,8 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "cozy_runtime"
 CALLED: dict[str, str] = {
     "pull": (
         "(store, hub, refspec, *, lane=Ellipsis, credential=Ellipsis, timeout=None, "
-        "session=Ellipsis, streams=Ellipsis, allowed_hosts=Ellipsis, allow_local=False, "
-        "sample_seconds=None, cancellation=None, progress=None)"
+        "session=Ellipsis, streams=Ellipsis, streams_start=Ellipsis, allowed_hosts=Ellipsis, "
+        "allow_local=False, sample_seconds=None, cancellation=None, progress=None)"
     ),
     "PullCancellation": "()",
     "transfer_streams": "(wanted)",
@@ -69,6 +69,7 @@ CALLED: dict[str, str] = {
         "(source_uri, members, *, credential=Ellipsis, huggingface=None, civitai=None, "
         "allow_local=False)"
     ),
+    "select_source_profile": "(store, heads, *, registry=None)",
     "prepare_selected_source": (
         "(store, operation_id, source_selection_digest, profiles, members, *, registry=None, "
         "write_budget_bytes=None)"
@@ -96,7 +97,7 @@ CALLED: dict[str, str] = {
     "Store.ensure": "(root=None)",
     "Store.resolve_source": (
         "(self, /, source_uri, carriers=Ellipsis, *, profiles=Ellipsis, files=Ellipsis, "
-        "credential=Ellipsis, huggingface=None, civitai=None, allow_local=False)"
+        "credential=Ellipsis, huggingface=None, civitai=None, allow_local=False, registry=None)"
     ),
     "Store.materialize_source": (
         "(self, /, owner, members, *, allowed_hosts, credential_hosts=Ellipsis, "
