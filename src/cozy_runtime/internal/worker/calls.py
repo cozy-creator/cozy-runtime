@@ -63,7 +63,7 @@ class Calls:
         self,
         send: Callable[[pb.WorkerFrame], None],
         stream: Callable[[], int],
-        minor: Callable[[], int],
+        minor: Callable[[str], int],
         *,
         workspace: Workspace | None = None,
         owner: Callable[[], str] = lambda: "",
@@ -126,7 +126,11 @@ class Calls:
             return {"ok": True}
         with self.lock:
             try:
-                if self.minor() < 44 or attempt.state != "running" or attempt.canceling:
+                if (
+                    self.minor(attempt.request_id) < 44
+                    or attempt.state != "running"
+                    or attempt.canceling
+                ):
                     raise ValueError("parent call is not active under a capable owner")
                 if frame.get("kind") == "model_prefetch":
                     if self.prefetch is None:
@@ -323,7 +327,7 @@ class Calls:
             raise ValueError("call request must be a canonical object")
         capture = None
         if frame.get("capture") is not None:
-            if self.minor() < 43:
+            if self.minor(attempt.request_id) < 43:
                 raise ValueError("owner does not support capture")
             if allowed.get("native_source") or allowed.get("native_effect"):
                 raise ValueError("activation capture requires an ordinary serving invocation")

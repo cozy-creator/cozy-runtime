@@ -437,7 +437,7 @@ class Serving:
                 {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
             )
             desired = pb.DesiredWorkerState(
-                wire_minor=self.worker.fence.wire_minor,
+                wire_minor=executions.wire_minor(owner, call.parent_request),
                 posture=pb.POSTURE_ACCEPTING,
                 placement_set=pb.DesiredPlacementSet(
                     placement_set_digest=hashlib.sha256(placement_bytes).digest(),

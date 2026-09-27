@@ -546,6 +546,20 @@ class Executions:
             raw = self._row(db, owner, request)["preparation"]
             return cast(dict[str, Any], canonical_json.decode(raw)) if raw else {}
 
+    def wire_minor(self, owner: str, request: str) -> int:
+        """The wire minor this execution was admitted under: its root's submitting Claim.
+
+        Negotiated per operation and retained with the root, so a Runtime or Host restart,
+        which forgets every control stream, cannot change what accepted work may do.
+        """
+        root, _ = self.scheduling_root(owner, request)
+        prepared = self.preparation(owner, root)
+        if "wire_minor" in prepared:
+            return int(prepared["wire_minor"])
+        # A root accepted before the minor was retained: its owner's prepared state names it.
+        state = pb.DesiredWorkerState.FromString(base64.b64decode(prepared.get("state", "")))
+        return state.wire_minor
+
     def assigned_here(self, owner: str, request: str, ordinal: int, worker_boot: str) -> bool:
         from .workspace_recovery import process_identity
 

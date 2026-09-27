@@ -1191,7 +1191,7 @@ class Worker:
         self.calls = Calls(
             self.send,
             lambda: self.fence.control_stream_epoch,
-            lambda: self.fence.wire_minor,
+            self.operation_minor,
             workspace=self.workspace,
             owner=lambda: self.fence.record_owner_id,
             local=self._machine_call,
@@ -2178,6 +2178,15 @@ class Worker:
             ):
                 raise WorkspaceRefusal("workspace bootstrap proof was refused")
             return self.fence.record_owner_id
+
+    def operation_minor(self, request_id: str) -> int:
+        """The wire minor one attempt's operation was negotiated at (worker-protocol: gate the
+        operation, never the connection). A machine execution keeps its submitting Claim's;
+        only stream-offered work speaks the minor of the stream that offered it."""
+        executions, owner = self.executions, self.fence.record_owner_id
+        if executions is not None and owner and executions.owns(owner, request_id):
+            return min(WIRE_MINOR, executions.wire_minor(owner, request_id))
+        return self.fence.wire_minor
 
     def _execution_service(self, claim: pb.Claim) -> tuple[workspace_executions.Executions, str]:
         owner = self.authorize_workspace(claim)
@@ -6829,11 +6838,12 @@ class Worker:
                 CAUSE.CAUSE_CODE_NO_CAPACITY,
             )
             return
-        if self.fence.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
+        minor = self.operation_minor(offered.request_id) if machine_owned else self.fence.wire_minor
+        if minor < MIN_COMPATIBLE_WIRE_MINOR:
             self.refuse(
                 offered,
                 CAPABILITY_UNAVAILABLE_CODE,
-                _capability_unavailable("execution", self.fence.wire_minor),
+                _capability_unavailable("execution", minor),
                 CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
             )
             return
@@ -6928,7 +6938,7 @@ class Worker:
                         offered, "internal_callable", str(exc), CAUSE.CAUSE_CODE_INVALID_REQUEST
                     )
                     return
-        if ("job" in attempt.spec or self.fence.wire_minor >= 43) and attempt.state not in (
+        if ("job" in attempt.spec or minor >= 43) and attempt.state not in (
             "outcome",
             "closed",
         ):
@@ -7946,8 +7956,36 @@ class Worker:
     def resources(self) -> pb.WorkerResources:
         """Torch-free statics measured ONCE at claim time (#446): the worker NEVER
         fabricates capability facts — a discovered accelerator is present-but-unqualified
-        until a deployment executor qualifies it."""
-        facts = hostfacts.measure(self.options.accelerator_backend)
+        until a deployment executor qualifies it.
+
+        The devices are the inventory this worker schedules on (`options.gpus`, measured by
+        its launcher or supplied virtual), the same rows its workspace and readiness report.
+        """
+        gpus = self.options.gpus
+        facts = hostfacts.measure("none" if gpus else self.options.accelerator_backend)
+        if gpus:
+            names = {gpu["device_name"] for gpu in gpus}
+            memory = {gpu["memory_bytes"] for gpu in gpus}
+            drivers = {gpu["driver_version"] for gpu in gpus}
+            # One (name, memory, driver) describes a homogeneous inventory and nothing else.
+            unreadable = [
+                fact
+                for fact, values in (
+                    ("gpu_name", names),
+                    ("vram_total_bytes", memory),
+                    ("driver_version", drivers),
+                )
+                if len(values) != 1
+            ]
+            facts = dataclasses.replace(
+                facts,
+                backend="cuda",
+                gpu_count=len(gpus),
+                gpu_name=next(iter(names)) if len(names) == 1 else "",
+                vram_total_bytes=next(iter(memory)) if len(memory) == 1 else 0,
+                driver_version=next(iter(drivers)) if len(drivers) == 1 else "",
+                unreadable=tuple(sorted({*facts.unreadable, *unreadable})),
+            )
         memory_model = ""
         if facts.backend == "cuda":
             memory_model = "discrete"
