@@ -56,6 +56,7 @@ from typing import Any
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
+from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._errors import CapabilityError, InvalidRequest, Outcome, classify
@@ -1248,6 +1249,99 @@ class Executor:
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
         }
+
+    def warm(self, command: dict[str, Any]) -> dict[str, Any]:
+        """The startup warm (h3a-087): a started process with nothing constructed proves, on
+        every rank's own card, what its first construction will otherwise pay for there —
+        the fused glue's loads and the attention probes of the model's preferred chain and
+        the ranked table — so construction and a request's pin check read verdicts.
+
+        An optimization and never a verdict: whatever fails here the construction does again
+        for real and refuses there. The worker sends it only while the cards are idle."""
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if not self.started or self.torch is None or self.device_kind != "cuda":
+            return {"ok": True, "ranks": [], "skipped": "no started device process"}
+        started = time.perf_counter()
+        try:
+            if self.group is not None and self.rank == 0:
+                self.group.broadcast({**command, "cmd": "warm"})
+            rows = [self._warm_rank()]
+            if self.group is not None and self.rank == 0:
+                rows += [reply.get("rank_warm") or {} for reply in self.group.collect("warm")]
+        except GroupRefusal as exc:
+            return self._group_refusal(exc)
+        if self.rank > 0:
+            return {"ok": True, "rank_warm": rows[0]}
+        took = (time.perf_counter() - started) * 1000
+        if "started_unix_ms" in self.boot:
+            # The boot record spans the warm too: `cozy run show` reads one executor boot.
+            for name in ("fusion_load", "attention_probe"):
+                self.boot["legs_ms"][name] = max(r.get("legs_ms", {}).get(name, 0.0) for r in rows)
+            self.boot["ms"] = round(time.time() * 1000 - self.boot["started_unix_ms"], 1)
+        return {"ok": True, "ranks": rows, "ms": round(took, 1)}
+
+    def _warm_rank(self) -> dict[str, Any]:
+        from cozy_runtime.internal import fusion
+        from cozy_runtime.internal.encoding import measure_device
+
+        legs: dict[str, float] = {}
+        mark = time.perf_counter()
+        device = measure_device(self.torch, self.rank if self.world > 1 else 0)
+        fused = ""
+        classes = self._model_classes()
+        if any(getattr(cls, "__fusion__", "refuse") in ("accept", "require") for cls in classes):
+            try:
+                fusion.load(self._rank_device(self.torch))
+            except Exception as exc:
+                fused = f"{type(exc).__name__}: {exc}"[:200]
+            legs["fusion_load"] = round((time.perf_counter() - mark) * 1000, 1)
+        mark = time.perf_counter()
+        kernels = attention.warm(device, self._preferred_attention(classes, device))
+        # The probes' scratch goes back to the driver: the card may be another call's.
+        accel.release_cached(self.torch, self.device_kind)
+        legs["attention_probe"] = round((time.perf_counter() - mark) * 1000, 1)
+        return {
+            "rank": self.rank,
+            "legs_ms": legs,
+            "kernels": kernels,
+            **({"fusion": fused} if fused else {}),
+        }
+
+    def _model_classes(self) -> list[type[Model[Any]]]:
+        module = getattr(self.discovered, "module", None)
+        values = vars(module).values() if module is not None else ()
+        return [v for v in values if isinstance(v, type) and issubclass(v, Model) and v != Model]
+
+    def _preferred_attention(self, classes: list[type[Model[Any]]], device: Any) -> list[str]:
+        """Each model class's stated preference, asked per declared component with the facts
+        a site would carry. A class whose choice needs its constructed state says nothing."""
+        order: list[str] = []
+        for cls in classes:
+            if cls.choose_attention is Model.choose_attention:
+                continue
+            components = {c for used in component_use(cls).values() for c in used}
+            for component in sorted(components):
+                context = AttentionContext(
+                    component,
+                    "",
+                    device.kind,
+                    device.name,
+                    device.sm,
+                    "bfloat16",
+                    128,
+                    self.world,
+                    (),
+                    "",
+                    "",
+                )
+                try:
+                    chosen = cls.choose_attention(object.__new__(cls), context)
+                except Exception:
+                    continue
+                names = [chosen] if isinstance(chosen, str) else list(chosen or ())
+                order += [name for name in names if isinstance(name, str) and name not in order]
+        return order
 
     def _close_after(self, reply: dict[str, Any]) -> dict[str, Any]:
         """A refusal after followers were commanded leaves them mid-protocol: the process
@@ -4331,6 +4425,7 @@ _FOLLOWER_COMMANDS = frozenset(
     {
         "hello",
         "start",
+        "warm",
         "join",
         "load",
         "activate",
@@ -4453,6 +4548,8 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.describe_installed(command)
             elif name == "start":
                 reply = executor.start(command)
+            elif name == "warm":
+                reply = executor.warm(command)
             elif name == "load":
                 reply = executor.load(command)
             elif name == "activate":

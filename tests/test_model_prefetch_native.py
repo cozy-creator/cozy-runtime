@@ -126,6 +126,8 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             prepared_installations={"model": SimpleNamespace(document=placement)},
             calls=SimpleNamespace(progress_label=lambda *_: ""),
             emit_progress=lambda _parent, _ordinal, frame: progress.append(frame),
+            # This host harness has no GPUs; the process warm is `test_startup_warm`'s.
+            prespawns=SimpleNamespace(request=lambda *_: None),
         ),
     )
     serving = Serving(worker)

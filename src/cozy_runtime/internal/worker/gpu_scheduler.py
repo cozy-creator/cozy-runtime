@@ -142,6 +142,19 @@ class GpuScheduler:
             events, self.events = self.events, []
             return events
 
+    def spare(self, root: str, width: int, exclude: Iterable[int] = ()) -> Ordinals | None:
+        """`width` cards `root` could be granted without taking another root's: its own lease
+        first, then free ones. A look, never a hold: nothing here reserves or yields."""
+        with self.lock:
+            others = {o for r, held in self.leases.items() if r != root for o in held}
+            others |= {o for r, held in self.grants.values() if r != root for o in held}
+            lease = self.leases.get(root, set())
+            usable = sorted(
+                (o for o in range(self.devices) if o not in others and o not in set(exclude)),
+                key=lambda o: (o not in lease, o),
+            )
+            return tuple(sorted(usable[:width])) if len(usable) >= width else None
+
     def granted(self, key: str) -> Ordinals | None:
         with self.lock:
             grant = self.grants.get(key)

@@ -29,7 +29,11 @@ from cozy_runtime.author._assets import (
     VideoAsset,
 )
 from cozy_runtime.author._attention import AttentionContext
-from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
+from cozy_runtime.author._attention_scope import (
+    AttentionLayout,
+    attention_scope,
+    expect_attention,
+)
 from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable, prefetch
 from cozy_runtime.author._capture import (
     ActivationCapture,
@@ -299,6 +303,7 @@ __all__ = [
     "data_values",
     "decode_request",
     "describe",
+    "expect_attention",
     "invocable",
     "invoke",
     "placeable",
