@@ -3,6 +3,9 @@ name: Publish to PyPI
 # Publication IS the tag push (cozy-eval's pattern). No local publish —
 # this workflow is the single release procedure. Manual run for an existing tag:
 #   gh workflow run publish.yaml -R cozy-creator/cozy-runtime -f release_tag=vX.Y.Z
+# Two jobs because each bills at least one minute: `build` runs every refusal and builds
+# all three files; `publish` holds the PyPI OIDC token and runs no project code.
+# Success means PyPI's simple index serves exactly the built files: lock dependents after it.
 on:
   workflow_dispatch:
     inputs:
@@ -20,14 +23,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # The cheap refusals, ahead of the expensive build. ci.yaml owns lint + types + the
-  # behaviour gate on every push; this re-runs the architecture fences against the exact
-  # tagged tree rather than trusting that the tag points at a commit CI already saw.
-  gate:
+  build:
     outputs:
-      source: ${{ steps.release.outputs.source }}
+      version: ${{ steps.dist.outputs.version }}
+      sha256sums: ${{ steps.dist.outputs.sha256sums }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Hang bound, not a work budget: a native-input change adds image pull + CUDA toolkit +
+    # six-architecture compile.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -41,35 +44,26 @@ jobs:
           fetch-depth: 0
           path: source
       - uses: astral-sh/setup-uv@v7
+        with:
+          # A tag-scoped cache is never restored by another tag.
+          save-cache: false
       - run: uv python install 3.12
       - id: release
         name: Verify immutable unpublished release identity
         run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source
+      # Syntax errors and undefined names anywhere in the tree (Python has no compile step).
+      - run: uvx ruff@0.16.4 check --no-cache --select E9,F63,F7,F82 .
+        working-directory: source
       - run: uv sync --locked
         working-directory: source
+      # The architecture fences against the exact tagged tree.
       - name: Fences
         run: uv run python checks/architecture.py
         working-directory: source
 
-  # ONE package, TWO wheel files (cr-094). This is the second one: same source, same
-  # version, tagged cp312-abi3 and carrying `cozy_runtime/_kernels/_C.abi3.so`, so a
-  # linux/x86 install gets the fused Anima kernels by standard wheel-tag selection alone.
-  # The recipe lives in the script, not here, because a developer needs to run the very
-  # same build on a box with no CUDA toolkit.
-  kernel-wheel:
-    needs: gate
-    runs-on: ubuntu-latest
-    # Hang bound, not a work budget: image pull + CUDA toolkit + six-architecture compile.
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.gate.outputs.source }}
-          fetch-depth: 0
-      - uses: astral-sh/setup-uv@v7
-      - run: uv python install 3.12
+      # ONE package, TWO wheel files (cr-094): same source and version, the second tagged
+      # cp312-abi3 and carrying `cozy_runtime/_kernels/_C.abi3.so`. The recipe lives in the
+      # scripts so a developer can run the very same build on a box with no CUDA toolkit.
       - name: Fetch the pinned public native donor
         run: |
           uv run --no-project --python 3.12 python - <<'PY'
@@ -92,79 +86,118 @@ jobs:
               if hashlib.file_digest(source, "sha256").hexdigest() != expected:
                   raise SystemExit("downloaded native donor failed its pinned SHA-256")
           PY
+      # Runs on the still-clean checkout: reuse refuses a dirty tree, and stamping dirties it.
       - name: Reuse unchanged native inputs or build the kernels wheel
+        working-directory: source
         run: |
           set +e
           uv run --script scripts/build-dev-wheel.py \
             --native-wheel "$RUNNER_TEMP/cozy_runtime-0.18.32-cp312-abi3-manylinux_2_28_x86_64.whl" \
             --native-sha256 60d9cf186eb677461bbd34e8731caa622ded671a3d36459d156165ae1146e0e3 \
-            --release-commit "${{ needs.gate.outputs.source }}" --reuse-or-build --out dist
+            --release-commit "${{ steps.release.outputs.source }}" --reuse-or-build --out dist
           status=$?
           set -e
           if [ "$status" -eq 3 ]; then
-            scripts/build-kernel-wheel.sh --out dist --commit "${{ needs.gate.outputs.source }}"
+            scripts/build-kernel-wheel.sh --out dist --commit "${{ steps.release.outputs.source }}"
           elif [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kernel-wheel
-          path: dist/*.whl
-          if-no-files-found: error
-
-  publish:
-    needs: [gate, kernel-wheel]
-    runs-on: ubuntu-latest
-    environment: pypi
-    # Hang bound, not a work budget.
-    timeout-minutes: 20
-    permissions:
-      contents: read   # checkout on a private/org repo
-      id-token: write  # PyPI trusted publishing (OIDC)
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.gate.outputs.source }}
-
-      - uses: astral-sh/setup-uv@v7
-
-      - run: uv python install 3.12
-
-      - run: uv sync --locked
-
       # The pure wheel is first-class, not a fallback: every platform that is not
       # linux/x86 installs it, and it is the only artifact a macOS or Windows box sees.
       - name: Build (sdist + pure-py wheel)
+        working-directory: source
         env:
-          COZY_RUNTIME_BUILD_COMMIT: ${{ needs.gate.outputs.source }}
+          COZY_RUNTIME_BUILD_COMMIT: ${{ steps.release.outputs.source }}
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
-          uv build
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: kernel-wheel
-          path: dist
-
-      # cr-095: the release that silently carried ONE wheel is exactly the regression this
-      # job exists to prevent, so the shape of `dist/` is a refusal rather than a hope.
-      - name: Release carries the sdist and BOTH wheels
+          uv build --out-dir dist
+      # cr-095: a release that silently carried ONE wheel is the regression this refuses.
+      # Everything visible in dist/ is uploaded, so the set is exact; the digests travel to
+      # `publish` outside the artifact.
+      - id: dist
+        name: Release carries exactly the sdist and BOTH wheels
+        working-directory: source
         run: |
-          ls -l dist
-          uv run python - <<'PY'
-          import pathlib, sys
-          v = __import__("tomllib").load(open("pyproject.toml", "rb"))["project"]["version"]
+          uv run --no-project --python 3.12 python - <<'PY'
+          import hashlib, os, pathlib, sys, tomllib
+          v = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
           want = {
               f"cozy_runtime-{v}.tar.gz",
               f"cozy_runtime-{v}-py3-none-any.whl",
               f"cozy_runtime-{v}-cp312-abi3-manylinux_2_28_x86_64.whl",
           }
           dist = pathlib.Path("dist")
-          have = {p.name for p in [*dist.glob("*.whl"), *dist.glob("*.tar.gz")]}
+          # uv writes dist/.gitignore; hidden files are neither uploaded nor published.
+          have = {p.name for p in dist.iterdir() if not p.name.startswith(".")}
           if have != want:
               sys.exit(f"dist is not the release set\n  missing: {sorted(want - have)}\n  extra:   {sorted(have - want)}")
-          print("\n".join(sorted(have)))
+          sums = "\n".join(
+              f"{hashlib.sha256((dist / name).read_bytes()).hexdigest()}  {name}" for name in sorted(want)
+          )
+          print(sums)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={v}\nsha256sums<<SUMS\n{sums}\nSUMS\n")
           PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: source/dist/
+          if-no-files-found: error
 
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    # Hang bound, not a work budget.
+    timeout-minutes: 20
+    permissions:
+      id-token: write  # PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - name: Upload set is exactly what build hashed
+        env:
+          SUMS: ${{ needs.build.outputs.sha256sums }}
+        working-directory: dist
+        run: |
+          printf '%s\n' "$SUMS" | sha256sum --check --strict
+          [ "$(ls | sort)" = "$(printf '%s\n' "$SUMS" | awk '{print $2}' | sort)" ]
       - name: Publish (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+      # Uploads land one file at a time; a lock taken mid-upload silently misses platform
+      # files. Wait while files are absent, refuse at once on any file this run did not build.
+      - name: PyPI serves exactly the built files
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SUMS: ${{ needs.build.outputs.sha256sums }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.request
+          version = os.environ["VERSION"]
+          want = {name: digest for digest, name in (line.split() for line in os.environ["SUMS"].splitlines())}
+          prefixes = (f"cozy_runtime-{version}-", f"cozy_runtime-{version}.tar.gz")
+          request = urllib.request.Request(
+              "https://pypi.org/simple/cozy-runtime/",
+              headers={"Accept": "application/vnd.pypi.simple.v1+json", "Cache-Control": "no-cache"},
+          )
+          while True:
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      files = json.load(response)["files"]
+              except (OSError, urllib.error.URLError) as error:
+                  print(f"index unavailable ({error}); retrying", flush=True)
+                  time.sleep(5)
+                  continue
+              served = {f["filename"]: f["hashes"].get("sha256") for f in files if f["filename"].startswith(prefixes)}
+              wrong = {name: digest for name, digest in served.items() if want.get(name) != digest}
+              if wrong:
+                  sys.exit(f"PyPI serves files this run did not build: {wrong}")
+              missing = sorted(set(want) - set(served))
+              if not missing:
+                  print("\n".join(f"{want[name]}  {name}" for name in sorted(want)))
+                  break
+              print(f"not yet served: {missing}", flush=True)
+              time.sleep(5)
+          PY
