@@ -16,6 +16,7 @@ import os
 import socket
 import ssl
 import subprocess
+import sys
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -75,18 +76,13 @@ def certificate(path: Path) -> bytes:
     return der
 
 
-def runtime_gpus(
-    child_env: tuple[tuple[str, str], ...], *, accelerator_backend: str
-) -> list[RuntimeGPU]:
-    """Measure the exact executor-visible inventory required by the baked base profile."""
+def runtime_gpus(child_env: tuple[tuple[str, str], ...], *, required: bool) -> list[RuntimeGPU]:
+    """Measure the driver's GPU inventory; the Runtime's own Python needs no torch for it.
 
-    if accelerator_backend == "none":
-        return []
-    if accelerator_backend != "cuda":
-        raise LaunchRefusal(
-            "runtime_accelerator_backend_invalid",
-            f"pod base requires unsupported accelerator backend {accelerator_backend!r}",
-        )
+    `required` is a CUDA base: an absent or unreadable driver refuses the boot. Otherwise a
+    machine without NVIDIA tooling has no GPUs, and an unreadable driver serves CPU only
+    with the reason on the worker's log.
+    """
 
     command = [
         "nvidia-smi",
@@ -101,8 +97,19 @@ def runtime_gpus(
             text=True,
             env=dict(child_env),
         )
+    except FileNotFoundError as exc:
+        if required:
+            raise LaunchRefusal("runtime_gpus_unreadable", type(exc).__name__) from exc
+        return []
     except (OSError, subprocess.SubprocessError) as exc:
-        raise LaunchRefusal("runtime_gpus_unreadable", type(exc).__name__) from exc
+        if required:
+            raise LaunchRefusal("runtime_gpus_unreadable", type(exc).__name__) from exc
+        print(
+            f"[worker] GPU inventory unreadable ({type(exc).__name__}); serving CPU only",
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
     rows: list[RuntimeGPU] = []
     try:
         for fields in csv.reader(run.stdout.splitlines(), skipinitialspace=True):
@@ -124,9 +131,14 @@ def runtime_gpus(
             )
     except ValueError as exc:
         raise LaunchRefusal("runtime_gpus_invalid", "nvidia-smi returned an invalid row") from exc
-    rows.sort(key=lambda row: row["device_index"])
+    return validated_gpus(rows, required=required)
+
+
+def validated_gpus(rows: list[RuntimeGPU], *, required: bool) -> list[RuntimeGPU]:
+    """One inventory shape for a measured or a virtual device list."""
+    rows = sorted(rows, key=lambda row: row["device_index"])
     indexes = [row["device_index"] for row in rows]
-    if not 1 <= len(rows) <= 16 or indexes != sorted(set(indexes)):
+    if len(rows) > 16 or indexes != sorted(set(indexes)) or (required and not rows):
         raise LaunchRefusal(
             "runtime_gpus_invalid", "GPU inventory is empty, duplicate, or oversized"
         )

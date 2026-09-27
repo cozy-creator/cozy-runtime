@@ -12,7 +12,7 @@ import grpc
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
-from cozy_runtime.internal.worker import machine_capture
+from cozy_runtime.internal.worker import machine_capture, triage
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import (
@@ -84,10 +84,27 @@ class MachineExecutionRPC:
     ) -> Any:
         def get() -> pb.MachineExecutionWorkspace:
             assert self.worker.executions is not None
+            options = self.worker.options
             return pb.MachineExecutionWorkspace(
-                worker_id=self.worker.options.worker_id,
+                worker_id=options.worker_id,
                 worker_boot_id=self.worker.fence.worker_boot_id,
                 execution_workspace_id=self.worker.executions.workspace_id,
+                devices=[
+                    pb.MachineDevice(
+                        ordinal=ordinal,
+                        name=gpu["device_name"],
+                        uuid=gpu["device_uuid"],
+                        memory_bytes=gpu["memory_bytes"],
+                        pci_bus_id=gpu["pci_bus_id"],
+                        driver_version=gpu["driver_version"],
+                    )
+                    for ordinal, gpu in enumerate(options.gpus)
+                ],
+                # A backend without a measured inventory (a flag-launched `serve`) is unknown.
+                accelerator_backend=options.accelerator_backend
+                if options.gpus or options.accelerator_backend == "none"
+                else "",
+                executor_uid_isolation=options.executor_uid >= 0,
             )
 
         return self._call(request.claim, context, get)
@@ -262,6 +279,46 @@ class MachineExecutionRPC:
             )
 
         return self._call(request.execution.claim, context, collect)
+
+    def ReadMachineExecutionTriage(
+        self, request: pb.MachineExecutionTriageQuery, context: Any
+    ) -> Any:
+        def read() -> pb.MachineExecutionTriage:
+            self._query(request.execution)
+            executions = self.worker.executions
+            assert executions is not None
+            owner, request_id = (
+                request.execution.claim.record_owner_id,
+                request.execution.request_id,
+            )
+            if not executions.owns(owner, request_id):
+                raise _ExecutionNotFound("execution is not held by this owner")
+            outcome = executions.outcome(owner, request_id, request.attempt_ordinal or None)
+            body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+            ref = body.get("triage_bundle")
+            if not ref:
+                raise _ExecutionNotFound("the attempt's outcome names no triage bundle")
+            try:
+                data = triage.retained_bytes(
+                    self.worker.bundles.root,
+                    str(ref["subject_id"]),
+                    str(ref["write_receipt_digest"]),
+                    int(ref["length"]),
+                )
+            except triage.TriageError as exc:
+                if exc.code == "bundle_absent":
+                    raise _ExecutionNotFound(exc.detail) from exc
+                raise WorkspaceRefusal(f"{exc.code}: {exc.detail}") from exc
+            return pb.MachineExecutionTriage(
+                bundle=pb.TriageBundleRef(
+                    subject_id=str(ref["subject_id"]),
+                    write_receipt_digest=documents.raw(str(ref["write_receipt_digest"])),
+                    length=int(ref["length"]),
+                ),
+                bundle_canonical_bytes=data,
+            )
+
+        return self._call(request.execution.claim, context, read)
 
     def AcknowledgeMachineExecutionCollection(
         self, request: pb.MachineExecutionCollectionAck, context: Any

@@ -5,19 +5,16 @@ from __future__ import annotations
 import stat
 from pathlib import Path
 
-from cozy_runtime.internal import fill, host_paths
+from cozy_runtime.internal import fill
 from cozy_runtime.internal.config import WorkerHostConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
-
-BOOT_ROOT = host_paths.BOOT_DATA
-LOCAL_TENSORFS_ROOT = host_paths.TENSORFS_ROOT
 
 
 def prepare_boot(
     config: WorkerHostConfig,
     *,
-    boot_root: Path = BOOT_ROOT,
-    tensorfs_root: Path = LOCAL_TENSORFS_ROOT,
+    boot_root: Path | None = None,
+    tensorfs_root: Path | None = None,
 ) -> Path:
     """Bring the pod to READY-BUT-EMPTY by opening its local TensorFS Store.
 
@@ -37,8 +34,9 @@ def prepare_boot(
     publish or reconcile at boot.
     """
 
-    del config  # the handoff carries nothing this step decides on
-    # pod-supervisor already ensured this local Store and prepared its reader permissions
+    boot_root = boot_root or config.layout.boot_data
+    tensorfs_root = tensorfs_root or config.layout.tensorfs_root
+    # The Host already ensured this local Store and prepared its reader permissions
     # through TensorFS. Runtime validates it without creating, chmodding, or reading layout.
     try:
         fill.open_store(tensorfs_root)

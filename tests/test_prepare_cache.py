@@ -96,8 +96,9 @@ def test_the_cache_root_is_not_the_install_root() -> None:
     """`artifact_cache` holds content-addressed CONTROL DOCUMENTS; the install root holds
     package environments. Collapsing them would scatter digest-named files among installs."""
 
-    assert host_paths.PREPARE_CACHE != host_paths.INSTALL_ROOT
-    assert host_paths.INSTALL_ROOT not in host_paths.PREPARE_CACHE.parents
+    layout = host_paths.Layout()
+    assert layout.prepare_cache != layout.install_root
+    assert layout.install_root not in layout.prepare_cache.parents
 
 
 @root_only

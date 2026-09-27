@@ -945,6 +945,18 @@ class Executions:
 
     def collect(self, owner: str, request: str, ordinal: int | None = None) -> pb.AttemptOutcome:
         """Return the existing exact terminal; its native grants use existing byte readers."""
+        outcome, verify, schema = self._terminal(owner, request, ordinal)
+        if verify:
+            self._verify_outputs(owner, outcome, schema)
+        return outcome
+
+    def outcome(self, owner: str, request: str, ordinal: int | None = None) -> pb.AttemptOutcome:
+        """The exact terminal, without the retained-output check collection makes."""
+        return self._terminal(owner, request, ordinal)[0]
+
+    def _terminal(
+        self, owner: str, request: str, ordinal: int | None
+    ) -> tuple[pb.AttemptOutcome, bool, bytes]:
         state = self.status(owner, request)
         if ordinal is None and state.state not in TERMINAL:
             raise WorkspaceRefusal(
@@ -961,9 +973,7 @@ class Executions:
                 raise WorkspaceRefusal("execution has no durable terminal to collect")
             outcome = self.workspace._outcome_frame(row)
             verify = not execution["collected"] and not execution["retention_waived"]
-        if verify:
-            self._verify_outputs(owner, outcome, row["result_schema"])
-        return outcome
+            return outcome, verify, row["result_schema"]
 
     def _verify_outputs(self, owner: str, outcome: pb.AttemptOutcome, schema: bytes) -> None:
         """A journal alone cannot prove an uncollected native result remains present."""

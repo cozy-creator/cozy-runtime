@@ -15,8 +15,9 @@ from cozy_runtime.internal.refusal import LaunchRefusal
 
 
 def test_prepare_boot_opens_the_supervisor_prepared_local_store(tmp_path: Path) -> None:
-    assert Path("/var/lib/tensorfs") == host_paths.TENSORFS_ROOT
-    assert Path("/var/lib/cozy/installs") == host_paths.INSTALL_ROOT
+    assert Path("/var/lib/tensorfs") == host_paths.Layout().tensorfs_root
+    assert Path("/var/lib/cozy/installs") == host_paths.Layout().install_root
+    assert host_paths.layout(str(tmp_path)).tensorfs_root == tmp_path / "var/lib/tensorfs"
     fixed = tmp_path / "fixed-worker-roots"
     store_root = tmp_path / "tensorfs"
     tensorfs.Store.ensure(str(store_root)).prepare_readers()

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -247,6 +248,26 @@ class BundleStore:
                     f"{str(receipt['bundle_digest'])[:23]})",
                 )
         return document
+
+
+SUBJECT = re.compile(r"trb-[0-9a-f]{24}")
+
+
+def retained_bytes(root: Path, subject_id: str, digest: str, length: int) -> bytes:
+    """The exact bytes an outcome's `TriageBundleRef` names, checked against it."""
+    if SUBJECT.fullmatch(subject_id) is None:
+        raise TriageError("bundle_malformed", f"{subject_id!r} is not a triage subject")
+    path = root / f"{subject_id}.json"
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(MAX_BUNDLE_BYTES + 1)
+    except FileNotFoundError as exc:
+        raise TriageError("bundle_absent", f"triage bundle {subject_id} is not retained") from exc
+    if len(data) != length or "sha256:" + hashlib.sha256(data).hexdigest() != digest:
+        raise TriageError(
+            "bundle_corrupt", f"{subject_id}: bytes differ from the outcome's reference"
+        )
+    return data
 
 
 def explain(document: dict[str, Any]) -> list[str]:
