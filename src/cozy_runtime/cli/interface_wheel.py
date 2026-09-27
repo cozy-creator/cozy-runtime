@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 
 from cozy_runtime.author import ConformanceError
@@ -46,43 +48,42 @@ def run(args: list[str]) -> Result:
         if len(interface) > canonical.DOC_MAX_BYTES:
             raise ValueError("interface input exceeds its document bound")
         source = Path(request["implementation_wheel"])
-        with source.open("rb") as stream:
-            implementation = stream.read(interface_wheel.MAX_IMPLEMENTATION_WHEEL + 1)
-        if (
-            len(implementation) > interface_wheel.MAX_IMPLEMENTATION_WHEEL
-            or "sha256:" + hashlib.sha256(implementation).hexdigest()
-            != request["implementation_wheel_digest"]
-        ):
-            raise ValueError("implementation wheel changed or exceeds its bound")
-        filename, wheel = interface_wheel.build(
-            interface,
-            distribution=request["distribution"],
-            version=request["version"],
-            implementation_wheel=implementation,
-            implementation_filename=source.name,
-        )
         output = Path(request["output_directory"]).resolve()
         output.mkdir(parents=True, exist_ok=True)
-        target = output / filename
-        # The wheel is derived from its inputs: an existing file with other bytes (another
-        # generator version) is replaced atomically, never a refusal.
-        if not target.is_file() or target.read_bytes() != wheel:
-            temporary = output / f".{filename}.{os.getpid()}.partial"
-            with temporary.open("wb") as stream:
-                stream.write(wheel)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
+        with (
+            source.open("rb") as implementation,
+            tempfile.NamedTemporaryFile(dir=output, prefix=".", suffix=".partial") as staged,
+        ):
+            digest = "sha256:" + hashlib.file_digest(implementation, "sha256").hexdigest()
+            if digest != request["implementation_wheel_digest"]:
+                raise ValueError("implementation wheel changed")
+            implementation.seek(0)
+            filename = interface_wheel.build(
+                interface,
+                staged,
+                distribution=request["distribution"],
+                version=request["version"],
+                implementation=implementation,
+                implementation_filename=source.name,
+            )
+            staged.flush()
+            os.fsync(staged.fileno())
+            staged.seek(0)
+            digest = "sha256:" + hashlib.file_digest(staged, "sha256").hexdigest()
+            length = staged.tell()
+            # Derived from its inputs: whatever an earlier generator left there is replaced.
+            target = output / filename
+            os.replace(staged.name, target)
         return Result(
             document={
                 "filename": filename,
                 "path": str(target),
-                "digest": "sha256:" + hashlib.sha256(wheel).hexdigest(),
-                "length": len(wheel),
+                "digest": digest,
+                "length": length,
                 "generator_abi": interface_wheel.GENERATOR_ABI,
             }
         )
-    except (OSError, ValueError, ConformanceError) as exc:
+    except (OSError, ValueError, ConformanceError, zipfile.BadZipFile) as exc:
         raise CliError(
             "interface_generation_refused",
             str(exc),

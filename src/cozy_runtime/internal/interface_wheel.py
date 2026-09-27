@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import contextlib
 import csv
 import email.parser
 import hashlib
@@ -11,7 +12,8 @@ import io
 import re
 import zipfile
 from collections import defaultdict
-from typing import Any
+from collections.abc import Iterable, Iterator
+from typing import IO, Any
 
 from packaging.tags import parse_tag
 from packaging.utils import canonicalize_name, parse_wheel_filename
@@ -21,7 +23,6 @@ from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import invocable_interface, package_interface
 
 GENERATOR_ABI = "cozy.interface-generator/9"
-MAX_IMPLEMENTATION_WHEEL = 256 << 20
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _COMPANION = re.compile(r"(?:.+/)?_cozy_callers_[0-9a-f]{16}_[0-9]+\.py")
 _COMPANION_IMPORT = re.compile(rb"\n\nfrom \.?_cozy_callers_[0-9a-f]{16}_[0-9]+ import [^\n]*\n\Z")
@@ -339,115 +340,125 @@ def _declare(declarations: dict[str, tuple[bytes, str]], name: str, source: str)
 
 def build(
     interface: bytes,
+    output: IO[bytes],
     *,
     distribution: str,
     version: str,
-    implementation_wheel: bytes | None = None,
+    implementation: IO[bytes] | None = None,
     implementation_filename: str | None = None,
-) -> tuple[str, bytes]:
-    """Package deterministic interface source and an optional implementation overlay."""
+) -> str:
+    """Stream deterministic interface source, and an optional implementation overlay, to output."""
     if not _DISTRIBUTION.fullmatch(distribution) or str(Version(version)) != version:
         raise ConformanceError("interface wheel binding is not exact", code="interface_binding")
     normalized = re.sub(r"[-_.]+", "_", distribution).lower()
     dist = f"{normalized}-{version}.dist-info"
-    files = generate(interface)
-    attributes: dict[str, int] = {}
     filename = f"{normalized}-{version}-py3-none-any.whl"
     metadata = (
         "Metadata-Version: 2.4\n" + f"Name: {distribution}\nVersion: {version}\n"
         "Requires-Python: >=3.12\nRequires-Dist: cozy-runtime>=0.4.0\n"
     ).encode()
-    if implementation_wheel is not None:
-        if implementation_filename is None:
-            raise ConformanceError(
-                "implementation wheel filename is required", code="interface_binding"
+    with contextlib.ExitStack() as stack:
+        if implementation is None:
+            entries = {path: _bytes(data) for path, data in generate(interface).items()}
+            entries[dist + "/WHEEL"] = _bytes(
+                b"Wheel-Version: 1.0\nGenerator: cozy-runtime\n"
+                b"Root-Is-Purelib: true\nTag: py3-none-any\n"
             )
-        files, metadata, attributes = _overlay(
-            interface, implementation_wheel, distribution, version
+        else:
+            if implementation_filename is None:
+                raise ConformanceError(
+                    "implementation wheel filename is required", code="interface_binding"
+                )
+            source = stack.enter_context(zipfile.ZipFile(implementation))
+            entries, metadata = _overlay(interface, source, distribution, version)
+            _wheel_identity(
+                implementation_filename, source.read(dist + "/WHEEL"), distribution, version
+            )
+            filename = implementation_filename
+        entries[dist + "/package-interface.json"] = _bytes(interface)
+        layout = "generated" if implementation is None else "overlay"
+        header, _, description = metadata.partition(b"\n\n")
+        entries[dist + "/METADATA"] = _bytes(
+            header.rstrip(b"\n")
+            + (
+                f"\nCozy-Interface-Generator: {GENERATOR_ABI}\nCozy-Interface-Layout: {layout}\n\n"
+            ).encode()
+            + description,
+            entries.get(dist + "/METADATA", _bytes(b""))[0],
         )
-        _wheel_identity(implementation_filename, files[dist + "/WHEEL"], distribution, version)
-        filename = implementation_filename
-    files[dist + "/package-interface.json"] = interface
-    layout = "overlay" if implementation_wheel is not None else "generated"
-    header, _, description = metadata.partition(b"\n\n")
-    files[dist + "/METADATA"] = (
-        header.rstrip(b"\n")
-        + (
-            f"\nCozy-Interface-Generator: {GENERATOR_ABI}\nCozy-Interface-Layout: {layout}\n\n"
-        ).encode()
-        + description
-    )
-    if implementation_wheel is None:
-        files[dist + "/WHEEL"] = (
-            b"Wheel-Version: 1.0\nGenerator: cozy-runtime\n"
-            b"Root-Is-Purelib: true\nTag: py3-none-any\n"
-        )
-    rows = [
-        [
-            path,
-            "sha256="
-            + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode(),
-            str(len(data)),
-        ]
-        for path, data in sorted(files.items())
-    ]
-    rows.append([dist + "/RECORD", "", ""])
-    record = io.StringIO(newline="")
-    csv.writer(record, lineterminator="\n").writerows(rows)
-    files[dist + "/RECORD"] = record.getvalue().encode()
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for path, data in sorted(files.items()):
-            info = zipfile.ZipInfo(path, date_time=(2000, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = attributes.get(path, 0o100644 << 16)
-            archive.writestr(info, data)
-    return filename, output.getvalue()
+        archive = stack.enter_context(zipfile.ZipFile(output, "w"))
+        rows = [_write(archive, path, entry) for path, entry in sorted(entries.items())]
+        rows.append([dist + "/RECORD", "", ""])
+        record = io.StringIO(newline="")
+        csv.writer(record, lineterminator="\n").writerows(rows)
+        _write(archive, dist + "/RECORD", _bytes(record.getvalue().encode()))
+    return filename
+
+
+# (zip mode, uncompressed size, content chunks): an implementation member streams from its
+# archive, so no wheel is ever held in memory.
+_Entry = tuple[int, int, Iterable[bytes]]
+
+
+def _bytes(data: bytes, mode: int = 0o100644 << 16) -> _Entry:
+    return mode, len(data), (data,)
+
+
+def _member(source: zipfile.ZipFile, row: zipfile.ZipInfo) -> _Entry:
+    def chunks() -> Iterator[bytes]:
+        with source.open(row) as stream:
+            while chunk := stream.read(1 << 20):
+                yield chunk
+
+    return row.external_attr, row.file_size, chunks()
+
+
+def _write(archive: zipfile.ZipFile, path: str, entry: _Entry) -> list[str]:
+    info = zipfile.ZipInfo(path, date_time=(2000, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr, info.file_size, chunks = entry
+    digest = hashlib.sha256()
+    with archive.open(info, "w") as stream:
+        for chunk in chunks:
+            digest.update(chunk)
+            stream.write(chunk)
+    encoded = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode()
+    return [path, "sha256=" + encoded, str(info.file_size)]
 
 
 def _overlay(
-    interface: bytes, implementation: bytes, distribution: str, version: str
-) -> tuple[dict[str, bytes], bytes, dict[str, int]]:
+    interface: bytes, source: zipfile.ZipFile, distribution: str, version: str
+) -> tuple[dict[str, _Entry], bytes]:
     """Retain library code/data/dependencies and replace only managed callable exports."""
-    if len(implementation) > MAX_IMPLEMENTATION_WHEEL:
-        raise ConformanceError("implementation wheel exceeds its bound", code="interface_binding")
-    with zipfile.ZipFile(io.BytesIO(implementation)) as archive:
-        members = archive.infolist()
-        if sum(row.file_size for row in members) > MAX_IMPLEMENTATION_WHEEL:
+    entries: dict[str, _Entry] = {}
+    for row in source.infolist():
+        path = row.filename
+        if row.is_dir():
+            continue
+        if (
+            path in entries
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or ((row.external_attr >> 16) & 0o170000) == 0o120000
+        ):
             raise ConformanceError(
-                "implementation contents exceed their bound", code="interface_binding"
+                "implementation wheel has invalid members", code="interface_binding"
             )
-        files = {}
-        attributes = {}
-        for row in members:
-            path = row.filename
-            if row.is_dir():
-                continue
-            if (
-                path in files
-                or path.startswith("/")
-                or "\\" in path
-                or any(part in {"", ".", ".."} for part in path.split("/"))
-                or ((row.external_attr >> 16) & 0o170000) == 0o120000
-            ):
-                raise ConformanceError(
-                    "implementation wheel has invalid members", code="interface_binding"
-                )
-            files[path] = archive.read(row)
-            attributes[path] = row.external_attr
-    metadata_paths = [name for name in files if name.endswith(".dist-info/METADATA")]
+        entries[path] = _member(source, row)
+    metadata_paths = [name for name in entries if name.endswith(".dist-info/METADATA")]
     if len(metadata_paths) != 1:
         raise ConformanceError(
             "implementation wheel has no unique metadata", code="interface_binding"
         )
     metadata_path = metadata_paths[0]
-    metadata = files[metadata_path].replace(b"\r\n", b"\n")
+    metadata = source.read(metadata_path).replace(b"\r\n", b"\n")
     expected_dist = re.sub(r"[-_.]+", "_", distribution).lower() + "-" + version + ".dist-info"
     if metadata_path != expected_dist + "/METADATA":
         raise ConformanceError(
             "implementation metadata directory differs", code="interface_binding"
         )
-    if expected_dist + "/WHEEL" not in files:
+    if expected_dist + "/WHEEL" not in entries:
         raise ConformanceError(
             "implementation wheel has no WHEEL metadata", code="interface_binding"
         )
@@ -471,11 +482,14 @@ def _overlay(
             raise ConformanceError(
                 "a generated interface wheel is not an implementation", code="interface_binding"
             )
-        for name in [name for name in files if _COMPANION.fullmatch(name)]:
-            del files[name]
-        for name, data in files.items():
+        for name in [name for name in entries if _COMPANION.fullmatch(name)]:
+            del entries[name]
+        for name, (mode, _, _) in list(entries.items()):
             if name.endswith(".py"):
-                files[name] = _COMPANION_IMPORT.sub(b"", data)
+                data = source.read(name)
+                stripped = _COMPANION_IMPORT.sub(b"", data)
+                if stripped != data:
+                    entries[name] = _bytes(stripped, mode)
         header, _, description = metadata.partition(b"\n\n")
         metadata = (
             b"\n".join(
@@ -492,22 +506,23 @@ def _overlay(
             + b"\n\n"
             + description
         )
-    for target, (generated, source, suffix) in overlay_sources(interface, set(files)).items():
-        if generated in files:
+    for target, (generated, code, suffix) in overlay_sources(interface, set(entries)).items():
+        if generated in entries:
             raise ConformanceError(
                 "caller module collides with implementation", code="interface_binding"
             )
-        files[generated] = source
-        files[target] += suffix
-    # Rebuilt below; every other source, extension, asset and dependency header stays.
-    for name in list(files):
-        if name.startswith(metadata_path.rpartition("/")[0] + "/") and name.rpartition("/")[2] in {
+        entries[generated] = _bytes(code)
+        mode, _, chunks = entries[target]
+        entries[target] = _bytes(b"".join(chunks) + suffix, mode)
+    # Rebuilt by `build`; every other source, extension, asset and dependency header stays.
+    for name in list(entries):
+        if name.startswith(expected_dist + "/") and name.rpartition("/")[2] in {
             "RECORD",
             "RECORD.jws",
             "RECORD.p7s",
         }:
-            del files[name]
-    return files, metadata, attributes
+            del entries[name]
+    return entries, metadata
 
 
 def _wheel_identity(filename: str, raw: bytes, distribution: str, version: str) -> None:

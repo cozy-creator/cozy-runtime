@@ -70,6 +70,13 @@ def project(tmp_path: Path) -> Path:
     return root
 
 
+def built(raw: bytes, implementation: bytes | None = None, **options: str) -> tuple[str, bytes]:
+    """`interface_wheel.build` over in-memory wheels."""
+    output = io.BytesIO()
+    source = None if implementation is None else io.BytesIO(implementation)
+    return interface_wheel.build(raw, output, implementation=source, **options), output.getvalue()
+
+
 def test_modeled_invocable_serving_has_one_model_plane_for_self_and_generated_calls(
     tmp_path: Path,
 ) -> None:
@@ -445,18 +452,18 @@ def test_caller_overlay_preserves_helpers_assets_and_dependencies(tmp_path: Path
             "serving_fixture-0.1.0.dist-info/WHEEL",
             "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         )
-    filename, wheel = interface_wheel.build(
+    filename, wheel = built(
         raw,
         distribution="serving-fixture",
         version="0.1.0",
-        implementation_wheel=original.getvalue(),
+        implementation=original.getvalue(),
         implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
     )
-    assert interface_wheel.build(
+    assert built(
         raw,
         distribution="serving-fixture",
         version="0.1.0",
-        implementation_wheel=original.getvalue(),
+        implementation=original.getvalue(),
         implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
     ) == (filename, wheel)
     with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
@@ -527,26 +534,26 @@ def secret(ctx: Context, payload: Request) -> Result:
             "dual_fixture-0.1.0.dist-info/WHEEL",
             "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         )
-    _, wheel = interface_wheel.build(
+    _, wheel = built(
         raw,
         distribution="dual-fixture",
         version="0.1.0",
-        implementation_wheel=original.getvalue(),
+        implementation=original.getvalue(),
         implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
-    _, repeated = interface_wheel.build(
+    _, repeated = built(
         raw,
         distribution="dual-fixture",
         version="0.1.0",
-        implementation_wheel=wheel,
+        implementation=wheel,
         implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
     assert repeated == wheel
-    _, captured = interface_wheel.build(
+    _, captured = built(
         raw,
         distribution="dual-fixture",
         version="0.1.0",
-        implementation_wheel=wheel,
+        implementation=wheel,
         implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
     with zipfile.ZipFile(io.BytesIO(captured)) as archive:
@@ -562,11 +569,11 @@ def secret(ctx: Context, payload: Request) -> Result:
                 body += b"# tampered\n"
             altered.writestr(name, body)
     # Recapture replaces the reserved companions instead of comparing their bytes.
-    _, recaptured = interface_wheel.build(
+    _, recaptured = built(
         raw,
         distribution="dual-fixture",
         version="0.1.0",
-        implementation_wheel=corrupted.getvalue(),
+        implementation=corrupted.getvalue(),
         implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
     with (
@@ -673,24 +680,22 @@ def test_source_overlay_preserves_platform_build_metadata_and_native_bytes(
         version="0.1.0",
         implementation_filename=filename,
     )
-    actual_filename, overlay = interface_wheel.build(
-        raw, implementation_wheel=original.getvalue(), **options
-    )
+    actual_filename, overlay = built(raw, implementation=original.getvalue(), **options)
     assert actual_filename == filename
     with zipfile.ZipFile(io.BytesIO(overlay)) as archive:
         assert archive.read("serving_fixture-0.1.0.dist-info/WHEEL") == wheel_metadata
         assert archive.read("serving_fixture_native.abi3.so") == native
         assert archive.read(script.filename) == native
         assert archive.getinfo(script.filename).external_attr == script.external_attr
-    assert interface_wheel.build(raw, implementation_wheel=overlay, **options) == (
+    assert built(raw, implementation=overlay, **options) == (
         filename,
         overlay,
     )
     with pytest.raises(ConformanceError, match="filename and WHEEL metadata disagree"):
-        interface_wheel.build(
+        built(
             raw,
             distribution="serving-fixture",
             version="0.1.0",
             implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
-            implementation_wheel=original.getvalue(),
+            implementation=original.getvalue(),
         )
