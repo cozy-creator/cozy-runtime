@@ -40,7 +40,6 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
     root = capture.get("root_installation_id", "")
     prepared: dict[str, dict[str, Any]] = {}
     interfaces: dict[str, dict[str, Any]] = {}
-    root_placements: list[dict[str, Any]] = []
     for package in inventory:
         identifier = package.get("installation_id", "")
         if not identifier or identifier in prepared:
@@ -50,8 +49,6 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             for (_, selected, _), value in worker.prepared_installations.items()
             if selected == identifier
         ]
-        if identifier == root:
-            root_placements = [value.document for value in candidates]
         if not candidates:
             raise WorkspaceRefusal("execution package has not been installed on this machine")
         selected = candidates[0]
@@ -134,25 +131,24 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             ),
             None,
         )
-        # One of the placements this machine prepared for the root installation, named by
-        # the facts that bind execution; an additive or reordered field from the owner's
-        # copy is not a different placement. A release prepared for several model
-        # selections holds each, so concurrent roots of one release never displace another.
-        held = next(
-            (
-                placement
-                for placement in root_placements
-                if selected_entry is not None
-                and all(
-                    selected_entry.get(key) == placement.get(key)
-                    for key in ("installation_id", "bindings_digest", "package_interface", "models")
+        # The placement this machine prepared, by the key it holds it under: the bindings
+        # digest covers the entrypoints and models, and the installation its interface. A
+        # release prepared for several model selections holds each, so concurrent roots of
+        # one release never displace another.
+        held = (
+            worker.prepared_installations.get(
+                (
+                    request.offer.placement_id,
+                    root,
+                    documents.raw(str(selected_entry.get("bindings_digest", ""))),
                 )
-            ),
-            None,
+            )
+            if selected_entry is not None and selected_entry.get("bindings_digest")
+            else None
         )
-        if selected_entry is None or installation_identity(selected_entry) != root or held is None:
+        if held is None or installation_identity(selected_entry or {}) != root:
             raise WorkspaceRefusal("execution inference does not name the captured root")
-        prepared[root]["placement"] = held
+        prepared[root]["placement"] = held.document
     root_interface = interfaces[root]
     if "job" in spec:
         root_callable = next(
