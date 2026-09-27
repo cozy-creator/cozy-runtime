@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from cozy_runtime import canonical_json
@@ -16,7 +17,7 @@ from . import (
     workspace_memo,
     workspace_sources,
 )
-from .workspace import WorkspaceRefusal
+from .workspace import Journal, WorkspaceRefusal
 from .workspace_calls import Call
 from .workspace_calls import Calls as JournalCalls
 
@@ -34,6 +35,10 @@ OPERATIONS = {
     "upload_civitai": pb.NATIVE_SOURCE_OPERATION_CIVITAI,
 }
 PROVIDER_EXPORTS = ("download_huggingface", "download_civitai", *source_interfaces.UPLOADS)
+PROVIDERS = {
+    pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE: "huggingface",
+    pb.NATIVE_SOURCE_OPERATION_CIVITAI: "civitai",
+}
 
 
 class Sources:
@@ -41,6 +46,46 @@ class Sources:
         self.worker = worker
         self.lock = threading.Lock()
         self.selections: dict[str, pb.NativeSourceSelection] = {}
+        # The owner's provider credentials per (owner, root execution), in memory only.
+        self.credentials: dict[tuple[str, str], dict[pb.NativeSourceOperation, str]] = {}
+
+    def hold(self, owner: str, request: str, given: Iterable[pb.SourceCredential]) -> None:
+        values = {row.provider: row.credential for row in given if row.provider in PROVIDERS}
+        if values:
+            with self.lock:
+                self.credentials.setdefault((owner, request), {}).update(values)
+
+    def declare(self, owner: str, request: str) -> None:
+        """Journal the providers this accepted execution holds a credential for."""
+        with self.lock:
+            held = {PROVIDERS[p] for p in self.credentials.get((owner, request), {})}
+        if held and (workspace := self.worker.workspace) is not None:
+            with workspace.locked() as db:
+                names = ",".join(sorted(held | self._declared(db, owner, request)))
+                db.execute(
+                    "UPDATE executions SET source_providers=? WHERE owner=? AND request=?",
+                    (names, owner, request),
+                )
+
+    def forget(self, owner: str, request: str) -> None:
+        with self.lock:
+            self.credentials.pop((owner, request), None)
+
+    def awaiting(self, owner: str, request: str) -> list[pb.NativeSourceOperation]:
+        """Declared providers whose credential this process no longer holds (a restart)."""
+        assert self.worker.workspace is not None
+        with self.worker.workspace.locked() as db:
+            declared = self._declared(db, owner, request)
+        with self.lock:
+            held = self.credentials.get((owner, request), {})
+        return [p for p, name in PROVIDERS.items() if name in declared and p not in held]
+
+    @staticmethod
+    def _declared(db: Journal, owner: str, request: str) -> set[str]:
+        row = db.execute(
+            "SELECT source_providers FROM executions WHERE owner=? AND request=?", (owner, request)
+        ).fetchone()
+        return set(filter(None, row[0].split(","))) if row is not None else set()
 
     def observe(self, status: pb.NativeSourceStatus) -> None:
         # Delivery URLs stay in memory. The source service already journals the exact
@@ -85,7 +130,14 @@ class Sources:
             ):
                 return
         if request.export in PROVIDER_EXPORTS:
+            assert self.worker.executions is not None
+            root = self.worker.executions.scheduling_root(owner, request.parent_request_id)[0]
+            if command.operation in self.awaiting(owner, root):
+                return  # the owner's credential is supplied again before this call runs
             with self.lock:
+                command.credential = self.credentials.get((owner, root), {}).get(
+                    command.operation, ""
+                )
                 selection = self.selections.get(command.service_id)
             if selection is None:
                 command.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE

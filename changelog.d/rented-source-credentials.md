@@ -1,0 +1,1 @@
+A machine execution presents the owner's submitted Hugging Face or Civitai credential to its native source calls, so gated sources ingest on rentals. The value stays in worker memory only. After a restart, the call waits for the owner to supply it again instead of failing with 401.
