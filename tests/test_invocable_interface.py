@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import subprocess
 import sys
@@ -94,6 +95,27 @@ def test_legacy_memo_declaration_refuses_instead_of_silently_disabling_cache() -
     declaration["reusable"] = declaration.pop("memoize")
     with pytest.raises(ConformanceError, match="invocable_interface"):
         package_interface.read_bytes(canonical.write(document))
+
+
+def test_additive_invocable_metadata_from_another_runtime_still_generates() -> None:
+    _, raw = described()
+    document = canonical.parse_canonical(raw)
+    declaration = document["jobs"][0]["invocable"]
+    declaration["future_hint"] = {"added_by": "a newer Runtime"}
+    declaration["type_names"]["request/removed"] = "Removed"
+    declaration["defaults"]["request/removed"] = 3
+    declaration["capabilities"] = ["network-read", "gpu", "gpu"]
+    evolved = canonical.write(document)
+    package_interface.read_bytes(evolved)
+
+    def generated(interface: bytes) -> dict[str, bytes]:
+        digest = hashlib.sha256(interface).hexdigest().encode()
+        return {
+            name: body.replace(digest, b"<interface>")
+            for name, body in interface_wheel.generate(interface).items()
+        }
+
+    assert generated(evolved) == generated(raw)
 
 
 @pytest.mark.parametrize("fn", [invalid_positional, invalid_bytes, invalid_default])

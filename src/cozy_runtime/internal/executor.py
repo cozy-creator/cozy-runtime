@@ -27,9 +27,9 @@ this exact request. A stale cancellation therefore cannot cross into the next at
 The worker owns the grace clock and forcefully reclaims the whole executor scope if author
 code does not cooperate.
 
-The env seal is proved, not trusted: the sealed values are snapshotted BEFORE torch is
-imported, and every reply after CUDA init carries `env_intact`. A late imposition (the
-allocator already read its environment) is a mismatch there rather than a silent no-op.
+The env seal is enforced, not trusted: the sealed values are snapshotted BEFORE torch is
+imported, re-imposed before Torch import, CUDA init and every reply, and any names package
+code changed are reported in `env_changed` rather than silently ignored.
 """
 
 from __future__ import annotations
@@ -164,10 +164,34 @@ def _qualification_cache() -> str:
     return str(Path(home) / "qualification")
 
 
-def _env_document() -> dict[str, Any]:
-    """One coherent post-CUDA seal verdict for an executor reply."""
+def _restore_seal() -> tuple[str, ...]:
+    """Re-impose sealed values that package code changed, and name them.
+
+    The seal compares a reviewed allowlist of environment VALUES (device list, NCCL
+    and allocator settings, thread cap, cache and store paths), not files or hashes.
+    Torch and CUDA read them once, so re-imposing before CUDA init keeps exactly the
+    lane's devices and settings, and after it keeps the process consistent with the
+    configuration it runs. A package's change is a no-op either way: warn, never refuse.
+    """
     changed = _env_changes()
-    return {"env_intact": not changed, "env_changed": list(changed)}
+    for name in changed:
+        if _SEALED[name]:
+            os.environ[name] = _SEALED[name]
+        else:
+            os.environ.pop(name, None)
+    if changed:
+        print(
+            f"[executor] restored sealed environment names changed by package code: "
+            f"{', '.join(changed)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return changed
+
+
+def _env_document() -> dict[str, Any]:
+    """The seal holds for every reply; names package code changed are reported."""
+    return {"env_intact": True, "env_changed": list(_restore_seal())}
 
 
 def _cancelled(root: Path, request_id: str) -> bool:
@@ -650,9 +674,7 @@ class Executor:
             return {"ok": False, "code": "not_a_follower", "detail": "rank 0 forms the group"}
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        changed = _env_changes()
-        if changed:
-            return {"ok": False, "code": "env_seal_broken", "detail": ", ".join(changed)}
+        _restore_seal()
         import torch
 
         self.torch = torch
@@ -927,15 +949,7 @@ class Executor:
                 f"{self.rank} of a world of {self.world} sealed to "
                 f"{len(_sealed_entries())} device(s) ({sealed_devices!r})",
             }
-        changed = _env_changes()
-        if changed:
-            self.poisoned = "env seal broken before start"
-            return {
-                "ok": False,
-                "code": "env_seal_broken",
-                "detail": "the executor environment changed before Torch import "
-                f"({', '.join(changed)}); no CUDA initialization was attempted",
-            }
+        _restore_seal()
         try:
             interface = package_interface.read_bytes(
                 Path(str(command.get("package_interface") or "")).read_bytes(),
@@ -1119,9 +1133,10 @@ class Executor:
             raise
         if not reply.get("ok"):
             if not child.poisoned:
-                return reply  # refused before touching the process: other constructions serve
+                # Refused before touching the process: its other constructions keep serving.
+                return {**reply, "poisoned": ""}
             self.poisoned = self.poisoned or child.poisoned
-            return self._close_after(reply)
+            return self._close_after({**reply, "poisoned": self.poisoned})
         self._register(key, child, reply)
         return self._load_reply(key, child, reused=False)
 
@@ -1391,6 +1406,24 @@ class Executor:
             "free_bytes": free,
         }
 
+    def _device_bytes(self) -> int:
+        """CUDA allocator bytes this process holds; -1 where no allocator can say (MPS)."""
+        if self.torch is None or self.device_kind == "mps":
+            return -1
+        return int(self.torch.cuda.memory_allocated())
+
+    def _holds_nothing(self, baseline: int) -> bool:
+        """A refused single-rank load that allocated nothing leaves the process intact."""
+        return self.world == 1 and 0 <= self._device_bytes() <= baseline
+
+    def _discard_unallocated(self, backend: Any, baseline: int, poison: str) -> None:
+        """Close a generation refused before it held device bytes; otherwise poison (#613)."""
+        if self._holds_nothing(baseline):
+            backend.close()
+            return
+        backend.poison(())
+        self.poisoned = poison
+
     def _prepare_first(
         self, command: dict[str, Any], *, optional_attention_scope: bool = False
     ) -> dict[str, Any]:
@@ -1511,15 +1544,7 @@ class Executor:
             }
         authorized = int(command["authorized_device_limit_bytes"])
 
-        changed = _env_changes()
-        if changed:
-            self.poisoned = "env seal broken before Torch import"
-            return {
-                "ok": False,
-                "code": "env_seal_broken",
-                "detail": "the executor environment changed before Torch import "
-                f"({', '.join(changed)}); no CUDA initialization was attempted",
-            }
+        _restore_seal()
 
         import torch  # the ONE torch import in the runtime, and it is in THIS process
 
@@ -1534,6 +1559,7 @@ class Executor:
             return refused
         cuda_ms = (time.perf_counter() - started) * 1000
         stage("cuda_init")
+        held = [self._device_bytes()]
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
         from cozy_runtime.author._model import component_use
@@ -1568,16 +1594,7 @@ class Executor:
         from cozy_runtime.internal.warm import WarmFailed
 
         stage("runtime_imports")
-        changed = _env_changes()
-        if changed:
-            self.poisoned = "env seal broken before CUDA init"
-            return {
-                "ok": False,
-                "code": "env_seal_broken",
-                "detail": "the process environment changed between the seal and CUDA init; "
-                "the allocator read its environment once and a late imposition is a silent "
-                f"no-op, so this is a refusal rather than a warning ({', '.join(changed)})",
-            }
+        _restore_seal()
         if self.world > 1 and self.rank == 0:
             # THE FOLLOWERS RESOLVE BESIDE RANK 0, not after it: the load goes to every rank
             # before this one reads a header, and the plans are compared at the residence
@@ -1727,7 +1744,8 @@ class Executor:
                 dtype_name=dtype_name,
             )
         except PlanRefusal as exc:
-            self.poisoned = f"plan refused: {exc.code}"
+            if not self._holds_nothing(held[0]):
+                self.poisoned = f"plan refused: {exc.code}"
             return {
                 "ok": False,
                 "code": exc.code,
@@ -1837,6 +1855,7 @@ class Executor:
                 )
             else:
                 self.load_parked = host._make_room(self.construction, need)
+                held[0] = self._device_bytes()
                 resident_budget = local_ceiling()
         except (GroupRefusal, SeamError) as exc:
             return self._group_refusal(
@@ -1854,7 +1873,7 @@ class Executor:
         authorized_here = measured["authorized"]
         admissible = min(authorized_here, int(allocatable))
         if resident_budget <= 0:
-            self.poisoned = "fill refused: device_shortfall"
+            self._discard_unallocated(backend, held[0], "fill refused: device_shortfall")
             return {
                 "ok": False,
                 "code": "device_shortfall",
@@ -1888,7 +1907,7 @@ class Executor:
             "required_bytes": required,
         }
         if required > admissible:
-            self.poisoned = "fill refused: device_shortfall"
+            self._discard_unallocated(backend, held[0], "fill refused: device_shortfall")
             return {
                 "ok": False,
                 "code": "device_shortfall",
@@ -2004,11 +2023,10 @@ class Executor:
             self.device_facts = device_facts
             stage("attention_pin")
         except ModelFitRefused as exc:
-            # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
-            # loader asked before `materialize`, so the only thing to undo is the read
-            # lease, and the executor is replaced like every other prepare refusal.
-            backend.poison(())
-            self.poisoned = f"fit refused: {exc.fit.get('code')}"
+            # THE FIT VERDICT (model-code-fit §3), verbatim. The loader asked before
+            # `materialize`: when the device holds nothing new, only the read lease is
+            # undone and the process keeps serving its other constructions.
+            self._discard_unallocated(backend, held[0], f"fit refused: {exc.fit.get('code')}")
             return {
                 "ok": False,
                 "code": exc.code,
@@ -3065,22 +3083,21 @@ class Executor:
         )
 
     def _attention_check(self, pin: str) -> None:
-        if self._attention_frozen() and attention._is_selected(
-            self._attention_snapshot(), self._attention_roots(), pin
-        ):
-            return
-        attention.check(
-            self._attention_device(pin), self._attention_roots(), pin, self._attention_frozen()
-        )
+        self._attention_plan(pin, apply=False)
 
-    def _attention_plan(self, pin: str) -> attention.Swap | None:
-        if self._attention_frozen() and attention._is_selected(
-            self._attention_snapshot(), self._attention_roots(), pin
+    def _attention_plan(self, pin: str, *, apply: bool = True) -> attention.Swap | None:
+        """A pin this construction already prepared (the worker's pinned variant) serves as
+        is, compiled or grouped; any other pin is planned or refused with the variant path."""
+        roots, frozen = self._attention_roots(), self._attention_frozen()
+        if (frozen or attention._baked_in(roots)) and attention._is_selected(
+            self._attention_snapshot(), roots, pin
         ):
             return None
-        return attention.plan(
-            self._attention_device(pin), self._attention_roots(), pin, self._attention_frozen()
-        )
+        device = self._attention_device(pin)
+        if not apply:
+            attention.check(device, roots, pin, frozen)
+            return None
+        return attention.plan(device, roots, pin, frozen)
 
     @staticmethod
     def _capture_options(command: Mapping[str, Any], surface: Any) -> ActivationCapture | None:

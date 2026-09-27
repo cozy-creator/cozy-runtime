@@ -393,19 +393,60 @@ def sized_blocks(root: Path, size: int) -> dict[str, Any]:
         driver.close()
 
 
+def refused_loads(root: Path) -> dict[str, Any]:
+    """Loads refused before they hold device bytes leave the process and its models serving."""
+    store = root / "store"
+    torch.manual_seed(5)
+    pipe = BlockPipe(Config({"block": {"size": 8}}))
+    native.native_model(store, "block-a", pipe.components, {"block": {"size": 8}})
+    # The checkpoint's inline config asks for 16x16 while its tensor is 8x8: a fit refusal.
+    native.native_model(store, "block-bad", pipe.components, {"block": {"size": 16}})
+    expected = float(pipe.components["block"](torch.ones(1, 8)).sum().detach())
+    os.environ["CUDA_VISIBLE_DEVICES"] = "cpu0"
+    bindings = {
+        key: _stage(root, BLOCK, key, {"generate.models.block": f"test/{model}@1"}, store)
+        for key, model in (("A", "block-a"), ("B", "block-bad"), ("C", "block-a"))
+    }
+    driver = Driver(root / "run", "cpu", "cpu0")
+    try:
+        pid = driver.call({"cmd": "hello"})["pid"]
+        assert _start(driver, bindings["A"], 1, "cpu0")["ok"]
+        assert driver.call(_load_command(bindings["A"], "A", 1, "cpu", 64 << 30))["ok"]
+        misfit = driver.call(_load_command(bindings["B"], "B", 1, "cpu", 64 << 30))
+        assert not misfit["ok"] and misfit["code"] == "model_fit_refused", misfit
+        assert misfit["poisoned"] == "", misfit
+        starved = driver.call(_load_command(bindings["C"], "C", 1, "cpu", 1))
+        assert starved["code"] == "device_shortfall" and starved["poisoned"] == "", starved
+        assert set(_states(driver)) == {"A"}
+        activated = driver.call(
+            {"cmd": "activate", "construction": "A", "authorized_device_limit_bytes": 64 << 30}
+        )
+        assert activated["ok"], activated
+        served = _serve(driver, root, "A", "after-refusals")
+        assert math.isclose(served["checksum"], expected, rel_tol=1e-5), served
+        assert driver.call({"cmd": "hello"})["pid"] == pid
+        return {"codes": [misfit["code"], starved["code"]]}
+    finally:
+        driver.close()
+
+
 def main() -> None:
     if "--serve" in sys.argv:
         index = sys.argv.index("--serve")
         serve(sys.argv[index + 1], sys.argv[1:index] + sys.argv[index + 2 :])
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--arm", choices=("two-models", "sized-blocks"), required=True)
+    parser.add_argument(
+        "--arm", choices=("two-models", "sized-blocks", "refused-loads"), required=True
+    )
     parser.add_argument("--degree", type=int, default=1)
     parser.add_argument("--size", type=int, default=8192)
     args = parser.parse_args()
     torch.set_num_threads(1)
     if args.arm == "two-models":
         facts = two_models(args.root, args.degree)
+    elif args.arm == "refused-loads":
+        facts = refused_loads(args.root)
     else:
         facts = sized_blocks(args.root, args.size)
     print(json.dumps(facts), flush=True)

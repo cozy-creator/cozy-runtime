@@ -1349,9 +1349,10 @@ def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str 
     if blocked:
         raise AttentionRefusal(
             "attention_kernel_frozen",
-            f"{name} cannot be pinned per request: {blocked}. "
-            "Prepare a new generation with this choice in the model attention policy "
-            "before compilation or parallel-group construction",
+            f"{name} cannot be swapped into this prepared construction: {blocked}. "
+            "Send the pin with the request so the worker prepares a pinned construction "
+            "(or set it in the model attention policy) before compilation or parallel-group "
+            "construction",
         )
     unsupported = _device_admits(candidate, device)
     if unsupported:

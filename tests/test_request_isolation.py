@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import sys
 from collections.abc import Iterator
@@ -10,13 +11,16 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import attention, package_interface
+from cozy_runtime.internal import attention, executor, package_interface
+from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor
 from cozy_runtime.internal.seam import Channel
 
 MODULE = "request_isolation_fixture"
 SOURCE = """
+import os
+
 import msgspec
 from cozy_runtime.author import App, Context, InvalidRequest
 
@@ -39,6 +43,8 @@ def generate(ctx: Context, payload: Request) -> Result:
         ctx.raise_if_cancelled()
     if payload.mode == "fail":
         raise RuntimeError("handler state is now unknown")
+    if payload.mode == "env":
+        os.environ["OMP_NUM_THREADS"] = "7"
     return Result(7)
 """
 
@@ -126,3 +132,17 @@ def test_a_pin_no_parallel_group_can_run_refuses_before_construction() -> None:
     assert unknown.value.code == "attention_kernel_unknown"
     attention.admit("dit=flash-attn3", 4)
     attention.admit("dit=sageattention", 1)
+
+
+def test_package_environment_changes_are_restored_not_refused(
+    host: tuple[Executor, dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, load = host
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    monkeypatch.setattr(executor, "_SEALED", seal_snapshot())
+    assert runner.load({**load, "construction": "a"})["ok"]
+    assert runner.activate({"construction": "a"})["ok"]
+    served = _serve(runner, "env", "env")
+    assert served["outcome"]["terminal"] == "succeeded", served
+    assert served["env_intact"] and served["env_changed"] == ["OMP_NUM_THREADS"], served
+    assert os.environ["OMP_NUM_THREADS"] == "1" and not served["poisoned"]
