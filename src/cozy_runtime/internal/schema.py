@@ -26,7 +26,7 @@ from cozy_runtime.author._assets import Asset, AudioAsset, FileAsset, ImageAsset
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import AssetBound, _ModelDefaultMarker
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional
-from cozy_runtime.internal.canonical import Json, write
+from cozy_runtime.internal.canonical import CanonicalError, Json, write
 
 _PRIMITIVES: dict[object, str] = {
     bool: "bool",
@@ -47,6 +47,35 @@ _ASSET_KINDS: tuple[tuple[type[Asset], str], ...] = (
 def render(annotation: object, *, decoded_bounds: bool = False) -> Json:
     """One type as a canonical schema value."""
     return _render(annotation, frozenset(), decoded_bounds=decoded_bounds)
+
+
+def request(payload_type: object) -> Json:
+    """A callable's request: `render`, with each optional top-level field's author default.
+
+    Only the payload's own fields carry one. Nested types render exactly as `render` does,
+    because readers compare those by value (the Assets occurrence record, native operations).
+    """
+    doc = render(payload_type)
+    base, _ = strip(payload_type)
+    if isinstance(doc, dict) and isinstance(base, type) and is_struct(base):
+        fields = {field.encode_name: field for field in msgspec.structs.fields(base)}
+        for row in typing.cast(list[dict[str, Json]], doc["fields"]):
+            if row.get("wire") == "optional":
+                row.update(_default(fields[typing.cast(str, row["name"])]))
+    return doc
+
+
+def _default(field: msgspec.structs.FieldInfo) -> dict[str, Json]:
+    """The author's default for clients to show; none when it has no static JSON spelling."""
+    value = field.default
+    if value is msgspec.NODEFAULT:
+        if field.default_factory not in (list, dict):
+            return {}
+        value = field.default_factory()
+    try:
+        return {"default": msgspec.json.decode(write(msgspec.to_builtins(value)))}
+    except (TypeError, CanonicalError):
+        return {}
 
 
 def _render(
