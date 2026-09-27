@@ -3690,6 +3690,8 @@ class Worker:
             control_runtime_digest="",
             git_commit=self.options.git_commit,
             resources=self.resources(),
+            # The owner is durable for this boot and executions keep their Claim's minor.
+            claim_survives_restart=True,
         )
         send(self.stamp(pb.WorkerFrame(claim_ack=ack)))
         self._send_snapshot(send)

@@ -517,6 +517,7 @@ def test_restarted_worker_runs_its_owners_next_submission_without_another_claim(
         root.mkdir()
         machine = Machine(root, VIRTUAL_GPUS)
         try:
+            assert machine.ack.claim_survives_restart
             resources = machine.ack.resources
             assert (
                 resources.backend,
