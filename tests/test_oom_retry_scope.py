@@ -63,10 +63,14 @@ lane = "bf16"
 def burst_package(root: Path) -> Path:
     package = root / "burst-package"
     shutil.copytree(PACKAGE, package)
-    source = package / "tiny_tenant.py"
+    # Its own module name: `tiny_tenant` is already imported by other tests in this process.
+    source = package / "burst_tenant.py"
+    (package / "tiny_tenant.py").rename(source)
     source.write_text(source.read_text() + BURST)
     manifest = package / "package.toml"
-    manifest.write_text(manifest.read_text() + BINDING)
+    manifest.write_text(
+        manifest.read_text().replace("tiny_tenant:app", "burst_tenant:app") + BINDING
+    )
     return package
 
 
