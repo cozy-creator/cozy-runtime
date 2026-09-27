@@ -126,6 +126,7 @@ def pipeline() -> Any:
     pipe._blocks = {TASK: blocks}
     pipe._pipes = {TASK: upstream}
     pipe._plans = {TASK: official.canonical_timestep_plan(TASK)}
+    pipe._intake = official._IntakeLengths()
     pipe.components = {
         "ref2va_dit": dit,
         "text_encoder": text_encoder,

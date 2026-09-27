@@ -18,7 +18,8 @@ import sys
 import threading
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from fractions import Fraction
 from functools import lru_cache
@@ -1006,6 +1007,52 @@ class _ImageEdges:
             )
 
 
+#: The request state's handle on its intake length statement (`OfficialH3Pipeline._expect`).
+_INTAKE = "intake_length_statement"
+
+
+class _IntakeLengths:
+    """One pipeline's early attention-length statements (h3a-087), run off the request thread
+    by one non-daemon worker, so no statement outlives its owner. A request settles its own
+    before its first DiT step (`_settle_intake`), so what it records lands in that request; a
+    newer statement cancels an older one still queued; `close` or the interpreter's exit waits
+    out the one running rather than finalizing torch under it. The worker ends with the pool."""
+
+    def __init__(self) -> None:
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="minimax-h3-intake")
+        self._lock = threading.Lock()
+        self._queued: Future[None] | None = None
+        self._closed = False
+
+    def submit(self, statement: Callable[[], None]) -> Future[None] | None:
+        """None once closed: the statement is advisory, and the first dense step states it."""
+        # The copied context carries the request's observation scope to the kernel rows.
+        runner = contextvars.copy_context().run
+        with self._lock:
+            if self._closed:
+                return None
+            if self._queued is not None:
+                self._queued.cancel()
+            self._queued = future = self._pool.submit(runner, statement)
+        return future
+
+    def close(self) -> None:
+        """Cancel what is queued and wait for the statement running, if any."""
+        with self._lock:
+            self._closed = True
+        self._pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _settle_intake(state: Any) -> None:
+    """Wait for this request's statement, if it made one, to finish or be cancelled. Not
+    `concurrent.futures.wait`: a future `shutdown` cancels from the queue never notifies it."""
+    statement = state.get(_INTAKE)
+    if statement is not None:
+        state.set(_INTAKE, None)
+        with suppress(CancelledError):
+            statement.result()
+
+
 @contextmanager
 def _audio_weight_norm_scope(audio_vae: Any) -> Iterator[None]:
     """Release only legacy WeightNorm's recomputable, unregistered attributes."""
@@ -1077,6 +1124,12 @@ class OfficialH3Pipeline:
             task: canonical_timestep_plan(task) for task in _TASKS
         }
         self._dit_specs = dit_specs
+        self._intake = _IntakeLengths()
+
+    def close(self) -> None:
+        """End this pipeline's background work: queued intake statements are cancelled and the
+        running one is waited for. Requests after this state nothing early."""
+        self._intake.close()
 
     def generator(self, source: object) -> Any:
         """Adapt Runtime's public request generator to Diffusers' torch generator."""
@@ -1289,25 +1342,24 @@ class OfficialH3Pipeline:
     def _expect(self, task: Task, state: Any) -> None:
         """Tell the runtime this request's attention length while conditioning runs, so a
         length-specialized kernel starts preparing now. Off the request's thread (tokenizing
-        the references' vision blocks is ~0.4 s at their 2048-pixel edge) and advisory:
-        nothing here may fail a request, and a wrong answer only costs a background compile."""
+        the references' vision blocks is ~0.4 s at their 2048-pixel edge) and advisory: a
+        failure is reported, never raised, and a wrong answer only costs a background compile.
+        `denoise` settles the statement before the first DiT step."""
         snapshot = PipelineState(
             dict(state.values), {k: list(v) for k, v in state.kwargs_mapping.items()}
         )
         dit = self.components[_DIT_COMPONENT[_TRUNK[task]]]
 
         def state_length() -> None:
+            # Reported where it fails, whether or not its request reaches the DiT to settle it.
             try:
                 tokens = self.expected_live_tokens(task, snapshot)
+                if tokens is not None:
+                    expect_attention(tokens, dit)
             except Exception as exc:
                 print(f"[minimax-h3] no intake attention length: {exc!r}"[:300], file=sys.stderr)
-                return
-            if tokens is not None:
-                expect_attention(tokens, dit)
 
-        # The copied context carries the request's observation scope to the kernel rows.
-        runner = contextvars.copy_context().run
-        threading.Thread(target=runner, args=(state_length,), daemon=True).start()
+        state.set(_INTAKE, self._intake.submit(state_length))
 
     def text_state(self, state: Any) -> Any:
         """A copy of `state` for the text block alone: it reads the prompt and the references
@@ -1555,6 +1607,7 @@ class OfficialH3Pipeline:
         sol_dense_steps: int = 10,
     ) -> ScheduleFacts:
         _validate_sol_dense_steps(sol_dense_steps)
+        _settle_intake(state)
         blocks = self._blocks[self._workflow(task, state)].sub_blocks
         scoped = _ScopedPipeline(
             self._pipes[self._workflow(task, state)],
