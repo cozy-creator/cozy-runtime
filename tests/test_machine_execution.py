@@ -267,6 +267,19 @@ def test_deferred_telemetry_precedes_the_transition_that_follows_it(tmp_path: Pa
     ]
 
 
+def test_pending_telemetry_never_holds_process_exit(tmp_path: Path) -> None:
+    # A stream abandoned mid-read keeps the journal held until the process ends.
+    script = (
+        "import sys\nfrom pathlib import Path\n"
+        "from cozy_runtime.internal.worker.workspace import Workspace\n"
+        "w = Workspace(Path(sys.argv[1]))\n"
+        "def held():\n    with w.locked():\n        yield\n"
+        "stream = held(); next(stream)\n"
+        "w.defer(lambda db: None)\n"
+    )
+    subprocess.run([sys.executable, "-c", script, str(tmp_path / "store")], check=True, timeout=60)
+
+
 CHILD = """
 import base64,sys
 from pathlib import Path
