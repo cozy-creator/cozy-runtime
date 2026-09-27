@@ -15,8 +15,6 @@ from tensorfs.derived import Derivation, Source, Target
 from cozy_runtime.author import Config, ConformanceError
 from cozy_runtime.internal import canonical, model_config
 from cozy_runtime.internal.worker.package_prepare import _selected_models
-from cozy_runtime.internal.worker.session import _placement_profile
-from cozy_runtime.protocol import documents
 from test_derived_config_runtime import _released_source
 from test_model_runtime_closure import _CONFIG
 
@@ -49,49 +47,6 @@ def test_external_config_reference_is_not_a_config() -> None:
                 }
             }
         )
-
-
-def test_placement_slot_refuses_external_config_authority() -> None:
-    digest = "sha256:" + "1" * 64
-    placement = {
-        "placement_id": "placement",
-        "development": {
-            "package": "example/package",
-            "release": "0.2.5",
-            "source_digest": digest,
-        },
-        "package_interface": {"digest": digest, "length": 1},
-        "bindings_digest": digest,
-        "models": [
-            {
-                "id": "model-0000",
-                "repo": "example-model",
-                "version": "1",
-                "manifest": {"digest": digest, "length": 1},
-            }
-        ],
-        "entrypoints": [
-            {
-                "name": "generate",
-                "entrypoint_binding_digest": digest,
-                "slots": [
-                    {
-                        "slot": "model",
-                        "reference_model_id": "model-0000",
-                        "config": {
-                            "document": {"digest": digest, "length": 42},
-                            "assets": [],
-                        },
-                    }
-                ],
-            }
-        ],
-    }
-
-    with pytest.raises(documents.DocumentError) as refused:
-        _placement_profile(placement)
-
-    assert refused.value.code == "unknown_field"
 
 
 # ------------------------------------------- a reserved name is not a construction config

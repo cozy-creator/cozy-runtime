@@ -14,9 +14,9 @@ mapping below is proto3 -> JSON value:
     `sha256:<hex>`; every other `bytes` field is opaque payload spelled base64,
   * a `format` tag (`<full.Name>/1`) domain-separates two document kinds with equal fields.
 
-The reading half refuses what the writer cannot have produced: non-canonical encoding, an
-unknown key, a wrong `format`. That is what makes a planted service-class field on an
-ExecutionSpec a REFUSAL rather than an ignored unknown field.
+The reading half refuses non-canonical encoding and a wrong `format`. Keys this binding does
+not know are additive fields from a newer writer: the digest still covers the exact bytes, and
+the reader acts on the fields it consumes.
 
 Profile note, checked live rather than asserted (`scripts/worker-live.py fixtures` renders
 th-024's frozen canonical fixtures through THIS writer and compares bytes + ids):
@@ -189,7 +189,7 @@ def identity(message: Message) -> tuple[bytes, bytes]:
 
 
 def read(data: bytes, cls: type[Message]) -> dict[str, Any]:
-    """Exact canonical bytes -> a typed document. Unknown keys REFUSE (law 4's reading side).
+    """Exact canonical bytes -> a typed document; unknown keys are ignored.
 
     Deliberately returns the JSON value, not a parsed message: the document is the subject of
     the digest, and re-encoding it into a message would create a second representation that
@@ -206,8 +206,4 @@ def read(data: bytes, cls: type[Message]) -> dict[str, Any]:
     want = doc_format(cls.DESCRIPTOR.full_name)
     if value.get("format") != want:
         raise DocumentError("unknown_format", f"{value.get('format')!r} is not {want!r}")
-    known = {f.name for f in cls.DESCRIPTOR.fields} | {"format"}
-    for key in value:
-        if key not in known:
-            raise DocumentError("unknown_field", f"{want}: unknown field {key!r}")
     return value

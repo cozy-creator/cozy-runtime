@@ -29,7 +29,7 @@ SCHEMA = "cozy.package.interface/1"
 DIGEST_KEY = "package_interface_digest"
 FILENAME = "metadata/package-interface.json"
 
-#: The complete top-level field set. A reader admits EXACTLY these — never a superset.
+#: The top-level fields every interface carries. Readers ignore additional fields.
 TOP_LEVEL_KEYS = frozenset(
     {
         "format",
@@ -406,19 +406,10 @@ def read_bytes(raw: bytes, source: str = "package interface") -> dict[str, Json]
         raise StalePackageInterface(
             f"{source} is not a JSON object", code="malformed_package_interface"
         )
-    fields = set(parsed)
-    if fields != TOP_LEVEL_KEYS:
-        missing = sorted(TOP_LEVEL_KEYS - fields)
-        unknown = sorted(fields - TOP_LEVEL_KEYS)
-        problems = []
-        if missing:
-            problems.append(f"missing {', '.join(missing)}")
-        if unknown:
-            problems.append(f"unknown {', '.join(unknown)}")
+    missing = sorted(TOP_LEVEL_KEYS - set(parsed))
+    if missing:
         raise StalePackageInterface(
-            f"{source} has {'; '.join(problems)}: the interface fields are exactly "
-            f"{', '.join(sorted(TOP_LEVEL_KEYS))}",
-            code="unknown_field",
+            f"{source} is missing {', '.join(missing)}", code="malformed_package_interface"
         )
     if parsed["format"] != SCHEMA:
         raise StalePackageInterface(
@@ -442,11 +433,9 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
         for index, row in enumerate(rows):
             path = f"{collection}[{index}]"
             required = {"name", "request", "result"}
-            optional = {"models", "invocable", "assets", "internal"}
             if kind == "job":
                 required.add("publishes")
-                optional.add("weights_outputs")
-            item = _closed(row, required, optional, source, path)
+            item = _fields(row, required, source, path)
             if "internal" in item and type(item["internal"]) is not bool:
                 _invalid(source, f"{path}.internal", "must be a boolean")
             name = item["name"]
@@ -468,13 +457,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                 _invalid(source, f"{path}.models", "must be an array of at most 16 slots")
             for model_index, model in enumerate(models):
                 model_path = f"{path}.models[{model_index}]"
-                slot = _closed(
-                    model,
-                    {"class", "component_use", "path"},
-                    {"encoded_leaves", "fusion", "sequence_parallel", "default_ladder"},
-                    source,
-                    model_path,
-                )
+                slot = _fields(model, {"class", "component_use", "path"}, source, model_path)
                 for consent, vocabulary in (
                     ("encoded_leaves", ENCODED_LEAVES),
                     ("fusion", FUSION),
@@ -534,12 +517,8 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     weights_names: set[str] = set()
                     for output_index, output_raw in enumerate(weights_outputs):
                         output_path = f"{path}.weights_outputs[{output_index}]"
-                        output = _closed(
-                            output_raw,
-                            {"output_id", "mime_type", "max_bytes"},
-                            set(),
-                            source,
-                            output_path,
+                        output = _fields(
+                            output_raw, {"output_id", "mime_type", "max_bytes"}, source, output_path
                         )
                         output_id = _portable_name(
                             output["output_id"], source, f"{output_path}.output_id"
@@ -572,7 +551,7 @@ def _portable_name(value: Json, source: str, path: str) -> str:
 
 
 def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
-    slot = _closed(value, {"parameter", "kinds"}, {"view"}, source, path)
+    slot = _fields(value, {"parameter", "kinds"}, source, path)
     if "view" in slot and slot["view"] != "decoded":
         _invalid(source, f"{path}.view", "must be decoded when present")
     parameter = slot["parameter"]
@@ -589,13 +568,7 @@ def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
     seen: set[str] = set()
     media: set[str] = set()
     for value in kinds:
-        row = _closed(
-            value,
-            {"kind", "media_types"},
-            {"max_bytes", "max_decoded_bytes", "max_count", "prepare"},
-            source,
-            path,
-        )
+        row = _fields(value, {"kind", "media_types"}, source, path)
         kind = row["kind"]
         if kind not in ("image", "video", "audio", "file") or str(kind) in seen:
             _invalid(source, path, "assets kinds must be recognized and unique")
@@ -619,9 +592,7 @@ def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
         if "prepare" in row:
             if kind != "image" or slot.get("view") != "decoded":
                 _invalid(source, path, "image preparation needs decoded image Assets")
-            preparation = _closed(
-                row["prepare"], {"profile"}, {"max_edge", "max_pixels"}, source, path + ".prepare"
-            )
+            preparation = _fields(row["prepare"], {"profile"}, source, path + ".prepare")
             if preparation["profile"] != IMAGE_PREPARATION_PROFILE or not any(
                 key in preparation for key in ("max_edge", "max_pixels")
             ):
@@ -648,8 +619,7 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
         _invalid(source, path, "must carry exactly one schema form")
     form = next(iter(forms))
     if form == "fields":
-        optional = {"tag", "tag_field"}
-        struct = _closed(value, {"fields"}, optional, source, path)
+        struct = _fields(value, {"fields"}, source, path)
         tag = struct.get("tag")
         tag_field = struct.get("tag_field")
         active_tag_field: Json
@@ -671,13 +641,7 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
         names: set[str] = set()
         for index, value_field in enumerate(fields):
             field_path = f"{path}.fields[{index}]"
-            field = _closed(
-                value_field,
-                {"name", "type"},
-                {"asset_bound", "constraints", "wire"},
-                source,
-                field_path,
-            )
+            field = _fields(value_field, {"name", "type"}, source, field_path)
             name = field["name"]
             if not isinstance(name, str) or not name or name in names or name == active_tag_field:
                 _invalid(
@@ -707,7 +671,7 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
                 )
         return
     if form == "union":
-        union = _closed(value, {"union"}, {"tag_field"}, source, path)
+        union = _fields(value, {"union"}, source, path)
         branches = union["union"]
         if not isinstance(branches, list) or not branches:
             _invalid(source, f"{path}.union", "must be a non-empty array")
@@ -717,12 +681,12 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
         for index, branch in enumerate(branches):
             _schema(branch, source, f"{path}.union[{index}]", tag_field)
         return
-    exact = _closed(value, {form}, set(), source, path)
+    exact = _fields(value, {form}, source, path)
     child = exact[form]
     if form == "list":
         _schema(child, source, f"{path}.list")
     elif form == "map":
-        entry = _closed(child, {"key", "value"}, set(), source, f"{path}.map")
+        entry = _fields(child, {"key", "value"}, source, f"{path}.map")
         _schema(entry["key"], source, f"{path}.map.key")
         _schema(entry["value"], source, f"{path}.map.value")
     elif form == "tuple":
@@ -739,7 +703,7 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
 
 def _sequence_parallel(value: Json, source: str, path: str) -> None:
     """`{"degrees": [K, ...]}`: non-empty, ints >= 2, sorted unique (cr-068)."""
-    declared = _closed(value, {"degrees"}, set(), source, path)
+    declared = _fields(value, {"degrees"}, source, path)
     degrees = declared["degrees"]
     if (
         not isinstance(degrees, list)
@@ -750,23 +714,13 @@ def _sequence_parallel(value: Json, source: str, path: str) -> None:
         _invalid(source, f"{path}.degrees", "must be a non-empty sorted unique list of ints >= 2")
 
 
-def _closed(
-    value: Json,
-    required: set[str],
-    optional: set[str],
-    source: str,
-    path: str,
-) -> dict[str, Json]:
+def _fields(value: Json, required: set[str], source: str, path: str) -> dict[str, Json]:
+    """An object carrying `required`; additive fields from newer writers are ignored."""
     if not isinstance(value, dict):
         _invalid(source, path, "must be an object")
-    fields = set(value)
-    if fields != required | (fields & optional):
-        missing = sorted(required - fields)
-        unknown = sorted(fields - required - optional)
-        detail = ", ".join(
-            [*(f"missing {name}" for name in missing), *(f"unknown {name}" for name in unknown)]
-        )
-        _invalid(source, path, detail)
+    missing = sorted(required - set(value))
+    if missing:
+        _invalid(source, path, ", ".join(f"missing {name}" for name in missing))
     return cast(dict[str, Json], value)
 
 

@@ -249,21 +249,14 @@ class JobBinding:
 
     @classmethod
     def read(cls, record: dict[str, Any]) -> JobBinding:
-        known = {f for f in cls.__dataclass_fields__}
-        unknown = sorted(set(record) - known)
-        if unknown:
-            raise PlanRefusal(
-                "job_plan_unknown_field",
-                f"job plan record carries {', '.join(unknown)}: the record's key set is "
-                "closed, exactly like the documents it stands in for",
-            )
+        """Fields another Runtime version wrote and this one does not consume are ignored."""
         from cozy_runtime.internal import installed_interfaces
 
         observed = installed_interfaces.for_job(
             str(record.get("python", "")), str(record.get("installation_id", ""))
         )
-        captured = dict(record)
-        captured.pop("call_interfaces", None)
+        known = set(cls.__dataclass_fields__) - {"call_interfaces"}
+        captured = {key: value for key, value in record.items() if key in known}
         return cls(**captured, call_interfaces=tuple(observed))
 
 
