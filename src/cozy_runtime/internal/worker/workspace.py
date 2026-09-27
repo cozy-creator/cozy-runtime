@@ -443,7 +443,7 @@ class Workspace:
                 for row in db.execute(
                     "SELECT w.* FROM weights AS w JOIN attempts AS a ON "
                     "a.owner=w.owner AND a.request=w.request AND a.ordinal=w.ordinal "
-                    "WHERE w.owner=? AND a.state<>'released' "
+                    "WHERE w.owner=? AND a.state<>'released' AND w.state<>'released' "
                     "AND (a.state='outcome' OR a.worker_boot=?) ORDER BY w.id",
                     (owner, worker_boot),
                 )
@@ -879,6 +879,19 @@ class Workspace:
                 raise WorkspaceRefusal("workspace has no owned weights transaction")
             return dict(row)
 
+    def refuse_weights(self, owner: str, transaction: str) -> bool:
+        """Tombstone one transaction the Host refused and stop its native writer.
+
+        Returns false when it was already released (a duplicate refusal)."""
+        with self.locked() as db:
+            changed = db.execute(
+                "UPDATE weights SET state='released' WHERE owner=? AND id=? AND state<>'released'",
+                (owner, transaction),
+            ).rowcount
+            if changed:
+                db.native(partial(_stop_native_transaction, self.store_root, transaction))
+            return bool(changed)
+
     def ready_weights(self, owner: str, request: pb.WeightsIntentReadyRequest) -> dict[str, Any]:
         subject = request.weights
         with self.locked() as db:
@@ -1172,3 +1185,15 @@ class Workspace:
 
                 logging.getLogger(__name__).warning("workspace release compaction deferred")
         return result
+
+
+def _stop_native_transaction(store_root: Path, transaction: str) -> None:
+    """Fence an open native writer and abandon it, or dispose a committed result."""
+    store = fill.store(store_root)
+    observed = store.derived_lookup(transaction)
+    if observed.get("state") == "open":
+        if observed.get("writer_session_id"):
+            store.derived_fence(transaction, observed["writer_session_id"])
+        observed = store.derived_abandon(transaction)
+    if observed.get("state") == "committed":
+        store.derived_dispose(transaction)

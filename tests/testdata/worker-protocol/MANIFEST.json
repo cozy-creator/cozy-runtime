@@ -1013,6 +1013,11 @@
       "sha256": "ae0deb1fb83ab52a811620f3c47278bbd0359ab919db87983624c28c8af6e7d3",
       "type": "cozy.worker.v1.WorkerFrame"
     },
+    "weights_transaction_refused": {
+      "bytes": 219,
+      "sha256": "b9bfd8cdfd7d355f7990d6c37265574480693e0470fc70c0b1e434cc83217c26",
+      "type": "cozy.worker.v1.RecordOwnerFrame"
+    },
     "weights_transaction_waiting_ready": {
       "bytes": 208,
       "sha256": "092e475201e01d9cf826cf2a86a45e0a1a3b64ca7ea0515b988193bc888387db",
