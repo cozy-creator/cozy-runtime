@@ -473,10 +473,6 @@ def test_a_workflow_releases_from_its_executor_and_b_starts_during_its_cpu_tail(
                 e.at_ms for e in executions.events(OWNER, "B").events if e.kind == "gpu.grant"
             )
             assert granted_at >= at[released[0]]
-            # B's replica is refused like the shot's; let its placement churn settle so the
-            # workflow's CPU call is not offered under an admission epoch it then bumps.
-            until(lambda: worker.execution_status(claim, "B").state == "failed")
-            until(lambda: not worker.hosted)
             (gates / "assembly").touch()
             until(lambda: worker.execution_status(claim, "root").state in ("succeeded", "failed"))
             body = documents.read(

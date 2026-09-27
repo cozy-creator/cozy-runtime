@@ -2445,7 +2445,6 @@ class Worker:
                 try:
                     attempt = self.engine.offer(offered)
                 except AttemptRefusal:
-                    offered.admission_epoch = self.admission_epoch
                     self.on_offer(offered, machine_owned=True)
                     continue
                 if fault := self._failed_execution_binding(attempt):
@@ -2468,7 +2467,6 @@ class Worker:
                 lane = self._offer_lane(offered.placement_id, attempt)
                 if self._lane_slots(lane, machine_owned=True) < 1:
                     continue
-                offered.admission_epoch = self.admission_epoch
                 self.on_offer(offered, machine_owned=True)
 
     def _schedule_gpus(
@@ -4971,7 +4969,9 @@ class Worker:
             hosted.supervision.close()
             self.hosted.pop(placement_id, None)
             self._release_lane(placement_id)
-            self.bump_admission(f"placement {placement_id!r} removed")
+            # No second bump: the DRAINING edge above moved the fence, and an offer naming
+            # the gone placement is refused `unknown_placement` on its own.
+            self.note("admission", f"placement {placement_id!r} removed")
         return True
 
     def _reconcile_hosted(self, revision: int) -> None:
@@ -6802,7 +6802,8 @@ class Worker:
         """
         # THE ADMISSION FENCE FIRST (§6), because it is the cheapest deterministic verdict
         # and because a stale epoch means the RecordOwner dispatched against a picture
-        # of this worker that no longer holds.
+        # of this worker that no longer holds. A machine-owned offer is minted here from
+        # live state, so it has no picture to be stale: the checks below are its admission.
         if self.stop.is_set():
             self.refuse(
                 offered,
@@ -6819,7 +6820,7 @@ class Worker:
                 CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
             )
             return
-        if offered.admission_epoch != self.admission_epoch:
+        if not machine_owned and offered.admission_epoch != self.admission_epoch:
             self.refuse(
                 offered,
                 "admission_epoch_stale",
@@ -7299,8 +7300,8 @@ class Worker:
 
     def _entry_refused(self, attempt: AttemptRecord) -> bool:
         """An ACCEPTED attempt's device-entry fences, under the control lock: TRUE once
-        terminated. Acceptance already passed the admission epoch; what can still stop it
-        is a cancel, its own deadline, or its placement leaving this worker."""
+        terminated. What can still stop it is a cancel, its own deadline, or its placement
+        leaving this worker."""
         key = f"{attempt.request_id}#{attempt.attempt}"
         if attempt.canceling:
             self.note("cancel", f"{key} was cancelled before device entry")
@@ -7356,10 +7357,10 @@ class Worker:
         """FETCH -> HYDRATE -> LOAD -> CHOOSE -> ACCEPT, or a typed terminal. Never a silence."""
         # Desired-state convergence and executor rebuilds take this same lock. Recheck the
         # offer's immutable routing facts under it, then hold it through the acceptance:
-        # a queued offer cannot be accepted on the far side of a placement or
-        # admission-epoch change merely because it passed `on_offer()` earlier. The
-        # construction the attempt needs is loaded between the two holds, under the lane's
-        # device lock alone, so a load never stalls the control plane.
+        # a queued offer cannot be accepted on the far side of a change to ITS placement
+        # merely because it passed `on_offer()` earlier. The construction the attempt needs
+        # is loaded between the two holds, under the lane's device lock alone, so a load
+        # never stalls the control plane.
         key = f"{attempt.request_id}#{attempt.attempt}"
         with self.control_lock:
             if self._admission_refused(attempt):
@@ -7390,7 +7391,13 @@ class Worker:
         return True
 
     def _admission_refused(self, attempt: AttemptRecord) -> bool:
-        """The offer's routing facts, re-read under the control lock: TRUE once refused."""
+        """The queued offer's own facts, re-read under the control lock: TRUE once refused.
+
+        The worker-wide admission epoch fenced the owner's dispatch in `on_offer`; it is not
+        re-read here. It moves on ANY placement's edge, and another root's replica leaving
+        must not refuse a call already waiting on its lane (#790's proof). What can refuse
+        it is its cancel, its deadline, its own placement, or the worker's own admission.
+        """
         key = f"{attempt.request_id}#{attempt.attempt}"
         if attempt.canceling:
             self.note("cancel", f"{key} was cancelled before admission")
@@ -7401,23 +7408,9 @@ class Worker:
             self.note("cancel", f"{key} reached the lane past its deadline")
             self.terminate(attempt, self.engine.finish_cancel, "deadline")
             return True
-        if attempt.admission_epoch != self.admission_epoch:
-            self.note(
-                "admission",
-                f"refusing queued {key}: offered epoch "
-                f"{attempt.admission_epoch}, current {self.admission_epoch}",
-            )
-            self.terminate(
-                attempt,
-                self.engine.refuse_held,
-                "admission_epoch_stale",
-                f"the queued offer echoes admission epoch "
-                f"{attempt.admission_epoch} and this worker is now at "
-                f"{self.admission_epoch}",
-                CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
-            )
-            return True
-        if self.accepted.mode == "serving" and "job" not in attempt.spec:
+        if "job" not in attempt.spec:
+            # A serving call is re-checked on its OWN placement, in either mode: a machine
+            # replica can leave while its call is still queued (`queued` is not HELD).
             selected = self._placement_by_id(attempt.placement_id)
             if selected is None:
                 self.note(
@@ -7449,7 +7442,7 @@ class Worker:
                     CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
                 )
                 return True
-        if self.accepted.mode != "serving" and not self.dispatchable():
+        elif self.accepted.mode != "serving" and not self.dispatchable():
             self.note("admission", f"refusing queued {key}: worker is not dispatchable")
             self.terminate(
                 attempt,

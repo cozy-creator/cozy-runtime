@@ -1,0 +1,1 @@
+A queued call is no longer refused `admission_epoch_stale` when another root's placement leaves the worker: the lane re-checks only the call's own placement, and the worker's own durable executions are not fenced by the epoch it stamps itself.
