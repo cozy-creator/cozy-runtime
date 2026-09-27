@@ -28,8 +28,8 @@ SOURCE = VENDOR_DIR / "SOURCE"
 WANT_REPOSITORY = "https://github.com/cozy-creator/worker-protocol"
 #: What a re-vendor is, in one line, on every failure below.
 REMEDY = (
-    "re-vendor: copy gen/python/cozy/worker/v1/* from the worker-protocol commit into "
-    "src/cozy/worker/v1/ and rewrite SOURCE (repository, commit, wire_minor, a sha256 per file)"
+    "re-vendor bindings and corpus together: uv run python scripts/vendor-worker-protocol.py "
+    "<commit>"
 )
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
