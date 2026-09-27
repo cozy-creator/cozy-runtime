@@ -880,6 +880,36 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     assert all(row["pid"] > 0 and row["started_ticks"] > 0 for row in invoked)
                     assert all(row["ranks"] and row["reusable"] for row in released)
                     assert all(not row["reuse_miss_reason"] for row in released)
+                if case == "source":
+                    # Native source work reports on the root's own journaled lane: byte
+                    # samples per stage, then each stage's durable timing record.
+                    events = [
+                        canonical_json.decode(row["body"])
+                        for row in db.execute(
+                            "SELECT body FROM execution_events WHERE request='root' "
+                            "AND kind IN ('progress','log') ORDER BY sequence"
+                        )
+                    ]
+                    carrier = (Path(__file__).parent / "testdata/native_source").joinpath(
+                        "first.safetensors"
+                    )
+                    for stage in ("Downloading source", "Converting to cozytensors"):
+                        samples = [
+                            event["payload"]
+                            for event in events
+                            if event["type"] == "progress"
+                            and event["payload"].get("stage") == stage
+                        ]
+                        assert samples[-1]["unit"] == "bytes", samples
+                        assert samples[-1]["position"] == samples[-1]["total"] > 0
+                        (ended,) = [
+                            event["payload"]["fields"]
+                            for event in events
+                            if event["type"] == "log" and event["payload"].get("name") == stage
+                        ]
+                        assert ended["completed"] and ended["elapsed_ms"] > 0
+                        if stage == "Downloading source":
+                            assert ended["bytes"] == carrier.stat().st_size
                 assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
                     2
                     if case in ("source", "source_conflict")

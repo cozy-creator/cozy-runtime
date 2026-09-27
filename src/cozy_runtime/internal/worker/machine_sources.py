@@ -104,6 +104,8 @@ class Sources:
         if row["state"] in ("failed", "stopped"):
             result.state = pb.CHILD_CALL_STATE_FAILED
             result.safe_code = row["native_error"] or "native_source_failed"
+            if self.worker.source_calls is not None:
+                result.safe_detail = self.worker.source_calls.failure_detail(command.service_id)
             return result
         if row["state"] != "complete":
             return result
