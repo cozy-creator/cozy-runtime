@@ -33,11 +33,12 @@ def work_fingerprint(
     *,
     operation_identity: str = "",
 ) -> str:
-    """Bind native partial work to callee logic, actual inputs, and numerical policy.
+    """Bind native partial work to what determines its output: the operation (its
+    declared version and source identity, else its job declaration), the actual inputs,
+    and the numerical policy.
 
-    Attempt/custody clocks and SDK inventories never define numerical work.
-    An unavailable callee identity keeps non-memoized work private to the exact
-    frozen installation instead of guessing that arbitrary code is reusable.
+    Installation ids, attempt/custody clocks and SDK inventories never define it, so
+    interrupted work resumes after a Runtime upgrade or a reinstall of the same release.
     """
     job = spec.get("job")
     if not isinstance(job, Mapping) or len(numerical) != 32:
@@ -45,8 +46,7 @@ def work_fingerprint(
             "weights work has no selected job or numerical policy", code="weights_work_identity"
         )
     facts = {
-        "operation": operation_identity
-        or {key: job[key] for key in ("installation_id", "job_descriptor_id")},
+        "operation": operation_identity or {"job_descriptor_id": job["job_descriptor_id"]},
         "payload_digest": spec["payload_digest"],
         "inputs": spec.get("inputs", []),
         "outputs": spec.get("outputs", []),

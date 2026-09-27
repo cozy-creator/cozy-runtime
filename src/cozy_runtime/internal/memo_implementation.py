@@ -9,7 +9,6 @@ import importlib.resources
 import importlib.util
 import inspect
 import json
-import platform
 import sys
 import textwrap
 from collections.abc import Callable
@@ -138,7 +137,6 @@ def _native_identity(name: str) -> str | None:
                 "version": version,
                 "wheel": tags,
                 "build": provenance,
-                "python": platform.python_version(),
                 "abi": sys.implementation.cache_tag,
             },
             sort_keys=True,
