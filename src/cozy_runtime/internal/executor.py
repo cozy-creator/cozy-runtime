@@ -4221,15 +4221,29 @@ class Executor:
     def probe(self) -> dict[str, Any]:
         processes = self.process_incarnations()
         if self.torch is None:
-            return {"ok": True, "torch": False, "rss_bytes": _rss(), "processes": processes}
-        memory = accel.allocation(self.torch, self.device_kind)
+            # A process can be poisoned before Torch loads (a follower's rank divergence).
+            return {
+                "ok": True,
+                "torch": False,
+                "rss_bytes": _rss(),
+                "processes": processes,
+                "poisoned": self.poisoned,
+            }
+        # A torch-bearing process with no card (a CPU executor, a gloo rank) has no device
+        # numbers to report; readers take absent as unknown.
+        device: dict[str, int] = {}
+        if self.device_kind != "mps" and accel.present(self.torch, self.device_kind):
+            memory = accel.allocation(self.torch, self.device_kind)
+            device = {
+                "device_free_bytes": memory["driver_free_bytes"],
+                "device_total_bytes": memory["driver_total_bytes"],
+                "allocator_bytes": memory["allocated_bytes"],
+                "reserved_bytes": memory["reserved_bytes"],
+            }
         return {
             "ok": True,
             "torch": True,
-            "device_free_bytes": memory["driver_free_bytes"],
-            "device_total_bytes": memory["driver_total_bytes"],
-            "allocator_bytes": memory["allocated_bytes"],
-            "reserved_bytes": memory["reserved_bytes"],
+            **device,
             "residency": self._active_residency(),
             "constructions": self.arbiter.document(self.active),
             "rss_bytes": _rss(),

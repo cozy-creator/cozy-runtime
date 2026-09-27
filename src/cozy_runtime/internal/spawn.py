@@ -26,8 +26,9 @@ and does the privilege/parent-death work before exec'ing the executor.
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from cozy_runtime.internal import canonical, proctree
 from cozy_runtime.internal.child_env import project_child_env
@@ -123,28 +124,38 @@ def spawn_executor(
 @dataclass(slots=True)
 class Child:
     """One spawned follower as its rank-0 parent holds it: the pid and its exit status,
-    read through `waitpid` exactly once (the same shape `subprocess.Popen` gives)."""
+    read through `waitpid` exactly once (the same shape `subprocess.Popen` gives).
+
+    As in `Popen`, one lock serializes the reap: the group's seam reader polls while rank 0
+    may be waiting, and the thread that loses a reap race must not record -1 over the
+    status the winner read."""
 
     pid: int
     returncode: int | None = None
+    _reap: threading.Lock = field(default_factory=threading.Lock)
 
     def poll(self) -> int | None:
-        if self.returncode is None:
+        if self.returncode is None and self._reap.acquire(blocking=False):
             try:
-                pid, status = os.waitpid(self.pid, os.WNOHANG)
-            except ChildProcessError:
-                return self.returncode
-            if pid == self.pid:
-                self.returncode = os.waitstatus_to_exitcode(status)
+                if self.returncode is None:
+                    try:
+                        pid, status = os.waitpid(self.pid, os.WNOHANG)
+                    except ChildProcessError:
+                        return self.returncode
+                    if pid == self.pid:
+                        self.returncode = os.waitstatus_to_exitcode(status)
+            finally:
+                self._reap.release()
         return self.returncode
 
     def wait(self) -> int:
-        if self.returncode is None:
-            try:
-                _pid, status = os.waitpid(self.pid, 0)
-                self.returncode = os.waitstatus_to_exitcode(status)
-            except ChildProcessError:
-                self.returncode = -1
+        with self._reap:
+            if self.returncode is None:
+                try:
+                    _pid, status = os.waitpid(self.pid, 0)
+                    self.returncode = os.waitstatus_to_exitcode(status)
+                except ChildProcessError:
+                    self.returncode = -1
         return self.returncode
 
     def send_signal(self, number: int) -> None:

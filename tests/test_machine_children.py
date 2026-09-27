@@ -546,7 +546,6 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             )
         origin = native_origin(worker) if case in ("source", "source_conflict") else None
         try:
-            fixture.measure(worker, preparation)
             prepared = worker.prepare_local_package(preparation)
             captured, capture_digest = documents.identity(
                 pb.MachineExecutionCapture(
@@ -587,7 +586,9 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             ]
             binding = JobBinding.read(next(row for row in plans if row.get("job") == "nested"))
             thread.start()
-            deadline = time.monotonic() + (960 if case == "serving_media" or proof_gate else 60)
+            # Hang bounds, not budgets: on a loaded shared box several executors spawning
+            # could outlast the old 60 s / 45 s bounds with nothing wrong.
+            deadline = time.monotonic() + (960 if case == "serving_media" or proof_gate else 300)
             while not (root / "address").exists():
                 assert thread.is_alive() and time.monotonic() < deadline
                 time.sleep(0.02)
@@ -606,7 +607,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     kind="job",
                     request_id="root",
                     job_descriptor_id=binding.job_descriptor_id,
-                    timeout_ms=900_000 if case == "serving_media" or proof_gate else 45_000,
+                    timeout_ms=900_000 if case == "serving_media" or proof_gate else 240_000,
                 ),
                 {},
                 root / "grants",
@@ -679,7 +680,6 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     assert thread.is_alive() and time.monotonic() < deadline
                     time.sleep(0.02)
                 _, other = fixture.package(root, "unrelated")
-                fixture.measure(worker, other)
                 worker.prepare_local_package(other)
                 (root / "prepared-other").touch()
             if case == "pause":

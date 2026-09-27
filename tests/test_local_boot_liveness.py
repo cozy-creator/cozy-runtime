@@ -130,14 +130,14 @@ def _run(root: Path, hook: Any) -> tuple[SliceOutcome, float]:
 
 @needs_executor
 def test_a_boot_that_keeps_working_is_never_cut(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The slow arm: a boot far longer than the old cap's equivalent completes.
+    """The slow arm: a boot several stillness floors long completes.
 
-    The old 1800 s cap was 60 times the transport ledger's 30 s floor. At this resolution that is
-    60 times 0.5 s, so the convergence lane is made to work — hash, pause, hash — for that
-    long before it spawns the executor: a boot that is moving the whole time and never, in
-    any one pause, still for longer than the derived floor. The run must reach its terminal.
+    The convergence lane is made to work — hash, pause, hash — for three boot floors before it
+    spawns the executor: a boot that is moving the whole time and never, in any one pause,
+    still for longer than the derived floor. The run must reach its terminal; a flat cap
+    would have cut it at the first floor.
     """
-    long_boot = 60 * noise_floor()
+    long_boot = 3 * boot_floor()
 
     def hook(owner: LocalRecordOwner, worker: Worker) -> None:
         spawn = worker.supervision.spawn
@@ -174,6 +174,7 @@ def test_a_boot_that_stops_working_is_ended_on_the_measurement() -> None:
     stopped process.
     """
     stopped: list[int] = []
+    stopped_at: list[float] = []
 
     def hook(owner: LocalRecordOwner, worker: Worker) -> None:
         spawn = worker.supervision.spawn
@@ -182,19 +183,23 @@ def test_a_boot_that_stops_working_is_ended_on_the_measurement() -> None:
             executor = spawn(**kwargs)
             os.kill(executor.pid, signal.SIGSTOP)
             stopped.append(executor.pid)
+            stopped_at.append(time.monotonic())
             return executor
 
         worker.supervision.spawn = stop_after_spawn  # type: ignore[method-assign]
 
     with _short_tmp() as root:
-        outcome, elapsed = _run(root, hook)
+        outcome, _ = _run(root, hook)
+        ended_at = time.monotonic()
 
     assert stopped, "the executor was never spawned, so nothing was wedged"
     assert outcome.ended == "worker_wedged", (outcome.ended, outcome.error)
     assert "no measurable progress for" in outcome.error
     assert f"load:start:{LOCAL_PLACEMENT}" in outcome.error, outcome.error
-    assert elapsed > boot_floor(), f"{elapsed:.1f}s: ended before the derived floor"
+    # Measured from the stop, not from package discovery and spawn, which load stretches.
+    still = ended_at - stopped_at[0]
+    assert still > boot_floor(), f"{still:.1f}s: ended before the derived floor"
     # Promptly: within a few floors, which the rule explains. The old clock was 60 floors.
-    assert elapsed < 4 * boot_floor(), f"{elapsed:.1f}s: the run waited on a clock"
+    assert still < 4 * boot_floor(), f"{still:.1f}s: the run waited on a clock"
     with pytest.raises(ProcessLookupError):
         os.kill(stopped[0], 0)

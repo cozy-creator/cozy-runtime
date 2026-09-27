@@ -704,7 +704,7 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream(origin
     from cozy_runtime.protocol import WIRE_MINOR
     from cozy_runtime.protocol import worker_pb2_grpc as rpc
     from test_end_to_end import _run, _wheel_rows
-    from test_job_preparation_isolation import measure, package
+    from test_job_preparation_isolation import package
     from test_publish_derivation import _download_set, _SimpleIndex
 
     with tempfile.TemporaryDirectory(prefix="cz-machine.") as raw:
@@ -784,7 +784,6 @@ def serve(payload: Request) -> Result:
             placements = {}
             for current_preparation in (preparation, second_preparation):
                 if origin == "private":
-                    measure(worker, current_preparation)
                     prepared = worker.prepare_local_package(current_preparation)
                 else:
                     wheel, runtime = (

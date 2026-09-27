@@ -53,9 +53,10 @@ def _served(without: dict[str, str]) -> list[dict[str, Any]]:
 
 
 def _payload(broker: Any, export: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    return canonical_json.decode(
+    payload: dict[str, Any] = canonical_json.decode(
         broker.reserve(source_interfaces.MODULE, export, arguments).payload
     )
+    return payload
 
 
 def test_sdk_omits_a_defaulted_option_an_older_runtime_does_not_serve(tmp_path: Path) -> None:

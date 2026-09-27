@@ -331,7 +331,6 @@ def machine(monkeypatch: pytest.MonkeyPatch, script: str) -> Iterator[Machine]:
         thread = threading.Thread(target=worker.run, daemon=True)
         pod = Machine(root, worker, thread)
         try:
-            fixture.measure(worker, preparation)
             pod.prepared = worker.prepare_local_package(preparation)
             yield pod
         finally:

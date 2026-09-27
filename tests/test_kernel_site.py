@@ -7,11 +7,12 @@ change: exactly what the executor does once at entry.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-from cozy_runtime.internal import kernel_site
+import pytest
 
 PROBE = """
 import json, sys
@@ -55,18 +56,39 @@ def _image(root: Path, **manifest: str) -> Path:
     return root
 
 
+#: The CUDA torch build the probe's environment carries. `torch_build` reads files and never
+#: imports torch, so a dist-info and `torch/version.py` are the whole build on any host.
+TORCH, CUDA = "2.14.0", "13.0"
+
+
+def _torch(root: Path) -> Path:
+    environment = root / "cuda-torch"
+    (environment / "torch").mkdir(parents=True)
+    (environment / "torch" / "version.py").write_text(
+        f"__version__ = '{TORCH}+cu130'\ncuda = '{CUDA}'\n"
+    )
+    info = environment / f"torch-{TORCH}+cu130.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: torch\nVersion: {TORCH}+cu130\n")
+    return environment
+
+
 def _run(root: Path) -> dict[str, object]:
+    environment = os.pathsep.join(filter(None, (str(_torch(root)), os.environ.get("PYTHONPATH"))))
     result = subprocess.run(
-        [sys.executable, "-c", PROBE, str(root)], capture_output=True, text=True, check=True
+        [sys.executable, "-c", PROBE, str(root)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "PYTHONPATH": environment},
     )
     placed: dict[str, object] = json.loads(result.stdout)
     return placed
 
 
 def _built() -> dict[str, str]:
-    torch, cuda = kernel_site.torch_build()
     python = f"cp{sys.version_info.major}{sys.version_info.minor}"
-    return {"torch": torch + "+cu", "cuda": cuda, "python_abi": python}
+    return {"torch": TORCH + "+cu", "cuda": CUDA, "python_abi": python}
 
 
 def test_a_matching_site_is_appended_after_the_package_environment(tmp_path: Path) -> None:
@@ -81,7 +103,10 @@ def test_a_matching_site_is_appended_after_the_package_environment(tmp_path: Pat
     assert placed["pth"] == str(tmp_path / "site" / "extra" / "cozy_pth_kernel.py")
     assert not str(placed["packaging"]).startswith(site)
     # A kernel it does not ship is absent by name, and the refusal says the site was placed.
-    code, detail = placed["refusal"]  # type: ignore[misc]
+    pytest.importorskip("diffusers")
+    refusal = placed["refusal"]
+    assert isinstance(refusal, list)
+    code, detail = refusal
     assert code == "attention_kernel_absent" and f"kernel site {site}" in detail
 
 
@@ -92,6 +117,7 @@ def test_another_torch_build_places_nothing_and_says_why(tmp_path: Path) -> None
     assert "built for torch 9.9.9" in site["reason"]
     assert str(tmp_path / "site") not in placed["path"]  # type: ignore[operator]
     assert placed["kernel"] == "" and placed["pth"] == ""
+    pytest.importorskip("diffusers")
     assert "built for torch 9.9.9" in placed["refusal"][1]  # type: ignore[index]
 
 

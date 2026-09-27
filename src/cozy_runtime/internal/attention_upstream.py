@@ -117,12 +117,14 @@ def sdpa_impl(query: Any, key: Any, value: Any, options: dict[str, Any]) -> str:
         scale=options["scale"],
         enable_gqa=options["enable_gqa"],
     )
-    return {
+    backend = SDPBackend(choice)
+    names: dict[Any, str] = {
         SDPBackend.CUDNN_ATTENTION: "cudnn",
         SDPBackend.FLASH_ATTENTION: "flash",
         SDPBackend.EFFICIENT_ATTENTION: "efficient",
         SDPBackend.MATH: "math",
-    }.get(SDPBackend(choice), SDPBackend(choice).name.lower())
+    }
+    return names.get(backend, str(backend.name).lower())
 
 
 def cudnn(

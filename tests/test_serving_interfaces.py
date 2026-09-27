@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import mypy_cache
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import (
@@ -402,7 +403,7 @@ Path(sys.argv[2]).write_text(sent[0]["payload"])
         "    return generate(prompt='hello')\n"
     )
     typed = subprocess.run(
-        [sys.executable, "-m", "mypy", "--strict", str(caller)],
+        [sys.executable, "-m", "mypy", "--strict", "--cache-dir", str(mypy_cache()), str(caller)],
         cwd=output,
         capture_output=True,
         text=True,

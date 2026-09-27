@@ -472,6 +472,7 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_wrong_hash() -> None:
             (root / "artifacts").mkdir()
             (root / "store").mkdir()
             held: list[package_installation.InstalledEnvironment] = []
+            loaded = set(sys.modules)
             prepared = prep(export, held=held)
             placement = json.loads(prepared.placement_set.placement_set_canonical_bytes)[
                 "placements"
@@ -487,8 +488,9 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_wrong_hash() -> None:
                 text=True,
             )
             assert probe.returncode == 0, probe.stderr
-            # The hard guard, observed live: preparing a package never loads derive.
-            assert "cozy_runtime.internal.derive" not in sys.modules
+            # The hard guard, observed live: preparing a package never loads derive. Measured
+            # across the prepare, since another in-process test may have loaded it already.
+            assert "cozy_runtime.internal.derive" not in set(sys.modules) - loaded
             staged = root / "artifacts" / hashlib.sha256(interface).hexdigest()
             assert staged.read_bytes() == interface
             # Minor 60 callers still have this pre-check while the 60-61 window is supported.

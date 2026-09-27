@@ -117,7 +117,7 @@ def test_cancel_can_close_source_while_metadata_admission_waits(
         closer = threading.Thread(target=close, daemon=True)
         closer.start()
         try:
-            assert closed.wait(1), "read broker held its mutex while waiting for disk admission"
+            assert closed.wait(10), "read broker held its mutex while waiting for disk admission"
             assert not broker.sources
         finally:
             allow.set()

@@ -25,10 +25,6 @@ CAPACITY: dict[str, object] = {
     " - reserve 96.0 GiB = 3.0 GiB free",
     "facts": {"available": 213674622976, "required": 6012954214, "reserved": 107374182400},
 }
-WHEEL: dict[str, object] = {
-    "code": "wheel_download_failed",
-    "reason": "fetch sha256:ab: ended at 0 of 812 bytes: transfer interrupted: unexpected EOF",
-}
 
 
 @pytest.fixture
@@ -105,35 +101,14 @@ def test_capacity_refusal_reaches_the_host_with_its_budget(
     assert trailer(failure, "cozy-error-code") == ["insufficient_storage"]
 
 
-def test_wheel_transfer_failure_is_not_called_a_disk_refusal(
-    supervisor: list[dict[str, object]],
+def test_a_reasonless_supervisor_answer_says_so(
+    supervisor: list[dict[str, object]], tmp_path: Path
 ) -> None:
-    supervisor.append(WHEEL)
-
-    def preparer(_: pb.PreparePackageSetRequest) -> pb.PreparePackageSetResult:
-        storage.fetch_wheel(
-            "locked-" + "0" * 64,
-            "torch-2.14.0-cp312-cp312-manylinux_2_28_x86_64.whl",
-            "sha256:" + "0" * 64,
-            "https://example.com/torch.whl?X-Amz-Signature=secret",
-        )
-        raise AssertionError("unreachable")
-
-    failure = prepare(pb.PreparePackageSetRequest(), preparer)
-    assert failure.details() == (
-        "StorageRefusal: supervisor refused locked wheel "
-        "torch-2.14.0-cp312-cp312-manylinux_2_28_x86_64.whl: " + str(WHEEL["reason"])
-    )
-    assert trailer(failure, "cozy-error-code") == ["wheel_download_failed"]
-
-
-def test_a_reasonless_supervisor_answer_says_so(supervisor: list[dict[str, object]]) -> None:
     supervisor.append({})
     with pytest.raises(storage.StorageRefusal) as refused:
-        storage.release_wheels("locked-" + "0" * 64)
+        with storage.admit(storage.Write(tmp_path, 1, 1)):
+            pytest.fail("refused write ran")
     assert refused.value.code == "storage_admission_refused"
     assert str(refused.value) == (
-        "supervisor refused wheel staging release locked-"
-        + "0" * 64
-        + ": the supervisor gave no reason"
+        "supervisor refused Runtime disk write: the supervisor gave no reason"
     )

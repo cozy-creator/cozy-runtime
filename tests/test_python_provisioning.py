@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import image_inventory, package_environment, storage_admission
+from cozy_runtime.internal import config, image_inventory, package_environment, storage_admission
 from cozy_runtime.internal import python_interpreters as p
 from cozy_runtime.internal.config import package_install_environment
 from cozy_runtime.internal.worker import package_prepare
@@ -262,6 +262,9 @@ def test_cli_ensure_calls_shared_provisioner_without_an_installer(
         return _candidate("3.13.8")
 
     monkeypatch.setattr(p, "ensure", ensure)
+    # This process is the CLI's for one call: an earlier in-process test may have taken the
+    # one-config-authority latch.
+    monkeypatch.setattr(config, "_read", False)
     # The real command parser and frozen default home are used; ensure is the only seam.
     assert main.main(["--json", "python-ensure", ">=3.13", "3.13.8"]) == 0
     assert calls == [(">=3.13", "3.13.8", Path.home() / ".cozy" / "python")]

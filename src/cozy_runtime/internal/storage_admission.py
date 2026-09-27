@@ -22,7 +22,7 @@ from weakref import WeakValueDictionary
 
 
 class StorageRefusal(Exception):
-    """A Runtime write or wheel transfer that storage admission did not grant.
+    """A Runtime write that storage admission did not grant.
 
     `code` is the owner's stable reason, `facts` its measured budget, if any. A refusal
     that carries a budget and names no other code is a capacity refusal.
@@ -322,28 +322,3 @@ def _refusal(subject: str, answer: object) -> StorageRefusal:
         else None,
         code=code,
     )
-
-
-def fetch_wheel(operation: str, filename: str, digest: str, url: str) -> tuple[Path, int]:
-    """The existing supervisor downloader owns redirects, admission and hashing."""
-    body = json.dumps(
-        {"operation": operation, "filename": filename, "digest": digest, "url": url},
-        separators=(",", ":"),
-    ).encode()
-    with _exchange(body, subject=f"locked wheel {filename}") as answer:
-        path, length = answer.get("path"), answer.get("length")
-        if not isinstance(path, str) or type(length) is not int or not 0 < length <= 2 << 30:
-            raise StorageRefusal(
-                f"supervisor returned an invalid file for locked wheel {filename}",
-                code="wheel_download_failed",
-            )
-        return Path(path), length
-
-
-def release_wheels(operation: str) -> None:
-    """A completed immutable install releases its existing wheel staging operation."""
-    with _exchange(
-        json.dumps({"operation": operation, "release": True}).encode(),
-        subject=f"wheel staging release {operation}",
-    ):
-        pass
