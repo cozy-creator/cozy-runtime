@@ -61,6 +61,7 @@ from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.calls import Calls
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger
+from cozy_runtime.internal.worker.machine_publication import output_destination
 from cozy_runtime.internal.worker.plan import (
     AttemptPlan,
     DeclaredBinding,
@@ -1852,6 +1853,9 @@ class AttemptEngine:
                 "package_interface": attempt.job.package_interface,
                 "job": attempt.job.job,
                 "call_interfaces": self.calls.bindings(attempt) if self.calls is not None else [],
+                "publish_to": output_destination(
+                    output.url for output in attempt.grant.outputs.values()
+                ),
                 "payload": attempt.payload,
                 "deadline_s": seconds,
                 "spool": str(spool),

@@ -3689,6 +3689,7 @@ class Executor:
                 spool=spool,
                 deadline=_deadline(command["deadline_s"]),
                 calls=self._call_broker(command),
+                publish_to=str(command.get("publish_to") or ""),
                 device=self._device() if self.torch is not None else Device(),
                 cancel=lambda: _cancelled(self.root, command["request_id"]),
                 models=job_models,

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from cozy_runtime import canonical_json
+from cozy_runtime.internal.worker.machine_publication import PublicationRefusal, output_destination
 from cozy_runtime.internal.worker.workspace import Journal, Row, Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -135,6 +136,14 @@ def transaction(db: Journal) -> Iterator[None]:
 def _id(value: str) -> None:
     if _ID.fullmatch(value) is None:
         raise WorkspaceRefusal("execution identity must be a bounded opaque ID")
+
+
+def destination_of(offer: pb.AttemptOffer) -> str:
+    """The repository a root's weights outputs publish to, as its owner granted it."""
+    try:
+        return output_destination(output.url for output in offer.grant.outputs)
+    except PublicationRefusal as exc:
+        raise WorkspaceRefusal(f"output destination is invalid: {exc.code}") from exc
 
 
 def _offer_bytes(offer: pb.AttemptOffer) -> bytes:
@@ -295,6 +304,13 @@ class Executions:
         if not 1 <= max_attempts <= 100 or not 0 <= retry_delay_ms <= 86_400_000:
             raise WorkspaceRefusal("execution retry policy exceeds its bound")
         self.workspace.validate_offer(offer)
+        if destination_of(offer) and (
+            not publication_authorization_id
+            or "job" not in documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+        ):
+            raise WorkspaceRefusal(
+                "an output destination needs a job root with publication authority"
+            )
         if offer.attempt_ordinal != 1 or len(capture_digest) != 32:
             raise WorkspaceRefusal("new execution needs attempt one and an exact capture digest")
         self.workspace.recover(owner)
@@ -372,6 +388,12 @@ class Executions:
             row = self._row(db, owner, offer.request_id)
             self._event(db, row, "accepted", canonical_json.encode({"generation": 1}))
             return self._receipt(row, workspace_id)
+
+    def destination(self, owner: str, request: str) -> str:
+        with self.workspace.locked() as db:
+            return destination_of(
+                pb.AttemptOffer.FromString(self._row(db, owner, request)["offer"])
+            )
 
     def publication_authorization(self, owner: str, request: str) -> str:
         with self.workspace.locked() as db:
