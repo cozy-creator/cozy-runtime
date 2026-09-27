@@ -65,6 +65,7 @@ def test_selection_uses_granted_pool_and_old_rows_do_not_need_count_probe(
         SimpleNamespace(
             installation_id="installed",
             callee="",
+            prepared_installation={},
             entrypoint="run",
             declaration={"models": [{"path": "run.models.model"}]},
         ),
