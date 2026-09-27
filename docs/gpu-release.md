@@ -30,7 +30,7 @@ async def long_form(ctx: Context, payload: Input, out: Outputs) -> Output:
 The root's journal records `gpu.lease {ordinals: [], cause: "released_by_root"}` (or
 `"device_exit"`), and its `MachineExecutionState.gpu.phase` becomes `none`.
 
-Requires a `cozy-runtime` newer than 0.18.55 in the package. A worker older than the SDK
+Requires a `cozy-runtime` newer than 0.18.56 in the package. A worker older than the SDK
 declines the release and the lease ends with the request, as before.
 
 Deferred: running other queued work inside a request's gaps between GPU calls.
