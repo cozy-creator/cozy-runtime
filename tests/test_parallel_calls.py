@@ -394,11 +394,9 @@ def test_a_placeable_component_runs_on_its_follower(tmp_path: Path, degree: int)
 
 
 @pytest.mark.parametrize("degree", [2, 4])
-def test_h3_vae_clips_spread_over_the_group_decode_bitwise_as_one_rank(
-    tmp_path: Path, degree: int
-) -> None:
+def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degree: int) -> None:
     """Each temporal clip decodes on some rank from its own latent window; rank 0 cross-fades
-    them in order. The frames must equal a single-rank decode exactly."""
+    them in order. Encode clips spread the same way. Both must equal a single-rank run."""
     pytest.importorskip("diffusers")
     fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
 
@@ -415,6 +413,9 @@ def test_h3_vae_clips_spread_over_the_group_decode_bitwise_as_one_rank(
     # 33 latent frames are 7 clips: rounds of `degree`, the last one partial.
     z = torch.randn(1, 4, 33, 2, 3, generator=torch.Generator().manual_seed(5))
     expected = model.decode(z)
+    # 56 frames pad to four 17-frame encode clips, as a 56-frame continuation window does.
+    x = torch.rand(1, 3, 56, *expected.shape[-2:], generator=torch.Generator().manual_seed(6))
+    moments = model.encode(x)
     ours, theirs = socket.socketpair()
     leader: Any = Executor(Channel(ours), tmp_path, world=degree)
     leader.device_kind = "cpu"
@@ -429,6 +430,9 @@ def test_h3_vae_clips_spread_over_the_group_decode_bitwise_as_one_rank(
         assert leader._install_group(torch, model, HOSTED_BUDGET) is None
         assert leader.facts["sequence_parallel"]["spread_ranks"] == list(range(degree))
         leader._attempt_spool = tmp_path / "attempt"
+        assert torch.equal(model.encode(x), moments)
+        assert sorted(group.rank_records) == list(range(1, degree))
+        group.rank_records.clear()
         actual = model.decode(z)
         assert torch.equal(actual, expected)
         assert sorted(group.rank_records) == list(range(1, degree))

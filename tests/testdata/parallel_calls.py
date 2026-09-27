@@ -272,6 +272,11 @@ class SpreadCalls(H3Calls):
         with torch.no_grad():
             return torch.cat(list(self.vae.decode_chunks(z)), dim=2)
 
+    @uses_components("vae")
+    def encode(self, x: Any) -> Any:
+        with torch.no_grad():
+            return self.vae.encode(x, return_dict=False)[0].parameters
+
 
 def tiny_vae() -> Any:
     """H3's video VAE at a few thousand parameters: the same temporal clips and cross-fade."""

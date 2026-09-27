@@ -146,8 +146,9 @@ class DeliveredAVWindow:
 class AVContext:
     """Native normalized AV windows, independently encoded from delivered RGB/audio.
 
-    A shorter causal VAE window is not a suffix of a longer window's latents.
-    Keeping all three encodings also preserves the audio grid's window-local phase.
+    A shorter causal VAE window is not a suffix of a longer window's latents, and the audio
+    grid's phase is window-local, so every window a successor may select is its own
+    encoding. A producer encodes only the windows its caller names.
     """
 
     windows: dict[int, tuple[torch.Tensor, torch.Tensor]]
@@ -176,12 +177,12 @@ class AVContext:
     def validate(self) -> None:
         if (
             type(self.frame_count) is not int
-            or self.frame_count not in CONTEXT_FRAMES
             or not isinstance(self.windows, dict)
-            or set(self.windows) != set(CONTEXT_FRAMES)
+            or self.frame_count not in self.windows
+            or not set(self.windows) <= set(CONTEXT_FRAMES)
             or any(type(n) is not int for n in self.windows)
         ):
-            _refuse("context must contain all three independently encoded AV windows")
+            _refuse("context must contain its selected independently encoded AV window")
         if (
             type(self.height) is not int
             or type(self.width) is not int
@@ -220,7 +221,7 @@ class AVContext:
 
     def select(self, frames: int) -> AVContext:
         self.validate()
-        if type(frames) is not int or frames not in CONTEXT_FRAMES:
+        if type(frames) is not int or frames not in self.windows:
             _refuse("requested continuation window is absent from the completed tail")
         return AVContext(
             self.windows,
@@ -274,9 +275,9 @@ def decode_context(data: bytes) -> AVContext:
     try:
         header = json.loads(data[8 : 8 + length])
         metadata = header.get("__metadata__", {})
-        keys = {f"{kind}_{n}" for n in CONTEXT_FRAMES for kind in ("video", "audio")}
+        present = [n for n in CONTEXT_FRAMES if f"video_{n}" in header]
         if (
-            not keys <= set(header)
+            not present
             or not {
                 "schema",
                 "sample_rate",
@@ -293,7 +294,7 @@ def decode_context(data: bytes) -> AVContext:
         # Bounded, uncompressed safetensors validates offsets before allocation.
         tensors = load(data)
         return AVContext(
-            {n: (tensors[f"video_{n}"], tensors[f"audio_{n}"]) for n in CONTEXT_FRAMES},
+            {n: (tensors[f"video_{n}"], tensors[f"audio_{n}"]) for n in present},
             int(metadata["height"]),
             int(metadata["width"]),
             int(metadata["source_end_frame"]),
@@ -349,13 +350,13 @@ def align_context_rows(state: Any, context: AVContext, patch_size: tuple[int, in
 
 
 class CompletedTail:
-    """Bounded streaming delivery window and the last56 RGB frames, never a whole clip."""
+    """The delivery window of a streamed decode. The consumer lands the delivered frames as
+    RGB8 for its output; the context tail is read back from that buffer, not copied twice."""
 
     def __init__(self, plan: ContinuationPlan) -> None:
         self.plan = plan
         self.seen = 0
         self.delivered = 0
-        self._tail: torch.Tensor | None = None
         self.complete = False
 
     def push(self, chunk: torch.Tensor) -> torch.Tensor:
@@ -366,22 +367,6 @@ class CompletedTail:
         self.seen += int(chunk.shape[0])
         selected = chunk[start : max(start, end)]
         self.delivered += int(selected.shape[0])
-        if selected.shape[0]:
-            if not bool(torch.isfinite(selected).all()):
-                _refuse("continuation decode contains non-finite video")
-            # Exactly the RGB8 rounding used for delivered H3 frames.
-            pixels = (
-                (selected[-MAX_CONTEXT_FRAMES:].clamp(0, 1) * 255)
-                .round()
-                .to(device="cpu", dtype=torch.uint8)
-                .permute(0, 2, 3, 1)
-                .contiguous()
-            )
-            self._tail = (
-                pixels
-                if self._tail is None
-                else torch.cat((self._tail, pixels))[-MAX_CONTEXT_FRAMES:].clone()
-            )
         return selected
 
     def finish(self) -> None:
@@ -389,8 +374,17 @@ class CompletedTail:
             _refuse("completed continuation decode differs from its sampled/delivered frame plan")
         self.complete = True
 
-    def export(self, audio: torch.Tensor, sample_rate: int, provenance: str) -> DeliveredAVWindow:
-        if not self.complete or self._tail is None or len(self._tail) != MAX_CONTEXT_FRAMES:
+    def export(
+        self, frames: torch.Tensor, audio: torch.Tensor, sample_rate: int, provenance: str
+    ) -> DeliveredAVWindow:
+        """`frames` are every delivered frame as landed: uint8 CPU `[delivered, H, W, 3]`."""
+        if (
+            not self.complete
+            or not isinstance(frames, torch.Tensor)
+            or frames.dtype != torch.uint8
+            or frames.device.type != "cpu"
+            or len(frames) != self.plan.delivered_frames
+        ):
             _refuse("continuation is not a completed decoded segment")
         end_frame = self.plan.delivery_end
         start_frame = end_frame - MAX_CONTEXT_FRAMES
@@ -398,7 +392,7 @@ class CompletedTail:
         if audio.ndim != 2 or audio.shape[0] != 2 or audio.shape[1] < end:
             _refuse("completed audio does not cover the delivered continuation window")
         return DeliveredAVWindow(
-            self._tail.numpy().copy(),
+            frames[-MAX_CONTEXT_FRAMES:].numpy().copy(),
             audio[:, start:end].float().cpu().clone(),
             sample_rate,
             start_frame,

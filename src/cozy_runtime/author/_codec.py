@@ -116,10 +116,15 @@ def _image(width: int, height: int, rgb: bytes) -> Any:
 
 
 def encode_png(width: int, height: int, rgb: bytes) -> bytes:
-    """Encode exact RGB pixels with PNG's maximum practical lossless settings."""
+    """Encode exact RGB pixels losslessly at zlib's fastest level.
+
+    The worker encodes a registered frame at the attempt's tail, before its outcome. On
+    1344x768 and 1024x1024 frames, level 9 with `optimize` took 1.1-2.0 s here and 2.9 s
+    on an H100 pod to save 10-16% over level 1's ~0.12 s: a second inference tail.
+    """
 
     encoded = io.BytesIO()
-    _image(width, height, rgb).save(encoded, format="PNG", optimize=True, compress_level=9)
+    _image(width, height, rgb).save(encoded, format="PNG", compress_level=1)
     body = encoded.getvalue()
     if body[:8] != b"\x89PNG\r\n\x1a\n":
         raise OutputError("the lossless PNG encoder returned a malformed container", code="encode")

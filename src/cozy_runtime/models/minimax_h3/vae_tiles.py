@@ -109,6 +109,21 @@ class TileBatchedVideoVAE(AutoencoderKLMiniMaxH3):  # type: ignore[misc]
     def _decode(self, z: torch.Tensor) -> torch.Tensor:
         return torch.cat(list(self.decode_chunks(z)), dim=2)
 
+    def _encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Upstream's temporal encode with its clips spread over the group: each
+        `clip_length` clip encodes from its own frames alone, so a round runs on the ranks
+        at once and the moments join here in order, as one rank computes them."""
+        clip_length = self.config.clip_length
+        if x.shape[2] == 1:
+            return self._encode_clip(x)
+        if x.shape[2] % clip_length:
+            pad = x[:, :, -1:].repeat(1, 1, (-x.shape[2]) % clip_length, 1, 1)
+            x = torch.cat([x, pad], dim=2)
+        clips = ((x[:, :, i : i + clip_length],) for i in range(0, x.shape[2], clip_length))
+        moments = torch.cat(list(spread(self, "_encode_clip", clips)), dim=2)
+        token_drop = self.config.token_drop
+        return moments[:, :, :-token_drop] if token_drop > 0 else moments
+
     def _decode_clip(self, z: torch.Tensor) -> torch.Tensor:
         if not self.use_tiling:
             return self.decoder(self.post_quant_conv(z))
