@@ -161,6 +161,11 @@ def test_history_loss_does_not_authorize_fencing_an_existing_writer(tmp_path: Pa
     assert writer.commit()["transaction_id"] == _transaction(request)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="worker-protocol scripts/fixtures.py freezes weights_transaction_id for the pre-wire-62 "
+    "job_spec digest; fix the vector upstream, re-vendor, then drop this marker",
+)
 def test_transaction_identity_matches_the_shared_protocol_vector() -> None:
     import json
 
