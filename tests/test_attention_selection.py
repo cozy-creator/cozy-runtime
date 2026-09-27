@@ -231,16 +231,13 @@ def test_every_candidate_states_the_architectures_it_serves_and_where_that_came_
     assert fa4.jit and not fa4.snapshot and (fa4.min_sm, fa4.max_sm) == (90, 110)
     assert fa4.distribution == "flash-attn-4" and fa4.import_name == "flash_attn.cute"
     assert not attention.BY_NAME["flash-attn3"].jit
-    assert attention.BY_NAME["sageattention"].max_sm == 90
-    assert attention.BY_NAME["sageattention"].backend.endswith("sm90")
-    assert attention_upstream.SAGE.impl() == (
-        "sageattn_qk_int8_pv_fp8_cuda_sm90(per_thread, fp32+fp32, smooth_k)"
-    )
+    # Sage names one upstream entry per card in its adapter; the site's arches bound the build.
+    sage = attention.BY_NAME["sageattention"]
+    assert (sage.max_sm, sage.sms, sage.local) == (120, {89, 90, 120}, attention_upstream.SAGE)
     # The FP16 P/V entry is upstream's SM80 kernel; the image builds it sm_90a only.
     fp16pv = attention.BY_NAME["sageattention-fp16pv"]
     assert (fp16pv.min_sm, fp16pv.max_sm, fp16pv.distribution) == (90, 90, "sageattention")
     assert fp16pv.local is attention_upstream.SAGE_FP16PV
-    assert fp16pv.local.impl() == "sageattn_qk_int8_pv_fp16_cuda(per_thread, fp32, smooth_k)"
     assert fp16pv.rel_l2_max < attention.BY_NAME["sageattention"].rel_l2_max
     assert attention.BY_NAME["cudnn"].max_sm == 0 and attention.BY_NAME["sdpa"].max_sm == 0
     # The floor may never be bounded above: a card it refused would hold no attention at all.
@@ -284,29 +281,35 @@ def test_device_code_covers_a_card_by_nvidias_rule_and_never_by_optimism(
     assert attention._covers(declared, sm) is covers
 
 
-@pytest.mark.parametrize("name", ["sageattention", "sageattention-fp16pv"])
+@pytest.mark.parametrize(
+    ("name", "card", "says", "below"),
+    [
+        ("sageattention-fp16pv", 120, "sageattention-fp16pv serves sm90 only", 89),
+        ("sageattention", 100, "sageattention serves SM [89, 90, 120], not sm100", 86),
+    ],
+)
 def test_a_static_ceiling_refuses_the_card_by_name_instead_of_reaching_the_kernel(
-    name: str,
+    name: str, card: int, says: str, below: int
 ) -> None:
-    """RED ARM, no plant and no device: `sageattention`'s declared range excludes sm_120, so a
-    pin naming it there is refused BY NAME rather than admitted and probed.
+    """RED ARM, no plant and no device: a card outside the declared range is refused BY NAME
+    rather than admitted and probed.
 
     Admitting it is what the old table did, and probing it is what would then have run the
     kernel: h3a-022 measured `cudaErrorNoKernelImageForDevice` out of this extension on an
     sm_120 card, from an image that builds it `arch=compute_90a,code=sm_90a`."""
-    refused = _refusal(lambda: attention.pinned(name, _device(120)))
+    refused = _refusal(lambda: attention.pinned(name, _device(card)))
     assert refused.code == "attention_kernel_unsupported"
-    assert f"{name} serves sm90 only" in str(refused)
-    assert "sm120" in str(refused)
+    assert says in str(refused)
+    assert f"sm{card}" in str(refused)
     # The refusal is also the discoverability (cr-125): it says what this card CAN run.
     assert "This environment runs" in str(refused)
     # And the same entry on the card it does claim gets past the device gate, so the ceiling
     # is a bound and not a blanket refusal — sm90 reaches resolution and fails on absence.
     assert _refusal(lambda: attention.pinned(name, _device(90))).code == "attention_kernel_absent"
-    below = _refusal(lambda: attention.pinned(name, _device(89)))
-    assert below.code == "attention_kernel_unsupported" and "needs sm90" in str(below)
+    under = _refusal(lambda: attention.pinned(name, _device(below)))
+    assert under.code == "attention_kernel_unsupported" and f"sm{below}" in str(under)
     # The device gate is applied wherever a candidate is offered, not only at the pin.
-    assert name not in attention.image_kernels(_device(120))
+    assert name not in attention.image_kernels(_device(card))
 
 
 def test_a_baked_kernels_ceiling_is_read_from_the_artifact_and_refuses_the_card_by_name(
@@ -378,6 +381,40 @@ def test_a_baked_kernels_ceiling_is_read_from_the_artifact_and_refuses_the_card_
     assert _refusal(lambda: attention.pinned("flash-attn3", _device(90))).code == (
         "attention_kernel_absent"
     )
+
+
+def test_a_site_kernels_arches_come_from_the_bake_gates_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`sageattention` names an SM120 mode, but the image built it sm_90a only until the
+    per-extension gencode split. The site manifest's arches (proved by `kernel_gate.py`)
+    refuse the card by name before the kernel is reached; a site that declares sm_120a gets
+    past the gate. A package's own copy of the distribution is not described by the site."""
+    site = tmp_path / "site"
+    info = site / "sageattention-2.2.0.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: sageattention\nVersion: 2.2.0\n")
+    (info / "RECORD").write_text("")
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.setattr(kernel_site, "_ACTIVE", kernel_site.KernelSite(str(tmp_path), str(site)))
+
+    def declare(*arches: str) -> None:
+        manifest = {"kernels": {"sageattention": {"arches": list(arches)}}}
+        (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+    declare("sm_90a")
+    sage = attention.BY_NAME["sageattention"]
+    assert attention._baked_archs(sage) == {"kernel site": ["sm_90a"]}
+    refused = _refusal(lambda: attention.pinned("sageattention", _device(120)))
+    assert refused.code == "attention_kernel_unsupported" and "'sm_90a'" in str(refused)
+    declare("sm_89", "sm_90a", "sm_120a")
+    assert _refusal(lambda: attention.pinned("sageattention", _device(120))).code == (
+        "attention_kernel_absent"
+    )
+    # Source kernels carry no device code to declare, and other distributions are not the site's.
+    assert attention._site_archs(attention.BY_NAME["flash-attn4-fp8"]) == {}
+    monkeypatch.setattr(kernel_site, "_ACTIVE", kernel_site.KernelSite(str(tmp_path), str(info)))
+    assert attention._site_archs(sage) == {}
 
 
 def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() -> None:
@@ -705,11 +742,10 @@ def test_group_merge_preserves_automatic_precision_and_explicit_fp8() -> None:
     )
 
 
-def test_every_head_local_kernel_shards_and_a_cross_head_one_refuses() -> None:
+def test_every_head_local_kernel_shards() -> None:
     """Runtime's Ulysses wrapper makes every head-local kernel context-parallel — the fp8,
-    FA4, Sage and Kitchen refusals were adapter plumbing (audit 2026-09-26 §1). A kernel with
-    a cross-head reduction (FlashInfer's global V amax) is registered without it, so a sharded
-    pin of it refuses typed, through the real registry's own answer."""
+    FA4, Sage and Kitchen refusals were adapter plumbing (audit 2026-09-26 §1), and
+    FlashInfer's scalar V scale is now applied per head outside its kernel."""
     why = _diffusers_skip()
     if why:
         pytest.skip(why)
@@ -721,23 +757,9 @@ def test_every_head_local_kernel_shards_and_a_cross_head_one_refuses() -> None:
     assert sharded.totals() == {"flash-attn3": 2}
     assert sharded.offered == tuple(RANKED)
     assert _backends(roots) == {"dit": ["_cozy_flash_attn3"]}
-    for name in (
-        "flash-attn3-fp8",
-        "flash-attn4",
-        "sageattention",
-        "sageattention-fp16pv",
-        "kitchen-int8",
-        "sol-attn",
-    ):
+    for name in sorted(set(attention.BY_NAME) - set(RANKED)):
         assert attention.install(_ready(name), roots, name, degree=4).totals() == {name: 2}
         attention.admit(f"dit={name}", 4)
-    refused = _refusal(
-        lambda: attention.install(
-            _ready("flashinfer-bf16-fp8"), roots, "flashinfer-bf16-fp8", degree=4
-        )
-    )
-    assert refused.code == "attention_kernel_unsupported"
-    assert "degree 4" in str(refused) and "context parallelism" in str(refused)
 
 
 # ------------------------------------------------------------------------------ the CUDA arm

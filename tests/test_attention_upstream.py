@@ -18,10 +18,11 @@ from cozy_runtime.internal import attention_upstream as upstream
 
 torch = pytest.importorskip("torch")
 
-ADAPTERS = [upstream.kitchen_int8, upstream.flashinfer_mixed]
+NONCAUSAL = [upstream.kitchen_int8, upstream.flashinfer_mixed]
+ADAPTERS = [*NONCAUSAL, upstream.sage3_fp4]
 
 
-@pytest.mark.parametrize("adapter", ADAPTERS)
+@pytest.mark.parametrize("adapter", NONCAUSAL)
 @pytest.mark.parametrize(
     ("options", "reason"),
     [
@@ -39,9 +40,7 @@ def test_nondefault_unsupported_semantics_refuse(
         adapter(q, q, q, **options)
 
 
-@pytest.mark.parametrize(
-    "name", ["kitchen-int8", "sageattention", "sageattention-fp16pv", "flash-attn3"]
-)
+@pytest.mark.parametrize("name", sorted(set(attention.BY_NAME) - {"sol-attn"}))
 @pytest.mark.parametrize(
     ("options", "reason"),
     [({"return_lse": True}, "log-sum-exp"), ({"_parallel_config": object()}, "Ulysses")],
@@ -61,11 +60,19 @@ def test_the_wrapper_refuses_lse_and_anything_but_initialized_ulysses(
         backend(query=q, key=q, value=q, **options)
 
 
-def test_a_cross_head_kernel_refuses_ulysses_before_any_collective() -> None:
+def test_every_registered_kernel_is_head_local_and_a_cross_head_one_refuses_ulysses() -> None:
+    """Every Runtime kernel reduces within one head (FlashInfer's scalar V scale is applied per
+    head outside the kernel), so every one is context-parallel. The wrapper still refuses a
+    kernel that declares a cross-head reduction, before any collective."""
     pytest.importorskip("diffusers")
     from diffusers.models.attention_dispatch import _AttentionBackendRegistry
 
-    member = attention._member(attention.BY_NAME["flashinfer-bf16-fp8"])
+    for candidate in attention.BY_NAME.values():
+        assert candidate.local.head_local, candidate.name
+        member = attention._member(candidate)
+        assert _AttentionBackendRegistry._is_context_parallel_available(member), candidate.name
+    local = attention_ulysses.Local(lambda *_, **__: None, lambda *_: "", head_local=False)
+    member = attention_ulysses.member("_cozy_test_cross_head", local)
     assert not _AttentionBackendRegistry._is_context_parallel_available(member)
     q = torch.zeros((1, 2, 2, 128), dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="across heads"):
@@ -134,40 +141,78 @@ def test_mixed_backend_does_not_cast_qk_or_discard_padding() -> None:
         upstream.flashinfer_mixed(q, q, q, attn_mask=torch.ones((2, 2)))
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_current_value_scale_preserves_inputs_and_zero_values(dtype: Any) -> None:
-    value = torch.tensor([-100, -1, 0, 1, 100], dtype=dtype)
-    original = value.clone()
-    quantized, scale = upstream._quantize_value(value)
-    assert torch.equal(value, original)
-    assert quantized.dtype == torch.float8_e4m3fn
-    assert torch.isfinite(quantized.float()).all()
-    assert scale == 100 / 448
-    assert float((quantized.float() * scale - value.float()).abs().max()) < 0.02
-    zero, scale = upstream._quantize_value(torch.zeros_like(value))
-    assert scale > 0
-    assert torch.equal(zero.float(), torch.zeros_like(value).float())
-    with pytest.raises(ValueError, match="non-finite"):
-        upstream._quantize_value(torch.tensor([float("inf")]))
+def test_fp8_flash_attention_needs_bf16_and_equal_heads() -> None:
+    q = torch.zeros((1, 2, 2, 128), dtype=torch.float16)
+    with pytest.raises(ValueError, match="requires BF16 inputs"):
+        upstream.fa4_fp8(q, q, q)
+    q = q.bfloat16()
+    for adapter in (upstream.fa3_fp8, upstream.fa4_fp8):
+        with pytest.raises(ValueError, match="equal Q/KV head counts"):
+            adapter(q, q[:, :, :1], q[:, :, :1], enable_gqa=True)
+
+
+def test_sage3_refuses_what_upstream_would_silently_change() -> None:
+    """Upstream sends D>=256 to SDPA with a print and fixes the scale at D^-1/2."""
+    wide = torch.zeros((1, 2, 2, 256), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="does not serve head dimension 256"):
+        upstream.sage3_fp4(wide, wide, wide)
+    q = torch.zeros((1, 2, 2, 128), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="same CUDA device"):
+        upstream.sage3_fp4(q, q, q, scale=128**-0.5)
+
+
+def test_sage2_selects_upstreams_mode_by_the_querys_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Query:
+        device = torch.device("cuda", 0)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
+    assert upstream.SAGE.impl(Query()) == (
+        "sageattn_qk_int8_pv_fp8_cuda_sm90(per_thread, fp32+fp32, smooth_k)"
+    )
+    assert upstream.SAGE_FP16PV.impl(Query()) == (
+        "sageattn_qk_int8_pv_fp16_cuda(per_thread, fp32, smooth_k)"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (8, 9))
+    assert upstream.SAGE.impl(Query()) == (
+        "sageattn_qk_int8_pv_fp8_cuda(per_thread, fp32+fp16, smooth_k)"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (12, 0))
+    assert upstream.SAGE.impl(Query()) == (
+        "sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k)"
+    )
+    with pytest.raises(ValueError, match="no mode for sm120"):
+        upstream.SAGE_FP16PV.impl(Query())
+    with pytest.raises(ValueError, match="CUDA devices only"):
+        upstream.SAGE.impl(torch.zeros(1))
+
+
+#: adapter -> (module, cards, masks, grouped heads, scale, rel L2 bound)
+REAL: dict[Any, tuple[str, tuple[tuple[int, int], ...], bool, bool, float | None, float]] = {
+    upstream.kitchen_int8: ("comfy_kitchen", upstream.KITCHEN_SMS, True, True, 0.075, 0.05),
+    upstream.flashinfer_mixed: ("flashinfer", ((10, 0), (10, 3)), False, True, 0.075, 0.05),
+    upstream.fa4_fp8: ("flash_attn", ((10, 0), (10, 3)), False, False, 0.075, 0.06),
+    upstream.sage3_fp4: ("sageattn3", ((12, 0),), False, False, None, 0.2),
+}
 
 
 @pytest.mark.skipif(
     os.environ.get("COZY_TEST_ATTENTION_CUDA") != "1",
     reason="requires an explicitly owned CUDA device and upstream kernel installation",
 )
-@pytest.mark.parametrize("adapter", ADAPTERS)
+@pytest.mark.parametrize("adapter", list(REAL))
 @pytest.mark.parametrize("grouped", [False, True])
 def test_real_upstream_matches_sdpa_and_preserves_inputs(
     adapter: Callable[..., Any], grouped: bool
 ) -> None:
-    mixed = adapter is upstream.flashinfer_mixed
-    dependency = "flashinfer" if mixed else "comfy_kitchen"
+    dependency, cards, masks, groups, scale, bound = REAL[adapter]
+    if grouped and not groups:
+        pytest.skip("adapter serves equal Q/KV heads only")
     if importlib.util.find_spec(dependency) is None:
         pytest.skip(f"{dependency} is not installed")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     capability = torch.cuda.get_device_capability()
-    if capability not in (((10, 0), (10, 3)) if mixed else ((9, 0), (10, 0), (10, 3))):
+    if capability not in cards:
         pytest.skip(f"adapter does not serve {capability}")
     generator = torch.Generator(device="cuda").manual_seed(6057)
     kv_heads = 2 if grouped else 4
@@ -179,12 +224,11 @@ def test_real_upstream_matches_sdpa_and_preserves_inputs(
     k, v = kv[:, :, :, 1, :], kv[:, :, :, 2, :]
     originals = [tensor.clone() for tensor in (q, k, v)]
     mask = None
-    if not mixed:
+    if masks:
         mask = torch.ones((2, 1, 137, 259), device="cuda", dtype=torch.bool)
         mask[0, :, :, 129:] = False
     # A nondefault scale and batch-specific mask expose wrappers that drop options
     # or flatten batch boundaries. Actual upstream kernels run; there are no doubles.
-    scale = 0.075
     with torch.inference_mode():
         got = adapter(q, k, v, attn_mask=mask, scale=scale, enable_gqa=grouped)
         repeat = adapter(q, k, v, attn_mask=mask, scale=scale, enable_gqa=grouped)
@@ -201,4 +245,4 @@ def test_real_upstream_matches_sdpa_and_preserves_inputs(
     assert all(
         torch.equal(tensor, saved) for tensor, saved in zip((q, k, v), originals, strict=True)
     )
-    assert float((got.float() - exact).norm() / exact.norm()) < 0.05
+    assert float((got.float() - exact).norm() / exact.norm()) < bound

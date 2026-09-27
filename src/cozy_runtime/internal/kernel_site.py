@@ -105,6 +105,20 @@ def current() -> KernelSite:
     return _ACTIVE or KernelSite(str(ROOT), reason="not activated in this process")
 
 
+def arches(name: str) -> list[str]:
+    """The architectures the image's bake gate proved the site's build of kernel `name`
+    carries (`kernel_gate.py` refuses an extension missing a declared one); empty when no site
+    is placed or its manifest does not declare the kernel."""
+    if not current().path:
+        return []
+    try:
+        declared = json.loads((Path(current().root) / MANIFEST).read_text())["kernels"][name]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    found = declared.get("arches") if isinstance(declared, dict) else None
+    return [str(arch) for arch in found] if isinstance(found, list) else []
+
+
 def snapshot(name: str) -> Path:
     """A `kernels` Hub snapshot the image bakes beside the site, e.g. `flash-attn3`."""
     return Path(current().root) / name

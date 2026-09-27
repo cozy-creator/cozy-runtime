@@ -10,6 +10,7 @@ dependencies, and the executor imports torch only after its environment seal.
 from __future__ import annotations
 
 import math
+from collections.abc import Collection
 from importlib import import_module
 from typing import Any
 
@@ -196,23 +197,21 @@ def fa3_fp8(
     call, the descales handed to the kernel, BF16/FP16 output from the kernel itself. Every
     scale reduces within one head, so it is head-local under Ulysses."""
     _options("flash-attn3-fp8", attn_mask, dropout_p, scale)
-    _heads(query, key, enable_gqa)
-    (q8, q_descale), (k8, k_descale), (v8, v_descale) = (
-        attention_fp8.quantise(tensor) for tensor in (query, key, value)
-    )
+    q8, k8, v8, descales = _e4m3(query, key, value)
     return _first(
         _fa3().flash_attn_func(
-            q8,
-            k8,
-            v8,
-            softmax_scale=scale,
-            causal=is_causal,
-            num_splits=1,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
+            q8, k8, v8, softmax_scale=scale, causal=is_causal, num_splits=1, **descales
         )
     )
+
+
+def _e4m3(query: Any, key: Any, value: Any) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Per-(batch, head) e4m3 Q/K/V and the `*_descale` keywords FA3 and FA4 take. Their
+    descales are per KV head, so a grouped query (one scale per Q head) is refused."""
+    if query.shape[2] != key.shape[2]:
+        raise ValueError("FP8 FlashAttention needs equal Q/KV head counts")
+    (q8, q), (k8, k), (v8, v) = (attention_fp8.quantise(t) for t in (query, key, value))
+    return q8, k8, v8, {"q_descale": q, "k_descale": k, "v_descale": v}
 
 
 def fa4(
@@ -234,13 +233,51 @@ def fa4(
     return _first(cute.flash_attn_func(query, key, value, softmax_scale=scale, causal=is_causal))
 
 
+def fa4_fp8(
+    query: Any,
+    key: Any,
+    value: Any,
+    *,
+    attn_mask: Any = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> Any:
+    """FlashAttention-4's SM100 e4m3 forward with FA3's per-(batch, head) descales; the kernel
+    returns BF16. The public `flash_attn_func` takes no descales, so this calls the forward it
+    wraps, as upstream's own FP8 benchmark does. Every scale is per head: head-local."""
+    import torch
+
+    _options("flash-attn4-fp8", attn_mask, dropout_p, scale)
+    if query.dtype != torch.bfloat16:
+        raise ValueError("flash-attn4-fp8 returns BF16 and requires BF16 inputs")
+    q8, k8, v8, descales = _e4m3(query, key, value)
+    interface = import_module("flash_attn.cute.interface")
+    return _first(
+        interface._flash_attn_fwd(q8, k8, v8, softmax_scale=scale, causal=is_causal, **descales)
+    )
+
+
 # --------------------------------------------------------------------- quantized kernels
 
 
-def _sage(entry: str, pv_accum_dtype: str) -> Local:
-    """SageAttention2 through one named entry: INT8 Q/K per thread with smoothed K; `entry`
-    fixes the P/V precision and `pv_accum_dtype` its accumulation. Its scales reduce within
-    one head."""
+def _sage(modes: dict[int, tuple[str, str, str]]) -> Local:
+    """SageAttention2 through one named entry per SM: `sm -> (entry, qk_quant_gran,
+    pv_accum_dtype)`, upstream's own per-architecture choice, selected by the query's card.
+    INT8 Q/K with smoothed K; `entry` fixes the P/V precision. Its scales reduce within one
+    head."""
+
+    def mode(query: Any) -> tuple[str, str, str]:
+        import torch
+
+        if query.device.type != "cuda":
+            raise ValueError("sageattention serves CUDA devices only")
+        major, minor = torch.cuda.get_device_capability(query.device)
+        found = modes.get(major * 10 + minor)
+        if found is None:
+            raise ValueError(f"sageattention has no mode for sm{major}{minor}; it serves {modes}")
+        return found
 
     def forward(
         query: Any,
@@ -255,22 +292,41 @@ def _sage(entry: str, pv_accum_dtype: str) -> Local:
     ) -> Any:
         _options("sageattention", attn_mask, dropout_p, scale)
         _heads(query, key, enable_gqa)
+        entry, granularity, accumulation = mode(query)
         return getattr(import_module("sageattention"), entry)(
             query,
             key,
             value,
             tensor_layout="NHD",
             is_causal=is_causal,
-            qk_quant_gran="per_thread",
+            qk_quant_gran=granularity,
             sm_scale=scale,
-            pv_accum_dtype=pv_accum_dtype,
+            pv_accum_dtype=accumulation,
             smooth_k=True,
         )
 
-    return Local(forward, _named(f"{entry}(per_thread, {pv_accum_dtype}, smooth_k)"))
+    def impl(query: Any, *_: Any) -> str:
+        entry, granularity, accumulation = mode(query)
+        return f"{entry}({granularity}, {accumulation}, smooth_k)"
+
+    return Local(forward, impl)
 
 
-def _cuda_inputs(query: Any, key: Any, value: Any, enable_gqa: bool, *, mixed: bool) -> None:
+#: Kitchen's wheel carries device code for sm_75 up; these are the cards Runtime admits.
+KITCHEN_SMS = ((9, 0), (10, 0), (10, 3), (12, 0), (12, 1))
+
+
+def _cuda_inputs(
+    query: Any,
+    key: Any,
+    value: Any,
+    enable_gqa: bool,
+    *,
+    name: str,
+    admitted: tuple[tuple[int, int], ...],
+    dims: Collection[int] = range(1, 257),
+    bf16: bool = False,
+) -> None:
     import torch
 
     if any(not isinstance(x, torch.Tensor) for x in (query, key, value)):
@@ -281,8 +337,8 @@ def _cuda_inputs(query: Any, key: Any, value: Any, enable_gqa: bool, *, mixed: b
         raise ValueError("attention Q/K/V must be BF16 or FP16")
     if key.dtype != query.dtype or value.dtype != query.dtype:
         raise ValueError("attention Q/K/V must have identical input dtypes")
-    if mixed and query.dtype != torch.bfloat16:
-        raise ValueError("flashinfer-bf16-fp8 preserves BF16 Q/K and requires BF16 inputs")
+    if bf16 and query.dtype != torch.bfloat16:
+        raise ValueError(f"{name} preserves BF16 Q/K and requires BF16 inputs")
     batch, _sequence, heads, dim = query.shape
     if min(query.shape) <= 0 or min(key.shape) <= 0 or min(value.shape) <= 0:
         raise ValueError("attention tensor dimensions must be positive")
@@ -294,16 +350,15 @@ def _cuda_inputs(query: Any, key: Any, value: Any, enable_gqa: bool, *, mixed: b
     ):
         raise ValueError("attention needs matching K/V and compatible batch/head dimensions")
     _heads(query, key, enable_gqa)
-    if (mixed and dim != 128) or dim > 256:
-        raise ValueError("FlashInfer mixed attention needs D128; Kitchen supports D1 through D256")
+    if dim not in dims:
+        raise ValueError(f"{name} does not serve head dimension {dim}")
     if query.device.type != "cuda" or key.device != query.device or value.device != query.device:
         raise ValueError("attention Q/K/V must be on the same CUDA device")
     if getattr(torch.version, "hip", None):
         raise ValueError("these attention adapters currently admit NVIDIA CUDA devices only")
     capability = torch.cuda.get_device_capability(query.device)
-    admitted = ((10, 0), (10, 3)) if mixed else ((9, 0), (10, 0), (10, 3))
     if capability not in admitted:
-        raise ValueError(f"this attention adapter admits {admitted}, not {capability}")
+        raise ValueError(f"{name} admits {admitted}, not {capability}")
     if torch.is_grad_enabled() and any(x.requires_grad for x in (query, key, value)):
         raise ValueError("this attention adapter is inference-only")
 
@@ -324,27 +379,13 @@ def kitchen_int8(
     if is_causal:
         raise ValueError("kitchen-int8 serves noncausal attention only")
     _options("kitchen-int8", attn_mask, dropout_p, scale, masks=True)
-    _cuda_inputs(query, key, value, enable_gqa, mixed=False)
+    _cuda_inputs(query, key, value, enable_gqa, name="kitchen-int8", admitted=KITCHEN_SMS)
     kitchen = import_module("comfy_kitchen")
     tensors = [x if x.stride(-1) == 1 else x.contiguous() for x in (query, key, value)]
     output = kitchen.int8_attention(
         *(x.transpose(1, 2) for x in tensors), scale=scale, attn_mask=attn_mask
     )
     return _output(output, query.transpose(1, 2)).transpose(1, 2)
-
-
-def _quantize_value(value: Any) -> tuple[Any, float]:
-    """The scalar E4M3 scale FlashInfer's mixed FMHA takes; `item` synchronizes, so
-    complete-call benchmarks include it. Q/K are never cast."""
-    import torch
-
-    maximum = float(value.abs().amax().item())
-    if not math.isfinite(maximum):
-        raise ValueError("FlashInfer V contains non-finite values")
-    descale = max(maximum / 448.0, 1e-12)
-    scaled = value.to(dtype=torch.float32, copy=True)
-    quantized = scaled.div_(descale).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
-    return quantized.contiguous(), descale
 
 
 def flashinfer_mixed(
@@ -358,47 +399,99 @@ def flashinfer_mixed(
     scale: float | None = None,
     enable_gqa: bool = False,
 ) -> Any:
-    """Blackwell CuTe FMHA: BF16 Q/K, E4M3 V/P, BF16 output. Its V scale is one amax over
-    every head, so it is NOT head-local and is registered without context parallelism."""
+    """Blackwell CuTe FMHA: BF16 Q/K, E4M3 V/P, BF16 output. Its V scale is one scalar over
+    every head, so V is quantised per (batch, head), the kernel's scale stays 1 and each head's
+    descale multiplies that head's output (attention is linear in V): head-local, and no host
+    synchronisation. The kernel is compiled from the installed source (CuTe JIT) and handed
+    in, so the library never fetches its prebuilt artifacts at first use."""
     if is_causal:
         raise ValueError("flashinfer-bf16-fp8 serves noncausal attention only")
     _options("flashinfer-bf16-fp8", attn_mask, dropout_p, scale)
-    _cuda_inputs(query, key, value, enable_gqa, mixed=True)
+    _cuda_inputs(
+        query,
+        key,
+        value,
+        enable_gqa,
+        name="flashinfer-bf16-fp8",
+        admitted=((10, 0), (10, 3)),
+        dims=(128,),
+        bf16=True,
+    )
     import torch
 
-    fmha = import_module("flashinfer.attention.cute_dsl.fmha")
     batch, q_length, q_heads, dim = query.shape
     kv_length, kv_heads = key.shape[1:3]
     if batch * max(q_length, kv_length) >= 2**31:
         raise ValueError("FlashInfer ragged sequence offsets exceed int32")
+    compile_fmha = import_module("flashinfer.cute_dsl.attention.fmha.compile")
+    kernel = compile_fmha.compile_cute_dsl_fmha_kernel(
+        qk_dtype=torch.bfloat16,
+        v_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+        num_qo_heads=q_heads,
+        num_kv_heads=kv_heads,
+        head_dim=dim,
+        head_dim_v=dim,
+        is_causal=False,
+        with_lse=False,
+        enable_sink=False,
+        enable_skip_softmax=False,
+        use_pdl=False,
+        device=query.device,
+    )
+    v8, descale = attention_fp8.quantise(value.contiguous())
     q = query.reshape(batch * q_length, q_heads, dim).contiguous()
-    k = key.reshape(batch * kv_length, kv_heads, dim).contiguous()
-    v, descale = _quantize_value(value.reshape(batch * kv_length, kv_heads, dim))
     output = torch.empty_like(q)
     offsets = torch.arange(batch + 1, device=query.device, dtype=torch.int32)
-    fmha.cute_dsl_fmha_ragged_prefill(
+    import_module("flashinfer.attention.cute_dsl.fmha").cute_dsl_fmha_ragged_prefill(
         q,
-        k,
-        v,
+        key.reshape(batch * kv_length, kv_heads, dim).contiguous(),
+        v8.reshape(batch * kv_length, kv_heads, dim),
         output,
         offsets * q_length,
         offsets * kv_length,
         is_causal=False,
         sm_scale=scale,
-        scale_q=1.0,
-        scale_k=1.0,
-        scale_v=descale,
-        scale_o=1.0,
         max_qo_len=q_length,
         max_kv_len=kv_length,
-        window_left=-1,
-        window_right=-1,
-        attention_sinks=None,
-        lse=None,
-        skip_softmax_threshold_scale_factor=None,
-        enable_pdl=False,
+        kernel_fn=kernel,
+        enable_tvm_ffi=True,
     )
-    return _output(output.reshape(batch, q_length, q_heads, dim), query)
+    per_head = descale.repeat_interleave(q_heads // kv_heads, dim=1)[:, None, :, None]
+    return _output(output.reshape(batch, q_length, q_heads, dim).mul_(per_head), query)
+
+
+def sage3_fp4(
+    query: Any,
+    key: Any,
+    value: Any,
+    *,
+    attn_mask: Any = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> Any:
+    """SageAttention3's consumer-Blackwell FP4 kernel: NVFP4 Q/K/V with per-16 E4M3
+    microscales, K mean and per-block Q mean smoothing. Every mean and scale is per head, so
+    it is head-local. Upstream subtracts K's mean IN PLACE, so it gets a copy, and its softmax
+    scale is fixed at D^-1/2."""
+    import torch
+
+    _options("sageattention3-fp4", attn_mask, dropout_p, scale)
+    admitted = ((12, 0),)
+    _cuda_inputs(
+        query, key, value, enable_gqa, name="sageattention3-fp4", admitted=admitted, dims=(64, 128)
+    )
+    if query.shape[2] != key.shape[2]:
+        raise ValueError("sageattention3-fp4 needs equal Q/KV head counts")
+    if scale is not None and not math.isclose(scale, query.shape[-1] ** -0.5, rel_tol=1e-6):
+        raise ValueError("sageattention3-fp4 fixes the softmax scale at D^-1/2")
+    q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
+    output = import_module("sageattn3").sageattn3_blackwell(
+        q, k.clone(memory_format=torch.contiguous_format), v, is_causal=is_causal
+    )
+    return _output(output, q).transpose(1, 2)
 
 
 def _named(name: str) -> Any:
@@ -410,9 +503,18 @@ CUDNN = Local(cudnn, _named("cudnn"))
 FA3 = Local(fa3, lambda *_: f"flash_attn3 {_FA3_VARIANT}")
 FA3_FP8 = Local(fa3_fp8, lambda *_: f"flash_attn3 {_FA3_VARIANT} e4m3 per-head")
 FA4 = Local(fa4, _named("flash_attn.cute.flash_attn_func"))
-#: FP8 P/V: the Hopper kernel, which accepts only two-level FP32 accumulation.
-SAGE = _sage("sageattn_qk_int8_pv_fp8_cuda_sm90", "fp32+fp32")
+FA4_FP8 = Local(fa4_fp8, _named("flash_attn.cute.interface._flash_attn_fwd e4m3 per-head"))
+#: FP8 P/V, as upstream's `sageattn` dispatches it: the Hopper kernel (two-level FP32
+#: accumulation only) and the SM89 kernel, per warp on consumer Blackwell.
+SAGE = _sage(
+    {
+        89: ("sageattn_qk_int8_pv_fp8_cuda", "per_thread", "fp32+fp16"),
+        90: ("sageattn_qk_int8_pv_fp8_cuda_sm90", "per_thread", "fp32+fp32"),
+        120: ("sageattn_qk_int8_pv_fp8_cuda", "per_warp", "fp32+fp16"),
+    }
+)
 #: FP16 P/V at upstream's default (and most accurate) FP32 accumulation; BF16 V is cast to FP16.
-SAGE_FP16PV = _sage("sageattn_qk_int8_pv_fp16_cuda", "fp32")
+SAGE_FP16PV = _sage({90: ("sageattn_qk_int8_pv_fp16_cuda", "per_thread", "fp32")})
 KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"))
-FLASHINFER = Local(flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill"), head_local=False)
+FLASHINFER = Local(flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill jit, e4m3 V per-head"))
+SAGE3 = Local(sage3_fp4, _named("sageattn3.sageattn3_blackwell(nvfp4, per_block_mean)"))

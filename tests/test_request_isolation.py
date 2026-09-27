@@ -6,12 +6,13 @@ import os
 import socket
 import sys
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import attention, executor, package_interface
+from cozy_runtime.internal import attention, attention_ulysses, executor, package_interface
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor
@@ -122,23 +123,24 @@ def test_a_refused_load_leaves_loaded_constructions_serving(
     assert _serve(executor, "after", "ok")["outcome"]["terminal"] == "succeeded"
 
 
-def test_a_pin_no_parallel_group_can_run_refuses_before_construction() -> None:
+def test_a_pin_no_parallel_group_can_run_refuses_before_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     pytest.importorskip("diffusers.models.attention_dispatch")
+    # Every Runtime kernel is head-local today; a cross-head one must still refuse a group.
+    local = attention_ulysses.Local(lambda *_, **__: None, lambda *_: "", head_local=False)
+    kitchen = attention.BY_NAME["kitchen-int8"]
+    cross = replace(kitchen, name="cross-head", backend="_cozy_test_cross", local=local)
+    monkeypatch.setitem(attention.BY_NAME, "cross-head", cross)
     with pytest.raises(attention.AttentionRefusal, match="context parallelism") as refused:
-        attention.admit("model/dit=flashinfer-bf16-fp8", 4)
+        attention.admit("model/dit=cross-head", 4)
     assert refused.value.code == "attention_kernel_unsupported"
+    attention.admit("dit=cross-head", 1)
     with pytest.raises(attention.AttentionRefusal) as unknown:
         attention.admit("dit=not-a-kernel", 1)
     assert unknown.value.code == "attention_kernel_unknown"
-    for name in (
-        "flash-attn3",
-        "sageattention",
-        "sageattention-fp16pv",
-        "flash-attn4",
-        "kitchen-int8",
-    ):
+    for name in set(attention.BY_NAME) - {"cross-head"}:
         attention.admit(f"dit={name}", 4)
-    attention.admit("dit=flashinfer-bf16-fp8", 1)
 
 
 def test_package_environment_changes_are_restored_not_refused(
