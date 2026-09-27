@@ -125,13 +125,14 @@ def test_a_refused_load_leaves_loaded_constructions_serving(
 def test_a_pin_no_parallel_group_can_run_refuses_before_construction() -> None:
     pytest.importorskip("diffusers.models.attention_dispatch")
     with pytest.raises(attention.AttentionRefusal, match="context parallelism") as refused:
-        attention.admit("model/dit=sageattention", 4)
+        attention.admit("model/dit=flashinfer-bf16-fp8", 4)
     assert refused.value.code == "attention_kernel_unsupported"
     with pytest.raises(attention.AttentionRefusal) as unknown:
         attention.admit("dit=not-a-kernel", 1)
     assert unknown.value.code == "attention_kernel_unknown"
-    attention.admit("dit=flash-attn3", 4)
-    attention.admit("dit=sageattention", 1)
+    for name in ("flash-attn3", "sageattention", "flash-attn4", "kitchen-int8"):
+        attention.admit(f"dit={name}", 4)
+    attention.admit("dit=flashinfer-bf16-fp8", 1)
 
 
 def test_package_environment_changes_are_restored_not_refused(

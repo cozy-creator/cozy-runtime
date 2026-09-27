@@ -38,7 +38,7 @@ def _roots() -> dict[str, Any]:
 
 def _ready(*names: str) -> list[attention.Ready]:
     return [
-        attention.Ready(attention.BY_NAME[name], attention._member(attention.BY_NAME[name].backend))
+        attention.Ready(attention.BY_NAME[name], attention._member(attention.BY_NAME[name]))
         for name in names
     ]
 
@@ -93,7 +93,7 @@ def test_scoped_pin_and_snapshot_restore_different_prepared_policy() -> None:
     before = _choices(roots)
     applied = attention.plan(_device(), roots, "dit=sdpa").apply()
     assert applied.hosts == {"dit": {"sdpa": 1}} and applied.pin == "dit=sdpa"
-    assert _choices(roots)[0] == "native" and _choices(roots)[1] == before[1]
+    assert _choices(roots)[0] == "_cozy_sdpa" and _choices(roots)[1] == before[1]
     prepared.restore()
     assert _choices(roots) == before
 
@@ -161,7 +161,7 @@ def test_model_scope_and_restore_use_actual_executor_roots(
     for _, _, processor in attention._sites(all_roots):
         processor._attention_backend = "stale-request"
     parent._restore_attention()
-    assert _choices(all_roots) == ("native",) * (2 * model_count)
+    assert _choices(all_roots) == ("_cozy_sdpa",) * (2 * model_count)
 
 
 def test_scoped_pin_preserves_compiled_and_parallel_fences() -> None:
@@ -317,7 +317,7 @@ def test_sol_sites_are_removed_after_request_and_partial_apply_failure() -> None
         pytest.fail("conflicting installation must fail before entering the request")
     assert not hasattr(dit, "_cozy_sol_site")
     assert hasattr(vae, "_cozy_sol_site")
-    assert _choices(roots) == ("native", "native")
+    assert _choices(roots) == ("_cozy_sdpa", "_cozy_sdpa")
     attention_sol.remove_site(vae, "vae", "prepared")
 
 
@@ -341,9 +341,23 @@ def test_probe_refuses_wrong_output_dtype_even_with_perfect_values() -> None:
     query = torch.ones(1, 2, 1, 8, dtype=torch.bfloat16)
     exact = query.float()
     entry = _ready("sdpa")[0]
-    attention._validate_probe(entry, _device(), query, query, exact)
+    attention._validate_probe_contract(entry, _device(), query, query)
     with pytest.raises(attention.AttentionRefusal, match="must return"):
-        attention._validate_probe(entry, _device(), exact, query, exact)
+        attention._validate_probe_contract(entry, _device(), exact, query)
+
+
+def test_the_gate_tells_out_of_budget_from_carrying_no_attention() -> None:
+    """Finite output past its budget RUNS and is out of budget, by name; past rel L2 1 the
+    output carries no attention at all (h3a-013's uninitialized buffer)."""
+    entry = _ready("flash-attn3-fp8")[0]
+    attention._gate(entry, _device(), 0.05, "fixture")
+    with pytest.raises(attention.AttentionRefusal, match="numerically out of budget") as over:
+        attention._gate(entry, _device(), 0.31, "73439 keys")
+    assert over.value.code == "attention_kernel_out_of_budget"
+    assert "rel L2 0.31" in str(over.value) and "73439 keys" in str(over.value)
+    with pytest.raises(attention.AttentionRefusal) as none:
+        attention._gate(entry, _device(), 1.0, "fixture")
+    assert none.value.code == "attention_kernel_wrong"
 
 
 def test_encoded_projection_output_contract_wins_over_norm_and_storage_dtype() -> None:
@@ -429,7 +443,7 @@ def test_repeated_group_pin_requires_every_scoped_prepared_site() -> None:
     assert not attention._is_selected(defaults, roots, "missing/dit=sdpa")
     assert not attention._is_selected(defaults, roots, "base/dit=absent")
     # A changed site is not a no-op, even if the other site still matches.
-    modules[1].processor._attention_backend = attention._member(attention.BY_NAME["cudnn"].backend)
+    modules[1].processor._attention_backend = attention._member(attention.BY_NAME["cudnn"])
     assert not attention._is_selected(defaults, roots, "base/dit=sdpa")
     changed_defaults = attention.snapshot(roots)
     defaults.restore()

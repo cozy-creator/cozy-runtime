@@ -4,8 +4,8 @@ Runtime owns backend integration and preparation-time selection. Its current
 curated default keeps floating-point attention: FA3 BF16/FP16 when the installed
 artifact and site support it, otherwise PyTorch SDPA. The table in
 `internal/attention.py` links retained H3 timing evidence. It is not a universal
-hardware optimum: a small numerical smoke test proves the backend executes, not
-that its videos retain quality. Approximate backends remain explicit choices.
+hardware optimum: a numerical probe proves the backend computes attention at a
+production length, not that its videos retain quality. Approximate backends remain explicit choices.
 
 A model may choose a different eligible implementation before warm-up:
 
@@ -86,41 +86,34 @@ and `recommended` context explaining this limitation. Explicit matching pins or
 policy choices refuse, including components mixing managed and legacy processors;
 Runtime never creates an unused processor attribute to claim partial coverage.
 
-## Optional wheels on an existing worker
+## Kernel site, Ulysses and probes
 
-Optional kernels are ordinary dependencies of the Python package's complete,
-locked environment. Add a prebuilt wheel to that package and prepare its new
-immutable generation on the same worker. Existing uv cache/hardlink reuse applies;
-changing this closure replaces the affected executor generation, not the worker
-image or Runtime service. Never install into a running generation or the worker's
-system Python. No request runs pip, a shell, or a downloader.
+Kernels come from the package environment or the worker image's Runtime-owned site,
+never from a package lock written for them. The image bakes `/opt/cozy/kernels/`:
+the importable `site/`, the FA3 `kernels` snapshot `flash-attn3/` and the `manifest.json`
+its kernel gate writes (`site`, `torch`, `cuda`, `python_abi`, per-kernel facts). At process entry the
+executor appends `site/` after the package's own packages (`site.addsitedir`; the package
+wins on conflict) only when its torch release, CUDA build and Python ABI equal the
+manifest's. Otherwise every site kernel is typed-absent with the reason.
 
-SageAttention, Sol, Kitchen and FlashInfer use their existing distributions.
-FA3/FA4 kernel-builder snapshots can be packaged without compiling or downloading:
+Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) that
+`attention_ulysses` registers with Diffusers. Without a parallel config it calls the
+kernel; under Runtime's Ulysses config it runs Diffusers' unequal-length all-to-all,
+the kernel over the full sequence of this rank's heads, and the exchange back. A kernel
+whose reductions stay within a head therefore matches one GPU; FlashInfer's global V
+amax does not, so it is registered without context parallelism. Ring is refused.
 
-```sh
-uv run --no-project --with packaging python scripts/build-attention-wheel.py ./snapshot \
-  --kernel flash-attn3 --version 0.1.0 \
-  --revision FULL_UPSTREAM_COMMIT --source-url https://huggingface.co/kernels-community/flash-attn3 \
-  --license BSD-3-Clause --requirement 'torch==EXACT_BUILD_VERSION' \
-  --requirement 'kernels==EXACT_LOADER_VERSION' --out dist
-```
+Each rank probes the function it serves at `(1, 73439, 2, 128)` — one H3 rank's 10 s
+document, where length-dependent error shows — against exact float64 attention over
+64 sampled rows. Non-finite output fails first; then rel L2 against the kernel's
+declared budget: past 1 it is `attention_kernel_wrong`, otherwise
+`attention_kernel_out_of_budget` (FA3 FP8 at H3 length). `attention.capabilities`
+is the per-rank document of every kernel: status, version/artifact and probe.
 
-Use the real immutable upstream revision, license and exact build dependency
-versions; include every additional upstream dependency with `--requirement`.
-The input must already contain `build/<variant>/metadata.json`, native/source
-payload and upstream licenses. The wrapper conservatively tags CPython 3.12 on
-Linux x86-64; a Torch extension is not advertised as abi3. Version each candidate
-and lock the resulting wheel digest through the ordinary package dependency path.
-
-Runtime discovers `cozy-kernel-flash-attn3` or `cozy-kernel-flash-attn4` from the
-active environment's installed distribution metadata. The installed wheel takes
-precedence over `/opt/cozy/kernels`; a broken installed candidate refuses rather
-than loading different baked bytes. `kernels.get_local_kernel` still selects the
-Torch/CUDA variant. Native architecture metadata and numerical admission still
-apply. The wheel packaging step does not establish ABI compatibility, numerical
-correctness or model quality. A JIT source kernel can still compile its device
-code during normal upstream preparation.
+`cozy-runtime attention-qualify --degree 4 --out report.json` spawns one process per
+GPU and, per kernel, runs the registered backend at degree 4 on identical global
+`[1, 73439, 56, 128]` inputs against the same backend at degree 1 (byte equality and
+rel L2 ≤ 2e-3). `--device cpu` runs the same path over gloo.
 
 Select with the existing `kernel.attention=dit=flash-attn3` or
 `--attention-kernel=dit=flash-attn3` Creator argument. Eager requests restore the
@@ -128,12 +121,10 @@ prepared selection after success or failure, so an unpinned A / pinned B / unpin
 A sequence shares its prepared executor. Compiled or context-parallel changes
 require preparing a new model generation whose `choose_attention` policy selects
 that backend before warm-up; the request refuses a frozen change and does not
-silently rebuild it. Changing kernel wheel bytes likewise requires a new ordinary
-dependency generation, allowing rollback by selecting the prior package revision.
+silently rebuild it. Changing kernel bytes is a new worker image.
 
-Preparation facts and request `attention.artifact` observations identify installed
-distribution/version, SHA256 of its installed RECORD, immutable source URL when
-provided, and the original wheel SHA256 when the installer retains it in standard
-`direct_url.json`. The request's captured dependency closure remains authoritative
-for exact bytes when that optional origin field is absent. An installed RECORD
-digest is an inventory identity, not a signature or an additional integrity scan.
+Preparation facts and request `attention.artifact` observations identify the installed
+distribution/version and SHA256 of its RECORD, or the snapshot variant and metadata
+digest. Each rank's execution record carries `attention.impl`: the implementation that
+actually served, such as the SDPA backend torch dispatched (`cudnn` on H100) or Sol's
+`cute_sm90` route.

@@ -1,37 +1,17 @@
-"""FlashAttention-3's fp8-e4m3 forward, spelled as a diffusers attention backend (cr-136).
+"""Per-(batch, head) e4m3 quantisation for FlashAttention-3's fp8 forward (cr-136).
 
-diffusers 0.40.0's `_flash_3_hub` hands the kernel `q_descale=k_descale=v_descale=None` and
-constrains q/k/v to bf16/fp16, so FA3's 8-bit path — the fastest 8-bit arm h3a-013 measured
-on an H100, from the SAME baked `.so` rank 1 already loads — was unreachable through any
-`AttentionBackendName`. This module adds ONE backend to diffusers' registry, `_flash_3_hub_fp8`,
-whose body quantises q/k/v per call (per-(batch, head) amax to e4m3, the descales handed to the
-kernel, output bf16 from the kernel itself) and calls that same `flash_attn_func`. Nothing else
-in diffusers is touched, and the bf16 entry's Hub slot is left alone.
-
-THE MEMBER IS SYNTHESISED, because diffusers' enum is closed. `dispatch_attention_fn` resolves
-a backend with `AttentionBackendName(backend)`, which returns a member by identity and looks
-any other value up in `_value2member_map_`; both the registry dicts and that map are keyed
-here with one instance built through `str.__new__`, so a processor pinned to it dispatches
-exactly as one pinned to `_flash_3_hub` does. It is one instance per process, made once.
-
-QUANTISATION IS PER CALL AND CHARGED TO THE KERNEL: amax over (sequence, head dim) per head,
-a scale that maps that amax onto 440 rather than e4m3's 448 (e4m3fn has no inf — a product
-that lands past 448 becomes NaN in torch's cast, not a saturated value), then the scaled
-cast. On CUDA that is two Triton launches reading the tensor twice and writing it once
-(~5 bytes per element), the same shape as cr-086's rowwise activation quantiser and for the
-same reason: h3a-013 pass 3 measured the eager torch form at 5.6 ms per call at the 5 s cell
-against a 42 ms kernel, and the fused form at 3.4 ms — the difference between 1.19x and
-1.24x over rank 1. Everything else (a CPU probe, a venv without triton, a head dimension the
-kernel is not built for) runs the eager passes and stays correct.
+Amax over (sequence, head dim) per head maps onto 440 rather than e4m3's 448 (e4m3fn has no
+inf, so a product past 448 becomes NaN in torch's cast), then the scaled cast. On CUDA that
+is two Triton launches (~5 bytes per element): h3a-013 measured the eager form at 5.6 ms per
+call against a 42 ms kernel and the fused form at 3.4 ms. Everything else (CPU, no triton, a
+head dimension the tile cannot take) runs the eager passes. Every reduction stays within one
+head, so Ulysses' head split leaves each head's scale exactly what one GPU computes.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-#: The backend's value in diffusers' vocabulary. Not a diffusers name; ours, and stable.
-BACKEND = "_flash_3_hub_fp8"
-MEMBER_NAME = "_FLASH_3_HUB_FP8"
 #: The largest finite e4m3fn magnitude, and the value a head's amax is mapped onto instead.
 E4M3_MAX = 448.0
 E4M3_TARGET = 440.0
@@ -40,44 +20,6 @@ E4M3_TARGET = 440.0
 SCALE_FLOOR = 1e-12
 #: Rows of one head a fused program handles per launch; the head dimension is the tile width.
 CHUNK = 64
-
-_kernel: Any = None
-
-
-class Unbound(RuntimeError):
-    """The backend was dispatched before `bind` handed it a kernel. A programming error, not
-    a refusal: resolution binds before any site is pinned."""
-
-
-def member() -> Any:
-    """The `AttentionBackendName` member for this backend, registered on first use.
-
-    Registration is what makes the member REAL to diffusers: `_backends` holds the function,
-    `_constraints` the same checks `_flash_3_hub` declares, and `_value2member_map_` lets
-    `AttentionBackendName(BACKEND)` find it. Idempotent, and it does not need the kernel —
-    a member that dispatches before `bind` raises `Unbound` rather than computing nothing.
-    """
-    from diffusers.models.attention_dispatch import (
-        _check_device,
-        _check_qkv_dtype_bf16_or_fp16,
-        _check_shape,
-    )
-
-    from cozy_runtime.internal.attention_registry import register
-
-    return register(
-        BACKEND,
-        _flash_attention_3_hub_fp8,
-        constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
-        supports_context_parallel=False,
-    )
-
-
-def bind(kernel: Any) -> Any:
-    """Hand the backend the loaded snapshot's `flash_attn_func`; returns the member."""
-    global _kernel
-    _kernel = kernel
-    return member()
 
 
 def _triton_kernels() -> Any:
@@ -163,34 +105,3 @@ def quantise_eager(tensor: Any) -> tuple[Any, Any]:
     descale = (amax / E4M3_TARGET).clamp_(min=SCALE_FLOOR)
     scaled = (tensor.float() / descale[:, None, :, None]).clamp_(-E4M3_MAX, E4M3_MAX)
     return scaled.to(torch.float8_e4m3fn), descale.contiguous()
-
-
-def _flash_attention_3_hub_fp8(
-    query: Any,
-    key: Any,
-    value: Any,
-    attn_mask: Any = None,
-    scale: float | None = None,
-    is_causal: bool = False,
-    _parallel_config: Any = None,
-) -> Any:
-    if attn_mask is not None:
-        raise ValueError("`attn_mask` is not supported for flash-attn 3.")
-    if _parallel_config is not None:
-        raise ValueError("flash-attn3-fp8 does not serve context parallelism")
-    if _kernel is None:
-        raise Unbound("flash-attn3-fp8 was dispatched before its kernel was bound")
-    q8, q_descale = quantise(query)
-    k8, k_descale = quantise(key)
-    v8, v_descale = quantise(value)
-    out = _kernel(
-        q8,
-        k8,
-        v8,
-        softmax_scale=scale,
-        causal=is_causal,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-    )
-    return out[0] if isinstance(out, (tuple, list)) else out

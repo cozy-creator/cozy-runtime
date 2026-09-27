@@ -8,13 +8,16 @@ cozy-creator renders these unmodified; nothing here is a policy read.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
+from cozy_runtime.internal import attention_qualify as attention_qualification
 from cozy_runtime.internal import canonical, hostfacts
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
@@ -483,3 +486,38 @@ def capability(config: RuntimeConfig, args: list[str], opts: Options) -> Result:
             f"{device.predicate} --records <path> --json  # TensorFS owns the rule",
         ),
     )
+
+
+def attention_qualify(argv: list[str]) -> Result:
+    """`cozy-runtime attention-qualify --degree N [--kernels a,b] [--device cuda|cpu]
+    [--rows R] [--heads H] [--out report.json]`; refuses unless every kernel qualified."""
+    parser = argparse.ArgumentParser(
+        prog="cozy-runtime attention-qualify", description=attention_qualification.__doc__
+    )
+    parser.add_argument("--degree", type=int, required=True)
+    parser.add_argument("--kernels", default="", help="default: every kernel this card admits")
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--rows", type=int, default=attention_qualification.ROWS)
+    parser.add_argument("--heads", type=int, default=attention_qualification.HEADS)
+    parser.add_argument("--out", type=Path)
+    args = parser.parse_args(argv)
+    kernels = [name for name in args.kernels.split(",") if name]
+    try:
+        report = attention_qualification.qualify(
+            args.degree, kernels, args.device, args.rows, args.heads
+        )
+    except ValueError as exc:
+        raise CliError("usage", str(exc), "name kernels this runtime knows", Exit.usage) from exc
+    if args.out:
+        args.out.write_text(json.dumps(report, indent=2) + "\n")
+    if not report["ok"]:
+        raise CliError(
+            "attention_unqualified",
+            f"degree {args.degree}: {json.dumps(report['verdicts'], sort_keys=True)}",
+            "read the per-rank rows with --out; a refusal names its measured cause",
+            Exit.validation,
+        )
+    rows = tuple(
+        (name, "+".join(statuses)) for name, statuses in sorted(report["verdicts"].items())
+    )
+    return Result(rows=rows, document=report)

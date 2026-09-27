@@ -14,7 +14,7 @@ from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelC
 from torch.multiprocessing.spawn import spawn
 
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
-from cozy_runtime.internal import attention_sol
+from cozy_runtime.internal import attention, attention_sol, attention_ulysses
 from cozy_runtime.internal.parallel.cp import _GroupMesh
 
 
@@ -98,7 +98,9 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
         config.setup(
             rank, degree, device, mesh=cast(Any, _GroupMesh(dist.group.WORLD, degree, rank))
         )
-        group = attention_sol._parallel_group(config)
+        group = attention_ulysses.group(config)
+        registry = import_module("diffusers.models.attention_dispatch")._AttentionBackendRegistry
+        backend = registry._backends[attention._member(attention.BY_NAME["sol-attn"])]
         attention_sol.bind_dense(dense, "test-native-dense")
         results = []
         for length in (1029, 1032) if device_kind == "cuda" else (29, 32):
@@ -146,13 +148,19 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
                     ):
                         if device_kind == "cuda":
                             q, k, v = shards
-                            actual = attention_sol.sol_attention(q, k, v, _parallel_config=config)
+                            actual = backend(query=q, key=k, value=v, _parallel_config=config)
                             q, k, v = tensors
-                            reference = attention_sol.sol_attention(q, k, v)
+                            reference = backend(query=q, key=k, value=v)
                         else:
                             q, k, v = shards
-                            actual = attention_sol._execute_parallel(
-                                q, k, v, None, layout, site, group
+                            actual = attention_ulysses.exchange(
+                                q,
+                                k,
+                                v,
+                                group,
+                                lambda a, b, c, at=layout, where=site: attention_sol._execute(
+                                    a, b, c, None, at, where
+                                ),
                             )
                             q, k, v = tensors
                             reference = attention_sol._execute(q, k, v, None, layout, site)

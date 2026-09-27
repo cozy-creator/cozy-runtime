@@ -19,7 +19,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.internal import attention, attention_sol, execution_evidence, spawn  # noqa: E402
+from cozy_runtime.internal import (  # noqa: E402
+    attention,
+    attention_sol,
+    attention_ulysses,
+    execution_evidence,
+    spawn,
+)
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.parallel import cp, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
@@ -220,15 +226,21 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                 model._cozy_residency.open_attempt(
                     plan.placement, plan.headroom_bytes, dict(plan.scope_headroom_bytes)
                 )
+            served: dict[str, set[str]] = {}
             if kind == "h3":
                 for batch, full_output in expected:
                     # Observe the inputs of real SDPA calls, not just approximately equal
                     # model outputs: replicated text must not become a degree-times-long
                     # attention document before the packed sequence is sharded.
-                    with torch.profiler.profile(
-                        activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True
-                    ) as profile:
+                    with (
+                        torch.profiler.profile(
+                            activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True
+                        ) as profile,
+                        attention_ulysses.observing() as seen,
+                    ):
                         model.compute(batch, full_output)
+                    for backend, impls in seen.items():
+                        served.setdefault(backend, set()).update(impls)
                     attention_shapes = [
                         event.input_shapes[0]
                         for event in profile.events()
@@ -276,6 +288,11 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
             assert all(0 < row["start_us"] <= row["end_us"] for row in records.values())
             leader_view = execution_evidence.observed(attention.observed(roots).hosts)
             assert {row["attention"]["observed"] for row in records.values()} == {leader_view}
+            # What served on each follower is recorded, as the leader observed its own: the
+            # SDPA backend torch dispatched inside the Ulysses wrapper (none without attention).
+            impls = {row["attention"]["impl"] for row in records.values()}
+            assert impls == ({attention.implementations(served)} if kind == "h3" else {""})
+            assert kind != "h3" or impls <= {"flash", "efficient", "math"}
             execution = leader._execution("ref2va_dit=sdpa", None, 1, 2)
             assert execution["degree"] == degree
             assert [row["rank"] for row in execution["ranks"]] == list(range(degree))
