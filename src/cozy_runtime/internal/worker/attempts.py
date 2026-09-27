@@ -381,6 +381,8 @@ class AttemptRecord:
     #: what the component-use plane actually did: stages, evictions, leases, resident set
     residency: dict[str, Any] = dataclasses_field(default_factory=dict)
     execution_observation: dict[str, Any] = dataclasses_field(default_factory=dict)
+    #: the executor's `execution` record: degree, per-rank rows, executor and construction
+    execution: dict[str, Any] = dataclasses_field(default_factory=dict)
     capture_result: dict[str, Any] = dataclasses_field(default_factory=dict)
 
     #: the record the plan was PRICED against, resolved once by the executor's kernel
@@ -1875,6 +1877,7 @@ class AttemptEngine:
         attempt.resulted_at = time.perf_counter()
         self.monitor.end(key, "returned")
         attempt.execution_observation = dict(reply.get("execution_observation") or {})
+        attempt.execution = dict(reply.get("execution") or {})
         attempt.capture_result = dict(reply.get("capture") or {})
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
         # whatever came back, success or fault: a failed attempt's activation peak is
@@ -2134,9 +2137,11 @@ class AttemptEngine:
         )
 
     def forward(self, request_id: str, number: int, frame: Mapping[str, Any]) -> None:
-        """Hold ONE live observation the executor just emitted, before it can be lost."""
+        """Hold ONE live observation the executor just emitted, before it can be lost. A
+        `load` frame is a fill's MiB position for liveness, not an observation: thousands of
+        them per staged attempt would shed every real row from the bounded ring."""
         attempt = self.live.get(request_id)
-        if attempt is None or attempt.attempt != number:
+        if attempt is None or attempt.attempt != number or frame.get("kind") == "load":
             return
         attempt.ring.admit(self._row(frame))
         attempt.forwarded_seq = max(attempt.forwarded_seq, int(frame.get("seq", 0)))
@@ -2870,6 +2875,7 @@ class AttemptEngine:
                     ]
                 },
                 "attribution": attempt.attribution,
+                "execution": attempt.execution,
                 "windows_ms": {
                     "queue_ms": round(
                         max(attempt.dispatched_at - (attempt.queued_at or attempt.accepted_at), 0.0)

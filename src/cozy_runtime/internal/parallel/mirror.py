@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import attention_sol
+from cozy_runtime.internal import attention_sol, execution_evidence
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GroupRefusal
@@ -93,6 +93,8 @@ def mirror_component(
                     group.working_peaks[rank] = max(
                         group.working_peaks.get(rank, 0), int(reply.get("working_peak_bytes", 0))
                     )
+                    if reply.get("evidence"):
+                        execution_evidence.widen(group.rank_records, reply["evidence"])
                 return result
             except BaseException:
                 group._break(f"mirrored component {name!r} failed")

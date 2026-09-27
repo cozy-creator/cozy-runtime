@@ -19,7 +19,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.internal import attention_sol, spawn  # noqa: E402
+from cozy_runtime.internal import attention, attention_sol, execution_evidence, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.parallel import cp, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
@@ -269,6 +269,20 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                 )
             assert not cp.in_gated_call()
             assert not list((spool / "ranks").iterdir())
+            # Every follower reports its own process, interval and attention for the attempt.
+            records = group.rank_records
+            assert sorted(records) == list(range(1, degree))
+            assert tuple(records[rank]["pid"] for rank in sorted(records)) == group.pids()
+            assert all(0 < row["start_us"] <= row["end_us"] for row in records.values())
+            leader_view = execution_evidence.observed(attention.observed(roots).hosts)
+            assert {row["attention"]["observed"] for row in records.values()} == {leader_view}
+            execution = leader._execution("ref2va_dit=sdpa", None, 1, 2)
+            assert execution["degree"] == degree
+            assert [row["rank"] for row in execution["ranks"]] == list(range(degree))
+            assert {row["attention"]["requested"] for row in execution["ranks"]} == {
+                "ref2va_dit=sdpa"
+            }
+            records.clear()
         if kind in ("collective", "staged"):
             # The follower returns a failure while rank 0 is already in all_reduce.
             # Reading the failure only AFTER rank 0's body returns would wait forever.
