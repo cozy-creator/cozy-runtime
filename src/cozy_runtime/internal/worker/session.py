@@ -40,6 +40,7 @@ import os
 import queue
 import re
 import resource
+import shutil
 import signal
 import sys
 import threading
@@ -2027,7 +2028,51 @@ class Worker:
         stored = self._placement_from_entry(entries[0], result.placement_set.placement_set_digest)
         stored.installed = published[0]
         self.prepared_installations[(stored.placement_id, stored.installation_id)] = stored
+        self._collect_superseded_installations(published[0])
         return result
+
+    def _referenced_installations(self) -> set[str]:
+        """Every installation a live placement, job, executor or retained execution uses."""
+        placements = [self.placement, self.pending, *(h.placement for h in self.hosted.values())]
+        referenced = {p.installation_id for p in placements if p is not None}
+        referenced |= {binding.installation_id for binding in self.jobs.values()}
+        referenced |= {slot.binding.installation_id for slot in self.job_slots.values()}
+        supervisions = [
+            self.supervision,
+            *(hosted.supervision for hosted in self.hosted.values()),
+            *(slot.supervision for slot in self.job_slots.values()),
+        ]
+        referenced |= {s.environment_installation_id for s in supervisions}
+        if self.executions is not None:
+            referenced |= self.executions.retained_installations()
+        return referenced
+
+    def _collect_superseded_installations(
+        self, current: package_installation.InstalledEnvironment
+    ) -> None:
+        """Remove this package's other published environments that nothing live references.
+
+        Only content-keyed published installations are collected; a development
+        installation or one a placement, job, executor or retained execution names stays.
+        """
+        root = Path(self.options.install_root or "")
+        prefix = package_installation.PUBLISHED_PREFIX
+        referenced = self._referenced_installations()
+        for directory in sorted((root / "installations").glob(prefix + "*")):
+            identifier = directory.name
+            if identifier == current.installation_id or identifier in referenced:
+                continue
+            try:
+                installed = package_installation.open_installation(root, identifier)
+            except package_environment.EnvironmentRefusal:
+                continue
+            if installed.package != current.package:
+                continue
+            package_installation.remove(root, identifier)
+            shutil.rmtree(self.config.cozy_home / "job-plans" / identifier, ignore_errors=True)
+            for key in [key for key in self.prepared_installations if key[1] == identifier]:
+                del self.prepared_installations[key]
+            self.note("installation", f"collected superseded {installed.package} {identifier}")
 
     def numerical_environment(self) -> bytes:
         from cozy_runtime.internal.numerical_environment import fingerprint

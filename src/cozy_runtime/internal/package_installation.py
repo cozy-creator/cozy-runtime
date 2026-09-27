@@ -25,6 +25,8 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 MAX_SOURCE_BYTES = 1 << 30
 MAX_SOURCE_FILES = 100_000
 IMAGE_UV_CACHE = Path("/opt/cozy/dependency-seed/uv-cache")
+#: Installation ids of published environments keyed by their content (release, lock, ABI).
+PUBLISHED_PREFIX = "release-"
 
 
 class InstallationRecord(TypedDict):
@@ -363,6 +365,14 @@ def _installation_lock(root: Path, identifier: str) -> Generator[int, None, None
                 yield held.fileno()
             finally:
                 fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+
+
+def remove(root: Path, installation_id: str) -> None:
+    """Delete one installation directory under its installation lock."""
+    directory = _directory(root, installation_id)
+    with _installation_lock(root, installation_id):
+        shutil.rmtree(directory, ignore_errors=True)
+    (directory.parent / ".locks" / (installation_id + ".lock")).unlink(missing_ok=True)
 
 
 def install(

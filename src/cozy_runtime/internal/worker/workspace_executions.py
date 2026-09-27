@@ -502,6 +502,18 @@ class Executions:
                 is not None
             )
 
+    def retained_installations(self) -> set[str]:
+        """Installation ids an uncollected execution may still need to reopen."""
+        with self.workspace.locked(allow_frozen=True) as db:
+            rows = db.execute(
+                "SELECT preparation FROM executions WHERE collected=0 AND preparation<>x''"
+            ).fetchall()
+        return {
+            str(identifier)
+            for row in rows
+            for identifier in canonical_json.decode(row["preparation"]).get("installations", {})
+        }
+
     def preparation(self, owner: str, request: str) -> dict[str, Any]:
         with self.workspace.locked() as db:
             raw = self._row(db, owner, request)["preparation"]

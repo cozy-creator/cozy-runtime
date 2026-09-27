@@ -181,9 +181,9 @@ def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata
                         assert _placement(legacy) == _placement(modern)
                         assert len(worker.descriptions) == 3 * described
                         worker.assert_describes_reaped()
-                        # Each preparation is its own installation lifetime.
-                        installations = (root / "installs/installations").glob("install-*")
-                        assert len(list(installations)) == 3
+                        # One release and lock is one reused environment.
+                        installations = (root / "installs/installations").glob("release-*")
+                        assert len(list(installations)) == 1
                         (placement,) = read_placement_set(legacy.placement_set)
                         assert placement["entrypoints"][0]["name"] == "serve"
                         # Caller copies of installed facts are advisory.

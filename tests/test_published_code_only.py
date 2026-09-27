@@ -119,7 +119,8 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
         reopened = package_installation.open_installation(root, retained[0].installation_id)
         assert reopened.site_packages == retained[0].site_packages
         again = read_placement_set(prepare().placement_set)[0]
-        assert again["installation_id"] != placement["installation_id"]
+        # The same release and lock reuse one environment.
+        assert again["installation_id"] == placement["installation_id"]
         assert again["placement_id"] == placement["placement_id"]
     finally:
         index.close()

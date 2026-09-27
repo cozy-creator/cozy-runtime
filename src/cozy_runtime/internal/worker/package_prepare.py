@@ -15,6 +15,8 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from packaging.requirements import Requirement
+
 from cozy_runtime.internal import (
     base_observation,
     canonical,
@@ -337,6 +339,7 @@ def _prepare_published(
                 package=package_name,
                 release=release,
                 python=python,
+                installation_id=installation_key(package_name, release, locked, python),
                 requirements=requirements,
                 cache=dependency_cache,
             )
@@ -414,6 +417,31 @@ def _prepare_published(
             placement_set_canonical_bytes=placement_bytes,
         ),
     )
+
+
+def installation_key(
+    package_name: str,
+    release: str,
+    locked: package_environment.LockedRequirements,
+    python: Path,
+) -> str:
+    """A published environment's identity: its release, locked closure and interpreter ABI.
+
+    Index URLs and wheel locations are where bytes came from, not what was installed, so
+    a mirror change reuses the environment; a different lock or ABI makes a new one.
+    """
+    try:
+        abi = python_interpreters.probe(python).abi
+    except python_interpreters.InterpreterRefusal as exc:
+        raise PreparationRefusal(exc.code, exc.detail) from exc
+    rows = sorted(
+        f"{row.name}=={row.version};{Requirement(row.text.split(' --')[0]).marker or ''};"
+        + ",".join(sorted(row.hashes))
+        for row in locked.rows
+    )
+    document = {"package": package_name, "release": release, "abi": abi, "rows": rows}
+    digest = hashlib.sha256(canonical.write(document)).hexdigest()[:32]
+    return package_installation.PUBLISHED_PREFIX + digest
 
 
 def _printable(value: str) -> str:
