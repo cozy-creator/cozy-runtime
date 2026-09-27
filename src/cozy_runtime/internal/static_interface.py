@@ -253,7 +253,7 @@ _ENTRYPOINT_KEYWORDS = frozenset(
     }
 )
 _JOB_KEYWORDS = frozenset(
-    {"name", "publishes", "emits_media", "weights", "demand", "defaults", "internal"}
+    {"name", "publishes", "emits_media", "weights", "demand", "defaults", "internal", "accelerator"}
 )
 
 
@@ -1141,6 +1141,7 @@ class Registration:
     memoize: bool = False
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     internal: bool = False
+    accelerator: bool | None = None
 
 
 def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
@@ -1433,6 +1434,7 @@ def _registration(
     name = fn.name
     publishes = False
     internal = False
+    accelerator: bool | None = None
     hidden = False
     weights: tuple[author.WeightsOutput, ...] = ()
     for keyword in keywords:
@@ -1476,6 +1478,10 @@ def _registration(
             if type(value) is not bool:
                 reader.refuse(module, keyword.value, "internal must be a boolean")
             internal = value
+        elif keyword.arg == "accelerator":
+            if type(value) is not bool:
+                reader.refuse(module, keyword.value, "accelerator must be a boolean")
+            accelerator = value
         elif keyword.arg == "publishes":
             publishes = bool(value)
         elif keyword.arg == "memoize":
@@ -1500,6 +1506,7 @@ def _registration(
         memoize,
         default_models,
         internal,
+        accelerator,
     )
 
 
@@ -1632,6 +1639,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         publishes=registration.publishes,
         weights_outputs=registration.weights,
         internal=registration.internal,
+        accelerator=registration.accelerator,
     )
     if registration.kind == "entrypoint":
         doc["invocable"] = invocable_interface.serving_metadata(

@@ -103,6 +103,7 @@ def _callable(surface: Surface) -> dict[str, Json]:
         publishes=surface.publishes,
         weights_outputs=surface.weights_outputs,
         internal=surface.internal,
+        accelerator=surface.accelerator,
     )
     if surface.invocable or surface.kind == "entrypoint":
         from cozy_runtime.internal import invocable_interface
@@ -124,6 +125,7 @@ def callable_doc(
     publishes: bool,
     weights_outputs: Sequence[WeightsOutput],
     internal: bool = False,
+    accelerator: bool | None = None,
 ) -> dict[str, Json]:
     """One callable's document from plain facts — the import and static readers meet here."""
     doc: dict[str, Json] = {
@@ -167,6 +169,8 @@ def callable_doc(
         doc["assets"] = slot
     if kind == "job":
         doc["publishes"] = publishes
+        if accelerator is not None:
+            doc["accelerator"] = accelerator
         if weights_outputs:
             outputs: list[Json] = []
             for output in sorted(weights_outputs, key=lambda row: row.name):
@@ -513,6 +517,8 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             if kind == "job":
                 if not isinstance(item["publishes"], bool):
                     _invalid(source, f"{path}.publishes", "must be a boolean")
+                if "accelerator" in item and type(item["accelerator"]) is not bool:
+                    _invalid(source, f"{path}.accelerator", "must be a boolean")
                 if "weights_outputs" in item:
                     weights_outputs = item["weights_outputs"]
                     if not isinstance(weights_outputs, list) or not 1 <= len(weights_outputs) <= 16:

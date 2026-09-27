@@ -153,6 +153,7 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         assets=assets,
         publishes=registration.publishes,
         weights_outputs=registration.weights,
+        accelerator=registration.accelerator,
     )
     if registration.weights and "weights" not in capabilities:
         capabilities.append("weights")
