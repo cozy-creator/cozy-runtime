@@ -41,6 +41,14 @@ can share one literal ladder constant between its functions. Model references ar
 never executor-side lookups. A ladder admits 1 through 32 GPU selectors, with an optional
 catch-all `*` only last. Each target explicitly names a published release and portable lane.
 
+A lane may omit its org, as in `minimax-h3@1.0.0-rc.2/fp8-pruned`. It then names a model of the
+package's own account, so one source publishes unchanged under `paul` on a development Hub and
+`fidika` on tensorhub.com. The Runtime records the lane as written. Creator writes the publishing
+account into the published interface, so the Hub and consumers only see absolute references. An
+unpublished (editable) package resolves it against the caller on the run's Hub. A lane with an
+explicit org names that account's model and is never rewritten. One ladder's rungs must spell the
+same target, so do not mix `paul/minimax-h3@...` and `minimax-h3@...` in one ladder.
+
 An explicit `gpus` count names the execution group, for example
 `{"gpu": "H100", "gpus": 2, "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-pruned"}`.
 Counts are positive integers; counts above 1 must be declared by the model's

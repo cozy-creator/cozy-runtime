@@ -32,7 +32,13 @@ def test_ladder_invalid_vectors(vector: dict[str, Any]) -> None:
         default_ladder(vector["ladder"])
 
 
-def project(tmp_path: Path, *, invocable: bool, defaults: str = "{'model': H3}") -> Path:
+def project(
+    tmp_path: Path,
+    *,
+    invocable: bool,
+    defaults: str = "{'model': H3}",
+    ladder: list[dict[str, Any]] = LADDER,
+) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     (root / "package.toml").write_text('[application]\nobject = "authored_defaults_fixture:app"\n')
@@ -51,7 +57,7 @@ def project(tmp_path: Path, *, invocable: bool, defaults: str = "{'model': H3}")
     body = (
         "import msgspec\n"
         "from cozy_runtime.author import App, Context, Loader, Model, invocable, uses_components\n"
-        f"H3 = {LADDER!r}\n"
+        f"H3 = {ladder!r}\n"
         "app = App()\n"
         "class Request(msgspec.Struct):\n    prompt: str = 'hello'\n"
         "class Result(msgspec.Struct):\n    count: int\n"
@@ -100,6 +106,17 @@ def test_shared_constant_has_identical_imported_static_and_stored_metadata(
     assert package_interface.package_interface_digest(
         changed
     ) != package_interface.package_interface_digest(direct)
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["app_sync", "invocable_async"])
+def test_org_relative_ladder_is_recorded_as_written(tmp_path: Path, managed: bool) -> None:
+    ladder = next(row["ladder"] for row in VECTORS["valid"] if row["name"] == "org_relative")
+    root = project(tmp_path, invocable=managed, ladder=ladder)
+    static = static_interface.build(root)
+    assert imported(root) == static
+    assert package_interface.read_bytes(package_interface.canonical_bytes(static)) == static
+    for row in static["entrypoints"]:
+        assert row["models"][0]["default_ladder"] == ladder
 
 
 @pytest.mark.parametrize("managed", [False, True])

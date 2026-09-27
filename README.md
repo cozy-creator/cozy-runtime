@@ -358,8 +358,9 @@ An ordinary `@app.job` may opt into source-first model production without introd
 workflow language. A slot's capability is its class annotation (cr-077). Authors may attach
 an ordered model default ladder through `@invocable(defaults={"model": [...]})` or
 `@app.entrypoint(defaults={"model": [...]})`; both publish the same per-slot `default_ladder`
-metadata. Each rung names a GPU selector and full `org/model@release/lane` reference, and
-one slot's rungs share its model and release. The invocation override wins over the owner's
+metadata. Each rung names a GPU selector and a `[org/]model@release/lane` reference, and
+one slot's rungs share its model and release. Omitting the org names a model of the package's
+own account; the publishing Creator writes that account into the published interface. The invocation override wins over the owner's
 mutable Hub binding, which wins over the published default. Selection resolves before
 dispatch; the executor receives exact artifacts. See [authored defaults](docs/authored-model-defaults.md).
 Known-next calls can [prepare their models in the background](docs/model-prefetch.md)

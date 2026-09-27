@@ -34,6 +34,19 @@
           "lane": "alice/m.o_d-e_l@RC+2!a/fp8+fast!"
         }
       ]
+    },
+    {
+      "name": "org_relative",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "minimax-h3@1.0.0-rc.2/fp8-pruned"
+        },
+        {
+          "gpu": "*",
+          "lane": "minimax-h3@1.0.0-rc.2/fp8-pruned"
+        }
+      ]
     }
   ],
   "invalid": [
@@ -365,6 +378,19 @@
         {
           "gpu": "H100",
           "lane": "paul/minimax-h3@2.0.0/fp8"
+        }
+      ]
+    },
+    {
+      "name": "mixed_org_relative",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-pruned"
+        },
+        {
+          "gpu": "*",
+          "lane": "minimax-h3@1.0.0-rc.2/fp8-pruned"
         }
       ]
     }
