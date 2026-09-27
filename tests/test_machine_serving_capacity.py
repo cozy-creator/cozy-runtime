@@ -2,74 +2,22 @@
 
 from __future__ import annotations
 
-import base64
-import hashlib
 from dataclasses import replace
 
 import pytest
 
-from cozy_runtime import canonical_json
-from cozy_runtime.internal.worker import machine_lanes
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import (
     HostedPlacement,
     Worker,
     WorkerOptions,
-    desired_state_body,
 )
-from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config, _workspace
 from test_group_lanes import _placement
 from test_machine_calls import request, running
 from test_machine_execution import offer
-
-
-def test_failed_machine_preparation_is_not_an_endless_capacity_wait() -> None:
-    with _workspace() as root:
-        worker = Worker(
-            _config(root / "home"), WorkerOptions(root=root / "worker"), InMemoryControlHost()
-        )
-        try:
-            placement = _placement("failed")
-            worker.placement = placement
-            raw = canonical_json.encode(
-                {
-                    "format": "cozy.worker.v1.PlacementSet/1",
-                    "placements": [{"placement_id": "failed"}],
-                }
-            )
-            placement.placement_set_digest = hashlib.sha256(raw).digest()
-            desired = pb.DesiredWorkerState(
-                placement_set=pb.DesiredPlacementSet(
-                    placement_set_digest=placement.placement_set_digest,
-                    placement_set_canonical_bytes=raw,
-                )
-            )
-            # The retained machine placement, composed exactly as the drive loop applied it.
-            composed = machine_lanes.compose(worker, desired)
-            assert composed is not None
-            worker.accepted.desired_state_body = desired_state_body(composed)
-            preparation = {"state": base64.b64encode(desired.SerializeToString()).decode()}
-            placement.materialization = pb.MATERIALIZATION_STATE_FAILED
-            worker.engine.fault(
-                pb.Fault(
-                    kind=pb.FAULT_KIND_CONFIG_REFUSED,
-                    subject="failed",
-                    reason="device_group_unsupported",
-                    detail="the selected group is unsupported",
-                )
-            )
-            with pytest.raises(WorkspaceRefusal, match="device_group_unsupported"):
-                worker._prepare_execution(preparation, "managed-child")
-            # Ongoing or recoverable acquisition is not converted into a terminal failure.
-            for state in (pb.MATERIALIZATION_STATE_MATERIALIZING, pb.MATERIALIZATION_STATE_ABSENT):
-                placement.materialization = state
-                assert worker._prepare_execution(preparation, "managed-child")
-        finally:
-            worker.supervision.close()
-            worker.weights.close()
 
 
 @pytest.mark.parametrize("hosted", [False, True])

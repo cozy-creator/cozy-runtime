@@ -35,7 +35,9 @@ from cozy_runtime.internal.worker.gpu_scheduler import (
     model_degrees,
     width_for,
 )
+from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+from cozy_runtime.internal.worker.workspace_executions import TERMINAL
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -107,7 +109,7 @@ def test_a_root_keeps_its_lease_through_the_gap_and_the_head_waiter_reserves() -
     assert gpus.sync(roots, [Demand("a1#1", "A", 4)]) == {"a1#1": (0, 1, 2, 3)}
     assert gpus.sync(roots, [Demand("b1#1", "B", 1)]) == {}  # a1 ended: A's gap
     assert gpus.view()["leases"] == {"A": [0, 1, 2, 3]}
-    assert gpus.waiting == {"b1#1": ("A",)}
+    assert gpus.view()["waiting"] == {"b1#1": ["A"]}
     grants = gpus.sync(roots, [Demand("a2#1", "A", 4), Demand("b1#1", "B", 1)])
     assert grants == {"a2#1": (0, 1, 2, 3)}  # A's next child reuses its own ordinals
     assert gpus.sync({"B": 2}, [Demand("b1#1", "B", 1)]) == {"b1#1": (0,)}  # A stopped
@@ -366,6 +368,10 @@ class Machine:
         return call.child_request
 
     def finish(self, request: str, status: pb.OutcomeStatus = pb.OUTCOME_STATUS_SUCCEEDED) -> None:
+        """Record the attempt's outcome; a child whose replica could not activate here
+        (these templates name no installed package) was already refused typed."""
+        if self.executions.status(OWNER, request).state in TERMINAL:
+            return
         selected = self.executions.offer(OWNER, request)
         body, digest = documents.identity(
             pb.AttemptOutcomeBody(
@@ -393,6 +399,8 @@ class Machine:
 
     def tick(self) -> dict[str, Any]:
         self.worker.drive_executions()
+        for thread in list(self.worker._activating.values()):
+            thread.join()  # replica activation runs off the tick; settle it deterministically
         return self.worker.gpu.view()
 
     def journal(self, root: str) -> list[tuple[int, str, dict[str, Any]]]:
@@ -502,9 +510,8 @@ def test_weightless_calls_never_wait_and_a_device_job_waits_for_the_holder(
     helper = machine.child("B", "helper")
     machine.device_job("J")
     view = machine.tick()
-    assert helper + "#1" not in view["waiting"] and machine.worker.gpu.phase(helper + "#1") == {
-        "phase": "none"
-    }
+    assert helper + "#1" not in view["waiting"]
+    assert machine.worker.gpu_status(helper).phase == "none"
     assert view["waiting"] == {"J#1": ["A"]}  # D1: no device job in A's gap
     machine.finish("A")
     machine.tick()
@@ -582,3 +589,60 @@ def test_a_restarted_worker_orders_by_durable_root_priority(
         assert view["waiting"] == {b1 + "#1": ["A"]}
     finally:
         second.worker.shutdown()
+
+
+def test_sibling_replicas_activate_together_and_a_failure_refuses_only_its_call(
+    machine: Machine,
+) -> None:
+    machine.root("C")
+    references = [machine.child("C", "qwen") for _ in range(3)]
+    machine.tick()
+    replicas = [p for p in machine.worker.hosted if p.startswith("machine-")]
+    # D7: all three bind in one tick, beside each other, without a desired-state revision
+    assert sorted(machine.worker.hosted[p].placement.device_pin for p in replicas) == [
+        (0,),
+        (1,),
+        (2,),
+    ]
+    assert machine.worker.accepted.accepted_desired_state_revision == 0
+    # These templates name no installed package: each activation fails typed, on its own,
+    # and refuses only its own call; the root keeps its lease for its next call.
+    machine.tick()
+    for reference in references:
+        body = documents.read(
+            machine.executions.collect(OWNER, reference).outcome_canonical_bytes,
+            pb.AttemptOutcomeBody,
+        )
+        assert "environment_materialization_input_missing" in body["safe_message"]
+    view = machine.tick()
+    assert view["leases"] == {"C": [0, 1, 2]} and not machine.worker.hosted
+
+
+def test_machine_execution_state_reports_the_gpu_phase(machine: Machine) -> None:
+    """T11: `MachineExecutionState.gpu` as Creator reads it, at each transition."""
+    rpc = MachineExecutionRPC(machine.worker)
+
+    def gpu(request: str) -> pb.MachineExecutionGpu:
+        return rpc._state(machine.executions.status(OWNER, request)).gpu
+
+    machine.root("A")
+    machine.root("B")
+    assert gpu("A").phase == "none"
+    a1 = machine.child("A", "h3")
+    b1 = machine.child("B", "h3")
+    machine.worker.drive_executions()  # granted, its replica not yet on the device
+    assert (gpu("A").phase, list(gpu("A").ordinals)) == ("granted", [0, 1, 2, 3])
+    assert gpu(a1).phase == "granted" and gpu(a1).width == 4
+    waiting = gpu("B")
+    assert (waiting.phase, waiting.width, list(waiting.blocked_by)) == ("waiting", 4, ["A"])
+    assert gpu(b1) == waiting
+    entered = AttemptRecord(a1, 1, b"", {}, lane_id="lane-0+1+2+3", state="running")
+    machine.worker.engine.live[a1] = entered
+    assert gpu("A").phase == "executing"
+    del machine.worker.engine.live[a1]
+    machine.finish(a1)
+    machine.tick()
+    assert (gpu("A").phase, list(gpu("A").ordinals)) == ("holding", [0, 1, 2, 3])
+    machine.finish("A")
+    machine.tick()
+    assert gpu("B").phase == "granted"
