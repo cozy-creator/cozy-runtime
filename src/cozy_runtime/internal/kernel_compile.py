@@ -30,7 +30,7 @@ from importlib import import_module, metadata
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import kernel_cache
+from cozy_runtime.internal import config, kernel_cache
 
 KERNEL = "sol-attn.sm90"
 OPTIONS = "--enable-tvm-ffi"
@@ -40,8 +40,8 @@ _SCALE = 128**-0.5
 
 
 def target(capability: tuple[int, int]) -> str:
-    """CuTe-DSL's own arch spelling (`env_manager.detect_gpu_arch`) unless the env names one."""
-    named = os.environ.get("CUTE_DSL_ARCH", "")
+    """CuTe-DSL's own arch spelling (`env_manager.detect_gpu_arch`) unless its config names one."""
+    named = config.cute_dsl_environment().get("CUTE_DSL_ARCH", "")
     if named:
         return named
     major, minor = capability
@@ -70,8 +70,8 @@ def sol_library() -> dict[str, Any]:
         "python": f"cp{sys.version_info.major}{sys.version_info.minor}",
         "cute_dsl_env": {
             name: value
-            for name, value in sorted(os.environ.items())
-            if name.startswith("CUTE_DSL_") and name != "CUTE_DSL_ARCH"
+            for name, value in config.cute_dsl_environment().items()
+            if name != "CUTE_DSL_ARCH"
         },
     }
 
@@ -196,14 +196,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kv-splits", type=int, default=1)
     parser.add_argument("--target", required=True)
     parser.add_argument("--lock-fd", type=int, default=-1)
+    parser.add_argument("--store", type=Path, required=True)
+    parser.add_argument("--trusted", type=Path, default=None)
     options = parser.parse_args(argv)
     os.nice(19)
-    if os.environ.get("CUTE_DSL_ARCH") != options.target:
+    if config.cute_dsl_environment().get("CUTE_DSL_ARCH") != options.target:
         # The DSL reads its target once at import; the parent imposes it with the key.
         raise SystemExit("CUTE_DSL_ARCH must name the key's target before the DSL imports")
-    store = kernel_cache.from_environment(os.environ)
-    if store is None:
-        raise SystemExit(f"{kernel_cache.OWN_ENV} names no kernel store")
+    store = kernel_cache.Store(options.store, options.trusted)
     started = time.perf_counter()
     key = sol_key(options.tokens, options.kv_splits, options.target)
     if store.get(key) is None:

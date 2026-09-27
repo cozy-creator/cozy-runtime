@@ -164,7 +164,7 @@ def test_machine_namespaces_under_one_uid(tmp_path: Path) -> None:
         "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": str(own / "flash-attn4"),
     }
     assert root.stat().st_mode & 0o777 == 0o711 and own.stat().st_mode & 0o777 == 0o755
-    store = kernel_cache.from_environment(environment)
+    store = kernel_cache.from_sealed(environment)
     assert store is not None and store.own == own and store.trusted is None
     assert jit_cache.machine(root) == environment
 
@@ -239,7 +239,9 @@ def test_second_sm90_process_loads_the_kernel_without_compiling(tmp_path: Path) 
         pytest.skip("requires an SM90 device to execute the loaded object")
     code = """
         import json, sys, torch, cutlass.cute as cute
-        from cozy_runtime.internal import attention_sol
+        from pathlib import Path
+        from cozy_runtime.internal import attention_sol, kernel_cache
+        kernel_cache.configure(kernel_cache.Store(Path(sys.argv[2])))
         compiles = []
         original = cute.compile
         cute.compile = lambda *a, **k: compiles.append(1) or original(*a, **k)
@@ -252,9 +254,9 @@ def test_second_sm90_process_loads_the_kernel_without_compiling(tmp_path: Path) 
         torch.save(out.cpu(), sys.argv[1])
         print(json.dumps({"compiles": len(compiles), "sources": [r["source"] for r in rows]}))
     """
-    env = {kernel_cache.OWN_ENV: str(tmp_path / "u1")}
-    first = json.loads(_run(code, str(tmp_path / "out0.pt"), env=env).stdout.splitlines()[-1])
-    second = json.loads(_run(code, str(tmp_path / "out1.pt"), env=env).stdout.splitlines()[-1])
+    own = str(tmp_path / "u1")
+    first = json.loads(_run(code, str(tmp_path / "out0.pt"), own).stdout.splitlines()[-1])
+    second = json.loads(_run(code, str(tmp_path / "out1.pt"), own).stdout.splitlines()[-1])
     assert first["sources"] == ["compiled"]
     assert second == {"compiles": 0, "sources": ["store"]}
     assert torch.equal(torch.load(tmp_path / "out0.pt"), torch.load(tmp_path / "out1.pt"))
@@ -298,10 +300,10 @@ def test_background_builder_publishes_under_the_inherited_lock(tmp_path: Path) -
     store = kernel_cache.Store(own)
     lock = store.claim(kernel_compile.sol_key(4096, 1, "sm_90a"))
     assert lock is not None
-    argv, environment = attention_sol.builder_command(4096, 1, "sm_90a", lock)
+    argv, environment = attention_sol.builder_command(store, 4096, 1, "sm_90a", lock)
     child = subprocess.Popen(
         argv,
-        env={**environment, kernel_cache.OWN_ENV: str(own)},
+        env=environment,
         pass_fds=(lock,),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

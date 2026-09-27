@@ -33,7 +33,7 @@ from types import MethodType
 from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
-from cozy_runtime.internal import kernel_cache, kernel_compile
+from cozy_runtime.internal import config, kernel_cache, kernel_compile
 from cozy_runtime.internal.attention_ulysses import Local
 
 
@@ -277,7 +277,7 @@ def _prefetch(tokens: int, kv_splits: int, device: Any, step: int) -> None:
     if wanted in _CONSIDERED or wanted in _KERNELS or not _sm90(device):
         return
     _CONSIDERED.add(wanted)
-    store = kernel_cache.from_environment(os.environ)
+    store = kernel_cache.configured()
     if store is None:
         return
     started = time.perf_counter()
@@ -294,7 +294,7 @@ def _prefetch(tokens: int, kv_splits: int, device: Any, step: int) -> None:
             _kernel_row(_row(wanted, key.digest[:16], "peer_building", started, step=step))
             return
         try:
-            _BUILDERS[wanted] = _spawn(key, tokens, kv_splits, device, lock, step)
+            _BUILDERS[wanted] = _spawn(store, key, tokens, kv_splits, device, lock, step)
         finally:
             os.close(lock)
         _kernel_row(_row(wanted, key.digest[:16], "background_started", started, step=step))
@@ -312,10 +312,10 @@ def _prefetch(tokens: int, kv_splits: int, device: Any, step: int) -> None:
 
 
 def builder_command(
-    tokens: int, kv_splits: int, arch: str, lock: int
+    store: kernel_cache.Store, tokens: int, kv_splits: int, arch: str, lock: int
 ) -> tuple[list[str], dict[str, str]]:
-    """The builder's argv and environment: this interpreter and import path, no GPU, the
-    key's target imposed before the DSL imports, and the inherited build lock."""
+    """The builder's argv and environment: this interpreter and import path, this store, no
+    GPU, the key's target imposed before the DSL imports, and the inherited build lock."""
     argv = [
         sys.executable,
         "-I",
@@ -330,15 +330,30 @@ def builder_command(
         arch,
         "--lock-fd",
         str(lock),
+        "--store",
+        str(store.own),
+        *(["--trusted", str(store.trusted)] if store.trusted is not None else []),
     ]
-    return argv, {**os.environ, "CUDA_VISIBLE_DEVICES": "", "CUTE_DSL_ARCH": arch}
+    return argv, {
+        **config.inherited_environment(),
+        "CUDA_VISIBLE_DEVICES": "",
+        "CUTE_DSL_ARCH": arch,
+    }
 
 
 def _spawn(
-    key: kernel_cache.Key, tokens: int, kv_splits: int, device: Any, lock: int, step: int
+    store: kernel_cache.Store,
+    key: kernel_cache.Key,
+    tokens: int,
+    kv_splits: int,
+    device: Any,
+    lock: int,
+    step: int,
 ) -> _Builder:
     capability = tuple(import_module("torch").cuda.get_device_capability(device))
-    argv, environment = builder_command(tokens, kv_splits, kernel_compile.target(capability), lock)
+    argv, environment = builder_command(
+        store, tokens, kv_splits, kernel_compile.target(capability), lock
+    )
     process = subprocess.Popen(
         argv,
         env=environment,
@@ -389,7 +404,7 @@ def _resolve(tokens: int, kv_splits: int, device: Any) -> kernel_compile.Loaded 
             # Resident from an earlier request: say so once, rather than print nothing.
             rows.append(_row(wanted, _KEYS[wanted], "memory", time.perf_counter()))
         return loaded
-    store = kernel_cache.from_environment(os.environ)
+    store = kernel_cache.configured()
     if store is None:
         return None
     started = time.perf_counter()
