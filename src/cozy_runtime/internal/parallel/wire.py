@@ -102,7 +102,7 @@ def marshal(value: Any, spool: TensorSpool, *, path: str = "") -> Any:
                 f"{path or 'argument'} is not a prepared component in an active model scope"
             )
         return {_TAG: "component", _VAL: list(key)}
-    if isinstance(value, OrderedDict) and dataclasses.is_dataclass(value):
+    if isinstance(value, OrderedDict) and dataclasses.is_dataclass(type(value)):
         # A model output (transformers' `ModelOutput`): its class crosses by name and is
         # rebuilt only from a module the receiving rank has already imported.
         kind = type(value)
@@ -170,8 +170,8 @@ def unmarshal(value: Any, spool: TensorSpool, *, device: Any) -> Any:
             kind = getattr(sys.modules.get(module), qualname, None)
             if not (
                 isinstance(kind, type)
-                and issubclass(kind, OrderedDict)
                 and dataclasses.is_dataclass(kind)
+                and issubclass(kind, OrderedDict)
             ):
                 raise UncrossableArgument(
                     f"model output class {value.get('class')!r} is not loaded"
