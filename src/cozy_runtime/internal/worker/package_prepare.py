@@ -122,7 +122,10 @@ def prepare_package_set(
         raise PreparationRefusal("package_prepare_download_set_invalid", "package row")
     package_name = str(selected.get("package", ""))
     release = str(selected.get("release", ""))
-    application, slot_paths, locked = _request_facts(request, models)
+    try:
+        locked = package_environment.read_locked_requirements(bytes(request.locked_requirements))
+    except package_environment.EnvironmentRefusal as exc:
+        raise PreparationRefusal("package_prepare_locked_requirements_invalid", exc.detail) from exc
     python, base = _select_python(
         python,
         request.python_requires,
@@ -135,8 +138,6 @@ def prepare_package_set(
     return _prepare_published(
         package_name=package_name,
         release=release,
-        application=application,
-        model_slot_paths=slot_paths,
         locked=locked,
         models=models,
         artifact_cache=artifact_cache,
@@ -248,17 +249,11 @@ def prepare_published_local(
     installed_environment: package_installation.InstalledEnvironment,
     job_plan_root: Path | None = None,
 ) -> pb.PreparePackageSetResult:
-    """Creator's local published preparation over its already-materialized locked venv.
-
-    The two facts are adopted from the described interface — Creator compares it against
-    the committed release itself — and no image inventory exists locally.
-    """
+    """Creator's local published preparation over its already-materialized locked venv."""
 
     return _prepare_published(
         package_name=package_name,
         release=release,
-        application=None,
-        model_slot_paths=None,
         locked=locked,
         models=models,
         artifact_cache=artifact_cache,
@@ -275,45 +270,18 @@ def prepare_published_local(
     )
 
 
-def _request_facts(
-    request: pb.PreparePackageSetRequest, models: Sequence[Any]
-) -> tuple[str, tuple[str, ...], package_environment.LockedRequirements]:
-    """Admit selected release facts; image inventory is advisory discovery metadata."""
-
-    application = request.application
-    if not application or _printable(application) != application or len(application) > 256:
-        raise PreparationRefusal("package_prepare_application_invalid", application[:64])
-    slot_paths = tuple(request.model_slot_paths)
-    if (
-        len(slot_paths) > 256
-        or list(slot_paths) != sorted(set(slot_paths))
-        or any(not path or _printable(path) != path or len(path) > 512 for path in slot_paths)
-    ):
-        raise PreparationRefusal("package_prepare_model_slot_paths_invalid", str(len(slot_paths)))
-    for row in models:
-        slot = str(row.get("slot", "")) if isinstance(row, Mapping) else ""
-        if slot not in slot_paths:
-            raise PreparationRefusal("package_prepare_model_slot_unknown", slot)
-    try:
-        locked = package_environment.read_locked_requirements(bytes(request.locked_requirements))
-    except package_environment.EnvironmentRefusal as exc:
-        raise PreparationRefusal("package_prepare_locked_requirements_invalid", exc.detail) from exc
-    return application, slot_paths, locked
-
-
 def _filtered_rows(
     package_name: str,
     release: str,
     locked: package_environment.LockedRequirements,
 ) -> list[package_environment.LockedRow]:
-    """Validate the exact project pin and retain the complete locked wheel closure."""
+    """Validate the selected project pin and retain the complete locked wheel closure."""
 
     expected = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     projects = [row for row in locked.rows if row.name == expected]
-    if len(projects) != 1 or projects[0].version != release:
+    if not projects or any(row.version != release for row in projects):
         raise PreparationRefusal(
-            "package_prepare_project_pin_missing",
-            f"the export must pin {expected}=={release} exactly once",
+            "package_prepare_project_pin_missing", f"the export must pin {expected}=={release}"
         )
     return list(locked.rows)
 
@@ -322,8 +290,6 @@ def _prepare_published(
     *,
     package_name: str,
     release: str,
-    application: str | None,
-    model_slot_paths: tuple[str, ...] | None,
     locked: package_environment.LockedRequirements,
     models: Sequence[Any],
     artifact_cache: Path,
@@ -340,11 +306,9 @@ def _prepare_published(
 ) -> pb.PreparePackageSetResult:
     """Install from the exact export, read the interface, and author the PlacementSet.
 
-    On the wire path the request's facts cross-check the release interface. Image
-    inventory does not supply this environment. On the local path the venv already exists from the same export and `interface` describes it; Creator compares that
-    against the committed release itself, so the facts are adopted from it.
-    Both local and rented preparation materialize the complete locked closure; the
-    controller SDK never supplies package dependencies or interpreter-specific wheels.
+    The installed interface is the authority for application and model slots; caller
+    copies of those facts are advisory. Both local and rented preparation materialize the
+    complete locked closure; the controller SDK never supplies package dependencies.
     """
 
     _filtered_rows(package_name, release, locked)
@@ -369,20 +333,7 @@ def _prepare_published(
         interface_body = package_interface.read_bytes(interface_raw, "release package interface")
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
-    declared_application = str(interface_body.get("application", ""))
-    if application is not None and declared_application != application:
-        raise PreparationRefusal(
-            "package_prepare_application_disagrees",
-            f"request {application!r} != interface {declared_application!r}",
-        )
-    application = declared_application
-    declared = _slot_paths(interface_body, "entrypoints", "jobs")
-    if model_slot_paths is not None and declared != set(model_slot_paths):
-        raise PreparationRefusal(
-            "package_prepare_model_slots_disagree",
-            f"request-only={sorted(set(model_slot_paths) - declared)} "
-            f"interface-only={sorted(declared - set(model_slot_paths))}",
-        )
+    application = str(interface_body["application"])
     interface_ref = _stage(artifact_cache, interface_raw)
     jobs = _stage_job_plans(
         interface_body,
@@ -1267,9 +1218,10 @@ def _stage(root: Path, raw: bytes) -> tuple[str, int]:
         # the executor that will be handed its path, and re-reading it here proves nothing
         # about that. Re-assert the mode on the path we are about to publish.
         _readable(target, 0o444)
-        if _read_file(target, max(len(raw), 1)) != raw:
-            raise PreparationRefusal("package_prepare_cache_conflict", digest)
-        return digest, len(raw)
+        with contextlib.suppress(PreparationRefusal):
+            if _read_file(target, max(len(raw), 1)) == raw:
+                return digest, len(raw)
+    # Absent, or a damaged cache entry under this digest: publish the known bytes atomically.
     temporary = root / f".prepare-{uuid.uuid4().hex}"
     descriptor_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
     try:
@@ -1277,13 +1229,9 @@ def _stage(root: Path, raw: bytes) -> tuple[str, int]:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
-        # Before the link, so the document is never visible under a masked mode.
+        # Before the rename, so the document is never visible under a masked mode.
         _readable(temporary, 0o444)
-        os.link(temporary, target)
-    except FileExistsError:
-        _readable(target, 0o444)
-        if _read_file(target, max(len(raw), 1)) != raw:
-            raise PreparationRefusal("package_prepare_cache_conflict", digest) from None
+        os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
     return digest, len(raw)

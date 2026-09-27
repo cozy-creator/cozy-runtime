@@ -77,7 +77,9 @@ def test_catalogue_selects_matching_patch_and_lowest_minor(
             "3.11.12", "3.12.12", "3.13.2", "3.13.4", "3.13.8", "3.14.7", "3.15.0rc1"
         ),
     )
-    assert p._download_version("/uv", p._constraint(requires, version)) == expected
+    assert p._download_version("/uv", p._constraint(requires, version), preferred=version) == (
+        expected
+    )
 
 
 @pytest.mark.parametrize("version", ["3.13.1+freethreaded", "3.15", "3.11.9"])

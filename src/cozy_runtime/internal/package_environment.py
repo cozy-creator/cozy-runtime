@@ -243,9 +243,8 @@ def read_locked_requirements(raw: bytes) -> LockedRequirements:
     The only admitted rows are blank/comment lines, https index directives, and exact
     `name==version` requirements carrying at least one `--hash=sha256:`. Anything a resolver
     would have freedom over — a range, a bare name, a path or URL row, an editable — refuses.
+    Row order is the exporter's choice; a name may repeat under different markers.
     """
-
-    from cozy_runtime.protocol import weights_limits
 
     ceiling = int(weights_limits.MAX_LOCKED_REQUIREMENTS_BYTES)
     if not 0 < len(raw) <= ceiling:
@@ -268,7 +267,6 @@ def read_locked_requirements(raw: bytes) -> LockedRequirements:
         logical.append(pending)
     indexes: list[str] = []
     rows: list[LockedRow] = []
-    prior = ""
     for number, row in enumerate((entry.strip() for entry in logical), start=1):
 
         def refuse(detail: str, number: int = number) -> EnvironmentRefusal:
@@ -323,15 +321,12 @@ def read_locked_requirements(raw: bytes) -> LockedRequirements:
             version = clauses[0].version
         else:
             raise refuse("requirement is not one exact wheel or == pin")
-        if name <= prior:
-            raise refuse(f"{name!r} is out of order or repeats a name")
-        prior = name
         hashes = tuple(option.removeprefix("--hash=") for option in options)
-        rows.append(
-            LockedRow(
-                text=row, name=name, version=version, url=requirement.url or "", hashes=hashes
-            )
+        locked = LockedRow(
+            text=row, name=name, version=version, url=requirement.url or "", hashes=hashes
         )
+        if locked not in rows:
+            rows.append(locked)
     if not rows:
         raise EnvironmentRefusal("package_environment_lock_invalid", "the export pins nothing")
     return LockedRequirements(indexes=tuple(indexes), rows=tuple(rows))

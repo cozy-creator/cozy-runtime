@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import functools
 import hashlib
 import http.server
@@ -19,7 +20,7 @@ from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, pre
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
-def test_real_install_ignores_advisory_inventory_but_checks_wheel_and_application(tmp_path):
+def test_real_install_ignores_advisory_inventory_and_application_but_checks_wheel(tmp_path):
     interface = canonical.write(
         {
             "application": "inventory_fixture:app",
@@ -107,8 +108,10 @@ def test_real_install_ignores_advisory_inventory_but_checks_wheel_and_applicatio
                 text=True,
             )
             assert output.strip() == "42"
-        with pytest.raises(PreparationRefusal, match="package_prepare_application_disagrees"):
-            prepare("wrong-application", stale, application="other:app")
+        adopted = prepare("wrong-application", stale, application="other:app")
+        body = json.loads(adopted.placement_set.placement_set_canonical_bytes)
+        interface = base64.b64decode(body["placements"][0]["package_interface"])
+        assert json.loads(interface)["application"] == "inventory_fixture:app"
         with pytest.raises(PreparationRefusal, match="package_installation_uv_failed"):
             prepare("wrong-hash", stale, wheel_hash="0" * 64)
     finally:

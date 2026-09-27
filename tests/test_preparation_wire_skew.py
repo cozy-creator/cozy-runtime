@@ -174,17 +174,12 @@ def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata
                         assert len(list((root / "artifacts/installed-interfaces").iterdir())) == 1
                         (placement,) = read_placement_set(legacy.placement_set)
                         assert placement["entrypoints"][0]["name"] == "serve"
+                        # Caller copies of installed facts are advisory.
                         request.application = "compat_package:wrong"
-                        refused = client.CheckPackageSetCompatibility(request)
-                        assert refused.refusal_code == "package_prepare_application_disagrees"
-                        assert "compat_package:wrong" in refused.refusal_detail
-                        with pytest.raises(grpc.RpcError, match="application_disagrees"):
-                            client.PreparePackageSet(request)
-                        assert len(worker.descriptions) == (0 if metadata else 1)
-                        request.application = "compat_package:app"
                         request.model_slot_paths.append("serve.models.unexpected")
-                        with pytest.raises(grpc.RpcError, match="model_slots_disagree"):
-                            client.PreparePackageSet(request)
+                        assert not client.CheckPackageSetCompatibility(request).refusal_code
+                        assert client.PreparePackageSet(request) == modern
+                        request.application = "compat_package:app"
                         request.ClearField("model_slot_paths")
                         request.package_interface = b"{}"
                         refused = client.CheckPackageSetCompatibility(request)
