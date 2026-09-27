@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
-from cozy_runtime.internal import proctree
 from cozy_runtime.internal.worker.child import ExecutorSupervision
 from cozy_runtime.internal.worker.job_slots import JobSlot
 from cozy_runtime.internal.worker.lanes import DeviceLane
@@ -22,26 +20,6 @@ if TYPE_CHECKING:
 
 def key(request: str) -> str:
     return "cpu-" + hashlib.sha256(request.encode()).hexdigest()[:16]
-
-
-def free_memory() -> int:
-    """Current host/cgroup availability already charges suspended parent processes."""
-    rows = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
-    available = int(rows["MemAvailable"].split()[0]) * 1024
-    for line in Path("/proc/self/cgroup").read_text().splitlines():
-        if not line.startswith("0::"):
-            continue
-        relative = line.partition("0::")[2].lstrip("/")
-        group = Path("/sys/fs/cgroup") / relative
-        for directory in (group, *group.parents):
-            if not directory.is_relative_to("/sys/fs/cgroup"):
-                break
-            maximum, current = directory / "memory.max", directory / "memory.current"
-            if maximum.is_file() and current.is_file():
-                cap = maximum.read_text().strip()
-                if cap != "max":
-                    available = min(available, int(cap) - int(current.read_text()))
-    return max(0, available)
 
 
 def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: JobBinding) -> bool:
@@ -65,18 +43,8 @@ def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: Jo
         release(worker, request)
     if len(worker.lanes.composition) >= MAX_ACTIVE_CALLS:
         raise WorkspaceRefusal("CPU composition process capacity is exhausted")
-    remaining = 0
-    for name, slot in worker.job_slots.items():
-        if not name.startswith("cpu-"):
-            continue
-        executor = slot.supervision.current
-        resident = proctree.rss_bytes(executor.pid) if executor is not None else 0
-        if resident < 0:
-            raise WorkspaceRefusal("CPU composition memory is unreadable")
-        remaining += max(0, slot.directive.resource_caps.max_rss_bytes - resident)
-    needed = directive.resource_caps.max_rss_bytes or proctree.rss_bytes(os.getpid())
-    if needed <= 0 or needed + remaining > free_memory():
-        raise WorkspaceRefusal("CPU composition has insufficient host memory")
+    # Host RAM is never an admission gate: a CPU task that outgrows memory pages to disk
+    # like any other process, and its declared caps are sizing facts, not refusals.
     lane = DeviceLane(slot_key, (), "", worker_pid=os.getpid())
     supervision = ExecutorSupervision(
         root=worker.root / "placements" / slot_key,
