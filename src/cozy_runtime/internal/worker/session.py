@@ -1086,6 +1086,8 @@ class Worker:
         from cozy_runtime.internal.worker.job_slots import JobSlot
 
         self.job_slots: dict[str, JobSlot] = {}
+        #: idle CPU executors by (installation, job, directive), adopted by the next request
+        self.warm_cpu: dict[tuple[str, str, bytes], JobSlot] = {}
         self.placement: Placement | None = None
         #: The INCOMING placement being staged while `placement` keeps serving (#474). It is
         #: a separate field precisely because one field cannot hold both, which is the same
@@ -2119,6 +2121,7 @@ class Worker:
             if installed.package != current.package:
                 continue
             self.prespawns.forget(identifier)
+            machine_slots.forget(self, identifier)
             package_installation.remove(root, identifier)
             shutil.rmtree(self.config.cozy_home / "job-plans" / identifier, ignore_errors=True)
             for key in [key for key in self.prepared_installations if key[1] == identifier]:
@@ -8103,6 +8106,7 @@ class Worker:
         for name, slot in self.job_slots.items():
             if name == "orchestration" or name.startswith("cpu-"):
                 supervisions.append(slot.supervision)
+        supervisions += [slot.supervision for slot in self.warm_cpu.values()]
         seam = [
             supervision.current.channel.accounting()
             for supervision in supervisions
