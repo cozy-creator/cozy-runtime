@@ -43,7 +43,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 GiB = 1 << 30
 OWNER = "owner"
-H3 = [{"sequence_parallel": {"degrees": [2, 4]}}, {"sequence_parallel": {"degrees": [2, 4]}}]
+H3 = [{"sequence_parallel": {"degrees": [2, 4, 7, 8]}}] * 2
 MARCO = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
 
 
@@ -51,8 +51,8 @@ MARCO = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
 
 
 def test_width_is_the_largest_declared_degree_the_machine_forms() -> None:
-    # base + LoRA both (2,4): 4 GPUs -> one 4-rank group; 3 -> 2 (the third stays free)
-    assert [width_for(model_degrees(H3), n) for n in (1, 2, 3, 4, 8)] == [1, 2, 2, 4, 4]
+    # base + LoRA both (2,4,7,8): never an undeclared width; the rest of the cards stay free
+    assert [width_for(model_degrees(H3), n) for n in range(1, 10)] == [1, 2, 2, 4, 4, 4, 7, 8, 8]
     assert width_for(model_degrees([{}]), 4) == 1  # no declaration is its declared truth
     assert width_for(model_degrees([{"sequence_parallel": {"degrees": "2"}}]), 4) == 1
 

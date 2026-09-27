@@ -23,21 +23,21 @@ from .official import (
 from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
 
 
-@sequence_parallel(degrees=(2, 4))
+@sequence_parallel(degrees=(2, 4, 7, 8))
 class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept"):
-    """H3 is head-shardable at 2 and 4.
+    """H3 is head-shardable at every divisor of its 56 attention heads up to eight GPUs.
 
-    The DiT declares 56 attention heads, which divide by 2, 4 and 8, and its upstream
-    `_cp_plan` shards the packed sequence itself -- every block's GEMMs, norms, RoPE and
-    SwiGLU run on S/K rows, not just attention. `EncodedLinear` quantizes per TOKEN with
-    rowwise `_scaled_mm` scales, so a row's numbers do not depend on which rank holds it;
-    a per-tensor activation scale would be derived from the local shard and is refused by
-    the runtime rather than served.
+    The upstream `_cp_plan` shards the packed sequence itself with `tensor_split`, so any
+    length splits and every block's GEMMs, norms, RoPE, AdaLN rows and SwiGLU run on the
+    local rows; only attention exchanges, per head. `EncodedLinear` quantizes per TOKEN with
+    rowwise `_scaled_mm` scales, so a row's numbers do not depend on which rank holds it; a
+    per-tensor activation scale would be derived from the local shard and is refused by the
+    runtime rather than served. Conditioning, sampling and both VAEs stay on the leader.
 
-    2 and 4 are declared because 2 and 4 are what has been RUN: degree 2 and degree 4
-    reproduce the degree-1 video and audio velocities to 1.2e-7 and 2.4e-7 max absolute
-    error on this pipeline's own AdaLN-pruned DiT (2026-09-08), which is float32 round-off.
-    8 divides the heads too and stays undeclared until an 8-wide arm exists.
+    Degrees 2 and 4 reproduce the degree-1 video and audio velocities to 1.2e-7 and 2.4e-7
+    max absolute error on this pipeline's own AdaLN-pruned DiT (2026-09-08), which is
+    float32 round-off. 7 and 8 match one rank on CPU Gloo ranks (`test_parallel_calls`) and
+    have not yet run on GPUs (h3a-019).
     """
 
     pipe: OfficialH3Pipeline
@@ -161,7 +161,6 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
             return self.pipe.denoise("ref2va", state, on_step=on_step, cancel=cancel, checks=checks)
 
 
-@sequence_parallel(degrees=(2, 4))
 class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
     """The five-root base checkpoint with construction-time turbo consumers.
 
@@ -216,7 +215,7 @@ class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
         )
 
 
-@sequence_parallel(degrees=(2, 4))
+@sequence_parallel(degrees=(2, 4, 7, 8))
 class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
     """Independent PDD weights, replicated alongside the base on every CP rank."""
 

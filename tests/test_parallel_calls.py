@@ -102,7 +102,15 @@ def test_truncated_tensor_refuses_instead_of_returning_uninitialized_memory(tmp_
 
 @pytest.mark.parametrize(
     ("kind", "degree"),
-    [("collective", 2), ("collective", 4), ("staged", 2), ("h3", 2), ("h3", 4)],
+    [
+        ("collective", 2),
+        ("collective", 4),
+        ("staged", 2),
+        ("h3", 2),
+        ("h3", 4),
+        ("h3", 7),
+        ("h3", 8),
+    ],
 )
 def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int, kind: str) -> None:
     if kind == "h3":

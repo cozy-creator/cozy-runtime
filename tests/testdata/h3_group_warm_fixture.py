@@ -40,6 +40,7 @@ PACKAGE = Path(__file__).parent / "h3_group_warm"
 sys.path.insert(0, str(PACKAGE))
 from h3_group_warm import (  # type: ignore[import-not-found]  # noqa: E402
     CONFIG,
+    Base,
     BasePipe,
     OverlayPipe,
 )
@@ -127,7 +128,7 @@ def preflight_uid(root: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--degree", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument("--degree", type=int, choices=(1, *Base.__sequence_parallel__), default=4)
     parser.add_argument("--attention", choices=("sdpa", "flash-attn3", "sol-attn"), default="sdpa")
     parser.add_argument(
         "--allocator",

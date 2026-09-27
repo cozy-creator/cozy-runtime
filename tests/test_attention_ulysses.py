@@ -24,10 +24,10 @@ pytest.importorskip("diffusers")
 ENV = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "CUDA_VISIBLE_DEVICES": ""}
 
 
-@pytest.mark.parametrize("degree", [2, 4])
+@pytest.mark.parametrize("degree", [2, 4, 7, 8])
 def test_the_wrapper_reproduces_one_process_at_degree(degree: int) -> None:
-    # 1031 rows split 258/258/258/257 at degree 4, the unequal H3 case.
-    report = attention_qualify.qualify(degree, [], "cpu", rows=1031, heads=8)
+    # 1031 rows split unequally at every degree (258/258/258/257 at 4), H3's 56 heads.
+    report = attention_qualify.qualify(degree, [], "cpu", rows=1031, heads=56)
     assert report["ok"] and report["verdicts"] == {"sdpa": ["ready"]}, report["verdicts"]
     assert [rank["kernels"][0]["rank"] for rank in report["ranks"]] == list(range(degree))
     for rank in report["ranks"]:
