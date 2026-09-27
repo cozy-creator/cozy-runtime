@@ -168,7 +168,7 @@ class _Handle:
             self.pending.append(write)
         if first:
             # One writer per burst: whatever arrives while it waits joins its commit.
-            threading.Thread(target=flush, name="workspace-telemetry").start()
+            threading.Thread(target=flush, name="workspace-telemetry", daemon=True).start()
 
     def drain(self, db: Journal) -> None:
         with self.pending_lock:
