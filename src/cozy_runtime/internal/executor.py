@@ -74,6 +74,7 @@ from cozy_runtime.internal import (
     canonical,
     child_env,
     effect_interfaces,
+    execution_evidence,
     model_config,
     package_interface,
     prepare_diagnostics,
@@ -544,6 +545,12 @@ class Executor:
         self.load_parked: list[str] = []
         #: follower only: the attempt spool and allocator bytes at its first mirrored call
         self._run_entry: tuple[Path, int] | None = None
+        #: follower only: the attention its processors held at that first call
+        self._run_attention = ""
+        #: HOST ONLY: this process's start, for the execution record (wall ms and its legs)
+        self.boot: dict[str, Any] = {}
+        #: HOST ONLY: this rank's pid, host ordinal and GPU uuid, read once after device init
+        self._identity: dict[str, Any] | None = None
         #: THIS process's rank in its generation's group and the group's size (cr-068). A
         #: plain executor is rank 0 of a world of 1 and forms nothing; rank 0 of a wider
         #: world spawns and drives the followers; a follower's channel is rank 0's seam.
@@ -663,6 +670,52 @@ class Executor:
         self._device_ready = True
         return None
 
+    def _rank_identity(self) -> dict[str, Any]:
+        owner = self.host
+        if owner._identity is None:
+            owner._identity = execution_evidence.identity(
+                self.torch,
+                self.device_kind == "cuda" and accel.present(self.torch, self.device_kind),
+                self.rank if self.world > 1 else 0,
+                _sealed_entries(),
+            )
+        return owner._identity
+
+    def _execution(
+        self, pin: str, choices: attention.Applied | None, start_us: int, end_us: int
+    ) -> dict[str, Any]:
+        """The attempt's execution record: degree, every rank, and the setup it ran on."""
+        ranks = [
+            execution_evidence.record(
+                0,
+                self._rank_identity() if self.torch is not None else {"pid": os.getpid()},
+                start_us,
+                end_us,
+                execution_evidence.attention(
+                    pin, execution_evidence.observed(choices.hosts) if choices else ""
+                ),
+            )
+        ]
+        if self.group is not None:
+            for follower in self.group.followers:
+                row = self.group.rank_records.get(follower.rank) or execution_evidence.record(
+                    follower.rank, {"pid": follower.pid}, 0, 0
+                )
+                ranks.append({**row, "attention": {**row["attention"], "requested": pin}})
+        facts = self.facts
+        return {
+            "degree": self.world,
+            "ranks": ranks,
+            "executor": dict(self.host.boot),
+            "construction": {
+                "prepared_unix_ms": int(facts.get("prepared_unix_ms", 0)),
+                "prepare_ms": float(facts.get("prepare_ms", 0)),
+                "fill_ms": float(facts.get("fill_ms", 0)),
+                "warm_ms": float(facts.get("warm_ms", 0)),
+                "legs_ms": dict(facts.get("stages") or ()),
+            },
+        }
+
     def _rank_device(self, torch: Any) -> Any:
         if self.device_kind == "cuda" and accel.present(torch, self.device_kind):
             return torch.device("cuda", self.rank if self.world > 1 else 0)
@@ -740,11 +793,17 @@ class Executor:
         _model, component = target
         sol_counts: dict[str, int] = {}
         models = {key[0]: model for key, (model, _root) in self.group_components.items()}
+        started_us = execution_evidence.now_us()
         try:
             spool = Path(command["spool"])
             if self._run_entry is None or self._run_entry[0] != spool:
                 accel.reset_peak(self.torch, self.device_kind)
                 self._run_entry = (spool, accel.allocated(self.torch, self.device_kind))
+                self._run_attention = execution_evidence.observed(
+                    attention.observed(
+                        {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
+                    ).hosts
+                )
             scopes = command["scopes"]
             if not isinstance(scopes, list) or not 1 <= len(scopes) <= len(models):
                 raise GroupRefusal("mirrored scope set is not a bounded prepared model set")
@@ -815,6 +874,13 @@ class Executor:
             "component": list(name),
             "sol_calls": sol_counts,
             "working_peak_bytes": working,
+            "evidence": execution_evidence.record(
+                self.rank,
+                self._rank_identity(),
+                started_us,
+                execution_evidence.now_us(),
+                execution_evidence.attention(observed=self._run_attention),
+            ),
         }
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
@@ -1046,6 +1112,12 @@ class Executor:
                 self.group.close()
             raise
         self.started = True
+        took_ms = (time.perf_counter() - started) * 1000
+        self.boot = {
+            "started_unix_ms": int(time.time() * 1000 - took_ms),
+            "ms": round(took_ms, 1),
+            "legs_ms": dict(stages),
+        }
         return self._start_reply(stages, warmup_error=warmup_error)
 
     def _start_reply(
@@ -2237,6 +2309,7 @@ class Executor:
             **group_facts,
             "cuda_init_ms": round(cuda_ms, 2),
             "prepare_ms": round((time.perf_counter() - started) * 1000, 2),
+            "prepared_unix_ms": int(time.time() * 1000),
             # THE SEGMENT LEDGER (cr-102), in execution order. `prepare_ms` minus `fill_ms`
             # was a 20s number nobody could attribute; these are the legs that spend it.
             "stages": list(stages) + [(f"construct.{name}", ms) for name, ms in record.stage_ms],
@@ -2814,6 +2887,7 @@ class Executor:
         self._attempt_spool = self.host._attempt_spool = spool
         if self.group is not None:
             self.group.working_peaks.clear()
+            self.group.rank_records.clear()
 
         # The lossy lane, carrying BOTH kinds of live record. A progress frame is not
         # retained anywhere: its `position` is the monotone unit count the worker's
@@ -2841,6 +2915,7 @@ class Executor:
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
+        started_us = execution_evidence.now_us()
         served_attention: attention.Applied | None = None
         sol_counts: dict[str, int] = {}
         sol_rank_counts: dict[int, dict[str, int]] = {}
@@ -2927,6 +3002,7 @@ class Executor:
         if torch is not None:
             accel.synchronize(torch, self.device_kind)
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
+        released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
         residency_document = self.residency.document() if self.residency is not None else {}
         peak_vram = max(peak_vram, int(residency_document.get("attempt_absolute_peak_bytes", 0)))
@@ -2972,6 +3048,7 @@ class Executor:
             "position": record.position,
             "outcome": terminal,
             "execution_observation": self._execution_observation(served_attention),
+            "execution": self._execution(pin, served_attention, started_us, released_us),
             "capture": capture_result,
             "quiescent": quiescent,
             **_env_document(),

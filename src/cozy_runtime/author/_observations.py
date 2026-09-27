@@ -70,6 +70,8 @@ KEY_CAP = 48
 MAX_TRACKS = 32
 #: Fixed per-row bookkeeping charged against `MAX_RING_BYTES` beside the row's own text.
 ROW_OVERHEAD = 96
+#: Per-step points a step track keeps, first come; a longer schedule counts the rest.
+MAX_SERIES = 512
 
 #: Value shapes that carry credentials — signed URLs and the common bearer/key spellings.
 _SECRET_VALUE = re.compile(
@@ -171,8 +173,7 @@ class EventRing:
         except ObservationRefusal:
             self.refused += 1
             raise
-        self.admit(observation)
-        return observation
+        return self.admit(observation)
 
     def _build(
         self, kind: Kind, name: str, value: Scalar, fields: Mapping[str, Scalar]
@@ -221,8 +222,9 @@ class EventRing:
         self.redactions += count
         return redacted
 
-    def admit(self, observation: Observation) -> None:
-        """Admit a built record, shedding OLDEST first until both caps hold."""
+    def admit(self, observation: Observation) -> Observation:
+        """Admit a built record, shedding OLDEST first until both caps hold. The stamped
+        row is returned: its `seq` is what the worker de-duplicates the live lane by."""
         stamped = Observation(
             observation.kind,
             observation.name,
@@ -237,6 +239,7 @@ class EventRing:
         while self.events and (len(self.events) > self.max_events or self.held > self.max_bytes):
             self.held -= self.events.popleft().held_bytes()
             self.dropped += 1
+        return stamped
 
     def rows(self) -> list[dict[str, Scalar | dict[str, Scalar]]]:
         return [event.document(self.subject) for event in self.events]
@@ -261,7 +264,8 @@ class EventRing:
 
 @dataclass(slots=True)
 class Track:
-    """One named span's timing, as five numbers. Nothing here grows with the step count."""
+    """One named span's timing and wall bounds. A step track also keeps a bounded series of
+    `(end_unix_ms, ms)` points; nothing else grows with the step count."""
 
     count: int = 0
     total_ms: float = 0.0
@@ -269,20 +273,32 @@ class Track:
     max_ms: float = 0.0
     first_ms: float = 0.0
     last_ms: float = 0.0
+    started_unix_ms: int = 0
+    ended_unix_ms: int = 0
+    series: list[tuple[int, float]] | None = None
+    series_dropped: int = 0
 
     def add(self, ms: float) -> None:
+        end = time.time() * 1000
         if self.count == 0:
             self.first_ms = self.min_ms = ms
+            self.started_unix_ms = int(end - ms)
         elif ms < self.min_ms:
             self.min_ms = ms
         self.count += 1
         self.total_ms += ms
         self.last_ms = ms
+        self.ended_unix_ms = int(end)
         if ms > self.max_ms:
             self.max_ms = ms
+        if self.series is not None:
+            if len(self.series) < MAX_SERIES:
+                self.series.append((int(end), round(ms, 3)))
+            else:
+                self.series_dropped += 1
 
-    def document(self) -> dict[str, float | int]:
-        return {
+    def document(self) -> dict[str, object]:
+        document: dict[str, object] = {
             "count": self.count,
             "total_ms": round(self.total_ms, 3),
             "mean_ms": round(self.total_ms / self.count, 3) if self.count else 0.0,
@@ -290,7 +306,13 @@ class Track:
             "max_ms": round(self.max_ms, 3),
             "first_ms": round(self.first_ms, 3),
             "last_ms": round(self.last_ms, 3),
+            "started_unix_ms": self.started_unix_ms,
+            "ended_unix_ms": self.ended_unix_ms,
         }
+        if self.series is not None:
+            document["series"] = [[end, ms] for end, ms in self.series]
+            document["series_dropped"] = self.series_dropped
+        return document
 
 
 @dataclass(slots=True)
@@ -311,9 +333,9 @@ class Attribution:
         self._track(self.stages, name).add(ms)
 
     def step(self, name: str, ms: float) -> None:
-        self._track(self.steps, name).add(ms)
+        self._track(self.steps, name, series=True).add(ms)
 
-    def _track(self, book: dict[str, Track], name: str) -> Track:
+    def _track(self, book: dict[str, Track], name: str, *, series: bool = False) -> Track:
         track = book.get(name)
         if track is None:
             if len(book) >= MAX_TRACKS:
@@ -322,7 +344,7 @@ class Attribution:
                 track = book.get(name)
                 if track is not None:
                     return track
-            track = book[name] = Track()
+            track = book[name] = Track(series=[] if series else None)
         return track
 
     def document(self) -> dict[str, object]:
@@ -331,7 +353,8 @@ class Attribution:
             "steps": {name: track.document() for name, track in sorted(self.steps.items())},
             "folded_names": self.folded,
             "method": (
-                "perf_counter deltas accumulated in place: count/total/min/max/first/last per "
-                "named span, never one row per step"
+                "perf_counter deltas accumulated in place: count/total/min/max/first/last and "
+                f"wall bounds per named span; step tracks keep up to {MAX_SERIES} "
+                "[end_unix_ms, ms] points"
             ),
         }

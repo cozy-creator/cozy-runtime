@@ -209,6 +209,8 @@ class RankGroup:
         self.broken = ""
         #: per follower rank, the largest working peak its mirrored calls reported this attempt
         self.working_peaks: dict[int, int] = {}
+        #: per follower rank, its `execution_evidence` record folded over this attempt's calls
+        self.rank_records: dict[int, dict[str, Any]] = {}
         self._readers: list[threading.Thread] = []
 
     # ------------------------------------------------------------------ lifecycle
