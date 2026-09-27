@@ -11,10 +11,12 @@ from __future__ import annotations
 import base64
 import fcntl
 import hashlib
+import logging
 import os
 import re
 import sqlite3
 import threading
+import weakref
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -86,18 +88,180 @@ Row = sqlite3.Row
 
 class Journal(sqlite3.Connection):
     lock_fd: int
+    mutex: threading.Lock
     guard: Callable[[], None]
 
     def native[T](self, operation: Callable[[], T]) -> T:
         """Native owns object/GC locking; no workspace transaction spans its IO."""
         if self.in_transaction:
             raise RuntimeError("native work cannot run inside a workspace SQL transaction")
-        fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+        lock_fd, guard = self.lock_fd, self.guard
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        self.mutex.release()
         try:
             return operation()
         finally:
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
-            self.guard()
+            self.mutex.acquire()
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            self.lock_fd, self.guard = lock_fd, guard
+            guard()
+
+
+_LOG = logging.getLogger(__name__)
+
+
+class _Handle:
+    """This process's one journal connection for one workspace directory.
+
+    The file lock still serializes processes; the mutex serializes this process's threads
+    over the shared connection. Telemetry is deferred and committed without a sync of its
+    own: every synchronous commit after it makes it durable, in order.
+    """
+
+    def __init__(self, directory: Path):
+        for path in (directory.parent, directory):
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        self.path = directory / "journal.sqlite3"
+        self.pid = os.getpid()
+        self.mutex = threading.Lock()
+        self.db: Journal | None = None
+        self.identity: tuple[int, int] = (0, 0)
+        self.process = b""
+        self.pending: list[Callable[[Journal], None]] = []
+        self.pending_lock = threading.Lock()
+
+    def connect(self) -> Journal:
+        if self.path.is_symlink():
+            raise WorkspaceRefusal("workspace journal cannot be a symlink")
+        try:
+            stat = os.stat(self.path)
+            identity = (stat.st_dev, stat.st_ino)
+        except FileNotFoundError:
+            identity = (0, 0)
+        if self.db is None or identity != self.identity:
+            # A replaced journal is a different workspace. The previous connection closes
+            # when its last user drops it.
+            db = sqlite3.connect(
+                self.path, isolation_level=None, factory=Journal, check_same_thread=False
+            )
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+            _migrate(db)
+            # Recovery reads only live attempts. An index is not a schema version: any
+            # Runtime maintains it, so no reader of this journal is refused over it.
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS attempts_live ON attempts(owner,request,ordinal) "
+                "WHERE state IN ('accepted','running')"
+            )
+            stat = os.stat(self.path)
+            self.db, self.identity = db, (stat.st_dev, stat.st_ino)
+        return self.db
+
+    def defer(self, write: Callable[[Journal], None], flush: Callable[[], None]) -> None:
+        with self.pending_lock:
+            first = not self.pending
+            self.pending.append(write)
+        if first:
+            # One writer per burst: whatever arrives while it waits joins its commit.
+            threading.Thread(target=flush, name="workspace-telemetry").start()
+
+    def drain(self, db: Journal) -> None:
+        with self.pending_lock:
+            writes, self.pending = self.pending, []
+        if not writes:
+            return
+        db.execute("PRAGMA synchronous=NORMAL")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            for write in writes:
+                write(db)
+            db.execute("COMMIT")
+        except Exception:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            _LOG.warning(
+                "workspace telemetry batch of %d was not recorded", len(writes), exc_info=True
+            )
+        finally:
+            db.execute("PRAGMA synchronous=FULL")
+
+
+_handles: weakref.WeakValueDictionary[Path, _Handle] = weakref.WeakValueDictionary()
+_handles_lock = threading.Lock()
+
+
+def _handle(directory: Path) -> _Handle:
+    with _handles_lock:
+        handle = _handles.get(directory)
+        if handle is None or handle.pid != os.getpid():
+            handle = _handles[directory] = _Handle(directory)
+        return handle
+
+
+def _migrate(db: Journal) -> None:
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version == 13:
+        return
+    if version == 0:
+        db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=3;COMMIT;")
+    elif version in (1, 2):
+        process_column = (
+            "ALTER TABLE attempts ADD COLUMN process_owner BLOB NOT NULL DEFAULT x'';"
+            if version == 1
+            else ""
+        )
+        db.executescript(
+            "BEGIN IMMEDIATE;" + process_column + _MIGRATION_3 + "PRAGMA user_version=3; COMMIT;"
+        )
+    elif version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+        raise WorkspaceRefusal("workspace journal schema is not supported")
+    if version <= 3:
+        from .workspace_sources import SCHEMA4
+
+        db.executescript("BEGIN IMMEDIATE;" + SCHEMA4 + "PRAGMA user_version=4; COMMIT;")
+    if version <= 4:
+        from .workspace_byte_outputs import SCHEMA5
+
+        db.executescript("BEGIN IMMEDIATE;" + SCHEMA5 + "PRAGMA user_version=5; COMMIT;")
+    if version <= 5:
+        from .workspace_byte_outputs import migrate6
+
+        migrate6(db)
+    if version <= 6:
+        from .workspace_executions import SCHEMA7
+
+        db.executescript("BEGIN IMMEDIATE;" + SCHEMA7 + "PRAGMA user_version=7; COMMIT;")
+    if version <= 7:
+        from .workspace_calls import SCHEMA8
+
+        db.executescript("BEGIN IMMEDIATE;" + SCHEMA8 + "PRAGMA user_version=8; COMMIT;")
+    if version <= 8:
+        from .machine_models import SCHEMA9
+
+        db.executescript("BEGIN IMMEDIATE;" + SCHEMA9 + "PRAGMA user_version=9; COMMIT;")
+    if version <= 9:
+        from .workspace_input_trees import SCHEMA10
+
+        db.executescript("BEGIN IMMEDIATE;" + SCHEMA10 + "PRAGMA user_version=10; COMMIT;")
+    if version <= 10:
+        from .machine_checkpoint_inputs import SCHEMA11
+
+        db.executescript("BEGIN IMMEDIATE;" + SCHEMA11 + "PRAGMA user_version=11; COMMIT;")
+    if version <= 11:
+        from .workspace_partial import SCHEMA12
+
+        db.executescript("BEGIN IMMEDIATE;" + SCHEMA12 + "PRAGMA user_version=12; COMMIT;")
+    if version <= 12:
+        # Providers an execution was given a credential for; never a credential value.
+        db.executescript(
+            "BEGIN IMMEDIATE;ALTER TABLE executions ADD COLUMN source_providers TEXT "
+            "NOT NULL DEFAULT '';PRAGMA user_version=13; COMMIT;"
+        )
 
 
 _OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
@@ -190,107 +354,66 @@ class Workspace:
         if self.directory.stat().st_uid != os.geteuid():
             raise WorkspaceRefusal("workspace journal belongs to another operating-system owner")
         os.chmod(self.directory, 0o700)
-        for directory in (self.store_root, self.directory):
-            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        self._journal = _handle(self.directory)
+
+    @property
+    def _handle(self) -> _Handle:
+        if self._journal.pid != os.getpid():
+            self._journal = _handle(self.directory)
+        return self._journal
 
     @contextmanager
     def locked(self, *, allow_frozen: bool = False, blocking: bool = True) -> Iterator[Journal]:
-        lock = os.open(self.directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        db: Journal | None = None
-        baseline = 0
+        handle = self._handle
+        if not handle.mutex.acquire(blocking=blocking):
+            raise WorkspaceBusy("foreground workspace transition is active")
+        lock = -1
+        changed = False
         try:
+            lock = os.open(self.directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             except BlockingIOError as exc:
                 raise WorkspaceBusy("foreground workspace transition is active") from exc
             guard = _authority.get()
             guard()
-            path = self.directory / "journal.sqlite3"
-            if path.is_symlink():
-                raise WorkspaceRefusal("workspace journal cannot be a symlink")
-            db = sqlite3.connect(path, isolation_level=None, factory=Journal)
-            db.lock_fd = lock
-            db.guard = guard
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA synchronous=FULL")
-            version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version == 0:
-                db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=3;COMMIT;")
-            elif version in (1, 2):
-                process_column = (
-                    "ALTER TABLE attempts ADD COLUMN process_owner BLOB NOT NULL DEFAULT x'';"
-                    if version == 1
-                    else ""
-                )
-                db.executescript(
-                    "BEGIN IMMEDIATE;"
-                    + process_column
-                    + _MIGRATION_3
-                    + "PRAGMA user_version=3; COMMIT;"
-                )
-            elif version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
-                raise WorkspaceRefusal("workspace journal schema is not supported")
-            if version <= 3:
-                from .workspace_sources import SCHEMA4
-
-                db.executescript("BEGIN IMMEDIATE;" + SCHEMA4 + "PRAGMA user_version=4; COMMIT;")
-            if version <= 4:
-                from .workspace_byte_outputs import SCHEMA5
-
-                db.executescript("BEGIN IMMEDIATE;" + SCHEMA5 + "PRAGMA user_version=5; COMMIT;")
-            if version <= 5:
-                from .workspace_byte_outputs import migrate6
-
-                migrate6(db)
-            if version <= 6:
-                from .workspace_executions import SCHEMA7
-
-                db.executescript("BEGIN IMMEDIATE;" + SCHEMA7 + "PRAGMA user_version=7; COMMIT;")
-            if version <= 7:
-                from .workspace_calls import SCHEMA8
-
-                db.executescript("BEGIN IMMEDIATE;" + SCHEMA8 + "PRAGMA user_version=8; COMMIT;")
-            if version <= 8:
-                from .machine_models import SCHEMA9
-
-                db.executescript("BEGIN IMMEDIATE;" + SCHEMA9 + "PRAGMA user_version=9; COMMIT;")
-            if version <= 9:
-                from .workspace_input_trees import SCHEMA10
-
-                db.executescript("BEGIN IMMEDIATE;" + SCHEMA10 + "PRAGMA user_version=10; COMMIT;")
-            if version <= 10:
-                from .machine_checkpoint_inputs import SCHEMA11
-
-                db.executescript("BEGIN IMMEDIATE;" + SCHEMA11 + "PRAGMA user_version=11; COMMIT;")
-            if version <= 11:
-                from .workspace_partial import SCHEMA12
-
-                db.executescript("BEGIN IMMEDIATE;" + SCHEMA12 + "PRAGMA user_version=12; COMMIT;")
-            if version <= 12:
-                # Providers an execution was given a credential for; never a credential value.
-                db.executescript(
-                    "BEGIN IMMEDIATE;ALTER TABLE executions ADD COLUMN source_providers TEXT "
-                    "NOT NULL DEFAULT '';PRAGMA user_version=13; COMMIT;"
-                )
-            if (
-                not allow_frozen
-                and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
-                != "active"
-            ):
-                raise WorkspaceInactive("workspace authority transfer is not active")
+            db = handle.connect()
+            db.lock_fd, db.mutex, db.guard = lock, handle.mutex, guard
             baseline = db.total_changes
-            yield db
+            try:
+                _migrate(db)
+                active = (
+                    db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
+                    == "active"
+                )
+                if not allow_frozen and not active:
+                    raise WorkspaceInactive("workspace authority transfer is not active")
+                if active:
+                    handle.drain(db)
+                yield db
+            finally:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                changed = db.total_changes != baseline
         finally:
-            changed = db is not None and db.total_changes != baseline
-            if db is not None:
-                db.close()
-            os.close(lock)
+            if lock >= 0:
+                os.close(lock)
+            handle.mutex.release()
             if changed:
                 self.changes().bump()
+
+    def defer(self, write: Callable[[Journal], None]) -> None:
+        """Record lossy telemetry with the next journal access, never on the caller's path."""
+        self._handle.defer(write, self._flush)
+
+    def _flush(self) -> None:
+        try:
+            with self.locked():
+                pass
+        except WorkspaceInactive:
+            pass  # The pending rows wait for the next active access.
+        except Exception:
+            _LOG.warning("workspace telemetry waits for the next journal access", exc_info=True)
 
     def changes(self) -> Changes:
         """This journal's change counter, shared by every Workspace opened on it."""
@@ -412,10 +535,16 @@ class Workspace:
             )
 
     def recover(self, owner: str) -> None:
-        """Recover dead process births without disturbing another live local worker."""
+        """Recover dead process births without disturbing another live local worker.
+
+        This process's own attempts are never examined: it is alive to ask.
+        """
         from . import workspace_recovery
 
         self.owner(owner)
+        handle = self._handle
+        if not handle.process:
+            handle.process = workspace_recovery.process_identity()
         with self.locked(allow_frozen=True) as db:
             if (
                 db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
@@ -424,8 +553,8 @@ class Workspace:
                 return
             rows = db.execute(
                 "SELECT * FROM attempts WHERE owner=? AND state IN ('accepted','running') "
-                "AND process_owner<>x'' ORDER BY request,ordinal",
-                (owner,),
+                "AND process_owner NOT IN (x'',?) ORDER BY request,ordinal",
+                (owner, handle.process),
             ).fetchall()
             for attempt in rows:
                 if not workspace_recovery.process_ended(attempt["process_owner"]):

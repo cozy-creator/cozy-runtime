@@ -101,6 +101,8 @@ def test_lookup_distinguishes_absence_from_authority_workspace_and_storage_failu
     assert rpc.GetMachineExecution(query, context).state == "queued"
     assert not observed
     # A failed read must never be interpreted as permission to submit fresh work.
+    for sidecar in ("-wal", "-shm", ""):
+        (executions.workspace.directory / f"journal.sqlite3{sidecar}").unlink()
     (executions.workspace.directory / "journal.sqlite3").write_bytes(b"corrupt database")
     with pytest.raises(Aborted):
         rpc.GetMachineExecution(query, context)

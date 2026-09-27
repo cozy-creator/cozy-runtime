@@ -41,6 +41,8 @@ def test_borrowed_model_root_collection_retains_bytes_and_rejects_a_copied_journ
     assert executions.collect("owner", "root") == outcome
 
     empty = Workspace(tmp_path / "empty")
+    with workspace.locked() as db:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     shutil.copyfile(workspace.directory / "journal.sqlite3", empty.directory / "journal.sqlite3")
     with pytest.raises(Exception) as lost:
         Executions(empty).collect("owner", "root")
