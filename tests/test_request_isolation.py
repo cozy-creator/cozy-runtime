@@ -130,7 +130,13 @@ def test_a_pin_no_parallel_group_can_run_refuses_before_construction() -> None:
     with pytest.raises(attention.AttentionRefusal) as unknown:
         attention.admit("dit=not-a-kernel", 1)
     assert unknown.value.code == "attention_kernel_unknown"
-    for name in ("flash-attn3", "sageattention", "flash-attn4", "kitchen-int8"):
+    for name in (
+        "flash-attn3",
+        "sageattention",
+        "sageattention-fp16pv",
+        "flash-attn4",
+        "kitchen-int8",
+    ):
         attention.admit(f"dit={name}", 4)
     attention.admit("dit=flashinfer-bf16-fp8", 1)
 

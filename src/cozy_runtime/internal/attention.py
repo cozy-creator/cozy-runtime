@@ -152,6 +152,23 @@ PINNABLE: tuple[Candidate, ...] = (
         ),
     ),
     Candidate(
+        name="sageattention-fp16pv",
+        backend="_cozy_sage_fp16pv",
+        local=upstream.SAGE_FP16PV,
+        min_sm=90,
+        dtypes=_HALF,
+        max_head_dim=128,
+        max_sm=90,
+        distribution="sageattention",
+        rel_l2_max=3e-2,
+        why=(
+            "Explicit experiment: INT8 Q/K + FP16 P/V (FP32 accumulation), upstream's SM80 "
+            "kernel built sm_90a and not upstream-qualified on SM90. H100 Gaussian 3.55e-3 rel "
+            "L2 versus FP8 P/V 3.75e-2 and BF16 2.33e-3, at 0.63x FA3 speed (h3a-013). The "
+            "budget refuses an FP8-P/V-class answer."
+        ),
+    ),
+    Candidate(
         name="kitchen-int8",
         backend="_cozy_kitchen_int8",
         local=upstream.KITCHEN,

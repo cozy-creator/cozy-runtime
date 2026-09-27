@@ -237,36 +237,37 @@ def fa4(
 # --------------------------------------------------------------------- quantized kernels
 
 
-def sage_sm90(
-    query: Any,
-    key: Any,
-    value: Any,
-    *,
-    attn_mask: Any = None,
-    dropout_p: float = 0.0,
-    is_causal: bool = False,
-    scale: float | None = None,
-    enable_gqa: bool = False,
-) -> Any:
-    """SageAttention2's Hopper kernel, named explicitly: INT8 Q/K per thread with smoothed K,
-    FP8 P/V with two-level FP32 accumulation. Its scales reduce within one head."""
-    _options("sageattention", attn_mask, dropout_p, scale)
-    _heads(query, key, enable_gqa)
-    sage = import_module("sageattention")
-    return sage.sageattn_qk_int8_pv_fp8_cuda_sm90(
-        query,
-        key,
-        value,
-        tensor_layout="NHD",
-        is_causal=is_causal,
-        qk_quant_gran="per_thread",
-        sm_scale=scale,
-        pv_accum_dtype="fp32+fp32",
-        smooth_k=True,
-    )
+def _sage(entry: str, pv_accum_dtype: str) -> Local:
+    """SageAttention2 through one named entry: INT8 Q/K per thread with smoothed K; `entry`
+    fixes the P/V precision and `pv_accum_dtype` its accumulation. Its scales reduce within
+    one head."""
 
+    def forward(
+        query: Any,
+        key: Any,
+        value: Any,
+        *,
+        attn_mask: Any = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+    ) -> Any:
+        _options("sageattention", attn_mask, dropout_p, scale)
+        _heads(query, key, enable_gqa)
+        return getattr(import_module("sageattention"), entry)(
+            query,
+            key,
+            value,
+            tensor_layout="NHD",
+            is_causal=is_causal,
+            qk_quant_gran="per_thread",
+            sm_scale=scale,
+            pv_accum_dtype=pv_accum_dtype,
+            smooth_k=True,
+        )
 
-SAGE_MODE = "sageattn_qk_int8_pv_fp8_cuda_sm90(per_thread, fp32+fp32, smooth_k)"
+    return Local(forward, _named(f"{entry}(per_thread, {pv_accum_dtype}, smooth_k)"))
 
 
 def _cuda_inputs(query: Any, key: Any, value: Any, enable_gqa: bool, *, mixed: bool) -> None:
@@ -409,6 +410,9 @@ CUDNN = Local(cudnn, _named("cudnn"))
 FA3 = Local(fa3, lambda *_: f"flash_attn3 {_FA3_VARIANT}")
 FA3_FP8 = Local(fa3_fp8, lambda *_: f"flash_attn3 {_FA3_VARIANT} e4m3 per-head")
 FA4 = Local(fa4, _named("flash_attn.cute.flash_attn_func"))
-SAGE = Local(sage_sm90, _named(SAGE_MODE))
+#: FP8 P/V: the Hopper kernel, which accepts only two-level FP32 accumulation.
+SAGE = _sage("sageattn_qk_int8_pv_fp8_cuda_sm90", "fp32+fp32")
+#: FP16 P/V at upstream's default (and most accurate) FP32 accumulation; BF16 V is cast to FP16.
+SAGE_FP16PV = _sage("sageattn_qk_int8_pv_fp16_cuda", "fp32")
 KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"))
 FLASHINFER = Local(flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill"), head_local=False)

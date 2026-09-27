@@ -39,7 +39,9 @@ def test_nondefault_unsupported_semantics_refuse(
         adapter(q, q, q, **options)
 
 
-@pytest.mark.parametrize("name", ["kitchen-int8", "sageattention", "flash-attn3"])
+@pytest.mark.parametrize(
+    "name", ["kitchen-int8", "sageattention", "sageattention-fp16pv", "flash-attn3"]
+)
 @pytest.mark.parametrize(
     ("options", "reason"),
     [({"return_lse": True}, "log-sum-exp"), ({"_parallel_config": object()}, "Ulysses")],

@@ -39,6 +39,7 @@ from cozy_runtime.cli.io import CliError
 from cozy_runtime.internal import (
     attention,
     attention_fp8,
+    attention_upstream,
     child_env,
     kernel_site,
     package_interface,
@@ -152,7 +153,7 @@ def test_every_nameable_kernel_has_one_name_and_one_backend() -> None:
     assert set(attention.BY_NAME) == set(names)
     # Both quantized-activation kernels remain explicit choices. A speed result
     # alone does not make their numerical change an automatic model default.
-    for name in ("flash-attn3-fp8", "sageattention"):
+    for name in ("flash-attn3-fp8", "sageattention", "sageattention-fp16pv"):
         assert name in {c.name for c in attention.PINNABLE}
         assert name not in {c.name for c in attention.CANDIDATES}
 
@@ -232,7 +233,15 @@ def test_every_candidate_states_the_architectures_it_serves_and_where_that_came_
     assert not attention.BY_NAME["flash-attn3"].jit
     assert attention.BY_NAME["sageattention"].max_sm == 90
     assert attention.BY_NAME["sageattention"].backend.endswith("sm90")
-    assert "sm90" in attention.upstream.SAGE_MODE
+    assert attention_upstream.SAGE.impl() == (
+        "sageattn_qk_int8_pv_fp8_cuda_sm90(per_thread, fp32+fp32, smooth_k)"
+    )
+    # The FP16 P/V entry is upstream's SM80 kernel; the image builds it sm_90a only.
+    fp16pv = attention.BY_NAME["sageattention-fp16pv"]
+    assert (fp16pv.min_sm, fp16pv.max_sm, fp16pv.distribution) == (90, 90, "sageattention")
+    assert fp16pv.local is attention_upstream.SAGE_FP16PV
+    assert fp16pv.local.impl() == "sageattn_qk_int8_pv_fp16_cuda(per_thread, fp32, smooth_k)"
+    assert fp16pv.rel_l2_max < attention.BY_NAME["sageattention"].rel_l2_max
     assert attention.BY_NAME["cudnn"].max_sm == 0 and attention.BY_NAME["sdpa"].max_sm == 0
     # The floor may never be bounded above: a card it refused would hold no attention at all.
     assert attention.CANDIDATES[-1].name == "sdpa"
@@ -275,26 +284,29 @@ def test_device_code_covers_a_card_by_nvidias_rule_and_never_by_optimism(
     assert attention._covers(declared, sm) is covers
 
 
-def test_a_static_ceiling_refuses_the_card_by_name_instead_of_reaching_the_kernel() -> None:
+@pytest.mark.parametrize("name", ["sageattention", "sageattention-fp16pv"])
+def test_a_static_ceiling_refuses_the_card_by_name_instead_of_reaching_the_kernel(
+    name: str,
+) -> None:
     """RED ARM, no plant and no device: `sageattention`'s declared range excludes sm_120, so a
     pin naming it there is refused BY NAME rather than admitted and probed.
 
     Admitting it is what the old table did, and probing it is what would then have run the
     kernel: h3a-022 measured `cudaErrorNoKernelImageForDevice` out of this extension on an
     sm_120 card, from an image that builds it `arch=compute_90a,code=sm_90a`."""
-    refused = _refusal(lambda: attention.pinned("sageattention", _device(120)))
+    refused = _refusal(lambda: attention.pinned(name, _device(120)))
     assert refused.code == "attention_kernel_unsupported"
-    assert "sageattention serves sm90 only" in str(refused)
+    assert f"{name} serves sm90 only" in str(refused)
     assert "sm120" in str(refused)
     # The refusal is also the discoverability (cr-125): it says what this card CAN run.
     assert "This environment runs" in str(refused)
     # And the same entry on the card it does claim gets past the device gate, so the ceiling
     # is a bound and not a blanket refusal — sm90 reaches resolution and fails on absence.
-    assert _refusal(lambda: attention.pinned("sageattention", _device(90))).code == (
-        "attention_kernel_absent"
-    )
+    assert _refusal(lambda: attention.pinned(name, _device(90))).code == "attention_kernel_absent"
+    below = _refusal(lambda: attention.pinned(name, _device(89)))
+    assert below.code == "attention_kernel_unsupported" and "needs sm90" in str(below)
     # The device gate is applied wherever a candidate is offered, not only at the pin.
-    assert "sageattention" not in attention.image_kernels(_device(120))
+    assert name not in attention.image_kernels(_device(120))
 
 
 def test_a_baked_kernels_ceiling_is_read_from_the_artifact_and_refuses_the_card_by_name(
@@ -709,7 +721,14 @@ def test_every_head_local_kernel_shards_and_a_cross_head_one_refuses() -> None:
     assert sharded.totals() == {"flash-attn3": 2}
     assert sharded.offered == tuple(RANKED)
     assert _backends(roots) == {"dit": ["_cozy_flash_attn3"]}
-    for name in ("flash-attn3-fp8", "flash-attn4", "sageattention", "kitchen-int8", "sol-attn"):
+    for name in (
+        "flash-attn3-fp8",
+        "flash-attn4",
+        "sageattention",
+        "sageattention-fp16pv",
+        "kitchen-int8",
+        "sol-attn",
+    ):
         assert attention.install(_ready(name), roots, name, degree=4).totals() == {name: 2}
         attention.admit(f"dit={name}", 4)
     refused = _refusal(
