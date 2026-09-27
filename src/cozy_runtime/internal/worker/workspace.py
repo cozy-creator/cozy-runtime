@@ -1151,6 +1151,12 @@ class Workspace:
             return dict(db.execute("SELECT * FROM weights WHERE id=?", (row["id"],)).fetchone())
 
     def checkpoint(self, owner: str, frame: pb.WeightsCheckpointFrame) -> None:
+        """Record this worker's own native writer's latest checkpoint.
+
+        The frame is what that writer just produced, so it is not re-validated against its
+        whole chain (a cost that grows with every part). A checkpoint named from outside,
+        to restore from, is validated in full by `ready_weights`.
+        """
         with self.locked() as db:
             row = db.execute(
                 "SELECT * FROM weights WHERE owner=? AND id=?",
@@ -1168,17 +1174,6 @@ class Workspace:
             ):
                 raise WorkspaceRefusal("checkpoint does not belong to the current native writer")
             self._checkpoint_advances(row["checkpoint"], frame.checkpoint)
-            db.native(lambda: self._validate_checkpoint(row, frame.checkpoint))
-            current = db.execute(
-                "SELECT state,epoch,ordinal,checkpoint FROM weights WHERE id=?", (row["id"],)
-            ).fetchone()
-            if (
-                current["state"] != "intent"
-                or current["epoch"] != frame.writer_epoch
-                or current["ordinal"] != frame.attempt_ordinal
-            ):
-                raise WorkspaceRefusal("writer changed during checkpoint recording")
-            self._checkpoint_advances(current["checkpoint"], frame.checkpoint)
             db.execute(
                 "UPDATE weights SET checkpoint=? WHERE id=?",
                 (frame.checkpoint.SerializeToString(), row["id"]),

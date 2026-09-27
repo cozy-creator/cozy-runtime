@@ -1,0 +1,1 @@
+A worker records its own native writer's checkpoints without re-validating the whole checkpoint chain each time, which cost time proportional to the parts written so far (about 40 s over an SDXL quantization). A checkpoint named to restore from is still validated in full.
