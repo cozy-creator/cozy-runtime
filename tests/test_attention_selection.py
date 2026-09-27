@@ -293,7 +293,11 @@ def test_every_candidate_states_the_architectures_it_serves_and_where_that_came_
     assert not attention.BY_NAME["flash-attn3"].jit
     # Sage names one upstream entry per card in its adapter; the site's arches bound the build.
     sage = attention.BY_NAME["sageattention"]
-    assert (sage.max_sm, sage.sms, sage.local) == (120, {89, 90, 120}, attention_upstream.SAGE)
+    assert (sage.max_sm, sage.sms, sage.local) == (
+        120,
+        frozenset({89, 90, 120}),
+        attention_upstream.SAGE,
+    )
     # The FP16 P/V entry is upstream's SM80 kernel; the image builds it sm_90a only.
     fp16pv = attention.BY_NAME["sageattention-fp16pv"]
     assert (fp16pv.min_sm, fp16pv.max_sm, fp16pv.distribution) == (90, 90, "sageattention")
@@ -954,12 +958,12 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     # name (0.31 rel L2 at 109k rows, h3a-044) rather than calling it wrong or serving it.
     fp8 = out["fp8"]
     if fp8["code"]:
-        expected = (
+        refusals = (
             {"attention_kernel_unsupported"}
             if out["sm"] < 90
             else {"attention_kernel_absent", "attention_kernel_out_of_budget"}
         )
-        assert fp8["code"] in expected and "flash-attn3-fp8" in fp8["detail"], fp8
+        assert fp8["code"] in refusals and "flash-attn3-fp8" in fp8["detail"], fp8
     else:
         assert 1e-2 < fp8["rel_l2"] < out["selfcheck_budgets"]["flash-attn3-fp8"]
         assert fp8["backend"] == "_cozy_flash_attn3_fp8"

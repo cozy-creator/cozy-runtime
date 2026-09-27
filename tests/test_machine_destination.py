@@ -168,7 +168,6 @@ def test_job_root_publishes_its_weights_output_to_the_granted_destination(
             worker.machine_effects.allow_local = True  # the stand-in bucket is plain HTTP
             thread = threading.Thread(target=worker.run, daemon=True)
             try:
-                fixture.measure(worker, preparation)
                 installed = worker.prepare_local_package(preparation).installed_package
                 captured, capture_digest = documents.identity(
                     pb.MachineExecutionCapture(

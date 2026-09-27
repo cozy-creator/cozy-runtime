@@ -10,9 +10,9 @@ import msgspec
 import pytest
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._services import MAX_OUTPUT_BYTES
 from cozy_runtime.internal.worker import source_views, workspace_memo, workspace_sources
 from cozy_runtime.internal.worker import workspace_byte_outputs as byte_outputs
-from cozy_runtime.internal.worker.commit_files import MAX_OUTPUT_BYTES
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_native_source_views import run_view, view_call
@@ -34,7 +34,8 @@ def _additive(value: dict[str, Any]) -> dict[str, Any]:
 def _stored(workspace: Workspace, service: str) -> dict[str, Any]:
     with workspace.locked() as db:
         row = db.execute("SELECT result FROM native_calls WHERE service_id=?", (service,))
-        return canonical_json.decode(row.fetchone()[0])
+        stored: dict[str, Any] = canonical_json.decode(row.fetchone()[0])
+        return stored
 
 
 def _restore(workspace: Workspace, service: str, value: dict[str, Any]) -> None:
@@ -126,7 +127,7 @@ def test_file_commit_manifest_with_additive_members_reserves_its_accepted_blob(
 ) -> None:
     workspace, command, _, data = pending(tmp_path)
     workspace_sources.accepted(workspace, "owner", command)
-    entry = {
+    entry: dict[str, Any] = {
         "path": "payload",
         "kind": "file",
         "mode": "0644",

@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from cozy_runtime.author import AttentionContext, Model
-from cozy_runtime.internal import attention
+from cozy_runtime.internal import attention, attention_ulysses
 from cozy_runtime.internal.attention_registry import register
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor import Executor
@@ -354,6 +354,7 @@ def test_probe_refuses_wrong_output_dtype_even_with_perfect_values() -> None:
 def test_the_gate_tells_out_of_budget_from_carrying_no_attention() -> None:
     """Finite output past its budget RUNS and is out of budget, by name; past rel L2 1 the
     output carries no attention at all (h3a-013's uninitialized buffer)."""
+    pytest.importorskip("diffusers")
     entry = _ready("flash-attn3-fp8")[0]
     attention._gate(entry, _device(), 0.05, "fixture")
     with pytest.raises(attention.AttentionRefusal, match="numerically out of budget") as over:
@@ -408,7 +409,7 @@ def test_numerical_probe_runs_on_the_selected_nondefault_device() -> None:
         pytest.skip("requires two explicitly owned CUDA devices")
     indices: list[int] = []
 
-    def reference(query: Any, key: Any, value: Any) -> Any:
+    def reference(query: Any, key: Any, value: Any, **_options: Any) -> Any:
         indices.append(query.device.index)
         assert query.device == key.device == value.device == torch.device("cuda", 1)
         assert torch.cuda.current_device() == 1
@@ -416,12 +417,18 @@ def test_numerical_probe_runs_on_the_selected_nondefault_device() -> None:
             query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
         ).transpose(1, 2)
 
-    member = register("_cozy_probe_device_test", reference)
+    local = attention_ulysses.Local(reference, lambda *_: "reference")
     entry = attention.Ready(
         attention.Candidate(
-            "index-probe", member.value, 0, frozenset({"bfloat16"}), 128, rel_l2_max=2e-2
+            name="index-probe",
+            backend="_cozy_probe_device_test",
+            local=local,
+            min_sm=0,
+            dtypes=frozenset({"bfloat16"}),
+            max_head_dim=128,
+            rel_l2_max=2e-2,
         ),
-        member,
+        attention_ulysses.member("_cozy_probe_device_test", local),
     )
     major, minor = torch.cuda.get_device_capability(1)
     selected = DeviceFacts(
@@ -479,6 +486,8 @@ def _cuda(sm: int) -> DeviceFacts:
 
 
 def test_h3_prefers_sol_then_sage_then_fa3_for_every_dit_and_never_fp8() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
     from cozy_runtime.models.minimax_h3.model import DIT_ATTENTION, H3Model, H3TurboBase
 
     assert DIT_ATTENTION == ("sol-attn", "sageattention", "flash-attn3", "sdpa")
@@ -500,6 +509,8 @@ def test_h3_prefers_sol_then_sage_then_fa3_for_every_dit_and_never_fp8() -> None
 def test_h3_dits_fall_through_to_fa3_when_sol_and_sage_cannot_serve(sm: int) -> None:
     """sm90 without Sol/Sage in the environment, and a non-SM90 card: both walk to FA3 and
     say why each earlier preference was skipped. FA3 is installation-only here, as above."""
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
     from cozy_runtime.models.minimax_h3.model import H3Model
 
     roots = _h3_roots("bfloat16")
@@ -519,6 +530,8 @@ def test_h3_dits_fall_through_to_fa3_when_sol_and_sage_cannot_serve(sm: int) -> 
 
 
 def test_h3_preference_records_skips_through_real_cpu_selection() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
     from cozy_runtime.models.minimax_h3.model import H3Model
 
     applied = attention.select(
@@ -531,6 +544,8 @@ def test_h3_preference_records_skips_through_real_cpu_selection() -> None:
 
 
 def test_a_pin_overrides_the_h3_preference() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
     from cozy_runtime.models.minimax_h3.model import H3Model
 
     policy = object.__new__(H3Model)

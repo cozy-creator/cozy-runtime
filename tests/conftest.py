@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 import functools
+import shutil
+import tempfile
 from pathlib import Path
 
 
@@ -92,3 +95,12 @@ def sample_python() -> Path:
         capture_output=True,
     )
     return python
+
+
+@functools.cache
+def mypy_cache() -> Path:
+    """One mypy cache per session: every generated caller type-checks against the same
+    `cozy_runtime`, so only the first check pays for analysing it."""
+    root = Path(tempfile.mkdtemp(prefix="cozy-mypy-cache."))
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
+    return root

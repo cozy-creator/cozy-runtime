@@ -68,18 +68,21 @@ def restore_env() -> Iterator[None]:
 
 
 def _compile_something() -> None:
-    """One real inductor compilation on the CPU backend — enough to reach `cache_dir()`.
+    """One real inductor compilation on the CPU backend, then the write under test.
 
-    The write under test is `torch/_inductor/runtime/cache_dir_utils.py:cache_dir`, which
-    every backend reaches; a device is not needed to prove which environment names move.
+    The write is `torch/_inductor/runtime/cache_dir_utils.py:cache_dir`: the CUDA/triton
+    path reaches it on every compile (`triton_cache_dir`), but Torch 2.14's CPU path no
+    longer does, so it is called here exactly as that path calls it.
     """
     import torch
     import torch._dynamo as dynamo
     from torch import nn
+    from torch._inductor.runtime.cache_dir_utils import cache_dir
 
     dynamo.reset()
     tiny = nn.Sequential(nn.Linear(16, 16), nn.SiLU(), nn.Linear(16, 16)).eval()
     torch.compile(tiny, fullgraph=True)(torch.randn(4, 16))
+    cache_dir()
 
 
 def _seal_under(imposed: dict[str, str]) -> dict[str, object]:
@@ -113,20 +116,19 @@ def test_compile_leaves_the_seal_intact_under_the_imposed_jit_scope(
     assert verdict == {"env_intact": True, "env_changed": []}
 
 
-def test_compile_breaks_the_seal_when_the_jit_scope_is_not_imposed(restore_env: None) -> None:
-    """RED ARM: plant the pre-`b6c65d7` condition and watch the same compile break it.
+def test_compile_moves_the_seal_when_the_jit_scope_is_not_imposed(restore_env: None) -> None:
+    """RED ARM: plant the pre-`b6c65d7` condition and watch the same compile move the seal.
 
     This is the defect the record remembers as "mutated the sealed allocator environment".
     It was never the allocator: `PYTORCH_CUDA_ALLOC_CONF` does not move here, and naming it
-    is what let the whole of compilation be written off. Delete the imposition in
-    `_prepare_jit_cache` and this arm goes green while the ARM above goes red.
+    is what let the whole of compilation be written off. Since #692 a moved name is restored
+    and reported, never refused. Delete the imposition in `_prepare_jit_cache` and the ARM
+    above reports this name too.
     """
     verdict = _seal_under({})
 
-    assert verdict["env_intact"] is False
-    assert verdict["env_changed"] == ["TORCHINDUCTOR_CACHE_DIR"]
-    assert "PYTORCH_CUDA_ALLOC_CONF" not in verdict["env_changed"]
-    assert os.environ["TORCHINDUCTOR_CACHE_DIR"]
+    assert verdict == {"env_intact": True, "env_changed": ["TORCHINDUCTOR_CACHE_DIR"]}
+    assert "TORCHINDUCTOR_CACHE_DIR" not in os.environ, "the executor restores its seal"
 
 
 def test_only_the_wrapping_spelling_renames_destinations() -> None:

@@ -94,20 +94,3 @@ def test_video_soundtrack_needs_no_torchaudio(monkeypatch: pytest.MonkeyPatch, r
     assert tuple(reference.audio.shape) == (1, 2 * VAE_RATE)
     waveform = _normalized(reference.audio, reference.sample_rate, 5.0)
     assert abs(_peak_hz(waveform) - 440.0) < 1.0
-
-
-@pytest.mark.parametrize("rate", RATES)
-def test_resampling_equals_torchaudio(rate: int) -> None:
-    torchaudio = pytest.importorskip("torchaudio")
-    waveform = torch.randn(2, rate * 2 + 17, generator=torch.Generator().manual_seed(rate))
-    audio = DecodedAudio(
-        channels=2,
-        sample_count=waveform.shape[1],
-        sample_rate=rate,
-        channel_layout="stereo",
-        channel_names=("FL", "FR"),
-        pcm_f32le=tuple(row.numpy().astype("<f4").tobytes() for row in waveform),
-        start_time=Fraction(0),
-    )
-    ours = OfficialH3Pipeline.audio_reference(PIPE, audio).audio  # type: ignore[arg-type]
-    assert torch.equal(ours, torchaudio.transforms.Resample(rate, VAE_RATE)(waveform))

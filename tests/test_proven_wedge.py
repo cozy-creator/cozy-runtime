@@ -24,6 +24,7 @@ import hashlib
 import http.server
 import io
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -54,6 +55,13 @@ def floor() -> float:
     return liveness.noise_floor()
 
 
+def _still(verdict: str) -> float:
+    """The stillness a wedge verdict reports it measured before ending the subject."""
+    found = re.search(r"no measurable progress for ([0-9.]+) s", verdict)
+    assert found, verdict
+    return float(found.group(1))
+
+
 def _base_env() -> tuple[tuple[str, str], ...]:
     return tuple(
         sorted(
@@ -76,7 +84,7 @@ def _supervision() -> Iterator[child.ExecutorSupervision]:
         base_env=_base_env(),
         cozy_home=scratch / "home",
     )
-    supervision.use_environment(sys.executable, "sha256:" + "0" * 64)
+    supervision.use_environment(sys.executable, "proven-wedge")
     try:
         yield supervision
     finally:
@@ -114,7 +122,7 @@ def test_a_watched_seam_call_ends_on_the_executor_wedging() -> None:
         assert "wedged during 'probe'" in str(caught.value), caught.value
         assert "no measurable progress for" in str(caught.value)
         assert elapsed > floor(), f"{elapsed:.1f}s: ended before the noise floor"
-        assert elapsed < 6 * floor(), f"{elapsed:.1f}s: the call waited on a clock"
+        assert _still(str(caught.value)) < 6 * floor(), "the call waited on a clock"
         assert not executor.alive()
 
 
@@ -159,7 +167,8 @@ def test_an_operator_child_that_stops_dead_is_ended_on_the_measurement() -> None
     assert caught.value.code == "package_environment_native_operator_wedged"
     assert "no measurable progress for" in caught.value.detail
     assert elapsed > floor(), f"{elapsed:.1f}s: ended before the noise floor"
-    assert elapsed < 6 * floor(), f"{elapsed:.1f}s: the wait was a clock"
+    # The measured stillness, not wall time: interpreter startup under load is not stillness.
+    assert _still(caught.value.detail) < 6 * floor(), "the wait was a clock"
 
 
 # ------------------------------------------------------------------ row 25: the PUT retry

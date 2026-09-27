@@ -1,6 +1,8 @@
 name: ci-torch
-# On demand only (CPU torch install + torch-dependent tests):
+# On demand only: every test FILE that gates on Torch, Diffusers or Transformers, on CPU
+# wheels, plus the proofs that need root to hand the executor another UID.
 #   gh workflow run ci-torch.yaml -R cozy-creator/cozy-runtime --ref <branch>
+# Files are selected by their own gates, so a new Torch test runs here without a list edit.
 on:
   workflow_dispatch:
 concurrency:
@@ -9,11 +11,12 @@ concurrency:
 jobs:
   torch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Hang bound, not a work budget.
+    timeout-minutes: 30
     env:
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
-      # The UID proof runs Python as another user; the runner's private temp dir is not traversable.
+      # The UID proofs run Python as another user; the runner's private temp dir is not traversable.
       UV_PYTHON_INSTALL_DIR: /tmp/cozy-runtime-ci-python
     steps:
       - uses: actions/checkout@v4
@@ -22,29 +25,34 @@ jobs:
         with:
           save-cache: ${{ github.ref == 'refs/heads/master' }}
       - run: uv python install 3.12
-      - run: uv sync --locked
-      - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.14.0"
+      - id: sync
+        run: uv sync --locked
+      - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.14.0" torchvision
       - run: uv pip install --python .venv/bin/python "diffusers==0.40.0" "accelerate==1.14.0" "transformers==5.16.1"
       - run: .venv/bin/python -c "import torch; assert torch.version.cuda is None"
-      - run: >-
-          .venv/bin/python -m pytest tests/test_parallel_calls.py tests/test_attention_sol.py
-          tests/test_h3_group_warm_fixture.py
-          tests/test_job_source_derivation.py tests/test_construction_dtype.py
-          tests/test_h3_conditioner_lifecycle.py tests/test_gpu_job_device.py
-          tests/test_prepare_diagnostics.py
-          tests/test_encoded_leaf_dtype.py
-          tests/test_h3_sol_prefix.py tests/test_h3_sol_turbo.py
-          tests/test_h3_reference_audio.py
-          tests/test_end_to_end.py::test_real_modeled_package_prepare_can_be_acquired_before_model_selection -q -rs
-      - name: Pod executor UID boundary during warmup
+      - name: Torch-gated test files
+        run: |
+          mapfile -t files < <(grep -lE '(importorskip|find_spec)\(\s*"(torch|diffusers|transformers)|needs_torch|NO_TORCH|SkipTest\(' tests/test_*.py)
+          .venv/bin/python -m pytest -rs "${files[@]}"
+      # The executor runs as another UID only when the worker is root, as on a pod. Every
+      # proof that needs that crossing runs here, from a tree that UID can traverse.
+      - name: Pod executor UID boundary
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: |
           proof_root=$(mktemp -d /tmp/cozy-runtime-uid.XXXXXX)
           trap 'sudo rm -rf "$proof_root"' EXIT
           chmod 0755 "$proof_root"
           uv build --wheel --out-dir "$proof_root/wheels"
           uv venv --python 3.12 "$proof_root/.venv"
-          UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" "$proof_root"/wheels/*.whl pytest
+          wheel=$(echo "$proof_root"/wheels/*.whl)
+          UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" "$wheel[media,model-execution]" pytest
           UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" --index https://download.pytorch.org/whl/cpu "torch==2.14.0"
           cp -a tests "$proof_root/"
           cd "$proof_root"
-          sudo -E .venv/bin/python -m pytest tests/test_warm_isolation.py -q -rs
+          sudo -E .venv/bin/python -m pytest -q -rs tests/test_warm_isolation.py \
+            tests/test_prepare_cache.py::test_the_executor_uid_can_read_a_staged_document \
+            tests/test_prepare_cache.py::test_a_root_only_document_is_refused_by_the_executor \
+            tests/test_executor_handoff.py::test_the_executor_can_write_the_document_the_handoff_returns \
+            tests/test_executor_handoff.py::test_a_directory_beneath_the_grant_is_not_granted \
+            tests/test_executor_handoff.py::test_a_stale_document_does_not_refuse_the_next_preparation \
+            tests/test_weights_source_config.py::test_native_source_fd_preserves_repository_permissions

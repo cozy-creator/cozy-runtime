@@ -83,7 +83,7 @@ def test_every_registered_kernel_is_head_local_and_a_cross_head_one_refuses_ulys
 
 def test_sdpa_names_the_backend_torch_dispatches_and_matches_it() -> None:
     q = torch.randn((1, 16, 2, 64))
-    options = {
+    options: dict[str, Any] = {
         "attn_mask": None,
         "dropout_p": 0.0,
         "is_causal": False,
@@ -95,10 +95,11 @@ def test_sdpa_names_the_backend_torch_dispatches_and_matches_it() -> None:
     ).transpose(1, 2)
     assert torch.equal(upstream.sdpa(q, q, q, **options), expected)
     assert upstream.sdpa_impl(q, q, q, options) in {"flash", "efficient", "math", "cudnn"}
+    pytest.importorskip("diffusers")
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+
     with attention_ulysses.observing() as seen:
         member = attention._member(attention.BY_NAME["sdpa"])
-        pytest.importorskip("diffusers")
-        from diffusers.models.attention_dispatch import dispatch_attention_fn
 
         dispatch_attention_fn(q, q, q, backend=member)
     assert attention.implementations(seen) == upstream.sdpa_impl(q, q, q, options)

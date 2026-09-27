@@ -256,6 +256,9 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
                 }
             )
             return {"ok": True}
+        if kind == "child_forget":
+            # A settled call releases its runtime handle.
+            return {"ok": True}
         assert kind == "child_poll"
         return answer
 

@@ -214,7 +214,10 @@ def _ranks(worker: Worker, outcome: dict[str, Any]) -> dict[int, dict[str, str]]
     """rank -> requested, observed and dispatched attention, from the triage bundle."""
     subject = outcome["triage_bundle"]["subject_id"]
     bundle = triage.BundleStore.read(worker.root / "triage", subject, worker.records)
-    return ranks(bundle["measurements"].get("execution") or {"ranks": []})
+    observed: dict[int, dict[str, str]] = ranks(
+        bundle["measurements"].get("execution") or {"ranks": []}
+    )
+    return observed
 
 
 @pytest.mark.skipif(bool(NO_CARD), reason=NO_CARD or "")

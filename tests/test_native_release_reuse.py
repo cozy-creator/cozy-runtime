@@ -7,9 +7,10 @@ import csv
 import hashlib
 import io
 import json
-import os
+import re
 import subprocess
 import tomllib
+import urllib.request
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
@@ -25,13 +26,29 @@ def run(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
 
 
+@pytest.fixture(scope="session")
+def donor(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The public donor publish.yaml pins, fetched once and checked against that pin."""
+    workflow = (ROOT / ".github/workflows/publish.yaml").read_text()
+    filename = re.search(r'filename = "(cozy_runtime-[^"]+\.whl)"', workflow)
+    pinned = re.search(r"--native-sha256 ([0-9a-f]{64})", workflow)
+    assert filename and pinned, "publish.yaml no longer names its native donor"
+    version = filename.group(1).split("-")[1]
+    with urllib.request.urlopen(f"https://pypi.org/pypi/cozy-runtime/{version}/json") as response:
+        (url,) = [
+            row["url"]
+            for row in json.load(response)["urls"]
+            if row["filename"] == filename.group(1)
+        ]
+    path = tmp_path_factory.mktemp("donor") / filename.group(1)
+    with urllib.request.urlopen(url) as response:
+        path.write_bytes(response.read())
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == pinned.group(1)
+    return path
+
+
 @pytest.fixture
-def release_copy(tmp_path: Path) -> tuple[Path, Path, str]:
-    named = os.environ.get("COZY_NATIVE_DONOR_WHEEL")
-    if not named:
-        pytest.skip("set COZY_NATIVE_DONOR_WHEEL to the reviewed public native donor")
-    donor = Path(named).resolve()
-    assert donor.is_file()
+def release_copy(tmp_path: Path, donor: Path) -> tuple[Path, Path, str]:
     repo = tmp_path / "source"
     cloned = run("git", "clone", "--shared", str(ROOT), str(repo), cwd=tmp_path)
     assert cloned.returncode == 0, cloned.stderr

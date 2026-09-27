@@ -1,8 +1,9 @@
 name: ci
 # On demand, before a release (lint, types, fences, wheel, pytest, handoff proof):
 #   gh workflow run ci.yaml -R cozy-creator/cozy-runtime --ref <branch>
-# Nothing runs on push: publish.yaml's build job runs the whole-tree syntax/undefined-name
-# lint and the fences on every release, the only point where the tree ships.
+# Every gate after the sync runs even when an earlier one is red, so one dispatch reports all
+# of them; the job still fails on any red gate. Nothing runs on push: publish.yaml's build job
+# runs the whole-tree syntax/undefined-name lint and the fences on every release.
 on:
   workflow_dispatch:
 concurrency:
@@ -14,33 +15,45 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The native release reuse proof compares against its donor's source commit.
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v7
         with:
           save-cache: ${{ github.ref == 'refs/heads/master' }}
       - run: uv python install 3.12
-      - run: uv sync --locked
-      - run: >-
+      - id: sync
+        run: uv sync --locked
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: >-
           uv run python -c "import sys, sysconfig;
           assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12)
           and sysconfig.get_config_var('Py_GIL_DISABLED') != 1"
       # Gate on bug classes only. Formatting, line length, import order and other
       # auto-fixable style stay local (`ruff format`, `ruff check --fix`).
-      - run: uv run ruff check --select E9,F,B --ignore F401 .
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff check --select E9,F,B --ignore F401 .
       # Fixture packages under tests/testdata are inputs to tests, not typed product code.
-      - run: >-
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: >-
           uv run mypy --follow-imports=silent
           --exclude 'src/cozy/worker/v1/worker_pb2|src/cozy_runtime/models/qwen_image21/upstream|^tests/testdata/'
-      - run: uv run python checks/architecture.py
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run python checks/architecture.py
       - name: Reproducible wheel
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: |
           set -euo pipefail
           a=$(mktemp -d); b=$(mktemp -d)
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$a"
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$b"
           cmp "$a"/*.whl "$b"/*.whl
-      - run: uv run --with "triton==3.8.0" python -m cozy_runtime.internal.fusion_build --check --arch 90
-      - run: uv run pytest
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run --with "triton==3.8.0" python -m cozy_runtime.internal.fusion_build --check --arch 90
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run pytest
       - name: Primary handoff under real supervised processes
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: |
           sudo systemd-run --wait --pipe --collect \
             --unit="cozy-runtime-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \

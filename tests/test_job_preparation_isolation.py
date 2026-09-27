@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import email.parser
+import functools
 import json
 import os
 import shutil
@@ -74,50 +75,57 @@ def package(
     assert uv is not None
     _run(uv, "build", "--wheel", "--out-dir", str(wheels), str(project))
     (wheel,) = wheels.glob("*.whl")
-    image = image_python()
-    runtime_wheel = next((image.parent.parent.parent / "wheels").glob("cozy_runtime-*.whl"))
+    runtime_wheel = next((image_python().parents[2] / "wheels").glob("cozy_runtime-*.whl"))
     runtime_copy = wheels / runtime_wheel.name
     shutil.copyfile(runtime_wheel, runtime_copy)
-    with zipfile.ZipFile(runtime_copy) as archive:
-        metadata = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
-        parsed = email.parser.BytesParser().parsebytes(archive.read(metadata))
-    dependencies = [Requirement(raw) for raw in parsed.get_all("Requires-Dist", [])]
-    requirements = root / (label + "-requirements.in")
-    requirements.write_text(
-        f"cozy-runtime=={runtime}\n"
-        if runtime
-        else "\n".join(
-            str(row)
-            for row in dependencies
-            if row.marker is None or row.marker.evaluate({"extra": ""})
-        )
-        + "\n"
-    )
-    locked = root / (label + "-requirements.txt")
-    _run(
-        uv,
-        "pip",
-        "compile",
-        "--python",
-        str(image),
-        "--generate-hashes",
-        "--no-header",
-        "--no-annotate",
-        "--output-file",
-        str(locked),
-        str(requirements),
-    )
     return environment, pb.PrepareLocalPackageRequest(
         operation_id=label,
         package=_development("local/" + name, "1.0.0"),
         files=_wheel_rows([wheel] if runtime else [wheel, runtime_copy]),
-        dependency_requirements=locked.read_bytes(),
+        dependency_requirements=runtime_lock(runtime),
         install_root=str(environment),
     )
 
 
-def measure(worker: Worker, request: pb.PrepareLocalPackageRequest) -> None:
-    worker.prepare_local_package(request)
+@functools.cache
+def runtime_lock(runtime: str = "") -> bytes:
+    """A hashed lock of this checkout's Runtime dependencies, or of released `runtime`: the
+    same for every package that names it, so it is compiled once per session."""
+    image = image_python()
+    runtime_wheel = next((image.parents[2] / "wheels").glob("cozy_runtime-*.whl"))
+    with zipfile.ZipFile(runtime_wheel) as archive:
+        metadata = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        parsed = email.parser.BytesParser().parsebytes(archive.read(metadata))
+    dependencies = [Requirement(raw) for raw in parsed.get_all("Requires-Dist", [])]
+    uv = shutil.which("uv")
+    assert uv is not None
+    with tempfile.TemporaryDirectory(prefix="cozy-runtime-lock.") as raw:
+        requirements = Path(raw) / "requirements.in"
+        requirements.write_text(
+            f"cozy-runtime=={runtime}\n"
+            if runtime
+            else "\n".join(
+                str(row)
+                for row in dependencies
+                if row.marker is None or row.marker.evaluate({"extra": ""})
+            )
+            + "\n"
+        )
+        locked = Path(raw) / "requirements.txt"
+        _run(
+            uv,
+            "pip",
+            "compile",
+            "--python",
+            str(image),
+            "--generate-hashes",
+            "--no-header",
+            "--no-annotate",
+            "--output-file",
+            str(locked),
+            str(requirements),
+        )
+        return locked.read_bytes()
 
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
@@ -163,8 +171,7 @@ def test_job_only_worker_preparation_preserves_running_job_and_exact_readiness()
             ),
             owner.host,
         )
-        measure(worker, other)
-        measure(worker, first)
+        worker.prepare_local_package(other)
         worker.prepare_local_package(first)
         # These fixture preparations precede control-service startup. Retire an
         # older Runtime's idle describe process before run's orphan sweep; the

@@ -318,7 +318,7 @@ def modeled(tmp_path_factory: pytest.TempPathFactory) -> ModeledRelease:
     python = environment / "bin" / "python"
     _run(
         "uv", "pip", "install", "--python", str(python),
-        "--index", "https://download.pytorch.org/whl/cpu", "torch==2.13.0",
+        "--index", "https://download.pytorch.org/whl/cpu", "torch==2.14.0",
     )  # fmt: skip
     runtime = next(image.parent.parent.parent.glob("wheels/cozy_runtime-*.whl"))
     _run("uv", "pip", "install", "--python", str(python), str(runtime), str(project))

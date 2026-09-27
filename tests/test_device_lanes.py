@@ -296,8 +296,12 @@ def test_ceilings_are_measured_and_never_double_booked() -> None:
         text=True,
         check=True,
     ).stdout.strip()
+    after = accel.device_memory("0", kind)
     free_mib, total_mib = (int(part) for part in projected.split(","))
-    assert abs(real.free_bytes - free_mib * (1 << 20)) < (1 << 20), (real, projected)
+    # Other processes move free memory between reads; nvidia-smi's must lie between NVML's
+    # readings taken either side of it, to its MiB rounding.
+    low, high = sorted((real.free_bytes, after.free_bytes))
+    assert low - (1 << 20) < free_mib * (1 << 20) < high + (1 << 20), (real, after, projected)
     assert real.total_bytes == total_mib * (1 << 20), (real, projected)
 
     # THE PROCESS CEILING: the lane's measured capacity less what its co-tenants hold, so a

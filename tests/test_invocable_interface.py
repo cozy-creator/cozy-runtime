@@ -13,6 +13,7 @@ from typing import Any, cast
 import msgspec
 import pytest
 
+from conftest import mypy_cache
 from cozy_runtime.author import (
     App,
     CapabilityError,
@@ -169,7 +170,7 @@ else:raise AssertionError('generated proxy executed without its RecordOwner')
         "    return await transform(text='hello',count=3)\n"
     )
     checked = subprocess.run(
-        [sys.executable, "-m", "mypy", "--strict", str(caller)],
+        [sys.executable, "-m", "mypy", "--strict", "--cache-dir", str(mypy_cache()), str(caller)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -181,7 +182,7 @@ else:raise AssertionError('generated proxy executed without its RecordOwner')
         "    return await transform(text='hello',count='wrong')\n"
     )
     refused = subprocess.run(
-        [sys.executable, "-m", "mypy", "--strict", str(caller)],
+        [sys.executable, "-m", "mypy", "--strict", "--cache-dir", str(mypy_cache()), str(caller)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
