@@ -601,3 +601,127 @@ def test_current_source_validation_refusal_reaches_protocol_peer(tmp_path: Path)
         assert outgoing.empty(), "stale owner received a new source callback"
     finally:
         server.stop(0).wait()
+
+
+def _second_carrier(body: bytes) -> bytes:
+    """The fixture decoder: the first carrier's F32[1024] header over different values."""
+    header_length = int.from_bytes(body[:8], "little")
+    return body[: 8 + header_length] + bytes([7]) * (len(body) - 8 - header_length)
+
+
+def test_several_reviewed_profiles_compose_one_model_and_memoize(tmp_path: Path) -> None:
+    from cozy_runtime.internal import source_interfaces
+    from cozy_runtime.internal.worker import workspace_sources
+
+    fixture = Path(__file__).parent / "testdata/native_source"
+    first = (fixture / "first.safetensors").read_bytes()
+    files = {
+        "provider/first.safetensors": first,
+        "provider/second.safetensors": _second_carrier(first),
+    }
+    served: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/api/models/"):
+                data = json.dumps(
+                    [
+                        {
+                            "type": "file",
+                            "path": path,
+                            "size": len(body),
+                            "lfs": {"oid": hashlib.sha256(body).hexdigest(), "size": len(body)},
+                        }
+                        for path, body in files.items()
+                    ]
+                ).encode()
+                self.send_response(200)
+            else:
+                served.append(self.path)
+                body = next(body for path, body in files.items() if self.path.endswith("/" + path))
+                start, end = map(int, self.headers["Range"].removeprefix("bytes=").split("-"))
+                data = body[start : end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    origin = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=origin.serve_forever)
+    thread.start()
+    try:
+        workspace = Workspace(tmp_path / "store")
+        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        calls = SourceCalls(
+            workspace,
+            lambda: "owner",
+            messages.put,
+            lambda _: True,
+            endpoints={"huggingface": f"http://127.0.0.1:{origin.server_port}"},
+            native_registry=(fixture / "registry.json").read_bytes(),
+        )
+
+        def convert(parent: str, arguments: dict[str, object]) -> pb.NativeSourceStatus:
+            source = accepted(workspace, parent, {"carriers": sorted(files)})
+            source.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
+            calls.handle(source)
+            resolution = messages.get(timeout=30).native_source_status
+            assert resolution.state == pb.NATIVE_SOURCE_STATE_RESOLVED, resolution.safe_code
+            source.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
+            source.selection.CopyFrom(resolution.selection)
+            calls.handle(source)
+            downloaded = messages.get(timeout=30).native_source_status
+            assert downloaded.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, downloaded.safe_code
+            command = pb.NativeSourceCommand()
+            command.CopyFrom(source)
+            command.operation = pb.NATIVE_SOURCE_OPERATION_CONVERT
+            command.ClearField("selection")
+            command.parent_call.call_index = 1
+            command.parent_call.export = "convert_cozytensors"
+            args = {"source": canonical_json.decode(downloaded.result_canonical_bytes), **arguments}
+            command.parent_call.request_canonical_bytes = canonical_json.encode(args)
+            command.parent_call.intent_digest = hashlib.sha256(
+                canonical_json.encode(
+                    {
+                        "module": source_interfaces.MODULE,
+                        "export": "convert_cozytensors",
+                        "request": args,
+                    }
+                )
+            ).digest()
+            command.service_id = workspace_sources.identity("owner", parent, 1)
+            calls.handle(command)
+            return messages.get(timeout=30).native_source_status
+
+        profiles = ["fixture/first/1", "fixture/second/1"]
+        both = {"profiles": profiles}
+        composed = convert("compose", both)
+        assert composed.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, composed.safe_code
+        assert not composed.memo_hit
+        store = tensorfs.Store.open(str(workspace.store_root))
+        manifest = canonical_json.decode(composed.result_canonical_bytes)["manifest"]
+        header = tensorfs.parse_header(store.manifest(manifest["digest"])["header"])
+        assert sorted(header["components"]) == ["decoder", "encoder"]
+        assert sorted(served) == sorted(set(served)), "a carrier was downloaded twice"
+        assert {path.rsplit("/", 1)[-1] for path in served} == {
+            "first.safetensors",
+            "second.safetensors",
+        }
+
+        again = convert("compose-again", both)
+        assert again.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, again.safe_code
+        assert again.memo_hit
+        assert canonical_json.decode(again.result_canonical_bytes)["manifest"] == manifest
+
+        single = convert("single", {"profile": "fixture/first/1"})
+        as_tuple = convert("single-as-tuple", {"profiles": ["fixture/first/1"]})
+        assert single.state == as_tuple.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED
+        assert as_tuple.memo_hit, "one profile names one conversion however it is spelled"
+    finally:
+        origin.shutdown()
+        origin.server_close()
+        thread.join()

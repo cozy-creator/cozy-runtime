@@ -18,7 +18,9 @@ from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
-def accepted(workspace: Workspace, parent: str) -> pb.NativeSourceCommand:
+def accepted(
+    workspace: Workspace, parent: str, request: dict[str, object] | None = None
+) -> pb.NativeSourceCommand:
     raw = documents.canonical_bytes(
         pb.InvocationSpec(
             job=pb.JobInvocationSpec(
@@ -45,7 +47,7 @@ def accepted(workspace: Workspace, parent: str) -> pb.NativeSourceCommand:
             invocation_spec_digest=spec,
         ),
     )
-    args = {"repository": "example/model", "revision": "a" * 40}
+    args = {"repository": "example/model", "revision": "a" * 40, **(request or {})}
     intent = canonical_json.encode(
         {
             "module": source_interfaces.MODULE,

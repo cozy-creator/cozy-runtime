@@ -14,7 +14,7 @@ import msgspec
 from cozy_runtime.author._artifacts import ModelArtifact, SourceArtifact
 from cozy_runtime.author._assets import Tree
 from cozy_runtime.author._calls import _current
-from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._errors import CapabilityError, UnsupportedInput
 from cozy_runtime.author._markers import AssetBound
 
 SOURCE_FILES_MAX_BYTES = 64 << 20
@@ -64,12 +64,22 @@ def download_civitai(version: int, *, file: str = "") -> Awaitable[SourceArtifac
     )
 
 
-def convert_cozytensors(source: SourceArtifact, *, profile: str) -> Awaitable[ModelArtifact]:
-    """Convert retained source bytes with one reviewed native TensorFS profile."""
-    return cast(
-        Awaitable[ModelArtifact],
-        _call("convert_cozytensors", {"source": source, "profile": profile}),
-    )
+def convert_cozytensors(
+    source: SourceArtifact, *, profile: str = "", profiles: tuple[str, ...] = ()
+) -> Awaitable[ModelArtifact]:
+    """Convert retained source bytes with one reviewed native TensorFS profile, or with
+    several whose disjoint components compose one model."""
+    if bool(profile) == bool(profiles) or len(set(profiles)) != len(profiles):
+        raise UnsupportedInput(
+            "convert_cozytensors takes one profile or distinct profiles",
+            code="model_source_profiles_invalid",
+        )
+    arguments: dict[str, object] = {"source": source}
+    if profile:
+        arguments["profile"] = profile
+    else:
+        arguments["profiles"] = profiles
+    return cast(Awaitable[ModelArtifact], _call("convert_cozytensors", arguments))
 
 
 async def source_files(source: SourceArtifact) -> Tree:

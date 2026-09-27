@@ -22,7 +22,7 @@ import msgspec
 from cozy_runtime import canonical_json
 from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
 from cozy_runtime.internal import fill, source_interfaces, storage_admission
-from cozy_runtime.internal.worker import source_views, workspace_sources
+from cozy_runtime.internal.worker import source_views, source_worker, workspace_sources
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -458,7 +458,12 @@ class SourceCalls:
                                 "source conversion lacks granted byte-tree custody"
                             )
                     envelope["source_owner"] = access["retention_id"]
-                    effective = {"source": artifact["manifest"], "profile": arguments["profile"]}
+                    profiles = source_worker.profiles_of(arguments)
+                    effective = (
+                        {"source": artifact["manifest"], "profile": profiles[0]}
+                        if len(profiles) == 1
+                        else {"source": artifact["manifest"], "profiles": list(profiles)}
+                    )
                     if self.native_registry is not None:
                         envelope["registry"] = base64.b64encode(self.native_registry).decode()
                         effective["registry"] = hashlib.sha256(self.native_registry).hexdigest()
