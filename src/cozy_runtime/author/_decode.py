@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import math
 import struct
+from array import array
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -1037,8 +1038,12 @@ class MediaDecoder:
         finally:
             asset._check_file()
 
-    def stream_audio(self, asset: AudioAsset) -> DecodedMediaStream:
-        av, budget, path = self._start(asset, AudioAsset, "stream_audio", retained=False)
+    def stream_audio(self, asset: AudioAsset | VideoAsset) -> DecodedMediaStream:
+        """An audio asset, or a video's one soundtrack without decoding a picture."""
+        if isinstance(asset, VideoAsset):
+            av, budget, path = self._start(asset, VideoAsset, "stream_audio", retained=False)
+        else:
+            av, budget, path = self._start(asset, AudioAsset, "stream_audio", retained=False)
         return DecodedMediaStream(
             self._attempt,
             asset,
@@ -1377,7 +1382,10 @@ def _valid_audio_samples(frame: Any, samples: int, rate: int) -> int:
 
 
 def _require_finite_f32(data: bytes) -> None:
-    if any(not math.isfinite(value) for (value,) in struct.iter_unpack("<f", data)):
+    # Summed in double, finite f32 samples cannot overflow; one NaN or infinity cannot vanish.
+    values = array("f")
+    values.frombytes(data)
+    if not math.isfinite(sum(values)):
         raise MediaDecodeError("audio PCM contains NaN or infinity", code="audio_format")
 
 
