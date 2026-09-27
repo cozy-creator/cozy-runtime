@@ -206,9 +206,10 @@ class QwenImage21Model(Model[QwenImage21Graph]):
         """Encode the instruction and ordered reference images as one condition."""
         encoder = self.graph.components["text_encoder"]
         with torch.inference_mode():
-            return self._pipeline().encode_prompt(
+            encoded: tuple[Any, Any, Any] = self._pipeline().encode_prompt(
                 prompt, image=images, device=next(encoder.parameters()).device
             )
+        return encoded
 
     @uses_components("transformer")
     def denoise(

@@ -233,7 +233,8 @@ def read_events(root: Path) -> list[dict[str, Any]]:
             event = json.loads(line)
         except ValueError:
             continue
-        required = _EVENT_FIELDS.get(event.get("event")) if isinstance(event, dict) else None
+        kind = event.get("event") if isinstance(event, dict) else None
+        required = _EVENT_FIELDS.get(kind) if isinstance(kind, str) else None
         if required is not None and required <= set(event):
             events.append(event)
     return events
