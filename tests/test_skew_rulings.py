@@ -32,12 +32,14 @@ from cozy_runtime.protocol import worker_pb2 as pb
 SOURCE = {"source": {"digest": "sha256:" + "a" * 64, "length": 1}}
 
 
-def test_native_memo_key_is_operation_version_and_inputs_only(
+def test_native_memo_key_is_operation_version_output_format_and_inputs_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Pinned: a Runtime or TensorFS release that keeps output meaning keeps this key.
+    # Pinned: a Runtime or TensorFS release that keeps output meaning and format keeps this key.
     key = computation_key("download_huggingface", SOURCE)
-    assert key.hex() == "7699ac855e27dbbddbe0920cbceacadefa3014cdf7369f90fe578fedb9dc0f85"
+    assert key.hex() == "2739c9b1e6771dee3872314aee8548064ad7736c6f0a9aeacfb3ca4fb6da363b"
+    assert computation_key("download_huggingface", SOURCE, "cozytensors/1") == key
+    assert computation_key("download_huggingface", SOURCE, "cozytensors/2") != key
     monkeypatch.setitem(source_interfaces.OPERATION_VERSIONS, "download_huggingface", 2)
     assert computation_key("download_huggingface", SOURCE) != key
 

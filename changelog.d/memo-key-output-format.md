@@ -1,0 +1,1 @@
+The native memo key now includes the CozyTensors format TensorFS writes (`cozytensors/1`, from its typed header), so a TensorFS that writes another format misses instead of replaying an older result. Every native memo key changes once: the first run of each download, conversion or upload after this release is a one-time local miss.
