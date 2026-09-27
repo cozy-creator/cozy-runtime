@@ -367,7 +367,8 @@ own account; the publishing Creator writes that account into the published inter
 mutable Hub binding, which wins over the published default. Selection resolves before
 dispatch; the executor receives exact artifacts. See [authored defaults](docs/authored-model-defaults.md).
 Known-next calls can [prepare their models in the background](docs/model-prefetch.md)
-with `prefetch(callee, models={...})` while another model runs.
+with `prefetch(callee, models={...})` while another model runs, and a request done with its
+GPUs can [release them early](docs/gpu-release.md) with `ctx.release_gpus()`.
 The existing `package.toml [bindings."<callable>.models.<param>"]` remains the explicit local
 development binding; it is not copied into a package's published default. The retired `source_profiles=` decorator field refuses with the typed
 code `source_profiles_retired`. Each `WeightsOutput` declares only its name and new-byte ceiling;

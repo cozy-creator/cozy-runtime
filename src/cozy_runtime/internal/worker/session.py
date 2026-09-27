@@ -1194,6 +1194,7 @@ class Worker:
             owner=lambda: self.fence.record_owner_id,
             local=self._machine_call,
             prefetch=self._machine_prefetch,
+            release_gpus=self._release_gpus,
             installed_bindings=self._installed_call_bindings,
         )
         from .machine_calls import Calls as MachineCalls
@@ -2175,6 +2176,15 @@ class Worker:
             return {"ok": True, "scheduled": False}
         assert self.machine_calls is not None
         return self.machine_calls.serving.prefetch(attempt, frame)
+
+    def _release_gpus(self, attempt: AttemptRecord) -> None:
+        """`ctx.release_gpus()`: the attempt's root ends its GPU lease now (the next drive
+        tick grants the next waiter). A direct attempt holds no lease."""
+        owner = self.fence.record_owner_id
+        if self.executions is None or not self.executions.owns(owner, attempt.request_id):
+            return
+        root, _parent = self.executions.scheduling_root(owner, attempt.request_id)
+        self.gpu.release_root(root)
 
     def _machine_call(
         self, attempt: AttemptRecord, request: pb.ChildCallRequest, action: str
