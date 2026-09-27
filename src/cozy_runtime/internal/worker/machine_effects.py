@@ -19,23 +19,65 @@ from cozy_runtime.internal.worker.machine_publication import (
     PublicationAuthority,
     PublicationClient,
     PublicationRefusal,
+    PublicationUncommitted,
     apply_release,
     attach_assessment,
     prepare_release,
+    reconcile_checkpoint,
     upload_checkpoint,
 )
-from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
-from cozy_runtime.internal.worker.workspace_calls import Call, Calls
+from cozy_runtime.internal.worker.workspace import (
+    Workspace,
+    WorkspaceBusy,
+    WorkspaceInactive,
+    WorkspaceRefusal,
+)
+from cozy_runtime.internal.worker.workspace_calls import Call, CallFenced, Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+# Native codes for IO that may succeed when repeated; others are refusals of this closure.
+_TRANSIENT_NATIVE = frozenset({"STORE_BUSY", "TRANSFER_FAILED", "DEADLINE_EXCEEDED"})
+# An uncommitted effect whose consecutive attempts land nothing new refuses; any landed
+# object resets the count. Backoff doubles per stalled attempt up to its ceiling.
+_STALLED_ATTEMPTS = 10
+_MAX_BACKOFF_SECONDS = 60.0
+# Hub's durable finalization job is progressing on its own: poll it at most 8 s apart.
+_PENDING_POLL_STALLS = 3
+
+
+def _refusal(exc: Exception) -> Exception:
+    """Map native and credential failures to stable codes, never their text.
+
+    Exception text can contain signed URLs, headers or private arguments.
+    """
+    if isinstance(exc, (PublicationRefusal, WorkspaceRefusal, msgspec.ValidationError, ValueError)):
+        return exc
+    native = getattr(exc, "code", "")
+    if native == "STORE_BUSY":
+        return PublicationRefusal("publication.storage_busy", status=503)
+    code = "publication.adapter_failed." + type(exc).__name__
+    if (
+        isinstance(native, str)
+        and 0 < len(native) <= 80
+        and all(c.isascii() and (c.isalnum() or c == "_") for c in native)
+    ):
+        code += "." + native
+    return PublicationRefusal(code[:128], status=503 if native in _TRANSIENT_NATIVE else 409)
+
 
 class Effects:
     def __init__(
-        self, workspace: Workspace, executions: Executions, authority: PublicationAuthority | None
+        self,
+        workspace: Workspace,
+        executions: Executions,
+        authority: PublicationAuthority | None,
+        *,
+        allow_local: bool = False,
     ):
         self.workspace, self.executions, self.authority = workspace, executions, authority
+        self.allow_local = allow_local
         self.journal = Calls(workspace)
         self.lock = threading.Lock()
         self.thread_ids: set[int] = set()
@@ -44,6 +86,8 @@ class Effects:
         )
         self.active: dict[tuple[str, str], Future[None]] = {}
         self.retry_after: dict[tuple[str, str], float] = {}
+        self.landed: dict[tuple[str, str], int] = {}
+        self.stalls: dict[tuple[str, str], int] = {}
         self.cleanup_after: dict[str, tuple[int, str]] = {}
         self.stopped = False
 
@@ -84,7 +128,9 @@ class Effects:
                 if future.done():
                     del self.active[key]
                     if future.exception() is not None:
-                        self.retry_after[key] = time.monotonic() + 1
+                        self.retry_after[key] = time.monotonic() + min(
+                            2.0 ** self.stalls.get(key, 0), _MAX_BACKOFF_SECONDS
+                        )
             if self.stopped:
                 return
         for call in self.journal.pending_effects(owner):
@@ -96,6 +142,12 @@ class Effects:
             if not self.stopped and len(self.active) < 2 and key not in self.active:
                 self.active[key] = self.pool.submit(self._cleanup, owner)
 
+    def _before_stage(self, owner: str, call: Call) -> None:
+        with self.lock:
+            if self.stopped:
+                raise WorkspaceRefusal("publication worker is stopping")
+        self.journal.check_active(owner, call)
+
     def _before_write(self, owner: str, call: Call) -> None:
         with self.lock:
             if self.stopped:
@@ -103,7 +155,11 @@ class Effects:
         self.journal.before_write(owner, call)
 
     def _run(self, owner: str, original: Call) -> None:
+        key = owner, original.child_request
+        with self.lock:
+            landed = self.landed.get(key, 0)
         call = self.journal.get(owner, original.parent_request, original.call_index)
+        operation = ""
         try:
             if call.result or (call.safe_code and not call.sent):
                 return
@@ -118,10 +174,10 @@ class Effects:
             if not grant or self.authority is None:
                 raise PublicationRefusal("publication.authority_absent", status=403)
             intent = canonical_json.decode(call.intent)
+            operation = intent["export"]
             if intent["module"] != effect_interfaces.MODULE:
                 raise PublicationRefusal("publication.interface_changed")
             client = self.authority.client(grant)
-            operation = intent["export"]
             if operation == "publish_release":
                 request = msgspec.convert(
                     intent["request"], type=effect_interfaces.Publish, strict=True
@@ -156,38 +212,56 @@ class Effects:
                 self.journal.complete(owner, call, raw)
             else:
                 self.journal.observe_result(owner, call, raw)
-        except Exception as exc:
-            if not isinstance(
-                exc, (PublicationRefusal, WorkspaceRefusal, msgspec.ValidationError, ValueError)
-            ):
-                # Native failures and credential IO must not silently retry in a
-                # Future. Preserve only stable identifiers, never exception text
-                # that could contain signed URLs, headers or private arguments.
-                native = getattr(exc, "code", "")
-                if native == "STORE_BUSY":
-                    exc = PublicationRefusal("publication.storage_busy", status=503)
-                else:
-                    code = "publication.adapter_failed." + type(exc).__name__
-                    if (
-                        isinstance(native, str)
-                        and 0 < len(native) <= 80
-                        and all(c.isascii() and (c.isalnum() or c == "_") for c in native)
-                    ):
-                        code += "." + native
-                    exc = PublicationRefusal(code[:128])
+            self._settled(key)
+        except Exception as caught:
+            exc = _refusal(caught)
+            pending = isinstance(exc, PublicationRefusal) and (
+                exc.code == "publication.finalization_pending"
+            )
+            with self.lock:
+                stopping = self.stopped
+                stalls = 0 if self.landed.get(key, 0) > landed else self.stalls.get(key, 0) + 1
+                self.stalls[key] = min(stalls, _PENDING_POLL_STALLS) if pending else stalls
+            if stopping or isinstance(caught, (CallFenced, WorkspaceInactive, WorkspaceBusy)):
+                # This attempt may not act now. The parent's next generation, its
+                # cancellation or the next worker decides; none of those is a refusal.
+                raise
             latest = self.journal.get(owner, call.parent_request, call.call_index)
             transient = isinstance(exc, PublicationRefusal) and (
                 exc.status in {408, 425, 429} or exc.status >= 500
             )
-            if not latest.sent and not transient:
+            if not latest.sent and (not transient or stalls >= _STALLED_ATTEMPTS):
+                # Nothing committed, so no remote readback is owed: settle and release.
                 code = (
                     exc.code
                     if isinstance(exc, PublicationRefusal)
                     else "publication.intent_refused"
                 )
-                self.journal.refuse(owner, latest, code, "publication was refused before any write")
+                self.journal.refuse(
+                    owner,
+                    latest,
+                    code,
+                    "publication stopped making progress before its commit"
+                    if transient
+                    else "publication was refused before its commit",
+                )
+                self._settled(key)
                 return
-            if latest.sent and isinstance(exc, PublicationRefusal) and not transient:
+            if latest.sent and isinstance(exc, PublicationUncommitted):
+                # Hub durably reports the commit did not land: settle like a refusal.
+                self.journal.uncommitted(owner, latest, exc.code, "publication commit did not land")
+                self._settled(key)
+                return
+            if (
+                latest.sent
+                and isinstance(exc, PublicationRefusal)
+                and not transient
+                and (
+                    operation != "upload_checkpoint" or exc.code == "publication.checkpoint_changed"
+                )
+            ):
+                # A sent upload stays pending until Hub's finalization status decides it;
+                # only a durable answer contradicting the frozen closure is surfaced.
                 self.journal.unresolved(owner, latest, exc.code)
             # An interrupted/revoked authority does not establish whether a prior
             # send committed. Keep the obligation and exact baseline for readback.
@@ -208,6 +282,11 @@ class Effects:
                 },
             )
             raise
+
+    def _settled(self, key: tuple[str, str]) -> None:
+        with self.lock:
+            self.landed.pop(key, None)
+            self.stalls.pop(key, None)
 
     def _upload(
         self, owner: str, call: Call, request: effect_interfaces.Upload, client: PublicationClient
@@ -231,34 +310,54 @@ class Effects:
         manifest = pb.Ref(
             digest=documents.raw(artifact.manifest.digest), length=artifact.manifest.length
         )
-        with self.workspace.held_model(owner, source, manifest):
-            store = fill.store(self.workspace.store_root)
-            objects = {artifact.manifest.digest: artifact.manifest.length}
-            for row in store.walk_cozytensors(artifact.manifest.digest):
-                key, length = str(row["id"]), int(row["length"])
-                if key in objects and objects[key] != length:
-                    raise WorkspaceRefusal("publication closure changed its object length")
-                objects[key] = length
-            # The native manifest fixes this inventory; no second file/catalog
-            # journal or multi-megabyte inventory copy lives in execution_calls.
-            checkpoint = CheckpointRef(
-                request.destination,
-                artifact.manifest.digest,
-                artifact.manifest,
-                call.child_request,
-                "",
+        slot = owner, call.child_request
+        # The retention above keeps the closure; the native manifest fixes this inventory,
+        # so no second file/catalog journal or inventory copy lives in execution_calls.
+        store = fill.store(self.workspace.store_root)
+        objects = {artifact.manifest.digest: artifact.manifest.length}
+        for row in store.walk_cozytensors(artifact.manifest.digest):
+            key, length = str(row["id"]), int(row["length"])
+            if key in objects and objects[key] != length:
+                raise WorkspaceRefusal("publication closure changed its object length")
+            objects[key] = length
+        checkpoint = CheckpointRef(
+            request.destination, artifact.manifest.digest, artifact.manifest, call.child_request, ""
+        )
+        if call.sent:
+            # A sent finalize is decided by Hub's durable job, without re-staging bytes.
+            settled = reconcile_checkpoint(
+                client, operation=call.child_request, checkpoint=checkpoint, objects=objects
             )
+            if settled is not None:
+                return settled
+            # The finalize never reached Hub. A live parent stages and sends it again;
+            # a canceled one never will, so nothing can land.
+            if self.journal.canceled(owner, call):
+                raise PublicationUncommitted("publication.finalize_absent")
+        with self.workspace.held_model(owner, source, manifest):
 
             def push(key: str, length: int, grant: str) -> None:
-                store.checkpoint_push(key, length, key == artifact.manifest.digest, grant)
+                store.checkpoint_push(
+                    key,
+                    length,
+                    key == artifact.manifest.digest,
+                    grant,
+                    allow_local=self.allow_local,
+                )
+
+            def landed(count: int) -> None:
+                with self.lock:
+                    self.landed[slot] = max(self.landed.get(slot, 0), count)
 
             return upload_checkpoint(
                 client,
                 operation=call.child_request,
                 checkpoint=checkpoint,
                 objects=objects,
+                before_stage=lambda: self._before_stage(owner, call),
                 before_write=lambda: self._before_write(owner, call),
                 push=push,
+                landed=landed,
             )
 
     def _cleanup(self, owner: str) -> None:

@@ -43,6 +43,10 @@ class Call:
     safe_detail: str
 
 
+class CallFenced(WorkspaceRefusal):
+    """This call may not act now; a later parent generation or its settlement decides."""
+
+
 class Calls:
     def __init__(self, workspace: Workspace):
         self.workspace = workspace
@@ -83,7 +87,7 @@ class Calls:
             or row["fenced"]
             or (generation is not None and row["generation"] != generation)
         ):
-            raise WorkspaceRefusal("call parent is no longer the admitted running generation")
+            raise CallFenced("call parent is no longer the admitted running generation")
         stopped = db.execute(
             "WITH RECURSIVE ancestors(request) AS (VALUES(?) UNION "
             "SELECT c.parent_request FROM execution_calls c JOIN ancestors a "
@@ -93,7 +97,7 @@ class Calls:
             (parent, owner, owner),
         ).fetchone()
         if stopped:
-            raise WorkspaceRefusal("call ancestor is no longer an admitted running generation")
+            raise CallFenced("call ancestor is no longer an admitted running generation")
         return cast(Row, row)
 
     @staticmethod
@@ -113,6 +117,21 @@ class Calls:
             ).fetchone()
             is not None
         )
+
+    def canceled(self, owner: str, call: Call) -> bool:
+        """Whether the call's parent or an ancestor is canceled, so it will never act again."""
+        with self.workspace.locked() as db:
+            return (
+                db.execute(
+                    "WITH RECURSIVE ancestors(request) AS (VALUES(?) UNION "
+                    "SELECT c.parent_request FROM execution_calls c JOIN ancestors a "
+                    "ON c.child_request=a.request WHERE c.owner=?) "
+                    "SELECT 1 FROM executions e JOIN ancestors a ON e.request=a.request "
+                    "WHERE e.owner=? AND e.desired='cancel' LIMIT 1",
+                    (call.parent_request, owner, owner),
+                ).fetchone()
+                is not None
+            )
 
     def has_unsettled_effects(self, owner: str, root_request: str) -> bool:
         with self.workspace.locked() as db:
@@ -197,7 +216,7 @@ class Calls:
                 db, owner, call.parent_request, call.parent_ordinal, call.parent_generation
             )
             if row["intent_digest"] != call.intent_digest or row["result"] or row["safe_code"]:
-                raise WorkspaceRefusal("call cannot act after settlement")
+                raise CallFenced("call cannot act after settlement")
 
     def refuse(self, owner: str, call: Call, code: str, detail: str) -> None:
         """Settle admission failure only before a child or external write is accepted."""
@@ -261,6 +280,20 @@ class Calls:
                 ),
             )
 
+    def uncommitted(self, owner: str, call: Call, code: str, detail: str) -> None:
+        """Settle a sent effect whose authority durably answered that its commit did not land."""
+        if not 0 < len(code.encode()) <= 128 or len(detail.encode()) > 1024:
+            raise WorkspaceRefusal("effect failure exceeds its bound")
+        with self.workspace.locked() as db, transaction(db):
+            row = self._row(db, owner, call.parent_request, call.call_index)
+            if row["intent_digest"] != call.intent_digest or not row["sent"] or row["result"]:
+                raise WorkspaceRefusal("effect has no unresolved send")
+            db.execute(
+                "UPDATE execution_calls SET sent=0,safe_code=?,safe_detail=? "
+                "WHERE owner=? AND parent_request=? AND call_index=?",
+                (code, detail, owner, call.parent_request, call.call_index),
+            )
+
     def freeze(self, owner: str, call: Call, prepared: bytes) -> Call:
         """Bind read-dependent metadata before a write, once for this exact call.
 
@@ -318,14 +351,18 @@ class Calls:
             )
 
     def before_write(self, owner: str, call: Call) -> None:
-        """Record possible remote mutation before IO, under the current parent fence."""
+        """Record that the effect's commit may be sent, before IO, under the parent fence.
+
+        Idempotent staging an effect can always redo (a checkpoint's object pushes) uses
+        ``check_active`` instead: only a possible commit makes a row ``sent``.
+        """
         with self.workspace.locked() as db, transaction(db):
             row = self._row(db, owner, call.parent_request, call.call_index)
             self._parent(
                 db, owner, call.parent_request, call.parent_ordinal, call.parent_generation
             )
             if row["intent_digest"] != call.intent_digest or row["result"] or row["safe_code"]:
-                raise WorkspaceRefusal("call cannot issue another write after settlement")
+                raise CallFenced("call cannot issue another write after settlement")
             db.execute(
                 "UPDATE execution_calls SET sent=1 "
                 "WHERE owner=? AND parent_request=? AND call_index=?",

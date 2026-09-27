@@ -26,8 +26,9 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def produced(
-    tmp_path: Path, *, request_id: str = "producer", result_schema: bytes = b""
+    tmp_path: Path, *, request_id: str = "producer", result_schema: bytes = b"", parts: int = 1
 ) -> tuple[tensorfs.Store, Workspace, WeightsReceipt]:
+    """One committed native model; ``parts`` distinct 2 KiB tensors give as many objects."""
     store = tensorfs.Store.ensure(tmp_path / "store")
     workspace = Workspace(Path(store.root))
     value = json.loads(
@@ -97,23 +98,29 @@ def produced(
         )
 
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
+    names = ["weight"] if parts == 1 else [f"weight{index:05d}" for index in range(parts)]
     definition = Derivation(
         {},
         {
             "model": Target(
-                add={"weight": Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})}
+                add={
+                    name: Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})
+                    for name in names
+                }
             )
         },
         {},
-        (("model", "weight"),),
+        tuple(("model", name) for name in names),
     )
     fingerprint = "sha256:" + "42" * 32
     transaction = weights_transaction_id("owner", request_id, documents.spell(spec), "model")
-    args = definition.native_arguments(2048)
+    args = definition.native_arguments(2048 * parts)
     declaration = store.derived_declaration(*args, work_fingerprint=fingerprint)
     epoch = bind("model", transaction, hashlib.sha256(declaration).digest(), declaration)
     writer = store.begin_derived(transaction, epoch, *args, work_fingerprint=fingerprint)
-    writer.add_part("model", "weight", "value", io.BytesIO(b"\x31" * 2048))
+    for index, name in enumerate(names):
+        value = b"\x31" * 2048 if parts == 1 else index.to_bytes(4, "little") * 512
+        writer.add_part("model", name, "value", io.BytesIO(value))
     facts = writer.commit()
     receipt = receipt_from_native(
         "model", transaction, facts, replayed=False, request_id=request_id
