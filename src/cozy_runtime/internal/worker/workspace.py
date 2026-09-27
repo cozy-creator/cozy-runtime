@@ -205,7 +205,7 @@ def _handle(directory: Path) -> _Handle:
 
 def _migrate(db: Journal) -> None:
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version == 13:
+    if version == 14:
         return
     if version == 0:
         db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=3;COMMIT;")
@@ -218,7 +218,7 @@ def _migrate(db: Journal) -> None:
         db.executescript(
             "BEGIN IMMEDIATE;" + process_column + _MIGRATION_3 + "PRAGMA user_version=3; COMMIT;"
         )
-    elif version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+    elif version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
         raise WorkspaceRefusal("workspace journal schema is not supported")
     if version <= 3:
         from .workspace_sources import SCHEMA4
@@ -261,6 +261,12 @@ def _migrate(db: Journal) -> None:
         db.executescript(
             "BEGIN IMMEDIATE;ALTER TABLE executions ADD COLUMN source_providers TEXT "
             "NOT NULL DEFAULT '';PRAGMA user_version=13; COMMIT;"
+        )
+    if version <= 13:
+        # The record owner answers this execution's memo lookups (MachineExecutionSubmit).
+        db.executescript(
+            "BEGIN IMMEDIATE;ALTER TABLE executions ADD COLUMN owner_memo INTEGER "
+            "NOT NULL DEFAULT 0 CHECK(owner_memo IN (0,1));PRAGMA user_version=14; COMMIT;"
         )
 
 

@@ -256,11 +256,11 @@ class Executions:
 
     def _event(
         self, db: Journal, row: Row, kind: str, body: bytes, at_ms: int | None = None
-    ) -> None:
+    ) -> int:
         if len(body) > MAX_EVENT_BYTES:
             raise WorkspaceRefusal("execution event exceeds its metadata bound")
         canonical_json.decode(body)
-        sequence = row["sequence"] + 1
+        sequence = int(row["sequence"]) + 1
         db.execute(
             "UPDATE executions SET sequence=? WHERE owner=? AND request=?",
             (sequence, row["owner"], row["request"]),
@@ -289,6 +289,7 @@ class Executions:
                     "WHERE owner=? AND request=?",
                     (through, row["owner"], row["request"]),
                 )
+        return sequence
 
     def submit(
         self,
@@ -307,6 +308,7 @@ class Executions:
         preparation: bytes = b"",
         worker_id: str = "",
         publication_authorization_id: str = "",
+        owner_memo: bool = False,
     ) -> Receipt:
         """Atomically accept a verified capture/root and its first existing attempt."""
         self.require_workspace(expected_execution_workspace_id)
@@ -386,8 +388,8 @@ class Executions:
                 "INSERT INTO executions(owner,request,submission,capture,offer,accepted_ms,"
                 "ordinal,generation,state,max_attempts,retry_delay_ms,"
                 "capture_document,preparation,worker_id,accepted_boot,"
-                "publication_authorization_id) "
-                "VALUES(?,?,?,?,?,?,1,1,'queued',?,?,?,?,?,?,?)",
+                "publication_authorization_id,owner_memo) "
+                "VALUES(?,?,?,?,?,?,1,1,'queued',?,?,?,?,?,?,?,?)",
                 (
                     owner,
                     offer.request_id,
@@ -402,6 +404,7 @@ class Executions:
                     worker_id,
                     worker_boot,
                     publication_authorization_id,
+                    owner_memo,
                 ),
             )
             row = self._row(db, owner, offer.request_id)
@@ -876,11 +879,15 @@ class Executions:
 
         self.workspace.defer(write)
 
-    def notice(self, owner: str, request: str, kind: str, document: dict[str, Any]) -> None:
+    def notice(self, owner: str, request: str, kind: str, document: dict[str, Any]) -> int:
         """A durable effect fact on the execution in any state: its owner acts on it."""
         raw = canonical_json.encode(document)
         with self.workspace.locked() as db, transaction(db):
-            self._event(db, self._row(db, owner, request), kind, raw)
+            return self._event(db, self._row(db, owner, request), kind, raw)
+
+    def owner_memo(self, owner: str, request: str) -> bool:
+        with self.workspace.locked() as db:
+            return bool(self._row(db, owner, request)["owner_memo"])
 
     def wait_events(
         self, owner: str, request: str, after: int, limit: int, gone: Callable[[], bool]
