@@ -122,12 +122,15 @@ def test_work_identity_ignores_attempt_authority_but_binds_numerical_inputs() ->
         scratch="/new/path",
     )
     assert work(replacement) == expected
-    # A known callee, not its installing SDK or caller package, owns native work.
+    # A known callee, not its installing SDK or caller package, owns native work; without
+    # one the job descriptor does. An installation id never does (a reinstall resumes).
     for field in ("installation_id", "job_descriptor_id"):
         changed = deepcopy(spec)
         changed["job"][field] = "changed-sdk-or-caller"
         assert work(changed) == expected
-        assert work(changed, identity="") != work(spec, identity="")
+        assert (work(changed, identity="") != work(spec, identity="")) == (
+            field == "job_descriptor_id"
+        )
     changed = deepcopy(spec)
     changed["payload_digest"] = "sha256:" + "33" * 32
     assert work(changed) != expected
@@ -136,4 +139,46 @@ def test_work_identity_ignores_attempt_authority_but_binds_numerical_inputs() ->
     assert work(changed) != expected
     assert work(spec, identity="sha256:" + "43" * 32) != expected
     assert work(spec, fingerprint(replace(device, gpu_sm=89), threads=4, inherited={})) != expected
+    updated = replace(device, driver_version="590.4")
+    assert work(spec, fingerprint(updated, threads=4, inherited={})) == expected
     assert work(spec, fingerprint(device, threads=1, inherited={})) != expected
+
+
+def _partial_then_resume(tmp_path: Path, first: HostFacts, second: HostFacts) -> dict[str, Any]:
+    """Interrupt real native work under one device's policy, resume it under another."""
+    store = tensorfs.Store.init(tmp_path / "store")
+    plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
+    request = Derivation(
+        {},
+        {
+            "model": Target(
+                add={"weight": Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})}
+            )
+        },
+        {},
+        (("model", "weight"),),
+    )
+    for epoch, device in ((1, first), (2, second)):
+        with NativeExecution(store, tmp_path, "resume", {}, {"result": 2048}, epoch=epoch) as host:
+            host.attempt.weights_work_fingerprint = work_fingerprint(
+                host.attempt.spec,
+                fingerprint(device, threads=4, inherited={}),
+                operation_identity="sha256:" + "42" * 32,
+            )
+            writer = host.client.open_output("result", request)
+            writer.add_part("model", "weight", "value", b"\x31" * 2048)
+            if epoch == 2:
+                return dict(writer.commit())
+    raise AssertionError("unreachable")
+
+
+def test_interrupted_work_resumes_after_a_host_driver_update(tmp_path: Path) -> None:
+    before = HostFacts(gpu_name="H200", gpu_sm=90, driver_version="580.1", backend="cuda")
+    facts = _partial_then_resume(tmp_path, before, replace(before, driver_version="590.4"))
+    assert facts["transaction_id"]
+
+
+def test_interrupted_work_does_not_resume_on_another_architecture(tmp_path: Path) -> None:
+    before = HostFacts(gpu_name="H200", gpu_sm=90, driver_version="580.1", backend="cuda")
+    with pytest.raises(CapabilityError):
+        _partial_then_resume(tmp_path, before, replace(before, gpu_sm=100))

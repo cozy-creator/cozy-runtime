@@ -41,14 +41,17 @@ def fingerprint(
     threads: int,
     inherited: Mapping[str, str],
 ) -> bytes:
-    """Bind device behavior and numerical policy; callee declarations bind libraries."""
-    if device.backend == "cuda" and (device.gpu_sm <= 0 or not device.driver_version):
+    """Bind device architecture and numerical policy; callee declarations bind libraries.
+
+    The host driver is not a numerical fact: kernels come from the environment's own
+    libraries, so a provider's driver update must not orphan interrupted derived work.
+    """
+    if device.backend == "cuda" and device.gpu_sm <= 0:
         raise NumericalEnvironmentRefusal("numerical device identity is unavailable")
     facts = {
         "device": {
             "backend": device.backend or "cpu",
             "architecture": device.gpu_sm,
-            "driver": device.driver_version,
         },
         "settings": {
             "threads": threads,
@@ -58,5 +61,5 @@ def fingerprint(
         },
     }
     return hashlib.sha256(
-        b"cozy.runtime.numerical-environment/3\0" + canonical_json.encode(facts)
+        b"cozy.runtime.numerical-environment/4\0" + canonical_json.encode(facts)
     ).digest()
