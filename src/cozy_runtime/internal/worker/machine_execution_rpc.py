@@ -99,6 +99,7 @@ class MachineExecutionRPC:
             worker_id=self.worker.options.worker_id,
             worker_boot_id=self.worker.fence.worker_boot_id,
             execution_workspace_id=self.worker.executions.workspace_id,
+            gpu=self.worker.gpu_status(state.request_id),
         )
 
     def SubmitMachineExecution(self, request: pb.MachineExecutionSubmit, context: Any) -> Any:

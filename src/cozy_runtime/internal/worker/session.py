@@ -414,6 +414,10 @@ class Placement:
     installed: package_installation.InstalledEnvironment | None = None
 
 
+#: Attempt states between device entry and device release.
+ON_DEVICE = frozenset({"entering", "accepted", "running", "reclaiming", "finalizing"})
+
+
 @dataclass(slots=True)
 class HostedPlacement:
     """One additional placement and the process that imports only its package.
@@ -1185,6 +1189,7 @@ class Worker:
         self.gpu = GpuScheduler(len(self.lanes.entries))
         self._gpu_shapes: dict[str, machine_lanes.Shape] = {}
         self._dead_replicas: dict[str, child.Executor] = {}
+        self._activating: dict[str, threading.Thread] = {}
         from .machine_sources import Sources as MachineSources
 
         self.machine_sources = MachineSources(self)
@@ -2341,7 +2346,6 @@ class Worker:
                         pb.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
                     )
                     continue
-                self._revive(offered.placement_id)
                 # Validation precedes waiting for capacity, so malformed work does not
                 # occupy a durable queue forever. The engine still authors its refusal.
                 try:
@@ -2396,9 +2400,9 @@ class Worker:
             key = f"{request}#{state.attempt_ordinal}"
             held = self.engine.history.get((request, state.attempt_ordinal))
             if held is not None:
-                phase = self.gpu.phase(key)
-                if held.state in self.engine.PRE_RELEASE and phase["phase"] == "granted":
-                    demands.append(Demand(key, self._gpu_shapes[request].root, phase["width"]))
+                granted = self.gpu.granted(key)
+                if held.state in self.engine.PRE_RELEASE and granted is not None:
+                    demands.append(Demand(key, self._gpu_shapes[request].root, len(granted)))
                 continue
             if state.state != "queued" or not self.executions.assigned_here(
                 owner, request, state.attempt_ordinal, self.fence.worker_boot_id
@@ -2441,6 +2445,15 @@ class Worker:
             if event == "gpu.wait":
                 self._gpu_waiting(owner, body)
         return grants
+
+    def gpu_status(self, request: str) -> pb.MachineExecutionGpu:
+        """What the GPU scheduler holds for this execution and, for a root, its calls."""
+
+        def on_device(key: str) -> bool:
+            held = self.engine.live.get(key.rpartition("#")[0])
+            return held is not None and held.state in ON_DEVICE
+
+        return pb.MachineExecutionGpu(**self.gpu.status(request, on_device))
 
     def _warm(self, template: tuple[str, str]) -> tuple[int, ...]:
         """Ordinals where a replica of this template is resident, so a grant reuses it."""
@@ -2580,61 +2593,108 @@ class Worker:
             )
             machine_capture.restore(self, preparation)
             return machine_slots.ensure(self, request_id, desired.job, binding)
-        managed_placement = request_id and desired.WhichOneof("mode") == "placement_set"
-        if managed_placement:
-            combined = machine_lanes.compose(self, desired)
-            if combined is None:
-                return False
-            desired = combined
+        if request_id and desired.WhichOneof("mode") == "placement_set":
+            return self._bind_replica(preparation, desired)
         desired.revision = self.accepted.accepted_desired_state_revision
-        same = desired_state_body(desired) == self.accepted.desired_state_body
-        if same:
-            if desired.WhichOneof("mode") == "placement_set":
-                candidates = [self.placement, self.pending]
-                candidates.extend(hosted.placement for hosted in self.hosted.values())
-                for placement in candidates:
-                    if (
-                        placement is not None
-                        and placement.placement_set_digest
-                        == desired.placement_set.placement_set_digest
-                        and placement.materialization == pb.MATERIALIZATION_STATE_FAILED
-                    ):
-                        fault = next(
-                            (
-                                f
-                                for f in reversed(self.engine.faults)
-                                if f.subject == placement.placement_id
-                            ),
-                            None,
-                        )
-                        detail = (
-                            f"{fault.reason}: {fault.detail}" if fault else placement.placement_id
-                        )
-                        raise WorkspaceRefusal(f"model preparation failed: {detail}")
+        if desired_state_body(desired) == self.accepted.desired_state_body:
             return True
-        if managed_placement and self.accepted.mode == "serving":
-            if self.accepted.converged_revision < self.accepted.accepted_desired_state_revision:
-                # Finish the retained topology transition before adding another replica.
-                return False
-        elif any(
+        if any(
             (attempt.state in self.engine.PRE_RELEASE or attempt.state in self.engine.HELD)
             and not (
-                (
-                    desired.WhichOneof("mode") == "placement_set"
-                    or (desired.WhichOneof("mode") == "job" and not desired.job.orchestration)
-                )
+                desired.WhichOneof("mode") == "job"
+                and not desired.job.orchestration
                 and attempt.lane_id.startswith("cpu-")
                 and attempt.state != "queued"
             )
             for attempt in self.engine.history.values()
         ):
-            # on_offer journals the queue before a lane begins accepting it. That queue
-            # already owns its preparation and admission epoch, just like a running job.
+            # A device job replaces the whole worker: it waits for every held attempt.
             return False
         machine_capture.restore(self, preparation)
         desired.revision = self.accepted.accepted_desired_state_revision + 1
         self._apply_desired_state(desired)
         return self.dispatchable()
+
+    def _bind_replica(self, preparation: dict[str, Any], desired: pb.DesiredWorkerState) -> bool:
+        """Activate this machine replica on its grant, beside every other placement.
+
+        No desired-state revision is written, so replicas on other GPUs activate at once
+        and a failed one refuses only its own demand (the next demand starts it afresh).
+        Replicas on the granted devices leave first; while one holds an attempt this waits.
+        """
+        (row,) = read_placement_set(desired.placement_set)
+        pins = desired.placement_set.device_pins
+        pin = tuple(pins[0].device_ordinals) if pins else None
+        placement_id = str(row["placement_id"])
+        hosted = self.hosted.get(placement_id)
+        if hosted is not None:
+            busy = self._activating.get(placement_id)
+            if self._placement_dispatchable(placement_id) or (busy and busy.is_alive()):
+                return self._placement_dispatchable(placement_id)
+            placement = hosted.placement
+            if (
+                hosted.latched
+                or placement.serving == pb.ServingState.SERVING_STATE_OFFLINE
+                or placement.materialization
+                in (pb.MATERIALIZATION_STATE_FAILED, pb.MATERIALIZATION_STATE_ABSENT)
+            ):
+                # This demand is refused; the replica leaves in the background so the next
+                # demand activates it afresh instead of inheriting the failure.
+                self._lifecycle(placement_id, self._retire_one, placement_id)
+                fault = next(
+                    (f for f in reversed(self.engine.faults) if f.subject == placement_id), None
+                )
+                detail = f"{fault.reason}: {fault.detail}" if fault else hosted.latched
+                raise WorkspaceRefusal(f"model preparation failed: {detail or placement_id}")
+            self._revive(placement_id)
+            return False
+        overlap = [
+            other
+            for other, held in self.hosted.items()
+            if other.startswith(machine_lanes.REPLICA)
+            and set(held.placement.device_pin or ()) & set(pin or ())
+        ]
+        if any(
+            attempt.placement_id in overlap
+            and attempt.state in (*self.engine.PRE_RELEASE, *self.engine.HELD)
+            for attempt in self.engine.history.values()
+        ):
+            return False
+        machine_capture.restore(self, preparation)
+        placement = self._placement_from_entry(row, desired.placement_set.placement_set_digest)
+        placement.device_pin = pin
+        hosted = HostedPlacement(placement, self._new_placement_supervision(placement_id))
+        self.hosted[placement_id] = hosted
+        job = self.accepted.mode == "job"
+        if job:
+            # A device job's slot leaves with it; CPU job slots keep serving beside replicas.
+            self.lanes.envelope.forget("")
+            self.job_slots.pop("envelope", None)
+        self.accepted.mode = "serving"
+        self._lifecycle(placement_id, self._activate_replica, hosted, overlap, job)
+        return False
+
+    def _lifecycle(self, placement_id: str, body: Callable[..., Any], *args: Any) -> None:
+        """One replica's activation or retirement, off the drive tick."""
+        self._activating = {k: v for k, v in self._activating.items() if v.is_alive()}
+        name = f"replica-{placement_id}"
+        thread = threading.Thread(target=self._lane(name, body, *args), name=name, daemon=True)
+        self._activating[placement_id] = thread
+        thread.start()
+
+    def _activate_replica(self, hosted: HostedPlacement, overlap: list[str], job: bool) -> None:
+        """Free the granted devices, then acquire, bind and start this replica's executor."""
+        try:
+            current = self.supervision.current
+            if job and current is not None:
+                self.supervision.retire_current(current, "a machine replica takes the devices")
+            for placement_id in overlap:
+                if not self._retire_one(placement_id):
+                    raise ExecutorGone(f"{placement_id} could not be reclaimed")
+            self._activate_hosted(hosted, None)
+        except Exception as exc:
+            hosted.latched = f"replica_activation_failed: {type(exc).__name__}: {exc}"[:200]
+            self._settle()
 
     def collect_execution(
         self, claim: pb.Claim, request_id: str, ordinal: int | None = None
@@ -4718,50 +4778,57 @@ class Worker:
 
     def _retire_hosted(self, keep: set[str], revision: int | None = None) -> bool:
         """Remove only placements absent from the complete desired set."""
+        return all(
+            self._retire_one(placement_id, revision)
+            for placement_id in sorted(set(self.hosted) - keep)
+        )
 
-        for placement_id in sorted(set(self.hosted) - keep):
-            if revision is not None and revision != self.accepted.accepted_desired_state_revision:
-                return False
-            hosted = self.hosted[placement_id]
-            self._hosted_set_serving(
-                placement_id,
-                pb.ServingState.SERVING_STATE_DRAINING,
-                f"placement {placement_id!r} removed from desired state",
+    def _retire_one(self, placement_id: str, revision: int | None = None) -> bool:
+        """Drain one hosted placement, reclaim its executor and free its lane."""
+
+        def superseded() -> bool:
+            return (
+                revision is not None and revision != self.accepted.accepted_desired_state_revision
             )
-            for attempt in list(self.engine.history.values()):
-                while attempt.placement_id == placement_id and attempt.state in self.engine.HELD:
-                    if (
-                        revision is not None
-                        and revision != self.accepted.accepted_desired_state_revision
-                    ) or self.stop.wait(0.02):
-                        return False
-            if revision is not None and revision != self.accepted.accepted_desired_state_revision:
-                return False
-            current = hosted.supervision.current
-            if current is not None:
-                try:
-                    hosted.supervision.retire_current(current, "placement removed")
-                except ExecutorGone as exc:
-                    hosted.latched = f"executor_reclaim_failed: {exc}"[:200]
-                    self.engine.fault(
-                        pb.Fault(
-                            kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
-                            subject=placement_id,
-                            reason="executor_reclaim_failed",
-                            detail=safe(str(exc)),
-                        )
+
+        hosted = self.hosted.get(placement_id)
+        if hosted is None:
+            return True
+        if superseded():
+            return False
+        self._hosted_set_serving(
+            placement_id,
+            pb.ServingState.SERVING_STATE_DRAINING,
+            f"placement {placement_id!r} removed",
+        )
+        for attempt in list(self.engine.history.values()):
+            while attempt.placement_id == placement_id and attempt.state in self.engine.HELD:
+                if superseded() or self.stop.wait(0.02):
+                    return False
+        if superseded():
+            return False
+        current = hosted.supervision.current
+        if current is not None:
+            try:
+                hosted.supervision.retire_current(current, "placement removed")
+            except ExecutorGone as exc:
+                hosted.latched = f"executor_reclaim_failed: {exc}"[:200]
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                        subject=placement_id,
+                        reason="executor_reclaim_failed",
+                        detail=safe(str(exc)),
                     )
-                    return False
-            with self.control_lock:
-                if (
-                    revision is not None
-                    and revision != self.accepted.accepted_desired_state_revision
-                ):
-                    return False
-                hosted.supervision.close()
-                del self.hosted[placement_id]
-                self._release_lane(placement_id)
-                self.bump_admission(f"placement {placement_id!r} removed")
+                )
+                return False
+        with self.control_lock:
+            if superseded():
+                return False
+            hosted.supervision.close()
+            self.hosted.pop(placement_id, None)
+            self._release_lane(placement_id)
+            self.bump_admission(f"placement {placement_id!r} removed")
         return True
 
     def _reconcile_hosted(self, revision: int) -> None:
@@ -4816,13 +4883,17 @@ class Worker:
                 self.accepted.converged_revision = revision
             self._settle()
 
-    def _activate_hosted(self, hosted: HostedPlacement, revision: int) -> None:
-        """Acquire, place and activate one hosted placement in its own uv environment."""
+    def _activate_hosted(self, hosted: HostedPlacement, revision: int | None) -> None:
+        """Acquire, place and activate one hosted placement in its own uv environment.
+
+        A machine replica passes no revision: no desired state supersedes it."""
 
         placement = hosted.placement
         placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_MATERIALIZING
-        acquired = self._acquire(placement, revision)
-        if acquired is None or revision != self.accepted.accepted_desired_state_revision:
+        acquired = self._acquire(placement, revision or 0)
+        if acquired is None or (
+            revision is not None and revision != self.accepted.accepted_desired_state_revision
+        ):
             return
         bindings = dict(acquired.bindings)
         if not bindings:
@@ -4852,7 +4923,9 @@ class Worker:
             hosted.supervision.use_environment(str(installed.python), installed.installation_id)
         hosted.bindings = bindings
         hosted.failed_bindings = {}
-        if not self._assign_lane(placement, bindings, hosted.supervision):
+        with self.control_lock:
+            assigned = self._assign_lane(placement, bindings, hosted.supervision)
+        if not assigned:
             placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
             hosted.latched = "device_lane_infeasible"
             self._settle()

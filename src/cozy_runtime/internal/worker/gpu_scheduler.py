@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import itertools
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,7 +58,7 @@ class GpuScheduler:
         self.lock = threading.Lock()
         self.leases: dict[str, set[int]] = {}
         self.grants: dict[str, tuple[str, Ordinals]] = {}
-        self.waiting: dict[str, tuple[str, ...]] = {}
+        self.waiting: dict[str, tuple[str, int, tuple[str, ...]]] = {}
         self.released: set[str] = set()
         self.events: list[tuple[str, str, dict[str, Any]]] = []
         self._arrival: dict[str, int] = {}
@@ -114,8 +114,8 @@ class GpuScheduler:
                         | {r for r, held in self.leases.items() if held and r != demand.root}
                     )
                 )
-                if self.waiting.get(demand.key) != blocked:
-                    self.waiting[demand.key] = blocked
+                if self.waiting.get(demand.key) != (demand.root, demand.width, blocked):
+                    self.waiting[demand.key] = (demand.root, demand.width, blocked)
                     self.events.append(
                         (
                             demand.root,
@@ -138,21 +138,45 @@ class GpuScheduler:
             events, self.events = self.events, []
             return events
 
-    def phase(self, key: str) -> dict[str, Any]:
+    def granted(self, key: str) -> Ordinals | None:
         with self.lock:
-            if key in self.grants:
-                ordinals = self.grants[key][1]
-                return {"phase": "granted", "width": len(ordinals), "ordinals": list(ordinals)}
-            if key in self.waiting:
-                return {"phase": "waiting", "blocked_by": list(self.waiting[key])}
-            return {"phase": "none"}
+            grant = self.grants.get(key)
+            return grant[1] if grant is not None else None
+
+    def status(self, request: str, on_device: Callable[[str], bool]) -> dict[str, Any]:
+        """One execution and, for a root, its calls: waiting, executing, granted, holding."""
+        with self.lock:
+
+            def mine(key: str, root: str) -> bool:
+                return root == request or key.rpartition("#")[0] == request
+
+            status: dict[str, Any] = {"phase": "none", "width": 0, "ordinals": [], "blocked_by": []}
+            for key, (root, width, blocked) in self.waiting.items():
+                if mine(key, root):
+                    return {
+                        **status,
+                        "phase": "waiting",
+                        "width": width,
+                        "blocked_by": list(blocked),
+                    }
+            granted = {key: o for key, (root, o) in self.grants.items() if mine(key, root)}
+            if granted:
+                return {
+                    **status,
+                    "phase": "executing" if any(map(on_device, granted)) else "granted",
+                    "width": max(map(len, granted.values())),
+                    "ordinals": sorted({o for ordinals in granted.values() for o in ordinals}),
+                }
+            if self.leases.get(request):
+                return {**status, "phase": "holding", "ordinals": sorted(self.leases[request])}
+            return status
 
     def view(self) -> dict[str, Any]:
         with self.lock:
             return {
                 "leases": {root: sorted(held) for root, held in self.leases.items()},
                 "grants": {key: [root, list(o)] for key, (root, o) in self.grants.items()},
-                "waiting": {key: list(blocked) for key, blocked in self.waiting.items()},
+                "waiting": {key: list(blocked) for key, (_, _, blocked) in self.waiting.items()},
             }
 
     def _end(self, key: str, cause: str, facts: dict[str, Any] | None = None) -> None:

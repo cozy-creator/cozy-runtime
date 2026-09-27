@@ -730,7 +730,7 @@ class MachineExecutionQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionState(_message.Message):
-    __slots__ = ("request_id", "attempt_ordinal", "generation", "state", "collected", "sequence", "worker_id", "worker_boot_id", "execution_workspace_id")
+    __slots__ = ("request_id", "attempt_ordinal", "generation", "state", "collected", "sequence", "worker_id", "worker_boot_id", "execution_workspace_id", "gpu")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
     GENERATION_FIELD_NUMBER: _ClassVar[int]
@@ -740,6 +740,7 @@ class MachineExecutionState(_message.Message):
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    GPU_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     attempt_ordinal: int
     generation: int
@@ -749,7 +750,20 @@ class MachineExecutionState(_message.Message):
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
-    def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., generation: _Optional[int] = ..., state: _Optional[str] = ..., collected: bool = ..., sequence: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ...) -> None: ...
+    gpu: MachineExecutionGpu
+    def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., generation: _Optional[int] = ..., state: _Optional[str] = ..., collected: bool = ..., sequence: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., gpu: _Optional[_Union[MachineExecutionGpu, _Mapping]] = ...) -> None: ...
+
+class MachineExecutionGpu(_message.Message):
+    __slots__ = ("phase", "width", "ordinals", "blocked_by")
+    PHASE_FIELD_NUMBER: _ClassVar[int]
+    WIDTH_FIELD_NUMBER: _ClassVar[int]
+    ORDINALS_FIELD_NUMBER: _ClassVar[int]
+    BLOCKED_BY_FIELD_NUMBER: _ClassVar[int]
+    phase: str
+    width: int
+    ordinals: _containers.RepeatedScalarFieldContainer[int]
+    blocked_by: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, phase: _Optional[str] = ..., width: _Optional[int] = ..., ordinals: _Optional[_Iterable[int]] = ..., blocked_by: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class MachineExecutionEventsQuery(_message.Message):
     __slots__ = ("execution", "after", "limit")
