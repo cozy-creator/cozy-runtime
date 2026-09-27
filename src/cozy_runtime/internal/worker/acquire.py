@@ -12,6 +12,7 @@ from __future__ import annotations
 from cozy_runtime.internal import package_installation
 
 import hashlib
+import os
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -783,23 +784,24 @@ def _model_group_weight_bytes(
     )
 
 
-def _verify_file(path: Path, digest: str, length: int | None) -> bytes:
+def _verify_file(path: Path, digest: str, length: int | None) -> None:
+    """Hash a cached artifact as a stream; its size is never bounded by host memory."""
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as stream:
+            measured = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
+            size = os.fstat(stream.fileno()).st_size
     except OSError as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
             "local_artifact_unreadable",
             str(exc),
         ) from exc
-    measured = "sha256:" + hashlib.sha256(raw).hexdigest()
-    if (length is not None and len(raw) != length) or measured != digest:
+    if (length is not None and size != length) or measured != digest:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
             "local_artifact_identity_mismatch",
-            f"measured {measured}/{len(raw)}, expected {digest}/{length or 'measured length'}",
+            f"measured {measured}/{size}, expected {digest}/{length or 'measured length'}",
         )
-    return raw
 
 
 def _verify_bytes(raw: bytes, digest: str, length: int) -> None:
