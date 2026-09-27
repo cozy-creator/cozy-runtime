@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING
 from cozy_runtime import canonical_json
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from . import machine_models, workspace_byte_outputs, workspace_memo, workspace_sources
+from . import (
+    commit_files,
+    machine_models,
+    workspace_byte_outputs,
+    workspace_memo,
+    workspace_sources,
+)
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
 from .workspace_calls import Calls as JournalCalls
@@ -106,6 +112,11 @@ class Sources:
             result.safe_code = row["native_error"] or "native_source_failed"
             if self.worker.source_calls is not None:
                 result.safe_detail = self.worker.source_calls.failure_detail(command.service_id)
+            if (
+                not result.safe_detail
+                and result.safe_code == commit_files.UnsupportedCommitRequest.code
+            ):
+                result.safe_detail = commit_files.unsupported_detail(row["accepted"])
             return result
         if row["state"] != "complete":
             return result

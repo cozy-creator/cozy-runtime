@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import gc
 import hashlib
 import importlib
@@ -3638,6 +3639,9 @@ class Executor:
                         f"this Runtime offers no native operation {module}.{export}",
                         code="child_interface",
                     )
+                served = row.get("request_fields")
+                if isinstance(served, list) and all(isinstance(name, str) for name in served):
+                    native = dataclasses.replace(native, served_fields=frozenset(served))
                 bindings[(module, export)] = native
             elif row.get("builtin"):
                 import msgspec

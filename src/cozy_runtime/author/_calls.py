@@ -209,6 +209,42 @@ class _CallType:
     request: type[msgspec.Struct]
     result: type[msgspec.Struct]
     python_result: type[msgspec.Struct] | None = None
+    #: Request fields the serving Runtime accepts; ``None`` when it did not say.
+    served_fields: frozenset[str] | None = None
+
+
+RUNTIME_UPDATE = (
+    "this package's SDK is newer than this Runtime; update the rental's Runtime "
+    "(`cozy rental update <name>`) or pin an older SDK"
+)
+
+
+def _served(binding: _CallType, request: msgspec.Struct, value: dict[str, Any]) -> dict[str, Any]:
+    """Omit an option the serving Runtime predates while it keeps its default; else refuse."""
+    served = binding.served_fields
+    if served is None:
+        return value
+    unsupported = []
+    for field_info in msgspec.structs.fields(binding.request):
+        name = field_info.encode_name
+        if name in served:
+            continue
+        default = (
+            field_info.default_factory()
+            if field_info.default_factory is not msgspec.NODEFAULT
+            else field_info.default
+        )
+        if default is not msgspec.NODEFAULT and getattr(request, field_info.name) == default:
+            value.pop(name, None)
+        else:
+            unsupported.append(name)
+    if unsupported:
+        raise CapabilityError(
+            f"{binding.module}.{binding.export} does not support {', '.join(unsupported)} "
+            f"here: {RUNTIME_UPDATE}",
+            code="child_capability_unavailable",
+        )
+    return value
 
 
 class PendingCall[R](Awaitable[R]):
@@ -315,18 +351,17 @@ class _Broker:
             request = msgspec.convert(
                 plain, type=binding.request, dec_hook=asset_dec_hook, strict=True
             )
-            payload = canonical_json.encode(
-                msgspec.to_builtins(
-                    request,
-                    enc_hook=lambda value: (
-                        value.ref if isinstance(value, (Asset, Tree)) else asset_value(value)
-                    ),
-                )
+            encoded = msgspec.to_builtins(
+                request,
+                enc_hook=lambda value: (
+                    value.ref if isinstance(value, (Asset, Tree)) else asset_value(value)
+                ),
             )
         except (TypeError, ValueError, msgspec.ValidationError) as exc:
             raise ConformanceError(
                 "package call arguments do not match its interface", code="child_arguments"
             ) from exc
+        payload = canonical_json.encode(_served(binding, request, encoded))
         if len(payload) > MAX_CALL_BYTES:
             raise CapabilityError("package call exceeds inline bound", code="child_payload_bound")
         call = PendingCall[Any](self, self.next_index, binding, payload, ctx)

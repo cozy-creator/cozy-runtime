@@ -78,7 +78,16 @@ def bindings() -> dict[tuple[str, str, str], _CallType]:
 
 
 def rows() -> list[dict[str, object]]:
+    """``request_fields`` lets a newer SDK omit options this Runtime does not serve."""
     return [
-        {"interface_digest": DIGEST, "module": MODULE, "export": name, "native_source": True}
-        for name in _TYPES
+        {
+            "interface_digest": DIGEST,
+            "module": MODULE,
+            "export": name,
+            "native_source": True,
+            "request_fields": sorted(
+                field.encode_name for field in msgspec.structs.fields(request)
+            ),
+        }
+        for name, (request, _) in _TYPES.items()
     ]
