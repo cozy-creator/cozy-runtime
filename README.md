@@ -69,6 +69,9 @@ For labelled model-ready input media, see [Ordered media inputs](docs/assets.md)
 | `cozy_runtime.protocol` | `cozy.worker.v1` — worker-protocol's bindings, copied verbatim into `src/cozy/`, plus canonical document handling | protobuf, internal.canonical |
 | `cozy_runtime.cli` | user CLI plus the fixed product-host worker entrypoint | author, internal |
 
+Re-vendor worker-protocol with `uv run python scripts/vendor-worker-protocol.py <commit>`: it
+rewrites the bindings and the canonical test corpus from that one commit, so their pins move together.
+
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
 -> preflight -> hydrate -> invoke -> validate -> finalize. It is pure surface semantics —
 no device, config, environment, protocol or network — so it lives beside the types it

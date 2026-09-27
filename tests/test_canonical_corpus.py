@@ -33,10 +33,8 @@ SOURCE = CORPUS / "SOURCE"
 BINDINGS_SOURCE = Path(__file__).resolve().parents[1] / "src" / "cozy" / "worker" / "v1" / "SOURCE"
 WANT_REPOSITORY = "https://github.com/cozy-creator/worker-protocol-v2"
 REMEDY = (
-    "re-vendor: copy MANIFEST.json, canonical/, red/ and tolerated/ from worker-protocol's "
-    "fixtures/ "
-    "into tests/testdata/worker-protocol/ and rewrite its SOURCE (same commit as the "
-    "bindings SOURCE)"
+    "re-vendor bindings and corpus together: uv run python scripts/vendor-worker-protocol.py "
+    "<commit>"
 )
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
