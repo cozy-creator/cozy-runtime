@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -95,6 +95,24 @@ def destination_path(destination: str) -> str:
         "publication.destination_invalid",
     )
     return "/v1/models/" + destination
+
+
+# A job root's weights output access spelled ``model://org/name`` publishes that output
+# as a checkpoint of the repository, under the root's publication authorization.
+DESTINATION_SCHEME = "model://"
+
+
+def output_destination(urls: Iterable[str]) -> str:
+    """The one repository a root's output grants name, or "" when none names one."""
+    named = {
+        url.removeprefix(DESTINATION_SCHEME) for url in urls if url.startswith(DESTINATION_SCHEME)
+    }
+    _require(len(named) <= 1, "publication.destination_ambiguous")
+    if not named:
+        return ""
+    (destination,) = named
+    destination_path(destination)
+    return destination
 
 
 class MachinePublicationClient:

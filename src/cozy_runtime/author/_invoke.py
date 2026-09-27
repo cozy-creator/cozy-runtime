@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
@@ -85,6 +85,7 @@ from cozy_runtime.author._services import (
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
+from cozy_runtime.author.publication import upload_checkpoint
 
 if TYPE_CHECKING:
     from tensorfs.derived import Derivation, DerivedTransaction, SourceCapability
@@ -140,6 +141,8 @@ class Invocation:
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
     calls: _Broker | None = None
+    publish_to: str = ""
+    """The repository the owner granted this root: each Model it returns is uploaded there."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,7 +333,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
         inv.calls.bind(ctx, Telemetry(record, ctx))
     token = _current.set(inv.calls)
     try:
-        result = _call(surface, kwargs)
+        result = _call(surface, kwargs, inv.publish_to)
         if inv.calls is not None:
             inv.calls.finish()
     finally:
@@ -927,20 +930,24 @@ def _settings_value(schema: object, value: object, what: str) -> Any:
 # ------------------------------------------------------------------------- execution
 
 
-def _call(surface: Surface, kwargs: Mapping[str, object]) -> object:
+def _call(surface: Surface, kwargs: Mapping[str, object], publish_to: str = "") -> object:
     """`def` runs right here on the calling (executor) thread; `async def` runs on a
     PRIVATE event loop created for THIS attempt and closed with it.
 
     `await` interleaves I/O within one attempt and never admits a second — this function
     is synchronous, so law 8's one-active-GPU-attempt rule is unchanged by the spelling.
+    A granted destination receives the returned Models before the attempt closes.
     """
-    if not surface.is_async:
+    if not surface.is_async and not publish_to:
         return surface.fn(**kwargs)
     loop = asyncio.new_event_loop()
     try:
-        coroutine = surface.fn(**kwargs)
-        assert asyncio.iscoroutine(coroutine)
-        return loop.run_until_complete(coroutine)
+        if surface.is_async:
+            coroutine = surface.fn(**kwargs)
+            assert asyncio.iscoroutine(coroutine)
+        else:
+            coroutine = _returned(surface.fn(**kwargs))
+        return loop.run_until_complete(_published(coroutine, publish_to))
     finally:
         if (broker := _current.get()) is not None:
             broker.closed = True
@@ -952,7 +959,35 @@ def _call(surface: Surface, kwargs: Mapping[str, object]) -> object:
         loop.close()
 
 
+async def _returned(value: object) -> object:
+    return value
+
+
+async def _published(coroutine: Coroutine[Any, Any, object], destination: str) -> object:
+    """Upload each distinct Model the root returned, in result order, then return it."""
+    result = await coroutine
+    if destination:
+        for model in dict.fromkeys(models_in(result)):
+            await upload_checkpoint(model, destination=destination)
+    return result
+
+
 # ------------------------------------------------------------------------- result
+
+
+def models_in(value: object, _seen: set[int] | None = None) -> list[ModelArtifact]:
+    """Every Model reachable from a value, in declaration order."""
+    seen = _seen if _seen is not None else set()
+    if isinstance(value, ModelArtifact):
+        return [value]
+    if id(value) in seen:
+        return []
+    seen.add(id(value))
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [m for item in value for m in models_in(item, seen)]
+    if isinstance(value, dict):
+        return [m for item in value.values() for m in models_in(item, seen)]
+    return [m for member in field_values(value).values() for m in models_in(member, seen)]
 
 
 def assets_in(value: object, _seen: set[int] | None = None) -> list[Asset]:

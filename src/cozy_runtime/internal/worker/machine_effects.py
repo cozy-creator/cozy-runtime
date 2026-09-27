@@ -215,13 +215,18 @@ class Effects:
                     "SELECT memoize FROM attempts WHERE owner=? AND request=? AND ordinal=?",
                     (owner, call.parent_request, call.parent_ordinal),
                 ).fetchone()
-            if pure is None or pure["memoize"]:
+            intent = canonical_json.decode(call.intent)
+            operation = intent["export"]
+            # A memoized root may upload only its own result, to the destination its
+            # owner granted; its memo identity never includes that upload.
+            granted = operation == "upload_checkpoint" and intent["request"].get(
+                "destination"
+            ) == self.executions.destination(owner, call.parent_request)
+            if pure is None or (pure["memoize"] and not granted):
                 raise PublicationRefusal("publication.impure_call_forbidden")
             grant = self.executions.publication_authorization(owner, call.parent_request)
             if not grant or self.authority is None:
                 raise PublicationRefusal("publication.authority_absent", status=403)
-            intent = canonical_json.decode(call.intent)
-            operation = intent["export"]
             if intent["module"] != effect_interfaces.MODULE:
                 raise PublicationRefusal("publication.interface_changed")
             client = self.authority.client(grant)
@@ -244,6 +249,18 @@ class Effects:
                     intent["request"], type=effect_interfaces.Upload, strict=True
                 )
                 result = self._upload(owner, call, request_upload, client)
+                # The owner settles a destination from these, at least once per output.
+                self.executions.record(
+                    owner,
+                    call.parent_request,
+                    "checkpoint",
+                    {
+                        "destination": result.destination,
+                        "checkpoint": result.checkpoint,
+                        "output_slot": request_upload.artifact.output_slot,
+                        "observation": result.observation,
+                    },
+                )
             elif operation == "attach_assessment":
                 attachment = msgspec.convert(
                     intent["request"],
