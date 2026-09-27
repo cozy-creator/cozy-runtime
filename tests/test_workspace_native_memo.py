@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,7 @@ def completed(
     data: bytes = b"weights",
     *,
     retain: bool = True,
+    shape: Callable[[dict[str, Any]], dict[str, Any]] = lambda value: value,
 ) -> tuple[bytes, dict[str, Any]]:
     store = tensorfs.Store.open(str(workspace.store_root))
     digest = tensorfs.object_id(data)
@@ -100,12 +102,14 @@ def completed(
         workspace_sources.native_owner("owner", command.service_id), manifest_id, len(manifest)
     )
     value = canonical_json.encode(
-        {
-            "producer_request_id": command.service_id,
-            "output_slot": "source",
-            "manifest": {"digest": manifest_id, "length": len(manifest)},
-            "tensorfs_receipt_digest": root["receipt_digest"],
-        }
+        shape(
+            {
+                "producer_request_id": command.service_id,
+                "output_slot": "source",
+                "manifest": {"digest": manifest_id, "length": len(manifest)},
+                "tensorfs_receipt_digest": root["receipt_digest"],
+            }
+        )
     )
     workspace_sources.record_complete(
         workspace, "owner", command, value, b"k" * 32, root["receipt"]

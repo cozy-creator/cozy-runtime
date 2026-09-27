@@ -13,7 +13,13 @@ from typing import Any
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, source_interfaces
 from cozy_runtime.internal.call_intent import canonical_intent
-from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import (
+    Journal,
+    Workspace,
+    WorkspaceRefusal,
+    artifact_identity,
+    same_ref,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -241,8 +247,9 @@ def record_complete(
                 or value.get("output_slot") != ("source" if source else "model")
                 or value.get("tensorfs_receipt_digest")
                 != "sha256:" + hashlib.sha256(native_receipt).hexdigest()
-                or value.get("manifest")
-                != {"digest": "sha256:" + manifest["sha256"], "length": manifest["length"]}
+                or not same_ref(
+                    value.get("manifest"), "sha256:" + manifest["sha256"], manifest["length"]
+                )
             ):
                 raise WorkspaceRefusal("source result differs from its native receipt")
 
@@ -259,7 +266,7 @@ def record_complete(
         ):
             raise WorkspaceRefusal("source call changed during native result validation")
         if row["result"] and (
-            row["result"] != result
+            artifact_identity(canonical_json.decode(row["result"])) != artifact_identity(value)
             or row["computation_digest"] != computation
             or row["native_receipt"] != native_receipt
         ):
