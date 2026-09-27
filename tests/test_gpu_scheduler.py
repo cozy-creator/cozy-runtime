@@ -450,7 +450,10 @@ class Machine:
                 model_weight_bytes=GiB,
                 models=(
                     WorkerSlot(
-                        "M", "marco.models.model", "model", "", "", "", ("unet",), {}, degrees
+                        *("M", "marco.models.model", "model", "", "", ""),
+                        components=("unet",),
+                        snapshots={},
+                        sequence_parallel_degrees=degrees,
                     ),
                 ),
             )
@@ -748,6 +751,12 @@ def test_consecutive_roots_of_different_widths_reuse_every_warm_executor(
     warm = machine.warm()
     assert len(warm) == 4 and {p: warm[p] for p in qwen} == qwen, "the shot retired nothing"
     lanes_of = {p: machine.worker._lane_of(p).lane_id for p in warm}
+    degrees = {
+        b.sequence_parallel_degrees()
+        for h in machine.worker.hosted.values()
+        for b in h.bindings.values()
+    }
+    assert degrees == {(), (2, 4)}
     assert sorted(lanes_of.values()) == ["lane-0", "lane-0+1+2+3", "lane-1", "lane-2"]
     epoch, started = machine.worker.admission_epoch, dict(machine.worker._activating)
     machine.finish(shot)
