@@ -1000,8 +1000,16 @@ def _selected_models(
         if not isinstance(row, dict) or row.get("package") != package_name:
             raise PreparationRefusal("package_prepare_model_selection_mismatch", "package")
         slot = str(row.get("slot", ""))
-        if not slot or (slot in selected and selected[slot]["selection"] != row):
-            raise PreparationRefusal("package_prepare_model_selection_mismatch", slot)
+        if not slot:
+            raise PreparationRefusal("package_prepare_model_selection_mismatch", "slot")
+        if slot in selected and selected[slot]["selection"] != row:
+            first = selected[slot]["selection"]
+            raise PreparationRefusal(
+                "package_prepare_model_selection_mismatch",
+                f"{package_name} slot {slot} is selected twice with different models "
+                f"({first.get('model')} {first.get('manifest')} and "
+                f"{row.get('model')} {row.get('manifest')}); select one model for this slot",
+            )
         selected[slot] = {"selection": row}
     if not selected:
         return selected
