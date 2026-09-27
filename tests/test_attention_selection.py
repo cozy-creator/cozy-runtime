@@ -98,6 +98,66 @@ def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
     assert attention.PROBE == (1, 73_439, 2, 128)
 
 
+def test_the_probe_refuses_a_fault_confined_to_the_partial_tail_tile() -> None:
+    """A kernel wrong only on its last, partial tile passes a sample of rows; the probe checks
+    the first and last rows and every tile edge, each group against the budget on its own."""
+    torch = pytest.importorskip("torch")
+    shape = (1, 4_095, 2, 128)  # the last 128-row tile holds 127 rows
+    seed = torch.Generator().manual_seed(0x5A6E)
+    query, key, value = (torch.randn(shape, generator=seed).to(torch.bfloat16) for _ in range(3))
+    served = torch.nn.functional.scaled_dot_product_attention(
+        *(t.transpose(1, 2).float() for t in (query, key, value))
+    )
+    served = served.transpose(1, 2).to(torch.bfloat16)
+    budget = attention.BY_NAME["flash-attn4"].rel_l2_max
+
+    correct, floor, checked = attention._disagreement(
+        served, query, key, value, torch.Generator().manual_seed(1)
+    )
+    assert set(correct) == {"sampled", "first", "last", "tile_edges"}
+    assert max(correct.values()) < budget and floor < budget
+    assert checked > 2 * shape[1] // attention.PROBE_TILE_GRAIN
+
+    faulty = served.clone()
+    faulty[:, shape[1] // 128 * 128 :] *= 1.03
+    wrong, _, _ = attention._disagreement(
+        faulty, query, key, value, torch.Generator().manual_seed(1)
+    )
+    assert wrong["sampled"] < budget < wrong["last"]
+
+
+def test_probe_inputs_refuse_per_head_fp8_that_gaussian_inputs_admit() -> None:
+    """FA3 FP8 garbled H3 video (run 1250) yet passed its budget on N(0, 1) inputs. The probe's
+    QK-normalised inputs attend sharply, where per-head e4m3 rounding of Q/K/V alone -- the
+    dequantised-input control, a floor under the kernel's own error (h3a-044) -- is past the
+    fp8 budget, while exact BF16 attention keeps the BF16 kernels' budget."""
+    torch = pytest.importorskip("torch")
+    from cozy_runtime.internal.attention_fp8 import quantise_eager
+
+    shape = (1, 4_095, 2, 128)
+    fp8_budget = attention.BY_NAME["flash-attn3-fp8"].rel_l2_max
+    bf16_budget = attention.BY_NAME["flash-attn3"].rel_l2_max
+
+    def served(*tensors: Any) -> Any:
+        out = torch.nn.functional.scaled_dot_product_attention(
+            *(t.transpose(1, 2).float() for t in tensors)
+        )
+        return out.transpose(1, 2).to(torch.bfloat16)
+
+    def fp8_control(*tensors: Any) -> Any:
+        return served(*(q.float() * d[:, None, :, None] for q, d in map(quantise_eager, tensors)))
+
+    def worst(inputs: tuple[Any, Any, Any], output: Any) -> float:
+        by_rows, _, _ = attention._disagreement(output, *inputs, torch.Generator().manual_seed(1))
+        return max(by_rows.values())
+
+    seed = torch.Generator().manual_seed(0x5A6E)
+    sharp = attention.probe_inputs(shape, seed, "cpu", torch.bfloat16)
+    gaussian = tuple(torch.randn(shape, generator=seed).to(torch.bfloat16) for _ in range(3))
+    assert worst(sharp, served(*sharp)) < bf16_budget
+    assert worst(gaussian, fp8_control(*gaussian)) < fp8_budget < worst(sharp, fp8_control(*sharp))
+
+
 def test_fp8_admits_a_strict_subset_of_the_bf16_entrys_sites_so_no_floor_site_moves() -> None:
     """The promotion moves ONLY sites the bf16 entry already served at head dim <= 128. Every
     site that kept the floor keeps it — H3's two VAEs (x37) hold it on dtype — because fp8's

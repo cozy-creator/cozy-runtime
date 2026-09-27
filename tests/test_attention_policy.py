@@ -428,7 +428,7 @@ def test_numerical_probe_runs_on_the_selected_nondefault_device() -> None:
         kind="cuda", name="owned GPU 1", sm=major * 10 + minor, driver="", configuration="", index=1
     )
     with torch.cuda.device(0):
-        attention._computes(entry, selected)
+        attention.probe(entry, selected)
         assert torch.cuda.current_device() == 0
     assert indices == [1]
 
