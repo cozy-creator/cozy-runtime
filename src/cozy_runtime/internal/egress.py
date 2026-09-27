@@ -163,6 +163,41 @@ def request_control_metadata(
         connection.close()
 
 
+def request_catalog_metadata(
+    host: str, port: int | None, tls: bool, path: str, *, limit: int
+) -> tuple[int, bytes]:
+    """One bounded anonymous GET of public catalog metadata (bindings, lane resolutions).
+
+    The origin is the controller's configured public catalog, checked by the caller; plain
+    HTTP is for a loopback development catalog only. No credential is sent and nothing is
+    retried: a failed read fails the one selection that needed it.
+    """
+    import http.client
+
+    if not 0 < limit <= 8 << 20 or not path.startswith("/v1/"):
+        raise EgressRefusal("catalog_route_invalid", "catalog route is invalid")
+    connection: http.client.HTTPConnection = (
+        http.client.HTTPSConnection(
+            host, port, context=ssl.create_default_context(), timeout=SILENCE_SECONDS
+        )
+        if tls
+        else http.client.HTTPConnection(host, port, timeout=SILENCE_SECONDS)
+    )
+    try:
+        connection.request("GET", path, headers={"Accept": "application/json"})
+        response = connection.getresponse()
+        raw = response.read(limit + 1)
+        if len(raw) > limit:
+            raise EgressRefusal("catalog_response_bound", "catalog response exceeds its bound")
+        return response.status, raw
+    except (OSError, http.client.HTTPException) as exc:
+        raise EgressRefusal(
+            "catalog_unavailable", f"catalog unreachable: {type(exc).__name__}"
+        ) from exc
+    finally:
+        connection.close()
+
+
 @dataclass(frozen=True, slots=True)
 class StreamReceipt:
     """Facts measured while one stream was copied to its destination."""

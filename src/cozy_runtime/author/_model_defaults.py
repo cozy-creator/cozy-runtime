@@ -77,6 +77,16 @@ def default_ladder(value: object) -> DefaultLadder:
     return tuple(out)
 
 
+def reference(lane: str) -> tuple[str, str, str]:
+    """One validated rung's ([org/]model, release, lane)."""
+    match = _REFERENCE.fullmatch(lane)
+    if match is None:
+        raise ConformanceError(
+            "default lane is not [org/]model@release/lane", code="model_defaults"
+        )
+    return match["model"], match["release"], match["lane"]
+
+
 def model_defaults(value: object) -> dict[str, DefaultLadder]:
     """Copy a decorator declaration so later mutations cannot rewrite registered defaults."""
     if value is None:

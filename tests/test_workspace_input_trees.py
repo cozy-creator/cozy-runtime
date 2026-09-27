@@ -380,3 +380,17 @@ def test_serving_root_dispatches_from_the_submitters_native_hold(tmp_path: Path)
     )
     with pytest.raises(grants.GrantRefusal, match="no exact received retention"):
         hydrate("released")
+
+
+def test_a_later_input_reuses_only_its_owners_held_objects(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path)
+    header, frames, data = intake("first-root")
+    receive(workspace, "owner", header, frames)
+    # The same bytes for the owner's next root: the commit alone, no object sent.
+    again, _, _ = intake("second-root")
+    read(workspace, receive(workspace, "owner", again, frames[-1:]), data)
+    # Another owner never learns what this owner holds: it sends its bytes.
+    other, _, _ = intake("third-root")
+    with pytest.raises(WorkspaceRefusal, match="input_objects_absent"):
+        receive(workspace, "stranger", other, frames[-1:])
+    assert receive(workspace, "stranger", other, frames).source.content_bytes == len(data) * 2

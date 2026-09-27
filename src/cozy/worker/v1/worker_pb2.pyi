@@ -592,18 +592,20 @@ class KeepRentalAliveResult(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., acknowledged_at_unix_ms: _Optional[int] = ..., idle_deadline_unix_ms: _Optional[int] = ...) -> None: ...
 
 class MachineExecutionCapture(_message.Message):
-    __slots__ = ("bindings", "model_defaults", "root_installation_id", "installed_packages", "deferred_installations")
+    __slots__ = ("bindings", "model_defaults", "root_installation_id", "installed_packages", "deferred_installations", "catalog_origin")
     BINDINGS_FIELD_NUMBER: _ClassVar[int]
     MODEL_DEFAULTS_FIELD_NUMBER: _ClassVar[int]
     ROOT_INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     INSTALLED_PACKAGES_FIELD_NUMBER: _ClassVar[int]
     DEFERRED_INSTALLATIONS_FIELD_NUMBER: _ClassVar[int]
+    CATALOG_ORIGIN_FIELD_NUMBER: _ClassVar[int]
     bindings: _containers.RepeatedCompositeFieldContainer[MachineCallableBinding]
     model_defaults: _containers.RepeatedCompositeFieldContainer[MachineModelDefault]
     root_installation_id: str
     installed_packages: _containers.RepeatedCompositeFieldContainer[InstalledPackage]
     deferred_installations: _containers.RepeatedCompositeFieldContainer[DeferredInstallation]
-    def __init__(self, bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ..., model_defaults: _Optional[_Iterable[_Union[MachineModelDefault, _Mapping]]] = ..., root_installation_id: _Optional[str] = ..., installed_packages: _Optional[_Iterable[_Union[InstalledPackage, _Mapping]]] = ..., deferred_installations: _Optional[_Iterable[_Union[DeferredInstallation, _Mapping]]] = ...) -> None: ...
+    catalog_origin: str
+    def __init__(self, bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ..., model_defaults: _Optional[_Iterable[_Union[MachineModelDefault, _Mapping]]] = ..., root_installation_id: _Optional[str] = ..., installed_packages: _Optional[_Iterable[_Union[InstalledPackage, _Mapping]]] = ..., deferred_installations: _Optional[_Iterable[_Union[DeferredInstallation, _Mapping]]] = ..., catalog_origin: _Optional[str] = ...) -> None: ...
 
 class DeferredInstallation(_message.Message):
     __slots__ = ("key", "package", "release", "preparation")
@@ -684,7 +686,7 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus", "owner_publication_reconciliation", "source_credentials", "deferred_installations")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus", "owner_publication_reconciliation", "source_credentials", "deferred_installations", "resolves_model_defaults", "release_roots", "input_object_reuse", "event_wait")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -696,6 +698,10 @@ class MachineExecutionWorkspace(_message.Message):
     OWNER_PUBLICATION_RECONCILIATION_FIELD_NUMBER: _ClassVar[int]
     SOURCE_CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
     DEFERRED_INSTALLATIONS_FIELD_NUMBER: _ClassVar[int]
+    RESOLVES_MODEL_DEFAULTS_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_ROOTS_FIELD_NUMBER: _ClassVar[int]
+    INPUT_OBJECT_REUSE_FIELD_NUMBER: _ClassVar[int]
+    EVENT_WAIT_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -707,7 +713,11 @@ class MachineExecutionWorkspace(_message.Message):
     owner_publication_reconciliation: bool
     source_credentials: bool
     deferred_installations: bool
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ..., owner_publication_reconciliation: bool = ..., source_credentials: bool = ..., deferred_installations: bool = ...) -> None: ...
+    resolves_model_defaults: bool
+    release_roots: bool
+    input_object_reuse: bool
+    event_wait: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ..., owner_publication_reconciliation: bool = ..., source_credentials: bool = ..., deferred_installations: bool = ..., resolves_model_defaults: bool = ..., release_roots: bool = ..., input_object_reuse: bool = ..., event_wait: bool = ...) -> None: ...
 
 class MachineDevice(_message.Message):
     __slots__ = ("ordinal", "name", "uuid", "memory_bytes", "pci_bus_id", "driver_version")
@@ -726,7 +736,7 @@ class MachineDevice(_message.Message):
     def __init__(self, ordinal: _Optional[int] = ..., name: _Optional[str] = ..., uuid: _Optional[str] = ..., memory_bytes: _Optional[int] = ..., pci_bus_id: _Optional[str] = ..., driver_version: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionSubmit(_message.Message):
-    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id", "source_credentials")
+    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id", "source_credentials", "release_root")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -739,6 +749,7 @@ class MachineExecutionSubmit(_message.Message):
     PUBLICATION_AUTHORIZATION_ID_FIELD_NUMBER: _ClassVar[int]
     EXPECTED_EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
     SOURCE_CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_ROOT_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     submission_id: str
     capture_digest: bytes
@@ -751,7 +762,58 @@ class MachineExecutionSubmit(_message.Message):
     publication_authorization_id: str
     expected_execution_workspace_id: str
     source_credentials: _containers.RepeatedCompositeFieldContainer[SourceCredential]
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ...) -> None: ...
+    release_root: ReleaseRoot
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., release_root: _Optional[_Union[ReleaseRoot, _Mapping]] = ...) -> None: ...
+
+class ReleaseRoot(_message.Message):
+    __slots__ = ("package", "release", "entrypoint", "callees", "installations", "models", "inputs", "input_access", "deadline_unix_ms", "attention_kernel", "capture", "catalog_origin")
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
+    ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
+    CALLEES_FIELD_NUMBER: _ClassVar[int]
+    INSTALLATIONS_FIELD_NUMBER: _ClassVar[int]
+    MODELS_FIELD_NUMBER: _ClassVar[int]
+    INPUTS_FIELD_NUMBER: _ClassVar[int]
+    INPUT_ACCESS_FIELD_NUMBER: _ClassVar[int]
+    DEADLINE_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    ATTENTION_KERNEL_FIELD_NUMBER: _ClassVar[int]
+    CAPTURE_FIELD_NUMBER: _ClassVar[int]
+    CATALOG_ORIGIN_FIELD_NUMBER: _ClassVar[int]
+    package: str
+    release: str
+    entrypoint: str
+    callees: _containers.RepeatedCompositeFieldContainer[ReleaseEdge]
+    installations: _containers.RepeatedCompositeFieldContainer[DeferredInstallation]
+    models: _containers.RepeatedCompositeFieldContainer[ModelChoice]
+    inputs: _containers.RepeatedCompositeFieldContainer[InputBinding]
+    input_access: _containers.RepeatedCompositeFieldContainer[InputAccess]
+    deadline_unix_ms: int
+    attention_kernel: str
+    capture: ActivationCapture
+    catalog_origin: str
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., entrypoint: _Optional[str] = ..., callees: _Optional[_Iterable[_Union[ReleaseEdge, _Mapping]]] = ..., installations: _Optional[_Iterable[_Union[DeferredInstallation, _Mapping]]] = ..., models: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., input_access: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., attention_kernel: _Optional[str] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., catalog_origin: _Optional[str] = ...) -> None: ...
+
+class ReleaseEdge(_message.Message):
+    __slots__ = ("caller", "callee")
+    CALLER_FIELD_NUMBER: _ClassVar[int]
+    CALLEE_FIELD_NUMBER: _ClassVar[int]
+    caller: str
+    callee: str
+    def __init__(self, caller: _Optional[str] = ..., callee: _Optional[str] = ...) -> None: ...
+
+class ModelChoice(_message.Message):
+    __slots__ = ("parameter", "repository", "release", "lane", "manifest")
+    PARAMETER_FIELD_NUMBER: _ClassVar[int]
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
+    LANE_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    parameter: str
+    repository: str
+    release: str
+    lane: str
+    manifest: Ref
+    def __init__(self, parameter: _Optional[str] = ..., repository: _Optional[str] = ..., release: _Optional[str] = ..., lane: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
 class SourceCredential(_message.Message):
     __slots__ = ("provider", "credential")
@@ -832,14 +894,16 @@ class MachineExecutionGpu(_message.Message):
     def __init__(self, phase: _Optional[str] = ..., width: _Optional[int] = ..., ordinals: _Optional[_Iterable[int]] = ..., blocked_by: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class MachineExecutionEventsQuery(_message.Message):
-    __slots__ = ("execution", "after", "limit")
+    __slots__ = ("execution", "after", "limit", "wait")
     EXECUTION_FIELD_NUMBER: _ClassVar[int]
     AFTER_FIELD_NUMBER: _ClassVar[int]
     LIMIT_FIELD_NUMBER: _ClassVar[int]
+    WAIT_FIELD_NUMBER: _ClassVar[int]
     execution: MachineExecutionQuery
     after: int
     limit: int
-    def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., after: _Optional[int] = ..., limit: _Optional[int] = ...) -> None: ...
+    wait: bool
+    def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., after: _Optional[int] = ..., limit: _Optional[int] = ..., wait: bool = ...) -> None: ...
 
 class MachineExecutionEvent(_message.Message):
     __slots__ = ("sequence", "attempt_ordinal", "at_ms", "kind", "body_canonical_bytes")

@@ -2260,6 +2260,19 @@ class Worker:
                         arguments or {},
                         wire_minor=claim.wire_minor,
                     )
+                elif any(
+                    str(row.get("input_id", "")).startswith(grants.MODEL_PREFIX)
+                    for row in spec.get("inputs", [])
+                ):
+                    # A root this machine resolved names its Models as catalog inputs.
+                    catalog = grants.model_inputs(
+                        grants.bind(spec, offer.grant, offer.invocation_spec_digest)
+                    )
+                    if catalog:
+                        workspace = executions.workspace
+                        machine_checkpoint_inputs.preflight(workspace, owner, offer, catalog)
+                        for entry in catalog.values():
+                            machine_checkpoint_inputs.retain(workspace, owner, offer, entry)
                 receipt = executions.submit(
                     owner,
                     submission_id,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -12,7 +13,12 @@ import grpc
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
-from cozy_runtime.internal.worker import machine_capture, machine_slots, triage
+from cozy_runtime.internal.worker import (
+    machine_capture,
+    machine_release_roots,
+    machine_slots,
+    triage,
+)
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import (
@@ -49,6 +55,17 @@ class MachineExecutionRPC:
             return operation()
         except _ExecutionNotFound as exc:
             return context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+        except machine_release_roots.Preparing as exc:
+            context.set_trailing_metadata((("cozy-error-code", "release_root_preparing"),))
+            return context.abort(grpc.StatusCode.UNAVAILABLE, str(exc)[:512])
+        except machine_release_roots.InstallationsAbsent as exc:
+            context.set_trailing_metadata(
+                (
+                    ("cozy-error-code", "release_root_installations_absent"),
+                    *(("cozy-absent-release", key) for key in exc.keys),
+                )
+            )
+            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
         except ExecutionWorkspaceRefusal as exc:
             context.set_trailing_metadata((("cozy-error-code", exc.code),))
             return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
@@ -111,6 +128,10 @@ class MachineExecutionRPC:
                 exact_execution_gpus=True,
                 source_credentials=True,
                 deferred_installations=self.worker.machine_calls is not None,
+                resolves_model_defaults=True,
+                release_roots=self.worker.machine_calls is not None,
+                input_object_reuse=True,
+                event_wait=True,
             )
 
         return self._call(request.claim, context, get)
@@ -131,6 +152,9 @@ class MachineExecutionRPC:
         )
 
     def SubmitMachineExecution(self, request: pb.MachineExecutionSubmit, context: Any) -> Any:
+        if request.HasField("release_root"):
+            return self._submit_release_root(request, context)
+
         def submit() -> pb.MachineExecutionReceipt:
             assert self.worker.executions is not None
             self.worker.executions.require_workspace(request.expected_execution_workspace_id)
@@ -222,6 +246,40 @@ class MachineExecutionRPC:
 
         return self._call(request.claim, context, checked_submit)
 
+    def _submit_release_root(self, request: pb.MachineExecutionSubmit, context: Any) -> Any:
+        """Answer a receipt, the preparation's progress, or the releases lacking facts."""
+
+        def submit() -> pb.MachineExecutionReceipt:
+            calls, executions = self.worker.machine_calls, self.worker.executions
+            if calls is None or executions is None:
+                raise WorkspaceRefusal("release roots need the machine execution workspace")
+            if (
+                request.capture_digest
+                or request.capture_canonical_bytes
+                or request.HasField("prepared_state")
+                or request.offer.invocation_spec_canonical_bytes
+                or not request.offer.request_id
+            ):
+                raise WorkspaceRefusal("a release root names only its request, never a capture")
+            owner = self.worker.authorize_workspace(request.claim)
+            try:
+                return calls.release_roots.submit(owner, request, context)
+            except machine_release_roots.InstallationsAbsent:
+                raise
+            except WorkspaceRefusal:
+                # Nothing is journaled before the receipt: the refusal is definitive.
+                if executions.submission_absent(
+                    request.claim.record_owner_id,
+                    request.offer.request_id,
+                    request.expected_execution_workspace_id,
+                ):
+                    context.set_trailing_metadata(
+                        (("cozy-error-code", "execution_submission_refused"),)
+                    )
+                raise
+
+        return self._call(request.claim, context, submit)
+
     def GetMachineExecution(self, request: pb.MachineExecutionQuery, context: Any) -> Any:
         def get() -> pb.MachineExecutionState:
             self._query(request)
@@ -237,12 +295,15 @@ class MachineExecutionRPC:
     ) -> Any:
         def events() -> pb.MachineExecutionEventPage:
             self._query(request.execution)
-            page = self.worker.execution_events(
-                request.execution.claim,
-                request.execution.request_id,
-                request.after,
-                request.limit or 256,
-            )
+            if request.wait:
+                page = self._wait_events(request, context)
+            else:
+                page = self.worker.execution_events(
+                    request.execution.claim,
+                    request.execution.request_id,
+                    request.after,
+                    request.limit or 256,
+                )
             return pb.MachineExecutionEventPage(
                 events=[
                     pb.MachineExecutionEvent(
@@ -260,6 +321,27 @@ class MachineExecutionRPC:
             )
 
         return self._call(request.execution.claim, context, events)
+
+    def _wait_events(self, request: pb.MachineExecutionEventsQuery, context: Any) -> Any:
+        executions = self.worker.executions
+        assert executions is not None
+        owner = self.worker.authorize_workspace(request.execution.claim)
+        changes = executions.workspace.changes()
+        left = threading.Event()
+
+        def leave() -> None:
+            left.set()
+            changes.bump()
+
+        if hasattr(context, "add_callback"):
+            context.add_callback(leave)
+        return executions.wait_events(
+            owner,
+            request.execution.request_id,
+            request.after,
+            request.limit or 256,
+            lambda: left.is_set() or self.worker.stop.is_set(),
+        )
 
     def ControlMachineExecution(self, request: pb.MachineExecutionControl, context: Any) -> Any:
         def control() -> pb.MachineExecutionState:

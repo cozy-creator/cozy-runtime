@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack, nullcontext
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -18,7 +18,7 @@ from cozy_runtime.protocol import (
 )
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from . import grants
+from . import grants, machine_model_resolve
 from .workspace import WorkspaceRefusal
 
 if TYPE_CHECKING:
@@ -64,6 +64,9 @@ def verify(
     capture: dict[str, Any],
     interfaces: dict[str, dict[str, Any]],
 ) -> None:
+    origin = capture.get("catalog_origin", "")
+    if origin and not valid_origin(origin, local=bool(worker.config.bootstrap_credential)):
+        raise WorkspaceRefusal("execution capture names an invalid catalog origin")
     rows = capture.get("model_defaults", [])
     if not rows:
         return
@@ -145,6 +148,24 @@ def matches(selector: str, observed: str) -> bool:
     return bool(wanted) and all(any(token == candidate for candidate in actual) for token in wanted)
 
 
+def fitter(worker: Worker) -> Callable[[Mapping[str, Any]], bool]:
+    """Whether a rung's GPU selector and count fit this machine's devices."""
+    facts = hostfacts.measure(worker.options.accelerator_backend)
+    if "gpu_name" in facts.unreadable:
+        raise WorkspaceRefusal("captured Model default cannot select an unreadable accelerator")
+    entries = getattr(getattr(worker, "lanes", None), "entries", None)
+
+    def fits(candidate: Mapping[str, Any]) -> bool:
+        if not matches(str(candidate.get("gpu", "")), facts.gpu_name):
+            return False
+        count = candidate.get("gpus", 0)
+        if count and entries is None and "gpu_count" in facts.unreadable:
+            raise WorkspaceRefusal("counted Model default requires a readable granted GPU count")
+        return not count or count <= (len(entries) if entries is not None else facts.gpu_count)
+
+    return fits
+
+
 def select(
     worker: Worker, owner: str, call: Call, target: Target, arguments: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -157,37 +178,46 @@ def select(
         return []
     assert worker.executions is not None
     root = worker.executions.capture_root(owner, call.parent_request)
-    rows = worker.executions.capture(owner, root).get("model_defaults", [])
+    capture = worker.executions.capture(owner, root)
+    rows = capture.get("model_defaults", [])
     defaults = {
         row["parameter"]: row
         for row in rows
         if (callee(row), row["entrypoint"])
         == (target.callee or target.installation_id, target.entrypoint)
     }
+    # A slot the capture left open is resolved here, at the capture's catalog origin.
+    origin = capture.get("catalog_origin", "")
     for parameter in sorted(missing):
         row = defaults.get(parameter)
-        if row is None or row.get("unavailable_code"):
+        if (row is None and not origin) or (row is not None and row.get("unavailable_code")):
             raise WorkspaceRefusal("captured Model default is unavailable for " + parameter)
-    facts = hostfacts.measure(worker.options.accelerator_backend)
-    if "gpu_name" in facts.unreadable:
-        raise WorkspaceRefusal("captured Model default cannot select an unreadable accelerator")
-    entries = getattr(getattr(worker, "lanes", None), "entries", None)
+    fits = fitter(worker)
+    catalog = machine_model_resolve.Catalog(origin) if origin else None
+    package = str(
+        (
+            target.prepared_installation.get("placement", {}).get("package")
+            or target.prepared_installation.get("placement", {}).get("development")
+            or {}
+        ).get("package", "")
+    )
+    declared = {
+        model["path"].rpartition(".")[2]: model for model in target.declaration.get("models", [])
+    }
     selected = []
     for parameter in sorted(missing):
-        fitting = []
-        for candidate in defaults[parameter]["rungs"]:
-            if not matches(candidate["gpu"], facts.gpu_name):
-                continue
-            count = candidate.get("gpus", 0)
-            if count and entries is None and "gpu_count" in facts.unreadable:
-                raise WorkspaceRefusal(
-                    "counted Model default requires a readable granted GPU count"
+        row = defaults.get(parameter)
+        if row is None:
+            assert catalog is not None
+            selected.append(
+                machine_model_resolve.slot(
+                    catalog, package, declared[parameter], parameter, None, fits
                 )
-            if not count or count <= (len(entries) if entries is not None else facts.gpu_count):
-                fitting.append(candidate)
+            )
+            continue
+        fitting = [candidate for candidate in row["rungs"] if fits(candidate)]
         # The widest rung this machine holds: the width itself is the declared degree.
         rung = max(fitting, key=lambda candidate: candidate.get("gpus", 0), default=None)
-        row = defaults[parameter]
         if rung is None:
             raise WorkspaceRefusal("captured Model default has no rung for this accelerator")
         selected.append({"parameter": parameter, "public_origin": row["public_origin"], **rung})

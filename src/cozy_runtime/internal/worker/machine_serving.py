@@ -83,6 +83,8 @@ class Serving:
         self.worker = worker
         self.preparations = Preparations[Prepared](MAX_ACTIVE_CALLS)
         self.pending: dict[tuple[str, str], Future[Prepared]] = {}
+        # A preparation with no parent execution (a release root) reports here instead.
+        self.observers: dict[str, Callable[[dict[str, Any]], None]] = {}
         # Read leases die with the old process, but durable temporary holds need
         # release through the existing journal after a worker restart.
         workspace = worker.workspace
@@ -107,6 +109,9 @@ class Serving:
             )
 
     def _progress(self, call: Call, request: pb.ChildCallRequest, frame: dict[str, Any]) -> None:
+        if (observer := self.observers.get(call.child_request)) is not None:
+            observer(frame)
+            return
         if call.call_index == (1 << 32) - 1 and frame.get("kind") == "progress":
             frame = {
                 "kind": "log",
