@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import socket
 from pathlib import Path
 
@@ -14,7 +15,13 @@ from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._capture import ExecutionObservation
 from cozy_runtime.author.publication import CheckpointRef
-from cozy_runtime.internal import census_cache, derive_child, effect_interfaces, source_interfaces
+from cozy_runtime.internal import (
+    census_cache,
+    derive_child,
+    effect_interfaces,
+    source_interfaces,
+    witness,
+)
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.seam import Channel
 
@@ -152,3 +159,12 @@ def test_a_torn_census_entry_is_a_miss(tmp_path: Path) -> None:
     entry = tmp_path / "census.json"
     entry.write_bytes(b'{"format": ')
     assert census_cache._read(entry) is None
+
+
+def test_witness_logs_from_other_versions_keep_their_known_rows(tmp_path: Path) -> None:
+    log = tmp_path / "witness" / "events.jsonl"
+    log.parent.mkdir()
+    death = dict.fromkeys(witness._EVENT_FIELDS["death"], 0) | {"event": "death", "future": 1}
+    rows = [json.dumps({"event": "future_kind"}), json.dumps(death), '{"event": "de']
+    log.write_text("\n".join(rows))
+    assert witness.read_death(tmp_path)["future"] == 1
