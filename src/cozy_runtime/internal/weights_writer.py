@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 
+import tensorfs
+
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal import storage_admission
 from cozy_runtime.internal.seam import DescriptorReply
@@ -33,6 +35,11 @@ if TYPE_CHECKING:
 
 _TRANSACTION = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CHUNK = 1 << 20
+
+
+def declaration_bound() -> int:
+    """A declaration grows with the tensors it declares; TensorFS bounds its own documents."""
+    return int(tensorfs.manifest_max_bytes())
 
 
 class ExecutionStorage:
@@ -73,7 +80,7 @@ class ExecutionStorage:
         length = _write(
             exchange_file(self.spool, output_slot, "derivation"),
             io.BytesIO(data),
-            weights_limits.MAX_WEIGHTS_DECLARATION_BYTES,
+            declaration_bound(),
         )
         answer = self._call("output", output_slot=output_slot, length=length, descriptor=True)
         writer = DerivedTransaction.accept(answer["descriptor"])
@@ -376,7 +383,7 @@ class WriterBroker:
         with _read(
             exchange_file(attempt.spool, slot, "derivation"),
             int(frame["length"]),
-            weights_limits.MAX_WEIGHTS_DECLARATION_BYTES,
+            declaration_bound(),
         ) as source:
             args = self._arguments(attempt, slot, json.load(source))
         fingerprint = attempt.weights_work_fingerprint

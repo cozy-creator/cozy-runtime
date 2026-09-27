@@ -309,20 +309,17 @@ class WeightsExchange:
                 raise WeightsExchangeError(
                     "weights_checkpoint_scope", "checkpoint validation exceeds its bound"
                 )
+            # Omitted bytes name the declaration by reference: the subject's digest
+            # already binds the journaled declaration, whatever its size.
+            declaration = request.tensorfs_declaration_canonical_bytes or None
             row = self._checkpoint_pending(
-                intent,
-                subject,
-                attempt_ordinal=intent.attempt_ordinal,
-                declaration=request.tensorfs_declaration_canonical_bytes,
+                intent, subject, attempt_ordinal=intent.attempt_ordinal, declaration=declaration
             )
             if intent.HasField("checkpoint"):
                 assert self.workspace is not None
                 self.workspace._validate_checkpoint(row, intent.checkpoint)
             self._checkpoint_pending(
-                intent,
-                subject,
-                attempt_ordinal=intent.attempt_ordinal,
-                declaration=request.tensorfs_declaration_canonical_bytes,
+                intent, subject, attempt_ordinal=intent.attempt_ordinal, declaration=declaration
             )
             result.valid = True
         except Exception as exc:
