@@ -14,8 +14,9 @@ import ssl
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
@@ -31,8 +32,10 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 _MAX_METADATA = 8 << 20
-# Bound sockets and issue only grants that can start immediately, below Hub's 128-id limit.
-_PUBLICATION_UPLOADS = 8
+# Pushes in flight. Each finished push starts the next; grants are fetched ahead in
+# batches (Hub allows 128 ids) small enough that a queued grant starts well before it expires.
+_PUBLICATION_UPLOADS = 16
+_GRANT_BATCH = 32
 
 
 class PublicationRefusal(Exception):
@@ -497,71 +500,77 @@ def upload_checkpoint(
             held_count += 1
             landed(held_count)
 
-    # Every native push finishes before this scope exits, including after a failed
-    # sibling, so the caller's retained native lease outlives all in-flight bytes.
-    with ThreadPoolExecutor(max_workers=_PUBLICATION_UPLOADS) as pool:
-        for offset in range(0, len(pending), _PUBLICATION_UPLOADS):
-            selected = pending[offset : offset + _PUBLICATION_UPLOADS]
-            before_stage()
-            granted = _object(
-                client.request(
-                    "POST", path + "/grants", canonical_json.encode({"object_ids": selected})
-                )
+    def granted(selected: list[str]) -> list[tuple[str, int, str]]:
+        """Validate one complete grants answer before spending any of its grants."""
+        nonlocal held_count
+        before_stage()
+        body = canonical_json.encode({"object_ids": selected})
+        answer = _object(client.request("POST", path + "/grants", body))
+        grants, held = answer.get("grants"), answer.get("held")
+        # Go's empty slices may be JSON null; they still represent zero rows.
+        grants = [] if grants is None else grants
+        held = [] if held is None else held
+        if not isinstance(grants, list) or not isinstance(held, list):
+            raise PublicationRefusal("publication.response_invalid")
+        seen: set[str] = set()
+        for item in grants + held:
+            _require(isinstance(item, dict))
+            key = item.get("object_id")
+            _require(isinstance(key, str) and key in selected and key not in seen)
+            _require(item.get("length") == objects[key])
+            seen.add(key)
+        _require(seen == set(selected))
+        for item in held:
+            _require(item.get("state") in {"accepted", "verifying"})
+        uploads: list[tuple[str, int, str]] = []
+        for item in grants:
+            key = item["object_id"]
+            required = {
+                "if-none-match": "*",
+                "x-amz-checksum-sha256": base64.b64encode(bytes.fromhex(key[7:])).decode("ascii"),
+            }
+            _require(item.get("required_headers") == required and isinstance(item.get("url"), str))
+            now, expires = answer.get("server_time_unix"), item.get("expires_at_unix")
+            _require(
+                type(now) is int and type(expires) is int and expires > now,
+                "publication.grant_expired",
             )
-            grants, held = granted.get("grants"), granted.get("held")
-            # Go's empty slices may be JSON null; they still represent zero rows.
-            grants = [] if grants is None else grants
-            held = [] if held is None else held
-            if not isinstance(grants, list) or not isinstance(held, list):
-                raise PublicationRefusal("publication.response_invalid")
-            seen: set[str] = set()
-            uploads: list[tuple[str, int, str]] = []
-            for item in grants + held:
-                _require(isinstance(item, dict))
-                key = item.get("object_id")
-                _require(isinstance(key, str) and key in selected and key not in seen)
-                _require(item.get("length") == objects[key])
-                seen.add(key)
-            _require(seen == set(selected))
-            for item in held:
-                _require(item.get("state") in {"accepted", "verifying"})
-            if held:
-                with count_lock:
-                    held_count += len(held)
-                    landed(held_count)
-            for item in grants:
-                key = item["object_id"]
-                required = {
-                    "if-none-match": "*",
-                    "x-amz-checksum-sha256": base64.b64encode(bytes.fromhex(key[7:])).decode(
-                        "ascii"
-                    ),
-                }
-                _require(
-                    item.get("required_headers") == required and isinstance(item.get("url"), str)
-                )
-                now, expires = granted.get("server_time_unix"), item.get("expires_at_unix")
-                _require(
-                    type(now) is int and type(expires) is int and expires > now,
-                    "publication.grant_expired",
-                )
-                uploads.append(
-                    (
-                        key,
-                        objects[key],
-                        "\n".join(
-                            [item["url"], *(f"{name}: {value}" for name, value in required.items())]
-                        ),
-                    )
-                )
-            # Validate the complete response before spending any grant. A failed
-            # push leaves the same frozen operation for ordinary remote readback.
-            futures = []
-            for upload in uploads:
-                before_stage()
-                futures.append(pool.submit(pushed, *upload))
-            for future in futures:
-                future.result()
+            headers = (f"{name}: {value}" for name, value in required.items())
+            uploads.append((key, objects[key], "\n".join([item["url"], *headers])))
+        if held:
+            with count_lock:
+                held_count += len(held)
+                landed(held_count)
+        return uploads
+
+    # A sliding window: each finished push starts the next granted object, and the next
+    # grant batch is fetched while pushes run. A failed push stops new pushes; the Hub
+    # re-grants only what is still missing when the same operation is retried. Every
+    # push finishes before this scope exits, so the caller's native lease outlives it.
+    queued: deque[tuple[str, int, str]] = deque()
+    running: set[Future[None]] = set()
+    failure: BaseException | None = None
+    offset = 0
+    with ThreadPoolExecutor(max_workers=_PUBLICATION_UPLOADS) as pool:
+        while True:
+            if failure is None:
+                if len(queued) < _PUBLICATION_UPLOADS and offset < len(pending):
+                    selected = pending[offset : offset + _GRANT_BATCH]
+                    offset += len(selected)
+                    queued.extend(granted(selected))
+                while queued and len(running) < _PUBLICATION_UPLOADS:
+                    before_stage()
+                    running.add(pool.submit(pushed, *queued.popleft()))
+            if not running:
+                if failure is not None:
+                    raise failure
+                if offset >= len(pending) and not queued:
+                    break
+                continue
+            done, running = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                if failure is None:
+                    failure = future.exception()
     before_write()
     try:
         answer = _object(
