@@ -65,6 +65,24 @@ class FinalHiddenState:
         return SimpleNamespace(hidden_states={_RETAINED_LAYERS: outputs.last_hidden_state})
 
 
+class PresentationLength(FinalHiddenState):
+    """The conditioner as the text block calls it, running nothing: the block's own
+    tokenization of the presentation is the whole answer an early length reader needs, so the
+    call returns a shape on `meta` and no weight is touched (h3a-087)."""
+
+    _hf_hook = None
+
+    @property
+    def device(self) -> Any:
+        return torch.device("meta")
+
+    def model(self, **kwargs: Any) -> Any:
+        ids = kwargs["input_ids"]
+        return SimpleNamespace(
+            hidden_states={_RETAINED_LAYERS: torch.empty((*ids.shape, 1), device="meta")}
+        )
+
+
 def text_conditioner_config() -> dict[str, object]:
     """The closed artifact extension, shared by fixtures and production publishers."""
     return {

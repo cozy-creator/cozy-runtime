@@ -256,6 +256,11 @@ class Serving:
         )
         tensorfs = fill.tensorfs_module()
         token = tensorfs.PullCancellation()
+        # The callee's process starts while its weights download, or while a hinted
+        # download already runs (h3a-087). A slot never reserves a GPU and yields to others.
+        self.worker.prespawns.request(
+            owner, call.parent_request, target, lambda frame: self._progress(call, request, frame)
+        )
 
         def load(cancelled: Callable[[], bool]) -> Prepared:
             try:

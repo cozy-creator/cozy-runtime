@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,3 +54,18 @@ def attention_scope(layout: AttentionLayout) -> Iterator[None]:
         yield
     finally:
         _ACTIVE_LAYOUT.reset(token)
+
+
+#: What the runtime does with an early length statement; the executor's attention installs it.
+_EXPECTED: list[Callable[[int, Any], None]] = []
+
+
+def expect_attention(live_tokens: int, module: Any) -> None:
+    """State, before inference reaches it, the live document length `module`'s attention sites
+    will see, so a kernel specialized on that length can start preparing now (h3a-087).
+
+    Advisory only: the layout each forward supplies stays the authority, and a wrong length
+    costs a wasted background compile, never an output."""
+    if type(live_tokens) is int and live_tokens > 0:
+        for listener in _EXPECTED:
+            listener(live_tokens, module)

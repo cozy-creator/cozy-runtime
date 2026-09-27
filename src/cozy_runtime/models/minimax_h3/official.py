@@ -8,11 +8,14 @@ selects the official FULL modulation modules or AdaLN-pruned table replacements 
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import math
 import random
 import struct
+import sys
+import threading
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -21,6 +24,7 @@ from fractions import Fraction
 from functools import lru_cache
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import msgspec
@@ -66,10 +70,11 @@ from cozy_runtime.author import (
     Telemetry,
     attention_scope,
     canonical_json,
+    expect_attention,
 )
 
 from .adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
-from .conditioner import FinalHiddenState, build_text_conditioner
+from .conditioner import FinalHiddenState, PresentationLength, build_text_conditioner
 from .continuation import (
     CONTEXT_FRAMES,
     AVContext,
@@ -1086,7 +1091,7 @@ class OfficialH3Pipeline:
         # With no anchor, state the official default canvas. With an anchor, leaving the
         # dimensions absent makes the first supplied keyframe the geometry authority.
         height, width = (768, 1344) if first_frame is None and last_frame is None else (None, None)
-        return self._start(
+        state = self._start(
             _trunk_task(task, "fl2va"),
             prompt=prompt,
             generator=generator,
@@ -1097,6 +1102,8 @@ class OfficialH3Pipeline:
             height=height,
             width=width,
         )
+        self._expect(task, state)
+        return state
 
     def start_ref2va(
         self,
@@ -1143,6 +1150,7 @@ class OfficialH3Pipeline:
             )
         state.set("continuation_context", context)
         state.set("continuation_delivery", delivery)
+        self._expect(task, state)
         return state
 
     def _start(
@@ -1192,6 +1200,84 @@ class OfficialH3Pipeline:
             if edges is not None:
                 edges.settle()
         return state
+
+    def expected_live_tokens(self, task: Task, state: Any) -> int | None:
+        """The packed length this request's DiT will attend over, read at intake (h3a-087).
+
+        The workflow's own text block tokenizes the presentation beside a conditioner that
+        only counts (`PresentationLength`), and its own layout block packs it, all on `meta`.
+        The one input not yet known is each reference's latent block, sized here by the video
+        VAE's grid exactly as `condition_media` will encode it; an audio-bearing public
+        reference, whose rows are the audio VAE's own count, answers None.
+        """
+        workflow = self._workflow(task, state)
+        pipe, blocks = self._pipes[workflow], self._blocks[workflow].sub_blocks
+        scratch = PipelineState(
+            dict(state.values), {k: list(v) for k, v in state.kwargs_mapping.items()}
+        )
+        shell = SimpleNamespace(device=torch.device("meta"))
+        counted = PresentationLength(self.components["text_encoder"])
+        blocks["text_encoder"](
+            _ScopedPipeline(pipe, shell, overrides={"text_encoder": counted}), scratch
+        )
+        if _TRUNK[task] == "ref2va":
+            references = list(scratch.get("normalized_references"))
+            if any(reference.has_audio for reference in references):
+                return None
+            video, audio = [], []
+            for reference in references:
+                if reference.kind == "image":
+                    width, height = reference.image.size
+                    frames = 1
+                else:
+                    count, height, width = reference.frames.shape[:3]
+                    snapped = (
+                        max(1, (count - LATENTS_PER_CHUNK) // FRAMES_PER_CHUNK) * FRAMES_PER_CHUNK
+                        + LATENTS_PER_CHUNK
+                    )
+                    frames = video_latent_num_frames(snapped, FRAMES_PER_CHUNK, LATENTS_PER_CHUNK)
+                video.append(
+                    torch.empty(
+                        (1, 1, frames, height // VAE_SPATIAL_RATIO, width // VAE_SPATIAL_RATIO),
+                        device="meta",
+                    )
+                )
+            context = scratch.get("continuation_context")
+            if context is not None:
+                # `condition_media` appends the completed tail after the public references.
+                video.append(context.video_latents)
+                audio.append(context.audio_latents)
+                references.append(ContextReferenceLayout())
+            scratch.set("normalized_references", references)
+            scratch.set("condition_latents", video)
+            scratch.set("audio_condition_latents", audio)
+        elif "denoise.no_keyframe_anchors" in blocks:
+            blocks["denoise.no_keyframe_anchors"](pipe, scratch)
+        blocks["denoise.prepare_layout"](_ScopedPipeline(pipe, shell), scratch)
+        return int(scratch.get("token_tags").numel())
+
+    def _expect(self, task: Task, state: Any) -> None:
+        """Tell the runtime this request's attention length while conditioning runs, so a
+        length-specialized kernel starts preparing now. Off the request's thread (tokenizing
+        the references' vision blocks is ~0.4 s at their 2048-pixel edge) and advisory:
+        nothing here may fail a request, and a wrong answer only costs a background compile."""
+        snapshot = PipelineState(
+            dict(state.values), {k: list(v) for k, v in state.kwargs_mapping.items()}
+        )
+        dit = self.components[_DIT_COMPONENT[_TRUNK[task]]]
+
+        def state_length() -> None:
+            try:
+                tokens = self.expected_live_tokens(task, snapshot)
+            except Exception as exc:
+                print(f"[minimax-h3] no intake attention length: {exc!r}"[:300], file=sys.stderr)
+                return
+            if tokens is not None:
+                expect_attention(tokens, dit)
+
+        # The copied context carries the request's observation scope to the kernel rows.
+        runner = contextvars.copy_context().run
+        threading.Thread(target=runner, args=(state_length,), daemon=True).start()
 
     def condition_text(
         self, task: Task, state: Any, *, checks: NumericalChecks | None = None

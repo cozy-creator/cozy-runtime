@@ -15,6 +15,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -162,6 +163,7 @@ def test_machine_namespaces_under_one_uid(tmp_path: Path) -> None:
     assert environment == {
         kernel_cache.OWN_ENV: str(own),
         "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": str(own / "flash-attn4"),
+        "TRITON_CACHE_DIR": str(own / "triton"),
     }
     assert root.stat().st_mode & 0o777 == 0o711 and own.stat().st_mode & 0o777 == 0o755
     store = kernel_cache.from_sealed(environment)
@@ -289,6 +291,45 @@ def test_fa4_second_process_loads_from_its_persistent_cache(tmp_path: Path) -> N
     second = json.loads(_run(code, str(tmp_path / "fa1.pt"), env=env).stdout.splitlines()[-1])
     assert first["compiles"] >= 1 and second["compiles"] == 0
     assert torch.equal(torch.load(tmp_path / "fa0.pt"), torch.load(tmp_path / "fa1.pt"))
+
+
+def test_a_triton_kernel_compiles_once_per_machine(tmp_path: Path) -> None:
+    """Triton's cache is in the machine store's namespace, so a later process (another
+    executor, a later boot) loads what an earlier one compiled and compiles nothing."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("triton")
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    env = jit_cache.machine(tmp_path / "var/lib/cozy/kernels")
+    cache = Path(env["TRITON_CACHE_DIR"])
+    code = """
+        import json, sys, torch, triton, triton.language as tl
+
+        @triton.jit
+        def double(x, y, n, BLOCK: tl.constexpr):
+            offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+            tl.store(y + offsets, 2 * tl.load(x + offsets, mask=offsets < n), mask=offsets < n)
+
+        x = torch.arange(1000, device="cuda", dtype=torch.float32)
+        y = torch.empty_like(x)
+        double[(8,)](x, y, 1000, BLOCK=128)
+        print(json.dumps({"sum": float(y.sum())}))
+    """
+    script = tmp_path / "double.py"  # Triton reads a kernel's source from its file
+    script.write_text(textwrap.dedent(code))
+
+    def run() -> Any:
+        done = subprocess.run(
+            [sys.executable, str(script)], env={**os.environ, **env}, capture_output=True, text=True
+        )
+        assert done.returncode == 0, done.stderr[-2000:]
+        return json.loads(done.stdout.splitlines()[-1])
+
+    first = run()
+    entries = sorted(path.name for path in cache.iterdir())
+    second = run()
+    assert first == second == {"sum": 999000.0}
+    assert entries and sorted(path.name for path in cache.iterdir()) == entries
 
 
 def test_background_builder_publishes_under_the_inherited_lock(tmp_path: Path) -> None:

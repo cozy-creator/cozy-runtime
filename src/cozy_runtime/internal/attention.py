@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -24,6 +25,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from cozy_runtime.author._attention import AttentionContext
+from cozy_runtime.author._attention_scope import _EXPECTED
 from cozy_runtime.internal import attention_sol, attention_ulysses, kernel_site
 from cozy_runtime.internal import attention_upstream as upstream
 from cozy_runtime.internal.attention_ulysses import Local
@@ -793,8 +795,92 @@ def _snapshot_artifact(location: str) -> dict[str, Any]:
     }
 
 
+#: Each kernel's probe verdict, proven once per (kernel, device, kernel site, registered
+#: implementation): all fixed for the process's life. The startup warm (`warm`) fills it
+#: before the first request, so construction and a request's pin check read it instead of
+#: probing again. Presence refusals are cheap and asked again.
+_PROVEN: dict[tuple[Any, ...], Ready | AttentionRefusal] = {}
+_VERDICTS = frozenset({"attention_kernel_wrong", "attention_kernel_out_of_budget"})
+
+
+def _proof_key(candidate: Candidate, device: DeviceFacts) -> tuple[Any, ...] | None:
+    try:
+        served = _registry()._backends.get(_member(candidate))
+    except Exception:
+        return None  # nothing is registered to prove; `_prove` refuses with the reason
+    return (candidate, device, kernel_site.current(), served)
+
+
 def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     """One candidate, proven present here AND proven to compute, or a typed refusal."""
+    key = _proof_key(candidate, device)
+    if key is None:
+        return _prove(candidate, device)
+    known = _PROVEN.get(key)
+    if isinstance(known, AttentionRefusal):
+        raise known
+    if known is None:
+        try:
+            known = _PROVEN[key] = _prove(candidate, device)
+        except AttentionRefusal as exc:
+            if exc.code in _VERDICTS:
+                _PROVEN[key] = exc
+            raise
+    return known
+
+
+def warm(device: DeviceFacts, preferred: Sequence[str] = ()) -> list[dict[str, Any]]:
+    """Prove, before any construction exists, what this device's first construction will
+    select: the model's preference walk up to its first kernel that serves, then the ranked
+    table `available` resolves. One row per kernel: its verdict and what proving it cost."""
+    rows: list[dict[str, Any]] = []
+
+    def one(candidate: Candidate) -> bool:
+        started = time.perf_counter()
+        held = _proof_key(candidate, device) in _PROVEN
+        try:
+            _resolve(candidate, device)
+            status = "ready"
+        except Exception as exc:
+            status = str(getattr(exc, "code", type(exc).__name__))
+        rows.append(
+            {
+                "kernel": candidate.name,
+                "status": status,
+                "ms": round((time.perf_counter() - started) * 1000, 1),
+                **({"held": True} if held else {}),
+            }
+        )
+        return status == "ready"
+
+    for name in preferred:
+        candidate = BY_NAME.get(name)
+        if candidate is not None and not _device_admits(candidate, device) and one(candidate):
+            break
+    done = {row["kernel"] for row in rows}
+    for candidate in for_device(device):
+        if candidate.name not in done:
+            one(candidate)
+    return rows
+
+
+def _expected(live_tokens: int, module: Any) -> None:
+    """A model's early length statement reaches Sol when a Sol site serves `module`."""
+    if "sol-attn" not in observed({"": module}).totals():
+        return
+    import torch
+
+    device = next((p.device for p in module.parameters() if p.device.type != "meta"), None)
+    if device is None and torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+    if device is not None:
+        attention_sol.expect(live_tokens, device)
+
+
+_EXPECTED.append(_expected)
+
+
+def _prove(candidate: Candidate, device: DeviceFacts) -> Ready:
     _admit_arch(candidate, _baked_archs(candidate), device)
     registry = _registry()
     module = _import(candidate) if candidate.distribution else None

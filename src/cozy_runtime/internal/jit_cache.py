@@ -96,7 +96,8 @@ def remove_pod(cozy_home: Path, pod_scope: str) -> None:
 
 
 def machine(root: Path, *, uid: int = -1, gid: int = -1) -> dict[str, str]:
-    """The executor's namespaces of the persistent kernel store, and FA4's cache inside its own.
+    """The executor's namespaces of the persistent kernel store, and FA4's and Triton's caches
+    inside its own.
 
     Unlike the boot scope above, nothing here is deleted: entries are keyed by every compile
     input, so a worker restart, a new package version or a Runtime update reads them as it
@@ -126,6 +127,10 @@ def machine(root: Path, *, uid: int = -1, gid: int = -1) -> dict[str, str]:
     environment = {
         kernel_cache.OWN_ENV: str(own),
         "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": str(own / "flash-attn4"),
+        # Triton keys every entry by kernel source, constants, target and its own version, so
+        # a shape compiled once (Sol's per-length preprocess, a package's kernels) serves the
+        # machine's later executors and boots too (owner, 2026-09-27).
+        "TRITON_CACHE_DIR": str(own / "triton"),
     }
     if own != worker:
         environment[kernel_cache.TRUSTED_ENV] = str(worker)

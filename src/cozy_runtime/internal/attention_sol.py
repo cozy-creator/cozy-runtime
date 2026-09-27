@@ -5,10 +5,11 @@ protected query rows are recomputed with the selected dense reference. The
 model supplies its live layout, step policy and dense module paths explicitly.
 
 The kernel compiles at most once per key per machine (h3a-087). Upstream's SM90 kernel is
-specialized on the live token count, which only the request knows, so the first dense step
-that sees a count starts a niced, GPU-less builder for it and the dense steps cover the
-compile; the first sparse call then loads the object from the machine kernel store, or waits
-on the builder's lock, never switching kernels. Upstream's preprocess autotuning is pinned to
+specialized on the live token count, which only the request knows, so the model's intake
+statement (`expect`), or else the first dense step that sees a count, starts a niced, GPU-less
+builder for it and conditioning and the dense steps cover the compile; the first sparse call
+then loads the object from the machine kernel store, or waits on the builder's lock, never
+switching kernels. Upstream's preprocess autotuning is pinned to
 one configuration, because its candidates differ bitwise and a timing race must not choose
 the output.
 """
@@ -309,6 +310,12 @@ def _prefetch(tokens: int, kv_splits: int, device: Any, step: int) -> None:
                 "detail": f"{type(exc).__name__}: {exc}"[:300],
             }
         )
+
+
+def expect(tokens: int, device: Any) -> None:
+    """A model stated its live length at request intake: start that count's kernel now, a
+    whole text conditioning ahead of the first dense step. Its row carries step -1."""
+    _prefetch(tokens, 1, device, -1)
 
 
 def builder_command(

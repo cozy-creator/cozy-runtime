@@ -85,6 +85,7 @@ from cozy_runtime.internal.worker import (
     model_source_prepare,
     observe,
     page_warm,
+    prespawn,
     store_gc,
     triage,
     weights,
@@ -1199,6 +1200,7 @@ class Worker:
 
         self.machine_calls = MachineCalls(self) if self.workspace is not None else None
         self.gpu = GpuScheduler(len(self.lanes.entries))
+        self.prespawns = prespawn.Prespawns(self)
         self._gpu_shapes: dict[str, machine_lanes.Shape] = {}
         self._dead_replicas: dict[str, child.Executor] = {}
         self._activating: dict[str, threading.Thread] = {}
@@ -1329,8 +1331,11 @@ class Worker:
                 return uid
         raise RuntimeError("executor slot uid range exhausted")
 
-    def _new_placement_supervision(self, placement_id: str) -> ExecutorSupervision:
-        """Create the one executor slot owned by an additional package placement."""
+    def _new_placement_supervision(
+        self, placement_id: str, *, uid_key: str = ""
+    ) -> ExecutorSupervision:
+        """Create the one executor slot owned by an additional package placement. `uid_key`
+        names whose executor uid it runs as, when that is not the placement's own."""
 
         key = hashlib.sha256(placement_id.encode()).hexdigest()[:24]
         supervision = ExecutorSupervision(
@@ -1338,7 +1343,7 @@ class Worker:
             python=self.options.python or sys.executable,
             base_env=self.config.child_base_env,
             cozy_home=self.config.cozy_home,
-            executor_uid=self._slot_executor_uid(placement_id),
+            executor_uid=self._slot_executor_uid(uid_key or placement_id),
             executor_gid=self.options.executor_gid,
             jit_pod_scope=f"{self.fence.worker_boot_id}-{key}",
             kernel_cache=self.config.kernel_cache,
@@ -2480,7 +2485,9 @@ class Worker:
             demands.append(
                 Demand(key, shape.root, width, self._warm(shape.template), tuple(sorted(exclude)))
             )
-        grants = self.gpu.sync(self.executions.scheduling_roots(owner), demands)
+        roots = self.executions.scheduling_roots(owner)
+        grants = self.gpu.sync(roots, demands)
+        self.prespawns.reconcile(roots, self.gpu.view())
         for root, event, body in self.gpu.drain():
             with contextlib.suppress(WorkspaceRefusal):
                 self.executions.record(owner, root, event, body)
@@ -2498,7 +2505,8 @@ class Worker:
         return pb.MachineExecutionGpu(**self.gpu.status(request, on_device))
 
     def _warm(self, template: tuple[str, str]) -> tuple[int, ...]:
-        """Ordinals where a replica of this template is resident, so a grant reuses it."""
+        """Ordinals where a replica of this template is resident, or where its installation's
+        process was started beside the download, so a grant reuses it."""
         placements = [self.placement, *(hosted.placement for hosted in self.hosted.values())]
         return tuple(
             sorted(
@@ -2511,6 +2519,7 @@ class Worker:
                     == template
                     for ordinal in placement.device_pin or ()
                 }
+                | set(self.prespawns.ordinals(template[0]))
             )
         )
 
@@ -2688,7 +2697,16 @@ class Worker:
         machine_capture.restore(self, preparation)
         placement = self._placement_from_entry(row, desired.placement_set.placement_set_digest)
         placement.device_pin = pin
-        hosted = HostedPlacement(placement, self._new_placement_supervision(placement_id))
+        # The process started beside this replica's download (h3a-087), when there is one.
+        warm = self.prespawns.claim(placement.installation_id, pin or ())
+        supervision = (
+            warm.supervision
+            if warm is not None
+            else self._new_placement_supervision(
+                placement_id, uid_key=prespawn.uid_key(placement.installation_id, pin or ())
+            )
+        )
+        hosted = HostedPlacement(placement, supervision)
         self.hosted[placement_id] = hosted
         job = self.accepted.mode == "job"
         if job:
@@ -2696,7 +2714,7 @@ class Worker:
             self.lanes.envelope.forget("")
             self.job_slots.pop("envelope", None)
         self.accepted.mode = "serving"
-        self._lifecycle(placement_id, self._activate_replica, hosted, job)
+        self._lifecycle(placement_id, self._activate_replica, hosted, job, warm)
         return False
 
     def _lifecycle(self, placement_id: str, body: Callable[..., Any], *args: Any) -> None:
@@ -2707,9 +2725,13 @@ class Worker:
         self._activating[placement_id] = thread
         thread.start()
 
-    def _activate_replica(self, hosted: HostedPlacement, job: bool) -> None:
+    def _activate_replica(
+        self, hosted: HostedPlacement, job: bool, warm: prespawn.Slot | None = None
+    ) -> None:
         """Acquire, bind and start this replica's executor; a device job's leaves first."""
         try:
+            if warm is not None:
+                self.prespawns.settle(warm, hosted.placement.placement_id)
             current = self.supervision.current
             if job and current is not None:
                 self.supervision.retire_current(current, "a machine replica takes the devices")
@@ -7949,6 +7971,7 @@ class Worker:
             if supervision.current is not None
         ]
         self.request_stop()
+        self.prespawns.close()
         if self.machine_calls is not None:
             self.machine_calls.close()
         if self.machine_effects is not None:
