@@ -66,7 +66,7 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._model import Model, _derive_model
+from cozy_runtime.author._model import Model, _derive_model, component_use
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.internal import (
@@ -88,7 +88,7 @@ from cozy_runtime.internal import (
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.parallel import cp, wire
+from cozy_runtime.internal.parallel import cp, mirror, wire
 from cozy_runtime.internal.parallel.group import (
     RankGroup,
     RankSpec,
@@ -580,6 +580,8 @@ class Executor:
         self.models: dict[str, Any] = {}
         self.group_components: dict[tuple[str, str], tuple[Any, Any]] = {}
         self.group_sharded: set[tuple[str, str]] = set()
+        #: component -> the follower rank that keeps it resident for the whole group
+        self.group_hosted: dict[tuple[str, str], int] = {}
         #: the many-model construction this per-model generation belongs to, if any
         self._group_parent: Executor | None = None
         self._group_model_key = ""
@@ -768,7 +770,8 @@ class Executor:
         return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
 
     def run(self, command: dict[str, Any]) -> dict[str, Any]:
-        """Run a prepared sharded component under its leader's scope and execution modes."""
+        """Run a prepared sharded component, or one this rank hosts, under its leader's
+        scope and execution modes. A hosted call's result returns through the spool."""
         if self.rank == 0:
             return {
                 "ok": False,
@@ -792,7 +795,8 @@ class Executor:
             }
         name = (named[0], named[1])
         target = self.group_components.get(name)
-        if target is None or name not in self.group_sharded:
+        hosted = self.group_hosted.get(name) == self.rank
+        if target is None or not (hosted or name in self.group_sharded):
             self.poisoned = "mirrored call names no prepared sharded component"
             return {
                 "ok": False,
@@ -802,6 +806,7 @@ class Executor:
             }
         _model, component = target
         sol_counts: dict[str, int] = {}
+        result: Any = None
         models = {key[0]: model for key, (model, _root) in self.group_components.items()}
         started_us = execution_evidence.now_us()
         try:
@@ -832,8 +837,11 @@ class Executor:
                         raise GroupRefusal("mirrored scope names no prepared component")
                     residency = models[key]._cozy_residency
                     if residency is not None and self._group_attempts.get(key) != spool:
+                        # A rank that hosts a component holds a set rank 0's plan never
+                        # priced, so it may always make room: demand-pull when measured.
+                        homes = any(rank == self.rank for rank in self.group_hosted.values())
                         residency.open_attempt(
-                            scope["placement"],
+                            "component_staged" if homes else scope["placement"],
                             scope["headroom_bytes"],
                             scope["scope_headroom_bytes"],
                             tuple(scope.get("measured_scopes") or ()),
@@ -851,7 +859,8 @@ class Executor:
                 # Stage the same scopes before allocating the incoming activations.
                 stack.enter_context(self.torch.inference_mode(command["inference_mode"]))
                 stack.enter_context(self.torch.set_grad_enabled(command["grad_enabled"]))
-                stack.enter_context(cp.gated_call())
+                if not hosted:
+                    stack.enter_context(cp.gated_call())
                 stack.enter_context(wire.attention_context(command))
                 sol_counts = stack.enter_context(attention_sol.observing())
                 served = stack.enter_context(attention_ulysses.observing())
@@ -860,7 +869,22 @@ class Executor:
                     wire.TensorSpool(spool / "ranks", references),
                     device=self._rank_device(self.torch),
                 )
-                component(*args, **kwargs)
+                if hosted:
+                    plane = models[name[0]]._cozy_residency
+                    call = component.get_submodule(str(command.get("module", "")))
+                    try:
+                        output = call(*args, **kwargs)
+                    except accel.oom_error(self.torch, self.device_kind):
+                        # The call has no effect beside its result: free what the scope
+                        # does not hold and run it once more before refusing.
+                        if plane is None:
+                            raise
+                        plane.shed()
+                        accel.release_cached(self.torch, self.device_kind)
+                        output = call(*args, **kwargs)
+                    result = wire.marshal(output, wire.TensorSpool(spool / "hosted"))
+                else:
+                    component(*args, **kwargs)
                 accel.synchronize(self.torch, self.device_kind)
             self._attempt_spool = spool
             moved = sum(
@@ -886,6 +910,7 @@ class Executor:
             "component": list(name),
             "sol_calls": sol_counts,
             "working_peak_bytes": working,
+            **({"result": result} if hosted else {}),
             "evidence": execution_evidence.record(
                 self.rank,
                 self._rank_identity(),
@@ -905,8 +930,9 @@ class Executor:
             self.group.close()
         return {"ok": False, "code": exc.code, "detail": exc.message[:900]}
 
-    def _install_group(self, torch: Any, model: Any) -> dict[str, Any] | None:
-        """Every rank shards its replica and takes its side of the mirror."""
+    def _install_group(self, torch: Any, model: Any, budget: int = 0) -> dict[str, Any] | None:
+        """Every rank shards its replica, takes its side of the mirror, and agrees which
+        follower keeps each placeable component that rank 0 has no room for."""
         if self.world <= 1:
             return None
         owner = self.host
@@ -944,10 +970,42 @@ class Executor:
                         and _cancelled(owner.root, owner._attempt_request)
                     ),
                 )
+        hosted = mirror.hosting_plan(
+            placeable=tuple(getattr(type(model), "__placeable__", ())),
+            sizes={
+                name: int(getattr(self.backend, "component_bytes", {}).get(name, 0))
+                for name in roots
+            },
+            sharded={name[1] for name in owner.group_sharded if name[0] == self._group_model_key},
+            scopes=component_use(type(model)),
+            budget=budget,
+            world=self.world,
+        )
+        for component_name, home in hosted.items():
+            name = (self._group_model_key, component_name)
+            owner.group_hosted[name] = home
+            if self.rank != home and self.residency is not None:
+                self.residency.host(component_name)
+            if self.rank == 0:
+                assert self.group is not None
+                mirror.host_component(
+                    roots[component_name],
+                    name=name,
+                    prepared=owner.group_components,
+                    group=self.group,
+                    spool=lambda: owner._attempt_spool,
+                    rank=home,
+                    device=self._rank_device(torch),
+                    cancelled=lambda: (
+                        bool(owner._attempt_request)
+                        and _cancelled(owner.root, owner._attempt_request)
+                    ),
+                )
         self.facts["sequence_parallel"] = {
             "degree": self.world,
             "rank": self.rank,
             "components": list(installed),
+            "hosted": hosted,
             "followers": list(self.group.pids()) if self.group is not None else [],
         }
         return None
@@ -1452,6 +1510,9 @@ class Executor:
             for name in [name for name in self.group_components if name[0].startswith(prefix)]:
                 del self.group_components[name]
             self.group_sharded = {n for n in self.group_sharded if not n[0].startswith(prefix)}
+            self.group_hosted = {
+                n: r for n, r in self.group_hosted.items() if not n[0].startswith(prefix)
+            }
             for member in (*members, child):
                 member.models.clear()
                 member.prepared.clear()
@@ -2277,7 +2338,7 @@ class Executor:
             if refused is not None:
                 return refused
         self.facts = {}
-        refused = self._install_group(torch, model)
+        refused = self._install_group(torch, model, resident_budget)
         if refused is not None:
             return refused
         stage("install")
@@ -2285,7 +2346,9 @@ class Executor:
         # Preserve what the construction actually fitted before those temporary moves:
         # the worker must restore that set, not treat warm's last scope as a capacity floor.
         constructed_resident = dict(backend.vram_charge)
-        construction_parked = sorted(set(backend.parked) | set(backend.paging))
+        # A component another rank hosts is not this rank's to hold, restore or price.
+        hosted = self.residency.hosted if self.residency is not None else frozenset()
+        construction_parked = sorted((set(backend.parked) | set(backend.paging)) - hosted)
         # THE AUTHOR'S ONE WARM MOMENT (cr-110, model-lifecycle.md): after the fill, its
         # verification, the execution plan, the residency install and the group mirror;
         # before this generation is Ready, so a placement is never DISPATCHABLE over a cold
@@ -2369,7 +2432,11 @@ class Executor:
             # WITH THEIR SIZES, like the residency document's `evicted`: a parked component
             # is a component the next attempt may have to bring back, and a chooser that
             # sees its name and not its bytes prices that stage-in at nothing.
-            "evicted": {name: backend.component_bytes.get(name, 0) for name in backend.parked},
+            "evicted": {
+                name: backend.component_bytes.get(name, 0)
+                for name in backend.parked
+                if name not in hosted
+            },
             "resident_budget_bytes": resident_budget,
             "authorized_device_limit_bytes": authorized,
             "rss_bytes": _rss(),

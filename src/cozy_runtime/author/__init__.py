@@ -121,6 +121,7 @@ from cozy_runtime.author._model import (
     ModelRegistry,
     ModelTestHarness,
     ScopeCall,
+    placeable,
     sequence_parallel,
     uses_components,
 )
@@ -299,6 +300,7 @@ __all__ = [
     "describe",
     "invocable",
     "invoke",
+    "placeable",
     "prefetch",
     "prepare",
     "publish_release",

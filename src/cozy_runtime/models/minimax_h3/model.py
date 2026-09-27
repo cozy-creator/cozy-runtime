@@ -11,6 +11,7 @@ from cozy_runtime.author import (
     Context,
     Loader,
     Model,
+    placeable,
     sequence_parallel,
     uses_components,
 )
@@ -36,6 +37,7 @@ DIT_ATTENTION: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3", "s
 DIT_COMPONENTS: frozenset[str] = frozenset({"fl2va_dit", "ref2va_dit"})
 
 
+@placeable("text_encoder")
 @sequence_parallel(degrees=(2, 4, 7, 8))
 class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept"):
     """H3 is head-shardable at every divisor of its 56 attention heads up to eight GPUs.
@@ -45,7 +47,9 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
     local rows; only attention exchanges, per head. `EncodedLinear` quantizes per TOKEN with
     rowwise `_scaled_mm` scales, so a row's numbers do not depend on which rank holds it; a
     per-tensor activation scale would be derived from the local shard and is refused by the
-    runtime rather than served. Conditioning, sampling and both VAEs stay on the leader.
+    runtime rather than served. Sampling and both VAEs stay on the leader. The 51.5 GB text
+    conditioner is entered only through module calls, so a group whose leader cannot hold
+    it beside the DiT keeps it resident on a follower instead (`placeable`).
 
     Degrees 2 and 4 reproduce the degree-1 video and audio velocities to 1.2e-7 and 2.4e-7
     max absolute error on this pipeline's own AdaLN-pruned DiT (2026-09-08), which is

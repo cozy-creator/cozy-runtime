@@ -27,7 +27,7 @@ from cozy_runtime.internal import (  # noqa: E402
     spawn,
 )
 from cozy_runtime.internal.executor import Executor  # noqa: E402
-from cozy_runtime.internal.parallel import cp, wire  # noqa: E402
+from cozy_runtime.internal.parallel import cp, mirror, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
@@ -37,7 +37,13 @@ from cozy_runtime.internal.worker.plan import (  # noqa: E402
     PreparedModel,
     PreparedRequest,
 )
-from testdata.parallel_calls import collective_model, h3_batch, h3_model  # noqa: E402
+from testdata.parallel_calls import (  # noqa: E402
+    HOSTED_BUDGET,
+    collective_model,
+    h3_batch,
+    h3_model,
+    hosted_model,
+)
 
 
 @pytest.mark.parametrize(("backend", "degree"), [("cpu", 2), ("cpu", 4), ("cuda", 1)])
@@ -327,6 +333,103 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         ours.close()
         theirs.close()
     assert not torch.distributed.is_initialized()
+
+
+@pytest.mark.parametrize("degree", [2, 4])
+def test_a_placeable_component_runs_on_its_follower(tmp_path: Path, degree: int) -> None:
+    """Rank 0 holds no bytes of a hosted component; its module calls run on the home rank
+    and the result, a transformers model output, comes back identical."""
+    pytest.importorskip("diffusers")
+    fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
+
+    def launch(module_argv: list[str], fd: int) -> spawn.Child:
+        return spawn.spawn_follower(
+            python=sys.executable,
+            module_argv=[str(fixture), *module_argv[2:], "--hosted"],
+            inherit_fd=fd,
+            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        )
+
+    group = RankGroup(degree=degree, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    model: Any = hosted_model()
+    x = torch.randn(3, 4)
+    with torch.no_grad():
+        expected = model.text_encoder.proj(x)
+    ours, theirs = socket.socketpair()
+    leader: Any = Executor(Channel(ours), tmp_path, world=degree)
+    leader.device_kind = "cpu"
+    leader.group = group
+    leader._group_model_key = "fixture"
+    roots = {"dit": model.dit, "text_encoder": model.text_encoder, "vae": model.vae}
+    leader.backend = SimpleNamespace(
+        components=roots, parked={}, component_bytes={"dit": 100, "text_encoder": 60, "vae": 30}
+    )
+    try:
+        group.spawn()
+        group.form(torch, {})
+        leader.pg = group.pg
+        assert leader._install_group(torch, model, HOSTED_BUDGET) is None
+        assert leader.facts["sequence_parallel"]["hosted"] == {"text_encoder": 1}
+        for attempt in ("attempt-a", "attempt-b"):
+            leader._attempt_spool = tmp_path / attempt
+            output = model.encode(x)
+            assert type(output).__name__ == "BaseModelOutputWithPast"
+            assert torch.equal(output.last_hidden_state, expected)
+            assert output.hidden_states[0].tolist() == [group.pids()[0]]
+            assert not list((tmp_path / attempt).rglob("tensor-*.raw"))
+        # A call outside any component scope is refused on rank 0, before a follower sees it.
+        with pytest.raises(cp.UngatedShardedForward):
+            model.text_encoder(x)
+        # The sharded DiT still mirrors to every rank beside the hosted component.
+        batch = h3_batch()
+        with torch.no_grad():
+            model.compute(batch, h3_model().dit(**batch))
+    finally:
+        group.close()
+        ours.close()
+        theirs.close()
+    assert not torch.distributed.is_initialized()
+
+
+def test_hosting_plan_keeps_h3s_text_encoder_on_a_follower_only_when_rank_0_cannot() -> None:
+    sizes = {
+        "text_encoder": 51_506_192_496,
+        "ref2va_dit": 21_105_997_260,
+        "fl2va_dit": 21_105_997_260,
+        "video_vae": 5_570_955_392,
+        "audio_vae": 605_306_340,
+    }
+    scopes = {
+        "condition_text": ("text_encoder",),
+        "condition_ref2va_media": ("video_vae", "audio_vae"),
+        "sample_ref2va": ("ref2va_dit",),
+        "sample_fl2va": ("fl2va_dit",),
+    }
+    plan = {
+        "placeable": ("text_encoder",),
+        "sizes": sizes,
+        "sharded": {"ref2va_dit", "fl2va_dit"},
+        "scopes": scopes,
+    }
+    assert mirror.hosting_plan(**plan, budget=85_017_493_504, world=4) == {"text_encoder": 1}
+    assert mirror.hosting_plan(**plan, budget=85_017_493_504, world=1) == {}
+    # An H200 holds everything on rank 0; nothing moves.
+    assert mirror.hosting_plan(**plan, budget=140_000_000_000, world=2) == {}
+    # A card too small for the conditioner beside a DiT shard keeps staging it on rank 0.
+    assert mirror.hosting_plan(**plan, budget=70_000_000_000, world=4) == {}
+
+
+def test_a_model_output_crosses_the_rank_seam(tmp_path: Path) -> None:
+    outputs = pytest.importorskip("transformers.modeling_outputs")
+    value = outputs.BaseModelOutputWithPast(
+        last_hidden_state=torch.randn(1, 3, 4), hidden_states=(torch.ones(2),)
+    )
+    spool = wire.TensorSpool(tmp_path)
+    restored = wire.unmarshal(wire.marshal(value, spool), spool, device="cpu")
+    assert type(restored) is type(value)
+    assert torch.equal(restored.last_hidden_state, value.last_hidden_state)
+    assert restored.past_key_values is None
+    assert torch.equal(restored.hidden_states[0], value.hidden_states[0])
 
 
 def test_actual_accelerate_wrappers_refuse_only_on_sharded_components() -> None:

@@ -353,36 +353,47 @@ class RankGroup:
         wedged only against the pauses it has itself shown (`liveness.Pace`). Death is
         observed through the seam, not inferred from silence.
         """
-        replies: list[dict[str, Any]] = []
-        for follower in self.followers:
-            pace = liveness.Pace()
-            floor = liveness.noise_floor(self.sample_seconds)
-            while True:
-                try:
-                    frame = follower.replies.get(timeout=self.sample_seconds)
-                except queue.Empty:
-                    pace.observe(liveness.burn(follower.pid))
-                    if pace.wedged(floor):
-                        self._break(
-                            f"rank {follower.rank} wedged during {name!r}: {pace.verdict(floor)}"
-                        )
-                        raise GroupRefusal(self.broken, code="group_broken") from None
-                    continue
-                if frame is None:
-                    raise GroupRefusal(f"{self.verdict()} during {name!r}", code="group_broken")
-                if frame.get("reply") != name:
-                    refused = (
-                        f": {frame.get('code')}: {frame.get('detail', '')}"[:600]
-                        if frame.get("ok") is False
-                        else ""
-                    )
+        return [self._reply(follower, name) for follower in self.followers]
+
+    def call_one(self, rank: int, command: dict[str, Any]) -> dict[str, Any]:
+        """One command to ONE follower and its reply: a hosted component's call."""
+        self.check_alive()
+        follower = self.followers[rank - 1]
+        try:
+            follower.channel.send(command)
+        except SeamError as exc:
+            raise GroupRefusal(
+                f"rank {rank} cannot be commanded: {exc}", code="group_broken"
+            ) from exc
+        return self._reply(follower, str(command["cmd"]))
+
+    def _reply(self, follower: Follower, name: str) -> dict[str, Any]:
+        pace = liveness.Pace()
+        floor = liveness.noise_floor(self.sample_seconds)
+        while True:
+            try:
+                frame = follower.replies.get(timeout=self.sample_seconds)
+            except queue.Empty:
+                pace.observe(liveness.burn(follower.pid))
+                if pace.wedged(floor):
                     self._break(
-                        f"rank {follower.rank} answered {frame.get('reply')!r} to {name!r}{refused}"
+                        f"rank {follower.rank} wedged during {name!r}: {pace.verdict(floor)}"
                     )
-                    raise GroupRefusal(self.broken, code="group_broken")
-                replies.append(frame)
-                break
-        return replies
+                    raise GroupRefusal(self.broken, code="group_broken") from None
+                continue
+            if frame is None:
+                raise GroupRefusal(f"{self.verdict()} during {name!r}", code="group_broken")
+            if frame.get("reply") != name:
+                refused = (
+                    f": {frame.get('code')}: {frame.get('detail', '')}"[:600]
+                    if frame.get("ok") is False
+                    else ""
+                )
+                self._break(
+                    f"rank {follower.rank} answered {frame.get('reply')!r} to {name!r}{refused}"
+                )
+                raise GroupRefusal(self.broken, code="group_broken")
+            return frame
 
     def agree_residence(
         self,

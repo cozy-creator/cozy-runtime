@@ -930,6 +930,8 @@ class Reader:
         for decorator in node.decorator_list:
             call = decorator if isinstance(decorator, ast.Call) else None
             found = self.resolve(module, call.func if call else decorator)
+            if isinstance(found, Vocab) and found.key == "author.placeable" and call:
+                continue  # a runtime placement capability; the interface does not carry it
             if not (isinstance(found, Vocab) and found.key == "author.sequence_parallel" and call):
                 self.refuse(module, decorator, "a Model class decorator outside the closed set")
             for keyword in call.keywords:

@@ -1,6 +1,5 @@
 """Actual Qwen forwards preserve H3 conditioning and release unused generation state."""
 
-from contextlib import nullcontext
 from typing import Any
 
 import pytest
@@ -39,9 +38,7 @@ def _conditioner(torch: Any, device: str) -> Any:
     return Qwen3VLForConditionalGeneration(config).eval().to(device)
 
 
-def _condition(torch: Any, model: Any, *, image: bool, release: bool) -> Any:
-    from cozy_runtime.models.minimax_h3.conditioner import conditioning_scope
-
+def _inputs(torch: Any, model: Any, *, image: bool) -> dict[str, Any]:
     device = model.device
     tokens = [1, 2, 3, 3, 3, 3, 4, 5] if image else [1, 5]
     inputs = {
@@ -58,8 +55,12 @@ def _condition(torch: Any, model: Any, *, image: bool, release: bool) -> Any:
             pixel_values=torch.zeros((16, 12), device=device),
             image_grid_thw=torch.tensor([[1, 4, 4]], device=device),
         )
-    with torch.inference_mode(), conditioning_scope(model) if release else nullcontext():
-        result = model.model(**inputs)
+    return inputs
+
+
+def _condition(torch: Any, model: Any, *, image: bool) -> Any:
+    with torch.inference_mode():
+        result = model.model(**_inputs(torch, model, image=image))
         return tuple(state.cpu().clone() for state in result.hidden_states)
 
 
@@ -72,7 +73,7 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA allocation proof requires a local accelerator")
     from cozy_runtime.internal.worker.ledger import Ledger
-    from cozy_runtime.models.minimax_h3.conditioner import conditioning_scope
+    from cozy_runtime.models.minimax_h3.conditioner import FinalHiddenState, release_position_cache
 
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(2)
@@ -88,7 +89,7 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
 
         # The actual first text-only forward pays cuBLAS's first-use workspace.
         opened = observe()
-        _condition(torch, model, image=False, release=False)
+        _condition(torch, model, image=False)
         observe()
         assert ledger.close_attempt("text", opened)["closed"]
         assert model.model.rope_deltas is None
@@ -96,7 +97,7 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
         # Unchanged upstream image conditioning retains its one int64 cache even
         # with use_cache=False; the normal second-attempt ledger detects it.
         opened = observe()
-        expected = _condition(torch, model, image=True, release=False)
+        expected = _condition(torch, model, image=True)
         assert type(model.model).__name__ == "Qwen3VLModel"
         deltas: Any = model.model.rope_deltas
         assert deltas.numel() == 1
@@ -111,9 +112,10 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
         if device == "cuda":
             assert ledger.device_allocated == opened["device_allocated"]
 
+        release_position_cache(model)
         for index in range(4):
             opened = observe()
-            actual = _condition(torch, model, image=True, release=True)
+            actual = _condition(torch, model, image=True)
             assert model.model.rope_deltas is None
             assert all(
                 torch.equal(left, right) for left, right in zip(expected, actual, strict=True)
@@ -121,13 +123,22 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
             observe()
             assert ledger.close_attempt(f"scoped-image-{index}", opened)["closed"]
 
-        with (
-            pytest.raises(RuntimeError, match="conditioner failure"),
-            conditioning_scope(model),
-        ):
-            _condition(torch, model, image=True, release=False)
+        # The block's one-state view computes exactly the tensor it reads.
+        with torch.inference_mode():
+            view = FinalHiddenState(model).model(**_inputs(torch, model, image=True))
+        layers = len(model.model.language_model.layers)
+        assert torch.equal(view.hidden_states[50].cpu(), expected[layers])
+        assert FinalHiddenState(model).device == model.device
+
+        # A forward that fails after the cache was written still releases it.
+        def fail(*_: Any) -> None:
             assert model.model.rope_deltas is not None
             raise RuntimeError("conditioner failure")
+
+        handle = model.model.language_model.layers[-1].register_forward_hook(fail)
+        with pytest.raises(RuntimeError, match="conditioner failure"):
+            _condition(torch, model, image=True)
+        handle.remove()
         assert model.model.rope_deltas is None
     finally:
         torch.set_num_threads(previous_threads)
