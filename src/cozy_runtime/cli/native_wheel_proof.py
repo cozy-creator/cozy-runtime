@@ -162,8 +162,8 @@ def _request(path: Path) -> Request:
         value = canonical.parse(_bounded_bytes(path, "request"))
     except canonical.CanonicalError as exc:
         raise _error(str(exc)) from exc
-    if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
-        raise _error("request fields are not closed")
+    if not isinstance(value, dict) or not REQUEST_FIELDS.issubset(value):
+        raise _error("request is missing a field")
     digests = ("expected_result_digest",)
     if any(
         not isinstance(value[name], str) or canonical.DIGEST_RE.fullmatch(value[name]) is None

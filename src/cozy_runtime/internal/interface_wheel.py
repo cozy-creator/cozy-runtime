@@ -18,11 +18,13 @@ from packaging.utils import canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.internal import canonical, invocable_interface, package_interface
+from cozy_runtime.internal import invocable_interface, package_interface
 
 GENERATOR_ABI = "cozy.interface-generator/8"
 MAX_IMPLEMENTATION_WHEEL = 256 << 20
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_COMPANION = re.compile(r"(?:.+/)?_cozy_callers_[0-9a-f]{16}_[0-9]+\.py")
+_COMPANION_IMPORT = re.compile(rb"\n\nfrom \.?_cozy_callers_[0-9a-f]{16}_[0-9]+ import [^\n]*\n\Z")
 
 
 def generate(interface: bytes) -> dict[str, bytes]:
@@ -458,22 +460,19 @@ def _overlay(
         raise ConformanceError("implementation wheel identity differs", code="interface_binding")
     # Description text is a body, not header text. Preserve it after adding bindings.
     if headers.get("Cozy-Interface-Generator") is not None:
-        # A published callable wheel already carries its managed import surface.
-        # Private capture may rebind that same source to a new exact revision. Remove
-        # only code reproduced by this generator, never an arbitrary package suffix.
-        if (
-            headers.get("Cozy-Interface-Generator") != GENERATOR_ABI
-            or headers.get("Cozy-Interface-Layout") != "overlay"
-            or files.get(expected_dist + "/package-interface.json") != interface
-        ):
-            raise ConformanceError("caller wheel provenance changed", code="interface_binding")
-        for target, (generated, source, suffix) in overlay_sources(interface, set(files)).items():
-            if files.get(generated) != source or not files[target].endswith(suffix):
-                raise ConformanceError(
-                    "caller wheel generated source changed", code="interface_binding"
-                )
-            files[target] = files[target][: -len(suffix)]
-            del files[generated]
+        # A published callable wheel already carries a managed import surface from
+        # whichever generator built it. Private capture rebinds that source: remove exactly
+        # the reserved caller companions and their terminal imports, then regenerate them
+        # for this interface below. Every other package source stays as published.
+        if headers.get("Cozy-Interface-Layout") != "overlay":
+            raise ConformanceError(
+                "a generated interface wheel is not an implementation", code="interface_binding"
+            )
+        for name in [name for name in files if _COMPANION.fullmatch(name)]:
+            del files[name]
+        for name, data in files.items():
+            if name.endswith(".py"):
+                files[name] = _COMPANION_IMPORT.sub(b"", data)
         header, _, description = metadata.partition(b"\n\n")
         metadata = (
             b"\n".join(

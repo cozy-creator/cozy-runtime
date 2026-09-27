@@ -50,13 +50,13 @@ from cozy_runtime.internal.host_paths import input_media_root
 _INPUT_LIMIT = 16 << 10
 
 
-class _Policy(msgspec.Struct, forbid_unknown_fields=True):
+class _Policy(msgspec.Struct):
     profile: str
     max_edge: int | None = None
     max_pixels: int | None = None
 
 
-class _Request(msgspec.Struct, forbid_unknown_fields=True):
+class _Request(msgspec.Struct):
     source_path: str
     prepare: _Policy
     media_types: list[str]

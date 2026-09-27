@@ -77,16 +77,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
                 "Creator supplies exact JSON",
                 Exit.usage,
             ) from exc
-        required_model = {
-            "package",
-            "slot",
-            "model",
-            "release",
-            "lane",
-            "manifest",
-            "manifest_length",
-        }
-        if not isinstance(row, dict) or set(row) != required_model:
+        if not isinstance(row, dict) or not {"package", "slot", "model", "manifest"}.issubset(row):
             raise CliError(
                 "usage",
                 "invalid modeled-package selection",
