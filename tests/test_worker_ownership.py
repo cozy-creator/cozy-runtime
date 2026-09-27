@@ -82,7 +82,6 @@ def test_claim_authority_survives_worker_process_replacement(tmp_path: Path) -> 
         ("stale", 7, "owner-A", "STALE_RECORD_OWNER_EPOCH"),
         ("other", 8, "owner-B", "EPOCH_HELD"),
         ("forged", 99, "owner-C", "UNAUTHENTICATED"),
-        ("legacy", 99, "owner-A", "PROTOCOL_INCOMPATIBLE"),
     ]:
         result = _run(tmp_path, mode, epoch, identity)
         assert not result["accepted"] and result["rejection"] == "CLAIM_REJECTION_" + refusal
@@ -90,6 +89,9 @@ def test_claim_authority_survives_worker_process_replacement(tmp_path: Path) -> 
     newer = _run(tmp_path, "newer", 9, "owner-B")
     assert newer["accepted"] and newer["stream"] == 3
     assert not _run(tmp_path, "old", 8)["accepted"]
+    # An owner on an old wire minor still claims; operations it cannot use fail alone.
+    legacy = _run(tmp_path, "legacy", 10, "owner-B")
+    assert legacy["accepted"] and legacy["stream"] == 4 and not legacy["dispatch_open"]
 
 
 def test_claim_ack_is_durable_before_process_is_killed(tmp_path: Path) -> None:
