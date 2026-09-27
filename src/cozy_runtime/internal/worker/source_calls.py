@@ -704,13 +704,9 @@ class SourceCalls:
                     byte_output_spec=view_fact[2] if view_fact else b"",
                 )
                 return
-            binding = source_interfaces.bindings()[
-                (source_interfaces.DIGEST, source_interfaces.MODULE, row["operation"])
-            ]
+            request = source_interfaces.TYPES[row["operation"]][0]
             arguments = msgspec.to_builtins(
-                msgspec.convert(
-                    canonical_json.decode(row["accepted"]), type=binding.request, strict=True
-                )
+                msgspec.convert(canonical_json.decode(row["accepted"]), type=request, strict=True)
             )
             phase = "resolve" if command.phase == pb.NATIVE_SOURCE_PHASE_RESOLVE else "execute"
             if row["operation"] in source_interfaces.UPLOADS:

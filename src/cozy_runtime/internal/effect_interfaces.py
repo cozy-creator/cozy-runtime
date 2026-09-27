@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-
 import msgspec
 
 from cozy_runtime import canonical_json
@@ -34,7 +32,7 @@ class AttachAssessment(msgspec.Struct, frozen=True):
     workloads: FileAsset
 
 
-_TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
+TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
     "upload_checkpoint": (Upload, CheckpointRef),
     "attach_assessment": (AttachAssessment, AssessmentRef),
     "publish_release": (Publish, ReleaseReceipt),
@@ -45,23 +43,14 @@ DOCUMENT = canonical_json.encode(
         "module": MODULE,
         "operations": {
             name: {"request": schema.render(request), "result": schema.render(result)}
-            for name, (request, result) in _TYPES.items()
+            for name, (request, result) in TYPES.items()
         },
     }
 )
-DIGEST = "sha256:" + hashlib.sha256(DOCUMENT).hexdigest()
 
 
-def bindings() -> dict[tuple[str, str, str], _CallType]:
+def bindings() -> dict[str, _CallType]:
     return {
-        (prefix, MODULE, name): _CallType(DIGEST, MODULE, name, request, result)
-        for name, (request, result) in _TYPES.items()
-        for prefix in ("", DIGEST)
+        name: _CallType("", MODULE, name, request, result)
+        for name, (request, result) in TYPES.items()
     }
-
-
-def rows() -> list[dict[str, object]]:
-    return [
-        {"interface_digest": DIGEST, "module": MODULE, "export": name, "native_effect": True}
-        for name in _TYPES
-    ]

@@ -14,11 +14,12 @@ from cozy_runtime.author import CapabilityError, ConformanceError, FileAsset
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._capture import ExecutionObservation
+from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.internal import (
     census_cache,
     derive_child,
-    effect_interfaces,
+    native_interfaces,
     source_interfaces,
     witness,
 )
@@ -40,16 +41,25 @@ def _broker(tmp_path: Path, rows: list[dict[str, object]]) -> object:
 def test_native_operations_bind_when_the_recorded_interface_digest_moved(tmp_path: Path) -> None:
     rows = [
         {**row, "interface_digest": STALE}
-        for row in (*source_interfaces.rows(), *effect_interfaces.rows())
+        for row in native_interfaces.rows({"native_interfaces": native_interfaces.stated()})
     ]
     broker = _broker(tmp_path, rows)
     assert set(broker.bindings) == {(row["module"], row["export"]) for row in rows}  # type: ignore[attr-defined]
 
 
-def test_an_operation_this_runtime_lacks_still_refuses(tmp_path: Path) -> None:
-    row = {**source_interfaces.rows()[0], "export": "not_an_operation"}
-    with pytest.raises(CapabilityError, match="no native operation"):
-        _broker(tmp_path, [row])
+def test_native_rows_bind_per_operation(tmp_path: Path) -> None:
+    rows = native_interfaces.rows({"native_interfaces": native_interfaces.stated()})
+    listed = [{**rows[0], "export": "not_an_operation"}, *rows[1:]]
+    broker = _broker(tmp_path, listed)
+    bindings = broker.bindings  # type: ignore[attr-defined]
+    # An operation this Runtime lacks cannot be called from here, so its row is ignored.
+    assert (source_interfaces.MODULE, "not_an_operation") not in bindings
+    # One the worker did not list is refused alone, naming the rental update.
+    assert not any(b.unavailable for key, b in bindings.items() if key[1] != rows[0]["export"])
+    broker.bind(fake_context(request_id="parent"))  # type: ignore[attr-defined]
+    with pytest.raises(CapabilityError, match="cozy rental update") as refused:
+        broker.reserve(rows[0]["module"], rows[0]["export"], {})  # type: ignore[attr-defined]
+    assert refused.value.code == "child_capability_unavailable"
 
 
 def test_child_observations_and_receipts_accept_future_fields() -> None:

@@ -48,6 +48,4 @@ def test_public_source_facades_use_the_admitted_broker(tmp_path: Path) -> None:
         (1, "download_civitai"),
         (2, "convert_cozytensors"),
     ]
-    assert all(
-        call.binding.interface_digest == source_interfaces.DIGEST for call in broker.calls.values()
-    )
+    assert all(call.binding.module == source_interfaces.MODULE for call in broker.calls.values())
