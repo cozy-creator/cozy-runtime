@@ -18,7 +18,8 @@ async def long_form(ctx: Context, payload: Input, out: Outputs) -> Output:
 - A GPU call still in flight keeps its GPUs until it returns; they then go to the pool.
 - A GPU call made afterwards is a new demand. It waits in line at the request's
   original priority and starts a new lease; it never preempts whoever was granted the
-  GPUs meanwhile. Call `release_gpus()` again when that work is done.
+  GPUs meanwhile. Call `release_gpus()` again when that work is done. A call is made
+  when it is awaited, so release after awaiting the last GPU call, not before.
 - Idempotent. Where there is no lease it does nothing: a request that made no GPU call,
   `warm`, or a GPU handler (its GPUs end when it returns).
 - A request that is itself one GPU call (a direct serving or device-job request) needs
