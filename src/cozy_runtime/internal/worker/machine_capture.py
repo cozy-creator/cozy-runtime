@@ -40,15 +40,18 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
     root = capture.get("root_installation_id", "")
     prepared: dict[str, dict[str, Any]] = {}
     interfaces: dict[str, dict[str, Any]] = {}
+    root_placements: list[dict[str, Any]] = []
     for package in inventory:
         identifier = package.get("installation_id", "")
         if not identifier or identifier in prepared:
             raise WorkspaceRefusal("execution capture repeats or omits an installation ID")
         candidates = [
             value
-            for (_, selected), value in worker.prepared_installations.items()
+            for (_, selected, _), value in worker.prepared_installations.items()
             if selected == identifier
         ]
+        if identifier == root:
+            root_placements = [value.document for value in candidates]
         if not candidates:
             raise WorkspaceRefusal("execution package has not been installed on this machine")
         selected = candidates[0]
@@ -128,18 +131,25 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             ),
             None,
         )
-        held = prepared[root]["placement"]
-        # The placement this machine prepared, named by the facts that bind execution; an
-        # additive or reordered field from the owner's copy is not a different placement.
-        if (
-            selected_entry is None
-            or installation_identity(selected_entry) != root
-            or any(
-                selected_entry.get(key) != held.get(key)
-                for key in ("installation_id", "bindings_digest", "package_interface", "models")
-            )
-        ):
+        # One of the placements this machine prepared for the root installation, named by
+        # the facts that bind execution; an additive or reordered field from the owner's
+        # copy is not a different placement. A release prepared for several model
+        # selections holds each, so concurrent roots of one release never displace another.
+        held = next(
+            (
+                placement
+                for placement in root_placements
+                if selected_entry is not None
+                and all(
+                    selected_entry.get(key) == placement.get(key)
+                    for key in ("installation_id", "bindings_digest", "package_interface", "models")
+                )
+            ),
+            None,
+        )
+        if selected_entry is None or installation_identity(selected_entry) != root or held is None:
             raise WorkspaceRefusal("execution inference does not name the captured root")
+        prepared[root]["placement"] = held
     root_interface = interfaces[root]
     if "job" in spec:
         root_callable = next(
@@ -197,5 +207,5 @@ def restore(worker: Worker, preparation: dict[str, Any]) -> pb.DesiredWorkerStat
             Path(worker.options.install_root or ""),
             identifier,
         )
-        worker.prepared_installations[(placement.placement_id, identifier)] = placement
+        worker.prepared_installations[placement.prepared_key] = placement
     return pb.DesiredWorkerState.FromString(base64.b64decode(preparation["state"], validate=True))
