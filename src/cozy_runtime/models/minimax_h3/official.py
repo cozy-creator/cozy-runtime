@@ -2010,24 +2010,12 @@ def _resample(waveform: Any, rate: int, target: int) -> Any:
 
 
 def _aligned_soundtrack(video: DecodedVideo) -> Any | None:
-    """Put embedded PCM on the video's origin without rounding either native clock."""
+    """Put embedded PCM on the video's origin, to the nearest sample of its own clock."""
     audio = video.soundtrack
     if audio is None:
         return None
-    exact_offset = (audio.start_time - video.start_time) * audio.sample_rate
-    exact_samples = video.duration * audio.sample_rate
-    if exact_offset.denominator != 1:
-        raise ConformanceError(
-            "reference soundtrack offset is not aligned to its sample clock",
-            code="reference_policy",
-        )
-    if exact_samples.denominator != 1:
-        raise ConformanceError(
-            "reference video duration is not aligned to its soundtrack sample clock",
-            code="reference_policy",
-        )
-    offset = exact_offset.numerator
-    target_samples = exact_samples.numerator
+    offset = _round_fraction((audio.start_time - video.start_time) * audio.sample_rate)
+    target_samples = _round_fraction(video.duration * audio.sample_rate)
     waveform = _audio_tensor(audio)
     start = max(offset, 0)
     end = min(offset + audio.sample_count, target_samples)
@@ -2043,13 +2031,17 @@ def _aligned_soundtrack(video: DecodedVideo) -> Any | None:
 
 
 def _video_at_24fps(video: DecodedVideo) -> Any:
-    """Exact presentation boundaries onto the official whole-frame 24-fps clock."""
+    """Presentation boundaries onto the official whole-frame 24-fps clock.
+
+    Each frame shows until the next one starts, so a timestamp gap holds the previous frame
+    and an overlap ends it early, as a player would; only time running backwards refuses.
+    """
     starts = video.frame_pts
     durations = video.frame_durations
     for index in range(len(starts) - 1):
-        if starts[index] + durations[index] != starts[index + 1]:
+        if starts[index + 1] < starts[index]:
             raise ConformanceError(
-                f"reference video clock has a gap or overlap before frame {index + 1}",
+                f"reference video presentation time runs backwards at frame {index + 1}",
                 code="reference_policy",
             )
 

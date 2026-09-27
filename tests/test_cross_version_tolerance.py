@@ -10,7 +10,7 @@ from pathlib import Path
 import msgspec
 import pytest
 
-from cozy_runtime.author import CapabilityError, FileAsset
+from cozy_runtime.author import CapabilityError, ConformanceError, FileAsset
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._capture import ExecutionObservation
@@ -24,6 +24,7 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.seam import Channel
+from cozy_runtime.models.minimax_h3.table_layout import TableLayout
 
 STALE = "sha256:" + "0" * 64
 
@@ -168,3 +169,26 @@ def test_witness_logs_from_other_versions_keep_their_known_rows(tmp_path: Path) 
     rows = [json.dumps({"event": "future_kind"}), json.dumps(death), '{"event": "de']
     log.write_text("\n".join(rows))
     assert witness.read_death(tmp_path)["future"] == 1
+
+
+def test_h3_table_labels_from_other_writers_ignore_extras_and_default_optionals() -> None:
+    t = (1.0).hex()
+    layout = TableLayout.parse(
+        {
+            "final_normalization": [{"timestep": t, "writer": "future"}],
+            "block_modulation": [
+                {"index": 0, "timestep": t, "modality_tag": 0, "modality": "video"},
+                {"timestep": t, "modality": "text"},
+                {"timestep": t, "modality_tag": 2, "note": 1},
+            ],
+            "provenance": {"tool": "future"},
+        }
+    )
+    assert layout.block_keys == ((0, 0), (0, 1), (0, 2))
+    with pytest.raises(ConformanceError, match="modalities"):
+        TableLayout.parse(
+            {
+                "final_normalization": [{"timestep": t}],
+                "block_modulation": [{"timestep": t, "modality_tag": 0, "modality": "audio"}],
+            }
+        )
