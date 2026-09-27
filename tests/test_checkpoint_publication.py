@@ -49,7 +49,10 @@ MODELS = "/v1/models/alice/model"
 
 
 class Bucket:
-    """Immutable content-addressed keys; ``failing`` answers 503 until the Hub reopens."""
+    """Immutable content-addressed keys; ``failing`` answers 503 until the Hub reopens.
+
+    Each PUT takes ``seconds`` (``slow`` for one key), standing in for transfer time.
+    """
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -57,6 +60,9 @@ class Bucket:
         self.puts: Counter[str] = Counter()
         self.failing = ""
         self.reopened = threading.Event()
+        self.seconds = 0.0
+        self.slow: tuple[str, float] = ("", 0.0)
+        self.active = self.peak = 0
 
 
 class Hub:
@@ -77,6 +83,7 @@ class Hub:
         self.finalizations: dict[str, dict[str, Any]] = {}
         self.checkpoints: dict[str, str] = {}
         self.refuse_grants = 0
+        self.grant_batches: list[int] = []
         self.finalize_seconds = 0.3
         self.fail_finalization = ""
         self.lose_finalize = False
@@ -164,6 +171,7 @@ class Hub:
                     return self.refuse_grants, {"code": "publication.hold_key_conflict"}
                 selected = request["object_ids"]
                 assert 0 < len(selected) <= 128 and len(set(selected)) == len(selected)
+                self.grant_batches.append(len(selected))
                 grants, held = [], []
                 for key in selected:
                     if key in accepted or self.held(key):
@@ -272,6 +280,11 @@ def bucket_handler(bucket: Bucket) -> Callable[[BaseHTTPRequestHandler, str], No
         digest = hashlib.sha256(body).digest()
         assert handler.headers["x-amz-checksum-sha256"] == base64.b64encode(digest).decode()
         with bucket.lock:
+            bucket.active += 1
+            bucket.peak = max(bucket.peak, bucket.active)
+        time.sleep(bucket.slow[1] if key == bucket.slow[0] else bucket.seconds)
+        with bucket.lock:
+            bucket.active -= 1
             bucket.puts[key] += 1
             if key == bucket.failing and not bucket.reopened.is_set():
                 status = 503
@@ -375,9 +388,12 @@ class Stage:
         ]
 
 
-@pytest.fixture
-def stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Stage, Hub, Effects]]:
-    _, workspace, receipt = produced(tmp_path, parts=6)
+@contextlib.contextmanager
+def staging(
+    root: Path, setenv: Callable[[str, str], None], *, parts: int = 6
+) -> Iterator[tuple[Stage, Hub, Effects]]:
+    """One admitted upload_checkpoint call of a ``parts``-tensor model, Hub and bucket up."""
+    _, workspace, receipt = produced(root, parts=parts)
     executions = Executions(workspace)
     executions.submit(
         "owner",
@@ -402,9 +418,9 @@ def stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Sta
     request.intent_digest = hashlib.sha256(canonical_intent(request)).digest()
     staged = Stage(workspace, executions, receipt.artifact)
     staged.calls.accept("owner", request)
-    trusted, context = certificate(tmp_path)
+    trusted, context = certificate(root)
     # The real client builds its default context; the throwaway CA is its only trust root.
-    monkeypatch.setenv("SSL_CERT_FILE", str(trusted))
+    setenv("SSL_CERT_FILE", str(trusted))
     bucket = Bucket()
     hub = Hub(bucket)
     with (
@@ -418,6 +434,12 @@ def stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Sta
             yield staged, hub, effects
         finally:
             effects.close()
+
+
+@pytest.fixture
+def stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Stage, Hub, Effects]]:
+    with staging(tmp_path, monkeypatch.setenv) as staged:
+        yield staged
 
 
 def drive(effects: Effects, done: Callable[[], bool]) -> None:
@@ -464,6 +486,21 @@ def test_push_failure_retries_the_frozen_operation_without_repushing(
     )
     drive(effects, lambda: staged.hold_states() == ["released"])
     assert not staged.calls.has_unsettled_effects("owner", "parent")
+
+
+def test_pushes_slide_through_a_full_window_with_grants_fetched_ahead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with staging(tmp_path, monkeypatch.setenv, parts=100) as (staged, hub, effects):
+        hub.bucket.seconds = 0.05
+        call = settle(staged, effects)
+        assert not call.safe_code and canonical_json.decode(call.result)["observation"] == (
+            "acknowledged"
+        )
+        # 102 objects: every one pushed once, sixteen in flight, grants 32 at a time.
+        assert len(hub.bucket.objects) == 102 and set(hub.bucket.puts.values()) == {1}
+        assert hub.bucket.peak == 16
+        assert hub.grant_batches == [32, 32, 32, 6]
 
 
 def test_asynchronous_finalization_is_pending_until_the_hub_commits(

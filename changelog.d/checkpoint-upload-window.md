@@ -1,0 +1,1 @@
+`upload_checkpoint` pushes through a sliding window of 16 objects instead of lockstep batches of 8: each finished push starts the next, and grants are fetched 32 at a time while pushes run, so one large object no longer idles the other slots and grant round trips drop fourfold.
