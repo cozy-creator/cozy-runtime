@@ -23,7 +23,6 @@ from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
-_MEMBER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 _PROFILE = re.compile(r"[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*")
 _OBJECT_ID = re.compile(r"sha256:[0-9a-f]{64}")
 
@@ -160,11 +159,12 @@ def _request(
             "model_source_prepare_identity_invalid", "source preparation identity is invalid"
         )
 
-    profiles = [(row.slot, row.profile) for row in request.profiles]
+    # Order is the sender's; only one slot naming two profiles is ambiguous.
+    profiles = sorted({(row.slot, row.profile) for row in request.profiles})
     if not 1 <= len(profiles) <= weights_limits.MAX_MODEL_SOURCE_PROFILES:
         raise ModelSourceRefusal("model_source_profile_count", "source profile count is invalid")
-    if [slot for slot, _ in profiles] != sorted({slot for slot, _ in profiles}):
-        raise ModelSourceRefusal("model_source_profile_order", "source profiles are not sorted")
+    if len({slot for slot, _ in profiles}) != len(profiles):
+        raise ModelSourceRefusal("model_source_profile_order", "a source slot names two profiles")
     if any(
         _IDENTIFIER.fullmatch(slot) is None
         or len(profile.encode()) > weights_limits.MAX_MODEL_SOURCE_PROFILE_BYTES
@@ -173,11 +173,14 @@ def _request(
     ):
         raise ModelSourceRefusal("model_source_profile_invalid", "source profile is invalid")
 
-    rows = list(request.files)
+    # Order is the sender's and a repeated identical row is one file; only one member naming
+    # two different files is ambiguous.
+    unique = {row.SerializeToString(deterministic=True): row for row in request.files}
+    rows = sorted(unique.values(), key=lambda row: row.member)
     if not 1 <= len(rows) <= weights_limits.MAX_MODEL_SOURCE_FILES:
         raise ModelSourceRefusal("model_source_file_count", "source file count is invalid")
-    if [row.member for row in rows] != sorted({row.member for row in rows}):
-        raise ModelSourceRefusal("model_source_file_order", "source files are not sorted")
+    if len({row.member for row in rows}) != len(rows):
+        raise ModelSourceRefusal("model_source_file_order", "a source member names two files")
 
     roster: list[tuple[str, str, int, str, bytes]] = []
     landed: list[str] = []
@@ -401,14 +404,12 @@ def _refused(code: str, detail: str) -> pb.PrepareModelSourceResult:
 
 
 def _member(value: str) -> bool:
-    try:
-        encoded = value.encode("ascii")
-    except UnicodeError:
-        return False
+    """A safe relative member, as TensorFS admits one: `model (1).safetensors` is one."""
     return (
-        0 < len(encoded) <= weights_limits.MAX_MODEL_SOURCE_MEMBER_BYTES
-        and _MEMBER.fullmatch(value) is not None
-        and not value.startswith((".", "/"))
+        value.isascii()
+        and value.isprintable()
+        and 0 < len(value) <= weights_limits.MAX_MODEL_SOURCE_MEMBER_BYTES
+        and not value.startswith("/")
         and "\\" not in value
         and all(part not in ("", ".", "..") for part in value.split("/"))
     )
