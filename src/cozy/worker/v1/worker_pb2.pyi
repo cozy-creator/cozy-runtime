@@ -637,7 +637,7 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., describe: _Optional[_Union[PackageSelection, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "described_release", "run_output_log")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "described_release", "run_output_log", "release_root_owner")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -646,6 +646,7 @@ class MachineExecutionWorkspace(_message.Message):
     EXECUTOR_UID_ISOLATION_FIELD_NUMBER: _ClassVar[int]
     DESCRIBED_RELEASE_FIELD_NUMBER: _ClassVar[int]
     RUN_OUTPUT_LOG_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_ROOT_OWNER_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -654,7 +655,8 @@ class MachineExecutionWorkspace(_message.Message):
     executor_uid_isolation: bool
     described_release: DescribedRelease
     run_output_log: bool
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., described_release: _Optional[_Union[DescribedRelease, _Mapping]] = ..., run_output_log: bool = ...) -> None: ...
+    release_root_owner: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., described_release: _Optional[_Union[DescribedRelease, _Mapping]] = ..., run_output_log: bool = ..., release_root_owner: bool = ...) -> None: ...
 
 class DescribedRelease(_message.Message):
     __slots__ = ("package", "release", "package_interface")

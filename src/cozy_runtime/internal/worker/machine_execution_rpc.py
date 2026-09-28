@@ -134,6 +134,7 @@ class MachineExecutionRPC:
                 executor_uid_isolation=options.executor_uid >= 0,
                 described_release=described,
                 run_output_log=True,
+                release_root_owner=True,
             )
 
         return self._call(request.claim, context, get)

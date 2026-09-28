@@ -772,6 +772,8 @@ def test_the_machine_describes_a_release_from_its_own_hub(published: Machine) ->
             pb.MachineExecutionWorkspaceQuery(claim=machine.claim), Context()
         )
         assert not plain.HasField("described_release") and catalog.reads == []
+        # It resolves an unpublished root's slots under the root's owner, and says so.
+        assert plain.release_root_owner
     finally:
         catalog.close()
 
