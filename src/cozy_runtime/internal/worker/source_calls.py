@@ -597,6 +597,18 @@ class SourceCalls:
             content = workspace_sources.selection_content(command.selection)
             if not upload.slots:
                 upload.select(_native_selection(command.selection))
+            if any(profile == upload_plan.AS_IS for _, profile in upload.slots):
+                members = [m.member for m in command.selection.members]
+                note = {"members": [m for m in members if upload_plan.carrier(m)]}
+                self._emit(
+                    command,
+                    {
+                        "kind": "log",
+                        "name": upload_plan.AS_IS_NOTE,
+                        "value": "warning",
+                        "fields": note,
+                    },
+                )
             effective = {
                 "source": content["content_manifest"],
                 "slots": upload.slots,

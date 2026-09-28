@@ -8,6 +8,9 @@ from typing import Any
 from cozy_runtime.models.ingestion import Recipe, huggingface_recipe
 
 _CIVITAI_MEMBER = re.compile(r"civitai/files/[1-9][0-9]*")
+# TensorFS's profile for a source no reviewed profile recognizes: its keys, stored as-is.
+AS_IS = "as-is/1"
+AS_IS_NOTE = "unrecognized layout; stored as-is; packages may need to normalize it"
 # Upload refusals a caller can act on; everything else is a native TensorFS code or opaque.
 CODES = frozenset(
     {

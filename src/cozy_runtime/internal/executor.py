@@ -2274,6 +2274,7 @@ class Executor:
             # local bind of an un-bordered checkpoint tiers its extras (§1.1). Defaulting
             # to canonical keeps the strict reading for any record that does not say.
             custody=binding.get("custody", "canonical"),
+            unnormalized=model_config.unnormalized(config_checkpoint.header.get("configs")),
         )
         seen = Observations()
         registry = ModelRegistry(
@@ -2361,8 +2362,7 @@ class Executor:
                 "detail": (
                     f"{binding.get('package') or binding['application']} "
                     f"{binding['model_binding_path']} does not fit "
-                    f"{binding.get('model') or reference.snapshot}: "
-                    f"{exc.fit.get('code')} — {exc.fit.get('detail')}"
+                    f"{binding.get('model') or reference.snapshot}: {exc.message}"
                 )[:900],
                 "fit": exc.fit,
                 "state": backend.state,

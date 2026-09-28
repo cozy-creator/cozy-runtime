@@ -916,6 +916,14 @@ def _census(
                 ],
             )
         except census_cache.CensusRefusal as exc:
+            # A construction that cannot read a checkpoint stored as-is says so, and why.
+            remedy = next(
+                (m["unnormalized"] for m, _ in wanted.values() if m.get("unnormalized")), ""
+            )
+            if remedy:
+                raise PreparationRefusal(
+                    model_config.UNNORMALIZED, f"{remedy}; {exc.code}: {exc.detail}"
+                ) from exc
             raise PreparationRefusal(exc.code, exc.detail) from exc
 
     return lookup
@@ -1203,6 +1211,7 @@ def _selected_models(
             ):
                 try:
                     construction = {
+                        "unnormalized": model_config.unnormalized(header.get("configs")),
                         "config_bytes": model_config.construction_config(header.get("configs")),
                         "header": header_raw,
                         "assets": _asset_reader(
@@ -1212,7 +1221,7 @@ def _selected_models(
                     }
                 except model_config.ModelConfigRefusal as exc:
                     raise PreparationRefusal(
-                        "package_prepare_model_config_mismatch", f"{digest}: {exc}"
+                        exc.code or "package_prepare_model_config_mismatch", f"{digest}: {exc}"
                     ) from exc
             for slot, value in selected.items():
                 if value["selection"]["manifest"] == digest:

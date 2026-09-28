@@ -6,12 +6,19 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from cozy_runtime.author._loader import UNNORMALIZED as UNNORMALIZED
 from cozy_runtime.internal import canonical
 
 
 class ModelConfigRefusal(Exception):
-    pass
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
+
+#: TensorFS's record of how a checkpoint's keys were ingested:
+#: `{"converter", "dialect", "state": "raw" | "normalized"}`. Absent on older checkpoints.
+NORMALIZATION = "normalization"
 
 #: Inline header config names that are NOT construction configs and are SKIPPED here (cr-121).
 #: `execution` is the RETIRED lane execution contract (cr-124 deleted its reader). Checkpoints
@@ -19,7 +26,24 @@ class ModelConfigRefusal(Exception):
 #: rather than deleted: folded into the constructor document its `weights` key reads as a
 #: source carrier and the §1.1 ban refuses the whole lane, which is exactly the 42-second
 #: prepare death cr-121 was opened for. Inert, not fatal.
-RESERVED = frozenset({"execution"})
+RESERVED = frozenset({"execution", NORMALIZATION})
+
+
+def unnormalized(configs: object) -> str:
+    """Why a construction may not read this checkpoint, when it was stored as-is; else ""."""
+    record = configs.get(NORMALIZATION) if isinstance(configs, Mapping) else None
+    try:
+        document = json.loads(record) if isinstance(record, bytes) else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(document, dict) or document.get("state") != "raw":
+        return ""
+    return (
+        f"this checkpoint was stored as-is from a layout no converter recognized (dialect "
+        f"{document.get('dialect')!r}, converter {document.get('converter')!r}), so its keys "
+        "are not normalized: run the package's normalize job on it, or re-upload the source "
+        "once a TensorFS converter recognizes its layout"
+    )
 
 
 def tensor_dtypes(header: Mapping[str, Any]) -> dict[str, str]:
@@ -59,6 +83,8 @@ def construction_config(configs: object) -> bytes:
         decoded[name] = document
         held.append(normalized)
     if not held:
+        if remedy := unnormalized(configs):
+            raise ModelConfigRefusal(remedy, UNNORMALIZED)
         raise ModelConfigRefusal("the CozyTensors header declares no inline construction configs")
     if len(held) == 1:
         return held[0]

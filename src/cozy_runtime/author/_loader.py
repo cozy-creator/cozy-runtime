@@ -336,6 +336,9 @@ class Artifact:
     custody: Custody = "canonical"
     """`canonical` refuses a stored key inside a constructed component that the code does
     not consume (conversion drift); `local` lists it and ignores it (D5)."""
+    unnormalized: str = ""
+    """Set when the checkpoint was stored as-is from an unrecognized layout: why, and the
+    fix. A construction that fails on it refuses `checkpoint_unnormalized` with this text."""
 
 
 #: The `Fit` document `tensorfs.fit` returns, verbatim: `code` (one of the eight),
@@ -344,14 +347,28 @@ class Artifact:
 Fit = Mapping[str, object]
 
 
+UNNORMALIZED = "checkpoint_unnormalized"
+
+
+class CheckpointUnnormalized(ConformanceError):
+    """A factory failed on a checkpoint stored as-is; the failure is its cause."""
+
+    default_code = UNNORMALIZED
+
+
 class ModelFitRefused(ConformanceError):
     """The construction does not fit its checkpoint. Raised before a byte is reserved; the
-    Fit document rides whole so the prepare refusal can carry it verbatim (§3)."""
+    Fit document rides whole so the prepare refusal can carry it verbatim (§3). On a
+    checkpoint stored as-is it is `checkpoint_unnormalized`, prefixed with why and the fix."""
 
     default_code = "model_fit_refused"
 
-    def __init__(self, fit: Fit) -> None:
-        super().__init__(f"{fit.get('code')} — {fit.get('detail')}")
+    def __init__(self, fit: Fit, unnormalized: str = "") -> None:
+        verdict = f"{fit.get('code')} — {fit.get('detail')}"
+        super().__init__(
+            f"{unnormalized}; {verdict}" if unnormalized else verdict,
+            code=UNNORMALIZED if unnormalized else None,
+        )
         self.fit = dict(fit)
 
 
@@ -697,7 +714,14 @@ class Loader:
                     key: spec.dtype for key, spec in self._artifact.tensor_schema.items()
                 },
             )
-        obj = factory(config)
+        try:
+            obj = factory(config)
+        except Exception as exc:
+            if self._artifact.unnormalized:
+                raise CheckpointUnnormalized(
+                    f"{self._artifact.unnormalized}; {type(exc).__name__}: {exc}"
+                ) from exc
+            raise
         _legs.append(("factory", round((time.perf_counter() - _t0) * 1000, 1)))
         _weightless = _weightless_census(obj)
         _t0 = time.perf_counter()
@@ -714,7 +738,7 @@ class Loader:
         # the checkpoint header and asks `tensorfs.fit`; this plane matches nothing itself.
         fit = self._backend.fit(walked, encoded_leaves=self._consent())
         if fit is not None and not fit.get("ok"):
-            raise ModelFitRefused(fit)
+            raise ModelFitRefused(fit, self._artifact.unnormalized)
         ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
         _legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()
