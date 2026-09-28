@@ -33,7 +33,6 @@ from cozy_runtime.internal.worker.supervisor import Unit
 from cozy_runtime.internal.worker.workspace import (
     Workspace,
     WorkspaceBusy,
-    WorkspaceInactive,
     WorkspaceRefusal,
 )
 from cozy_runtime.internal.worker.workspace_calls import Call, CallFenced, Calls
@@ -157,7 +156,7 @@ class Effects:
                 try:
                     self._run(owner, latest)
                     continue
-                except (CallFenced, WorkspaceInactive):
+                except CallFenced:
                     with self.lock:
                         stopping = self.stopped
                     if stopping or not latest.sent:
@@ -315,7 +314,7 @@ class Effects:
                 stopping = self.stopped
                 stalls = self._stalls(key, landed)
                 self.stalls[key] = min(stalls, _PENDING_POLL_STALLS) if pending else stalls
-            if stopping or isinstance(caught, (CallFenced, WorkspaceInactive, WorkspaceBusy)):
+            if stopping or isinstance(caught, (CallFenced, WorkspaceBusy)):
                 # This attempt may not act now. The parent's next generation, its
                 # cancellation or the next worker decides; none of those is a refusal.
                 raise

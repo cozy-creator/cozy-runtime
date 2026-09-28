@@ -72,10 +72,6 @@ class WorkspaceRefusal(ValueError):
     """A stable workspace identity or custody invariant refused the operation."""
 
 
-class WorkspaceInactive(WorkspaceRefusal):
-    """The journal is fenced while existing Host custody transfers to Runtime."""
-
-
 class WorkspaceBusy(WorkspaceRefusal):
     """A foreground custody transition takes precedence over optional collection."""
 
@@ -323,22 +319,8 @@ _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 _SCHEMA = """
-CREATE TABLE workspace_state (
- singleton INTEGER PRIMARY KEY CHECK(singleton=1),
- state TEXT NOT NULL CHECK(state IN ('active','frozen','imported')),
- migration_id TEXT NOT NULL DEFAULT ''
-) STRICT;
-INSERT INTO workspace_state(singleton,state) VALUES(1,'active');
-CREATE TABLE workspace_imports (
- id TEXT PRIMARY KEY, record_count INTEGER NOT NULL, digest BLOB NOT NULL,
- owner TEXT NOT NULL, source_schema INTEGER NOT NULL,
- state TEXT NOT NULL CHECK(state IN ('receiving','imported','active'))
-) STRICT;
-CREATE TABLE workspace_import_records (
- migration_id TEXT NOT NULL, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, body BLOB NOT NULL,
- verified BLOB NOT NULL DEFAULT x'',
- PRIMARY KEY(migration_id,ordinal)
-) STRICT;
+CREATE TABLE workspace_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1)) STRICT;
+INSERT INTO workspace_state(singleton) VALUES(1);
 CREATE TABLE attempts (
  owner TEXT NOT NULL, request TEXT NOT NULL, ordinal INTEGER NOT NULL,
  spec BLOB NOT NULL, invocation BLOB NOT NULL,
@@ -348,7 +330,6 @@ CREATE TABLE attempts (
  fenced INTEGER NOT NULL DEFAULT 0,
  worker_boot TEXT NOT NULL DEFAULT '', result_schema BLOB NOT NULL DEFAULT x'',
  process_owner BLOB NOT NULL DEFAULT x'',
- transport_owner TEXT NOT NULL DEFAULT '',
  memoize INTEGER NOT NULL DEFAULT 0 CHECK(memoize IN (0,1)),
  PRIMARY KEY(owner,request,ordinal)
 ) STRICT;
@@ -410,7 +391,7 @@ class Workspace:
         return self._journal
 
     @contextmanager
-    def locked(self, *, allow_frozen: bool = False, blocking: bool = True) -> Iterator[Journal]:
+    def locked(self, *, blocking: bool = True) -> Iterator[Journal]:
         handle = self._handle
         if not handle.mutex.acquire(blocking=blocking):
             raise WorkspaceBusy("foreground workspace transition is active")
@@ -429,14 +410,7 @@ class Workspace:
             baseline = db.total_changes
             try:
                 _migrate(db)
-                active = (
-                    db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
-                    == "active"
-                )
-                if not allow_frozen and not active:
-                    raise WorkspaceInactive("workspace authority transfer is not active")
-                if active:
-                    handle.drain(db)
+                handle.drain(db)
                 yield db
             finally:
                 if db.in_transaction:
@@ -457,8 +431,6 @@ class Workspace:
         try:
             with self.locked():
                 pass
-        except WorkspaceInactive:
-            pass  # The pending rows wait for the next active access.
         except Exception:
             _LOG.warning("workspace telemetry waits for the next journal access", exc_info=True)
 
@@ -594,12 +566,7 @@ class Workspace:
         handle = self._handle
         if not handle.process:
             handle.process = workspace_recovery.process_identity()
-        with self.locked(allow_frozen=True) as db:
-            if (
-                db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
-                != "active"
-            ):
-                return
+        with self.locked() as db:
             rows = db.execute(
                 "SELECT * FROM attempts WHERE owner=? AND state IN ('accepted','running') "
                 "AND process_owner NOT IN (x'',?) ORDER BY request,ordinal",
@@ -653,28 +620,27 @@ class Workspace:
         with self.locked() as db:
             return (
                 db.execute(
-                    "SELECT 1 FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
-                    "AND request=? AND ordinal=?",
-                    (owner, owner, request, ordinal),
+                    "SELECT 1 FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                    (owner, request, ordinal),
                 ).fetchone()
                 is not None
             )
 
     def retained_outcomes(self, owner: str) -> list[pb.AttemptOutcome]:
         self.recover(owner)
-        with self.locked(allow_frozen=True) as db:
+        with self.locked() as db:
             return [
                 self._outcome_frame(row)
                 for row in db.execute(
-                    "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
+                    "SELECT * FROM attempts WHERE owner=? "
                     "AND state='outcome' "
                     "ORDER BY request,ordinal",
-                    (owner, owner),
+                    (owner,),
                 )
             ]
 
     def projected_weights(self, owner: str, worker_boot: str) -> list[WeightsRow]:
-        with self.locked(allow_frozen=True) as db:
+        with self.locked() as db:
             return db.all(
                 WeightsRow,
                 "SELECT w.* FROM weights AS w JOIN attempts AS a ON "
@@ -777,9 +743,8 @@ class Workspace:
             raise WorkspaceRefusal("outcome body differs from its execution identity")
         with self.locked() as db:
             row = db.execute(
-                "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
-                "AND request=? AND ordinal=?",
-                (owner, owner, outcome.request_id, outcome.attempt_ordinal),
+                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                (owner, outcome.request_id, outcome.attempt_ordinal),
             ).fetchone()
             if (
                 row is None
@@ -850,9 +815,8 @@ class Workspace:
         byte_releases: list[str] = []
         with self.locked() as db:
             row = db.execute(
-                "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
-                "AND request=? AND ordinal=?",
-                (owner, owner, ack.request_id, ack.attempt_ordinal),
+                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                (owner, ack.request_id, ack.attempt_ordinal),
             ).fetchone()
             if row is None and not ack.retain_work:
                 source_releases = [

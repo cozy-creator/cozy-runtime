@@ -21,7 +21,6 @@ from types import SimpleNamespace
 from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
-import grpc
 import pytest
 import tensorfs
 
@@ -691,44 +690,6 @@ def test_a_factless_preparation_is_completed_from_the_machines_own_hub(
     assert sent.locked_requirements.startswith(LOCKED)
     assert sent.package_interface == machine.interface
     assert sent.application == "tenant_workflow:app"
-
-
-def test_a_custody_handoff_answers_not_now(
-    published: Machine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """While the Host hands its custody to a fresh Runtime the journal is fenced: a root
-    submitted then is told "not now" (UNAVAILABLE), never refused, and the same root is
-    accepted once the handoff completes."""
-    machine = published
-    monkeypatch.setattr(
-        hostfacts,
-        "measure",
-        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
-    )
-    raw = tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
-    catalog = Catalog(
-        machine.manifest, None, [{"gpu": "H100", "lane": LANE}], raw, interface=machine.interface
-    )
-    catalog.serve(machine)
-    workspace = machine.worker.workspace
-    assert workspace is not None
-
-    def fence(state: str) -> None:
-        with workspace.locked(allow_frozen=True) as db:
-            db.execute("UPDATE workspace_state SET state=? WHERE singleton=1", (state,))
-
-    root = submission(machine, "handoff")
-    try:
-        fence("frozen")
-        with pytest.raises(Refused) as refused:
-            machine.rpc.SubmitMachineExecution(root, Context())
-        assert refused.value.code == grpc.StatusCode.UNAVAILABLE
-        assert refused.value.trailers.get("cozy-error-code") == "workspace_not_now"
-        fence("active")
-        receipt, _ = submit(machine, root)
-        assert receipt.request_id == "handoff"
-    finally:
-        catalog.close()
 
 
 def test_the_owners_unpublished_checkpoint_resolves_with_the_worker_capability(

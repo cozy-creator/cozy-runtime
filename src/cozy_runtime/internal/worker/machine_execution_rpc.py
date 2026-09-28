@@ -19,7 +19,6 @@ from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.servicer_context import ServicerContext
 from cozy_runtime.internal.worker.workspace import (
     WorkspaceBusy,
-    WorkspaceInactive,
     WorkspaceRefusal,
 )
 from cozy_runtime.internal.worker.workspace_executions import (
@@ -64,9 +63,8 @@ class MachineExecutionRPC:
         except StaleExecutionGeneration as exc:
             context.set_trailing_metadata((("cozy-error-code", exc.code),))
             context.abort(grpc.StatusCode.ABORTED, str(exc))
-        except (WorkspaceInactive, WorkspaceBusy) as exc:
-            # A custody handoff or a foreground transition is "not now", never a verdict: the
-            # caller asks again, as it does after a fresh machine's first Claim.
+        except WorkspaceBusy as exc:
+            # A foreground transition is "not now", never a verdict: the caller asks again.
             context.set_trailing_metadata((("cozy-error-code", "workspace_not_now"),))
             context.abort(grpc.StatusCode.UNAVAILABLE, str(exc)[:512])
         except (
@@ -226,7 +224,7 @@ class MachineExecutionRPC:
         def checked_submit() -> pb.MachineExecutionReceipt:
             try:
                 return submit()
-            except (ExecutionWorkspaceRefusal, WorkspaceInactive, WorkspaceBusy):
+            except (ExecutionWorkspaceRefusal, WorkspaceBusy):
                 raise
             except Exception:
                 # A lost reply after commit stays ambiguous. Only an actual
@@ -269,7 +267,7 @@ class MachineExecutionRPC:
             owner = self.worker.authorize_workspace(request.claim)
             try:
                 return calls.release_roots.submit(owner, request, context)
-            except (WorkspaceInactive, WorkspaceBusy):
+            except WorkspaceBusy:
                 raise
             except WorkspaceRefusal:
                 # Nothing is journaled before the receipt: the refusal is definitive.
