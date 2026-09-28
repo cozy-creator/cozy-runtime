@@ -18,7 +18,7 @@ from PIL import Image
 
 from cozy_runtime.author import App, AssetBound, ImageAsset, Invocation, MediaDecoder, attempt
 from cozy_runtime.author._assets import GrantedInput
-from cozy_runtime.internal.executor import _granted_inputs
+from cozy_runtime.internal.executor_commands import InputFile
 from cozy_runtime.internal.sandbox import refuse_network
 from cozy_runtime.internal.worker import grants
 
@@ -77,10 +77,13 @@ def invoke(root: Path, inputs: dict[str, GrantedInput]) -> tuple[Any, Any]:
             }
         )
     )
+    assets = {
+        key: msgspec.convert(row, InputFile).granted(key) for key, row in command["inputs"].items()
+    }
     result, outcome, _ = attempt(
         app.get("inspect_input"),
         {"image": inputs["image"].digest},
-        Invocation("direct", root, time.monotonic() + 10, assets=_granted_inputs(command)),
+        Invocation("direct", root, time.monotonic() + 10, assets=assets),
     )
     return result, outcome
 
@@ -147,6 +150,23 @@ def test_changed_borrowed_source_refuses_before_decode(tmp_path: Path, change: s
     assert source.exists() == (change != "delete")
 
 
+@pytest.mark.parametrize("declared", ["image/jpeg", "image/jpg", "application/octet-stream"])
+def test_an_image_declared_under_another_image_type_decodes_as_its_bytes(
+    tmp_path: Path, declared: str
+) -> None:
+    """A `.jpg` that is really a PNG, or an `image/jpg` label, is still the image the field
+    asked for: it used to refuse `input_media_type` before the handler ran."""
+    source = tmp_path / "photo.jpg"
+    Image.new("RGB", (8, 8), (12, 34, 56)).save(source, format="PNG")
+    bound = grant(source)
+    bound.inputs["image"] = replace(bound.inputs["image"], kind_mime=declared)
+    verified = grants.hydrate_inputs(bound, grants.Authorizer(), spool=tmp_path / "spool")
+    assert verified["image"].media_type == "image/png"
+    result, outcome = invoke(tmp_path / "result", verified)
+    assert outcome.terminal == "succeeded", outcome
+    assert result.result.pixel == "0c2238"
+
+
 @pytest.mark.parametrize("fault", ["digest", "length", "mime", "missing", "root", "url"])
 def test_direct_grant_refusals_leave_no_media_copy(tmp_path: Path, fault: str) -> None:
     source = tmp_path / "image.png"
@@ -166,7 +186,7 @@ def test_direct_grant_refusals_leave_no_media_copy(tmp_path: Path, fault: str) -
     elif fault == "length":
         bound.inputs["image"] = replace(entry, length=entry.length - 1)
     elif fault == "mime":
-        bound.inputs["image"] = replace(entry, kind_mime="image/jpeg")
+        bound.inputs["image"] = replace(entry, kind_mime="video/mp4")
     elif fault == "missing":
         source.unlink()
     elif fault == "url":

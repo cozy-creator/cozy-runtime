@@ -383,14 +383,14 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
         return known
     if (candidate.name, device) in _BROKEN:
         raise _BROKEN[(candidate.name, device)]
-    registry = _registry()
+    _registry()
     artifact = _compiled(candidate, device) if candidate.artifact else None
     if candidate.import_name:
         module = _import(candidate)
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
     if candidate.name == "sol-attn":
-        _bind_sol_dense(device, registry)
+        _sol_route(device)
         if device.kind == "cuda":
             attention_sol.submit_card(device.index)
     ready = Ready(candidate, _member(candidate), artifact)
@@ -494,9 +494,8 @@ def evidence(served: Iterable[str]) -> list[dict[str, Any]]:
     ]
 
 
-def _bind_sol_dense(device: DeviceFacts, registry: Any) -> None:
-    """Sol serves only its CuTe routes (upstream silently falls back to Triton without CuTe)
-    and recomputes dense rows with the first ranked dense kernel on this rank."""
+def _sol_route(device: DeviceFacts) -> None:
+    """Sol serves only its CuTe routes; upstream silently falls back to Triton without CuTe."""
     if device.kind == "cuda":
         route = attention_sol.backend(device.index)
         if not route.startswith("cute_"):
@@ -505,15 +504,47 @@ def _bind_sol_dense(device: DeviceFacts, registry: Any) -> None:
                 f"sol-attn selects its {route!r} route on {device.name}; only its CuTe routes "
                 "are served, which need cutlass.cute and cuda.bindings",
             )
+
+
+def _sol_dense(
+    order: Sequence[str],
+    device: DeviceFacts,
+    resolved: dict[str, Ready],
+    refused: dict[str, str],
+) -> Ready:
+    """The kernel Sol recomputes dense rows with (its dense steps, protected prefix and dense
+    paths): the first one after Sol in the model's preference that serves BF16 at head
+    dimension 128 on this rank, else the first ranked one. It runs locally after the Ulysses
+    exchange, so it needs no context parallelism. A preferred kernel still compiling is
+    recorded in `refused`, so `pending` re-selects when it is ready (run 1565: SDPA served
+    Sol's dense steps at 35 s where SageAttention takes about 24 s)."""
+    for name in order:
+        candidate = BY_NAME.get(name)
+        if (
+            candidate is None
+            or name == "sol-attn"
+            or _device_admits(candidate, device)
+            or not _admits(candidate, "bfloat16", 128)
+        ):
+            continue
+        if name not in resolved:
+            try:
+                resolved[name] = _resolve(candidate, device)
+            except Exception as exc:
+                refused.setdefault(name, f"{type(exc).__name__}: {exc}"[:300])
+                continue
+        return resolved[name]
     dense = next(
         (entry for entry in available(device) if _admits(entry.candidate, "bfloat16", 128)),
         None,
     )
     if dense is None:
         raise AttentionRefusal("attention_kernel_absent", "Sol has no ready dense reference")
-    # Rebound at each selection: a dense kernel that finished compiling since the last one
-    # becomes Sol's reference with the construction that selects it.
-    attention_sol.bind_dense(registry._backends[dense.member], dense.name)
+    return dense
+
+
+def _bind_sol_dense(dense: Ready) -> None:
+    attention_sol.bind_dense(_registry()._backends[dense.member], dense.name)
 
 
 def _device_admits(candidate: Candidate, device: DeviceFacts) -> str:
@@ -922,10 +953,9 @@ def _preferred(
     for name in order:
         candidate = BY_NAME.get(name)
         if candidate is None:
-            raise AttentionRefusal(
-                "attention_kernel_unknown",
-                f"model attention preference names {name!r}; this runtime knows {sorted(BY_NAME)}",
-            )
+            # A package written for a newer Runtime may prefer a kernel this one lacks.
+            refused[name] = "unknown to this runtime"
+            continue
         if name in refused:
             continue
         entry = resolved.get(name)
@@ -985,6 +1015,7 @@ def install(
     refused: dict[str, str] = dict(skipped or {})
     matched = False
     eligible_sites: dict[tuple[str, int], tuple[str, ...]] = {}
+    sol_order: tuple[str, ...] | None = None
     for component, path, module, processor in _attention_records(roots):
         dtype, head_dim = _dtype(module), _head_dim(module)
         forced = bool(name and _matches(component, scope))
@@ -1063,6 +1094,8 @@ def install(
                     _preferred(selection, device, dtype, head_dim, degree, resolved, refused)
                     or entry
                 )
+                if entry.name == "sol-attn" and sol_order is None:
+                    sol_order = tuple(selection[list(selection).index("sol-attn") + 1 :])
             elif selection is not None:
                 if not isinstance(selection, str) or selection not in eligible:
                     raise AttentionRefusal(
@@ -1080,6 +1113,8 @@ def install(
         raise AttentionRefusal(
             "attention_kernel_unsupported", f"{pin!r} matches no attention component"
         )
+    if device is not None and any(entry.name == "sol-attn" for *_, entry in assignments):
+        _bind_sol_dense(_sol_dense(sol_order or (), device, resolved, refused))
     _install_sites(
         [
             (entry, component, path, module)
@@ -1301,6 +1336,8 @@ def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: in
     candidate = check(device, roots, name, degree)
     scope, _ = _pin_parts(name)
     entry = pinned(candidate.name, device)[0]
+    if entry.name == "sol-attn" and not attention_sol.dense_identity():
+        _bind_sol_dense(_sol_dense((), device, {}, {}))
     records = [
         (component, path, module, processor)
         for component, path, module, processor in _site_records(roots)

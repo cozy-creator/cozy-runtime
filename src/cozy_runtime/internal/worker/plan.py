@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 import msgspec
 
-from cozy_runtime.internal import canonical, installed_interfaces
+from cozy_runtime.internal import canonical, installed_interfaces, tolerant
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.delivery import RUNGS_BY_NAME, DeliveryRefusal, cost_class
 from cozy_runtime.internal.execution_evidence import Boot
@@ -322,7 +322,8 @@ class PreparedModel:
     @classmethod
     def from_reply(cls, reply: Mapping[str, object]) -> PreparedModel:
         """Read exactly the executor's prepared generation, including each model's routes."""
-        read = msgspec.convert(reply, _PrepareReply)
+        # What was built and how it is delivered are exact; which kernels won is narration.
+        read, _ = tolerant.read(reply, _PrepareReply, ("facts.attention",))
         models = read.delivery.models
         return cls(
             constructed_model_digest=read.constructed_model_digest,

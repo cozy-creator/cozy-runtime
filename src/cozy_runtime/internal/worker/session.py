@@ -5654,7 +5654,12 @@ class Worker:
         facts = dict(reply.get("facts") or {})
         try:
             resolved = PreparedModel.from_reply(reply)
-            delivery = msgspec.convert(reply.get("delivery"), _Delivery | None)
+            narrated = reply.get("delivery")
+            delivery = (
+                None
+                if narrated is None
+                else tolerant.read(narrated, _Delivery, _Delivery.__struct_fields__)[0]
+            )
         except (KeyError, TypeError, ValueError) as exc:
             # An executor from another Runtime version answered without a fact this worker
             # needs: refuse this attempt, never the lane or the worker.

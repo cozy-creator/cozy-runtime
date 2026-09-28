@@ -1,13 +1,15 @@
 """GPU scheduling policy: one lease per root, exact device sets, level-triggered.
 
 Each pass takes the open roots with their durable priority and every demand not yet
-released from its device; anything missing is gone, so a hold cannot leak. A root's lease
-grows only from free ordinals and ends when the root stops or says it is done with GPUs
+released from its device; anything missing is gone, so a hold cannot leak. One total order
+ranks every demand: its root's admission, then its own arrival. A root's lease holds the
+ordinals its calls were granted until the root stops or says it is done with GPUs
 (`release_root`, the author's `ctx.release_gpus()`; a root that is itself the GPU call is
-done at its device exit), so the Python gap between two children never lets another root
-in. Priority orders the waiters: the oldest waiter that cannot start reserves the free
-ordinals, so a younger narrow demand never starves it. Nothing is revoked, lent or
-preempted.
+done at its device exit), so the Python gap between two children never lets a younger root
+in. A lease never holds against an older root: its call takes a younger lease's idle
+ordinals, and waits only for calls actually on the devices. The oldest waiter that cannot
+start reserves what it can use, so a younger narrow demand never starves it. A grant is
+never revoked or preempted.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ class Demand:
     exclude: Ordinals = ()  # ordinals it must not take
 
 
-def model_degrees(models: Iterable[Any]) -> list[set[int]]:
+def model_degrees(models: Iterable[object]) -> list[set[int]]:
     """Declared `sequence_parallel.degrees` per model slot; an unreadable field is none."""
     rows = []
     for model in models:
@@ -91,11 +93,13 @@ class GpuScheduler:
                 self._lease(root, set(), "stopped")
             self.yielded = {r: c for r, c in self.yielded.items() if r in roots}
             self._arrival = {k: self._arrival.get(k, next(self._counter)) for k in live}
-            busy = {o for _, ordinals in self.grants.values() for o in ordinals}
-            stalled: set[str] = set()
+            order = {root: (priority, root) for root, priority in roots.items()}
+            holder = {o: root for root, ordinals in self.grants.values() for o in ordinals}
+            #: root -> the root its waiting call is named behind ("" for none, or its own run)
+            stalled: dict[str, str] = {}
             pending = sorted(
                 (d for d in live.values() if d.key not in self.grants and d.root in roots),
-                key=lambda d: (roots[d.root], d.root, self._arrival[d.key]),
+                key=lambda d: (order[d.root], self._arrival[d.key]),
             )
             for demand in pending:  # a GPU call after a release starts a new lease
                 self.yielded.pop(demand.root, None)
@@ -103,33 +107,37 @@ class GpuScheduler:
                 if demand.root in stalled:
                     continue  # FIFO within a root: a later call never overtakes an earlier one
                 lease = self.leases.get(demand.root, set())
-                taken = {o for held in self.leases.values() for o in held}
+                older = {
+                    o: r
+                    for r, held in self.leases.items()
+                    if order[r] < order[demand.root]
+                    for o in held
+                }
+                younger = {o for held in self.leases.values() for o in held} - lease - set(older)
                 usable = [
                     o
                     for o in range(self.devices)
-                    if o not in busy and o not in demand.exclude and (o in lease or o not in taken)
+                    if o not in holder and o not in older and o not in demand.exclude
                 ]
                 if len(usable) >= demand.width:
-                    ranked = sorted(usable, key=lambda o: (o not in demand.warm, o not in lease, o))
+                    ranked = sorted(
+                        usable,
+                        key=lambda o: (o not in demand.warm, o not in lease, o in younger, o),
+                    )
                     chosen = tuple(sorted(ranked[: demand.width]))
                     self.grants[demand.key] = (demand.root, chosen)
                     self.waiting.pop(demand.key, None)
-                    busy.update(chosen)
-                    self._lease(demand.root, lease | set(chosen), f"granted {demand.key}")
+                    holder.update(dict.fromkeys(chosen, demand.root))
+                    self._claim(demand, set(chosen), "granted")
                     self.events.append(
                         (demand.root, "gpu.grant", {"key": demand.key, "ordinals": list(chosen)})
                     )
                     continue
                 if not stalled:
-                    # The head of the line reserves what is free; nothing else moves.
-                    self._lease(demand.root, lease | set(usable), f"reserved for {demand.key}")
-                stalled.add(demand.root)
-                blocked = tuple(
-                    sorted(
-                        {r for r, _ in self.grants.values()}
-                        | {r for r, held in self.leases.items() if held and r != demand.root}
-                    )
-                )
+                    # The head of the line reserves what it can use; nothing else moves.
+                    self._claim(demand, set(usable), "reserved for")
+                blocked = self._behind(demand, holder, older, stalled, order)
+                stalled[demand.root] = blocked[0] if blocked and blocked[0] != demand.root else ""
                 if self.waiting.get(demand.key) != (demand.root, demand.width, blocked):
                     self.waiting[demand.key] = (demand.root, demand.width, blocked)
                     self.events.append(
@@ -141,7 +149,7 @@ class GpuScheduler:
                     )
             return {key: ordinals for key, (_, ordinals) in self.grants.items()}
 
-    def release(self, key: str, **facts: Any) -> None:
+    def release(self, key: str, **facts: object) -> None:
         """Device exit: the ordinals return to the root's lease before the next tick. A root
         that is itself this call (a direct serving or device-job root) has no GPU work after
         it, so its lease ends here and its encode and output transfer hold no GPU."""
@@ -222,6 +230,45 @@ class GpuScheduler:
                 "waiting": {key: list(blocked) for key, (_, _, blocked) in self.waiting.items()},
             }
 
+    def _claim(self, demand: Demand, ordinals: set[int], verb: str) -> None:
+        """`demand`'s root leases `ordinals`; a younger root's idle hold on any of them ends."""
+        for root, held in list(self.leases.items()):
+            if root != demand.root and held & ordinals:
+                self._lease(root, held - ordinals, f"yielded to {demand.key}")
+        self._lease(
+            demand.root, self.leases.get(demand.root, set()) | ordinals, verb + " " + demand.key
+        )
+
+    @staticmethod
+    def _behind(
+        demand: Demand,
+        holder: Mapping[int, str],
+        older: Mapping[int, str],
+        stalled: Mapping[str, str],
+        order: Mapping[str, tuple[int, str]],
+    ) -> tuple[str, ...]:
+        """The one root `demand` is named behind: the earliest older waiter holding what it
+        needs, else a root whose calls hold it, never one already named behind this root (no
+        cycle). Its own root when only its own run stands between it and the GPUs."""
+        blockers = {
+            holder[o] if o in holder else older[o]
+            for o in {*holder, *older}
+            if o not in demand.exclude
+        }
+        ranked = sorted(
+            blockers - {demand.root},
+            key=lambda r: (r not in stalled, r not in order, order.get(r, (0, r))),
+        )
+        for candidate in ranked:
+            named = candidate
+            for _ in stalled:
+                named = stalled.get(named, "")
+                if not named or named == demand.root:
+                    break
+            if named != demand.root:
+                return (candidate,)
+        return (demand.root,) if blockers else ()
+
     def _end(self, key: str, cause: str, facts: Document | None = None) -> None:
         root, ordinals = self.grants.pop(key)
         body = {"key": key, "ordinals": list(ordinals), "cause": cause, **(facts or {})}
@@ -300,7 +347,7 @@ class GpuBroker(GpuScheduler):
             self.wants[key] = want
         self.resync()
 
-    def release(self, key: str, **facts: Any) -> None:
+    def release(self, key: str, **facts: object) -> None:
         """The attempt left the device, or never reached it: its demand and grant end."""
         super().release(key, **facts)
         with self.changes:

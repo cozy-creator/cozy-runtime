@@ -1,0 +1,1 @@
+Sol recomputes its dense rows (dense steps, protected prefix, dense paths) with the kernel after it in the model's attention preference, so H3 runs them on SageAttention rather than SDPA or FA3. A preferred kernel still compiling is recorded as skipped and joins at the next request boundary on every rank of a group; Sol's dense reference rebinds there instead of refusing.
