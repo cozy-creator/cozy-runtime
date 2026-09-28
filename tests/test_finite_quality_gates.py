@@ -43,11 +43,16 @@ def test_scaled_fp8_grading_refuses_poison_and_nonzero_zeros() -> None:
         got = _scaled()
         got[normal] = value
         assert not probe._grade_scaled(EPS16, got, SCALE).passed, value
-    everywhere = [math.nan] * 256
-    assert not probe._grade_scaled(EPS16, everywhere, SCALE).passed
     garbage_zero = _scaled()
     garbage_zero[0x00] = 1e-3
     assert not probe._grade_scaled(EPS16, garbage_zero, SCALE).passed
+
+
+def test_an_all_nan_decoder_fails_both_decode_checks() -> None:
+    everywhere = [math.nan] * 256
+    assert not probe._grade_scaled(EPS16, everywhere, SCALE).passed
+    sweep = probe._domain_sweep(np, np.float32, everywhere, [(1.0, "s")])
+    assert not sweep.passed and sweep.wrong is not None and sweep.wrong["normal"] > 0
 
 
 def _domain(dtype: type[np.floating], scale: float) -> list[float]:
