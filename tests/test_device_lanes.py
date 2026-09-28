@@ -146,8 +146,8 @@ def test_ceilings_are_measured_and_never_double_booked() -> None:
     assert low - (1 << 20) < free_mib * (1 << 20) < high + (1 << 20), (real, after, projected)
     assert real.total_bytes == total_mib * (1 << 20), (real, projected)
 
-    # THE PROCESS CEILING: the lane's measured capacity less what its co-tenants hold, so a
-    # second executor on the card is never handed the bytes the first one holds.
+    # THE CEILING IS THE DEVICE: the lock is the reservation and idle co-tenants are
+    # evicted for the tenant holding it, so nothing is partitioned in advance.
     with _workspace() as root:
         worker = Worker(
             *claimable(_config(root / "home"), WorkerOptions(root=root / "worker", devices="0")),
@@ -155,14 +155,7 @@ def test_ceilings_are_measured_and_never_double_booked() -> None:
         )
         try:
             lane = worker.lanes.lanes[0]
-            alone = worker._process_ceiling(lane, "a")
-            assert real.total_bytes - (1 << 20) <= alone <= real.total_bytes, (alone, real)
-            neighbour = lane.row("b")
-            neighbour.model_bearing = True
-            neighbour.ledger.resident = {"unet": 3 << 30}
-            beside = worker._process_ceiling(lane, "a")
-            assert beside == alone - (3 << 30), (beside, alone)
-            assert lane.rows["a"].ledger.authorized_device_limit_bytes == beside
+            assert worker._ceiling(lane, "a") == real.total_bytes
         finally:
             worker.supervision.close()
 

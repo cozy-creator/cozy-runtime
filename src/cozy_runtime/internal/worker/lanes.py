@@ -13,11 +13,6 @@ byte-identical on the wire to the worker before lanes existed. The ENVELOPE lane
 whole envelope as one group lane with one seat: it is the shape a job takes (cr-018's
 door), never a serving placement's.
 
-Residence ceilings are ASSIGNED by the worker, not derived in the executor (cr-025's
-`authorized_device_limit_bytes`): a process ceiling is what a device measures less what its
-co-tenants hold there, and loads are serialized by the device lock, so two executors on one
-device cannot both be handed the same headroom. Every input is a measurement.
-
 A GROUP lane has d > 1 ordinals (cr-068): ONE executor sealed to all d devices, one seat
 and one staged, one `DeviceFacts` row per device. Lanes OVERLAP: a group over 0-3 and the
 device lanes 0..3 exist together, so a device holds any number of tenants (the owner's
@@ -25,12 +20,9 @@ device lanes 0..3 exist together, so a device holds any number of tenants (the o
 `bind` binds exactly those; nothing is refused or retired for occupancy.
 
 EXECUTION is exclusive per physical device (law 8): each device has one lock and a lane
-takes its devices' locks in ordinal order. RESIDENCY is shared: co-tenants of a device
-hold weights side by side while they fit; when a tenant's demand does not fit, co-tenants
-on its tightest device VACATE, LRU-first — the process and its construction stay, the
-weights re-stage on that tenant's next attempt. No timer decides anything here; a tenant
-that fits beside its neighbours is never moved, and one on the card is never a victim:
-the arbiter holds that device's lock.
+takes its devices' locks in ordinal order. RESIDENCY is shared and belongs to the machine's
+memory manager (`memory.py`): the device lock is the reservation, and idle tenants of a
+device are evicted for the one holding it.
 """
 
 from __future__ import annotations
@@ -92,24 +84,19 @@ class LaneRow:
     model_bearing: bool = False
     #: the executor slot this row's generation lives in, so the lane can ask it to vacate
     supervision: child.ExecutorSupervision | None = None
-    #: the lane clock at this tenant's latest admission or prepare: LRU victim order
+    #: the lane clock at this tenant's latest admission or load: LRU victim order
     last_used: int = 0
-    #: invocation spec digest -> THE LANE RESIDENCY SIGNATURE under which an attempt of
-    #: that exact invocation died of a device OOM (cr-097). The same invocation under the
-    #: SAME signature cannot get a different answer -- measured as four identical 38.3 s
-    #: failures, each followed by a 25.8 s executor rebuild, while an IDLE co-tenant held
-    #: 6.07 GiB. The arbitration reads it to make that retry a different request, or to
-    #: refuse it typed instead of spending the handler again. Keyed by invocation (cr-190):
-    #: one oversized request must not refuse every other request of the placement.
-    oom_signatures: dict[bytes, str] = field(default_factory=dict)
+    #: ordinal -> what this tenant holds there beyond its process's context, as the driver
+    #: measured its own loads, restores and calls (`memory.py`); cleared when it is evicted
+    held: dict[int, int] = field(default_factory=dict)
+    #: (entrypoint, shape cell) -> ordinal -> the most it held there during a successful call
+    peak: dict[tuple[str, str], dict[int, int]] = field(default_factory=dict)
 
     def resident_bytes(self) -> int:
         return sum(self.ledger.resident.values())
 
     def executor(self) -> child.Executor | None:
-        """The live, unpoisoned executor holding this row's bytes, or None. A poisoned or
-        dead one is not a vacate candidate: its own rebuild reclaims it, by process death,
-        which frees more surely than any eviction."""
+        """The live, unpoisoned executor holding this row's bytes, or None."""
         current = self.supervision.current if self.supervision is not None else None
         if current is None or current.poisoned or not current.alive():
             return None
@@ -349,51 +336,6 @@ class LaneSet:
         mine = set(lane.ordinals)
         return [lane, *(o for o in self.lanes if o is not lane and mine & set(o.ordinals))]
 
-    def tenants(self, lane: DeviceLane, ordinal: int | None = None) -> list[tuple[str, LaneRow]]:
-        """Model-bearing rows on `lane`'s devices (on `ordinal` alone, if given)."""
-        return [
-            (slot, row)
-            for other in self.sharing(lane)
-            if ordinal is None or ordinal in other.ordinals
-            for slot, row in other.rows.items()
-            if row.model_bearing
-        ]
-
-    def victims(self, lane: DeviceLane, slot: str, ordinal: int) -> list[tuple[str, LaneRow]]:
-        """`slot`'s live co-tenants on `ordinal`, one of `lane`'s devices, LRU first. None
-        is on the card: the caller holds `lane.device`, which any of them needs to execute.
-        One holding no residents may still hold an allocator cache."""
-        held = [
-            (key, row)
-            for key, row in self.tenants(lane, ordinal)
-            if key != slot and row.executor() is not None
-        ]
-        return sorted(held, key=lambda item: item[1].last_used)
-
-    def beside(self, lane: DeviceLane, slot: str) -> int:
-        """The most any one of `lane`'s devices holds for tenants other than `slot`."""
-        return max(
-            (
-                sum(row.resident_bytes() for key, row in self.tenants(lane, o) if key != slot)
-                for o in lane.ordinals
-            ),
-            default=0,
-        )
-
-    def signature(self, lane: DeviceLane) -> str:
-        """WHO HOLDS WHAT ON `lane`'s DEVICES, right now, as one comparable word (cr-097).
-
-        The question a retry has to be able to answer: is the device in the same state it
-        was in when the last attempt died? Bytes rather than names, because a co-tenant
-        that vacated half its components changed the answer even though the set of tenants
-        did not.
-        """
-        rows = sorted(
-            ((slot, row) for other in self.sharing(lane) for slot, row in other.rows.items()),
-            key=lambda item: item[0],
-        )
-        return ";".join(f"{slot}={row.resident_bytes()}" for slot, row in rows)
-
     # ------------------------------------------------------------------- assignment
 
     def bind(
@@ -486,15 +428,16 @@ class LaneSet:
             == "measured"
         ]
 
+        def tenants(lane: DeviceLane) -> int:
+            return sum(
+                row.model_bearing for other in self.sharing(lane) for row in other.rows.values()
+            )
+
         def crowd(lane: DeviceLane) -> tuple[int, tuple[int, ...]]:
-            return len(self.tenants(lane)), lane.ordinals
+            return tenants(lane), lane.ordinals
 
         steps = (
-            [
-                lane
-                for lane, m in readable
-                if not self.tenants(lane) and m.free_bytes >= declared_bytes
-            ],
+            [lane for lane, m in readable if not tenants(lane) and m.free_bytes >= declared_bytes],
             [lane for lane, m in readable if m.free_bytes >= declared_bytes],
             sorted((lane for lane, m in readable if m.total_bytes >= declared_bytes), key=crowd),
             sorted((lane for lane, _m in readable), key=crowd),

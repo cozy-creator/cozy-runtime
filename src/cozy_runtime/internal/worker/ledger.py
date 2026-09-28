@@ -177,7 +177,6 @@ class Measurement(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True)
     classes: tuple[Counter, ...]
     unreadable: tuple[str, ...] = ()
     unreconciled: str = ""
-    unsuitable_placements: dict[str, str] = {}
     activation_scopes_by_cell: dict[str, dict[str, int]] = {}
 
 
@@ -287,65 +286,12 @@ class Ledger:
     activations_peak: int = 0
     #: the device this generation was BUILT on, named by the process that owns it
     accelerator: str = ""
-    #: shape cell -> the activation peak measured on THAT cell. A generation-wide maximum
-    #: prices a 512px request against whatever a 1024px one needed, which is a refusal or a
-    #: worse rung charged to a request that never asked for it (codex audit, adopted
-    #: 2026-08-25). `activations_for` reads this and falls back, LABELLED, when a cell has
-    #: no serve behind it yet.
+    #: shape cell -> the activation peak its successful serves measured. A property of the
+    #: model and the shape, so it outlives the executor generation.
     activations_by_cell: dict[str, int] = field(default_factory=dict)
     #: shape cell -> component-use method -> measured scratch peak while that method's
     #: declared component set was resident. Staged admission prices matching pairs only.
     activation_scopes_by_cell: dict[str, dict[str, int]] = field(default_factory=dict)
-    #: THE SAME TWO MAPS, ACROSS GENERATIONS (cr-097).
-    #:
-    #: §3.2 says reservations are executor-generation-scoped and the ledger restarts WITH
-    #: the new generation, never reconstructed from DEVICE STATE. That invariant is not
-    #: weakened here, and the distinction is the reason: §3.2 protects against claiming to
-    #: know what a device holds after the process that filled it was replaced. An
-    #: activation envelope is not device state. It is a property of a MODEL and a REQUEST
-    #: SHAPE — what these kernels allocate at this shape — and it would be equally true on
-    #: another card in another datacenter. Nothing about it describes the replaced
-    #: process's residency, so carrying it forward asserts nothing §3.2 forbids.
-    #:
-    #: The shape cell is what keeps that honest: a measurement read for the wrong shape
-    #: would be the same lie by another route, so these are keyed by cell and nothing else
-    #: is inferred across cells that `activations_for` does not already label as an upper
-    #: bound. The placement id and the lane hold the model and the card fixed for the life
-    #: of the row (`lane.forget` drops it when the placement leaves), so a carried number
-    #: can never be read for a different model.
-    #:
-    #: It has to. `plan.py` may not refuse on an UNCALIBRATED envelope, so the 1 GiB
-    #: placeholder deepens the ladder and runs. When the real demand is 3.9 GiB and a
-    #: co-tenant holds the slack that used to hide the gap, the attempt OOMs, poisons the
-    #: executor, and the rebuild wiped the measurement that would have refused the retry —
-    #: so the retry was uncalibrated again. Measured live: four identical 38.3 s failures,
-    #: each with a 25.8 s rebuild, until the requeue budget ran out.
-    carried_activations_by_cell: dict[str, int] = field(default_factory=dict)
-    carried_activation_scopes_by_cell: dict[str, dict[str, int]] = field(default_factory=dict)
-    #: cell -> THE DRIVER-FREE BYTES THE MEASUREMENT WAS TAKEN UNDER (cr-097, third cut).
-    #: An activation peak is not interpretable without it. Kernels expand into the headroom
-    #: they are given — cuBLAS/cuDNN workspace selection, allocator behaviour — so the same
-    #: model at the same shape measured 3.91 GiB alone on a 15.6 GiB card and 1.92 GiB with
-    #: a co-tenant beside it, reproducibly. A peak observed with the card empty is therefore
-    #: an upper bound the kernels CHOSE, not a requirement they HAVE, and a bare scalar
-    #: cannot say which it is. This is what lets a reader tell.
-    carried_activation_free_by_cell: dict[str, int] = field(default_factory=dict)
-    #: cell -> the free bytes under which an attempt for it ALREADY FAILED on the device
-    #: (cr-097). A lower bound on demand, never an envelope; see `observe_device_shortfall`.
-    carried_shortfall_by_cell: dict[str, int] = field(default_factory=dict)
-    #: cell -> THE LEAST DRIVER-FREE BYTES THIS CELL HAS COMPLETED IN WITH NOTHING MOVING
-    #: (cr-100). The exact counterpart of the row above, in the same units and comparable
-    #: with the card the same way: one says "at this much room, this shape FAILED", this
-    #: one says "at this much room, this shape FINISHED, with its whole resident set
-    #: standing still". Two direct observations of the question a rung actually asks.
-    #:
-    #: It exists because an activation PEAK cannot answer that question. A peak is what the
-    #: kernels took given the room they had, so a peak from a roomier card is an upper
-    #: bound they chose (decisions 698) and a peak from a tighter one says nothing about a
-    #: roomier one. A completed serve at F free bytes is not an inference at all — it is
-    #: the outcome the plan is trying to predict, already observed, and it outranks the
-    #: envelope wherever the two disagree.
-    carried_resident_free_by_cell: dict[str, int] = field(default_factory=dict)
     #: set when an attempt staged or evicted: the activation basis moved under it
     activations_moved: bool = False
     #: attempts closed since the device baseline was last measured. Zero means the next
@@ -353,11 +299,6 @@ class Ledger:
     closed_since_baseline: int = 0
     executor_pid: int = 0
     worker_pid: int = 0
-    #: the residence ceiling the WORKER assigned this generation before its prepare (cr-025's
-    #: `authorized_device_limit_bytes`; cr-066 assigns it from the lane's measured free
-    #: bytes). -1 until assigned. It is a policy fact the executor is handed, never one it
-    #: derives: the executor fits its prepare under the smaller of this and what it measures.
-    authorized_device_limit_bytes: int = -1
     #: ordinal -> that device's driver-reported row (cr-068). One entry on a device lane;
     #: K on a group lane. `device_free`/`device_total` above are the MIN over these, which
     #: is what a plan priced once for every rank is priced against.
@@ -404,9 +345,6 @@ class Ledger:
     #: card holding one component (cl-003). It clears only when the ledger is re-established
     #: from a real construction — never by another attempt agreeing with itself.
     unreconciled: str = ""
-    #: Placement rungs this executor generation falsified with measured capacity evidence.
-    #: The fact dies with the generation; a different construction/device proves itself.
-    unsuitable_placements: dict[str, str] = field(default_factory=dict)
 
     @property
     def out_of_allocator(self) -> int:
@@ -448,14 +386,9 @@ class Ledger:
         self.device_total = -1
         self.activations_peak = 0
         self.accelerator = ""
-        self.activations_by_cell.clear()
-        self.activation_scopes_by_cell.clear()
-        # `carried_activations_by_cell` / `carried_activation_scopes_by_cell` are NOT
-        # cleared: they outlive the generation deliberately (cr-097, see their field docs).
         self.activations_moved = False
         self.closed_since_baseline = 0
         self.executor_pid = executor_pid
-        self.authorized_device_limit_bytes = -1
         self.devices.clear()
         self.unreadable.clear()
         self.resident.clear()
@@ -467,7 +400,6 @@ class Ledger:
         self.baseline_notes.clear()
         self.residency_delta = 0
         self.unreconciled = ""
-        self.unsuitable_placements.clear()
 
     def observe_construction(self, facts: Mapping[str, object]) -> None:
         """The generation's resident baseline, from the fill that just committed."""
@@ -509,18 +441,11 @@ class Ledger:
         """What one attempt's kernel allocated ON TOP of the resident weights.
 
         A residency-aware executor supplies `activation_peak_bytes` from a fresh allocator
-        high-water mark inside each component-use scope. That measurement survives staging.
-        Without it, `peak_allocated - the post-fill baseline` is valid only while the resident
-        set stands still; a moved basis is named absent rather than reported as a small number.
+        high-water mark inside each component-use scope, which survives staging. Without it,
+        `peak_allocated - the post-fill baseline` holds only while the resident set stands
+        still. Only a succeeding serve is banked per cell: a failed one died climbing, so
+        its peak is a lower bound, not a measurement.
         """
-        # A SERVE THAT FINISHED WITHOUT MOVING A BYTE IS A FACT ABOUT THE CARD, not about
-        # the kernels' appetite (cr-100). It is banked before anything below, because it
-        # does not depend on an activation peak being readable: whatever the peak was, the
-        # whole resident set stood still and the work completed in the room that was left.
-        if succeeded and cell and not resident_moved and self.device_free >= 0:
-            previous = self.carried_resident_free_by_cell.get(cell)
-            if previous is None or self.device_free < previous:
-                self.carried_resident_free_by_cell[cell] = self.device_free
         scopes = {method: value for method, value in metrics.activation_peaks.items() if value > 0}
         direct = max(scopes.values(), default=metrics.activation_peak_bytes)
         if direct > 0:
@@ -533,204 +458,26 @@ class Ledger:
         else:
             peak = metrics.peak_vram_bytes
             measured = peak - self.device_baseline if peak and self.device_baseline >= 0 else 0
-        if measured > 0:
-            self.activations_peak = max(self.activations_peak, measured)
-            if cell:
-                self.activations_by_cell[cell] = max(
-                    self.activations_by_cell.get(cell, 0), measured
-                )
-                held = self.activation_scopes_by_cell.setdefault(cell, {})
-                for method, value in scopes.items():
-                    held[method] = max(held.get(method, 0), value)
-                # ONLY A SUCCEEDING SERVE MAY CALIBRATE (cr-097). The generation-scoped
-                # maps above still record a fault's peak, which is what an operator wants
-                # to read; the CARRIED map may not, because a peak observed on an attempt
-                # that died on its way up is a TRUNCATED LOWER BOUND, not a measurement.
-                # Banking it would make the retry calibrated AND WRONG — priced too low,
-                # `enforceable`, and therefore able to refuse nothing while running
-                # straight back into the same OOM. That is strictly worse than
-                # uncalibrated, whose may-not-refuse rule is at least honest about not
-                # knowing. A failed attempt's fact goes to `observe_device_shortfall`,
-                # which is a different slot holding a different KIND of number.
-                if succeeded:
-                    previous = self.carried_activations_by_cell.get(cell, 0)
-                    self.carried_activations_by_cell[cell] = max(previous, measured)
-                    if measured >= previous:
-                        # The CONDITIONS travel with the number, always together: a peak
-                        # whose free-bytes context was dropped is exactly the category
-                        # error this issue is about.
-                        self.carried_activation_free_by_cell[cell] = self.device_free
-                    carried = self.carried_activation_scopes_by_cell.setdefault(cell, {})
-                    for method, value in scopes.items():
-                        carried[method] = max(carried.get(method, 0), value)
-
-    def observe_device_shortfall(self, cell: str, free_bytes: int) -> None:
-        """A failed attempt's REFUSAL-GRADE fact (cr-097): at `free_bytes` free on this
-        lane, this shape cell did not fit. It is a LOWER BOUND on demand and never an
-        envelope — the attempt died climbing, so its true peak is strictly greater than
-        anything it was observed to reach. Kept apart from `carried_activations_by_cell`
-        in the TYPE, not by convention, because the one thing that must never happen is a
-        truncated peak being read as a measurement.
-        """
-        if not cell or free_bytes < 0:
+        if measured <= 0:
             return
-        self.carried_shortfall_by_cell[cell] = max(
-            self.carried_shortfall_by_cell.get(cell, 0), int(free_bytes)
-        )
+        self.activations_peak = max(self.activations_peak, measured)
+        if cell and succeeded:
+            self.activations_by_cell[cell] = max(self.activations_by_cell.get(cell, 0), measured)
+            held = self.activation_scopes_by_cell.setdefault(cell, {})
+            for method, value in scopes.items():
+                held[method] = max(held.get(method, 0), value)
 
-    def carried_conditions_apply(self, cell: str) -> bool:
-        """Whether a CARRIED measurement for `cell` may be enforced right now (cr-097).
-
-        True when it was observed with no more room than there is now, so the number is a
-        requirement the kernels actually had; false when it was observed on a roomier card,
-        where it is an upper bound they chose. A basis of 0 means nothing was banked, and
-        the uncalibrated path owns that case with its own may-not-refuse rule.
-        """
-        basis = self.activation_basis_free(cell)
-        return basis == 0 or basis <= self.device_free
-
-    def activation_basis_free(self, cell: str) -> int:
-        """The driver-free bytes the carried activation measurement for `cell` was observed
-        under, or 0 when there is none (cr-097).
-
-        A caller compares it with the free bytes NOW. Measured under conditions at least as
-        tight as the present ones, the number is a requirement and may refuse. Measured on a
-        roomier card, it is an upper bound the kernels chose and may only DEEPEN the ladder
-        — never refuse, and never evict a co-tenant. Getting that backwards would move the
-        defect from "this tenant is slow" to "the OTHER tenant is thrown off the card for no
-        reason", which is quieter and worse: the victim is not even the tenant being served.
-        """
-        exact = self.carried_activation_free_by_cell.get(cell, 0)
-        if exact:
-            return exact
-        # A cross-cell read already labels itself an upper bound; its conditions are the
-        # widest cell's, so the same comparison still applies.
-        if self.carried_activation_free_by_cell:
-            widest = max(
-                self.carried_activations_by_cell,
-                key=lambda k: self.carried_activations_by_cell[k],
-                default="",
-            )
-            return self.carried_activation_free_by_cell.get(widest, 0)
-        return 0
-
-    def insufficient_for(self, cell: str, free_now: int) -> int:
-        """The banked floor when this cell is KNOWN not to fit in `free_now`, else 0.
-
-        The comparison is deliberately `<=`: a picture no better than the one that already
-        failed cannot produce a different answer, which is the whole of the retry rule. A
-        picture with MORE room is not answered here — it may or may not fit, and finding
-        out is exactly what a genuinely different attempt is for.
-        """
-        floor = self.carried_shortfall_by_cell.get(cell, 0)
-        if floor and free_now <= floor:
-            return floor
-        return 0
-
-    def resident_sufficiency(self, cell: str) -> int:
-        """The least free bytes this cell has COMPLETED in with nothing moving, else 0.
-
-        The mirror of `insufficient_for` and read the same way: a caller compares it with
-        the free bytes it has now, and a number no larger than what it has is a serve that
-        already happened under conditions no roomier than these. It PERMITS; it never
-        refuses, because the absence of an observation is not evidence against one.
-        """
-        return self.carried_resident_free_by_cell.get(cell, 0)
-
-    def activations_for(self, cell: str) -> tuple[int, str]:
-        """The activation envelope for ONE shape cell, and where the number came from.
-
-        A cell with its own serve behind it is measured. A cell with none takes the largest
-        cell measured on this generation — conservative, and NAMED as an upper bound over
-        other shapes rather than passed off as this request's measurement.
-        """
-        exact = self.activations_by_cell.get(cell, 0)
-        if exact:
-            return exact, (
-                f"scope-local max_memory_allocated() minus its resident component baseline, "
-                f"on cell {cell}"
-            )
-        if self.activations_by_cell:
-            widest = max(self.activations_by_cell, key=lambda k: self.activations_by_cell[k])
-            return self.activations_by_cell[widest], (
-                f"no serve has been banked on cell {cell}; the widest cell measured on this "
-                f"generation ({widest}) is the upper bound this request is priced against"
-            )
-        # NOTHING ON THIS GENERATION — which is the normal state of a generation the last
-        # attempt's OOM just rebuilt. A measurement carried from an earlier generation of
-        # the same placement on the same lane is still a measurement (cr-097): it prices
-        # the retry against what the model actually allocated instead of against the 1 GiB
-        # placeholder that may not refuse.
-        exact = self.carried_activations_by_cell.get(cell, 0)
-        if exact:
-            return exact, (
-                f"scope-local max_memory_allocated() minus its resident component baseline, "
-                f"on cell {cell}, measured on an earlier generation of this placement"
-            )
-        if self.carried_activations_by_cell:
-            widest = max(
-                self.carried_activations_by_cell,
-                key=lambda k: self.carried_activations_by_cell[k],
-            )
-            return self.carried_activations_by_cell[widest], (
-                f"no serve has been banked on cell {cell} in any generation; the widest "
-                f"cell measured on an earlier generation of this placement ({widest}) is "
-                f"the upper bound this request is priced against"
-            )
-        return 0, ""
+    def activations_for(self, cell: str) -> int:
+        """The activation peak this shape cell's successful serves measured, else 0."""
+        return self.activations_by_cell.get(cell, 0)
 
     def activation_scopes_for(self, cell: str) -> dict[str, int]:
-        # ONE PREDICATE, AT THE TOP, FOR EVERY SCOPE MEASUREMENT — carried or this
-        # generation's own (cr-100). cr-097 gated only the carried maps, which left the
-        # same over-estimate live inside the generation that measured it: a serve run
-        # alone banks per-scope peaks, a co-tenant arrives, and `admit` then refuses
-        # `device_shortfall` on `size + headroom` INSIDE the executor, past every upstream
-        # check, against a number measured on a card that no longer exists. A scope
-        # measurement that does not apply is ABSENT, whoever measured it.
-        if not self.carried_conditions_apply(cell):
-            return {}
-        exact = self.activation_scopes_by_cell.get(cell)
-        if exact:
-            return dict(exact)
-        if self.activation_scopes_by_cell:
-            widest = max(
-                self.activation_scopes_by_cell,
-                key=lambda key: max(self.activation_scopes_by_cell[key].values(), default=0),
-            )
-            return dict(self.activation_scopes_by_cell[widest])
-        # THE CARRIED SCOPES OBEY THE SAME CONDITIONS RULE AS THE CARRIED ENVELOPE
-        # (cr-097). This is the consumer that reaches furthest: `plan.py` turns these into
-        # `scope_headrooms`, the worker sends them to the executor on `open_attempt`, and
-        # `admit` refuses `device_shortfall` on `size + headroom` INSIDE the executor —
-        # past `Coefficient.enforceable`, which is where every other over-estimate is
-        # caught. A per-scope peak measured on a roomier card would refuse an attempt there
-        # that would have succeeded, and no gate upstream would see it. So a carried scope
-        # measurement that does not apply is simply absent, and the caller falls back to
-        # the same bound it uses when nothing was ever measured. The gate itself is at the
-        # top of this function now (cr-100), where it covers the generation's own map too.
-        exact = self.carried_activation_scopes_by_cell.get(cell)
-        if exact:
-            return dict(exact)
-        if self.carried_activation_scopes_by_cell:
-            widest = max(
-                self.carried_activation_scopes_by_cell,
-                key=lambda key: max(
-                    self.carried_activation_scopes_by_cell[key].values(), default=0
-                ),
-            )
-            return dict(self.carried_activation_scopes_by_cell[widest])
-        return {}
+        """Per component-use method, the scratch peak measured at exactly this cell."""
+        return dict(self.activation_scopes_by_cell.get(cell) or {})
 
     def measured_scopes(self, cell: str) -> frozenset[str]:
-        """Methods whose scratch peak was measured at exactly `cell`, applies on this card
-        now, and never ran out of room here: the scopes staged admission may keep other
-        components beside. Another cell's peak says nothing about this one's demand."""
-        if not cell or cell in self.carried_shortfall_by_cell:
-            return frozenset()
-        if not self.carried_conditions_apply(cell):
-            return frozenset()
-        exact = self.activation_scopes_by_cell.get(cell)
-        return frozenset(exact or self.carried_activation_scopes_by_cell.get(cell) or ())
+        """The methods a staged call may keep other components beside: measured here."""
+        return frozenset(self.activation_scopes_by_cell.get(cell) or ())
 
     def observe_residency(self, residency: Mapping[str, object]) -> None:
         """The attempt's DECLARED residency transition, from the plane that performed it."""
@@ -816,14 +563,6 @@ class Ledger:
                 min(row.free for row in rows.values()), min(row.total for row in rows.values())
             )
 
-    def refuse_placement(self, placement: str, reason: str) -> None:
-        """Bank one measured generation/rung capacity falsification."""
-
-        self.unsuitable_placements[placement] = reason[:400]
-
-    def placement_refusal(self, placement: str) -> str:
-        return self.unsuitable_placements.get(placement, "")
-
     def device_unreadable(self, why: str) -> None:
         """The executor is gone: its device classes are UNREADABLE, never zero."""
         self.device_allocated = -1
@@ -879,7 +618,6 @@ class Ledger:
             classes=tuple(self.counters()),
             unreadable=tuple(sorted(self.unreadable)),
             unreconciled=self.unreconciled,
-            unsuitable_placements=dict(self.unsuitable_placements),
             activation_scopes_by_cell={
                 cell: dict(scopes)
                 for cell, scopes in sorted(self.activation_scopes_by_cell.items())
@@ -892,7 +630,6 @@ class Ledger:
             "pinned": {"registered": self.registered},
             "device": {
                 "active_weights": self.weights_bytes,
-                "authorized_limit": self.authorized_device_limit_bytes,
                 "baseline": self.device_baseline,
                 "allocated": self.device_allocated,
                 "reserved": self.device_reserved,
@@ -910,7 +647,6 @@ class Ledger:
             },
             "components": {"resident": dict(self.resident), "evicted": dict(self.evicted)},
             "unreconciled": self.unreconciled,
-            "unsuitable_placements": dict(self.unsuitable_placements),
         }
 
     # ------------------------------------------------------------------ reconciliation

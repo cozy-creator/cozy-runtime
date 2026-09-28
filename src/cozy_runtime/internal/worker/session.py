@@ -90,7 +90,6 @@ from cozy_runtime.internal.executor_commands import (
     Restore,
     Start,
     Unload,
-    Vacate,
 )
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker import (
@@ -122,6 +121,7 @@ from cozy_runtime.internal.worker import (
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
     DEVICE_SHORTFALL_CODES,
+    GROUP_FAULT_CODES,
     ORIGIN,
     STATUS,
     AttemptEngine,
@@ -148,17 +148,16 @@ from cozy_runtime.internal.worker.lanes import (
     LaneRefusal,
     LaneRow,
     LaneSet,
-    fold_memory,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
+from cozy_runtime.internal.worker.memory import MemoryManager
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,
     PlanRefusal,
     PreparedModel,
-    PreparedRequest,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.supervisor import Stopping, Supervisor, Unit, fault_text
@@ -1001,6 +1000,8 @@ class Worker:
         #: owns its attempt thread, its work queue, its `settled` gate and one ledger row per
         #: resident executor generation — nothing device-scoped lives on the worker any more.
         self.lanes = LaneSet.from_envelope(options.devices, worker_pid=os.getpid())
+        #: every device byte of this machine, across every executor, package and rank
+        self.memory = MemoryManager(self.lanes, self.note, self._end_tenant)
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         self.supervision = ExecutorSupervision(
             root=self.root,
@@ -1490,7 +1491,9 @@ class Worker:
         row.supervision = supervision
         row.ledger.observe_devices(lane.device_facts(measured))
         tenants = sorted(
-            slot for slot, _row in self.lanes.tenants(lane) if slot != placement.placement_id
+            slot
+            for slot, _lane, _row in self.memory.tenants(set(lane.ordinals))
+            if slot != placement.placement_id
         )
         self.note(
             "materialization",
@@ -2559,15 +2562,14 @@ class Worker:
             self._dead_replicas[placement_id] = current
         return current
 
-    def _reclaim_dead(self, placement_id: str, dead: child.Executor) -> None:
-        """Kill, reap and prove absent a deferred replica's dead generation NOW, under its
-        lane's device hold: only its successor waits for the next grant. A poisoned process
-        left alive kept 62 GB of a card another tenant was then granted (darkness 1514), and
-        exited ranks stayed unreaped zombies."""
+    def _reclaim_dead(self, placement_id: str, dead: child.Executor, why: str = "") -> bool:
+        """Kill, reap and prove absent one tenant's executor NOW, under its lane's device
+        hold: only its successor waits. A poisoned process left alive kept 62 GB of a card
+        another tenant was then granted (darkness 1514). True once gone."""
         hosted = self.hosted.get(placement_id)
         supervision = hosted.supervision if hosted is not None else self.supervision
         try:
-            evidence = supervision.retire_current(dead, dead.poisoned or "executor exited")
+            evidence = supervision.retire_current(dead, (why or dead.poisoned or "exited")[:200])
         except ExecutorGone as exc:
             if hosted is not None:
                 hosted.latched = f"executor_reclaim_failed: {exc}"[:200]
@@ -2579,13 +2581,14 @@ class Worker:
                     detail=safe(str(exc)),
                 )
             )
-            return
-        if evidence is not None:
-            self.note(
-                "recovery",
-                f"{placement_id!r}: reclaimed dead executor epoch {dead.epoch} pid {dead.pid} "
-                f"(members {list(evidence.members)}) before its devices return",
-            )
+            return False
+        members = list(evidence.members) if evidence is not None else [dead.pid]
+        self.note(
+            "recovery",
+            f"{placement_id!r}: reclaimed executor epoch {dead.epoch} (pids {members}): "
+            f"{why or dead.poisoned or 'exited'}"[:400],
+        )
+        return True
 
     def _revive(self, placement_id: str) -> None:
         """Rebuild a deferred dead replica now that a grant holds its devices, here."""
@@ -5637,30 +5640,24 @@ class Worker:
             return tenant
         return self._tenant(tenant.placement.placement_id)
 
-    def _process_ceiling(self, lane: DeviceLane, slot: str) -> int:
-        """The PROCESS ceiling for a load or an activation: the lane's measured capacity
-        less the most its co-tenants hold on any one of its devices. The executor fits under
-        it less what it already holds, verified against what its own allocator can get."""
+    def _ceiling(self, lane: DeviceLane, slot: str) -> int:
+        """What a load or activation may hold: the whole device. The device lock is the
+        reservation (`memory.py`); the executor verifies against its own allocator. A lane
+        with an unreadable device refuses typed."""
         measured = lane.measure(accel.host_backend_family())
-        memory = fold_memory(measured)
-        if memory.state != "measured":
-            unreadable = [
-                f"{lane.entries[index]!r}"
-                for index, ordinal in enumerate(lane.ordinals)
-                if measured[ordinal].state != "measured"
-            ]
+        unreadable = [
+            repr(entry)
+            for entry, ordinal in zip(lane.entries, lane.ordinals, strict=True)
+            if measured[ordinal].state != "measured"
+        ]
+        if unreadable:
             raise LaneRefusal(
                 "device_capacity_unreadable",
                 f"{lane.lane_id}: the driver could not report free bytes for "
-                f"{', '.join(unreadable)}, so no residence ceiling can be assigned (NVML "
-                "nvmlDeviceGetMemoryInfo, else nvidia-smi --query-gpu=memory.free, is the "
-                "reading); a lane with any unreadable device is unreadable",
+                f"{', '.join(unreadable)} (NVML nvmlDeviceGetMemoryInfo, else nvidia-smi)",
             )
-        row = lane.row(slot)
-        row.ledger.observe_devices(lane.device_facts(measured))
-        others = self.lanes.beside(lane, slot)
-        row.ledger.authorized_device_limit_bytes = max(int(memory.total_bytes) - others, 0)
-        return row.ledger.authorized_device_limit_bytes
+        lane.row(slot).ledger.observe_devices(lane.device_facts(measured))
+        return min(memory.total_bytes for memory in measured.values())
 
     def _load_construction(
         self,
@@ -5677,19 +5674,18 @@ class Worker:
         first = group[0]
         label = key.removeprefix("sha256:")[:12]
         if not first.weightless:
-            # A CO-TENANT PROCESS on a shared single-device lane gives the card up first
-            # (cr-022); a lane with one process has no victim and moves nothing. Bindings of
-            # one construction share its weights, so they are counted once.
+            # Idle tenants of every device give room for the weights first. Bindings of one
+            # construction share its weights, so they are counted once.
             declared = max(binding.logical_weight_bytes for binding in group)
             lane.touch(slot)
-            self._make_room(
+            self.memory.make_room(
                 lane,
                 slot,
-                lambda memory: memory.free_bytes >= declared,
+                {ordinal: declared for ordinal in lane.ordinals},
                 f"load of {label} for {placement_id!r} declaring {declared} B",
             )
         try:
-            authorized = 0 if first.weightless else self._process_ceiling(lane, slot)
+            authorized = 0 if first.weightless else self._ceiling(lane, slot)
         except LaneRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
@@ -5707,14 +5703,17 @@ class Worker:
         began = time.perf_counter()
         self.monitor.start(subject, "load")
         try:
-            reply = executor.call(
-                command,
-                timeout=None,
-                on_progress=lambda frame: self.monitor.advance(
-                    subject, int(frame.get("position", 0) or 0)
-                ),
-                on_request=self._room(lane, slot),
-            )
+            with self.memory.watch(lane, sample=False) as seen:
+                reply = executor.call(
+                    command,
+                    timeout=None,
+                    on_progress=lambda frame: self.monitor.advance(
+                        subject, int(frame.get("position", 0) or 0)
+                    ),
+                    on_request=self._room(lane, slot),
+                )
+            if reply.get("ok") and not first.weightless:
+                self.memory.moved(lane, slot, seen)
         except ExecutorGone as exc:
             self.monitor.end(subject, "executor_gone")
             reply = {"ok": False, "code": "executor_gone_during_prepare", "detail": str(exc)}
@@ -5879,19 +5878,20 @@ class Worker:
             authorized = (
                 0
                 if built is not None and built.facts.get("weightless")
-                else self._process_ceiling(tenant.lane, tenant.slot)
+                else self._ceiling(tenant.lane, tenant.slot)
             )
         except LaneRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
             ) from exc
         try:
-            with executor.watched("activate"):
+            with executor.watched("activate"), self.memory.watch(tenant.lane, sample=False) as seen:
                 reply = executor.call(
                     Activate(construction=key, authorized_device_limit_bytes=authorized),
                     timeout=None,
                     on_request=self._room(tenant.lane, tenant.slot),
                 )
+            self.memory.moved(tenant.lane, tenant.slot, seen)
         except ExecutorGone as exc:
             raise AttemptRefusal(
                 "executor_absent",
@@ -6119,19 +6119,9 @@ class Worker:
     # ------------------------------------------------------ residency arbitration
 
     def _arbitrate_residency(self, attempt: AttemptRecord, slot: AttemptSlot) -> None:
-        """Give THIS attempt's tenant the device its plan needs, before the plan is priced.
-
-        cr-022's swap arm, the owner's "one gets to use it first, then the next gets to use
-        it for a different request". The tenant's row is refreshed with the driver's free
-        bytes as they stand now — the ledger's own number is the executor's last probe,
-        and co-tenants move gigabytes between probes — and the chooser is asked whether
-        `all_resident` fits. If it does not, idle co-tenants vacate LRU-first until it does
-        (or nobody holds anything, in which case the chooser deepens or refuses exactly as
-        it would alone): the executing tenant never self-stages or runs short beside an
-        idle one (darkness 1513/1514). The lane seat is held by this attempt throughout, so
-        no co-tenant is mid-attempt; the device lock is held by this lane thread, so no
-        co-tenant's prepare is either. Both fitting means nothing moves, ever.
-        """
+        """Make room for THIS attempt on every device of its lane, then refill what an
+        eviction took from it (`memory.py`). The caller holds the lane's devices, so every
+        other tenant there is idle and none is mid-load."""
         serving = attempt.spec.get("serving")
         if serving is None or self.accepted.mode != "serving":
             return
@@ -6140,70 +6130,27 @@ class Worker:
             return
         lane = self.lanes.by_id[slot.lane_id]
         tenant = attempt.placement_id
-        lane.touch(tenant)
-        row = lane.row(tenant)
         why = f"attempt {attempt.request_id}#{attempt.attempt}"
-        cell = attempt.prepared.cell() if attempt.prepared is not None else ""
+        prepared = attempt.prepared
+        shape = (prepared.entrypoint, prepared.cell()) if prepared else (declared.entrypoint, "")
+        attempt.room = self.memory.admit(lane, tenant, shape, why)
+        row = lane.row(tenant)
+        self._restore_residency(lane, tenant, row, why)
+        row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
 
-        def fits(memory: accel.DeviceMemory) -> bool:
-            row.ledger.observe_device_free(memory.free_bytes, memory.total_bytes)
-            return row.chooser.fits(declared, cell) == "all_resident"
-
-        # FIRST, TAKE BACK WHAT WAS TAKEN (cr-097). A tenant a co-tenant's prepare emptied
-        # is priced, otherwise, against a hole nobody put back — which is how a placement
-        # that had 10 GiB of room to itself spent seven consecutive attempts at +118%.
-        # This evicts nothing, so it runs before the arbitration below rather than instead
-        # of it: what it cannot restore, `_make_room` is still free to make room for.
-        self._restore_residency(lane, tenant, row, why, declared, attempt.prepared)
-        # THEN, THE RETRY RULE. The same invocation under the residency picture that already
-        # produced its device OOM cannot get a different answer. Any other request can.
-        self._break_oom_repeat(lane, tenant, row, attempt.digest, cell, why)
-        self._make_room(lane, tenant, fits, why)
-
-    def _restore_residency(
-        self,
-        lane: DeviceLane,
-        slot: str,
-        row: LaneRow,
-        why: str,
-        declared: DeclaredBinding | None = None,
-        prepared: PreparedRequest | None = None,
-    ) -> None:
-        """RE-FILL a tenant the lane emptied, when the card has room. Evicts NOBODY (cr-097).
-
-        `vacate` had no counterpart, and the gap was the defect: a tenant vacated for a
-        co-tenant's prepare stayed empty for the life of its generation, re-admitting per
-        scope on every attempt at a cost the device had room to stop paying. Measured live
-        on an A4000: 8739 ms fully resident, 18909 ms after the vacate, 9056 ms once an
-        unrelated rebuild happened to re-prepare it — with the co-tenant resident and
-        untouched throughout, which is the proof the room was there all along.
-
-        Unknown shapes and shapes that have already completed without moving weights
-        retain prepare's measured-capacity restoration rule. An activation peak from a
-        roomy device alone must not prevent their co-tenant recovery. A shape with only
-        staged execution behind it is different: refilling all weights cannot help when
-        its plan must immediately evict them again to make room for activations.
-        """
+    def _restore_residency(self, lane: DeviceLane, slot: str, row: LaneRow, why: str) -> None:
+        """Refill what an eviction took from `slot`, now that room was made for it. What
+        does not fit stays absent and the attempt stages it."""
         missing = row.ledger.missing_resident()
-        if not missing:
-            return
         executor = row.executor()
-        if executor is None:
+        if not missing or executor is None:
             return
         kind = accel.host_backend_family()
         memory = lane.memory(kind)
-        if memory.state != "measured":
-            return
-        row.ledger.observe_device_free(memory.free_bytes, memory.total_bytes)
-        if (
-            declared is not None
-            and prepared is not None
-            and not row.chooser.should_restore(declared, prepared)
-        ):
-            return
         try:
-            with executor.watched("restore"):
+            with executor.watched("restore"), self.memory.watch(lane, sample=False) as seen:
                 reply = executor.call(Restore(names=tuple(sorted(missing))), timeout=None)
+            self.memory.moved(lane, slot, seen)
         except ExecutorGone as exc:
             row.ledger.device_unreadable(f"the executor died while restoring: {exc}")
             self.note("residency", f"{slot!r} died while restoring: {exc}"[:256])
@@ -6279,176 +6226,38 @@ class Worker:
                 + "; ".join(f"{name}: {reason}" for name, reason in sorted(held.items()))[:300],
             )
 
-    def _break_oom_repeat(
-        self,
-        lane: DeviceLane,
-        slot: str,
-        row: LaneRow,
-        invocation: bytes,
-        cell: str,
-        why: str,
-    ) -> None:
-        """A RETRY MUST BE A DIFFERENT REQUEST, or it must refuse (cr-097).
-
-        proto-037 fixed the mirror of this: a refusal is resumable only if the same request
-        could get a different answer later. Here the answer COULD change, but only if
-        something about the device changes first — and nothing did. Measured live: four
-        attempts for one request, each 38.3 s of execution plus a 25.8 s executor rebuild,
-        every one of them dying on the same allocator while an IDLE co-tenant held 6.07 GiB,
-        until the requeue budget ran out. Roughly two and a half minutes of paid GPU to
-        prove the same thing four times.
-
-        So when THIS invocation already died on the device and the lane looks exactly as it
-        did then, the co-tenants vacate — LRU-first, the ordinary arbitration, just with a
-        demand the chooser's own `fits` is not allowed to talk it out of. If nothing can be
-        freed, the picture cannot change and the attempt refuses TYPED and quantified
-        instead of spending the handler to rediscover the allocator.
-
-        The memory is per invocation, never per placement (cr-190): one oversized request
-        is not evidence about a different, smaller one.
-        """
-        signature = row.oom_signatures.get(invocation, "")
-        if not signature or signature != self.lanes.signature(lane):
-            return
-        self.note(
-            "residency",
-            f"{lane.lane_id}: {slot!r} already died on the device for this invocation under "
-            f"this exact residency ({signature}); making room before {why} rather than "
-            "repeating it",
-        )
-        # Never the chooser's `fits`: its verdict is what admitted the attempt that OOMed.
-        self._make_room(lane, slot, lambda _memory: False, f"{why} after a device OOM")
-        if signature != self.lanes.signature(lane):
-            row.oom_signatures.pop(invocation, None)
-            return
-        kind = accel.host_backend_family()
-        memory = lane.memory(kind)
-        floor = row.ledger.carried_shortfall_by_cell.get(cell, 0)
-        raise AttemptRefusal(
-            "device_shortfall",
-            f"this exact invocation already failed on the device with {floor} B free on "
-            f"{lane.lane_id}, no co-tenant holds bytes that could be given back, and the "
-            f"lane is unchanged ({signature}). Retrying would run the same request against "
-            f"the same device and reach the same allocator; the driver reports "
-            f"{memory.free_bytes} B free",
-            cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
-            origin=ORIGIN.CAUSE_ORIGIN_RUNTIME,
-        )
-
-    def _make_room(
-        self,
-        lane: DeviceLane,
-        slot: str,
-        fits: Callable[[accel.DeviceMemory], bool],
-        why: str,
-    ) -> None:
-        """RESIDENCY ARBITRATION on a lane's devices: vacate co-tenants, tightest device
-        first and LRU-first on each, until `fits`.
-
-        `fits` reads the lane as the driver measures it NOW (cr-066's NVML reading, the
-        same meter ceilings are assigned from) and says whether `slot`'s demand holds. It is
-        asked before anything moves and again after each vacate. Co-tenants come from every
-        lane over each device (a group's ranks, other singletons), and from EVERY device of
-        the lane once the tighter ones have none left: each rank of a group admits on its
-        own card and a follower cannot ask for room, so an idle neighbour on rank 3's card
-        must go even when rank 0's is the tightest (darkness 1513). A lane the driver
-        cannot read is left alone: the prepare or the plan refuses typed on the same fact.
-        A victim's process stays — only its residency changes, so its executor epoch and
-        its placement's serving state do not move; its next attempt re-stages on demand.
-        Idle allocator caches go back before any weights do: dropping one costs its owner
-        nothing, while a vacated tenant pays a re-stage on its next attempt.
-        """
-        kind = accel.host_backend_family()
-        tried: set[tuple[str, bool]] = set()
-        while True:
-            measured = lane.measure(kind)
-            memory = fold_memory(measured)
-            if memory.state != "measured" or fits(memory):
-                return
-            found = [
-                (ordinal, victim, row, residents)
-                for ordinal in sorted(measured, key=lambda ordinal: measured[ordinal].free_bytes)
-                for residents in (False, True)
-                for victim, row in self.lanes.victims(lane, slot, ordinal)
-                if (victim, residents) not in tried and (not residents or row.resident_bytes())
-            ]
-            if not found:
-                break
-            device, victim, row, residents = found[0]
-            tried.add((victim, residents))
-            executor = row.executor()
-            if executor is None:
-                continue
-            freed, took = self._vacate(victim, row, executor, why, residents=residents)
-            moved = f"vacated {freed} B in {took:.0f} ms" if residents else "released its cache"
-            self.note(
-                "residency",
-                f"{lane.lane_id}: {victim!r} (epoch {executor.epoch} pid {executor.pid}) "
-                f"{moved} for {slot!r} on {why}; the driver reports "
-                f"{measured[device].free_bytes} -> {lane.measure(kind)[device].free_bytes} "
-                f"B free on device {device}",
-            )
-        self.note(
-            "residency",
-            f"{lane.lane_id}: no co-tenant of {slot!r} holds bytes the driver could give "
-            f"back for {why}; the plan decides on {memory.free_bytes} B free",
-        )
-
     def _room(self, lane: DeviceLane, slot: str) -> Handler:
-        """Answer an executor whose own evictions cannot fit what it must place now: idle
-        co-tenants of its devices give memory back, LRU-first, and it re-measures. What
-        stays short after that is held by running work, and the executor refuses on it."""
+        """Answer an executor that asks for room mid-load or mid-call (released executors'
+        rank 0 does): idle tenants of every device of its lane give theirs back."""
 
         def answer(request: Request) -> Answer:
             if not isinstance(request, DeviceRoom):
                 return refuse("no_durable_exchange", "device_room only")
             need = request.free_bytes
             why = f"its executor needs {need} B free"
-            self._make_room(lane, slot, lambda memory: memory.free_bytes >= need, why)
+            self.memory.make_room(lane, slot, {ordinal: need for ordinal in lane.ordinals}, why)
             try:
-                return Room(
-                    ok=True, authorized_device_limit_bytes=self._process_ceiling(lane, slot)
-                )
+                return Room(ok=True, authorized_device_limit_bytes=self._ceiling(lane, slot))
             except LaneRefusal as exc:
                 return refuse(exc.code, exc.detail)
 
         return answer
 
-    def _vacate(
-        self, victim: str, row: LaneRow, executor: child.Executor, why: str, *, residents: bool
-    ) -> tuple[int, float]:
-        """Ask one co-tenant's executor to free every component it holds (or, without
-        `residents`, only its allocator cache); bank the after-state on its row. Returns the
-        bytes it reports freed and how long the free took (0 on refusal or death: a dead
-        executor freed everything, and the re-measurement says so). HALF OF A SWAP IS AN
-        EVICTION and the other half is a re-fill; both halves are timed now, because the
-        cost of alternating two models on one card was being inferred from a construction's
-        fill leg instead of measured (cr-100)."""
-        try:
-            with executor.watched("vacate"):
-                reply = executor.call(Vacate(residents=residents), timeout=None)
-        except ExecutorGone as exc:
-            row.ledger.device_unreadable(f"the executor died while vacating: {exc}")
-            self.note("residency", f"{victim!r} died while vacating: {exc}"[:256])
-            return 0, 0.0
-        if not reply.get("ok"):
-            self.note(
-                "residency",
-                f"{victim!r} refused to vacate: {reply.get('code')}: {reply.get('detail', '')}"[
-                    :256
-                ],
+    def _end_tenant(self, placement_id: str, executor: child.Executor, why: str) -> bool:
+        """End a dead tenant for the memory manager: reclaimed now, so no byte it held is
+        granted twice; rebuilt afterwards on its own lane (a machine replica on its next
+        grant, anything else once its devices are free)."""
+        with self.control_lock:
+            deferred = self._defer_rebuild(placement_id) is not None
+        if not self._reclaim_dead(placement_id, executor, why):
+            return False
+        lane = self.lanes.lane_of(placement_id)
+        if not deferred and lane is not None:
+            self.supervisor.spawn(
+                f"rebuild:{placement_id}:{executor.epoch}",
+                lambda _: self._rebuild_lane(lane, placement_id),
             )
-            return 0, 0.0
-        freed = row.ledger.observe_vacate(reply, why)
-        row.ledger.device_process = self.read_device_process(executor.pid)
-        held = (reply.get("vacated") or {}).get("held") or {}
-        if held:
-            self.note(
-                "residency",
-                f"{victim!r} kept {sorted(held)}: "
-                + "; ".join(f"{name}: {reason}" for name, reason in sorted(held.items()))[:300],
-            )
-        return freed, float((reply.get("vacated") or {}).get("vacate_ms", 0.0))
+        return True
 
     # ------------------------------------------------------------------ dispatch
 
@@ -6959,56 +6768,42 @@ class Worker:
 
     def execute(self, attempt: AttemptRecord, lane: DeviceLane) -> Released | None:
         """RUN -> RELEASE. The ledger closes at release, while the device is still held; the
-        caller runs the post phase after letting the device go.
+        caller runs the post phase after letting the device go. The driver is sampled while
+        the attempt runs: its peak is what this shape costs on each device (`memory.py`).
 
         A terminal built here is one the device phase itself produced (cancelled before
         dispatch, the executor died, the worker faulted) and is sent at once."""
-        try:
-            released = self.engine.execute(attempt)
-        except Exception as exc:
-            self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
+        with self.memory.watch(lane) as seen:
             try:
-                released = self.engine.abandon(
-                    attempt, f"the worker faulted while running this attempt: {exc}"
-                )
-            except Exception as inner:
-                self.note("attempt", f"even ABANDONED could not be built: {inner}")
-                self.terminate(attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}")
-                return None
+                released = self.engine.execute(attempt)
+            except Exception as exc:
+                self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
+                try:
+                    released = self.engine.abandon(
+                        attempt, f"the worker faulted while running this attempt: {exc}"
+                    )
+                except Exception as inner:
+                    self.note("attempt", f"even ABANDONED could not be built: {inner}")
+                    self.terminate(
+                        attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}"
+                    )
+                    return None
         if not isinstance(released, Released):
             self.settle(released)
             return None
-        self._mark_device_outcome(attempt, released, lane)
+        prepared = attempt.prepared
+        if attempt.placement_id in lane.rows and prepared is not None:
+            outcome = released.reply.outcome
+            code = outcome.code if outcome is not None else ""
+            self.memory.settle(
+                lane,
+                attempt.placement_id,
+                (prepared.entrypoint, prepared.cell()),
+                seen,
+                ok=outcome is not None and outcome.terminal == "succeeded",
+                forget=code in DEVICE_SHORTFALL_CODES or code in GROUP_FAULT_CODES,
+            )
         return released
-
-    def _mark_device_outcome(
-        self, attempt: AttemptRecord, released: Released, lane: DeviceLane
-    ) -> None:
-        """Remember WHETHER THE DEVICE KILLED THIS ATTEMPT, and under what picture (cr-097).
-
-        Recorded on the lane row rather than on the ledger because the ledger restarts with
-        the next generation and an OOM is precisely what replaces the generation: the fact
-        would die in the rebuild it caused, which is the whole shape of this defect. The row
-        outlives the rebuild — `lane.forget` runs only when the placement LEAVES the lane —
-        so the next attempt can see what the last one hit.
-        """
-        outcome = released.reply.outcome
-        row = lane.rows.get(attempt.placement_id)
-        if row is None or outcome is None:
-            return
-        if outcome.terminal == "succeeded":
-            # This invocation got through, so its earlier OOM is no longer a trap.
-            row.oom_signatures.pop(attempt.digest, None)
-            return
-        if outcome.code in DEVICE_SHORTFALL_CODES:
-            signature = self.lanes.signature(lane)
-            # An entry under another picture describes a lane that no longer exists.
-            row.oom_signatures = {
-                invocation: seen
-                for invocation, seen in row.oom_signatures.items()
-                if seen == signature
-            }
-            row.oom_signatures[attempt.digest] = signature
 
     def finish(self, released: Released) -> None:
         """POST PHASE -> OUTCOME -> SEND, on the lane's post thread.
@@ -7114,7 +6909,7 @@ class Worker:
         self, executor: child.Executor, placement_id: str = "", *, granted: bool = False
     ) -> None:
         """Rebuild only if the queued death still names the owned dead epoch, or its grant
-        found that epoch already reclaimed (`_reclaim_dead`)."""
+        found that epoch already reclaimed (`_end_tenant`)."""
 
         with self.control_lock:
             hosted = self.hosted.get(placement_id)

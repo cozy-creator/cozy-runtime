@@ -315,6 +315,8 @@ class AttemptRecord:
     spec: dict[str, Any]
     grant: grants.BoundGrant = dataclasses_field(default_factory=grants.BoundGrant)
     plan: AttemptPlan | None = None
+    #: the memory manager made room for this call's measured need on every device
+    room: bool = True
     declared: DeclaredBinding | None = None
     #: what THIS worker's prepare resolved for that binding — never what it declared
     prepared_model: PreparedModel | None = None
@@ -1345,7 +1347,7 @@ class AttemptEngine:
         if before_plan is not None:
             before_plan()
         try:
-            plan = slot.chooser.choose(declared, loaded.prepared_model, prepared)
+            plan = slot.chooser.choose(declared, loaded.prepared_model, prepared, fits=attempt.room)
         except PlanRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
@@ -1899,7 +1901,6 @@ class AttemptEngine:
                         or attempt.residency.get("attempt_evictions")
                     )
                     terminal = reply.outcome.terminal if reply.outcome else ""
-                    failed_code = reply.outcome.code if reply.outcome else ""
                     ledger = self.ledger_for(attempt)
                     ledger.observe_attempt(
                         reply.metrics,
@@ -1907,13 +1908,7 @@ class AttemptEngine:
                         cell=cell,
                         succeeded=terminal == "succeeded",
                     )
-                    if terminal != "succeeded" and failed_code in DEVICE_SHORTFALL_CODES:
-                        # cr-097: the attempt died climbing, so its peak is a truncated
-                        # lower bound and may not calibrate. What IS usable is the picture
-                        # it died under — recorded so the next attempt for this shape can
-                        # refuse typed instead of spending the handler to rediscover it.
-                        ledger.observe_device_shortfall(cell, ledger.device_free)
-                    self.bank_demand(attempt, reply.metrics, moved)
+                    terminal = reply.outcome.terminal if reply.outcome else ""
                 else:
                     attempt.confess(
                         "unavailable",
@@ -2234,13 +2229,7 @@ class AttemptEngine:
                 plan.shape_cell or "-",
             )
         )
-        # THE DESCRIPTION, not the enforcement figure (cr-100). An attempt admitted against
-        # 0 B — because the only observation of this shape was made on a roomier card — has
-        # still been described by that observation, and banking the description is what
-        # makes the instrument able to falsify it.
-        confession = self.demand.bank(
-            lane, plan.activation_envelope_bytes or plan.headroom_bytes, actual
-        )
+        confession = self.demand.bank(lane, plan.headroom_bytes, actual)
         if confession is not None:
             attempt.confess(confession.kind, confession.quantified)
 

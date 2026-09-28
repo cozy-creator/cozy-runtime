@@ -197,22 +197,16 @@ def _served(ledger: Ledger, cell: str, free: int) -> None:
     )
 
 
-def test_only_an_exact_cell_measurement_under_current_room_may_keep_components() -> None:
+def test_only_an_exact_cell_measurement_may_keep_components() -> None:
     ledger = Ledger(worker_pid=1)
     ledger.begin_generation(7)
     _served(ledger, CELL, free=60 << 30)
     assert ledger.measured_scopes(CELL) == frozenset(SCOPES)
     # Another shape's peak does not describe this one.
     assert ledger.measured_scopes("assets=12,frames=363") == frozenset()
-    # A measurement taken with more room than there is now is a bound, not a requirement.
-    ledger.device_free = 40 << 30
-    assert ledger.measured_scopes(CELL) == frozenset()
-    # Carried across an executor rebuild, and withdrawn once the cell ran out of room.
+    # A property of the model and the shape: it survives an executor rebuild.
     ledger.begin_generation(8)
-    ledger.device_free = 60 << 30
     assert ledger.measured_scopes(CELL) == frozenset(SCOPES)
-    ledger.observe_device_shortfall(CELL, 70 << 30)
-    assert ledger.measured_scopes(CELL) == frozenset()
 
 
 def test_a_hosted_text_encoder_leaves_rank_0_nothing_to_move(device: Device) -> None:

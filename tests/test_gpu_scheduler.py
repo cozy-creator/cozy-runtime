@@ -986,15 +986,14 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     def vacated() -> list[str]:
         return [e.step.split("'")[1] for e in worker.activity if " vacated " in e.step]
 
-    # Card 0 is the tight one. The shot's plan fits staged (it may evict its own weights),
-    # not all-resident, so every rank's idle neighbour goes: card 0's first.
+    # The shot's shape was never measured, so it has every card of its group: every
+    # rank's idle neighbour goes, least recently used first.
     machine.free["0"] = GiB // 2  # type: ignore[attr-defined]
     hosted = worker.hosted[h3]
     group = worker._lane_of(h3)
     row = group.row(h3)
     digest = next(iter(hosted.bindings))
     row.ledger.observe_device_free(GiB // 2, 80 * GiB)
-    assert row.chooser.fits(hosted.bindings[digest]) == "component_staged"
     slot = AttemptSlot(
         supervision=hosted.supervision,
         ledger=row.ledger,
@@ -1012,7 +1011,7 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     # Qwen on card 1 needs room: the idle H3 group is its only co-tenant there
     machine.free.pop("0")  # type: ignore[attr-defined]
     machine.free["1"] = GiB  # type: ignore[attr-defined]
-    worker._make_room(worker._lane_of(q1), q1, lambda memory: False, "a reference")
+    worker.memory.make_room(worker._lane_of(q1), q1, None, "a reference")
     assert vacated() == [q0, q1, q2, h3]
     assert machine.executors() == before, "vacated, not killed: every process is the same"
     assert all(

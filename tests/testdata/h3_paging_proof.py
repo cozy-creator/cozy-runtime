@@ -292,7 +292,7 @@ def main() -> None:
                     "phase": "advisory_activation_reserve",
                     "allocator_limit_bytes": allocation_limit,
                     "planner_capacity_bytes": capacity,
-                    "activation_estimate_bytes": plan.activation_envelope_bytes,
+                    "activation_estimate_bytes": plan.headroom_bytes,
                     "enforced_headroom_bytes": plan.headroom_bytes,
                 }
             ),

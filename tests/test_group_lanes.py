@@ -28,11 +28,10 @@ from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDiv
 from cozy_runtime.internal.worker import lane_wire, lanes
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.gpu_scheduler import width_for
-from cozy_runtime.internal.worker.ledger import DeviceFacts, Ledger
+from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     PlanChooser,
-    PlanRefusal,
     PreparedModel,
     PreparedRequest,
 )
@@ -257,40 +256,21 @@ def _pressed_ledger() -> Ledger:
     return ledger
 
 
-@pytest.mark.parametrize("degree", [1, 2, 4])
 @pytest.mark.parametrize("measured", [False, True])
-def test_one_common_plan_deepens_under_group_pressure(degree: int, measured: bool) -> None:
-    """Asymmetric ranks use the tightest ledger and preserve forward headroom."""
+def test_a_call_whose_need_does_not_fit_is_staged_with_its_measured_headroom(
+    measured: bool,
+) -> None:
+    """What the memory manager could not make room for runs one declared scope at a time."""
     ledger = _pressed_ledger()
-    ledger.observe_devices(
-        {
-            rank: DeviceFacts(rank, str(rank), (100 + rank * 100) << 20, 8 * GiB)
-            for rank in range(degree)
-        }
-    )
     if not measured:
         ledger.activations_by_cell.clear()
-    assert ledger.device_free == 100 << 20
-    declared = _binding()
     prepared = PreparedRequest.unresolved("serve", {"width": 512, "height": 512})
     chooser = PlanChooser(ledger)
-    assert chooser.fits(declared, prepared.cell()) == ""
-    plan = chooser.choose(declared, PreparedModel(delivery_rung="verbatim"), prepared)
+    model = PreparedModel(delivery_rung="verbatim")
+    plan = chooser.choose(_binding(), model, prepared, fits=False)
     assert plan.placement == "component_staged"
     assert plan.headroom_bytes == (512 << 20 if measured else 0)
-    assert chooser.walks[-1].deepened_to == "component_staged"
-
-
-def test_deepening_does_not_repeat_a_falsified_strategy() -> None:
-    ledger = _pressed_ledger()
-    ledger.unsuitable_placements = {
-        "all_resident": "allocation failed",
-        "component_staged": "smallest supported scope cannot fit",
-    }
-    prepared = PreparedRequest.unresolved("serve", {"width": 512, "height": 512})
-    with pytest.raises(PlanRefusal) as refused:
-        PlanChooser(ledger).choose(_binding(), PreparedModel(delivery_rung="verbatim"), prepared)
-    assert refused.value.code == "placement_capacity_falsified"
+    assert chooser.choose(_binding(), model, prepared).placement == "all_resident"
 
 
 def _placement(placement_id: str, lane_id: str = "") -> Placement:

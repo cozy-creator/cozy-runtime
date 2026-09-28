@@ -6,7 +6,7 @@ import pytest
 
 from cozy_runtime.internal.paging import partition
 from cozy_runtime.internal.worker.lanes import LaneSet
-from cozy_runtime.internal.worker.plan import DeclaredBinding
+from cozy_runtime.internal.worker.plan import DeclaredBinding, PreparedModel, PreparedRequest
 
 
 @pytest.mark.parametrize("degree", [1, 2, 4])
@@ -42,16 +42,12 @@ def test_h3_encoder_block_floor_reaches_the_attempt_planner(degree: int) -> None
         logical_weight_bytes=nominal,
     )
     chooser = lane.row("fixture").chooser
-    walk = chooser._walk(binding, "fixture")
-    assert walk.chosen == "component_staged", walk.rungs
-    assert walk.rungs[0].verdict == "construction_parked"
-    staged = next(row for row in walk.rungs if row.rung == "component_staged")
-    assert isinstance(staged.needs_bytes, int) and working <= staged.needs_bytes < nominal
-    assert staged.absent_bytes == nominal
+    prepared = PreparedRequest.unresolved("generate", {})
+    model = PreparedModel(delivery_rung="verbatim")
+    # Parked at construction: staged, whatever room the call was given.
+    assert chooser.choose(binding, model, prepared).placement == "component_staged"
     ledger.device_free = working - 1
-    walk = chooser._walk(binding, "fixture")
-    assert not walk.chosen, walk.rungs
-    assert next(row for row in walk.rungs if row.rung == "component_staged").verdict == "short"
+    assert chooser.choose(binding, model, prepared).placement == "component_staged"
 
 
 def test_declared_blocks_with_shared_storage_are_not_independently_pageable() -> None:
