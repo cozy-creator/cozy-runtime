@@ -176,6 +176,9 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
     if registration.kind == "entrypoint":
         invocable_interface.project_serving_models(doc)
     invocable_interface.validate(
-        doc["invocable"], doc["request"], doc["result"], kind=registration.kind
+        msgspec.convert(doc["invocable"], invocable_interface.Invocable, strict=True),
+        doc["request"],
+        doc["result"],
+        kind=registration.kind,
     )
     return doc

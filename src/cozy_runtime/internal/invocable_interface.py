@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import inspect
 import keyword
+import re
 import types
 import typing
 from collections.abc import Mapping, Sequence
@@ -205,71 +206,57 @@ def project_serving_models(document: dict[str, Any]) -> None:
         }
 
 
-def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> dict[str, Any]:
+class Invocable(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """Source-stable caller names/defaults for one callable; newer writers' keys are ignored."""
+
+    module: str
+    export: str
+    context: str
+    parameters: tuple[str, ...]
+    defaults: dict[str, object]
+    type_names: dict[str, str]
+    enum_members: dict[str, tuple[str, ...]]
+    memoize: bool
+    capabilities: tuple[str, ...]
+    operation_identity: str | msgspec.UnsetType = msgspec.UNSET
+    operation_identity_unavailable: str | msgspec.UnsetType = msgspec.UNSET
+
+
+def validate(value: Invocable, request: object, result: object, *, kind: str = "job") -> None:
     """Validate every token the pure generator can turn into Python source."""
-    keys = {
-        "module",
-        "export",
-        "context",
-        "parameters",
-        "defaults",
-        "type_names",
-        "enum_members",
-        "memoize",
-        "capabilities",
-    }
-    optional = {"operation_identity", "operation_identity_unavailable"}
-    # Keys another Runtime version added are ignored; the generator reads only these.
-    if not isinstance(value, dict) or not keys.issubset(value):
-        raise ConformanceError("invocable metadata is missing fields", code="invocable_interface")
-    if type(value["memoize"]) is not bool:
-        raise ConformanceError(
-            "invocable memoization declaration must be a boolean", code="invocable_interface"
-        )
-    if optional.issubset(value) or (not value["memoize"] and optional.intersection(value)):
+    outcomes = (value.operation_identity is not msgspec.UNSET) + (
+        value.operation_identity_unavailable is not msgspec.UNSET
+    )
+    if outcomes > int(value.memoize):
         raise ConformanceError(
             "operation identity requires one memoized identity outcome", code="invocable_interface"
         )
-    if "operation_identity" in value:
-        import re
-
-        if (
-            not isinstance(value["operation_identity"], str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", value["operation_identity"]) is None
-        ):
-            raise ConformanceError("invalid operation identity", code="invocable_interface")
-    if "operation_identity_unavailable" in value and (
-        not isinstance(value["operation_identity_unavailable"], str)
-        or not 1 <= len(value["operation_identity_unavailable"]) <= 256
+    if value.operation_identity is not msgspec.UNSET and (
+        re.fullmatch(r"sha256:[0-9a-f]{64}", value.operation_identity) is None
+    ):
+        raise ConformanceError("invalid operation identity", code="invocable_interface")
+    if value.operation_identity_unavailable is not msgspec.UNSET and not (
+        1 <= len(value.operation_identity_unavailable) <= 256
     ):
         raise ConformanceError("invalid operation identity reason", code="invocable_interface")
-    capabilities = value["capabilities"]
-    if not isinstance(capabilities, list) or not all(
-        isinstance(capability, str) for capability in capabilities
-    ):
-        raise ConformanceError(
-            "invocable capabilities must be a list of names", code="invocable_interface"
-        )
-    if value["memoize"] and set(capabilities) & {"egress", "secrets"}:
+    if value.memoize and set(value.capabilities) & {"egress", "secrets"}:
         raise ConformanceError(
             "memoized interface declares external or secret-dependent work",
             code="invocable_memoize_effect",
         )
     if (
-        not isinstance(value["module"], str)
-        or not all(_identifier(part) for part in value["module"].split("."))
-        or not _identifier(value["export"])
-        or not (_identifier(value["context"]) or (kind == "entrypoint" and value["context"] == ""))
+        not all(_identifier(part) for part in value.module.split("."))
+        or not _identifier(value.export)
+        or not (_identifier(value.context) or (kind == "entrypoint" and value.context == ""))
     ):
         raise ConformanceError(
             "invocable export is not a Python module function", code="invocable_interface"
         )
-    parameters = value["parameters"]
+    parameters = value.parameters
     if (
-        not isinstance(parameters, list)
-        or not all(_identifier(name) for name in parameters)
+        not all(_identifier(name) for name in parameters)
         or len(set(parameters)) != len(parameters)
-        or value["context"] in parameters
+        or value.context in parameters
     ):
         raise ConformanceError(
             "invocable parameters are not unique Python names", code="invocable_interface"
@@ -283,22 +270,17 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
         raise ConformanceError(
             "invocable request and result must be closed structs", code="invocable_interface"
         )
-    if parameters != [field.get("name") for field in request["fields"]]:
+    if list(parameters) != [field.get("name") for field in request["fields"]]:
         raise ConformanceError(
             "invocable parameters differ from request fields", code="invocable_interface"
         )
-    for key in ("defaults", "type_names", "enum_members"):
-        if not isinstance(value[key], dict):
-            raise ConformanceError(
-                "invocable name/default metadata must be an object", code="invocable_interface"
-            )
     nodes: dict[str, Any] = {}
 
     def walk(node: Any, path: str) -> None:
         nodes[path] = node
         if isinstance(node, dict):
             if "fields" in node:
-                if path not in value["type_names"]:
+                if path not in value.type_names:
                     raise ConformanceError(
                         "invocable struct is missing its Python name", code="invocable_interface"
                     )
@@ -325,7 +307,7 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
     walk(request, "request")
     walk(result, "result")
     # Names and defaults for paths this schema does not have are never read: ignore them.
-    for path, name in value["type_names"].items():
+    for path, name in value.type_names.items():
         if path not in nodes:
             continue
         if (
@@ -336,15 +318,14 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
             raise ConformanceError(
                 "invocable type name has no matching schema", code="invocable_interface"
             )
-    for path, members in value["enum_members"].items():
+    for path, members in value.enum_members.items():
         node = nodes.get(path)
         if node is None:
             continue
         if (
             not isinstance(node, dict)
-            or path not in value["type_names"]
+            or path not in value.type_names
             or "literal" not in node
-            or not isinstance(members, list)
             or len(members) != len(node["literal"])
             or not all(_identifier(member) for member in members)
             or len(set(members)) != len(members)
@@ -352,7 +333,7 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
             raise ConformanceError(
                 "invocable enumeration names differ from its values", code="invocable_interface"
             )
-    for path, default in value["defaults"].items():
+    for path, default in value.defaults.items():
         allowed = (
             (str, int, float, bool, list, dict) if kind == "entrypoint" else (str, int, float, bool)
         )
@@ -367,4 +348,3 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
                 code="invocable_interface",
             )
         canonical.write(default)
-    return value

@@ -94,7 +94,7 @@ def test_legacy_memo_declaration_refuses_instead_of_silently_disabling_cache() -
     document = canonical.parse_canonical(raw)
     declaration = document["jobs"][0]["invocable"]
     declaration["reusable"] = declaration.pop("memoize")
-    with pytest.raises(ConformanceError, match="invocable_interface"):
+    with pytest.raises(ConformanceError, match="missing required field `memoize`"):
         package_interface.read_bytes(canonical.write(document))
 
 

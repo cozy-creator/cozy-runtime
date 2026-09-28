@@ -5,24 +5,27 @@ from __future__ import annotations
 import ast
 import hashlib
 from collections import defaultdict
-from typing import Any
+
+import msgspec
 
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.internal import invocable_interface, package_interface
+from cozy_runtime.internal import package_interface
+from cozy_runtime.internal.canonical import Json
+from cozy_runtime.internal.invocable_interface import Invocable
+from cozy_runtime.internal.package_interface import CallableDoc
 
 
 def generate(interface: bytes) -> dict[str, bytes]:
     """Generate code without importing the package or its implementation dependencies."""
-    document = package_interface.read_bytes(interface, source="interface generator")
+    document = package_interface.parse(interface, source="interface generator")
     digest = "sha256:" + hashlib.sha256(interface).hexdigest()
-    modules: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
-        for entry in document[collection]:
-            if "invocable" in entry and not entry.get("internal", False):
-                metadata = invocable_interface.validate(
-                    entry["invocable"], entry["request"], entry["result"], kind=kind
-                )
-                modules[metadata["module"]].append({**entry, "_kind": kind})
+    modules: dict[str, list[tuple[package_interface.Kind, CallableDoc, Invocable]]] = defaultdict(
+        list
+    )
+    for kind, entry in document.callables():
+        invocable = entry.invocable
+        if invocable is not msgspec.UNSET and not entry.internal:
+            modules[invocable.module].append((kind, entry, invocable))
     if not modules:
         raise ConformanceError(
             "package declares no invocable exports", code="interface_exports_absent"
@@ -46,7 +49,11 @@ def generate(interface: bytes) -> dict[str, bytes]:
     return files
 
 
-def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
+def _module(
+    module: str,
+    entries: list[tuple[package_interface.Kind, CallableDoc, Invocable]],
+    digest: str,
+) -> str:
     imports = [
         "from __future__ import annotations",
         "from collections.abc import Awaitable",
@@ -60,29 +67,24 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "",
     ]
-    if any(entry["_kind"] == "entrypoint" for entry in entries):
+    if any(kind == "entrypoint" for kind, _, _ in entries):
         imports.append("from cozy_runtime.author import ActivationCapture, PendingCall")
     declarations: dict[str, tuple[bytes, str]] = {}
     functions: list[str] = []
     bindings: list[str] = []
     exports: set[str] = set()
-    for entry in sorted(entries, key=lambda item: item["invocable"]["export"]):
-        metadata = entry["invocable"]
-        serving = entry["_kind"] == "entrypoint"
-        defaults, names, enums = (
-            metadata["defaults"],
-            metadata["type_names"],
-            metadata["enum_members"],
-        )
+    for kind, entry, metadata in sorted(entries, key=lambda item: item[2].export):
+        serving = kind == "entrypoint"
+        defaults, names, enums = metadata.defaults, metadata.type_names, metadata.enum_members
 
         def expression(
-            node: Any,
+            node: Json,
             path: str,
             tag_field: str | None = None,
             *,
             names: dict[str, str] = names,
-            defaults: dict[str, Any] = defaults,
-            enums: dict[str, list[str]] = enums,
+            defaults: dict[str, object] = defaults,
+            enums: dict[str, tuple[str, ...]] = enums,
         ) -> str:
             if isinstance(node, str):
                 return {
@@ -189,57 +191,70 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
             )
 
         def literal(
-            node: Any,
+            node: Json,
             path: str,
-            value: Any,
+            value: object,
             *,
             names: dict[str, str] = names,
-            enums: dict[str, list[str]] = enums,
+            enums: dict[str, tuple[str, ...]] = enums,
         ) -> str:
             if path in enums:
                 return names[path] + "." + enums[path][int(node["literal"].index(value))]
             return repr(value)
 
-        request_name = expression(entry["request"], "request")
-        result_name = expression(entry["result"], "result")
-        export = metadata["export"]
+        request_name = expression(entry.request, "request")
+        result_name = expression(entry.result, "result")
+        export = metadata.export
         if export in exports or export in declarations:
             raise ConformanceError(
                 "interface repeats a Python export", code="interface_name_conflict"
             )
         exports.add(export)
         parameters: list[str] = []
-        if metadata["parameters"] or serving:
+        if metadata.parameters or serving:
             parameters.append("*")
-        fields = {field["name"]: field for field in entry["request"]["fields"]}
-        for name in metadata["parameters"]:
+        request = entry.request
+        assert isinstance(request, dict) and isinstance(request["fields"], list)
+        fields = {field["name"]: field for field in request["fields"] if isinstance(field, dict)}
+        for name in metadata.parameters:
             path = "request/" + name
             annotation = expression(fields[name]["type"], path)
-            if entry.get("assets", {}).get("parameter") == name:
+            if entry.assets is not msgspec.UNSET and entry.assets.parameter == name:
                 kinds = []
-                for row in entry["assets"]["kinds"]:
+                for row in entry.assets.kinds:
                     cls = (
                         {"image": "Image", "audio": "DecodedAudio", "video": "DecodedVideo"}[
-                            row["kind"]
+                            row.kind
                         ]
-                        if entry["assets"].get("view") == "decoded"
-                        else expression({"asset": row["kind"]}, path)
+                        if entry.assets.view == "decoded"
+                        else expression({"asset": row.kind}, path)
                     )
                     bound = {
                         key: value
-                        for key, value in row.items()
-                        if key in package_interface.ASSET_BOUND_KEYS
+                        for key, value in (
+                            ("max_bytes", row.max_bytes),
+                            ("max_decoded_bytes", row.max_decoded_bytes),
+                            ("media_types", row.media_types),
+                        )
+                        if value is not msgspec.UNSET
                     }
-                    bound["media_types"] = tuple(bound["media_types"])
                     if any(bound.values()):
                         cls = f"Annotated[{cls}, AssetBound(**{bound!r})]"
                     kinds.append(cls)
                 annotation = "Assets[" + " | ".join(kinds) + "]"
                 preparation = next(
-                    (row["prepare"] for row in entry["assets"]["kinds"] if "prepare" in row), None
+                    (row.prepare for row in entry.assets.kinds if row.prepare is not msgspec.UNSET),
+                    None,
                 )
                 if preparation is not None:
-                    caps = {key: value for key, value in preparation.items() if key != "profile"}
+                    caps = {
+                        key: value
+                        for key, value in (
+                            ("max_edge", preparation.max_edge),
+                            ("max_pixels", preparation.max_pixels),
+                        )
+                        if value is not msgspec.UNSET
+                    }
                     annotation = f"Annotated[{annotation}, ImagePreparation(**{caps!r})]"
             default = (
                 " = " + literal(fields[name]["type"], path, defaults[path])
@@ -250,10 +265,10 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                 annotation += " | msgspec.UnsetType"
                 default = " = msgspec.UNSET"
             parameters.append(f"{name}: {annotation}{default}")
-        arguments = "{" + ", ".join(f"{name!r}: {name}" for name in metadata["parameters"]) + "}"
+        arguments = "{" + ", ".join(f"{name!r}: {name}" for name in metadata.parameters) + "}"
         if any(
             isinstance(defaults.get("request/" + name), (list, dict))
-            for name in metadata["parameters"]
+            for name in metadata.parameters
         ):
             arguments = (
                 "{key: value for key, value in "
@@ -263,8 +278,8 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         options = ""
         returned = f"Awaitable[{result_name}]"
         if serving:
-            model_names = [slot["path"].rpartition(".")[2] for slot in entry.get("models", [])]
-            all_names = [*metadata["parameters"], *model_names, "capture"]
+            model_names = [slot.parameter for slot in entry.models]
+            all_names = [*metadata.parameters, *model_names, "capture"]
             if len(set(all_names)) != len(all_names):
                 raise ConformanceError(
                     "serving request fields collide with model slots or capture options",

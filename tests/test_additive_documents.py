@@ -129,10 +129,14 @@ def test_prepare_and_desired_state_accept_additive_fields(tmp_path: Path) -> Non
 def test_missing_required_interface_fields_still_refuse() -> None:
     body = json.loads(_interface())
     del body["jobs"][0]["result"]
-    with pytest.raises(package_interface.StalePackageInterface, match="missing result"):
+    with pytest.raises(
+        package_interface.StalePackageInterface, match="missing required field `result`"
+    ):
         package_interface.read_bytes(canonical.write(body))
     del body["jobs"]
-    with pytest.raises(package_interface.StalePackageInterface, match="missing jobs"):
+    with pytest.raises(
+        package_interface.StalePackageInterface, match="missing required field `jobs`"
+    ):
         package_interface.read_bytes(canonical.write(body))
 
 

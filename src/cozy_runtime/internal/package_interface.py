@@ -12,7 +12,9 @@ import re
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
+
+import msgspec
 
 from cozy_runtime.author import ConformanceError, Surface, WeightsOutput
 from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE
@@ -20,7 +22,7 @@ from cozy_runtime.author._media import KIND_MEDIA
 from cozy_runtime.author._model import ENCODED_LEAVES, FUSION
 from cozy_runtime.author._model_defaults import DefaultLadder, default_ladder
 from cozy_runtime.author._signature import AssetInputValue, AssetsBinding
-from cozy_runtime.internal import canonical, schema
+from cozy_runtime.internal import canonical, invocable_interface, schema
 from cozy_runtime.internal.canonical import Json
 
 if TYPE_CHECKING:
@@ -47,6 +49,102 @@ class StalePackageInterface(ConformanceError):
     """Supplied package-interface bytes are malformed or differ from the installed release."""
 
     default_code = "stale_package_interface"
+
+
+# ------------------------------------------------------------------ the typed reading
+#
+# `parse` decodes the document once into these structs. Additive fields from a newer writer
+# are ignored; the canonical bytes stay the identity, so nothing re-encodes a parsed
+# interface to name it. Request/result schemas are an open recursive grammar (`Json`),
+# checked by `_schema`; msgspec cannot analyze a recursive alias, so it sees `object`.
+
+if TYPE_CHECKING:
+    JsonValue = Json
+else:
+    JsonValue = object
+
+
+class LadderRung(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    gpu: str
+    gpus: int = 0
+    lane: str
+
+
+class SequenceParallel(msgspec.Struct, frozen=True):
+    degrees: tuple[Annotated[int, msgspec.Meta(ge=2)], ...]
+
+
+class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    path: str
+    class_name: str = msgspec.field(name="class")
+    component_use: dict[str, tuple[str, ...]]
+    encoded_leaves: str = "refuse"
+    fusion: str = "refuse"
+    default_ladder: tuple[LadderRung, ...] | msgspec.UnsetType = msgspec.UNSET
+    sequence_parallel: SequenceParallel | msgspec.UnsetType = msgspec.UNSET
+
+    @property
+    def parameter(self) -> str:
+        return self.path.rpartition(".")[2]
+
+
+class ImagePreparation(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    profile: str
+    max_edge: Annotated[int, msgspec.Meta(gt=0)] | msgspec.UnsetType = msgspec.UNSET
+    max_pixels: Annotated[int, msgspec.Meta(gt=0)] | msgspec.UnsetType = msgspec.UNSET
+
+
+class AssetKind(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    kind: Literal["image", "video", "audio", "file"]
+    media_types: tuple[str, ...]
+    max_count: Annotated[int, msgspec.Meta(ge=0)] | msgspec.UnsetType = msgspec.UNSET
+    max_bytes: Annotated[int, msgspec.Meta(gt=0)] | msgspec.UnsetType = msgspec.UNSET
+    max_decoded_bytes: Annotated[int, msgspec.Meta(gt=0)] | msgspec.UnsetType = msgspec.UNSET
+    prepare: ImagePreparation | msgspec.UnsetType = msgspec.UNSET
+
+
+class AssetsSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    parameter: str
+    kinds: Annotated[tuple[AssetKind, ...], msgspec.Meta(min_length=1, max_length=4)]
+    view: Literal["decoded"] | msgspec.UnsetType = msgspec.UNSET
+
+
+class WeightsOutputDeclaration(msgspec.Struct, frozen=True, kw_only=True):
+    output_id: Annotated[str, msgspec.Meta(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
+    mime_type: Literal["application/vnd.cozy.model-manifest"]
+    max_bytes: Annotated[int, msgspec.Meta(ge=0, le=(1 << 53) - 1)]
+
+
+class CallableDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    name: str
+    request: JsonValue
+    result: JsonValue
+    internal: bool = False
+    models: Annotated[tuple[ModelSlot, ...], msgspec.Meta(max_length=16)] = ()
+    assets: AssetsSlot | msgspec.UnsetType = msgspec.UNSET
+    invocable: invocable_interface.Invocable | msgspec.UnsetType = msgspec.UNSET
+    publishes: bool | msgspec.UnsetType = msgspec.UNSET
+    accelerator: bool | msgspec.UnsetType = msgspec.UNSET
+    weights_outputs: (
+        Annotated[tuple[WeightsOutputDeclaration, ...], msgspec.Meta(min_length=1, max_length=16)]
+        | msgspec.UnsetType
+    ) = msgspec.UNSET
+
+
+class PackageInterface(msgspec.Struct, frozen=True, kw_only=True):
+    format: str
+    application: Annotated[str, msgspec.Meta(min_length=1)]
+    entrypoints: tuple[CallableDoc, ...]
+    jobs: tuple[CallableDoc, ...]
+
+    def callables(self) -> tuple[tuple[Kind, CallableDoc], ...]:
+        return (
+            *(("entrypoint", entry) for entry in self.entrypoints),
+            *(("job", entry) for entry in self.jobs),
+        )
+
+    def job(self, name: str) -> CallableDoc | None:
+        return next((entry for entry in self.jobs if entry.name == name), None)
 
 
 # ------------------------------------------------------------------------ the document
@@ -109,8 +207,6 @@ def _callable(surface: Surface) -> dict[str, Json]:
         accelerator=surface.accelerator,
     )
     if surface.invocable or surface.kind == "entrypoint":
-        from cozy_runtime.internal import invocable_interface
-
         doc["invocable"] = invocable_interface.metadata(surface)
         if surface.invocable and surface.kind == "entrypoint":
             invocable_interface.project_serving_models(doc)
@@ -432,27 +528,28 @@ def _differences(left: Json, right: Json, path: str = "") -> list[str]:
     return []
 
 
-def read_bytes(raw: bytes, source: str = "package interface") -> dict[str, Json]:
-    """Read one interface projection without making its formatting part of identity."""
+def parse(raw: bytes, source: str = "package interface") -> PackageInterface:
+    """Decode one interface once, refusing a malformed document by the field it names."""
     try:
         parsed = canonical.parse(raw)
     except canonical.CanonicalError as exc:
         raise StalePackageInterface(f"{source}: {exc}", code="malformed_package_interface") from exc
-    if not isinstance(parsed, dict):
+    if isinstance(parsed, dict) and "format" in parsed and parsed["format"] != SCHEMA:
         raise StalePackageInterface(
-            f"{source} is not a JSON object", code="malformed_package_interface"
+            f"{source}: format {parsed['format']!r} is not {SCHEMA!r}", code="unknown_format"
         )
-    missing = sorted(TOP_LEVEL_KEYS - set(parsed))
-    if missing:
-        raise StalePackageInterface(
-            f"{source} is missing {', '.join(missing)}", code="malformed_package_interface"
-        )
-    if parsed["format"] != SCHEMA:
-        raise StalePackageInterface(
-            f"{source}: format {parsed['format']!r} is not {SCHEMA!r}",
-            code="unknown_format",
-        )
-    _validate(parsed, source)
+    try:
+        interface = msgspec.convert(parsed, PackageInterface, strict=True)
+    except msgspec.ValidationError as exc:
+        raise StalePackageInterface(f"{source}: {exc}", code="malformed_package_interface") from exc
+    _validate(interface, source)
+    return interface
+
+
+def read_bytes(raw: bytes, source: str = "package interface") -> dict[str, Any]:
+    """The validated document as untyped JSON, for readers not yet moved to `parse`."""
+    parse(raw, source)
+    parsed: dict[str, Any] = canonical.parse(raw)
     return parsed
 
 
@@ -481,193 +578,91 @@ def publish(path: Path, raw: bytes) -> None:
         Path(name).unlink(missing_ok=True)
 
 
-def _validate(body: Mapping[str, Json], source: str) -> None:
-    """Read the one current nested grammar. This is a hardcut, not a legacy decoder."""
-    application = body["application"]
-    if not isinstance(application, str) or not application:
-        _invalid(source, "application", "must be a non-empty string")
-    for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
-        rows = body[collection]
-        if not isinstance(rows, list):
-            _invalid(source, collection, "must be an array")
+def _validate(interface: PackageInterface, source: str) -> None:
+    """The cross-field rules the struct types cannot state. One current grammar, no legacy."""
+    for kind, entries in (("entrypoint", interface.entrypoints), ("job", interface.jobs)):
+        collection = kind + "s"
         names: set[str] = set()
-        for index, row in enumerate(rows):
+        for index, item in enumerate(entries):
             path = f"{collection}[{index}]"
-            required = {"name", "request", "result"}
-            if kind == "job":
-                required.add("publishes")
-            item = _fields(row, required, source, path)
-            if "internal" in item and type(item["internal"]) is not bool:
-                _invalid(source, f"{path}.internal", "must be a boolean")
-            name = item["name"]
-            if not isinstance(name, str) or not name or name in names:
+            if not item.name or item.name in names:
                 _invalid(source, f"{path}.name", "must be non-empty and unique")
-            names.add(name)
-            _schema(item["request"], source, f"{path}.request")
-            _schema(item["result"], source, f"{path}.result")
-            if "assets" in item:
-                _assets_slot(item["assets"], item["request"], source, f"{path}.assets")
-            if "invocable" in item:
-                from cozy_runtime.internal import invocable_interface
-
-                invocable_interface.validate(
-                    item["invocable"], item["request"], item["result"], kind=kind
-                )
-            models = item.get("models", [])
-            if not isinstance(models, list) or len(models) > 16:
-                _invalid(source, f"{path}.models", "must be an array of at most 16 slots")
-            for model_index, model in enumerate(models):
-                model_path = f"{path}.models[{model_index}]"
-                slot = _fields(model, {"class", "component_use", "path"}, source, model_path)
-                for consent, vocabulary in (
-                    ("encoded_leaves", ENCODED_LEAVES),
-                    ("fusion", FUSION),
-                ):
-                    if consent in slot and slot[consent] not in vocabulary:
-                        _invalid(
-                            source, f"{model_path}.{consent}", "must be " + " or ".join(vocabulary)
-                        )
-                if "sequence_parallel" in slot:
-                    _sequence_parallel(
-                        slot["sequence_parallel"], source, f"{model_path}.sequence_parallel"
-                    )
-                if "default_ladder" in slot:
-                    declared_defaults = default_ladder(slot["default_ladder"])
-                    parallel = slot.get("sequence_parallel", {})
-                    degrees = parallel.get("degrees", []) if isinstance(parallel, dict) else []
-                    if any(gpus > 1 and gpus not in degrees for _, gpus, _ in declared_defaults):
-                        _invalid(
-                            source,
-                            model_path,
-                            "default GPU count is not a declared sequence-parallel degree",
-                        )
-                prefix = f"{name}.models."
-                if (
-                    not isinstance(slot["path"], str)
-                    or not slot["path"].startswith(prefix)
-                    or not slot["path"][len(prefix) :]
-                ):
-                    _invalid(source, f"{model_path}.path", f"must start with {prefix!r}")
-                if not isinstance(slot["class"], str) or not slot["class"]:
-                    _invalid(source, f"{model_path}.class", "must be a non-empty string")
-                uses = slot["component_use"]
-                if not isinstance(uses, dict):
-                    _invalid(source, f"{model_path}.component_use", "must be an object")
-                for method, components in uses.items():
-                    if (
-                        not isinstance(method, str)
-                        or not isinstance(components, list)
-                        or not all(isinstance(component, str) for component in components)
-                    ):
-                        _invalid(
-                            source,
-                            f"{model_path}.component_use",
-                            "must map method names to component-name arrays",
-                        )
-            if kind == "job":
-                if not isinstance(item["publishes"], bool):
-                    _invalid(source, f"{path}.publishes", "must be a boolean")
-                if "accelerator" in item and type(item["accelerator"]) is not bool:
-                    _invalid(source, f"{path}.accelerator", "must be a boolean")
-                if "weights_outputs" in item:
-                    weights_outputs = item["weights_outputs"]
-                    if not isinstance(weights_outputs, list) or not 1 <= len(weights_outputs) <= 16:
-                        _invalid(
-                            source,
-                            f"{path}.weights_outputs",
-                            "must contain 1 through 16 outputs",
-                        )
-                    weights_names: set[str] = set()
-                    for output_index, output_raw in enumerate(weights_outputs):
-                        output_path = f"{path}.weights_outputs[{output_index}]"
-                        output = _fields(
-                            output_raw, {"output_id", "mime_type", "max_bytes"}, source, output_path
-                        )
-                        output_id = _portable_name(
-                            output["output_id"], source, f"{output_path}.output_id"
-                        )
-                        if output_id in weights_names:
-                            _invalid(source, f"{output_path}.output_id", "must be unique")
-                        weights_names.add(output_id)
-                        if output["mime_type"] != "application/vnd.cozy.model-manifest":
-                            _invalid(source, f"{output_path}.mime_type", "is not the model MIME")
-                        maximum = output["max_bytes"]
-                        if (
-                            not isinstance(maximum, int)
-                            or isinstance(maximum, bool)
-                            or not 0 <= maximum <= (1 << 53) - 1
-                        ):
-                            _invalid(
-                                source,
-                                f"{output_path}.max_bytes",
-                                "must be an integer in 0..=2^53-1",
-                            )
+            names.add(item.name)
+            if (kind == "job") != (item.publishes is not msgspec.UNSET):
+                _invalid(source, f"{path}.publishes", "is required exactly on jobs")
+            if kind != "job" and (
+                item.accelerator is not msgspec.UNSET or item.weights_outputs is not msgspec.UNSET
+            ):
+                _invalid(source, path, "only jobs declare accelerator or weights outputs")
+            _schema(item.request, source, f"{path}.request")
+            _schema(item.result, source, f"{path}.result")
+            if item.assets is not msgspec.UNSET:
+                _assets_slot(item.assets, item.request, source, f"{path}.assets")
+            if item.invocable is not msgspec.UNSET:
+                invocable_interface.validate(item.invocable, item.request, item.result, kind=kind)
+            for model_index, slot in enumerate(item.models):
+                _model_slot(slot, item.name, source, f"{path}.models[{model_index}]")
+            outputs = () if item.weights_outputs is msgspec.UNSET else item.weights_outputs
+            output_ids = [output.output_id for output in outputs]
+            if len(set(output_ids)) != len(output_ids):
+                _invalid(source, f"{path}.weights_outputs", "output ids must be unique")
 
 
-_PORTABLE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+def _model_slot(slot: ModelSlot, name: str, source: str, path: str) -> None:
+    for consent, value, vocabulary in (
+        ("encoded_leaves", slot.encoded_leaves, ENCODED_LEAVES),
+        ("fusion", slot.fusion, FUSION),
+    ):
+        if value not in vocabulary:
+            _invalid(source, f"{path}.{consent}", "must be " + " or ".join(vocabulary))
+    degrees = () if slot.sequence_parallel is msgspec.UNSET else slot.sequence_parallel.degrees
+    if slot.sequence_parallel is not msgspec.UNSET and (
+        not degrees or list(degrees) != sorted(set(degrees))
+    ):
+        _invalid(source, f"{path}.sequence_parallel.degrees", "must be non-empty, sorted, unique")
+    if slot.default_ladder is not msgspec.UNSET and any(
+        gpus > 1 and gpus not in degrees
+        for _, gpus, _ in default_ladder(msgspec.to_builtins(slot.default_ladder))
+    ):
+        _invalid(source, path, "default GPU count is not a declared sequence-parallel degree")
+    prefix = f"{name}.models."
+    if not slot.path.startswith(prefix) or not slot.path[len(prefix) :]:
+        _invalid(source, f"{path}.path", f"must start with {prefix!r}")
+    if not slot.class_name:
+        _invalid(source, f"{path}.class", "must be a non-empty string")
 
 
-def _portable_name(value: Json, source: str, path: str) -> str:
-    if not isinstance(value, str) or _PORTABLE_NAME.fullmatch(value) is None:
-        _invalid(source, path, "must be a portable lowercase name")
-    return value
-
-
-def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
-    slot = _fields(value, {"parameter", "kinds"}, source, path)
-    if "view" in slot and slot["view"] != "decoded":
-        _invalid(source, f"{path}.view", "must be decoded when present")
-    parameter = slot["parameter"]
-    if not isinstance(parameter, str) or not parameter.isidentifier():
+def _assets_slot(slot: AssetsSlot, request: Json, source: str, path: str) -> None:
+    if not slot.parameter.isidentifier():
         _invalid(source, path, "assets parameter must be an identifier")
     fields = request.get("fields", []) if isinstance(request, dict) else []
-    selected = [f for f in fields if isinstance(f, dict) and f.get("name") == parameter]
-    occurrence = schema.render(list[AssetInputValue])
-    if len(selected) != 1 or selected[0].get("type") != occurrence:
+    selected = (
+        [f for f in fields if isinstance(f, dict) and f.get("name") == slot.parameter]
+        if isinstance(fields, list)
+        else []
+    )
+    if len(selected) != 1 or selected[0].get("type") != schema.render(list[AssetInputValue]):
         _invalid(source, path, "assets parameter must name the declared occurrence records")
-    kinds = slot["kinds"]
-    if not isinstance(kinds, list) or not 1 <= len(kinds) <= 4:
-        _invalid(source, path, "assets kinds must be a nonempty bounded list")
-    seen: set[str] = set()
+    kinds = [row.kind for row in slot.kinds]
+    if len(set(kinds)) != len(kinds):
+        _invalid(source, path, "assets kinds must be unique")
     media: set[str] = set()
-    for value in kinds:
-        row = _fields(value, {"kind", "media_types"}, source, path)
-        kind = row["kind"]
-        if kind not in ("image", "video", "audio", "file") or str(kind) in seen:
-            _invalid(source, path, "assets kinds must be recognized and unique")
-        if slot.get("view") == "decoded" and kind == "file":
+    for row in slot.kinds:
+        if slot.view == "decoded" and row.kind == "file":
             _invalid(source, path, "decoded Assets does not include generic file handles")
-        if "max_count" in row and (type(row["max_count"]) is not int or row["max_count"] < 0):
-            _invalid(source, path, "assets kind max_count must be a nonnegative integer")
-        seen.add(str(kind))
-        types = row["media_types"]
-        if not isinstance(types, list) or (not types and kind != "file"):
+        if not row.media_types and row.kind != "file":
             _invalid(source, path, "a media kind needs explicit MIME types")
-        for mime in types:
-            if (
-                not isinstance(mime, str)
-                or mime != mime.strip().lower()
-                or "/" not in mime
-                or mime in media
-            ):
+        for mime in row.media_types:
+            if mime != mime.strip().lower() or "/" not in mime or mime in media:
                 _invalid(source, path, "assets MIME types must be distinct and canonical")
             media.add(mime)
-        if "prepare" in row:
-            if kind != "image" or slot.get("view") != "decoded":
-                _invalid(source, path, "image preparation needs decoded image Assets")
-            preparation = _fields(row["prepare"], {"profile"}, source, path + ".prepare")
-            if preparation["profile"] != IMAGE_PREPARATION_PROFILE or not any(
-                key in preparation for key in ("max_edge", "max_pixels")
-            ):
-                _invalid(source, path, "unknown or empty image preparation")
-            for key in ("max_edge", "max_pixels"):
-                if key in preparation and (
-                    type(preparation[key]) is not int or cast(int, preparation[key]) <= 0
-                ):
-                    _invalid(source, path, "image preparation caps must be positive integers")
-        for limit in ("max_bytes", "max_decoded_bytes"):
-            if limit in row and (type(row[limit]) is not int or cast(int, row[limit]) <= 0):
-                _invalid(source, path, "assets byte limits must be positive integers")
+        if row.prepare is not msgspec.UNSET and (
+            row.kind != "image"
+            or slot.view != "decoded"
+            or row.prepare.profile != IMAGE_PREPARATION_PROFILE
+            or (row.prepare.max_edge is msgspec.UNSET and row.prepare.max_pixels is msgspec.UNSET)
+        ):
+            _invalid(source, path, "image preparation needs decoded image Assets and a cap")
 
 
 def _schema(value: Json, source: str, path: str, union_tag_field: str | None = None) -> None:
@@ -760,19 +755,6 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
             _invalid(source, f"{path}.literal", "must be an array")
     elif not isinstance(child, str) or not child:
         _invalid(source, f"{path}.{form}", "must be a non-empty string")
-
-
-def _sequence_parallel(value: Json, source: str, path: str) -> None:
-    """`{"degrees": [K, ...]}`: non-empty, ints >= 2, sorted unique (cr-068)."""
-    declared = _fields(value, {"degrees"}, source, path)
-    degrees = declared["degrees"]
-    if (
-        not isinstance(degrees, list)
-        or not degrees
-        or not all(isinstance(d, int) and not isinstance(d, bool) and d >= 2 for d in degrees)
-        or degrees != sorted(set(degrees))
-    ):
-        _invalid(source, f"{path}.degrees", "must be a non-empty sorted unique list of ints >= 2")
 
 
 def _fields(value: Json, required: set[str], source: str, path: str) -> dict[str, Json]:
