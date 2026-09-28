@@ -16,14 +16,10 @@ from test_machine_execution import complete, offer
 
 
 def running(executions: Executions, request: str = "parent") -> pb.AttemptOffer:
+    """The parent's attempt is on its executor (dispatched once, however often asked)."""
     selected = executions.offer("owner", request)
-    accepted = pb.AttemptAccepted(
-        request_id=request,
-        attempt_ordinal=selected.attempt_ordinal,
-        invocation_spec_digest=selected.invocation_spec_digest,
-    )
-    executions.workspace.mark_running("owner", accepted)
-    executions.observe("owner", pb.WorkerFrame(attempt_accepted=accepted))
+    if executions.status("owner", request).state == "queued":
+        executions.dispatched("owner", request, selected.attempt_ordinal)
     return selected
 
 
@@ -305,11 +301,11 @@ def test_root_cancel_fences_descendant_writes_and_retains_uncertain_effect(tmp_p
     executions.control("owner", "parent", "cancel", 1, "cancel")
     with pytest.raises(WorkspaceRefusal, match="ancestor"):
         calls.before_write("owner", effect)
-    assert not executions.abandon("owner", "parent")
+    assert not executions.release("owner", "parent")
     assert executions.retention_required("owner")
     calls.complete("owner", effect, b'{"revision":1}')
     assert not calls.has_unsettled_effects("owner", "parent")
-    assert executions.abandon("owner", "parent")
+    assert executions.release("owner", "parent")
 
 
 def test_accepted_publication_authority_is_immutable_and_survives_reopen(tmp_path: Path) -> None:

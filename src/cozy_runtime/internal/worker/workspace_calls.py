@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
+
+import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.call_intent import canonical_intent
@@ -27,6 +29,24 @@ CREATE TABLE execution_calls (
 """
 
 
+class CallPlan(msgspec.Struct, frozen=True):
+    """A job or serving call's frozen plan (`execution_calls.prepared`)."""
+
+    kind: str
+    installation_id: str = ""
+    entrypoint: str = ""
+    parent_attempt: int = 0
+    computation: str = ""
+    result_schema: object = None
+
+
+class CallIntent(msgspec.Struct, frozen=True):
+    """What a call names (`execution_calls.intent`, `call_intent.canonical_intent`)."""
+
+    module: str
+    export: str
+
+
 @dataclass(frozen=True)
 class Call:
     parent_request: str
@@ -41,6 +61,12 @@ class Call:
     result: bytes
     safe_code: str
     safe_detail: str
+
+    def plan(self) -> CallPlan:
+        return canonical_json.decode_as(self.prepared, CallPlan)
+
+    def target(self) -> CallIntent:
+        return canonical_json.decode_as(self.intent, CallIntent)
 
 
 class CallFenced(WorkspaceRefusal):
@@ -209,6 +235,63 @@ class Calls:
         with self.workspace.locked() as db:
             return self._call(self._row(db, owner, parent, index))
 
+    def child(self, owner: str, child: str) -> Call | None:
+        """The call a child request answers; None for a root."""
+        with self.workspace.locked() as db:
+            row = db.execute(
+                "SELECT * FROM execution_calls WHERE owner=? AND child_request=?", (owner, child)
+            ).fetchone()
+        return self._call(row) if row is not None else None
+
+    def children(self, owner: str, parent: str) -> list[Call]:
+        with self.workspace.locked() as db:
+            return [
+                self._call(row)
+                for row in db.execute(
+                    "SELECT * FROM execution_calls WHERE owner=? AND parent_request=? "
+                    "ORDER BY call_index",
+                    (owner, parent),
+                )
+            ]
+
+    def unsettled_effects(self, owner: str) -> list[str]:
+        """Sent effect calls whose remote commit is still in doubt: owed a readback."""
+        from cozy_runtime.internal.effect_interfaces import MODULE
+
+        with self.workspace.locked() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT child_request FROM execution_calls WHERE owner=? AND sent=1 "
+                    "AND result=x'' AND json_extract(CAST(intent AS TEXT),'$.module')=?",
+                    (owner, MODULE),
+                )
+            ]
+
+    def ancestor_stop(self, owner: str, child: str) -> Literal["", "pause", "cancel"]:
+        """How a child follows its stopped ancestors: cancel when one was canceled, pause
+        when one paused or failed, nothing while every ancestor runs (or succeeded)."""
+        with self.workspace.locked() as db:
+            rows = db.execute(
+                "WITH RECURSIVE ancestors(request) AS ("
+                "SELECT parent_request FROM execution_calls WHERE owner=? AND child_request=? "
+                "UNION SELECT c.parent_request FROM execution_calls c JOIN ancestors a "
+                "ON c.child_request=a.request WHERE c.owner=?) "
+                "SELECT e.desired,e.state FROM executions e JOIN ancestors a "
+                "ON e.request=a.request WHERE e.owner=?",
+                (owner, child, owner, owner),
+            ).fetchall()
+        stopped = [
+            row
+            for row in rows
+            if row["desired"] != "run" or row["state"] in ("failed", "canceled", "paused")
+        ]
+        if not stopped:
+            return ""
+        if any(row["desired"] == "cancel" or row["state"] == "canceled" for row in stopped):
+            return "cancel"
+        return "pause"
+
     def check_active(self, owner: str, call: Call) -> None:
         with self.workspace.locked() as db:
             row = self._row(db, owner, call.parent_request, call.call_index)
@@ -240,25 +323,6 @@ class Calls:
                 "WHERE owner=? AND parent_request=? AND call_index=?",
                 (code, detail, owner, call.parent_request, call.call_index),
             )
-
-    def pending_effects(self, owner: str, *, limit: int = 32) -> list[Call]:
-        from cozy_runtime.internal.effect_interfaces import MODULE
-
-        if not 1 <= limit <= 32:
-            raise WorkspaceRefusal("effect page exceeds its bound")
-        with self.workspace.locked() as db:
-            return [
-                self._call(row)
-                for row in db.execute(
-                    "SELECT c.* FROM execution_calls c JOIN executions e "
-                    "ON e.owner=c.owner AND e.request=c.parent_request "
-                    "WHERE c.owner=? AND c.result=x'' AND (c.safe_code='' OR c.sent=1) "
-                    "AND json_extract(CAST(c.intent AS TEXT),'$.module')=? "
-                    "AND (c.sent=1 OR (e.state='running' AND e.desired='run')) "
-                    "ORDER BY c.created_ms,c.child_request LIMIT ?",
-                    (owner, MODULE, limit),
-                )
-            ]
 
     def unresolved(self, owner: str, call: Call, code: str) -> None:
         """Expose an effect problem without claiming its prior send did not land."""

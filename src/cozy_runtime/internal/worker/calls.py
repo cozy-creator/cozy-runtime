@@ -86,6 +86,8 @@ class Calls:
         #: per parent attempt: the socket a nudge is written to when its calls may have moved
         self.watchers: dict[tuple[str, int], socket.socket] = {}
         self.lock = threading.RLock()
+        #: one lock per parent attempt: parents never wait on each other's calls
+        self.parents: dict[tuple[str, int], threading.RLock] = {}
 
     def bindings(self, attempt: AttemptRecord) -> list[dict[str, Any]]:
         if attempt.job is None:
@@ -128,6 +130,10 @@ class Calls:
                 return {"ok": False, "code": "gpu_release_refused", "detail": str(exc)[:1024]}
             return {"ok": True}
         with self.lock:
+            parent_lock = self.parents.setdefault(
+                (attempt.request_id, attempt.attempt), threading.RLock()
+            )
+        with parent_lock:
             try:
                 if attempt.state != "running" or attempt.canceling:
                     raise ValueError("parent call is not active")
@@ -161,7 +167,7 @@ class Calls:
                     ):
                         raise ValueError("an existing parent call index changed its exact intent")
                     if pending is None:
-                        if sum(k[:2] == key[:2] for k in self.pending) >= MAX_ACTIVE_CALLS:
+                        if sum(k[:2] == key[:2] for k in list(self.pending)) >= MAX_ACTIVE_CALLS:
                             raise ValueError("active parent call bound exceeded")
                         label = frame.get("progress_label", "")
                         if (
@@ -278,14 +284,14 @@ class Calls:
         self.watchers[(attempt.request_id, attempt.attempt)] = ours
         return DescriptorReply({"ok": True}, theirs)
 
-    def wake(self) -> None:
-        """A call result, child progress or a cancel may have moved: every parent re-polls.
-
-        Lock-free, so any journal writer may call it; a nudge already queued is enough.
-        """
-        for watcher in tuple(self.watchers.values()):
-            with contextlib.suppress(OSError):
-                watcher.send(b"\0")
+    def wake(self, parent: str) -> None:
+        """A call result, child progress or a cancel of `parent`'s may have moved: that
+        parent re-polls. Lock-free, so any journal writer may call it; a nudge already
+        queued is enough."""
+        for (request, _), watcher in tuple(self.watchers.items()):
+            if request == parent:
+                with contextlib.suppress(OSError):
+                    watcher.send(b"\0")
 
     def _progress(self, pending: _Pending) -> dict[str, Any]:
         """Reuse the child's existing journal; polling progress does not change call identity."""
@@ -420,7 +426,7 @@ class Calls:
                 del self.pending[
                     (result.parent_request_id, result.parent_attempt_ordinal, result.call_index)
                 ]
-            self.wake()
+            self.wake(result.parent_request_id)
             return True
 
     def _materialize(self, attempt: AttemptRecord, pending: _Pending) -> list[dict[str, Any]]:
@@ -516,6 +522,7 @@ class Calls:
 
     def close(self, request_id: str, attempt: int) -> None:
         with self.lock:
+            self.parents.pop((request_id, attempt), None)
             if watcher := self.watchers.pop((request_id, attempt), None):
                 watcher.close()
             self.received.pop((request_id, attempt), None)

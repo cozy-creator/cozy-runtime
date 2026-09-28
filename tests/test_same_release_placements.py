@@ -5,9 +5,10 @@ preparation (its own slot) of the same release, so the serving root was refused 
 "execution inference does not name the captured root" while the job held the GPUs.
 
 Real: the Worker, its published and private preparation registration, SubmitMachineExecution's
-capture verification, the durable journal, the GPU scheduler's drive ticks and a TensorFS
+capture verification, the durable journal, each execution's unit and GPU grants, and a TensorFS
 store holding the model. Fakes: the uv install (a retained uv venv carries the package), the
-describe and census derives, and device memory.
+describe and census derives, device memory, and the job's run (it holds its GPUs until
+`finish`).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
@@ -40,10 +42,11 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.worker import package_prepare
+from cozy_runtime.internal.worker import activity, execution_unit, package_prepare
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions, read_placement_set
+from cozy_runtime.internal.worker.supervisor import Unit
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_job_slot_paths import _ASSET, _HEADER, _ref
@@ -141,6 +144,20 @@ class Machine:
             }
 
         monkeypatch.setattr(package_prepare, "prepare_package_set", install)
+        #: job request -> set when its Python returns
+        self.running: dict[str, threading.Event] = {}
+        dispatch = Worker.dispatch_machine
+
+        def dispatch_job(worker: Worker, unit: Unit, offered: pb.AttemptOffer, *args: Any) -> Any:
+            """A job runs its Python on its grant until `finish` (this venv carries no
+            Runtime to boot a job executor from); everything else dispatches for real."""
+            if offered.request_id not in self.running:
+                return dispatch(worker, unit, offered, *args)
+            self.executions.dispatched(OWNER, offered.request_id, offered.attempt_ordinal)
+            unit.wait_for(self.running[offered.request_id].is_set)
+            return None
+
+        monkeypatch.setattr(Worker, "dispatch_machine", dispatch_job)
         monkeypatch.setattr(package_prepare, "_census", census)
         monkeypatch.setattr(
             accel,
@@ -254,6 +271,8 @@ class Machine:
         spec: dict[str, Any],
         state: pb.DesiredWorkerState,
         placement: str = "",
+        *,
+        hold: bool = True,
     ) -> None:
         assert self.installed_package is not None
         installation = self.installed_package.installation_id
@@ -282,6 +301,8 @@ class Machine:
             )
         )
         state.revision, state.wire_minor, state.posture = 1, WIRE_MINOR, pb.POSTURE_ACCEPTING
+        if "job" in spec and hold:
+            self.running[request] = threading.Event()
         self.rpc.SubmitMachineExecution(
             pb.MachineExecutionSubmit(
                 claim=self.claim,
@@ -314,14 +335,9 @@ class Machine:
 
     def finish(self, request: str) -> None:
         """What the job's executor records when its Python returns."""
-        selected = self.executions.offer(OWNER, request)
-        accepted = pb.AttemptAccepted(
-            request_id=request,
-            attempt_ordinal=selected.attempt_ordinal,
-            invocation_spec_digest=selected.invocation_spec_digest,
-        )
-        self.executions.workspace.mark_running(OWNER, accepted)
-        self.executions.observe(OWNER, pb.WorkerFrame(attempt_accepted=accepted))
+        row = self.executions.row(OWNER, request)
+        assert row is not None and row.dispatched
+        selected = row.attempt_offer()
         body, digest = documents.identity(
             pb.AttemptOutcomeBody(
                 request_id=request,
@@ -344,12 +360,16 @@ class Machine:
             outcome_canonical_bytes=body,
         )
         self.executions.workspace.outcome(OWNER, terminal)
-        self.executions.observe(OWNER, pb.WorkerFrame(attempt_outcome=terminal))
+        self.executions.reconcile(OWNER, request)
+        self.running[request].set()
+        self.worker.supervisor.poke(execution_unit.key(request))
 
     def tick(self) -> None:
-        self.worker.drive_executions()
-        for thread in list(self.worker._activating.values()):
-            thread.join()
+        """Every unit has done all it can."""
+        bound = time.monotonic() + 300  # a hang bound on a loaded box, not a budget
+        while not self.worker.supervisor.quiet_now():
+            assert time.monotonic() < bound, self.worker.supervisor.keys("")
+            time.sleep(0.01)
 
     def journal(self, root: str) -> list[tuple[int, str, dict[str, Any]]]:
         return [
@@ -467,3 +487,28 @@ def test_a_serving_root_waits_behind_a_job_of_its_own_release(machine: Machine) 
         e.at_ms for e in machine.executions.events(OWNER, "B").events if e.kind == "gpu.grant"
     )
     assert granted_at >= at[released]
+
+
+def test_a_job_whose_executor_never_boots_ends_failed(machine: Machine) -> None:
+    """This venv carries no Runtime, so the job's executor exits before it dials back: that
+    is the execution's FAILED terminal, never a wait, and the rental is free at once."""
+    machine.prepare("touch.models.model", "retouch.models.model")
+    assert machine.installed_package is not None
+    installation = machine.installed_package.installation_id
+    interface = package_interface.read_bytes(machine.interface)
+    descriptor = package_interface.job_descriptor_id(interface, "workflow")
+    machine.submit(
+        "A",
+        {"job": pb.JobInvocationSpec(installation_id=installation, job_descriptor_id=descriptor)},
+        pb.DesiredWorkerState(
+            job=pb.JobDirective(installation_id=installation, job_descriptor_id=descriptor)
+        ),
+        hold=False,
+    )
+    machine.tick()
+    assert machine.executions.status(OWNER, "A").state == "failed"
+    body = documents.parse(
+        machine.executions.outcome(OWNER, "A").outcome_canonical_bytes, pb.AttemptOutcomeBody
+    )
+    assert "job_executor_absent" in body.safe_message
+    assert not activity.active_work(machine.worker)

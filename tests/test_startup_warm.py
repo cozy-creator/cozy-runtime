@@ -243,8 +243,7 @@ class Warm(Machine):
         accepted = pb.AttemptAccepted(
             request_id=name, attempt_ordinal=1, invocation_spec_digest=digest
         )
-        self.executions.workspace.mark_running(OWNER, accepted)
-        self.executions.observe(OWNER, pb.WorkerFrame(attempt_accepted=accepted))
+        self.executions.dispatched(OWNER, accepted.request_id, accepted.attempt_ordinal)
 
     def target(self, checkpoint: dict[str, Any], degrees: tuple[int, ...] = ()) -> Target:
         digest = "sha256:" + hashlib.sha256(b"warm-binding").hexdigest()

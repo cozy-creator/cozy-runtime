@@ -269,6 +269,8 @@ class SourceCalls:
         self.lock = threading.Lock()
         self.processes: dict[str, subprocess.Popen[bytes] | None] = {}
         self.tasks: dict[str, threading.Event] = {}
+        #: told the service id of every native task that ends, whatever its end
+        self.finished: Callable[[str], None] = lambda service_id: None
         self.parents: dict[str, str] = {}
         self.commands: dict[str, pb.NativeSourceCommand] = {}
         self.process_owners: dict[str, str] = {}
@@ -735,6 +737,7 @@ class SourceCalls:
                     self.process_owners.pop(command.service_id, None)
                     self.tasks.pop(command.service_id, None)
             done.set()
+            self.finished(command.service_id)
 
         terminal = _after(finish, self._status)
         view = command.operation == pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES

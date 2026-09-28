@@ -148,7 +148,7 @@ def terminal(db: Journal, attempt: Any, detail: str) -> None:
         status=pb.OUTCOME_STATUS_ABANDONED,
         safe_message=detail,
         cause=pb.OutcomeCause(
-            code=pb.CAUSE_CODE_EXECUTOR_INVALIDATED, origin=pb.CAUSE_ORIGIN_WORKER, detail=detail
+            code=pb.CAUSE_CODE_EXECUTOR_INVALIDATED, origin=pb.CAUSE_ORIGIN_INFRA, detail=detail
         ),
         execution_started=attempt["state"] == "running" or bool(rows),
     )

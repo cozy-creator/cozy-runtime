@@ -8,8 +8,11 @@ import signal
 import subprocess
 import sys
 import threading
+import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,7 +24,32 @@ from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
-from test_machine_execution import complete, offer
+from test_machine_execution import offer
+
+
+@pytest.fixture
+def prepared(monkeypatch: pytest.MonkeyPatch) -> Iterator[threading.Event]:
+    """An accepted execution's unit holds at its preparation (a download, say) until the
+    returned event is set: its work is owed, and the worker says so."""
+    done = threading.Event()
+    dispatch = Worker.dispatch_machine
+
+    def preparing(self: Worker, *args: Any) -> Any:
+        done.wait()
+        return dispatch(self, *args)
+
+    monkeypatch.setattr(Worker, "dispatch_machine", preparing)
+    try:
+        yield done
+    finally:
+        done.set()
+
+
+def settled(ready: Any) -> None:
+    bound = time.monotonic() + 60
+    while not ready():
+        assert time.monotonic() < bound
+        time.sleep(0.01)
 
 
 def _worker(root: Path) -> tuple[Worker, pb.Claim]:
@@ -80,6 +108,7 @@ def test_running_guard_capability_names_process_birth_and_worker_boot(tmp_path: 
 def test_real_hup_cannot_reenter_main_thread_admission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    prepared: threading.Event,
 ) -> None:
     worker, claim = _worker(tmp_path)
     read, write = os.pipe()
@@ -121,6 +150,7 @@ def test_real_hup_cannot_reenter_main_thread_admission(
         assert verdict["status"] == "busy" and verdict["active_executions"] == 1
         assert not worker.restart_requested
     finally:
+        prepared.set()
         signal.signal(signal.SIGHUP, previous)
         worker.request_stop()
         watcher.join(5)
@@ -129,7 +159,9 @@ def test_real_hup_cannot_reenter_main_thread_admission(
         worker.shutdown()
 
 
-def test_queued_detached_root_refuses_update_then_can_finish(tmp_path: Path) -> None:
+def test_queued_detached_root_refuses_update_then_can_finish(
+    tmp_path: Path, prepared: threading.Event
+) -> None:
     worker, claim = _worker(tmp_path)
     try:
         receipt = worker.submit_execution(
@@ -145,7 +177,8 @@ def test_queued_detached_root_refuses_update_then_can_finish(tmp_path: Path) -> 
         verdict = json.loads((worker.root / "restart-status.json").read_bytes())
         assert verdict["status"] == "busy" and verdict["active_executions"] == 1
         assert not worker.stop.is_set()
-        worker.drive_executions()
+        prepared.set()
+        settled(lambda: not worker.supervisor.busy())
         assert worker.execution_status(claim, receipt.request_id).state == "failed"
         outcome = worker.collect_execution(claim, receipt.request_id)
         assert worker.request_idle_restart()
@@ -161,35 +194,14 @@ def test_queued_detached_root_refuses_update_then_can_finish(tmp_path: Path) -> 
                 offer("later", job=False),
                 expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
             )
-        worker.drive_executions()  # Cannot reopen admission after a successful guard.
-        assert worker.stop.is_set()
+        assert worker.stop.is_set()  # Cannot reopen admission after a successful guard.
     finally:
         worker.shutdown()
 
 
-def test_retry_wait_is_active_and_preparation_is_busy(tmp_path: Path) -> None:
-    worker, claim = _worker(tmp_path)
+def test_a_preparation_is_busy(tmp_path: Path) -> None:
+    worker, _claim = _worker(tmp_path)
     try:
-        assert worker.executions is not None
-        worker.submit_execution(
-            claim,
-            "root",
-            b"c" * 32,
-            offer(job=False),
-            max_attempts=2,
-            retry_delay_ms=60000,
-            expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
-        )
-        complete(
-            worker.executions,
-            "root",
-            status=pb.OUTCOME_STATUS_FAILED,
-            cause=pb.CAUSE_CODE_EXECUTOR_FAULT,
-        )
-        assert worker.executions.status("owner", "root").state == "retrying"
-        assert not worker.request_idle_restart()
-        worker.control_execution(claim, "root", "cancel", 1, "cancel")
-        worker.drive_executions()
         with worker.preparation_lock:
             assert not worker.request_idle_restart()
             assert json.loads((worker.root / "restart-status.json").read_bytes())["preparing"]
@@ -198,7 +210,9 @@ def test_retry_wait_is_active_and_preparation_is_busy(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("iteration", range(8))
-def test_restart_and_root_admission_have_exactly_one_winner(tmp_path: Path, iteration: int) -> None:
+def test_restart_and_root_admission_have_exactly_one_winner(
+    tmp_path: Path, iteration: int, prepared: threading.Event
+) -> None:
     worker, claim = _worker(tmp_path / str(iteration))
     barrier = threading.Barrier(2)
 
@@ -227,6 +241,7 @@ def test_restart_and_root_admission_have_exactly_one_winner(tmp_path: Path, iter
             stopped = pool.submit(restart)
             assert admitted.result(timeout=10) != stopped.result(timeout=10)
         assert worker.executions is not None
-        assert bool(worker.executions.active_count()) != worker.stop.is_set()
+        assert worker.executions.owns("owner", "root") != worker.stop.is_set()
     finally:
+        prepared.set()
         worker.shutdown()

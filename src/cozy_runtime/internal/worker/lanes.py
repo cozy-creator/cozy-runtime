@@ -1,10 +1,10 @@
 """Device lanes: the serialized per-device resource inside ONE worker (cr-066).
 
-`device_lane()` always said ONE SERIALIZED PER-DEVICE STATE MACHINE and was one thread per
-WORKER. This module makes the sentence literally true: a LANE owns a set of envelope-local
-device ordinals, one attempt thread, one ledger row per resident executor generation, and
-the placements assigned to those devices. Law 8 (one active attempt per PHYSICAL device,
-#451) is a lane fact; `admission_epoch` and `admission_state` stay worker facts.
+A LANE owns a set of envelope-local device ordinals, the lock that serializes execution on
+them, one ledger row per resident executor generation, and the placements assigned to those
+devices. Attempts run on their own threads and take the lane's lock for their device phase.
+Law 8 (one active attempt per PHYSICAL device, #451) is a lane fact; `admission_epoch` and
+`admission_state` stay worker facts.
 
 The worker's envelope is a launcher fact (`--devices 0,1`, pod inventory). It is split
 into one lane per entry, in envelope order, so ordinal `i` is `entries[i]` and the seal a
@@ -36,7 +36,6 @@ the arbiter holds that device's lock.
 from __future__ import annotations
 
 import itertools
-import queue
 import threading
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -44,7 +43,6 @@ from dataclasses import dataclass, field
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.accel import DeviceMemory
 from cozy_runtime.internal.worker import child
-from cozy_runtime.internal.worker.attempts import AttemptRecord, Released
 from cozy_runtime.internal.worker.ledger import DeviceFacts, Ledger
 from cozy_runtime.internal.worker.plan import PlanChooser
 
@@ -99,16 +97,6 @@ class LaneRefusal(Exception):
         self.detail = detail
 
 
-@dataclass(frozen=True, slots=True)
-class ExecutorDeath:
-    """One exact child exit awaiting its lane's rebuild decision."""
-
-    executor: child.Executor
-    placement_id: str = ""
-    #: a deferred replica rebuild released by its own scheduler grant
-    granted: bool = False
-
-
 @dataclass(slots=True)
 class LaneRow:
     """One resident executor generation on a lane: its ledger and its plan chooser."""
@@ -145,7 +133,7 @@ class LaneRow:
 
 
 class DeviceLane:
-    """ONE serialized resource: devices, one attempt thread, one row per executor."""
+    """ONE serialized resource: devices, their lock, one row per executor."""
 
     def __init__(
         self,
@@ -168,23 +156,18 @@ class DeviceLane:
         self.rows: dict[str, LaneRow] = {}
         #: placement ids assigned to this lane, whether or not they are dispatchable yet
         self.placements: set[str] = set()
-        #: STAGING (proto-061 G): serving offers, in arrival order, to be accepted beside
-        #: the device. Never takes `device`: staging touches no executor.
-        self.stage: queue.Queue[AttemptRecord | None] = queue.Queue()
-        #: the DEVICE queue: staged attempts, job offers and executor deaths, in order
-        self.work: queue.Queue[AttemptRecord | ExecutorDeath | None] = queue.Queue()
-        #: the POST PHASE (cr-079): released attempts, one thread per lane, in release
-        #: order. It never takes `device`: everything it reads left the executor at release.
-        self.post: queue.Queue[Released | None] = queue.Queue()
+        #: the POST PHASE (cr-079) of this lane's released attempts, one at a time, in
+        #: release order. It never takes `device`: everything it reads left the executor.
+        self.posting = threading.Lock()
         #: this lane's gate: has it STOPPED moving? A rebuild on another lane leaves it set.
         self.settled = threading.Event()
         #: one lock per physical device, shared with every lane over that device
         self.locks = locks or (threading.RLock(),)
-        #: THE DEVICES, as a lock: held by the lane thread from an attempt's admission to its
-        #: device release, and by any model-bearing prepare on this lane. Residency arbitration
-        #: vacates co-tenants under it, so a tenant is never evicted while its own attempt
-        #: is on the card. Re-entrant because the lane thread rebuilds (prepares) inside
-        #: its own hold.
+        #: THE DEVICES, as a lock: held by an attempt from its admission to its device
+        #: release, and by any model-bearing prepare or rebuild on this lane. Residency
+        #: arbitration vacates co-tenants under it, so a tenant is never evicted while its
+        #: own attempt is on the card. Re-entrant because an attempt's own thread rebuilds
+        #: (prepares) inside its hold.
         self.device = Devices(self.locks)
 
     def __repr__(self) -> str:

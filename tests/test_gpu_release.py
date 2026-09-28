@@ -1,8 +1,8 @@
 """A request done with its GPUs hands them to the next one while it finishes its CPU work.
 
 Policy tests drive `GpuScheduler` alone. Worker tests use `test_gpu_scheduler.Machine`: a
-real Worker with four device entries, its durable journal and drive ticks; the release
-reaches it through the worker's own executor-exchange handler. The end-to-end test runs the
+real Worker with four device entries, its durable journal and its execution units; the
+release reaches it through the worker's own executor-exchange handler. The end-to-end test runs the
 workflow's Python in a real executor, so `ctx.release_gpus()` crosses the real seam. The only
 fake is the hardware memory seam, `accel.device_memory`.
 """
@@ -122,51 +122,15 @@ def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
         try:
             yield made
         finally:
-            made.worker.shutdown()
+            made.close()
 
 
 def _release(machine: Machine, root: str, ordinal: int = 1) -> dict[str, Any]:
     """`ctx.release_gpus()` as the root's executor sends it, through the worker's handler."""
-    attempt = AttemptRecord(root, ordinal, b"", {}, lane_id="orchestration", state="running")
+    attempt = AttemptRecord(
+        root, ordinal, b"", {}, lane_id="orchestration", state="running", machine=True
+    )
     return machine.worker.engine.durable_exchange(attempt, {"kind": "gpu_release"})
-
-
-def _running(machine: Machine, request: str) -> None:
-    selected = machine.executions.offer(OWNER, request)
-    accepted = pb.AttemptAccepted(
-        request_id=request,
-        attempt_ordinal=selected.attempt_ordinal,
-        invocation_spec_digest=selected.invocation_spec_digest,
-    )
-    machine.executions.workspace.mark_running(OWNER, accepted)
-    machine.executions.observe(OWNER, pb.WorkerFrame(attempt_accepted=accepted))
-
-
-def _executor_lost(machine: Machine, request: str) -> None:
-    """The attempt's executor died: a retryable outcome."""
-    selected = machine.executions.offer(OWNER, request)
-    body, digest = documents.identity(
-        pb.AttemptOutcomeBody(
-            request_id=request,
-            attempt_ordinal=selected.attempt_ordinal,
-            invocation_spec_digest=documents.spell(selected.invocation_spec_digest),
-            status=pb.OUTCOME_STATUS_ABANDONED,
-            cause=pb.OutcomeCause(
-                code=pb.CAUSE_CODE_EXECUTOR_INVALIDATED, origin=pb.CAUSE_ORIGIN_EXECUTOR
-            ),
-            safe_message="executor lost",
-        )
-    )
-    outcome = pb.AttemptOutcome(
-        request_id=request,
-        attempt_ordinal=selected.attempt_ordinal,
-        invocation_spec_digest=selected.invocation_spec_digest,
-        outcome_id=f"lost-{request}-{selected.attempt_ordinal}",
-        outcome_digest=digest,
-        outcome_canonical_bytes=body,
-    )
-    machine.executions.workspace.outcome(OWNER, outcome)
-    machine.executions.observe(OWNER, pb.WorkerFrame(attempt_outcome=outcome))
 
 
 def test_a_released_root_lets_the_next_root_start_while_its_python_runs(
@@ -213,18 +177,24 @@ def test_a_released_root_lets_the_next_root_start_while_its_python_runs(
     assert machine.granted(a2) == [0, 1, 2, 3]
 
 
-def test_a_serving_root_releases_its_gpus_at_device_exit(machine: Machine) -> None:
+def test_a_serving_root_releases_its_gpus_at_device_exit(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    downloaded = machine.hold_activations(monkeypatch)
     machine.serving("A", "h3")
     machine.root("B")
     b1 = machine.child("B", "qwen")
-    view = machine.tick()
+    machine.await_granted("A")
+    view = machine.worker.gpu.view()
     assert machine.granted("A") == [0, 1, 2, 3] and view["waiting"] == {b1 + "#1": ["A"]}
     # the lane's device exit (`Worker.run_lane`); A's encode and output transfer follow it
     machine.worker.gpu.release("A#1", ranks=[])
-    assert machine.worker.gpu.view()["leases"] == {}
+    # The same pass that ends A's lease grants B: no tick between them.
+    assert machine.worker.gpu.view()["leases"] == {"B": [0]}
     assert machine.worker.gpu_status("A").phase == "none"
-    machine.tick()
     assert machine.granted(b1) == [0]
+    downloaded.set()
+    machine.tick()
     leases = [body for _, kind, body in machine.journal("A") if kind == "gpu.lease"]
     assert leases == [
         {"ordinals": [0, 1, 2, 3], "cause": "granted A#1"},
@@ -232,42 +202,11 @@ def test_a_serving_root_releases_its_gpus_at_device_exit(machine: Machine) -> No
     ]
 
 
-def test_a_retried_root_starts_with_no_lease_and_holds_its_gaps_again(machine: Machine) -> None:
-    machine.submit(
-        "A",
-        pb.InvocationSpec(
-            job=pb.JobInvocationSpec(
-                installation_id="inst-root", job_descriptor_id="sha256:" + "12" * 32
-            )
-        ),
-        None,
-    )
-    with machine.executions.workspace.locked() as db:
-        db.execute("UPDATE executions SET max_attempts=2 WHERE owner=? AND request='A'", (OWNER,))
-    _running(machine, "A")
-    a1 = machine.child("A", "h3")
-    machine.tick()
-    machine.finish(a1)
-    machine.tick()
-    _release(machine, "A")
-    assert machine.tick()["leases"] == {}
-    _executor_lost(machine, "A")
-    machine.executions.retry_due(OWNER, worker_boot=machine.worker.fence.worker_boot_id)
-    _running(machine, "A")  # attempt 2 runs the workflow from its start
-    assert machine.executions.status(OWNER, "A").attempt_ordinal == 2
-    a2 = machine.child("A", "h3")
-    machine.root("B")
-    b1 = machine.child("B", "qwen")
-    machine.tick()
-    assert machine.granted(a2) == [0, 1, 2, 3]
-    machine.finish(a2)
-    view = machine.tick()
-    assert view["leases"] == {"A": [0, 1, 2, 3]} and b1 + "#1" in view["waiting"]
-
-
-def test_a_restarted_worker_forgets_the_release(
+def test_a_restarted_worker_fails_a_dispatched_root_and_frees_its_gpus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A root that was running when its worker went is never run again: the next worker
+    ends it FAILED, so its lease and its release are gone with it and B starts at once."""
     monkeypatch.setattr(accel, "device_memory", _measured)
     first = Machine(tmp_path, "0,1,2,3", "boot-release")
     try:
@@ -275,22 +214,19 @@ def test_a_restarted_worker_forgets_the_release(
         a1 = first.child("A", "h3")
         first.tick()
         first.finish(a1)
-        _release(first, "A")
-        assert first.tick()["leases"] == {}
+        assert first.tick()["leases"] == {"A": [0, 1, 2, 3]}
     finally:
-        first.worker.shutdown()
+        first.close()
     second = Machine(tmp_path, "0,1,2,3", "boot-release")
     try:
-        second.children = {"A": 0}
-        a2 = second.child("A", "h3")
         second.tick()
-        second.finish(a2)
+        assert second.executions.status(OWNER, "A").state == "failed"
         second.root("B")
         b1 = second.child("B", "qwen")
-        view = second.tick()
-        assert view["leases"] == {"A": [0, 1, 2, 3]} and b1 + "#1" in view["waiting"]
+        second.tick()
+        assert second.granted(b1) == [0]
     finally:
-        second.worker.shutdown()
+        second.close()
 
 
 # ------------------------------------------------------------------ a real executor

@@ -94,7 +94,7 @@ _SERVE_FLAGS: dict[str, str] = {
     "--executor-uid": "--executor-uid",
     "--executor-gid": "--executor-gid",
     "--threads": "--threads",
-    # Accepted and ignored: cancel escalation is measured (session.watchdog).
+    # Accepted and ignored: cancel escalation is measured (the attempt guard).
     "--grace": "--grace",
     # The REMOTE leg (cl-014 item 1): a non-loopback listener requires both, and the
     # worker refuses plaintext off-loopback. The bearer owner token arrives via

@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -39,9 +40,10 @@ from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker import activity
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import HostedPlacement, Placement, Worker, WorkerOptions
+from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
-from test_machine_execution import complete, offer
+from test_machine_execution import offer
 
 DRIVER = Path(podactivity_driver.__file__).resolve()
 #: The document the pod supervisor parses, byte for byte, in BOTH repositories. tensorhub
@@ -203,11 +205,16 @@ def test_active_work_excludes_connected_owners_and_retained_outcomes() -> None:
             assert published["owner_attached"] is True
             assert published["attempts_in_flight"] == 1
             assert published["active_work"] is False
-            # A retained outcome differs from real input preparation and the post phase.
-            for state in ("preparing", "running", "released"):
-                attempt.state = state
-                assert activity.active_work(worker)
-            attempt.state = "outcome"
+            # A retained outcome is not work; the attempt's own unit, while it lives, is.
+            done = threading.Event()
+            worker.supervisor.spawn("attempt:request#1", lambda unit: unit.wait_for(done.is_set))
+            assert activity.active_work(worker)
+            done.set()
+            worker.supervisor.poke("attempt:request#1")
+            bound = time.monotonic() + 60  # a hang bound, not a budget
+            while worker.supervisor.busy():
+                assert time.monotonic() < bound
+                time.sleep(0.01)
             with worker.preparation_lock:
                 assert activity.active_work(worker)
             assert not activity.active_work(worker)
@@ -248,87 +255,63 @@ def test_model_warmup_is_active_but_a_resident_model_is_idle() -> None:
             worker.shutdown()
 
 
-def _accepted(executions: Any, request: str, ordinal: int = 1) -> None:
-    executions.observe(
-        "owner",
-        pb.WorkerFrame(
-            attempt_accepted=pb.AttemptAccepted(request_id=request, attempt_ordinal=ordinal)
-        ),
-    )
+def test_an_execution_holds_the_rental_exactly_while_its_unit_lives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted work holds the rental while its own unit is alive: queued behind a
+    preparation, say. Once it is terminal (or paused) its unit leaves and the rental is
+    free, even while its output waits uncollected."""
+    preparing = threading.Event()
+    dispatch = Worker.dispatch_machine
 
+    def held(self: Worker, *args: Any) -> Any:
+        preparing.wait()
+        return dispatch(self, *args)
 
-def test_accepted_executions_are_active_until_terminal_and_paused_ones_are_not() -> None:
-    """A request queued behind running work holds the rental after that work ends and until
-    it ends itself; so does a running parent awaiting children, and cooperative stopping."""
+    monkeypatch.setattr(Worker, "dispatch_machine", held)
     with _short_tmp() as root:
         worker = Worker(
             _config(root / "home"),
             WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
             InMemoryControlHost(),
         )
+        claim = pb.Claim(
+            record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b""
+        )
         executions = worker.executions
         assert executions is not None
         try:
-            for request in ("first", "queued"):
+            worker.accept_claim(claim, lambda frame: None)
+            for request in ("queued", "paused"):
                 executions.submit(
                     "owner",
                     request,
                     b"c" * 32,
                     offer(request),
                     expected_execution_workspace_id=executions.workspace_id,
+                    worker_boot=worker.fence.worker_boot_id,
+                    worker_id=worker.options.worker_id,
                 )
-            assert activity.active_work(worker)  # accepted, not yet started
-            _accepted(executions, "first")
-            complete(executions, "first", {"finished": True})
-            assert executions.status("owner", "queued").state == "queued"
-            assert activity.active_work(worker)  # the queued request still holds the rental
-            _accepted(executions, "queued")
-            executions.control("owner", "queued", "pause", 1, "pause")
-            assert activity.active_work(worker)  # cooperative stopping is still work
-            executions.stop_queued("owner", "queued")
-            assert executions.status("owner", "queued").state == "paused"
-            assert not activity.active_work(worker)
-            executions.control("owner", "queued", "resume", 2, "resume")
-            _accepted(executions, "queued", 2)
-            assert activity.active_work(worker)
-            complete(executions, "queued", {"finished": True})
+            executions.control("owner", "paused", "pause", 1, "pause")
+            worker.execution("owner", "paused")
+            worker.execution("owner", "queued")
+            settle(lambda: executions.status("owner", "paused").state == "paused")
+            assert activity.active_work(worker)  # "queued" is still owed
+            preparing.set()
+            settle(lambda: not worker.supervisor.busy())
+            assert executions.status("owner", "queued").state == "failed"
             assert executions.retention_required("owner")  # uncollected output
             assert not activity.active_work(worker)
         finally:
+            preparing.set()
             worker.shutdown()
 
 
-def test_a_delayed_retry_holds_the_rental() -> None:
-    with _short_tmp() as root:
-        worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
-            InMemoryControlHost(),
-        )
-        executions = worker.executions
-        assert executions is not None
-        try:
-            executions.submit(
-                "owner",
-                "flaky",
-                b"c" * 32,
-                offer("flaky"),
-                max_attempts=2,
-                retry_delay_ms=3_600_000,
-                expected_execution_workspace_id=executions.workspace_id,
-            )
-            _accepted(executions, "flaky")
-            complete(
-                executions,
-                "flaky",
-                status=pb.OUTCOME_STATUS_FAILED,
-                cause=pb.CAUSE_CODE_EXECUTOR_FAULT,
-            )
-            executions.retry_due("owner")
-            assert executions.status("owner", "flaky").state == "retrying"
-            assert activity.active_work(worker)
-        finally:
-            worker.shutdown()
+def settle(ready: Any) -> None:
+    bound = time.monotonic() + 60  # a hang bound on a loaded box, not a budget
+    while not ready():
+        assert time.monotonic() < bound
+        time.sleep(0.01)
 
 
 def test_an_unreadable_meter_is_absent_and_never_a_zero(monkeypatch: pytest.MonkeyPatch) -> None:

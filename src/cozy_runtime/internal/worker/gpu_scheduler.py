@@ -1,13 +1,15 @@
 """GPU scheduling policy: one lease per root, exact device sets, level-triggered.
 
-Policy only, no I/O. Every drive tick passes the open roots with their durable priority
-and every demand not yet released from its device; anything missing is gone, so a hold
-cannot leak. A root's lease grows only from free ordinals and ends when the root stops or
-says it is done with GPUs (`release_root`, the author's `ctx.release_gpus()`; a root that is
-itself the GPU call is done at its device exit), so the Python gap between two children
-never lets another root in. Priority orders the waiters: the oldest waiter that cannot start
-reserves the free ordinals, so a younger narrow demand never starves it. Nothing is revoked,
-lent or preempted.
+Policy only, no I/O. Each pass takes the open roots with their durable priority and every
+demand not yet released from its device; anything missing is gone, so a hold cannot leak.
+`GpuBroker` runs one pass per change: units register their roots and demands and drop them
+when they end, and each new grant is handed to the unit that asked. A root's lease grows
+only from free ordinals and ends when the root stops or says it is done with GPUs
+(`release_root`, the author's `ctx.release_gpus()`; a root that is itself the GPU call is
+done at its device exit), so the Python gap between two children never lets another root
+in. Priority orders the waiters: the oldest waiter that cannot start reserves the free
+ordinals, so a younger narrow demand never starves it. Nothing is revoked, lent or
+preempted.
 """
 
 from __future__ import annotations
@@ -18,7 +20,13 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from cozy_runtime.internal.worker.supervisor import fault_text
+
 Ordinals = tuple[int, ...]
+#: A JSON-shaped fact: a journaled scheduling event's body, a status or view document.
+Document = dict[str, Any]
+#: (root, event kind, body): one observation to journal on its root.
+Event = tuple[str, str, Document]
 
 
 @dataclass(frozen=True)
@@ -68,7 +76,7 @@ class GpuScheduler:
         self.released: set[str] = set()
         #: roots done with GPUs -> why: their gap holds nothing until their next demand
         self.yielded: dict[str, str] = {}
-        self.events: list[tuple[str, str, dict[str, Any]]] = []
+        self.events: list[Event] = []
         self._arrival: dict[str, int] = {}
         self._counter = itertools.count()
 
@@ -156,7 +164,7 @@ class GpuScheduler:
         with self.lock:
             self._yield(root, cause)
 
-    def drain(self) -> list[tuple[str, str, dict[str, Any]]]:
+    def drain(self) -> list[Event]:
         """Observations since the last drain, for the caller to journal outside any lock."""
         with self.lock:
             events, self.events = self.events, []
@@ -180,14 +188,14 @@ class GpuScheduler:
             grant = self.grants.get(key)
             return grant[1] if grant is not None else None
 
-    def status(self, request: str, on_device: Callable[[str], bool]) -> dict[str, Any]:
+    def status(self, request: str, on_device: Callable[[str], bool]) -> Document:
         """One execution and, for a root, its calls: waiting, executing, granted, holding."""
         with self.lock:
 
             def mine(key: str, root: str) -> bool:
                 return root == request or key.rpartition("#")[0] == request
 
-            status: dict[str, Any] = {"phase": "none", "width": 0, "ordinals": [], "blocked_by": []}
+            status: Document = {"phase": "none", "width": 0, "ordinals": [], "blocked_by": []}
             for key, (root, width, blocked) in self.waiting.items():
                 if mine(key, root):
                     return {
@@ -208,7 +216,7 @@ class GpuScheduler:
                 return {**status, "phase": "holding", "ordinals": sorted(self.leases[request])}
             return status
 
-    def view(self) -> dict[str, Any]:
+    def view(self) -> Document:
         with self.lock:
             return {
                 "leases": {root: sorted(held) for root, held in self.leases.items()},
@@ -216,7 +224,7 @@ class GpuScheduler:
                 "waiting": {key: list(blocked) for key, (_, _, blocked) in self.waiting.items()},
             }
 
-    def _end(self, key: str, cause: str, facts: dict[str, Any] | None = None) -> None:
+    def _end(self, key: str, cause: str, facts: Document | None = None) -> None:
         root, ordinals = self.grants.pop(key)
         body = {"key": key, "ordinals": list(ordinals), "cause": cause, **(facts or {})}
         self.events.append((root, "gpu.release", body))
@@ -237,3 +245,110 @@ class GpuScheduler:
             self.leases[root] = ordinals
         else:
             self.leases.pop(root, None)
+
+
+@dataclass(frozen=True)
+class Want:
+    """One unit's standing GPU demand; warm ordinals and outside holders are read per pass."""
+
+    root: str
+    width: int
+    template: tuple[str, str] = ("", "")
+    exclude: Ordinals = ()  # ordinals it can never use (unreadable)
+
+
+Observed = Callable[[list[Event], dict[str, int], Document, dict[str, str]], None]
+
+
+class GpuBroker(GpuScheduler):
+    """The policy driven by changes instead of a tick.
+
+    Units register their root while its row is open and their demand until its attempt
+    leaves the device; each change runs one policy pass, pokes the units granted in it
+    (`granted_to`) and journals the pass (`observed`) in pass order. `outside()` is the set
+    of GPUs held by attempts no unit schedules (direct offers), read on every pass;
+    `warm(template)` the ordinals where that template is resident. A pass that raises
+    leaves grant state no one can trust: `fault` fails the worker.
+    """
+
+    def __init__(
+        self,
+        devices: int,
+        *,
+        granted_to: Callable[[str], None],
+        observed: Observed,
+        outside: Callable[[], set[int]],
+        warm: Callable[[tuple[str, str]], Ordinals],
+        fault: Callable[[str], None],
+    ) -> None:
+        super().__init__(devices)
+        self.granted_to, self.observed, self.outside, self.warm = (
+            granted_to,
+            observed,
+            outside,
+            warm,
+        )
+        self.fault = fault
+        self.changes = threading.Lock()
+        self.roots: dict[str, int] = {}
+        self.wants: dict[str, Want] = {}
+        self.delivered: set[str] = set()
+
+    def open_root(self, root: str, priority: int) -> None:
+        with self.changes:
+            if self.roots.get(root) == priority:
+                return
+            self.roots[root] = priority
+        self.resync()
+
+    def close_root(self, root: str) -> None:
+        with self.changes:
+            if self.roots.pop(root, None) is None:
+                return
+        self.resync()
+
+    def want(self, key: str, want: Want) -> None:
+        with self.changes:
+            if self.wants.get(key) == want:
+                return
+            self.wants[key] = want
+        self.resync()
+
+    def release(self, key: str, **facts: Any) -> None:
+        """The attempt left the device, or never reached it: its demand and grant end."""
+        super().release(key, **facts)
+        with self.changes:
+            self.wants.pop(key, None)
+        self.resync()
+
+    def release_root(self, root: str, cause: str = "released_by_root") -> None:
+        super().release_root(root, cause)
+        self.resync()
+
+    def resync(self) -> None:
+        with self.changes:
+            try:
+                outside = self.outside()
+                demands = [
+                    Demand(
+                        key,
+                        want.root,
+                        want.width,
+                        self.warm(want.template),
+                        tuple(sorted(outside | set(want.exclude))),
+                    )
+                    for key, want in self.wants.items()
+                ]
+                roots = dict(self.roots)
+                grants = self.sync(roots, demands)
+                fresh = [key for key in grants if key not in self.delivered]
+                self.delivered = set(grants)
+                installations = {
+                    key: self.wants[key].template[0] for key in grants if key in self.wants
+                }
+                self.observed(self.drain(), roots, self.view(), installations)
+            except Exception as exc:
+                self.fault(f"the GPU scheduling pass raised {fault_text(exc)}")
+                raise
+        for key in fresh:
+            self.granted_to(key)

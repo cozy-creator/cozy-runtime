@@ -111,7 +111,6 @@ def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: Jo
             worker.accepted.mode = "job"
         worker.set_job_ready(True)
         lane.settled.set()
-        worker._sync_lane_consumers()
         return True
     except BaseException:
         release(worker, request)
@@ -141,7 +140,6 @@ def release(worker: Worker, request: str, *, ordinal: int | None = None) -> None
         worker.job_slots.pop(slot_key, None)
         worker.lanes.composition.pop(slot_key, None)
         worker.lanes.by_id.pop(slot_key, None)
-        worker._sync_lane_consumers()
 
 
 def _memory_stalled() -> bool:

@@ -593,17 +593,19 @@ class Workspace:
         return None
 
     def mark_running(self, owner: str, accepted: pb.AttemptAccepted) -> None:
+        """Execution STARTS (a compare-and-set against every terminal recorded before it)."""
         with self.locked() as db:
-            db.execute(
+            if not db.execute(
                 "UPDATE attempts SET state='running' WHERE owner=? AND request=? "
-                "AND ordinal=? AND spec=? AND state='accepted' AND fenced=0",
+                "AND ordinal=? AND spec=? AND state='accepted' AND fenced=0 AND outcome=x''",
                 (
                     owner,
                     accepted.request_id,
                     accepted.attempt_ordinal,
                     accepted.invocation_spec_digest,
                 ),
-            )
+            ).rowcount:
+                raise WorkspaceRefusal("the attempt was stopped before dispatch")
 
     def recover(self, owner: str) -> None:
         """Recover dead process births without disturbing another live local worker.
@@ -898,13 +900,14 @@ class Workspace:
             ):
                 raise WorkspaceRefusal("outcome acknowledgment changed or revoked its subject")
             execution = db.execute(
-                "SELECT collected,desired FROM executions WHERE owner=? AND request=?",
+                "SELECT collected,desired,state FROM executions WHERE owner=? AND request=?",
                 (row["owner"], ack.request_id),
             ).fetchone()
-            if (
+            if (  # a failed execution holds no result: its hold ends at the next boot
                 execution is not None
                 and not execution["collected"]
                 and execution["desired"] != "cancel"
+                and execution["state"] != "failed"
                 and not ack.retain_work
             ):
                 raise WorkspaceRefusal("uncollected execution outcome must remain retained")

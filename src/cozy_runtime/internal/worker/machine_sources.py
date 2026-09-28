@@ -17,6 +17,7 @@ from . import (
     workspace_memo,
     workspace_sources,
 )
+from .supervisor import Unit
 from .workspace import Journal, WorkspaceRefusal
 from .workspace_calls import Call
 from .workspace_calls import Calls as JournalCalls
@@ -48,12 +49,23 @@ class Sources:
         self.selections: dict[str, pb.NativeSourceSelection] = {}
         # The owner's provider credentials per (owner, root execution), in memory only.
         self.credentials: dict[tuple[str, str], dict[pb.NativeSourceOperation, str]] = {}
+        #: service id -> the call unit waiting on it (a selection, a credential, its end)
+        self.waiting: dict[str, Unit] = {}
+
+    def poke(self, service_id: str) -> None:
+        with self.lock:
+            unit = self.waiting.get(service_id)
+        if unit is not None:
+            unit.poke()
 
     def hold(self, owner: str, request: str, given: Iterable[pb.SourceCredential]) -> None:
         values = {row.provider: row.credential for row in given if row.provider in PROVIDERS}
         if values:
             with self.lock:
                 self.credentials.setdefault((owner, request), {}).update(values)
+                waiting = list(self.waiting.values())
+            for unit in waiting:  # a call awaiting its root's credential runs now
+                unit.poke()
 
     def declare(self, owner: str, request: str) -> None:
         """Journal the providers this accepted execution holds a credential for."""
@@ -97,6 +109,7 @@ class Sources:
                 self.selections[status.service_id] = selected
             else:
                 self.selections.pop(status.service_id, None)
+        self.poke(status.service_id)
 
     def command(self, owner: str, request: pb.ChildCallRequest) -> pb.NativeSourceCommand:
 
@@ -111,39 +124,64 @@ class Sources:
         self.worker.stamp(command)
         return command
 
-    def drive(self, owner: str, call: Call, request: pb.ChildCallRequest) -> None:
+    def run(self, unit: Unit, owner: str, call: Call, request: pb.ChildCallRequest) -> None:
+        """One native source call on its own unit: resolve, then execute, each sent once,
+        until its native task ends. A provider call whose root's credential this process no
+        longer holds (a restart) waits for its owner to supply it again."""
         service, workspace = self.worker.source_calls, self.worker.workspace
         if service is None or workspace is None:
             raise WorkspaceRefusal("native source execution requires its retained workspace")
-        command = self.command(owner, request)
         if not call.prepared:
             JournalCalls(workspace).freeze(owner, call, canonical_json.encode({"kind": "source"}))
+        command = self.command(owner, request)
+        sent: set[int] = set()
+        with self.lock:
+            self.waiting[command.service_id] = unit
+        try:
+            while not self._settled(owner, command.service_id, request):
+                parent = self.worker.engine.live.get(call.parent_request)
+                if parent is None or parent.attempt != request.parent_attempt_ordinal:
+                    return  # its parent stopped: the parent's cancel stops the native task
+                command = self.command(owner, request)
+                if request.export in PROVIDER_EXPORTS:
+                    assert self.worker.executions is not None
+                    root = self.worker.executions.scheduling_root(owner, call.parent_request)[0]
+                    if command.operation in self.awaiting(owner, root):
+                        unit.wait()
+                        continue
+                    with self.lock:
+                        command.credential = self.credentials.get((owner, root), {}).get(
+                            command.operation, ""
+                        )
+                        selection = self.selections.get(command.service_id)
+                    if selection is None:
+                        command.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
+                    else:
+                        command.selection.CopyFrom(selection)
+                if command.phase not in sent:
+                    sent.add(command.phase)
+                    service.handle(command)
+                    continue
+                unit.wait()
+        finally:
+            with self.lock:
+                if self.waiting.get(command.service_id) is unit:
+                    del self.waiting[command.service_id]
+            self.worker.calls.wake(call.parent_request)
+
+    def _settled(self, owner: str, service_id: str, request: pb.ChildCallRequest) -> bool:
+        workspace = self.worker.workspace
+        assert workspace is not None
         with workspace.locked() as db:
             row = db.execute(
                 "SELECT state,parent_ordinal FROM native_calls WHERE owner=? AND service_id=?",
-                (owner, command.service_id),
+                (owner, service_id),
             ).fetchone()
-            if (
-                row is not None
-                and row["parent_ordinal"] == request.parent_attempt_ordinal
-                and row["state"] in ("complete", "failed", "stopped", "released", "releasing")
-            ):
-                return
-        if request.export in PROVIDER_EXPORTS:
-            assert self.worker.executions is not None
-            root = self.worker.executions.scheduling_root(owner, request.parent_request_id)[0]
-            if command.operation in self.awaiting(owner, root):
-                return  # the owner's credential is supplied again before this call runs
-            with self.lock:
-                command.credential = self.credentials.get((owner, root), {}).get(
-                    command.operation, ""
-                )
-                selection = self.selections.get(command.service_id)
-            if selection is None:
-                command.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
-            else:
-                command.selection.CopyFrom(selection)
-        service.handle(command)
+        return (
+            row is not None
+            and row["parent_ordinal"] == request.parent_attempt_ordinal
+            and row["state"] in ("complete", "failed", "stopped", "released", "releasing")
+        )
 
     def cancel(self, owner: str, request: pb.ChildCallRequest) -> None:
         if self.worker.source_calls is not None:

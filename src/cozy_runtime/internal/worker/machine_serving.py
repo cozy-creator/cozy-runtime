@@ -7,11 +7,11 @@ import contextlib
 import hashlib
 import time
 import uuid
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 
@@ -38,6 +38,7 @@ from . import (
 )
 from .machine_child_target import Target
 from .preparations import Preparations
+from .supervisor import Unit
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
 from .workspace_calls import Calls as JournalCalls
@@ -84,8 +85,9 @@ class Prepared:
 class Serving:
     def __init__(self, worker: Worker):
         self.worker = worker
-        self.preparations = Preparations[Prepared](MAX_ACTIVE_CALLS)
-        self.pending: dict[tuple[str, str], Future[Prepared]] = {}
+        self.preparations = Preparations[Prepared](MAX_ACTIVE_CALLS, changed=self._changed)
+        #: call units waiting for a free preparation entry; any completion pokes them
+        self.waiting: set[str] = set()
         # A preparation with no parent execution (a release root) reports here instead.
         self.observers: dict[str, Callable[[dict[str, Any]], None]] = {}
         # Read leases die with the old process, but durable temporary holds need
@@ -166,7 +168,11 @@ class Serving:
         owner = self.worker.fence.record_owner_id
         try:
             target = machine_child_target.resolve_export(
-                self.worker, parent, str(frame.get("module", "")), str(frame.get("export", ""))
+                self.worker,
+                parent,
+                str(frame.get("module", "")),
+                str(frame.get("export", "")),
+                wait=False,
             )
         except machine_builtin.Preparing:
             return {"ok": True, "scheduled": False}  # the callee installs on its call
@@ -206,33 +212,13 @@ class Serving:
             return {"ok": True, "scheduled": False}
         return {"ok": True, "scheduled": future is not None}
 
-    def sweep(self, owner: str) -> None:
-        def active(interest: Hashable) -> bool:
-            request_id, ordinal = cast(tuple[str, int], interest)
-            parent = self.worker.engine.live.get(request_id)
-            return bool(
-                parent is not None
-                and parent.attempt == ordinal
-                and parent.state == "running"
-                and not parent.canceling
-            )
+    def _changed(self) -> None:
+        for key in tuple(self.waiting):
+            self.worker.supervisor.poke(key)
 
-        self.preparations.retain(active)
-        workspace = self.worker.workspace
-        assert workspace is not None
-        for key, future in list(self.pending.items()):
-            if key[0] != owner or not future.done():
-                continue
-            with workspace.locked() as db:
-                row = db.execute(
-                    "SELECT e.desired FROM execution_calls c JOIN executions e "
-                    "ON e.owner=c.owner AND e.request=c.parent_request "
-                    "WHERE c.owner=? AND c.child_request=?",
-                    key,
-                ).fetchone()
-            if row is not None and row["desired"] != "run":
-                machine_models.release(workspace, owner, key[1])
-                self.pending.pop(key, None)
+    def forget(self, parent: str, ordinal: int) -> None:
+        """A parent attempt ended: the preparations only it wanted stop."""
+        self.preparations.retain(lambda interest: interest != (parent, ordinal))
 
     def _shared(
         self,
@@ -308,10 +294,13 @@ class Serving:
             stale=lambda prepared: prepared.generation != store_gc.generation,
         )
 
-    def drive(self, owner: str, call: Call, target: Target, request: pb.ChildCallRequest) -> None:
+    def submit(
+        self, unit: Unit, owner: str, call: Call, target: Target, request: pb.ChildCallRequest
+    ) -> bool:
+        """Wait for this call's shared preparation, then submit its serving child. True once
+        submitted; False when its parent stopped waiting first."""
         workspace, executions = self.worker.workspace, self.worker.executions
         assert workspace is not None and executions is not None
-        workspace_id = executions.workspace_id
         if target.declaration.get("invocable", {}).get("memoize"):
             raise WorkspaceRefusal("inference calls cannot enter the memo index")
         journal = JournalCalls(workspace)
@@ -329,20 +318,31 @@ class Serving:
                     }
                 ),
             )
-        key = owner, call.child_request
-        future = self.pending.get(key)
-        if future is None:
-            if len(self.pending) >= MAX_ACTIVE_CALLS:
-                return  # a later drive pass starts it once a preparation completes
-            _, models = arguments(target, request.request_canonical_bytes)
-            future = self._shared(owner, call, target, request, models, speculative=False)
-            if future is None:
-                return
-            self.pending[key] = future
-            # Admission continues on the drive pass its completion starts, not a later tick.
-            future.add_done_callback(lambda _: self.worker.drive_wake.set())
-        if not future.done():
-            return
+        _, models = arguments(target, request.request_canonical_bytes)
+
+        def waiting() -> bool:
+            parent = self.worker.engine.live.get(call.parent_request)
+            return (
+                parent is None
+                or parent.attempt != request.parent_attempt_ordinal
+                or parent.state != "running"
+                or bool(parent.canceling)
+            )
+
+        self.waiting.add(unit.key)
+        try:
+            # Every preparation entry is busy: the next one to finish pokes this unit.
+            while (
+                future := self._shared(owner, call, target, request, models, speculative=False)
+            ) is None:
+                if waiting():
+                    return False
+                unit.wait()
+        finally:
+            self.waiting.discard(unit.key)
+        future.add_done_callback(lambda _: unit.poke())
+        if not unit.wait_for(lambda: future.done() or waiting()) or not future.done():
+            return False
         prepared = None
         try:
             prepared = future.result()
@@ -373,7 +373,7 @@ class Serving:
                     "SELECT invocation FROM attempts WHERE owner=? AND request=? AND ordinal=?",
                     (owner, call.parent_request, request.parent_attempt_ordinal),
                 ).fetchone()
-            parent = documents.read(row["invocation"], pb.InvocationSpec)
+            parent = documents.parse(row["invocation"], pb.InvocationSpec)
             spec = pb.InvocationSpec(
                 installation_id=placement["installation_id"],
                 payload_digest=digest,
@@ -389,7 +389,7 @@ class Serving:
                     pb.OutputBinding(output_id=path, max_bytes=bound)
                     for path, bound in machine_byte_results.paths(target.declaration["result"])
                 ],
-                deadline_unix_ms=parent.get("deadline_unix_ms", 0),
+                deadline_unix_ms=parent.deadline_unix_ms,
                 serving=pb.ServingInvocationSpec(
                     entrypoint_binding_digest=selected["entrypoint_binding_digest"],
                     attempt_binding_id=selected["entrypoint_binding_digest"],
@@ -467,7 +467,6 @@ class Serving:
                 }
             )
             capture = canonical_json.encode(executions.capture(owner, call.parent_request))
-            attempts, delay = executions.retry_policy(owner, call.parent_request)
             machine_lanes.admit(self.worker, call.parent_request, preparation, offer)
             with (
                 self.phase(call, request, "Checking model inputs"),
@@ -490,19 +489,17 @@ class Serving:
                     call.child_request,
                     hashlib.sha256(capture).digest(),
                     offer,
-                    expected_execution_workspace_id=workspace_id,
+                    expected_execution_workspace_id=executions.workspace_id,
                     result_schema=canonical_json.encode(target.declaration["result"]),
                     worker_boot=self.worker.fence.worker_boot_id,
                     memoize=False,
                     preparation=preparation,
                     worker_id=self.worker.options.worker_id,
-                    max_attempts=attempts,
-                    retry_delay_ms=delay,
                 )
         finally:
             if prepared is not None:
                 prepared.access.close()
-            self.pending.pop(key, None)
+        return True
 
     def _prepare(
         self,

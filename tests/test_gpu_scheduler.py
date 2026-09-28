@@ -1,10 +1,13 @@
-"""GPU scheduling: the policy module, then the real Worker drive loop over a durable journal.
+"""GPU scheduling: the policy module, then the real Worker's execution units over a durable
+journal.
 
 Worker tests use a real `Worker` with four device entries, a real claim, real `Executions`
-and child-call journal rows, and real `drive_executions` ticks. Executors are never
-started (the convergence thread is not running), so a granted placement stays pending;
-what is asserted is the scheduler decision as the durable journal records it. The only
-fake is the hardware memory seam, `accel.device_memory`.
+and child-call journal rows, and each execution's own supervised unit. A root is held as a
+running attempt the test owns (its CPU parent "in Python"); a child's unit takes its grant
+and activates its replica, which, naming no installed package, refuses that child typed.
+What is asserted is the scheduler decision as the durable journal records it, once every
+unit has settled (`tick`: no unit has anything left to do). The only fake is the hardware
+memory seam, `accel.device_memory`.
 """
 
 from __future__ import annotations
@@ -15,10 +18,11 @@ import hashlib
 import os
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -40,7 +44,7 @@ from cozy_runtime.internal.worker.gpu_scheduler import (
 from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
-from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+from cozy_runtime.internal.worker.session import HostedPlacement, Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import TERMINAL
 from cozy_runtime.protocol import WIRE_MINOR, documents
@@ -287,6 +291,13 @@ class Machine:
         self.executions = self.worker.executions
         self.calls = self.worker.machine_calls
         self.children: dict[str, int] = {}
+        #: activations a test holds; teardown lets every one go before the worker stops
+        self.holds: list[threading.Event] = []
+
+    def close(self) -> None:
+        for held in self.holds:
+            held.set()
+        self.worker.shutdown()
 
     def submit(
         self,
@@ -295,6 +306,7 @@ class Machine:
         preparation: dict[str, Any] | None,
         placement: str = "",
         admit: bool = False,
+        held: bool = False,
     ) -> None:
         raw, digest = documents.identity(spec)
         offer = pb.AttemptOffer(
@@ -324,7 +336,10 @@ class Machine:
             expected_execution_workspace_id=self.executions.workspace_id,
             worker_boot=self.worker.fence.worker_boot_id,
             preparation=prepared,
+            worker_id=self.worker.options.worker_id,
         )
+        if not held:
+            self.worker.execution(OWNER, request)
 
     def root(self, name: str) -> None:
         """A CPU orchestration root, already running its Python."""
@@ -336,15 +351,15 @@ class Machine:
                 )
             ),
             None,
+            held=True,
         )
         selected = self.executions.offer(OWNER, name)
-        accepted = pb.AttemptAccepted(
-            request_id=name,
-            attempt_ordinal=1,
-            invocation_spec_digest=selected.invocation_spec_digest,
-        )
-        self.executions.workspace.mark_running(OWNER, accepted)
-        self.executions.observe(OWNER, pb.WorkerFrame(attempt_accepted=accepted))
+        self.executions.dispatched(OWNER, name, 1)
+        attempt = AttemptRecord(name, 1, selected.invocation_spec_digest, {}, state="running")
+        attempt.machine = True
+        self.worker.engine.history[attempt.key()] = attempt
+        self.worker.engine.live[name] = attempt
+        self.worker.execution(OWNER, name)
 
     def device_job(self, name: str) -> None:
         state = pb.DesiredWorkerState(
@@ -430,7 +445,9 @@ class Machine:
         (these templates name no installed package) was already refused typed."""
         if self.executions.status(OWNER, request).state in TERMINAL:
             return
-        selected = self.executions.offer(OWNER, request)
+        row = self.executions.row(OWNER, request)
+        assert row is not None
+        selected = row.attempt_offer()
         body, digest = documents.identity(
             pb.AttemptOutcomeBody(
                 request_id=request,
@@ -453,58 +470,97 @@ class Machine:
             outcome_canonical_bytes=body,
         )
         self.executions.workspace.outcome(OWNER, terminal)
-        self.executions.observe(OWNER, pb.WorkerFrame(attempt_outcome=terminal))
+        self.executions.reconcile(OWNER, request)
+        held = self.worker.engine.live.pop(request, None)
+        if held is not None:
+            held.state = "closed"
+        self.worker.execution(OWNER, request)
+        self.worker._capacity_changed()
+
+    def control(self, request: str, action: Literal["pause", "cancel"]) -> None:
+        state = self.executions.status(OWNER, request)
+        self.worker.control_execution(
+            self.claim, request, f"{action}-{request}", state.generation, action
+        )
 
     def warm(self) -> dict[str, tuple[int, int]]:
-        """Finish every pending replica's activation as a started executor would.
-
-        These templates name no installed package, so acquisition refused them; this binds
-        each to its grant through the worker's own `_assign_lane`, starts a real executor
-        process sealed to that lane, and makes it dispatchable. Returns placement ->
-        (executor epoch, pid)."""
-        for placement_id, hosted in self.worker.hosted.items():
-            if hosted.supervision.current is not None:
-                continue
-            kind = hosted.placement.installation_id.removeprefix("inst-")
-            degrees = (2, 4) if kind == "h3" else ()
-            binding = DeclaredBinding(
-                entrypoint_binding_digest="sha256:" + hashlib.sha256(kind.encode()).hexdigest(),
-                entrypoint="marco",
-                model_class="M",
-                model_binding_path="marco.models.model",
-                model_parameter_name="model",
-                release="r",
-                model_weight_bytes=GiB,
-                models=(
-                    WorkerSlot(
-                        *("M", "marco.models.model", "model", "", "", ""),
-                        components=("unet",),
-                        snapshots={},
-                        sequence_parallel_degrees=degrees,
-                    ),
-                ),
-            )
-            hosted.latched = ""
-            hosted.bindings = {binding.entrypoint_binding_digest: binding}
-            hosted.failed_bindings = {}
-            with self.worker.control_lock:
-                assert self.worker._assign_lane(
-                    hosted.placement, hosted.bindings, hosted.supervision
-                )
-            lane = self.worker._lane_of(placement_id)
-            hosted.supervision.spawn(imposed=self.worker.imposed(lane))
-            hosted.placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
-            hosted.placement.serving = pb.ServingState.SERVING_STATE_DISPATCHABLE
+        """Every replica's executor, started as an activated one would be."""
+        for hosted in list(self.worker.hosted.values()):
+            if hosted.supervision.current is None:
+                self.start(hosted)
         return self.executors()
+
+    def start(self, hosted: HostedPlacement) -> None:
+        """Activate one replica as a started executor would. These templates name no
+        installed package, so acquisition would refuse them; this binds it to its grant
+        through the worker's own `_assign_lane`, starts a real executor process sealed to
+        that lane, and makes it dispatchable."""
+        kind = hosted.placement.installation_id.removeprefix("inst-")
+        degrees = (2, 4) if kind == "h3" else ()
+        binding = DeclaredBinding(
+            entrypoint_binding_digest="sha256:" + hashlib.sha256(kind.encode()).hexdigest(),
+            entrypoint="marco",
+            model_class="M",
+            model_binding_path="marco.models.model",
+            model_parameter_name="model",
+            release="r",
+            model_weight_bytes=GiB,
+            models=(
+                WorkerSlot(
+                    *("M", "marco.models.model", "model", "", "", ""),
+                    components=("unet",),
+                    snapshots={},
+                    sequence_parallel_degrees=degrees,
+                ),
+            ),
+        )
+        hosted.latched = ""
+        hosted.bindings = {binding.entrypoint_binding_digest: binding}
+        hosted.failed_bindings = {}
+        with self.worker.control_lock:
+            assert self.worker._assign_lane(hosted.placement, hosted.bindings, hosted.supervision)
+        lane = self.worker._lane_of(hosted.placement.placement_id)
+        hosted.supervision.spawn(imposed=self.worker.imposed(lane))
+        hosted.placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+        hosted.placement.serving = pb.ServingState.SERVING_STATE_DISPATCHABLE
+        self.worker._settle()
+
+    def hold_activations(self, monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+        """Replica activations wait (their weights still downloading) until the returned
+        event is set: calls granted meanwhile hold their GPUs together."""
+        downloaded = threading.Event()
+        self.holds.append(downloaded)
+        activate = Worker._activate_replica
+
+        def downloading(worker: Worker, *args: Any) -> None:
+            downloaded.wait()
+            activate(worker, *args)
+
+        monkeypatch.setattr(Worker, "_activate_replica", downloading)
+        return downloaded
+
+    def await_granted(self, *requests: str) -> None:
+        bound = time.monotonic() + 120
+        while not all(self.granted(request) for request in requests):
+            assert time.monotonic() < bound
+            time.sleep(0.01)
+
+    def activate_warm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replicas activate as started executors (`start`) instead of acquiring a package."""
+        monkeypatch.setattr(
+            Worker, "_activate_hosted", lambda worker, hosted, revision: self.start(hosted)
+        )
 
     def executors(self) -> dict[str, tuple[int, int]]:
         live = {p: h.supervision.current for p, h in self.worker.hosted.items()}
         return {p: (e.epoch, e.pid) for p, e in live.items() if e is not None and e.alive()}
 
     def tick(self) -> dict[str, Any]:
-        self.worker.drive_executions()
-        for thread in list(self.worker._activating.values()):
-            thread.join()  # replica activation runs off the tick; settle it deterministically
+        """Every unit has done all it can: the scheduler's view, settled."""
+        bound = time.monotonic() + 120  # a hang bound on a loaded box, not a budget
+        while not self.worker.supervisor.quiet_now():
+            assert time.monotonic() < bound, self.worker.supervisor.keys("")
+            time.sleep(0.01)
         return self.worker.gpu.view()
 
     def journal(self, root: str) -> list[tuple[int, str, dict[str, Any]]]:
@@ -553,7 +609,7 @@ def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
         try:
             yield made
         finally:
-            made.worker.shutdown()
+            made.close()
 
 
 def test_an_older_root_holds_all_four_gpus_through_its_gap_and_b_starts_after(
@@ -593,11 +649,16 @@ def test_an_older_root_holds_all_four_gpus_through_its_gap_and_b_starts_after(
     assert b_grant_at >= a_release_at
 
 
-def test_three_reference_calls_fan_out_on_three_distinct_gpus(machine: Machine) -> None:
+def test_three_reference_calls_fan_out_on_three_distinct_gpus(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    downloaded = machine.hold_activations(monkeypatch)
     machine.root("C")
     references = [machine.child("C", "qwen") for _ in range(3)]
-    view = machine.tick()
+    machine.await_granted(*references)
     assert sorted(tuple(machine.granted(r)) for r in references) == [(0,), (1,), (2,)]
+    downloaded.set()
+    view = machine.tick()
     assert view["leases"] == {"C": [0, 1, 2]} and not view["waiting"]
     # the shot that follows the references takes one 4-rank group on the same root
     for reference in references:
@@ -634,28 +695,33 @@ def test_cancel_while_waiting_takes_no_grant_and_the_next_root_starts(machine: M
     b1 = machine.child("B", "h3")
     c1 = machine.child("C", "qwen")
     machine.tick()
-    state = machine.executions.status(OWNER, b1)
-    machine.executions.control(OWNER, b1, "cancel-b1", state.generation, "cancel")
+    machine.control(b1, "cancel")
     machine.tick()
     assert b1 + "#1" not in machine.worker.gpu.view()["waiting"] and machine.granted(b1) == []
-    state = machine.executions.status(OWNER, "A")
-    machine.executions.control(OWNER, "A", "cancel-a", state.generation, "cancel")
+    machine.control("A", "cancel")
     machine.finish(a1, pb.OUTCOME_STATUS_CANCELED)
+    machine.finish("A", pb.OUTCOME_STATUS_CANCELED)
     machine.tick()
     assert machine.granted(c1) == [0]
 
 
-def test_a_submitted_exact_width_is_the_group_and_leaves_the_rest_free(machine: Machine) -> None:
+def test_a_submitted_exact_width_is_the_group_and_leaves_the_rest_free(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """An explicit model GPU count reaches Runtime as `execution_gpus`: 2 of 4 GPUs is a
     2-GPU group, never the widest declared degree, and a count no slot declares or the
     machine cannot form is refused typed."""
+    downloaded = machine.hold_activations(monkeypatch)
     machine.serving("A", "h3", gpus=2)
     machine.serving("B", "h3", gpus=2)
     machine.serving("C", "h3", gpus=3)
     machine.serving("D", "h3", gpus=8)
-    view = machine.tick()
+    machine.await_granted("A", "B")
     assert machine.granted("A") == [0, 1] and machine.granted("B") == [2, 3]
+    view = machine.worker.gpu.view()
     assert view["leases"] == {"A": [0, 1], "B": [2, 3]} and not view["waiting"]
+    downloaded.set()
+    machine.tick()
     for refused, gpus in (("C", 3), ("D", 8)):
         assert machine.executions.status(OWNER, refused).state == "failed"
         outcome = machine.executions.collect(OWNER, refused).outcome_canonical_bytes
@@ -667,7 +733,7 @@ def test_work_this_machine_can_never_run_is_refused_at_admission(machine: Machin
     """Never journaled, so it never queues and never holds the rental; runnable work is
     accepted through the same intake."""
     machine.serving("A", "h3", gpus=2, admit=True)
-    assert machine.executions.status(OWNER, "A").state == "queued"
+    assert machine.executions.owns(OWNER, "A")
     for request, gpus in (("C", 3), ("D", 8)):
         with pytest.raises(WorkspaceRefusal, match=f"gpu_count_unavailable: exactly {gpus} GPUs"):
             machine.serving(request, "h3", gpus=gpus, admit=True)
@@ -704,51 +770,21 @@ def test_a_gpu_call_from_a_gpu_holder_is_refused_typed(machine: Machine) -> None
     assert "nested_gpu_call" in body["safe_message"]
 
 
-def test_a_restarted_worker_orders_by_durable_root_priority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        accel,
-        "device_memory",
-        lambda entry, kind: accel.DeviceMemory("measured", 80 * GiB, 80 * GiB),
-    )
-    first = Machine(tmp_path, "0,1,2,3", "boot-guarded")
-    try:
-        first.root("A")
-        first.root("B")
-        b1 = first.child("B", "h3")
-        first.tick()
-        assert first.granted(b1) == [0, 1, 2, 3]
-    finally:
-        first.worker.shutdown()
-    second = Machine(tmp_path, "0,1,2,3", "boot-guarded")
-    try:
-        second.children = {"A": -1, "B": 0}
-        a1 = second.child("A", "h3")
-        view = second.tick()
-        assert list(view["grants"]) == [a1 + "#1"]  # A was accepted first; nothing replayed
-        assert view["waiting"] == {b1 + "#1": ["A"]}
-    finally:
-        second.worker.shutdown()
-
-
 def test_sibling_replicas_activate_together_and_a_failure_refuses_only_its_call(
-    machine: Machine,
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    downloaded = machine.hold_activations(monkeypatch)
     machine.root("C")
     references = [machine.child("C", "qwen") for _ in range(3)]
+    machine.await_granted(*references)
+    downloaded.set()
     machine.tick()
-    replicas = [p for p in machine.worker.hosted if p.startswith("machine-")]
-    # D7: all three bind in one tick, beside each other, without a desired-state revision
-    assert sorted(machine.worker.hosted[p].placement.device_pin or () for p in replicas) == [
-        (0,),
-        (1,),
-        (2,),
-    ]
+    # D7: all three are granted and activate beside each other, on their own units, without
+    # a desired-state revision.
+    assert sorted(tuple(machine.granted(r)) for r in references) == [(0,), (1,), (2,)]
     assert machine.worker.accepted.accepted_desired_state_revision == 0
     # These templates name no installed package: each activation fails typed, on its own,
     # and refuses only its own call; the root keeps its lease for its next call.
-    machine.tick()
     for reference in references:
         body = documents.read(
             machine.executions.collect(OWNER, reference).outcome_canonical_bytes,
@@ -759,19 +795,32 @@ def test_sibling_replicas_activate_together_and_a_failure_refuses_only_its_call(
     assert view["leases"] == {"C": [0, 1, 2]} and not machine.worker.hosted
 
 
-def test_machine_execution_state_reports_the_gpu_phase(machine: Machine) -> None:
+def test_machine_execution_state_reports_the_gpu_phase(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """T11: `MachineExecutionState.gpu` as Creator reads it, at each transition."""
     rpc = MachineExecutionRPC(machine.worker)
 
     def gpu(request: str) -> pb.MachineExecutionGpu:
         return rpc._state(machine.executions.status(OWNER, request)).gpu
 
+    downloaded = threading.Event()
+    activate = Worker._activate_replica
+
+    def downloading(self: Worker, *args: Any) -> None:
+        downloaded.wait()  # the replica's weights arrive when the test says so
+        activate(self, *args)
+
+    monkeypatch.setattr(Worker, "_activate_replica", downloading)
     machine.root("A")
     machine.root("B")
     assert gpu("A").phase == "none"
     a1 = machine.child("A", "h3")
     b1 = machine.child("B", "h3")
-    machine.worker.drive_executions()  # granted, its replica not yet on the device
+    bound = time.monotonic() + 120
+    while gpu("A").phase != "granted":  # granted, its replica not yet on the device
+        assert time.monotonic() < bound
+        time.sleep(0.01)
     assert (gpu("A").phase, list(gpu("A").ordinals)) == ("granted", [0, 1, 2, 3])
     assert gpu(a1).phase == "granted" and gpu(a1).width == 4
     waiting = gpu("B")
@@ -781,12 +830,15 @@ def test_machine_execution_state_reports_the_gpu_phase(machine: Machine) -> None
     machine.worker.engine.live[a1] = entered
     assert gpu("A").phase == "executing"
     del machine.worker.engine.live[a1]
-    machine.finish(a1)
+    downloaded.set()  # its replica (no installed package) refuses it: the grant goes
     machine.tick()
     assert (gpu("A").phase, list(gpu("A").ordinals)) == ("holding", [0, 1, 2, 3])
+    downloaded.clear()
     machine.finish("A")
-    machine.tick()
+    machine.await_granted(b1)
     assert gpu("B").phase == "granted"
+    downloaded.set()
+    machine.tick()
 
 
 needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
@@ -794,12 +846,16 @@ needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 
 @needs_executor
 def test_consecutive_roots_of_different_widths_reuse_every_warm_executor(
-    machine: Machine,
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """References at width 1, then a 4-rank shot, twice: the group and the singletons stay
     resident beside each other, and the second root spawns and retires nothing."""
+    machine.activate_warm(monkeypatch)
+    downloaded = machine.hold_activations(monkeypatch)
     machine.root("A")
     references = [machine.child("A", "qwen") for _ in range(3)]
+    machine.await_granted(*references)
+    downloaded.set()
     machine.tick()
     qwen = machine.warm()
     assert len(qwen) == 3
@@ -818,29 +874,33 @@ def test_consecutive_roots_of_different_widths_reuse_every_warm_executor(
     }
     assert degrees == {(), (2, 4)}
     assert sorted(lanes_of.values()) == ["lane-0", "lane-0+1+2+3", "lane-1", "lane-2"]
-    epoch, started = machine.worker.admission_epoch, dict(machine.worker._activating)
+    epoch = machine.worker.admission_epoch
     machine.finish(shot)
     machine.finish("A")
     machine.root("B")
     references = [machine.child("B", "qwen") for _ in range(3)]
     machine.tick()
-    assert sorted(tuple(machine.granted(r)) for r in references) == [(0,), (1,), (2,)]
+    # Each call is granted a card its warm replica already holds (warm-first).
+    assert all(tuple(machine.granted(r)) in {(0,), (1,), (2,)} for r in references)
     for reference in references:
         machine.finish(reference)
     shot = machine.child("B", "h3")
     machine.tick()
     assert machine.granted(shot) == [0, 1, 2, 3]
-    assert machine.worker._activating == started, "every grant found its replica started"
+    assert not machine.worker._activating, "every grant found its replica started"
     assert machine.executors() == warm, "no executor was spawned, replaced or retired"
     assert {p: machine.worker._lane_of(p).lane_id for p in warm} == lanes_of
     assert machine.worker.admission_epoch == epoch
 
 
 @needs_executor
-def test_memory_pressure_vacates_idle_co_tenants_and_kills_none(machine: Machine) -> None:
+def test_memory_pressure_vacates_idle_co_tenants_and_kills_none(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The arbiter frees the tightest device of the tenant that needs room, LRU-first:
     only co-tenants on that device are asked, their processes stay, and the caller is
     never its own victim."""
+    machine.activate_warm(monkeypatch)
     machine.root("A")
     references = [machine.child("A", "qwen") for _ in range(3)]
     machine.tick()

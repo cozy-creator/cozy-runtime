@@ -21,8 +21,10 @@ class _Entry[T]:
 class Preparations[T]:
     """One future per immutable selection; demand promotes an already queued hint."""
 
-    def __init__(self, maximum: int = 32):
+    def __init__(self, maximum: int = 32, changed: Callable[[], None] = lambda: None):
         self.maximum = maximum
+        #: told whenever an entry finishes or goes, so a request refused for room retries
+        self.changed = changed
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="machine-prepare")
         self.lock = threading.RLock()
         self.entries: dict[Hashable, _Entry[T]] = {}
@@ -117,6 +119,7 @@ class Preparations[T]:
         finally:
             with self.lock:
                 self._schedule()
+            self.changed()
 
     def close(self) -> None:
         with self.lock:

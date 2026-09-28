@@ -1,11 +1,12 @@
 """Publication absence refuses before a send, without polluting another call."""
 
-import time
+import threading
 from pathlib import Path
 
 from cozy_runtime.internal import effect_interfaces
 from cozy_runtime.internal.worker.machine_effects import Effects
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
+from cozy_runtime.internal.worker.supervisor import Unit
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
@@ -24,19 +25,15 @@ def test_ungranted_effect_is_durably_refused_without_external_send(tmp_path: Pat
         expected_execution_workspace_id=executions.workspace_id,
     )
     calls = Calls(workspace)
-    calls.accept("owner", request(running(executions), module=effect_interfaces.MODULE))
+    call = calls.accept("owner", request(running(executions), module=effect_interfaces.MODULE))
     effects = Effects(workspace, executions, None)
     try:
-        until = time.monotonic() + 5
-        while not calls.get("owner", "parent", 0).safe_code:
-            effects.drive("owner")
-            assert time.monotonic() < until
-            time.sleep(0.01)
+        effects.run(Unit("effect", threading.Event()), "owner", call)  # settles at once
         value = calls.get("owner", "parent", 0)
         assert value.safe_code == "publication.authority_absent"
         assert not value.sent and not value.result
         assert not calls.has_unsettled_effects("owner", "parent")
-        assert not calls.pending_effects("another-owner")
+        assert not calls.unsettled_effects("owner")
     finally:
         effects.close()
 
@@ -59,16 +56,14 @@ def test_failed_effect_remains_reconcilable_after_parent_stops(tmp_path: Path) -
     failed = calls.get("owner", "parent", 0)
     assert failed.safe_code == "publication.outcome_unknown"
     assert calls.has_unsettled_effects("owner", "parent")
-    assert calls.pending_effects("owner") == [failed]
+    assert calls.unsettled_effects("owner") == [failed.child_request]
     calls.complete("owner", call, b'{"revision":1}')
     observed = calls.get("owner", "parent", 0)
     assert observed.result and not observed.safe_code
     assert not calls.has_unsettled_effects("owner", "parent")
 
 
-def test_invalid_worker_authority_is_visible_and_background_threads_are_pollers(
-    tmp_path: Path,
-) -> None:
+def test_invalid_worker_authority_is_visible(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
     executions.submit(
@@ -79,9 +74,8 @@ def test_invalid_worker_authority_is_visible_and_background_threads_are_pollers(
         publication_authorization_id="019aaaab-0000-7000-8000-000000000003",
         expected_execution_workspace_id=executions.workspace_id,
     )
-    call = request(running(executions), module=effect_interfaces.MODULE)
     calls = Calls(workspace)
-    calls.accept("owner", call)
+    call = calls.accept("owner", request(running(executions), module=effect_interfaces.MODULE))
     effects = Effects(
         workspace,
         executions,
@@ -92,15 +86,9 @@ def test_invalid_worker_authority_is_visible_and_background_threads_are_pollers(
         ),
     )
     try:
-        until = time.monotonic() + 5
-        while not calls.get("owner", "parent", 0).safe_code:
-            effects.drive("owner")
-            assert time.monotonic() < until
-            time.sleep(0.01)
+        effects.run(Unit("effect", threading.Event()), "owner", call)  # settles at once
         observed = calls.get("owner", "parent", 0)
         assert observed.safe_code == "publication.worker_authority_invalid"
         assert not observed.sent and not observed.result
-        assert effects.pollers
     finally:
         effects.close()
-    assert not effects.pollers

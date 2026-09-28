@@ -502,9 +502,22 @@ def stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Sta
 
 
 def drive(effects: Effects, done: Callable[[], bool]) -> None:
+    """Try every owed effect once per pass, as its unit does between its backoff waits,
+    and release what settled effects held, until `done`: the rule counts tries, not time."""
     deadline = time.monotonic() + 60
     while not done():
-        effects.drive("owner")
+        with effects.workspace.locked() as db:
+            rows = db.execute(
+                "SELECT parent_request,call_index FROM execution_calls WHERE owner='owner' "
+                "AND json_extract(CAST(intent AS TEXT),'$.module')=?",
+                (effect_interfaces.MODULE,),
+            ).fetchall()
+        for parent, index in rows:
+            call = effects.journal.get("owner", parent, index)
+            if not call.result and (not call.safe_code or call.sent):
+                with contextlib.suppress(Exception):
+                    effects._run("owner", call)
+            effects._release("owner", effects.journal.get("owner", parent, index))
         assert time.monotonic() < deadline, "effect did not settle"
         time.sleep(0.02)
 
@@ -805,14 +818,7 @@ def test_sent_upload_settles_once_restaging_stops_landing_objects(
     staged, hub, effects = stage
     hub.lose_finalize = True
     operation = staged.call().child_request
-    deadline = time.monotonic() + 60
-    while not staged.call().safe_code:
-        # The rule counts attempts, not time: skip each backoff's wait.
-        with effects.lock:
-            effects.retry_after.clear()
-        effects.drive("owner")
-        assert time.monotonic() < deadline, "effect did not settle"
-        time.sleep(0.02)
+    drive(effects, lambda: bool(staged.call().safe_code))
     call = staged.call()
     assert call.safe_code == "publication.control_transport_unavailable"
     assert call.safe_detail == "publication commit did not land"

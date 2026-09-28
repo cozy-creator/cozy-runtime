@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+import msgspec
+
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker.machine_publication import PublicationRefusal, output_destination
 from cozy_runtime.internal.worker.workspace import Journal, Row, Workspace, WorkspaceRefusal
@@ -31,7 +33,6 @@ CREATE TABLE executions (
  state TEXT NOT NULL, desired TEXT NOT NULL DEFAULT 'run',
  collected INTEGER NOT NULL DEFAULT 0, sequence INTEGER NOT NULL DEFAULT 0,
  compacted_through INTEGER NOT NULL DEFAULT 0,
- max_attempts INTEGER NOT NULL DEFAULT 1, retry_delay_ms INTEGER NOT NULL DEFAULT 0,
  finished_ms INTEGER NOT NULL DEFAULT 0,
  capture_document BLOB NOT NULL DEFAULT x'', preparation BLOB NOT NULL DEFAULT x'',
  worker_id TEXT NOT NULL DEFAULT '', accepted_boot TEXT NOT NULL DEFAULT '',
@@ -56,14 +57,19 @@ MAX_EVENT_BYTES = 64 << 10
 MAX_PAGE = 256
 MAX_PAGE_BYTES = 256 << 10
 TERMINAL = frozenset({"succeeded", "failed", "paused", "canceled"})
-#: Accepted and not terminal, delayed retries included: work this machine still owes.
-OPEN = "('queued','running','pausing','canceling','retrying')"
+#: Accepted and not terminal: work this machine still owes.
+OPEN = "('queued','running','pausing','canceling')"
 
 
 class StaleExecutionGeneration(WorkspaceRefusal):
     """A rejected command, distinct from a lost reply to an accepted command."""
 
     code = "execution_generation_stale"
+
+
+class ExecutionChanged(WorkspaceRefusal):
+    """The row moved under a writer's feet (a control, a stop, a dispatch): re-read and act
+    again. A fence, never a failure of the execution."""
 
 
 class ExecutionWorkspaceRefusal(WorkspaceRefusal):
@@ -107,6 +113,33 @@ class State:
         }
 
 
+class ExecutionRow(msgspec.Struct, frozen=True):
+    """One `executions` row as the supervision logic reads it, decoded once."""
+
+    request: str
+    ordinal: int
+    generation: int
+    state: str
+    desired: str
+    collected: bool
+    retention_waived: bool
+    #: the durable acceptance order (rowid): a root's GPU priority
+    priority: int
+    offer: bytes
+    preparation: bytes
+    #: its current attempt reached an executor (the dispatch mark)
+    dispatched: bool
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in TERMINAL
+
+    def attempt_offer(self) -> pb.AttemptOffer:
+        offer = pb.AttemptOffer.FromString(self.offer)
+        offer.attempt_ordinal = self.ordinal
+        return offer
+
+
 @dataclass(frozen=True)
 class Event:
     sequence: int
@@ -140,6 +173,27 @@ def _id(value: str) -> None:
         raise WorkspaceRefusal("execution identity must be a bounded opaque ID")
 
 
+def _lost_before_dispatch(db: Journal, row: Row, body: pb.AttemptOutcomeBody) -> bool:
+    """The Runtime process died before dispatching this attempt (`recover`'s INFRA
+    outcome) and no earlier attempt of the execution was lost the same way."""
+    if (
+        row["desired"] != "run"
+        or body.execution_started
+        or body.status != pb.OUTCOME_STATUS_ABANDONED
+        or body.cause.origin != pb.CAUSE_ORIGIN_INFRA
+    ):
+        return False
+    earlier = db.execute(
+        "SELECT outcome FROM attempts WHERE owner=? AND request=? AND ordinal<? AND outcome<>x''",
+        (row["owner"], row["request"], row["ordinal"]),
+    ).fetchall()
+    return not any(
+        documents.parse(prior["outcome"], pb.AttemptOutcomeBody).cause.origin
+        == pb.CAUSE_ORIGIN_INFRA
+        for prior in earlier
+    )
+
+
 def destination_of(offer: pb.AttemptOffer) -> str:
     """The repository a root's weights outputs publish to, as its owner granted it."""
     try:
@@ -161,8 +215,9 @@ class Executions:
     def __init__(self, workspace: Workspace, *, clock_ms: Callable[[], int] | None = None):
         self.workspace = workspace
         self.clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
-        #: told each non-log event's kind as it is journaled; must not block or take locks
-        self.changed: Callable[[str], None] = lambda kind: None
+        #: told (request, kind) of each non-log event as it is journaled, inside its
+        #: transaction: it must not block, take locks or read the journal
+        self.changed: Callable[[str, str], None] = lambda request, kind: None
 
     @property
     def workspace_id(self) -> str:
@@ -275,7 +330,7 @@ class Executions:
             (row["owner"], row["request"], sequence, row["ordinal"], at, kind, body),
         )
         if kind != "log":
-            self.changed(kind)
+            self.changed(row["request"], kind)
         # Only live progress is lossy. Control, outcomes and authored log records remain.
         if kind == "progress":
             obsolete = db.execute(
@@ -308,8 +363,6 @@ class Executions:
         result_schema: bytes = b"",
         worker_boot: str = "",
         memoize: bool = False,
-        max_attempts: int = 1,
-        retry_delay_ms: int = 0,
         capture_document: bytes = b"",
         preparation: bytes = b"",
         worker_id: str = "",
@@ -328,12 +381,12 @@ class Executions:
                 valid = False
             if not valid:
                 raise WorkspaceRefusal("publication authorization must be a canonical nonzero UUID")
-        if not 1 <= max_attempts <= 100 or not 0 <= retry_delay_ms <= 86_400_000:
-            raise WorkspaceRefusal("execution retry policy exceeds its bound")
         self.workspace.validate_offer(offer)
         if destination_of(offer) and (
             not publication_authorization_id
-            or "job" not in documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+            or not documents.parse(
+                offer.invocation_spec_canonical_bytes, pb.InvocationSpec
+            ).HasField("job")
         ):
             raise WorkspaceRefusal(
                 "an output destination needs a job root with publication authority"
@@ -355,8 +408,6 @@ class Executions:
                     row["request"],
                     row["capture"],
                     row["offer"],
-                    row["max_attempts"],
-                    row["retry_delay_ms"],
                     row["capture_document"],
                     row["preparation"],
                     row["publication_authorization_id"],
@@ -365,8 +416,6 @@ class Executions:
                     offer.request_id,
                     capture_digest,
                     raw,
-                    max_attempts,
-                    retry_delay_ms,
                     capture_document,
                     preparation,
                     publication_authorization_id,
@@ -392,10 +441,10 @@ class Executions:
             )
             db.execute(
                 "INSERT INTO executions(owner,request,submission,capture,offer,accepted_ms,"
-                "ordinal,generation,state,max_attempts,retry_delay_ms,"
+                "ordinal,generation,state,"
                 "capture_document,preparation,worker_id,accepted_boot,"
                 "publication_authorization_id,owner_memo) "
-                "VALUES(?,?,?,?,?,?,1,1,'queued',?,?,?,?,?,?,?,?)",
+                "VALUES(?,?,?,?,?,?,1,1,'queued',?,?,?,?,?,?)",
                 (
                     owner,
                     offer.request_id,
@@ -403,8 +452,6 @@ class Executions:
                     capture_digest,
                     raw,
                     self.clock_ms(),
-                    max_attempts,
-                    retry_delay_ms,
                     capture_document,
                     preparation,
                     worker_id,
@@ -452,19 +499,60 @@ class Executions:
                 is not None
             )
 
-    def pending(self, owner: str) -> tuple[str, ...]:
-        """Stable admission order; the existing Worker chooses each request's lane."""
+    def row(self, owner: str, request: str) -> ExecutionRow | None:
+        with self.workspace.locked() as db:
+            row = db.execute(
+                "SELECT e.rowid,e.*,a.state AS attempt_state FROM executions e "
+                "LEFT JOIN attempts a "
+                "ON a.owner=e.owner AND a.request=e.request AND a.ordinal=e.ordinal "
+                "WHERE e.owner=? AND e.request=?",
+                (owner, request),
+            ).fetchone()
+        if row is None:
+            return None
+        return ExecutionRow(
+            request=row["request"],
+            ordinal=row["ordinal"],
+            generation=row["generation"],
+            state=row["state"],
+            desired=row["desired"],
+            collected=bool(row["collected"]),
+            retention_waived=bool(row["retention_waived"]),
+            priority=row["rowid"],
+            offer=row["offer"],
+            preparation=row["preparation"],
+            dispatched=row["attempt_state"] == "running",
+        )
+
+    def owed(self, owner: str, worker_id: str) -> tuple[str, ...]:
+        """Every execution this worker still owes work: open, or canceled and still
+        retaining custody that its release must end. Boot reconcile gives each a unit."""
         Workspace.owner(owner)
         with self.workspace.locked() as db:
             return tuple(
                 row[0]
                 for row in db.execute(
-                    "SELECT request FROM executions WHERE owner=? "
+                    "SELECT request FROM executions WHERE owner=? AND worker_id=? "
                     f"AND (state IN {OPEN} "
                     "OR (desired='cancel' AND retention_waived=0)) "
-                    "ORDER BY accepted_ms,request",
-                    (owner,),
+                    "ORDER BY rowid",
+                    (owner, worker_id),
                 )
+            )
+
+    def held(self, owner: str, worker_id: str) -> tuple[str, ...]:
+        """Terminal executions whose retention a boot releases."""
+        Workspace.owner(owner)
+        with self.workspace.locked() as db:
+            return tuple(
+                row["request"]
+                for row in db.execute(
+                    "SELECT * FROM executions WHERE owner=? AND worker_id=? "
+                    f"AND state IN {tuple(sorted(TERMINAL))} AND retention_waived=0 "
+                    "ORDER BY rowid",
+                    (owner, worker_id),
+                )
+                if row["desired"] == "cancel" or _released_at_boot(row)
             )
 
     def scheduling_root(self, owner: str, request: str) -> tuple[str, str]:
@@ -483,20 +571,6 @@ class Executions:
                 request = parent[0]
         raise WorkspaceRefusal("execution has no bounded scheduling ancestry")
 
-    def scheduling_roots(self, owner: str) -> dict[str, int]:
-        """Open roots and their priority: the durable, monotonic acceptance order."""
-        with self.workspace.locked() as db:
-            return {
-                row["request"]: row["rowid"]
-                for row in db.execute(
-                    "SELECT e.rowid,e.request FROM executions e WHERE e.owner=? "
-                    "AND e.desired='run' AND e.state IN ('queued','running') "
-                    "AND NOT EXISTS(SELECT 1 FROM execution_calls c "
-                    "WHERE c.owner=e.owner AND c.child_request=e.request)",
-                    (owner,),
-                )
-            }
-
     def record(self, owner: str, request: str, kind: str, document: dict[str, Any]) -> None:
         """Journal one bounded worker observation on an execution, terminal or not."""
         with self.workspace.locked() as db, transaction(db):
@@ -510,17 +584,6 @@ class Executions:
                     (owner,),
                 ).fetchone()
                 is not None
-            )
-
-    def active_count(self) -> int:
-        """Every accepted, non-terminal execution, with or without a connected observer.
-
-        Each one holds the rental: queued behind other work, awaiting a delayed retry,
-        running or stopping. Work this machine can never run is refused at admission.
-        """
-        with self.workspace.locked(allow_frozen=True) as db:
-            return int(
-                db.execute(f"SELECT count(*) FROM executions WHERE state IN {OPEN}").fetchone()[0]
             )
 
     def retained_installations(self) -> set[str]:
@@ -568,13 +631,6 @@ class Executions:
                 worker_boot,
             )
 
-    def retry_policy(self, owner: str, request: str) -> tuple[int, int]:
-        """Local descendants inherit the root's accepted automatic retry limits."""
-        root = self.capture_root(owner, request)
-        with self.workspace.locked() as db:
-            row = self._row(db, owner, root)
-            return row["max_attempts"], row["retry_delay_ms"]
-
     def capture(self, owner: str, request: str) -> dict[str, Any]:
         root = self.capture_root(owner, request)
         with self.workspace.locked() as db:
@@ -598,17 +654,19 @@ class Executions:
                 request = parent[0]
         raise WorkspaceRefusal("execution has no bounded original capture ancestry")
 
-    def abandon(self, owner: str, request: str) -> bool:
-        """Relinquish this stopped root through existing native release operations."""
+    def release(self, owner: str, request: str, *, boot: bool = False) -> bool:
+        """Relinquish what this terminal root retains through the native release operations,
+        once no effect of it is in doubt: when it is canceled, and at `boot` also when it is
+        collected or failed (a boot ends every hold no one will read)."""
         from . import machine_models, workspace_finalize
         from .workspace_calls import Calls
 
         with self.workspace.locked() as db:
             row = self._row(db, owner, request)
             if (
-                row["desired"] != "cancel"
-                or row["state"] not in TERMINAL
+                row["state"] not in TERMINAL
                 or row["retention_waived"]
+                or not (row["desired"] == "cancel" or (boot and _released_at_boot(row)))
                 or Calls.unsettled_effects_in(db, owner, request)
             ):
                 return False
@@ -675,46 +733,71 @@ class Executions:
         return True
 
     def stop_queued(self, owner: str, request: str, *, deadline: bool = False) -> None:
-        """Stop work that has no live executor, through the same durable outcome codec."""
-        with self.workspace.locked() as db:
-            row = self._row(db, owner, request)
-            if row["state"] not in ("queued", "pausing", "canceling"):
-                raise WorkspaceRefusal("only undispatched execution may stop without an executor")
-            offer = pb.AttemptOffer.FromString(row["offer"])
-            ordinal = row["ordinal"]
-        body, digest = documents.identity(
-            pb.AttemptOutcomeBody(
-                request_id=request,
-                attempt_ordinal=ordinal,
-                invocation_spec_digest=documents.spell(offer.invocation_spec_digest),
-                status=pb.OUTCOME_STATUS_CANCELED,
-                safe_message="deadline expired before dispatch"
-                if deadline
-                else "stopped before dispatch",
-                cause=pb.OutcomeCause(
-                    code=pb.CAUSE_CODE_DEADLINE_EXPIRED
-                    if deadline
-                    else pb.CAUSE_CODE_CLIENT_CANCEL,
-                    origin=pb.CAUSE_ORIGIN_WORKER,
-                ),
-            )
-        )
-        self.workspace.outcome(
+        """Stop work that never reached an executor."""
+        self._close_undispatched(
             owner,
-            pb.AttemptOutcome(
-                request_id=request,
-                attempt_ordinal=ordinal,
-                invocation_spec_digest=offer.invocation_spec_digest,
-                outcome_id="out-" + digest.hex()[:24],
-                outcome_digest=digest,
-                outcome_canonical_bytes=body,
-            ),
+            request,
+            pb.OUTCOME_STATUS_CANCELED,
+            pb.CAUSE_CODE_DEADLINE_EXPIRED if deadline else pb.CAUSE_CODE_CLIENT_CANCEL,
+            "deadline expired before dispatch" if deadline else "stopped before dispatch",
         )
+
+    def fail(self, owner: str, request: str, why: str) -> None:
+        """End an execution no thread here holds FAILED with `why` (printable ASCII): an
+        undispatched attempt, or a dispatched one whose holder is gone."""
+        self._close_undispatched(
+            owner, request, pb.OUTCOME_STATUS_FAILED, pb.CAUSE_CODE_LOCAL_SAFETY, why, lost=True
+        )
+
+    def _close_undispatched(
+        self,
+        owner: str,
+        request: str,
+        status: pb.OutcomeStatus,
+        cause: pb.CauseCode,
+        message: str,
+        *,
+        lost: bool = False,
+    ) -> None:
+        """Record the current attempt's terminal if, and only if, it was never dispatched
+        (or, `lost`, was dispatched and no one holds it): a compare-and-set against the
+        dispatch mark, built from the attempt row's own columns. A held attempt ends only
+        through its runner (`ExecutionChanged` otherwise)."""
+        states = "('accepted','running')" if lost else "('accepted')"
+        with self.workspace.locked() as db, transaction(db):
+            row = self._row(db, owner, request)
+            attempt = db.execute(
+                "SELECT ordinal,spec,state FROM attempts WHERE owner=? AND request=? "
+                f"AND ordinal=? AND state IN {states} AND outcome=x''",
+                (owner, request, row["ordinal"]),
+            ).fetchone()
+            if row["state"] in TERMINAL or attempt is None:
+                raise ExecutionChanged("the execution is dispatched or already terminal")
+            body, digest = documents.identity(
+                pb.AttemptOutcomeBody(
+                    request_id=request,
+                    attempt_ordinal=attempt["ordinal"],
+                    invocation_spec_digest=documents.spell(attempt["spec"]),
+                    status=status,
+                    safe_message=message[:4096],
+                    cause=pb.OutcomeCause(
+                        code=cause, origin=pb.CAUSE_ORIGIN_WORKER, detail=message[:1024]
+                    ),
+                    execution_started=attempt["state"] == "running",
+                )
+            )
+            db.execute(
+                "UPDATE attempts SET state='outcome',fenced=1,outcome_id=?,outcome_digest=?,"
+                "outcome=? WHERE owner=? AND request=? AND ordinal=?",
+                ("out-" + digest.hex()[:24], digest, body, owner, request, attempt["ordinal"]),
+            )
         self.reconcile(owner, request)
 
-    def reconcile(self, owner: str, request: str) -> None:
-        """Project an existing durable outcome, including native process-death recovery."""
-        self.workspace.recover(owner)
+    def reconcile(self, owner: str, request: str, *, requeue: str = "") -> None:
+        """Project the current attempt's durable outcome onto its execution. Every outcome is
+        final except the one kind of work the machine never got: an attempt whose Runtime
+        process died before dispatching it. Boot reconcile passes its `requeue` worker boot,
+        and that attempt runs again as ordinal+1, once per execution."""
         with self.workspace.locked() as db, transaction(db):
             row = self._row(db, owner, request)
             attempt = db.execute(
@@ -723,23 +806,44 @@ class Executions:
             ).fetchone()
             if attempt is None:
                 raise WorkspaceRefusal("execution attempt history is missing")
-            if not attempt["outcome"] or row["state"] in TERMINAL or row["state"] == "retrying":
+            if not attempt["outcome"] or row["state"] in TERMINAL:
                 return
-            body = documents.read(attempt["outcome"], pb.AttemptOutcomeBody)
+            body = documents.parse(attempt["outcome"], pb.AttemptOutcomeBody)
             state = (
                 "paused"
                 if row["desired"] == "pause"
                 else "canceled"
-                if row["desired"] == "cancel" or body["status"] == pb.OUTCOME_STATUS_CANCELED
+                if row["desired"] == "cancel" or body.status == pb.OUTCOME_STATUS_CANCELED
                 else "succeeded"
-                if body["status"] == pb.OUTCOME_STATUS_SUCCEEDED
+                if body.status == pb.OUTCOME_STATUS_SUCCEEDED
                 else "failed"
             )
-            if state == "failed" and self._retryable(row, body):
-                state = "retrying"
+            if requeue and state == "failed" and _lost_before_dispatch(db, row, body):
+                offer = pb.AttemptOffer.FromString(row["offer"])
+                offer.attempt_ordinal = row["ordinal"] + 1
+                self.workspace.accept_in(
+                    db,
+                    owner,
+                    offer,
+                    result_schema=attempt["result_schema"],
+                    worker_boot=requeue,
+                    memoize=bool(attempt["memoize"]),
+                )
+                db.execute(
+                    "UPDATE executions SET state='queued',ordinal=?,generation=generation+1 "
+                    "WHERE owner=? AND request=?",
+                    (offer.attempt_ordinal, owner, request),
+                )
+                self._event(
+                    db,
+                    self._row(db, owner, request),
+                    "requeued",
+                    canonical_json.encode({"lost_ordinal": row["ordinal"]}),
+                )
+                return
             db.execute(
-                "UPDATE executions SET state=?,finished_ms=? WHERE owner=? AND request=?",
-                (state, self.clock_ms(), owner, request),
+                "UPDATE executions SET state=? WHERE owner=? AND request=?",
+                (state, owner, request),
             )
             self._event(
                 db,
@@ -755,103 +859,41 @@ class Executions:
             )
 
     def status(self, owner: str, request: str) -> State:
-        self.reconcile(owner, request)
         with self.workspace.locked() as db:
             return self._state(self._row(db, owner, request))
-
-    def _retryable(self, row: Row, body: dict[str, Any]) -> bool:
-        cause = body.get("cause", {})
-        executor_loss = (
-            body.get("status") == pb.OUTCOME_STATUS_ABANDONED
-            and cause.get("code") == pb.CAUSE_CODE_EXECUTOR_INVALIDATED
-            and cause.get("origin") == pb.CAUSE_ORIGIN_EXECUTOR
-        )
-        if (
-            row["desired"] != "run"
-            or row["ordinal"] >= row["max_attempts"]
-            or body.get("status") not in (pb.OUTCOME_STATUS_FAILED, pb.OUTCOME_STATUS_ABANDONED)
-            or cause.get("code")
-            not in (pb.CAUSE_CODE_EXECUTOR_FAULT, pb.CAUSE_CODE_EXECUTOR_INVALIDATED)
-            or (
-                not executor_loss
-                and cause.get("origin") not in (pb.CAUSE_ORIGIN_WORKER, pb.CAUSE_ORIGIN_RUNTIME)
-            )
-        ):
-            return False
-        spec = documents.read(
-            pb.AttemptOffer.FromString(row["offer"]).invocation_spec_canonical_bytes,
-            pb.InvocationSpec,
-        )
-        deadline = int(spec.get("deadline_unix_ms", 0))
-        return not deadline or self.clock_ms() < deadline
-
-    def retry_due(self, owner: str, *, worker_boot: str = "") -> None:
-        """A retryable attempt is not a final execution failure visible to observers."""
-        with self.workspace.locked() as db:
-            rows = db.execute(
-                "SELECT e.*,a.outcome FROM executions e JOIN attempts a "
-                "ON a.owner=e.owner AND a.request=e.request AND a.ordinal=e.ordinal "
-                "WHERE e.owner=? AND e.state='retrying' AND e.desired='run'",
-                (owner,),
-            ).fetchall()
-        for row in rows:
-            outcome = documents.read(row["outcome"], pb.AttemptOutcomeBody)
-            if not self._retryable(row, outcome):
-                with self.workspace.locked() as db, transaction(db):
-                    current = self._row(db, owner, row["request"])
-                    if (
-                        current["generation"] == row["generation"]
-                        and current["state"] == "retrying"
-                    ):
-                        db.execute(
-                            "UPDATE executions SET state='failed' WHERE owner=? AND request=?",
-                            (owner, row["request"]),
-                        )
-                        self._event(
-                            db,
-                            current,
-                            "retry_stopped",
-                            canonical_json.encode({"reason": "accepted retry or deadline bound"}),
-                        )
-                continue
-            if row["finished_ms"] + row["retry_delay_ms"] > self.clock_ms():
-                continue
-            self.control(
-                owner,
-                row["request"],
-                f"retry.{row['ordinal']}",
-                row["generation"],
-                "resume",
-                worker_boot=worker_boot,
-                _automatic=True,
-            )
 
     def offer(self, owner: str, request: str) -> pb.AttemptOffer:
         """Return pinned work for Worker; this does not execute or pick a machine."""
         with self.workspace.locked() as db:
             row = self._row(db, owner, request)
             if row["state"] not in ("queued", "running") or row["desired"] != "run":
-                raise WorkspaceRefusal("execution is not dispatchable")
+                raise ExecutionChanged("execution is not dispatchable")
             offer = pb.AttemptOffer.FromString(row["offer"])
             offer.attempt_ordinal = row["ordinal"]
             return offer
 
-    def observe(self, owner: str, frame: pb.WorkerFrame) -> None:
-        if frame.HasField("attempt_outcome"):
-            self.reconcile(owner, frame.attempt_outcome.request_id)
-            return
-        accepted = frame.attempt_accepted
+    def dispatched(self, owner: str, request: str, ordinal: int) -> None:
+        """Execution STARTS: the attempt row moves accepted -> running and the execution
+        queued -> running in one transaction, immediately before the executor is handed the
+        command. `running` means this and nothing earlier; everything before it is work the
+        machine never ran. A terminal recorded first wins (`ExecutionChanged`)."""
         with self.workspace.locked() as db, transaction(db):
-            row = self._row(db, owner, accepted.request_id)
-            if row["ordinal"] != accepted.attempt_ordinal or row["state"] != "queued":
-                return
-            db.execute(
-                "UPDATE executions SET state='running' WHERE owner=? AND request=?",
-                (owner, accepted.request_id),
-            )
-            self._event(
-                db, row, "running", canonical_json.encode({"generation": row["generation"]})
-            )
+            row = self._row(db, owner, request)
+            moved = db.execute(
+                "UPDATE attempts SET state='running' WHERE owner=? AND request=? AND ordinal=? "
+                "AND state='accepted' AND fenced=0 AND outcome=x''",
+                (owner, request, ordinal),
+            ).rowcount
+            if not moved or row["ordinal"] != ordinal or row["state"] not in TERMINAL | {"queued"}:
+                raise ExecutionChanged("the attempt was stopped before dispatch")
+            if row["state"] == "queued":
+                db.execute(
+                    "UPDATE executions SET state='running' WHERE owner=? AND request=?",
+                    (owner, request),
+                )
+                self._event(
+                    db, row, "running", canonical_json.encode({"generation": row["generation"]})
+                )
 
     def progress(self, owner: str, request: str, ordinal: int, document: dict[str, Any]) -> None:
         """Telemetry for a held execution, if any; recorded with the next journal access."""
@@ -899,7 +941,6 @@ class Executions:
     def events(self, owner: str, request: str, after: int = 0, limit: int = MAX_PAGE) -> EventPage:
         if not 0 <= after < 1 << 63 or not 1 <= limit <= MAX_PAGE:
             raise WorkspaceRefusal("execution event cursor or page bound is invalid")
-        self.reconcile(owner, request)
         with self.workspace.locked() as db:
             row = self._row(db, owner, request)
             if after > row["sequence"]:
@@ -936,10 +977,9 @@ class Executions:
         action: Literal["pause", "resume", "cancel"],
         *,
         worker_boot: str = "",
-        _automatic: bool = False,
     ) -> State:
         _id(command_id)
-        command_id = ("retry:" if _automatic else "user:") + command_id
+        command_id = "user:" + command_id
         if action not in ("pause", "resume", "cancel") or not 0 < expected_generation < 1 << 63:
             raise WorkspaceRefusal("execution command is invalid")
         self.reconcile(owner, request)
@@ -967,7 +1007,7 @@ class Executions:
                 )
                 return result
             if action == "resume":
-                if state not in ("paused", "failed") and not (_automatic and state == "retrying"):
+                if state not in ("paused", "failed"):
                     raise WorkspaceRefusal("only paused or failed execution can resume")
                 attempt = db.execute(
                     "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
@@ -975,8 +1015,9 @@ class Executions:
                 ).fetchone()
                 if attempt is None or not attempt["outcome"]:
                     raise WorkspaceRefusal("previous execution has not durably stopped")
-                spec = documents.read(attempt["invocation"], pb.InvocationSpec)
-                deadline = int(spec.get("deadline_unix_ms", 0))
+                deadline = documents.parse(
+                    attempt["invocation"], pb.InvocationSpec
+                ).deadline_unix_ms
                 if deadline and self.clock_ms() >= deadline:
                     raise WorkspaceRefusal("execution deadline has expired")
                 ordinal += 1
@@ -1048,48 +1089,41 @@ class Executions:
         """A journal alone cannot prove an uncollected native result remains present."""
         from cozy_runtime.internal import fill
 
-        body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
-        if body["status"] != pb.OUTCOME_STATUS_SUCCEEDED:
+        body = documents.parse(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        if body.status != pb.OUTCOME_STATUS_SUCCEEDED:
             return
-        if schema and (raw := body.get("result", {}).get("inline_result")):
+        if schema and body.result.inline_result:
             from . import machine_models
 
             records = machine_models.result_records(
                 self.workspace,
                 owner,
                 outcome.request_id,
-                canonical_json.decode(base64.b64decode(raw, validate=True)),
+                canonical_json.decode(body.result.inline_result),
                 canonical_json.decode(schema),
             )
-            if supplied := body["result"].get("retained_models"):
-                expected = [
-                    documents.body(
-                        pb.RetainedModelResult(
-                            result_pointer=pointer,
-                            model_artifact_canonical_bytes=artifact,
-                            retention=retention,
-                        )
-                    )
-                    for pointer, artifact, retention in records
-                ]
-                if supplied != expected:
-                    raise WorkspaceRefusal("terminal Model custody differs from its typed result")
+            supplied = list(body.result.retained_models)
+            expected = [
+                pb.RetainedModelResult(
+                    result_pointer=pointer,
+                    model_artifact_canonical_bytes=artifact,
+                    retention=retention,
+                )
+                for pointer, artifact, retention in records
+            ]
+            if supplied and supplied != expected:
+                raise WorkspaceRefusal("terminal Model custody differs from its typed result")
         manifests = set()
-        for reference in body.get("weights_receipts", []):
-            receipt = documents.read(
-                base64.b64decode(reference["weights_receipt_canonical_bytes"], validate=True),
-                pb.WeightsReceipt,
-            )
-            native = canonical_json.decode(
-                base64.b64decode(receipt["tensorfs_receipt_canonical_bytes"], validate=True)
-            )
+        for reference in body.weights_receipts:
+            receipt = documents.parse(reference.weights_receipt_canonical_bytes, pb.WeightsReceipt)
+            native = canonical_json.decode(receipt.tensorfs_receipt_canonical_bytes)
             manifests.add("sha256:" + native["manifest"]["sha256"])
-        outputs = list(body.get("output_manifest", {}).get("outputs", []))
-        if blob := body.get("result", {}).get("result_blob"):
-            outputs.append(blob)
+        outputs = list(body.output_manifest.outputs)
+        if body.result.HasField("result_blob"):
+            outputs.append(body.result.result_blob)
         for output in outputs:
-            if native_tree := output.get("native_tree"):
-                manifests.add(native_tree["manifest"]["digest"])
+            if output.HasField("native_tree"):
+                manifests.add(documents.spell(output.native_tree.manifest.digest))
         if not manifests:
             return
         store = fill.store(self.workspace.store_root)
@@ -1152,3 +1186,7 @@ class Executions:
                 ).fetchone()
                 is not None
             )
+
+
+def _released_at_boot(row: Row) -> bool:
+    return bool(row["collected"]) or row["state"] in ("canceled", "failed")

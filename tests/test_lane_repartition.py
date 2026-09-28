@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 from typing import Any
 
 import pytest
@@ -70,11 +69,10 @@ def test_split_lanes_execute_after_worker_started_on_a_group() -> None:
         def report(report: pb.ObservedWorkerState) -> None:
             observe(report)
             worker = workers[0]
-            if (
-                any(a.state == "queued" for a in worker.engine.history.values())
-                and "lane-1" not in worker.lane_threads
-            ):
-                owner.error = "a real attempt queued on lane-1 but that lane has no consumer"
+            if any(
+                a.state == "queued" for a in list(worker.engine.history.values())
+            ) and not worker.supervisor.busy("attempt:"):
+                owner.error = "a real attempt queued on lane-1 but nothing runs it"
                 owner.ended = "worker_error"
                 owner.done.set()
                 owner.host.close()
@@ -97,14 +95,12 @@ def test_fused_lane_dispatches_a_real_executor_after_boot(
 ) -> None:
 
     workers: list[Worker] = []
-    consumers: list[tuple[threading.Thread, ...]] = []
 
     def owner_hook(owner: LocalRecordOwner) -> None:
         desired = owner._desired_state
         observe = owner._on_observed_state
         send = owner._send
         repeated = False
-        first_consumers: list[tuple[threading.Thread, ...]] = []
 
         def replay_offer(frame: pb.RecordOwnerFrame) -> None:
             send(frame)
@@ -124,10 +120,8 @@ def test_fused_lane_dispatches_a_real_executor_after_boot(
         def report(report: pb.ObservedWorkerState) -> None:
             nonlocal repeated
             worker = workers[0]
-            consumers[:] = list(getattr(worker, "_device_consumers", {}).values())
             if any(p.serving == pb.SERVING_STATE_DISPATCHABLE for p in report.placements):
                 if not repeated:
-                    first_consumers[:] = consumers
                     repeated = True
                     successor = first()
                     successor.revision = 2
@@ -135,13 +129,11 @@ def test_fused_lane_dispatches_a_real_executor_after_boot(
                     return
                 if report.accepted_desired_state_revision != 2:
                     return
-                assert consumers == first_consumers
             observe(report)
-            if (
-                any(a.state == "queued" for a in worker.engine.history.values())
-                and "lane-0+1" not in worker.lane_threads
-            ):
-                owner.error = "a real attempt queued on the group without a consumer"
+            if any(
+                a.state == "queued" for a in list(worker.engine.history.values())
+            ) and not worker.supervisor.busy("attempt:"):
+                owner.error = "a real attempt queued on the group but nothing runs it"
                 owner.ended = "worker_error"
                 owner.done.set()
                 owner.host.close()
@@ -159,9 +151,7 @@ def test_fused_lane_dispatches_a_real_executor_after_boot(
     assert outcome.result == {"message": "polo"}
     assert seals == ["0,1"]
     assert workers[0].engine.executed == 1
-    assert consumers and all(not thread.is_alive() for pair in consumers for thread in pair)
-    assert not workers[0]._device_consumers
-    assert not workers[0]._retired_consumers
+    assert not workers[0].supervisor.busy()
 
 
 @needs_executor
@@ -389,4 +379,4 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     assert len(completed) == len(set(completed)) == 5
     assert len(overlap) == 2
     assert seals == ["0", "0,1", "0"]
-    assert not workers[0]._device_consumers and not workers[0]._retired_consumers
+    assert not workers[0].supervisor.busy()

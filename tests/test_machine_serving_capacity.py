@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 
 import pytest
@@ -105,7 +106,7 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
             )
             # There is no executor or available GPU seat. A known refusal must still
             # become a durable outcome; ordinary waiting must not become failure.
-            worker.drive_executions()
+            settle(worker, child.child_request)
             if fault_kind != "selected":
                 assert executions.status("owner", child.child_request).state == "queued"
                 return
@@ -119,11 +120,20 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
             reply = calls.result("owner", child, incoming)
             assert reply.state == pb.CHILD_CALL_STATE_FAILED
             assert "fusion_kernels_corrupt" in reply.safe_detail
-            # Repeated watchdog passes/reconnects return the same recorded outcome.
-            worker.drive_executions()
+            # Waking its unit again (a reconnect) returns the same recorded outcome.
+            settle(worker, child.child_request)
             assert worker.collect_execution(claim, child.child_request) == terminal
         finally:
             worker.shutdown()
+
+
+def settle(worker: Worker, request: str) -> None:
+    """Wake the execution's unit and let it do all it can: refuse it, or wait."""
+    worker.execution("owner", request)
+    bound = time.monotonic() + 60  # a hang bound on a loaded box, not a budget
+    while not worker.supervisor.quiet_now():
+        assert time.monotonic() < bound
+        time.sleep(0.01)
 
 
 def test_managed_child_waits_for_its_new_placement_despite_old_capacity(
@@ -187,7 +197,7 @@ def test_managed_child_waits_for_its_new_placement_despite_old_capacity(
                 expected_execution_workspace_id=executions.workspace_id,
                 worker_boot=worker.fence.worker_boot_id,
             )
-            worker.drive_executions()
+            settle(worker, child.child_request)
             assert executions.status("owner", child.child_request).state == "queued"
             assert (child.child_request, 1) not in worker.engine.history
         finally:

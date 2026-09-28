@@ -26,7 +26,6 @@ def test_restart_intent_never_enters_worker_queues_or_stops_transport(tmp_path: 
     host = worker.host
     assert isinstance(host, InMemoryControlHost)
     queues: list[Any] = [worker.outbound, host.inbound]
-    queues.extend(queue for lane in worker.lanes for queue in (lane.work, lane.post))
     try:
         with ThreadPoolExecutor(max_workers=1) as executor, ExitStack() as held:
             for queue in queues:

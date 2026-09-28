@@ -197,8 +197,8 @@ def test_a_credential_lost_at_restart_holds_the_call_until_the_owner_supplies_it
         gate.touch()
         calls = pod.worker.machine_calls
         assert calls is not None
-        pod.wait("the source call to be pending", lambda: bool(calls.pending), 120)
-        for _ in range(50):  # many drive ticks: the call must not reach the provider anonymously
+        pod.wait("the source call to be pending", lambda: bool(calls.requests), 120)
+        for _ in range(50):  # its unit waits: the call must not reach the provider anonymously
             assert pod.state("gated") == "running" and not origin.authorizations
             threading.Event().wait(0.02)
 

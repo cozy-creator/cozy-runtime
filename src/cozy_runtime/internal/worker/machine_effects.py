@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable
 from typing import Any
 
 import msgspec
@@ -29,6 +29,7 @@ from cozy_runtime.internal.worker.machine_publication import (
     upload_checkpoint,
 )
 from cozy_runtime.internal.worker.stage_progress import Progress, StageProgress
+from cozy_runtime.internal.worker.supervisor import Unit
 from cozy_runtime.internal.worker.workspace import (
     Workspace,
     WorkspaceBusy,
@@ -42,8 +43,10 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 # Native codes for IO that may succeed when repeated; others are refusals of this closure.
 _TRANSIENT_NATIVE = frozenset({"STORE_BUSY", "TRANSFER_FAILED", "DEADLINE_EXCEEDED"})
-# An uncommitted effect whose consecutive attempts land nothing new refuses; any landed
-# object resets the count. Backoff doubles per stalled attempt up to its ceiling.
+# An effect that lands nothing new on consecutive tries is settled after this many (refused
+# before its commit, or left for its owner's readback after it); any landed object resets
+# the count. The backoff between tries doubles up to its ceiling: it paces a remote, and
+# decides nothing.
 _STALLED_ATTEMPTS = 10
 _MAX_BACKOFF_SECONDS = 60.0
 # Hub's durable finalization job is progressing on its own: poll it at most 8 s apart.
@@ -121,75 +124,67 @@ class Effects:
         self.allow_local, self.report = allow_local, progress
         self.journal = Calls(workspace)
         self.lock = threading.Lock()
-        self.thread_ids: set[int] = set()
-        self.pool = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="publication", initializer=self._register_poller
-        )
-        self.active: dict[tuple[str, str], Future[None]] = {}
-        self.retry_after: dict[tuple[str, str], float] = {}
+        #: two effects move bytes at a time; the rest wait their turn on their own units
+        self.slots = threading.Semaphore(2)
         self.landed: dict[tuple[str, str], int] = {}
         self.stalls: dict[tuple[str, str], int] = {}
         # The stage each effect is in; it outlives retries, so its timing covers them.
         self.stages: dict[tuple[str, str], StageProgress] = {}
-        self.cleanup_after: dict[str, tuple[int, str]] = {}
         # Sent publications whose awaiting-owner notice this process already recorded.
         self.noticed: set[tuple[str, str]] = set()
         self.stopped = False
+        #: told (owner, call) when an effect settles: its parent and root act on it
+        self.settled: Callable[[str, Call], None] = lambda owner, call: None
 
     def _stalls(self, key: tuple[str, str], landed: int) -> int:
         """Consecutive attempts, this one included, that landed nothing; caller holds the lock."""
         return 0 if self.landed.get(key, 0) > landed else self.stalls.get(key, 0) + 1
 
-    def _register_poller(self) -> None:
-        with self.lock:
-            self.thread_ids.add(threading.get_native_id())
-
-    @property
-    def pollers(self) -> set[int]:
-        with self.lock:
-            return set(self.thread_ids)
-
     def close(self) -> None:
         with self.lock:
             self.stopped = True
-        self.pool.shutdown(wait=True, cancel_futures=True)
-        with self.lock:
-            self.thread_ids.clear()
 
-    def schedule(self, owner: str, call: Call) -> None:
-        """Queue metadata work, never perform network IO on the worker control lock."""
+    def run(self, unit: Unit, owner: str, call: Call) -> None:
+        """One effect call, on its own unit, until it settles: committed, refused, or left
+        for its owner to reconcile. A try that fails is tried again only while tries keep
+        landing objects (measured progress), at the backoff its stalled tries earned."""
         key = owner, call.child_request
-        with self.lock:
-            if self.stopped or key in self.active or len(self.active) >= 2:
-                return
-            if self.retry_after.get(key, 0) > time.monotonic():
-                return
-            self.active[key] = self.pool.submit(self._run, owner, call)
+        while True:
+            latest = self.journal.get(owner, call.parent_request, call.call_index)
+            with self.lock:
+                awaiting_owner = key in self.noticed
+            if latest.result or (latest.safe_code and not latest.sent) or awaiting_owner:
+                break
+            with self.slots:
+                try:
+                    self._run(owner, latest)
+                    continue
+                except (CallFenced, WorkspaceInactive):
+                    with self.lock:
+                        stopping = self.stopped
+                    if stopping or not latest.sent:
+                        break  # no one runs it now; a sent one is still read back
+                except Exception:
+                    pass  # recorded by `_run`; tried again below
+            with self.lock:
+                stalls = self.stalls.get(key, 0)
+            unit.wait(time.monotonic() + min(2.0**stalls, _MAX_BACKOFF_SECONDS))
+        self._release(owner, self.journal.get(owner, call.parent_request, call.call_index))
+        self.settled(owner, call)
 
-    def drive(self, owner: str) -> None:
-        # Sent calls stay in this query after the parent stops or the client goes
-        # away. Their exact remote state must be reconciled before retention ends.
-        with self.lock:
-            for key, deadline in list(self.retry_after.items()):
-                if deadline <= time.monotonic():
-                    del self.retry_after[key]
-            for key, future in list(self.active.items()):
-                if future.done():
-                    del self.active[key]
-                    if future.exception() is not None:
-                        self.retry_after[key] = time.monotonic() + min(
-                            2.0 ** self.stalls.get(key, 0), _MAX_BACKOFF_SECONDS
-                        )
-            if self.stopped:
-                return
-        for call in self.journal.pending_effects(owner):
-            self.schedule(owner, call)
-        if self.authority is None:
-            return
-        with self.lock:
-            key = owner, "cleanup"
-            if not self.stopped and len(self.active) < 2 and key not in self.active:
-                self.active[key] = self.pool.submit(self._cleanup, owner)
+    def _release(self, owner: str, call: Call) -> None:
+        """A settled effect's Model holds go: it will read its artifact no more. So do an
+        unsent one's whose parent stopped: nothing will send it."""
+        if call.result or (
+            not call.sent and (call.safe_code or self.journal.canceled(owner, call))
+        ):
+            with self.workspace.locked() as db:
+                held = db.execute(
+                    "SELECT 1 FROM execution_model_holds WHERE owner=? AND recipient=? LIMIT 1",
+                    (owner, call.child_request),
+                ).fetchone()
+            if held is not None:
+                machine_models.release(self.workspace, owner, call.child_request)
 
     def _stage(self, key: tuple[str, str], call: Call, name: str) -> StageProgress:
         """The effect's current stage, ending its previous stage as completed."""
@@ -226,13 +221,13 @@ class Effects:
     def _before_stage(self, owner: str, call: Call) -> None:
         with self.lock:
             if self.stopped:
-                raise WorkspaceRefusal("publication worker is stopping")
+                raise CallFenced("publication worker is stopping")
         self.journal.check_active(owner, call)
 
     def _before_write(self, owner: str, call: Call) -> None:
         with self.lock:
             if self.stopped:
-                raise WorkspaceRefusal("publication worker is stopping")
+                raise CallFenced("publication worker is stopping")
         self.journal.before_write(owner, call)
 
     def _run(self, owner: str, original: Call) -> None:
@@ -621,46 +616,6 @@ class Effects:
                 # or stopped landing objects: it cannot land, so its hold is released.
                 raise PublicationUncommitted(exc.code) from caught
             raise
-
-    def _cleanup(self, owner: str) -> None:
-        after = self.cleanup_after.get(owner, (0, ""))
-        with self.workspace.locked() as db:
-            rows = db.execute(
-                "SELECT c.*,e.desired FROM execution_calls c JOIN executions e "
-                "ON e.owner=c.owner AND e.request=c.parent_request "
-                "WHERE c.owner=? AND (c.created_ms,c.child_request)>(?,?) "
-                "AND json_extract(CAST(c.intent AS TEXT),'$.module')=? "
-                "ORDER BY c.created_ms,c.child_request LIMIT 32",
-                (owner, *after, effect_interfaces.MODULE),
-            ).fetchall()
-        for row in rows:
-            if not (
-                row["result"]
-                or (not row["sent"] and (row["safe_code"] or row["desired"] == "cancel"))
-            ):
-                continue
-            with self.workspace.locked() as db:
-                registry = db.execute(
-                    "SELECT retention FROM execution_model_holds WHERE owner=? AND recipient=?",
-                    (owner, row["child_request"]),
-                ).fetchall()
-                held = any(
-                    db.execute(
-                        "SELECT 1 FROM holds WHERE owner=? AND id=? AND state<>'released'",
-                        (
-                            owner,
-                            pb.DerivedRetentionRequest.FromString(entry["retention"]).retention_id,
-                        ),
-                    ).fetchone()
-                    for entry in registry
-                )
-            if held:
-                machine_models.release(self.workspace, owner, row["child_request"])
-        # This cursor only bounds background scanning; custody remains native and
-        # release is idempotent. Cycling revisits calls that finish after this page.
-        self.cleanup_after[owner] = (
-            (rows[-1]["created_ms"], rows[-1]["child_request"]) if rows else (0, "")
-        )
 
     def _assessment(
         self,

@@ -358,6 +358,17 @@ class AttemptRecord:
     replays: int = 0
     payload: dict[str, Any] = dataclasses_field(default_factory=dict)
     canceling: str = ""
+    #: why a "failed" cancel ends this attempt FAILED rather than CANCELED
+    failure: str = ""
+    #: the caller's absolute deadline (`InvocationSpec.deadline_unix_ms`), 0 for none
+    deadline_ms: int = 0
+    #: wakes this attempt's GUARD: a cancel, dispatch, and leaving the device
+    poke: Callable[[], None] = lambda: None
+    #: a guard is running for this attempt (one per attempt: escalation is single-flight)
+    guarded: bool = False
+    #: held by a machine execution's own unit, not offered on a control stream: its frames
+    #: go to the journal, and its outcome is acknowledged the moment it is recorded
+    machine: bool = False
     #: monotonic instant the cancel was marked; `math.inf` once escalation has finished
     cancel_started: float = 0.0
     #: the executor's frames for this attempt, counted: the meter a cancel is judged by
@@ -524,6 +535,7 @@ class AttemptEngine:
         instance_id: str,
         send: Callable[[pb.WorkerFrame], None],
         progress: Callable[[str, int, dict[str, Any]], None],
+        dispatched: Callable[[AttemptRecord], None] = lambda attempt: None,
         bundles: triage.BundleStore,
         monitor: observe.SilenceMonitor,
         posture: Callable[[], dict[str, Any]],
@@ -546,6 +558,9 @@ class AttemptEngine:
         self.attention_pin = attention_pin
         self.send = send
         self.progress = progress
+        #: journals that execution STARTED, immediately before the executor is handed the
+        #: command: the one boundary between work the machine never got and work it ran
+        self.dispatched = dispatched
         self.live: dict[str, AttemptRecord] = {}  # request_id -> the attempt held right now
         self.history: dict[tuple[str, int], AttemptRecord] = {}
         self.boot_id = ""
@@ -672,6 +687,7 @@ class AttemptEngine:
             # Capture the offered value itself; rereading the worker's live placement during
             # admission can observe a concurrently converging successor placement.
             placement_id=offered.placement_id,
+            deadline_ms=int(spec.get("deadline_unix_ms", 0)),
         )
 
     def _bind(self, spec: Mapping[str, Any], offered: pb.AttemptOffer) -> grants.BoundGrant:
@@ -1736,13 +1752,6 @@ class AttemptEngine:
         attempt.spool = spool
         if getattr(supervision, "isolated", False):
             supervision.grant_directory(spool, attempt.executor_epoch)
-        # The pace opens at dispatch, seeded with the gaps this process already showed.
-        attempt.pace = liveness.Pace(worst_pause=executor.worst_pause)
-        attempt.pace.observe(0)
-        attempt.state = "running"
-        attempt.executions += 1
-        self.executed += 1
-
         # WHAT THE HANDLER IS GIVEN, and it is the caller's own number or nothing at all.
         # A 0.5 s FLOOR under an already-expired deadline is not a floor, it is 0.5 s of
         # extension the caller never granted — and `admit` cancels a past-deadline attempt
@@ -1753,10 +1762,24 @@ class AttemptEngine:
         # only when the caller minted one (cr-009). NO BOUND is spelled `None` and never 0:
         # a duration of zero is a real remaining time — the instant a deadline lapses — and
         # collapsing the two would silently hand an expired attempt an unbounded one.
-        deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
-        seconds = deadline_ms / 1000 - time.time() if deadline_ms else None
-        attempt.dispatched_at = time.perf_counter()
+        seconds = attempt.deadline_ms / 1000 - time.time() if attempt.deadline_ms else None
         key = f"{attempt.request_id}#{attempt.attempt}"
+        command = self._command(attempt, key, spool, seconds)
+        # DISPATCH is one decision against a cancel: either the cancel's mark is seen here
+        # and nothing runs, or execution starts (journaled first) and the cancel signals it.
+        with attempt.transition_lock:
+            if not attempt.canceling:
+                self.dispatched(attempt)
+                # The pace opens at dispatch, seeded with the gaps this process already showed.
+                attempt.pace = liveness.Pace(worst_pause=executor.worst_pause)
+                attempt.pace.observe(0)
+                attempt.state = "running"
+                attempt.executions += 1
+        if attempt.state != "running":
+            return self.finish_cancel(attempt, attempt.canceling)
+        self.executed += 1
+        attempt.poke()
+        attempt.dispatched_at = time.perf_counter()
         self.progress(
             attempt.request_id,
             attempt.attempt,
@@ -1795,7 +1818,7 @@ class AttemptEngine:
 
         try:
             reply = executor.call(
-                self._command(attempt, key, spool, seconds),
+                command,
                 timeout=None,
                 on_progress=on_progress,
                 on_request=on_request if job else self.room(attempt) if self.room else None,
@@ -2000,6 +2023,7 @@ class AttemptEngine:
             self.reconcile(attempt)
             attempt.opened = {}
         attempt.state = "released"
+        attempt.poke()
         return Released(attempt, reply, spool, key)
 
     def finish(self, released: Released) -> pb.AttemptOutcome:
@@ -2850,6 +2874,7 @@ class AttemptEngine:
             },
         )
         attempt.state = "outcome"
+        attempt.poke()
         self._release_job_models(attempt)
         return self.wrap(attempt)
 
@@ -3110,8 +3135,9 @@ class AttemptEngine:
 
     # ------------------------------------------------------------------ cancel / abandon
 
-    def cancel(self, message: pb.CancelAttempt) -> str:
-        """Cooperative, then forceful. Returns what was done, for the activity lane."""
+    def cancel(self, message: pb.CancelAttempt, *, failure: str = "") -> str:
+        """Cooperative, then forceful. Returns what was done, for the activity lane. A
+        `failure` stops the attempt the same way and ends it FAILED with that reason."""
         held = self.live.get(message.request_id)
         if held is None or held.attempt != message.attempt_ordinal:
             return "dropped: no such held attempt"
@@ -3120,13 +3146,18 @@ class AttemptEngine:
         with held.transition_lock:
             if held.state in ("finalizing", "released", "outcome", "closed"):
                 return "ignored: the attempt already left the device"
-            held.canceling = {
-                pb.CancelReason.CANCEL_REASON_CLIENT: "client",
-                pb.CancelReason.CANCEL_REASON_DRAIN: "drain",
-                pb.CancelReason.CANCEL_REASON_SUPERSEDED: "superseded",
-                pb.CancelReason.CANCEL_REASON_POLICY: "policy",
-                pb.CancelReason.CANCEL_REASON_DEADLINE: "deadline",
-            }.get(message.reason, "client")
+            if failure:
+                held.canceling, held.failure = "failed", failure
+            elif not held.canceling:  # the first cause is the terminal's cause
+                held.canceling = {
+                    pb.CancelReason.CANCEL_REASON_CLIENT: "client",
+                    pb.CancelReason.CANCEL_REASON_DRAIN: "drain",
+                    pb.CancelReason.CANCEL_REASON_SUPERSEDED: "superseded",
+                    pb.CancelReason.CANCEL_REASON_POLICY: "policy",
+                    pb.CancelReason.CANCEL_REASON_DEADLINE: "deadline",
+                }.get(message.reason, "client")
+            held.cancel_started = held.cancel_started or time.monotonic()
+            held.poke()
             if held.state == "reclaiming":
                 return "forceful executor reclaim is already in progress"
             if held.state != "running":
@@ -3139,7 +3170,7 @@ class AttemptEngine:
             ):
                 return "executor already gone or cooperative marker unavailable"
             if self.calls is not None:
-                self.calls.wake()  # a parent awaiting children reads its marker now
+                self.calls.wake(held.request_id)  # a parent awaiting children reads it now
             return f"cooperative cancel marked ({held.canceling})"
 
     def escalate(self, attempt: AttemptRecord, stall: Mapping[str, float]) -> dict[str, Any]:
@@ -3175,6 +3206,14 @@ class AttemptEngine:
         }
 
     def finish_cancel(self, attempt: AttemptRecord, reason: str) -> pb.AttemptOutcome:
+        if reason == "failed":
+            return self.outcome(
+                attempt,
+                STATUS.OUTCOME_STATUS_FAILED,
+                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                ORIGIN.CAUSE_ORIGIN_WORKER,
+                attempt.failure,
+            )
         cause = {
             "client": CAUSE.CAUSE_CODE_CLIENT_CANCEL,
             "drain": CAUSE.CAUSE_CODE_DRAIN_CANCEL,
@@ -3245,6 +3284,7 @@ class AttemptEngine:
             },
         )
         attempt.state = "outcome"
+        attempt.poke()
         self._release_job_models(attempt)
         return self.wrap(attempt)
 

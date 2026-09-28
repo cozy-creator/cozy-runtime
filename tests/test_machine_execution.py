@@ -15,7 +15,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -78,8 +78,16 @@ def complete(
         outcome_canonical_bytes=body,
     )
     executions.workspace.outcome("owner", terminal)
-    executions.observe("owner", pb.WorkerFrame(attempt_outcome=terminal))
+    executions.reconcile("owner", request)
     return terminal
+
+
+def settle(ready: Callable[[], bool]) -> None:
+    """What an execution's own unit does next, as soon as it has done it."""
+    bound = time.monotonic() + 60  # a hang bound on a loaded box, not a budget
+    while not ready():
+        assert time.monotonic() < bound
+        time.sleep(0.01)
 
 
 def ack(outcome: pb.AttemptOutcome, *, retain: bool = False) -> pb.AttemptOutcomeAck:
@@ -220,6 +228,7 @@ def test_controls_fence_generation_and_replay_commands_without_another_attempt(
             outcome_canonical_bytes=body,
         ),
     )
+    e.reconcile("owner", "root")
     assert e.status("owner", "root").state == "canceled"
     with pytest.raises(WorkspaceRefusal, match="only paused or failed"):
         e.control("owner", "root", "resume-canceled", 3, "resume")
@@ -287,13 +296,20 @@ from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import worker_pb2 as pb
 e=Executions(Workspace(Path(sys.argv[1])))
-e.submit('owner','submission',b'c'*32,pb.AttemptOffer.FromString(base64.b64decode(sys.argv[2])),max_attempts=2,expected_execution_workspace_id=e.workspace_id)
+e.submit('owner','submission',b'c'*32,pb.AttemptOffer.FromString(base64.b64decode(sys.argv[2])),expected_execution_workspace_id=e.workspace_id)
+if sys.argv[3] == 'dispatched':
+    e.dispatched('owner','root',1)
 print('accepted',flush=True)
 sys.stdin.readline()
 """
 
 
-def test_actual_process_death_recovers_without_duplicate_execution(tmp_path: Path) -> None:
+@pytest.mark.parametrize("dispatched", [False, True])
+def test_a_dead_process_requeues_only_work_it_never_dispatched(
+    tmp_path: Path, dispatched: bool
+) -> None:
+    """The one automatic requeue: an attempt its Runtime process never handed to an
+    executor runs once more, at the next ordinal, once. Dispatched work is never rerun."""
     root = tmp_path / "store"
     child = subprocess.Popen(
         [
@@ -302,6 +318,7 @@ def test_actual_process_death_recovers_without_duplicate_execution(tmp_path: Pat
             CHILD,
             str(root),
             base64.b64encode(offer().SerializeToString()).decode(),
+            "dispatched" if dispatched else "queued",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -312,39 +329,52 @@ def test_actual_process_death_recovers_without_duplicate_execution(tmp_path: Pat
         assert child.stdout is not None
         assert child.stdout.readline().strip() == "accepted"
         e = Executions(Workspace(root))
-        assert e.status("owner", "root").state == "queued"  # live origin cannot be reclaimed
+        e.workspace.recover("owner")
+        e.reconcile("owner", "root", requeue="boot-next")
+        assert e.status("owner", "root").attempt_ordinal == 1  # a live origin is not reclaimed
         assert not e.assigned_here("owner", "root", 1, "")
         child.kill()
         child.communicate(timeout=10)
-        assert e.status("owner", "root").state == "retrying"
-        with pytest.raises(WorkspaceRefusal, match="not terminal"):
-            e.collect("owner", "root")
-        original = e.collect("owner", "root", 1)
-        assert (
-            documents.read(original.outcome_canonical_bytes, pb.AttemptOutcomeBody)["status"]
-            == pb.OUTCOME_STATUS_ABANDONED
+        e.workspace.recover("owner")  # boot reconcile, after the process is gone
+        e.reconcile("owner", "root", requeue="boot-next")
+        lost = documents.parse(
+            e.collect("owner", "root", 1).outcome_canonical_bytes, pb.AttemptOutcomeBody
         )
-        assert (
-            e.submit(
-                "owner",
-                "submission",
-                b"c" * 32,
-                offer(),
-                max_attempts=2,
-                expected_execution_workspace_id=e.workspace_id,
-            ).request_id
-            == "root"
+        assert (lost.status, lost.cause.origin) == (
+            pb.OUTCOME_STATUS_ABANDONED,
+            pb.CAUSE_ORIGIN_INFRA,
         )
-        assert e.status("owner", "root").attempt_ordinal == 1
-        e.retry_due("owner")
-        assert e.status("owner", "root").attempt_ordinal == 2
-        assert e.assigned_here("owner", "root", 2, "")
-        assert not e.assigned_here("owner", "root", 2, "foreign-boot")
-        assert e.collect("owner", "root", 1) == original
+        assert lost.execution_started == dispatched
+        state = e.status("owner", "root")
+        if dispatched:
+            assert (state.state, state.attempt_ordinal) == ("failed", 1)
+            return
+        assert (state.state, state.attempt_ordinal) == ("queued", 2)
+        assert e.assigned_here("owner", "root", 2, "boot-next")
+        # Lost before dispatch a second time: failed, never a third attempt.
+        with e.workspace.locked() as db:
+            db.execute(
+                "UPDATE attempts SET process_owner=? WHERE request='root' AND ordinal=2",
+                (child_identity(child.pid),),
+            )
+        e.workspace.recover("owner")
+        e.reconcile("owner", "root", requeue="boot-next")
+        assert (e.status("owner", "root").state, e.status("owner", "root").attempt_ordinal) == (
+            "failed",
+            2,
+        )
     finally:
         if child.poll() is None:
             child.kill()
         child.communicate(timeout=10)
+
+
+def child_identity(pid: int) -> bytes:
+    """A Runtime process birth that has ended (the killed child's pid, a later tick)."""
+    from cozy_runtime.internal.worker import workspace_recovery
+
+    identity = canonical_json.decode(workspace_recovery.process_identity())
+    return canonical_json.encode({**identity, "pid": pid})
 
 
 @pytest.mark.parametrize("abandon", [False, True])
@@ -399,6 +429,7 @@ def test_native_result_has_separate_collection_and_consumer_custody(
         outcome_canonical_bytes=body,
     )
     workspace.outcome("owner", terminal)
+    e.reconcile("owner", "producer")
     assert e.collect("owner", "producer") == terminal
     replacement = Workspace(tmp_path / "replacement-store")
     with workspace.locked() as db:
@@ -415,7 +446,7 @@ def test_native_result_has_separate_collection_and_consumer_custody(
     assert store.manifest(documents.spell(independent.manifest.digest))["manifest"]
     if abandon:
         e.control("owner", "producer", "abandon", 1, "cancel")
-        assert e.abandon("owner", "producer")
+        assert e.release("owner", "producer")
         assert not e.status("owner", "producer").collected
         assert not e.retention_required("owner")
     else:
@@ -471,7 +502,7 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
             submitted,
             expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
         )
-        worker.drive_executions()
+        settle(lambda: worker.execution_status(claim, "refused").state == "failed")
         assert receipt.request_id == "refused"
         assert json.loads((tmp_path / "activity").read_bytes())["execution_retention_required"]
         assert worker.execution_status(claim, "refused").state == "failed"
@@ -502,6 +533,7 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
             expected_execution_workspace_id=worker.executions.workspace_id,
         )
         attempt = worker.engine.offer(submitted)
+        attempt.machine = True  # held as its execution's unit holds it
         worker.engine.hold(attempt)
         terminal = worker.engine.outcome(
             attempt,
@@ -535,7 +567,8 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         with pytest.raises(WorkspaceRefusal, match="authenticated owner"):
             worker.execution_status(foreign, "scalar")
         worker.control_execution(claim, "refused", "abandon-refused", 1, "cancel")
-        worker.drive_executions()
+        executions = worker.executions
+        settle(lambda: not executions.retention_required("owner"))
         assert not worker.execution_status(claim, "refused").collected
         assert not worker.executions.retention_required("owner")
         worker.publish_activity()
@@ -544,46 +577,32 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         worker.shutdown()
 
 
-def test_retry_policy_never_retries_authored_errors_or_user_cancellation(tmp_path: Path) -> None:
-    now = [1000]
-    e = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: now[0])
-    for request, status, cause in [
-        ("transient", pb.OUTCOME_STATUS_FAILED, pb.CAUSE_CODE_EXECUTOR_FAULT),
-        ("author", pb.OUTCOME_STATUS_FAILED, pb.CAUSE_CODE_AUTHOR_EXCEPTION),
-        ("abandoned", pb.OUTCOME_STATUS_ABANDONED, pb.CAUSE_CODE_EXECUTOR_INVALIDATED),
-        ("canceled", pb.OUTCOME_STATUS_CANCELED, pb.CAUSE_CODE_CLIENT_CANCEL),
-        ("structural", pb.OUTCOME_STATUS_REFUSED, pb.CAUSE_CODE_LOCAL_SAFETY),
+def test_every_recorded_outcome_is_final_and_only_a_command_runs_again(tmp_path: Path) -> None:
+    """No automatic retry: an executor fault, an author error, an executor lost after dispatch
+    or a refusal ends the execution with its own reason. Only its owner's explicit resume
+    mints another attempt."""
+    e = Executions(Workspace(tmp_path / "store"))
+    for request, status, cause, state in [
+        ("transient", pb.OUTCOME_STATUS_FAILED, pb.CAUSE_CODE_EXECUTOR_FAULT, "failed"),
+        ("author", pb.OUTCOME_STATUS_FAILED, pb.CAUSE_CODE_AUTHOR_EXCEPTION, "failed"),
+        ("abandoned", pb.OUTCOME_STATUS_ABANDONED, pb.CAUSE_CODE_EXECUTOR_INVALIDATED, "failed"),
+        ("canceled", pb.OUTCOME_STATUS_CANCELED, pb.CAUSE_CODE_CLIENT_CANCEL, "canceled"),
+        ("structural", pb.OUTCOME_STATUS_REFUSED, pb.CAUSE_CODE_LOCAL_SAFETY, "failed"),
     ]:
         e.submit(
             "owner",
             request,
             b"c" * 32,
             offer(request),
-            max_attempts=2,
-            retry_delay_ms=500,
             expected_execution_workspace_id=e.workspace_id,
         )
         complete(e, request, status=status, cause=cause)
-    e.retry_due("owner")
-    assert e.status("owner", "transient").attempt_ordinal == 1
-    assert e.status("owner", "transient").state == "retrying"
-    with pytest.raises(WorkspaceRefusal, match="not terminal"):
-        e.collect("owner", "transient")
-    now[0] += 500
-    e.retry_due("owner")
-    assert e.status("owner", "transient").attempt_ordinal == 2
-    e.retry_due("owner")
-    assert all(
-        e.status("owner", request).attempt_ordinal == 1
-        for request in ("author", "canceled", "structural")
-    )
-    assert e.status("owner", "abandoned").attempt_ordinal == 2
-    complete(e, "transient", status=pb.OUTCOME_STATUS_FAILED, cause=pb.CAUSE_CODE_EXECUTOR_FAULT)
-    now[0] += 500
-    e.retry_due("owner")
-    assert e.status("owner", "transient").attempt_ordinal == 2
-    # An explicit command authorizes another attempt without quietly expanding auto retries.
-    assert e.control("owner", "transient", "user-resume", 2, "resume").attempt_ordinal == 3
+        e.reconcile("owner", request, requeue="boot")  # a boot pass changes nothing either
+        assert (e.status("owner", request).state, e.status("owner", request).attempt_ordinal) == (
+            state,
+            1,
+        )
+    assert e.control("owner", "transient", "user-resume", 1, "resume").attempt_ordinal == 2
 
 
 def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path: Path) -> None:
@@ -598,9 +617,9 @@ def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path
     e.control("owner", "cancel", "cancel", 1, "cancel")
     e.stop_queued("owner", "cancel")
     assert e.status("owner", "cancel").state == "canceled"
-    assert not documents.read(
+    assert not documents.parse(
         e.collect("owner", "cancel").outcome_canonical_bytes, pb.AttemptOutcomeBody
-    ).get("execution_started", False)
+    ).execution_started
     submitted = offer("expired")
     spec = pb.InvocationSpec(
         job=pb.JobInvocationSpec(
@@ -1246,25 +1265,3 @@ def serve(payload: Request) -> Result:
             else:
                 worker.shutdown()
             assert not thread.is_alive()
-
-
-def test_queued_offer_prevents_preparation_switch_before_lane_accepts() -> None:
-    from types import SimpleNamespace
-
-    from cozy_runtime.internal.worker.attempts import AttemptEngine
-    from cozy_runtime.internal.worker.session import Worker
-
-    # No lane consumer has accepted this offer yet. A second captured package must
-    # leave the first package's preparation and admission epoch intact during that gap.
-    worker = SimpleNamespace(
-        phase=pb.WorkerPhase.WORKER_PHASE_ONLINE,
-        accepted=SimpleNamespace(accepted_desired_state_revision=1, desired_state_body=b"first"),
-        engine=SimpleNamespace(
-            history={("first", 1): SimpleNamespace(state="queued", lane_id="")},
-            PRE_RELEASE=AttemptEngine.PRE_RELEASE,
-            HELD=AttemptEngine.HELD,
-        ),
-    )
-    state = pb.DesiredWorkerState(job=pb.JobDirective(installation_id="different"))
-    preparation = {"state": base64.b64encode(state.SerializeToString()).decode()}
-    assert Worker._prepare_execution(worker, preparation) is False  # type: ignore[arg-type]

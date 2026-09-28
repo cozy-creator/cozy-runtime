@@ -42,7 +42,9 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     return resolve_export(worker, parent, intent["module"], intent["export"])
 
 
-def resolve_export(worker: Worker, parent: AttemptRecord, module: str, export: str) -> Target:
+def resolve_export(
+    worker: Worker, parent: AttemptRecord, module: str, export: str, *, wait: bool = True
+) -> Target:
     """Resolve preparation and invocation through the same captured callable binding."""
     if worker.executions is None or parent.job is None:
         raise WorkspaceRefusal("child call needs an accepted captured job parent")
@@ -75,7 +77,7 @@ def resolve_export(worker: Worker, parent: AttemptRecord, module: str, export: s
         row = machine_deferred.rows(capture).get(callee)
         if row is None or worker.machine_calls is None:
             raise WorkspaceRefusal("child callable names an undeclared deferred installation")
-        prepared = worker.machine_calls.deferred.prepared(row)
+        prepared = worker.machine_calls.deferred.prepared(row, wait=wait)
     else:
         prepared = worker.executions.preparation(owner, root)["installations"].get(callee)
     if prepared is None:

@@ -20,6 +20,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
+from cozy_runtime.internal.worker import activity
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
@@ -587,11 +588,19 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             ]
             binding = JobBinding.read(next(row for row in plans if row.get("job") == "nested"))
             thread.start()
-            # Hang bounds, not budgets: on a loaded shared box several executors spawning
-            # could outlast the old 60 s / 45 s bounds with nothing wrong.
-            deadline = time.monotonic() + (960 if case == "serving_media" or proof_gate else 300)
+            # A hang is STILLNESS, not elapsed time: a loaded shared box may take any time
+            # while the worker, its executors and its journal keep moving.
+            still: list[Any] = ["", time.monotonic()]
+
+            def advancing() -> bool:
+                reading = str(activity.meter(worker))
+                if reading != still[0]:
+                    still[:] = [reading, time.monotonic()]
+                assert time.monotonic() - still[1] < 180, "the worker stopped moving"
+                return thread.is_alive()
+
             while not (root / "address").exists():
-                assert thread.is_alive() and time.monotonic() < deadline
+                assert advancing()
                 time.sleep(0.02)
             claim = pb.Claim(
                 record_owner_id="owner",
@@ -648,7 +657,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 from cozy_runtime.internal.worker import workspace_sources
 
                 while not (root / "source-ready").exists():
-                    assert thread.is_alive() and time.monotonic() < deadline
+                    assert advancing()
                     time.sleep(0.01)
                 # A native slot already accepted a different frozen source intent.
                 # The real public facade must receive the durable refusal and end.
@@ -677,14 +686,14 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 (root / "source-release").touch()
             if case == "model_sequence":
                 while not (root / "between-children").exists():
-                    assert thread.is_alive() and time.monotonic() < deadline
+                    assert advancing()
                     time.sleep(0.02)
                 _, other = fixture.package(root, "unrelated")
                 worker.prepare_local_package(other)
                 (root / "prepared-other").touch()
             if case == "pause":
                 while not (root / "entered").exists():
-                    assert thread.is_alive() and time.monotonic() < deadline
+                    assert advancing()
                     time.sleep(0.02)
                 assert len(worker.lanes.composition) == 3
                 # Two parents await a blocked leaf. They wait for a nudge, not a clock: a
@@ -702,7 +711,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 assert exchanged.count("child_poll") <= 2, exchanged
                 worker.control_execution(claim, "root", "pause-root", 1, "pause")
                 while True:
-                    assert thread.is_alive() and time.monotonic() < deadline
+                    assert advancing()
                     assert worker.workspace is not None
                     with worker.workspace.locked() as db:
                         states = [row[0] for row in db.execute("SELECT state FROM executions")]
@@ -713,7 +722,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 paused = worker.execution_status(claim, "root")
                 worker.control_execution(claim, "root", "resume-root", paused.generation, "resume")
             while worker.execution_status(claim, "root").state not in ("succeeded", "failed"):
-                assert thread.is_alive() and time.monotonic() < deadline
+                assert advancing()
                 time.sleep(0.02)
             outcome = worker.collect_execution(claim, "root")
             body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
@@ -776,7 +785,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             == "released"
                         )
                 while worker.lanes.composition:
-                    assert thread.is_alive() and time.monotonic() < deadline
+                    assert advancing()
                     time.sleep(0.02)
                 assert not worker.stop.is_set()
                 return
@@ -965,7 +974,9 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
         parent = running(executions, selected)
         parents.append(selected)
         selected = calls.accept("owner", request(parent)).child_request
-    dispatcher = Dispatcher(cast(Worker, SimpleNamespace(workspace=workspace)))
+    dispatcher = Dispatcher(
+        cast(Worker, SimpleNamespace(workspace=workspace, executions=executions))
+    )
     target = cast(
         Target,
         SimpleNamespace(
@@ -984,35 +995,51 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
 
 
 def test_canceling_root_also_abandons_failed_descendants(tmp_path: Path) -> None:
-    from types import SimpleNamespace
+    from dataclasses import replace
 
-    from cozy_runtime.internal.worker.machine_calls import Calls as Dispatcher
-    from cozy_runtime.internal.worker.workspace import Workspace
+    from cozy_runtime.internal.worker.control import InMemoryControlHost
     from cozy_runtime.internal.worker.workspace_calls import Calls
-    from cozy_runtime.internal.worker.workspace_executions import Executions
+    from test_device_lanes import _config
     from test_machine_calls import request, running
     from test_machine_execution import complete, offer
 
-    workspace = Workspace(tmp_path / "store")
-    executions, calls = Executions(workspace), Calls(workspace)
-    executions.submit(
-        "owner", "root", b"c" * 32, offer(), expected_execution_workspace_id=executions.workspace_id
+    worker = Worker(
+        replace(_config(tmp_path / "home"), bootstrap_credential="test-bootstrap"),
+        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
+        InMemoryControlHost(),
     )
-    call = calls.accept("owner", request(running(executions, "root")))
-    executions.submit(
-        "owner",
-        "child",
-        b"c" * 32,
-        offer(call.child_request),
-        expected_execution_workspace_id=executions.workspace_id,
+    claim = pb.Claim(
+        record_owner_id="owner",
+        record_owner_epoch=1,
+        wire_minor=WIRE_MINOR,
+        proof=b"test-bootstrap",
     )
-    complete(executions, call.child_request, status=pb.OUTCOME_STATUS_FAILED)
-    complete(executions, "root", status=pb.OUTCOME_STATUS_FAILED)
-    executions.control("owner", "root", "cancel-root", 1, "cancel")
-    dispatcher = Dispatcher(
-        cast(Worker, SimpleNamespace(workspace=workspace, executions=executions))
-    )
-    dispatcher._stop_descendants("owner")
-    assert executions.abandon("owner", "root")
-    assert executions.abandon("owner", call.child_request)
-    assert not executions.retention_required("owner")
+    try:
+        worker.accept_claim(claim, lambda frame: None)
+        executions = worker.executions
+        assert executions is not None and worker.workspace is not None
+        calls = Calls(worker.workspace)
+        executions.submit(
+            "owner",
+            "root",
+            b"c" * 32,
+            offer(),
+            expected_execution_workspace_id=executions.workspace_id,
+        )
+        call = calls.accept("owner", request(running(executions, "root")))
+        executions.submit(
+            "owner",
+            "child",
+            b"c" * 32,
+            offer(call.child_request),
+            expected_execution_workspace_id=executions.workspace_id,
+        )
+        complete(executions, call.child_request, status=pb.OUTCOME_STATUS_FAILED)
+        complete(executions, "root", status=pb.OUTCOME_STATUS_FAILED)
+        worker.control_execution(claim, "root", "cancel-root", 1, "cancel")
+        deadline = time.monotonic() + 60
+        while executions.retention_required("owner"):  # each settles on its own unit
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        worker.shutdown()

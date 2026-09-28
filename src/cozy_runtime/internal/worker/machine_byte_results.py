@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from cozy_runtime.author._call_results import result_at
@@ -54,11 +54,14 @@ def retain(
     index: int,
     value: Any,
     schema: Any,
-    outputs: list[dict[str, Any]],
+    outputs: Sequence[pb.OutputEntry],
     *,
     capture: bool = False,
 ) -> None:
-    by_id = {entry["output_id"]: entry for entry in outputs}
+    """Hold each typed output's native bytes for the parent. The entries are the decoded
+    protobuf, so an empty output (proto3 `content_bytes` 0, omitted from its document) reads
+    as 0 rather than a missing key."""
+    by_id = {entry.output_id: entry for entry in outputs}
     fields = list(paths(schema))
     if capture:
         fields.append(("runtime.capture", 64 << 20))
@@ -67,26 +70,21 @@ def retain(
         node = result_at(value, path) if path != "runtime.capture" else None
         if (
             entry is None
-            or "native_tree" not in entry
+            or not entry.HasField("native_tree")
             or (
                 path != "runtime.capture"
-                and (not isinstance(node, dict) or node.get("digest") != entry["digest"])
+                and (
+                    not isinstance(node, dict)
+                    or node.get("digest") != documents.spell(entry.digest)
+                )
             )
         ):
             raise WorkspaceRefusal("typed child output lacks its exact native result entry")
-        native = entry["native_tree"]
-        ref = pb.NativeByteTreeRef(
-            producer_root_id=native["producer_root_id"],
-            receipt_digest=documents.raw(native["receipt_digest"]),
-            manifest=pb.Ref(
-                digest=documents.raw(native["manifest"]["digest"]),
-                length=native["manifest"]["length"],
-            ),
-            content_bytes=native["content_bytes"],
-        )
-        if node is not None and node.get("size_bytes") != ref.content_bytes:
+        if node is not None and node.get("size_bytes") != entry.native_tree.content_bytes:
             raise WorkspaceRefusal("typed child output length differs from native custody")
-        machine_models.retain_bytes(workspace, owner, parent, f"call.{index}.output/{path}", ref)
+        machine_models.retain_bytes(
+            workspace, owner, parent, f"call.{index}.output/{path}", entry.native_tree
+        )
 
 
 def grants(
