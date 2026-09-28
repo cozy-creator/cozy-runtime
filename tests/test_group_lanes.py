@@ -20,7 +20,7 @@ import pytest
 from cozy_runtime.author._signature import ModelBinding
 from cozy_runtime.internal import accel, canonical, executor_commands, package_interface, spawn
 from cozy_runtime.internal.config import seal_snapshot
-from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.executor_commands import Start
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
@@ -45,7 +45,7 @@ from cozy_runtime.internal.worker.session import (
     executor_load_command,
 )
 from cozy_runtime.protocol import worker_pb2 as pb
-from test_device_lanes import PACKAGE, _config, _workspace
+from test_device_lanes import PACKAGE, WEIGHTLESS, _config, _workspace
 from test_end_to_end import NO_EXECUTOR
 
 needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
@@ -531,7 +531,6 @@ def _weightless_start(body: dict[str, Any], interface: Path, **extra: Any) -> St
         {
             "application": str(body["application"]),
             "package_interface": str(interface),
-            "development_project": str(PACKAGE),
             **extra,
         },
         Start,
@@ -581,7 +580,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
             WorkerOptions(root=root / "worker", devices="0,1"),
             InMemoryControlHost(),
         )
-        found = discover(PACKAGE)
+        found = discover_installed(WEIGHTLESS)
         body = package_interface.build(found)
         interface = root / "metadata" / "package-interface.json"
         interface.parent.mkdir()
@@ -647,7 +646,7 @@ def test_degree_one_is_a_plain_executor() -> None:
             WorkerOptions(root=root / "worker", devices="0"),
             InMemoryControlHost(),
         )
-        found = discover(PACKAGE)
+        found = discover_installed(WEIGHTLESS)
         body = package_interface.build(found)
         interface = root / "metadata" / "package-interface.json"
         interface.parent.mkdir()
@@ -749,7 +748,6 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
             "binding": {
                 "application": "x:app",
                 "package_interface": "/nowhere",
-                "development_project": "",
                 "model_class": "",
             },
             "budgets": {},

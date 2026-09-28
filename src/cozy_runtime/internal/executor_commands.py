@@ -91,7 +91,6 @@ class Release(msgspec.Struct, frozen=True, kw_only=True):
 
     application: str = ""
     package_interface: str = ""
-    development_project: str = ""
 
 
 class Start(Command, frozen=True, kw_only=True, tag="start"):
@@ -99,14 +98,9 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     sequence_parallel_degree: int = 1
     application: str = ""
     package_interface: str = ""
-    development_project: str = ""
 
     def release(self) -> Release:
-        return Release(
-            application=self.application,
-            package_interface=self.package_interface,
-            development_project=self.development_project,
-        )
+        return Release(application=self.application, package_interface=self.package_interface)
 
 
 class Adapter(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):

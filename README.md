@@ -422,19 +422,12 @@ a raise is a typed construction failure (`warm_failed`, naming the exception) th
 placement OFFLINE. Its wall time is the `warm` leg of the prepare, on the fill's boot record.
 There is no entrypoint-level warm pass and no `ctx.boot_warmup`.
 
-Source-checkout development is an explicit, same-user lane rather than a partially qualified
-published package. Creator privately asks Runtime to author a `Placement.development` carrying
-package, semantic release, and source digest, then launches Runtime with the matching local path
-and facts. No project wheel, release.json, Environment, or receipt is invented.
-For a modeled entrypoint, Runtime resolves package.toml through its existing binding owner and
-joins the exact release/lane through the explicitly granted local TensorFS Repository. The
-Placement carries the ordinary exact Manifest/component facts; at acquisition
-the launch Runtime re-reads the source interface and TensorFS Manifest/header/config, derives the
-same binding locally, and compares every accepted fact before STAGED. Creator owns the source-file
-digest and closes its scan race before replacing the whole worker generation after edits; Runtime
-does not invent a second source hash. Header-declared model assets travel in the CozyTensors
-runtime closure and reach package construction only through Loader's bounded read-only asset
-capability; a temporary private read-only tree exists only for third-party path-based constructors.
+A local package is prepared by `PrepareLocalPackage` into an installed environment, as a
+published release is; its Placement carries `development` (package, release, installation) in
+place of `package`. The executor always imports the installed environment, never a source tree.
+Header-declared model assets travel in the CozyTensors runtime closure and reach package
+construction only through Loader's bounded read-only asset capability; a temporary private
+read-only tree exists only for third-party path-based constructors.
 
 A writable delegated cgroup-v2 child remains the preferred executor lifecycle boundary. Ordinary
 RunPod containers instead expose their provider-owned cgroup-v2 scope read-only. Runtime uses its

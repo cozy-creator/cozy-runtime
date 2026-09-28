@@ -414,8 +414,6 @@ class DeclaredBinding:
     """The exact PackageInterface application imported from the installed venv."""
     interface_path: str = ""
     """Local path to the exact granted package-interface bytes; resolution, never identity."""
-    development_project: str = ""
-    """Launch-local source path for DevelopmentPackage discovery; never protocol identity."""
     store: str = ""
     variant: str = ""
     reference_snapshot: str = ""

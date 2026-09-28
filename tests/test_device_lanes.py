@@ -27,7 +27,7 @@ import pytest
 
 from cozy_runtime.internal import accel, child_env, executor_commands, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
-from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.executor_commands import Start
 from cozy_runtime.internal.worker import lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
@@ -44,6 +44,8 @@ from test_end_to_end import NO_EXECUTOR
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "examples" / "marco-polo"
+#: A weightless application the executor imports from its installed environment.
+WEIGHTLESS = "cozy_runtime.derive.operations:app"
 
 needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 
@@ -84,7 +86,7 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
         assert [lane.devices for lane in worker.lanes.lanes] == ["0", "1"]
         assert worker.lanes.envelope.devices == "0,1"
         lane = worker.lanes.lanes[1]
-        found = discover(PACKAGE)
+        found = discover_installed(WEIGHTLESS)
         body = package_interface.build(found)
         interface = root / "metadata" / "package-interface.json"
         interface.parent.mkdir()
@@ -96,7 +98,6 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
                 Start(
                     application=str(body["application"]),
                     package_interface=str(interface),
-                    development_project=str(PACKAGE),
                     devices=worker.lanes.lanes[0].devices,
                 ),
                 timeout=60.0,

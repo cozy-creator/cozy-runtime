@@ -1,7 +1,0 @@
-[application]
-object = "warm_restore_package:app"
-
-[bindings."generate.models.model"]
-model = "test/warm-restore"
-release = "1"
-lane = "main"

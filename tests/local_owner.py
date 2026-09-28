@@ -12,7 +12,7 @@ import os
 import shutil
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -28,9 +28,6 @@ from cozy_runtime.internal import (
     proctree,
 )
 from cozy_runtime.internal.config import RuntimeConfig
-from cozy_runtime.internal.development_launch import (
-    LOCAL_PLACEMENT,
-)
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import byte_inputs, workspace_byte_outputs
 from cozy_runtime.internal.worker import grants as grants_module
@@ -41,6 +38,8 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.worker.workspace import Workspace
+
+LOCAL_PLACEMENT = "plc-local"
 
 
 def claimable(config: RuntimeConfig, options: WorkerOptions) -> tuple[RuntimeConfig, WorkerOptions]:
@@ -147,7 +146,6 @@ class LocalRecordOwner:
         package_installation_id: str,
         placement: pb.Placement | None = None,
         auto_ack: bool = True,
-        on_progress: Callable[[pb.AttemptProgress], None] | None = None,
     ) -> None:
         self.request = request
         self.bindings = bindings  # entrypoint -> entrypoint_binding_digest
@@ -163,8 +161,6 @@ class LocalRecordOwner:
         self.error = ""
         self.host = InMemoryControlHost()
         self.host.on_frame = self._on_frame
-        self._on_progress = on_progress
-        self.progress_frames: list[pb.AttemptProgress] = []
         #: the accepted envelope this RecordOwner speaks under, learned from ClaimAck
         self.record_owner_epoch = 1
         self.control_stream_epoch = 0
@@ -194,12 +190,6 @@ class LocalRecordOwner:
     def destination(self, output_id: str) -> Path:
         """The exact granted destination for one output field path."""
         return self.output_dir / self._filename(output_id)
-
-    def tap_progress(self, frame: pb.AttemptProgress) -> None:
-        """The lossy lane's in-process observer (the local door's one watcher)."""
-        self.progress_frames.append(frame)
-        if self._on_progress is not None:
-            self._on_progress(frame)
 
     def watch(self, worker: Worker) -> None:
         """Start the READINESS WATCH: end the run only when the worker has provably stopped.

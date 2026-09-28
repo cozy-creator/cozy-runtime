@@ -1,5 +1,0 @@
-[project]
-name = "request-attention"
-version = "0.0.1"
-requires-python = ">=3.12"
-dependencies = ["cozy-runtime", "torch>=2.13", "diffusers==0.40.0"]

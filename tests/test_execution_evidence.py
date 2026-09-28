@@ -68,7 +68,6 @@ def executor(tmp_path: Path) -> Iterator[Executor]:
     binding = {
         "application": f"{MODULE}:app",
         "package_interface": str(interface),
-        "development_project": str(project),
     }
     devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
     left, right = socket.socketpair()

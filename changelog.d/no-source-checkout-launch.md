@@ -1,0 +1,1 @@
+The source-checkout worker launch is gone: `WorkerOptions.development_*`, the executor's `development_project` discovery and `development_launch` staging. A local package runs from the installed environment `PrepareLocalPackage` builds, like a published one.

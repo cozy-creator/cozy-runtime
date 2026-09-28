@@ -338,14 +338,6 @@ class WorkerOptions:
     makes a kill -9 mid-materialize resume by digest. Absent means no dynamic acquisition
     was provisioned and a placement naming artifacts this worker does not already hold
     reports a typed fault rather than guessing a directory."""
-    development_project: Path | None = None
-    """Explicit same-user source-checkout execution; product published venvs leave absent."""
-    development_package: str = ""
-    development_release: str = ""
-    development_installation_id: str = ""
-    """Exact launch facts the development Placement must echo."""
-    development_binding_overrides: Mapping[str, str] = field(default_factory=dict)
-    """One-shot local resolver inputs; long-lived Creator launches use package.toml."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
@@ -889,7 +881,6 @@ def executor_load_command(
                 binding=Binding(
                     application=binding.application,
                     package_interface=binding.interface_path,
-                    development_project=binding.development_project,
                     model_class=model.model_class,
                     model_binding_path=model.model_binding_path,
                     model_parameter_name=model.model_parameter_name,
@@ -928,7 +919,6 @@ def executor_load_command(
             binding=Binding(
                 application=binding.application,
                 package_interface=binding.interface_path,
-                development_project=binding.development_project,
             )
         )
     )
@@ -4887,87 +4877,6 @@ class Worker:
         Returns the installed generation, or None having already typed the fault and left the
         outgoing placement serving.
         """
-        if self.options.development_project is not None:
-            expected_development = {
-                "package": self.options.development_package,
-                "release": self.options.development_release,
-                "installation_id": self.options.development_installation_id,
-            }
-            if placement.development != expected_development or placement.package:
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        subject=placement.placement_id,
-                        reason="development_launch_mismatch",
-                        detail="the development Placement does not equal this process's exact "
-                        "package, release, and source digest",
-                    ),
-                    terminal=True,
-                )
-                return None
-            if self.options.artifact_cache is None or self.options.tensorfs_root is None:
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=placement.placement_id,
-                        reason="artifact_cache_absent",
-                        detail="source-checkout selection bytes require --artifact-cache and "
-                        "--tensorfs-root",
-                    ),
-                    terminal=False,
-                )
-                return None
-            try:
-                from cozy_runtime.internal import development_launch, static_interface
-
-                # A SOURCE reading (#713): the session supervises, the executor imports.
-                staged = development_launch.stage_development_placement(
-                    self.config.cozy_home,
-                    static_interface.build(self.options.development_project),
-                    package=self.options.development_package,
-                    release=self.options.development_release,
-                    installation_id=self.options.development_installation_id,
-                    artifact_cache=self.options.artifact_cache,
-                    tensorfs_root=self.options.tensorfs_root,
-                    project=self.options.development_project,
-                    binding_overrides=self.options.development_binding_overrides,
-                )
-                return acquire.preinstalled_development(
-                    placement,
-                    self.options.artifact_cache,
-                    staged.placement,
-                    staged.declared_bindings,
-                )
-            except acquire.AcquisitionRefusal as exc:
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=exc.kind,
-                        subject=placement.placement_id,
-                        reason=exc.code,
-                        detail=safe(exc.detail),
-                    ),
-                    terminal=True,
-                )
-                return None
-            except Exception as exc:
-                code, separator, detail = str(exc).partition(": ")
-                if not code.startswith("development_"):
-                    code = "development_source_invalid"
-                    detail = str(exc)
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        subject=placement.placement_id,
-                        reason=code,
-                        detail=safe(detail if separator else str(exc)),
-                    ),
-                    terminal=True,
-                )
-                return None
         from .machine_capture import installation_identity
 
         prepared_environment = next(
@@ -5460,17 +5369,6 @@ class Worker:
         latch, reused = self._prepare_generation(self._tenant(self.placement.placement_id))
         if latch:
             self.latched = latch
-            if (
-                latch == "prepare refused: every binding"
-                and self.options.development_project is not None
-            ):
-                # A source-checkout generation has one placement and no retained published
-                # fallback. Creator's readiness owner treats FAILED materialization as the
-                # terminal answer and replaces this generation; leaving it STAGED/OFFLINE
-                # made a permanent prepare refusal look like an endlessly activating model.
-                self.placement.materialization = (
-                    pb.MaterializationState.MATERIALIZATION_STATE_FAILED
-                )
             self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, latch[:200])
             self._settle()
             return
@@ -5639,7 +5537,6 @@ class Worker:
             sequence_parallel_degree=_rank_degree(lane, tenant.bindings.values()),
             application=first.application,
             package_interface=first.interface_path,
-            development_project=first.development_project,
         )
         began = time.perf_counter()
         self.monitor.start(f"start:{placement_id}", "load")

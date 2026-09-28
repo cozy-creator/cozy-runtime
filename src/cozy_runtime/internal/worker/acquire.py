@@ -18,7 +18,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import msgspec
 
@@ -34,7 +34,6 @@ from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     ModelBinding,
 )
-from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
@@ -43,27 +42,6 @@ if TYPE_CHECKING:
 type FaultKind = pb.FaultKind
 type LegName = Literal["package", "model"]
 type ObservationCallback = Callable[[pb.PlacementAcquisitionObservation], object]
-
-
-class _SequenceParallel(TypedDict):
-    degrees: list[int]
-
-
-_ModelDeclaration = TypedDict(
-    "_ModelDeclaration",
-    {
-        "path": str,
-        "class": str,
-        "component_use": NotRequired[dict[str, list[str]]],
-        "sequence_parallel": NotRequired[_SequenceParallel],
-    },
-)
-
-
-class _EntrypointDeclaration(TypedDict):
-    name: str
-    models: NotRequired[list[_ModelDeclaration]]
-    internal: NotRequired[bool]
 
 
 class _ArtifactReference(msgspec.Struct):
@@ -257,128 +235,6 @@ class AcquiredPlacement:
     fetched_bytes: int
     verified_bytes: int
     trusted_reuse_bytes: int
-
-
-def preinstalled_development(
-    placement: Any,
-    cache_root: Path,
-    expected_placement: Any,
-    bindings: Mapping[str, DeclaredBinding],
-) -> AcquiredPlacement:
-    """Admit one independently re-derived source-checkout selection.
-
-    The launch Runtime has re-read package.toml and the exact local TensorFS Repository,
-    Manifest, and inline header config. This function compares that derivation with every accepted
-    Placement fact before handing the normal attempt kernel its local resolution paths. No
-    PackageRelease or Environment is invented for this same-user lane.
-    """
-
-    actual = placement.document
-    expected = documents.body(expected_placement)
-    # Placement ID is RecordOwner routing, not package/model selection identity. A local
-    # owner may remint it while preserving the exact development closure.
-    comparable_actual = {key: value for key, value in actual.items() if key != "placement_id"}
-    comparable_expected = {key: value for key, value in expected.items() if key != "placement_id"}
-    if actual.get("package_interface") != expected.get("package_interface"):
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "development_source_changed",
-            "the current checkout derives a different PackageInterface",
-        )
-    if actual.get("models", []) != expected.get("models", []):
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-            "development_model_manifest_changed",
-            "the local TensorFS Repository now resolves different exact model Manifests",
-        )
-    actual_entries = {str(row.get("name", "")): row for row in actual.get("entrypoints", [])}
-    expected_entries = {str(row.get("name", "")): row for row in expected.get("entrypoints", [])}
-    if set(actual_entries) != set(expected_entries):
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "development_entrypoint_set_changed",
-            "the current checkout exposes a different entrypoint set",
-        )
-    for name, selected in expected_entries.items():
-        accepted = actual_entries[name]
-        selected_slots = selected.get("slots", [])
-        accepted_slots = accepted.get("slots", [])
-        if len(selected_slots) != len(accepted_slots):
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "development_model_slot_changed",
-                name,
-            )
-        for selected_slot, accepted_slot in zip(selected_slots, accepted_slots, strict=True):
-            if selected_slot.get("components", []) != accepted_slot.get("components", []):
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "development_model_components_changed",
-                    name,
-                )
-            if selected_slot != accepted_slot:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "development_model_slot_changed",
-                    name,
-                )
-    if comparable_actual != comparable_expected:
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "development_placement_changed",
-            "the accepted Placement does not equal the launch Runtime's local derivation",
-        )
-
-    interface_path = (
-        cache_root / "installed-interfaces" / placement.installation_id / "package-interface.json"
-    )
-    package_interface.publish(interface_path, placement.package_interface)
-    try:
-        interface = package_interface.read_bytes(placement.package_interface, str(interface_path))
-    except package_interface.StalePackageInterface as exc:
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
-        ) from exc
-    visible = _visible_entrypoints(interface)
-    if set(visible) != set(expected_entries):
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "binding_entrypoint_set_mismatch",
-            "PlacementSet/1 does not cover every interface entrypoint",
-        )
-    selected_digests = {
-        str(row["entrypoint_binding_digest"]): row for row in expected_entries.values()
-    }
-    if set(bindings) != set(selected_digests):
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "development_binding_set_changed",
-            "the locally derived bindings do not cover the exact selected entrypoints",
-        )
-    verified = len(placement.package_interface)
-    for digest, binding in bindings.items():
-        selected = selected_digests[digest]
-        slots = selected.get("slots", [])
-        if not slots:
-            continue
-        selected_paths = {f"{selected['name']}.models.{slot['slot']}" for slot in slots}
-        members = binding.model_bindings()
-        if selected_paths != {member.model_binding_path for member in members}:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                "development_model_slot_changed",
-                str(selected["name"]),
-            )
-    return AcquiredPlacement(
-        None,
-        bindings,
-        len({str(model["manifest"]["digest"]) for model in placement.models}),
-        1,
-        0,
-        0,
-        verified,
-        0,
-    )
 
 
 class Acquirer:
@@ -872,25 +728,6 @@ def _entrypoints_by_name(
 ) -> dict[str, package_interface.CallableDoc]:
     rows = interface.entrypoints
     visible = {row.name: row for row in rows}
-    if len(visible) != len(rows):
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "package_interface_invalid",
-            "entrypoint names are not unique",
-        )
-    return visible
-
-
-def _visible_entrypoints(interface: Mapping[str, object]) -> dict[str, _EntrypointDeclaration]:
-    try:
-        rows = msgspec.convert(interface.get("entrypoints"), type=list[_EntrypointDeclaration])
-    except msgspec.ValidationError as exc:
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "package_interface_invalid",
-            str(exc),
-        ) from exc
-    visible = {row["name"]: row for row in rows}
     if len(visible) != len(rows):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,

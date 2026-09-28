@@ -10,7 +10,6 @@ import functools
 import inspect
 import os
 import socket
-import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,38 +50,6 @@ from testdata.parallel_calls import (  # noqa: E402
     hosted_model,
     spread_model,
 )
-
-
-@pytest.mark.parametrize(("backend", "degree"), [("cpu", 2), ("cpu", 4), ("cuda", 1)])
-def test_native_models_keep_scope_and_restore_ownership(
-    tmp_path: Path, backend: str, degree: int
-) -> None:
-    pytest.importorskip("diffusers")
-    pytest.importorskip("tensorfs")
-    if backend == "cuda" and not torch.cuda.is_available():
-        pytest.skip("native CUDA fill requires one GPU")
-    env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "PYTHONFAULTHANDLER": "1"}
-    if backend == "cpu":
-        # Distinct seal entries without exposing a CUDA device to CPU/Gloo ranks.
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(f"cpu{rank}" for rank in range(degree))
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(Path(__file__).parent / "testdata" / "native_parallel_models.py"),
-            "--root",
-            str(tmp_path),
-            "--degree",
-            str(degree),
-            "--backend",
-            backend,
-        ],
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout
 
 
 @pytest.mark.parametrize("shape", ["scalar", "offset", "transpose", "empty", "shared"])

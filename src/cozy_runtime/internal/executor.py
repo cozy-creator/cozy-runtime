@@ -103,7 +103,7 @@ from cozy_runtime.internal import (
     sandbox,
 )
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
-from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
+from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
     Activate,
     Attention,
@@ -3059,14 +3059,10 @@ class Executor:
         }
 
     def _discover_provisioned(self, release: Release) -> None:
-        """Import the installed release or development source and bind its PackageInterface."""
+        """Import the installed release and bind its PackageInterface."""
         if not release.application or not release.package_interface:
             raise RuntimeError("executor requires the canonical installed release identity")
-        discovered = (
-            discover(Path(release.development_project))
-            if release.development_project
-            else discover_installed(release.application)
-        )
+        discovered = discover_installed(release.application)
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 

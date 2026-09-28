@@ -1,7 +1,0 @@
-[application]
-object = "staged_lane:app"
-
-[bindings."touch.models.model"]
-model = "cozytest/staged-lane"
-release = "1"
-lane = "bf16"

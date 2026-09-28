@@ -1,7 +1,0 @@
-[application]
-object = "block_package:app"
-
-[bindings."generate.models.block"]
-model = "test/block-a"
-release = "1"
-lane = "main"
