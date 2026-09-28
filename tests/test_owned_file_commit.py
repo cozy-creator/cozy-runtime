@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import queue
 import time
@@ -259,14 +258,8 @@ def test_mutated_or_nonregular_pending_file_cannot_become_retained(
         path.write_bytes(b"x" * (len(data) + (fault == "oversize")))
     store = tensorfs.Store.open(str(workspace.store_root))
     with pytest.raises((OSError, WorkspaceRefusal)):
-        commit_files.execute(
-            store,
-            {
-                **plan,
-                "arguments": canonical_json.decode(command.parent_call.request_canonical_bytes),
-            },
-        )
-    assert store.tree_root(plan["view_owner"]) is None
+        commit_files.execute(store, plan)
+    assert store.tree_root(plan.view_owner) is None
 
 
 def test_cancel_before_import_releases_only_after_permanent_stop(tmp_path: Path) -> None:
@@ -286,9 +279,7 @@ def test_cancel_before_import_releases_only_after_permanent_stop(tmp_path: Path)
     outputs.release_native(workspace, "owner", command.service_id)
     outputs.release_native(workspace, "owner", command.service_id)
     with workspace.locked() as db:
-        row = db.execute(
-            "SELECT state FROM byte_outputs WHERE id=?", (plan["view_owner"],)
-        ).fetchone()
+        row = db.execute("SELECT state FROM byte_outputs WHERE id=?", (plan.view_owner,)).fetchone()
         assert row["state"] == "released"
 
 
@@ -330,17 +321,14 @@ def test_accepted_slot_cannot_reuse_a_result_for_changed_bytes(tmp_path: Path) -
         workspace_sources.accepted(workspace, "owner", command)
     with workspace.locked() as db:
         rows = db.execute("SELECT id,state FROM byte_outputs").fetchall()
-        assert len(rows) == 1 and rows[0]["id"] == plan["view_owner"]
+        assert len(rows) == 1 and rows[0]["id"] == plan.view_owner
 
 
 def test_file_completion_fenced_after_native_import(tmp_path: Path) -> None:
     workspace, command, _, _ = pending(tmp_path)
     workspace_sources.accepted(workspace, "owner", command)
     plan = commit_files.prepare(workspace, "owner", command, b"k" * 32, tmp_path / "spool")
-    result = commit_files.execute(
-        tensorfs.Store.open(str(workspace.store_root)),
-        {**plan, "arguments": canonical_json.decode(command.parent_call.request_canonical_bytes)},
-    )
+    result = commit_files.execute(tensorfs.Store.open(str(workspace.store_root)), plan)
     with workspace.locked() as db:
         db.execute(
             "UPDATE native_calls SET state='stopped' WHERE service_id=?", (command.service_id,)
@@ -350,10 +338,10 @@ def test_file_completion_fenced_after_native_import(tmp_path: Path) -> None:
             workspace,
             "owner",
             command,
-            canonical_json.encode(result["result"]),
+            canonical_json.encode(result.result),
             b"k" * 32,
-            base64.b64decode(result["native_receipt"]),
-            plan["view_owner"],
+            result.native_receipt,
+            plan.view_owner,
         )
     outputs.release_native(workspace, "owner", command.service_id)
 
@@ -366,13 +354,7 @@ def test_interrupted_commit_reattaches_original_file_and_producer(
     workspace_sources.accepted(workspace, "owner", command)
     plan = commit_files.prepare(workspace, "owner", command, b"k" * 32, tmp_path / "spool")
     if imported:
-        commit_files.execute(
-            tensorfs.Store.open(str(workspace.store_root)),
-            {
-                **plan,
-                "arguments": canonical_json.decode(command.parent_call.request_canonical_bytes),
-            },
-        )
+        commit_files.execute(tensorfs.Store.open(str(workspace.store_root)), plan)
         path.unlink()
     with workspace.locked() as db:
         db.execute(
@@ -391,13 +373,13 @@ def test_interrupted_commit_reattaches_original_file_and_producer(
     result = frames.get(timeout=30).native_source_status
     assert result.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, result.safe_code
     assert result.parent_attempt_ordinal == 2 and result.byte_output_attempt_ordinal == 1
-    assert result.byte_output.producer_root_id == plan["view_owner"]
+    assert result.byte_output.producer_root_id == plan.view_owner
     assert result.byte_output.content_bytes == len(data)
     with restarted.locked() as db:
         assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 1
     finish_parent(restarted, retry, retain=False)
     store = tensorfs.Store.open(str(workspace.store_root))
-    root = store.tree_root(plan["view_owner"])
+    root = store.tree_root(plan.view_owner)
     assert root is not None and root["released"]
 
 

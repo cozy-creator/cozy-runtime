@@ -206,9 +206,9 @@ def test_crashed_source_worker_failure_carries_its_signal_and_stderr_tail(tmp_pa
     assert ended["value"] == "warning" and ended["fields"]["bytes"] < len(body)
 
 
-def test_an_uncoded_source_worker_error_names_itself_in_the_diagnosis() -> None:
-    """A Python error without a native code (a Runtime/TensorFS signature skew raised a
-    TypeError here) is still the fixed code, but its type and frames reach the detail."""
+def test_a_malformed_source_worker_launch_names_itself_in_the_diagnosis() -> None:
+    """A launch that does not decode refuses at the boundary with its own code, and its
+    type and frames reach the detail."""
     child = subprocess.run(
         [sys.executable, "-m", "cozy_runtime.internal.worker.source_worker"],
         input=canonical_json.encode({}),
@@ -216,12 +216,12 @@ def test_an_uncoded_source_worker_error_names_itself_in_the_diagnosis() -> None:
         check=True,
     )
     assert canonical_json.decode(child.stdout.strip()) == {
-        "code": "native_source_failed",
-        "ok": False,
+        "answer": "refused",
+        "code": "native_step_malformed",
     }
     detail = diagnosis(0, child.stderr.decode(), "")
-    assert "ValueError: native source execution needs its process owner" in detail
-    assert "source_worker.py:" in detail and " in main" in detail
+    assert "SourceRefusal: Object missing required field `store`" in detail
+    assert "source_steps.py:" in detail and " in serve" in detail
 
 
 def test_diagnosis_redacts_credentials_and_signed_urls() -> None:

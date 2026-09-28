@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import time
 from functools import partial
-from typing import Any
+from typing import Any, Literal
+
+import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, source_interfaces, weights_sink
@@ -52,6 +54,38 @@ ALTER TABLE holds ADD COLUMN kind TEXT NOT NULL DEFAULT 'derived';
 """
 
 
+class NativeCall(msgspec.Struct, frozen=True):
+    """One ``native_calls`` row."""
+
+    owner: str
+    parent_request: str
+    call_index: int
+    parent_ordinal: int
+    parent_spec: bytes
+    intent_digest: bytes
+    service_id: str
+    operation: str
+    accepted: bytes
+    pinned: bytes
+    computation_digest: bytes
+    state: Literal[
+        "accepted",
+        "resolved",
+        "executing",
+        "complete",
+        "failed",
+        "stopped",
+        "releasing",
+        "released",
+    ]
+    result: bytes
+    native_receipt: bytes
+    native_owner: str
+    native_error: str
+    release_ack: bytes
+    retired_ms: int
+
+
 def identity(owner: str, parent: str, index: int) -> str:
     return (
         "source-" + hashlib.sha256(canonical_json.encode([owner, parent, index])).hexdigest()[:48]
@@ -79,7 +113,7 @@ def _parent(db: Journal, owner: str, call: pb.ChildCallRequest) -> None:
         raise WorkspaceRefusal("native source call has no current running parent attempt")
 
 
-def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) -> dict[str, Any]:
+def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) -> NativeCall:
     call = command.parent_call
     if call.module != source_interfaces.MODULE or len(call.request_canonical_bytes) > 48 << 10:
         raise WorkspaceRefusal("native source call exceeds its fixed interface")
@@ -148,12 +182,11 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
                     command.service_id,
                 ),
             )
-        return dict(
-            db.execute(
-                "SELECT * FROM native_calls WHERE owner=? AND service_id=?",
-                (owner, command.service_id),
-            ).fetchone()
-        )
+        row = db.execute(
+            "SELECT * FROM native_calls WHERE owner=? AND service_id=?",
+            (owner, command.service_id),
+        ).fetchone()
+        return msgspec.convert(dict(row), NativeCall)
 
 
 def selection_content(selection: pb.NativeSourceSelection) -> dict[str, Any]:
@@ -475,7 +508,9 @@ def _release_native(
     if row["native_owner"] != native_owner(owner, row["service_id"]):
         return
     if row["operation"] in source_interfaces.UPLOADS:
-        source_upload.release(store, workspace.directory, row, live)
+        source_upload.release(
+            store, workspace.directory, row["service_id"], row["native_owner"], live
+        )
         return
     if row["operation"] == "convert_cozytensors":
         state = store.derived_lookup(row["native_owner"])
@@ -508,14 +543,10 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         workspace_memo.release_native_lookup(workspace, owner, service_id)
     store = fill.store(workspace.store_root)
     final = "released"
-    if row["operation"] == "commit_file":
+    if row["operation"] in ("commit_file", "source_files"):
         from . import workspace_byte_outputs
 
         workspace_byte_outputs.release_native(workspace, owner, service_id)
-    elif row["operation"] == "source_files":
-        from . import source_views
-
-        source_views.release_service(workspace, owner, row)
     elif (
         row["operation"] in _PARTIAL_OPERATIONS
         and not row["result"]
@@ -523,7 +554,7 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         and _has_progress(store, row)
     ) or (
         row["operation"] in source_interfaces.UPLOADS
-        and source_upload.retire(store, workspace.directory, row)
+        and source_upload.retire(store, workspace.directory, service_id, row["native_owner"])
     ):
         final = "stopped"
     else:

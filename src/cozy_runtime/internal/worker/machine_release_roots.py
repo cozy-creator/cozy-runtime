@@ -430,10 +430,9 @@ class ReleaseRoots:
             }
             resolved = {parameter: row.result() for parameter, row in resolving.items()}
         # A provider source is made here, in order: headers first, only its profile's members.
+        given = {choice.parameter: choice for choice in root.models}
         return [
-            machine_source_models.slot(
-                self.worker, parameter, choices[parameter], credentials, note
-            )
+            machine_source_models.slot(self.worker, given[parameter], credentials, note)
             if parameter in sourced
             else resolved[parameter]
             for parameter in parameters

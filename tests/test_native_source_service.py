@@ -12,12 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from weakref import WeakValueDictionary
 
+import msgspec
 import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import storage_admission
-from cozy_runtime.internal.worker import workspace_memo
+from cozy_runtime.internal.worker import source_steps, workspace_memo
 from cozy_runtime.internal.worker.source_calls import SourceCalls
 from cozy_runtime.internal.worker.stage_progress import SAMPLE_SECONDS
 from cozy_runtime.internal.worker.workspace import Workspace
@@ -455,27 +456,18 @@ def test_native_source_child_stops_when_its_runtime_process_dies(tmp_path: Path)
     try:
         store = tensorfs.Store.ensure(tmp_path / "store")
         native_owner = tensorfs.object_id(b"parent-death-source")
-        envelope = {
-            "store": store.root,
-            "operation": "download_huggingface",
-            "arguments": {},
-            "phase": "execute",
-            "native_owner": native_owner,
-            "service_id": "source-parent-death",
-            "allow_local": True,
-            "selection": {
-                "members": [
-                    [
-                        "weights.safetensors",
-                        "sha256:" + digest,
-                        len(data),
-                        f"http://127.0.0.1:{origin.server_port}/weights",
-                    ]
-                ],
-                "allowed_hosts": ["127.0.0.1"],
-                "credential_hosts": [],
-            },
-        }
+        url = f"http://127.0.0.1:{origin.server_port}/weights"
+        step = source_steps.Download(
+            native_owner=native_owner,
+            service_id="source-parent-death",
+            pin=source_steps.Pin(
+                [("weights.safetensors", "sha256:" + digest, len(data), url)], ["127.0.0.1"], []
+            ),
+            access=source_steps.Access(
+                credential="", huggingface=None, civitai=None, allow_local=True
+            ),
+        )
+        envelope = {"store": store.root, "step": msgspec.to_builtins(step)}
         wrapper = """
 import json,os,subprocess,sys,threading
 from cozy_runtime import canonical_json

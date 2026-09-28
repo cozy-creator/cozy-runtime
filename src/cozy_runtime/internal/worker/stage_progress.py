@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from typing import Any
 
 # Display resolution of the lossy lane: the observer polls about once a second.
 SAMPLE_SECONDS = 1.0
 
-Emit = Callable[[dict[str, Any]], None]
+# A frame of the worker's progress lane.
+Emit = Callable[[dict[str, object]], None]
 # Where native child work reports: (parent request, parent attempt, call index, frame).
-Progress = Callable[[str, int, int, dict[str, Any]], None]
+Progress = Callable[[str, int, int, dict[str, object]], None]
 
 
 class StageProgress:
@@ -42,7 +42,7 @@ class StageProgress:
         now = self.clock()
         if now - self.sampled_at < SAMPLE_SECONDS and position < total:
             return
-        frame: dict[str, Any] = {
+        frame: dict[str, object] = {
             "kind": "progress",
             "stage": self.stage,
             "position": position,
@@ -63,7 +63,7 @@ class StageProgress:
         self.done = True
         elapsed = self.clock() - self.started
         moved = self.position - (self.baseline or 0)
-        fields: dict[str, Any] = {
+        fields: dict[str, object] = {
             "phase": self.stage,
             "completed": completed,
             "started_unix_ms": self.started_ms,

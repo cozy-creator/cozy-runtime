@@ -193,7 +193,7 @@ READ: frozenset[str] = frozenset(
 
 #: Module attributes reached by name that are not themselves called or read as values —
 #: the types cozy-runtime names to get at the members above.
-NAMED: frozenset[str] = frozenset({"Store", "ReadLease", "errors"})
+NAMED: frozenset[str] = frozenset({"Store", "ReadLease", "Header", "errors"})
 
 
 def _resolve(dotted: str) -> object:

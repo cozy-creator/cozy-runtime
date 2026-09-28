@@ -6,292 +6,203 @@ The parent owns acceptance and memoization; this child owns only bounded native 
 
 from __future__ import annotations
 
-import base64
-import faulthandler
 import hashlib
-import os
-import sys
-import threading
-import traceback
-from typing import Any
+from typing import TypedDict
+
+import msgspec
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef, SourceArtifact
+from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
 from cozy_runtime.internal import fill
+from cozy_runtime.internal.worker import commit_files
+from cozy_runtime.internal.worker.source_steps import (
+    Answer,
+    Convert,
+    Download,
+    Launch,
+    Produced,
+    Resolved,
+    ResolveSource,
+    Selection,
+    SourceRefusal,
+    SourceStep,
+    View,
+    report,
+    serve,
+)
+from cozy_runtime.internal.worker.source_steps import Commit as CommitStep
+from cozy_runtime.internal.worker.workspace_byte_outputs import manifest_members
 
-MAX_COMMAND = 2 << 20
-_STDOUT = threading.Lock()
+
+class _Manifest(TypedDict):
+    sha256: str
+    length: int
 
 
-def report(stage: str, position: int, total: int) -> None:
-    """One progress line ahead of the final result line; the parent owns throttling."""
-    line = canonical_json.encode(
-        {"progress": {"stage": stage, "position": position, "total": total}}
-    )
-    with _STDOUT:
-        sys.stdout.buffer.write(line + b"\n")
-        sys.stdout.buffer.flush()
+class Receipt(TypedDict):
+    """The fields read from TensorFS's derive receipt; the whole document is the receipt."""
+
+    manifest: _Manifest
 
 
-def materialize(store: Any, command: dict[str, Any]) -> dict[str, Any]:
-    selected = command["selection"]
-    members = [tuple(member) for member in selected["members"]]
-    produced: dict[str, Any] = store.materialize_source(
-        command["native_owner"],
-        members,
-        allowed_hosts=selected["allowed_hosts"],
-        credential_hosts=selected["credential_hosts"],
-        credential=command.get("credential", ""),
-        allow_local=command.get("allow_local", False),
+def materialize(store: fill.Store, step: Download) -> Produced:
+    produced = store.materialize_source(
+        step.native_owner,
+        step.pin.members,
+        allowed_hosts=step.pin.allowed_hosts,
+        credential_hosts=step.pin.credential_hosts,
+        credential=step.access["credential"],
+        allow_local=step.access["allow_local"],
         progress=lambda present, whole: report("download", present, whole),
     )
-    return produced
+    root = produced["artifact"]
+    manifest = ObjectRef(root["manifest_digest"], root["manifest_length"])
+    artifact = SourceArtifact(step.service_id, "source", manifest, root["receipt_digest"])
+    return Produced(result=msgspec.to_builtins(artifact), native_receipt=root["receipt"])
 
 
-class ConversionRefusal(ValueError):
-    def __init__(self, code: str, detail: str) -> None:
-        super().__init__(detail)
-        self.code = code
+def view(store: fill.Store, step: View) -> Produced:
+    source, manifest = store.tree_root(step.source_owner), step.manifest
+    if (
+        not source
+        or not source["complete"]
+        or source["released"]
+        or source["manifest_digest"] != manifest.digest
+        or source["manifest_length"] != manifest.length
+        or source["receipt_digest"] != step.receipt_digest
+    ):
+        raise ValueError("source view lost its exact native source")
+    body = store.manifest(manifest.digest)["manifest"]
+    size = sum(row.blob.length for row in manifest_members(body, SOURCE_FILES_MAX_BYTES))
+    if size != step.view_bytes:
+        raise ValueError("source view content bound changed")
+    produced = store.create_tree_root(step.view_owner, manifest.digest, manifest.length)
+    tree = {"asset_ref": manifest.digest, "kind": "tree", "digest": manifest.digest}
+    return Produced(
+        result={"files": {**tree, "size_bytes": size}}, native_receipt=produced["receipt"]
+    )
 
 
-def profiles_of(arguments: dict[str, Any]) -> tuple[str, ...]:
-    """The reviewed profiles one conversion composes, in their declared order."""
-    single, several = arguments.get("profile", ""), tuple(arguments.get("profiles", ()))
-    if bool(single) == bool(several) or len(set(several)) != len(several):
-        raise ConversionRefusal(
-            "model_source_profiles_invalid", "name one profile or distinct profiles"
-        )
-    return (single,) if single else several
-
-
-def execute(command: dict[str, Any]) -> dict[str, Any]:
-    store = fill.store(command["store"])
-    operation = command["operation"]
-    args = command["arguments"]
-    if operation == "commit_file":
-        from cozy_runtime.internal.worker.commit_files import execute as commit_file
-
-        return commit_file(store, command)
-    if operation == "source_files":
-        from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
-        from cozy_runtime.internal.worker.workspace_byte_outputs import manifest_members
-
-        source = store.tree_root(command["source_owner"])
-        manifest = command["view_manifest"]
-        if (
-            not source
-            or not source["complete"]
-            or source["released"]
-            or source["manifest_digest"] != manifest["digest"]
-            or source["manifest_length"] != manifest["length"]
-            or source["receipt_digest"] != args["source"]["tensorfs_receipt_digest"]
-        ):
-            raise ValueError("source view lost its exact native source")
-        body = store.manifest(manifest["digest"])["manifest"]
-        members = manifest_members(body, SOURCE_FILES_MAX_BYTES)
-        size = sum(member.blob.length for member in members)
-        if size != command["view_bytes"]:
-            raise ValueError("source view content bound changed")
-        produced = store.create_tree_root(
-            command["view_owner"], manifest["digest"], manifest["length"]
-        )
-        return {
-            "result": {
-                "files": {
-                    "asset_ref": manifest["digest"],
-                    "kind": "tree",
-                    "digest": manifest["digest"],
-                    "size_bytes": size,
-                }
-            },
-            "native_receipt": base64.b64encode(produced["receipt"]).decode(),
-        }
-    if command["phase"] == "resolve":
-        if operation == "download_huggingface":
-            uri = f"hf://{args['repository']}@{args['revision']}"
-            carriers, profiles = args.get("carriers", []), args.get("profiles", [])
-            files = args.get("files", [])
-        elif operation == "download_civitai":
-            uri = f"civitai://{args['version']}"
-            carriers, profiles = [args["file"]] if args.get("file") else [], []
-            files = []
-        else:
-            raise ValueError("conversion does not resolve a foreign source")
-        selection = store.resolve_source(
-            uri,
-            carriers,
-            profiles=profiles,
-            files=files,
-            credential=command.get("credential", ""),
-            huggingface=command.get("huggingface"),
-            civitai=command.get("civitai"),
-            allow_local=command.get("allow_local", False),
-        )
-        return {"selection": selection, "implementation": store.implementation_sha256}
-    if operation in ("download_huggingface", "download_civitai"):
-        materialized = materialize(store, command)
-        root = materialized["artifact"]
-        receipt = root["receipt"]
-        result = {
-            "producer_request_id": command["service_id"],
-            "output_slot": "source",
-            "manifest": {"digest": root["manifest_digest"], "length": root["manifest_length"]},
-            "tensorfs_receipt_digest": root["receipt_digest"],
-        }
-        return {
-            "result": result,
-            "native_receipt": base64.b64encode(receipt).decode(),
-            "transferred_bytes": materialized["transferred_bytes"],
-        }
-    if operation != "convert_cozytensors":
-        raise ValueError("unknown fixed source operation")
-    conversion_id = command["service_id"]
-    transaction = command["native_owner"]
-    observed = store.derived_lookup(transaction)
-    if observed.get("state") == "committed":
-        receipt = observed["receipt"]
-    else:
-        # One reviewed profile per slot; several profiles compose one model whose
-        # components are the union of theirs.
-        slots = [(f"part{index}", profile) for index, profile in enumerate(profiles_of(args))]
-        if len(slots) == 1:
-            slots = [("model", slots[0][1])]
-        checkpoints: list[tuple[str, str, int]] = []
-        adopt = command.get("adopt_operation")
-        registry = (
-            base64.b64decode(command["registry"], validate=True)
-            if command.get("registry")
-            else None
-        )
-        retained = store.tree_root(command["source_owner"])
-        if retained is None:
-            raise ValueError("conversion source has no retained native root")
-        total = sum(int(row["length"]) for row in store.walk(retained["manifest_digest"]))
-        written = 0
-        report("convert", 0, total)
-        while True:
-            prepared = store.prepare_source_artifact(
-                command["source_owner"],
-                conversion_id,
-                slots,
-                checkpoints=checkpoints,
-                adopt_from_operation_id=adopt,
-                registry=registry,
-            )
-            adopt = None
-            written += int(prepared["converted_bytes"])
-            if prepared["complete"]:
-                report("convert", total, total)
-                break
-            # Checkpoint heads carry resumed work; this process's passes carry the rest.
-            durable = sum(int(row["bytes"]) for row in prepared["checkpoints"])
-            report("convert", min(max(durable, written), total), total)
-            checkpoints = [
-                (row["slot"], row["head"], row["head_length"]) for row in prepared["checkpoints"]
-            ]
-        converted = {row["slot"]: row for row in prepared["sources"]}
-        if epoch := observed.get("writer_session_id"):
-            store.derived_fence(transaction, epoch)
-        sources: dict[str, tuple[str, int]] = {}
-        targets: dict[str, dict[str, Any]] = {}
-        configs: dict[str, dict[str, str]] = {}
-        order: list[tuple[str, str]] = []
-        assets: dict[str, list[str]] = {}
-        for slot, _ in slots:
-            part = converted[slot]
-            sources[slot] = (part["manifest_digest"], part["manifest_length"])
-            header = fill.tensorfs_module().parse_header(
-                store.manifest(part["manifest_digest"])["header"]
-            )
-            for name, tensors in header["components"].items():
-                if name in targets:
-                    raise ConversionRefusal(
-                        "model_source_components_overlap",
-                        f"source profiles both produce component {name}",
-                    )
-                targets[name] = {"source": slot, "source_component": name, "drop": [], "add": {}}
-                order.extend((name, key) for key in tensors)
-            for name in header["configs"]:
-                if name in configs:
-                    raise ConversionRefusal(
-                        "model_source_configs_overlap",
-                        f"source profiles both carry config {name}",
-                    )
-                configs[name] = {"kind": "copy", "source": slot, "source_config": name}
-            if header["assets"]:
-                assets[slot] = sorted(header["assets"])
-        writer = store.begin_derived(
-            transaction,
-            int(command["writer_epoch"]),
-            sources,
-            targets,
-            configs,
-            order,
-            0,
-            work_fingerprint=command["computation_digest"],
-        )
-        receipt = writer.commit()
-        for slot, names in assets.items():
-            inherited = store.inherit_model_assets(
-                receipt["manifest"]["sha256"],
-                receipt["manifest"]["length"],
-                sources[slot][0],
-                sources[slot][1],
-                names,
-            )
-            receipt["manifest"] = {
-                "sha256": str(inherited["manifest_id"]).removeprefix("sha256:"),
-                "length": inherited["manifest_length"],
-            }
+def convert(store: fill.Store, step: Convert) -> Produced:
+    observed = store.derived_lookup(step.native_owner)
+    receipt: Receipt = (
+        observed["receipt"]
+        if observed.get("state") == "committed"
+        else _compose(store, step, observed.get("writer_session_id"))
+    )
     native_receipt = canonical_json.encode(receipt)
-    result = {
-        "producer_request_id": command["service_id"],
-        "output_slot": "model",
-        "manifest": {
-            "digest": "sha256:" + receipt["manifest"]["sha256"],
-            "length": receipt["manifest"]["length"],
-        },
-        "tensorfs_receipt_digest": "sha256:" + hashlib.sha256(native_receipt).hexdigest(),
-    }
+    manifest = ObjectRef("sha256:" + receipt["manifest"]["sha256"], receipt["manifest"]["length"])
+    digest = "sha256:" + hashlib.sha256(native_receipt).hexdigest()
+    artifact = ModelArtifact(step.service_id, "model", manifest, digest)
     # The genuine derived result now holds every inherited model byte independently.
-    store.release_model_source(conversion_id)
-    return {
-        "result": result,
-        "native_receipt": base64.b64encode(native_receipt).decode(),
-    }
+    store.release_model_source(step.service_id)
+    return Produced(result=msgspec.to_builtins(artifact), native_receipt=native_receipt)
 
 
-def main() -> None:
-    # A native crash leaves every thread's stack in the stderr tail the parent keeps.
-    faulthandler.enable()
-    try:
-        command = canonical_json.decode(sys.stdin.buffer.read(MAX_COMMAND + 1))
-        if not isinstance(command, dict):
-            raise ValueError("source command must be an object")
-        parent = command.get("parent_pid")
-        if type(parent) is not int or parent <= 0:
-            raise ValueError("native source execution needs its process owner")
+def _compose(store: fill.Store, step: Convert, epoch: int | None) -> Receipt:
+    """One reviewed profile per slot; several profiles compose one model whose components
+    are the union of theirs."""
+    retained = store.tree_root(step.source_owner)
+    if retained is None:
+        raise ValueError("conversion lost its retained source")
+    total = sum(row["length"] for row in store.walk(retained["manifest_digest"]))
+    checkpoints: list[tuple[str, str, int]] = []
+    adopt, written = step.adopt, 0
+    report("convert", 0, total)
+    while True:
+        prepared = store.prepare_source_artifact(
+            step.source_owner,
+            step.service_id,
+            step.slots,
+            checkpoints=checkpoints,
+            adopt_from_operation_id=adopt,
+            registry=step.registry,
+        )
+        adopt = None
+        written += prepared["converted_bytes"]
+        if prepared["complete"]:
+            report("convert", total, total)
+            break
+        # Checkpoint heads carry resumed work; this process's passes carry the rest.
+        durable = sum(row["bytes"] for row in prepared["checkpoints"])
+        report("convert", min(max(durable, written), total), total)
+        checkpoints = [
+            (row["slot"], row["head"], row["head_length"]) for row in prepared["checkpoints"]
+        ]
+    converted = {row["slot"]: row for row in prepared["sources"]}
+    if epoch:
+        store.derived_fence(step.native_owner, epoch)
+    sources: dict[str, tuple[str, int]] = {}
+    targets: dict[str, dict[str, object]] = {}
+    configs: dict[str, dict[str, str]] = {}
+    order: list[tuple[str, str]] = []
+    assets: dict[str, list[str]] = {}
+    for slot, _ in step.slots:
+        part = converted[slot]
+        sources[slot] = (part["manifest_digest"], part["manifest_length"])
+        header = fill.tensorfs_module().parse_header(
+            store.manifest(part["manifest_digest"])["header"]
+        )
+        for name, tensors in header["components"].items():
+            if name in targets:
+                raise SourceRefusal(
+                    "model_source_components_overlap",
+                    f"source profiles both produce component {name}",
+                )
+            targets[name] = {"source": slot, "source_component": name, "drop": [], "add": {}}
+            order.extend((name, key) for key in tensors)
+        for name in header["configs"]:
+            if name in configs:
+                raise SourceRefusal(
+                    "model_source_configs_overlap", f"source profiles both carry config {name}"
+                )
+            configs[name] = {"kind": "copy", "source": slot, "source_config": name}
+        if header["assets"]:
+            assets[slot] = sorted(header["assets"])
+    writer = store.begin_derived(
+        step.native_owner,
+        step.writer_epoch,
+        sources,
+        targets,
+        configs,
+        order,
+        0,
+        work_fingerprint=step.computation_digest,
+    )
+    receipt: Receipt = writer.commit()
+    for slot, names in assets.items():
+        inherited = store.inherit_model_assets(
+            receipt["manifest"]["sha256"],
+            receipt["manifest"]["length"],
+            sources[slot][0],
+            sources[slot][1],
+            names,
+        )
+        receipt["manifest"] = {
+            "sha256": str(inherited["manifest_id"]).removeprefix("sha256:"),
+            "length": int(inherited["manifest_length"]),
+        }
+    return receipt
 
-        def parent_lifetime() -> None:
-            tick = threading.Event()
-            while os.getppid() == parent:
-                tick.wait(0.25)
-            os._exit(70)
 
-        threading.Thread(target=parent_lifetime, daemon=True, name="source-parent").start()
-        result = {"ok": True, **execute(command)}
-    except Exception as exc:
-        # Only the fixed code is the result. The parent redacts this stderr tail into the
-        # failure's diagnosis, never into the result.
-        traceback.print_exc()
-        code = getattr(exc, "code", "native_source_failed")
-        result = {"ok": False, "code": code if isinstance(code, str) else "native_source_failed"}
-    body = canonical_json.encode(result)
-    if len(body) > MAX_COMMAND:
-        body = canonical_json.encode({"ok": False, "code": "source_result_bound"})
-    with _STDOUT:
-        sys.stdout.buffer.write(body + b"\n")
-        sys.stdout.buffer.flush()
+def execute(launch: Launch[SourceStep]) -> Answer:
+    store = fill.store(launch.store)
+    match launch.step:
+        case ResolveSource() as step:
+            selection = store.resolve_source(
+                step.uri, step.carriers, profiles=step.profiles, files=step.files, **step.access
+            )
+            return Resolved(selection=msgspec.convert(selection, Selection))
+        case Download() as step:
+            return materialize(store, step)
+        case Convert() as step:
+            return convert(store, step)
+        case View() as step:
+            return view(store, step)
+        case CommitStep() as step:
+            return commit_files.execute(store, step)
 
 
 if __name__ == "__main__":
-    main()
+    serve(Launch[SourceStep], execute)

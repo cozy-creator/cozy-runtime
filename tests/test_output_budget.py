@@ -159,7 +159,7 @@ def test_native_file_commit_uses_the_recorded_parent_budget(
         workspace_sources.accepted(workspace, "owner", command)
         if index <= (2 if final_bytes > 8 else 1):
             prepared = commit_files.prepare(workspace, "owner", command, b"c" * 32, tmp_path)
-            assert prepared["file_basename"] == f"file-{index:04d}"
+            assert prepared.basename == f"file-{index:04d}"
         else:
             with pytest.raises(ValueError, match=r"budget|bounded"):
                 commit_files.prepare(workspace, "owner", command, b"c" * 32, tmp_path)

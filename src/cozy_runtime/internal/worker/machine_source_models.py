@@ -12,23 +12,26 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import subprocess
-import sys
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
+import msgspec
+
 from cozy_runtime import canonical_json
+from cozy_runtime.author._artifacts import ObjectRef
 from cozy_runtime.internal import fill
+from cozy_runtime.internal.source_interfaces import UploadCivitai, UploadHuggingFace
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from . import source_upload, workspace_partial
-from .source_calls import _exchange, _Tail, diagnosis
+from . import source_steps, source_upload, upload_plan, workspace_partial
+from .source_calls import UPLOAD_CHILD, diagnosis
+from .source_steps import Answer, Launch, Refused, UploadStep
 from .workspace import WorkspaceRefusal
 
 if TYPE_CHECKING:
@@ -43,68 +46,69 @@ _LOCKS_GUARD = threading.Lock()
 type Note = Callable[[str, int, int], None]
 
 
+class Evidence(msgspec.Struct, frozen=True):
+    """The model an identical choice made here, kept beside its local repository."""
+
+    manifest: ObjectRef
+    resolved: str
+    profiles: list[str]
+    selection: str
+
+
 def name(source: str, profiles: Sequence[str]) -> str:
     digest = hashlib.sha256(canonical_json.encode([FORMAT, source, sorted(profiles)]))
     return "source-" + digest.hexdigest()[:40]
 
 
-def _operation(source: str, profiles: list[str], local: str) -> tuple[str, dict[str, Any], bool]:
-    """The upload operation this source is, and whether its spelling is immutable."""
+def _request(
+    source: str, profiles: tuple[str, ...], local: str
+) -> tuple[upload_plan.Request, bool]:
+    """The upload this source is, and whether its spelling is immutable."""
     if match := _HF.fullmatch(source):
         repository, revision, member = match.groups()
-        arguments = {
-            "repository": repository,
-            "revision": revision,
-            "destination": "local/" + local,
-            "profiles": profiles,
-            "carriers": [unquote(member)] if member else [],
-        }
-        return "upload_huggingface", arguments, re.fullmatch(r"[0-9a-f]{40}", revision) is not None
+        request = UploadHuggingFace(
+            repository=repository,
+            revision=revision,
+            destination="local/" + local,
+            profiles=profiles,
+            carriers=(unquote(member),) if member else (),
+        )
+        return request, re.fullmatch(r"[0-9a-f]{40}", revision) is not None
     if match := _CIVITAI.fullmatch(source):
         version, file = match.groups()
-        arguments = {
-            "version": int(version),
-            "destination": "local/" + local,
-            "profiles": profiles,
-            "file": file or "",
-        }
-        return "upload_civitai", arguments, True
+        destination = "local/" + local
+        return UploadCivitai(int(version), destination, profiles, file or ""), True
     raise WorkspaceRefusal(
         f"model source {source[:200]!r} is not hf://org/repo@revision or civitai://"
     )
 
 
 def slot(
-    worker: Worker,
-    parameter: str,
-    choice: Mapping[str, Any],
-    credentials: Mapping[str, str],
-    note: Note,
-) -> dict[str, Any]:
+    worker: Worker, choice: pb.ModelChoice, credentials: Mapping[str, str], note: Note
+) -> dict[str, object]:
     """One source choice as the slot row serving preparation binds, made once per machine."""
-    source, profiles = str(choice["source"]), [str(p) for p in choice.get("profiles", [])]
-    if choice.get("repository") or choice.get("manifest"):
-        raise WorkspaceRefusal(f"{parameter} names a source and a catalog checkpoint")
-    local = name(source, profiles)
-    operation, arguments, pinned = _operation(source, profiles, local)
+    if choice.repository or choice.HasField("manifest"):
+        raise WorkspaceRefusal(f"{choice.parameter} names a source and a catalog checkpoint")
+    local = name(choice.source, choice.profiles)
+    request, pinned = _request(choice.source, tuple(choice.profiles), local)
     with _LOCKS_GUARD:
         lock = _LOCKS.setdefault(local, threading.Lock())
     with lock:
         facts = _held(worker, local) if pinned else None
         if facts is None:
-            facts = _make(worker, local, operation, arguments, credentials, note)
+            facts = _make(worker, local, request, credentials, note)
     return {
-        "parameter": parameter,
+        "parameter": choice.parameter,
         "public_origin": "",
         "gpu": "*",
         "gpus": 0,
         "repository": "local/" + local,
-        "manifest": facts["manifest"],
+        "manifest": msgspec.to_builtins(facts.manifest),
         "release": "",
         "lane": "",
-        "source": source,
-        "resolved": facts["resolved"],
-        "profiles": facts["profiles"],
+        "source": choice.source,
+        "resolved": facts.resolved,
+        "profiles": facts.profiles,
     }
 
 
@@ -113,56 +117,50 @@ def _evidence(worker: Worker, local: str) -> Path:
     return worker.workspace.directory / "source-models" / f"{local}.json"
 
 
-def _held(worker: Worker, local: str) -> dict[str, Any] | None:
+def _held(worker: Worker, local: str) -> Evidence | None:
     """The model an earlier identical choice made here, when its bytes are all still held."""
     assert worker.workspace is not None
     store = fill.store(worker.workspace.store_root)
     try:
-        facts = canonical_json.decode(_evidence(worker, local).read_bytes())
+        facts = msgspec.json.decode(_evidence(worker, local).read_bytes(), type=Evidence)
         row = store.resolve_local(local)
-        digest, length = row["manifest_digest"], row["manifest_length"]
-        if facts.get("manifest") != {"digest": digest, "length": length}:
+        if facts.manifest != ObjectRef(row["manifest_digest"], row["manifest_length"]):
             return None
-        store.verify_checkpoint_source("local/" + local, digest, length)
+        store.verify_checkpoint_source(
+            "local/" + local, facts.manifest.digest, facts.manifest.length
+        )
     except (FileNotFoundError, ValueError, fill.tensorfs_module().errors.Refusal):
         return None
-    return dict(facts)
+    return facts
 
 
 def _make(
     worker: Worker,
     local: str,
-    operation: str,
-    arguments: dict[str, Any],
+    request: upload_plan.Request,
     credentials: Mapping[str, str],
     note: Note,
-) -> dict[str, Any]:
+) -> Evidence:
     workspace, calls = worker.workspace, worker.source_calls
     assert workspace is not None
     store = fill.store(workspace.store_root)
-    endpoints = dict(calls.endpoints) if calls is not None else {}
     native_owner = "sha256:" + hashlib.sha256(canonical_json.encode([FORMAT, local])).hexdigest()
-    credential = credentials.get(operation.removeprefix("upload_"), "")
+    provider = "huggingface" if isinstance(request, UploadHuggingFace) else "civitai"
+    credential = credentials.get(provider, "")
+
+    def child[A: Answer](launch: Launch[UploadStep], answer: type[A]) -> A:
+        return _child(credential, launch, answer)
+
     upload = source_upload.Upload(
         store_root=workspace.store_root,
         native_owner=native_owner,
         service_id=local,
-        operation=operation,
-        arguments=arguments,
-        envelope={
-            "store": str(workspace.store_root),
-            "parent_pid": os.getpid(),
-            "operation": operation,
-            "arguments": arguments,
-            "native_owner": native_owner,
-            "credential": credential,
-            **endpoints,
-            "allow_local": bool(endpoints),
-        },
+        request=request,
+        access=source_steps.access(calls.endpoints if calls is not None else {}, credential),
         registry=calls.native_registry if calls is not None else None,
         client=None,
         hooks=source_upload.Hooks(
-            child=partial(_child, credential),
+            child=child,
             canceled=lambda: False,
             active=calls.active if calls is not None else lambda: set(),
             live=lambda: set(),
@@ -170,85 +168,52 @@ def _make(
             consume=lambda _service: False,
             progress=note,
         ),
-        allow_local=bool(endpoints),
         directory=workspace.directory,
     )
     note("resolving model source headers", 0, 1)
     selection = upload.resolve()
     if not upload.slots:
         upload.select(selection)
-    content = {
-        "content_manifest": {
-            "digest": selection["content_manifest_digest"],
-            "length": selection["content_manifest_length"],
-        }
-    }
+    manifest = ObjectRef(selection.content_manifest_digest, selection.content_manifest_length)
+    content = {"content_manifest": msgspec.to_builtins(manifest)}
     computation = hashlib.sha256(
         canonical_json.encode(
             [FORMAT, content, upload.slots, upload.recipe.name if upload.recipe else ""]
         )
     ).digest()
     model = upload.convert(
-        selection, content, "sha256:" + computation.hex(), time.time_ns() // 1_000_000
+        selection, manifest, "sha256:" + computation.hex(), time.time_ns() // 1_000_000
     )
-    manifest = {"digest": model["digest"], "length": int(model["length"])}
     try:
-        current = store.repo_get("local", local)
+        current: bytes | None = store.repo_get("local", local)
     except fill.tensorfs_module().errors.Refusal:
         current = None
-    store.replace_local(
-        current,
-        local,
-        "sha256:" + selection["selection_sha256"],
-        manifest["digest"],
-        manifest["length"],
-    )
-    facts = {
-        "manifest": manifest,
-        "resolved": selection["canonical"],
-        "profiles": [profile for _, profile in upload.slots],
-        "selection": "sha256:" + selection["selection_sha256"],
-    }
+    pin = "sha256:" + selection.selection_sha256
+    store.replace_local(current, local, pin, model.digest, model.length)
+    facts = Evidence(model, selection.canonical, [profile for _, profile in upload.slots], pin)
     path = _evidence(worker, local)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as staged:
-        staged.write(canonical_json.encode(facts))
+        staged.write(canonical_json.encode(msgspec.to_builtins(facts)))
         staged.flush()
         os.fsync(staged.fileno())
     os.replace(staged.name, path)
     # The local repository holds the model; the source and the conversion session go.
-    source_upload.release(
-        store, workspace.directory, {"service_id": local, "native_owner": native_owner}, set()
-    )
+    source_upload.release(store, workspace.directory, local, native_owner, set())
     return facts
 
 
-def _child(credential: str, envelope: dict[str, Any]) -> dict[str, Any]:
+def _child[A: Answer](credential: str, launch: Launch[UploadStep], answer: type[A]) -> A:
     """One upload step in its own process; no wall clock ends it."""
-    encoded = canonical_json.encode(envelope)
-    process = subprocess.Popen(
-        [sys.executable, "-m", "cozy_runtime.internal.upload_child"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert process.stderr is not None
-    tail = _Tail(process.stderr)
-    try:
-        output = _exchange(process, encoded, lambda _sample: None)
-    finally:
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-    if process.returncode or not output:
+    status, output, stderr = source_steps.run(UPLOAD_CHILD, launch)
+    if status or not output:
         raise WorkspaceRefusal(
-            "model source preparation failed: "
-            + diagnosis(process.returncode, tail.text(), credential)
+            "model source preparation failed: " + diagnosis(status, stderr, credential)
         )
-    answer = canonical_json.decode(output)
-    if not answer.get("ok"):
-        raise WorkspaceRefusal(f"model source preparation refused: {answer.get('code')}")
-    return dict(answer)
+    got = source_steps.answer(output, answer)
+    if isinstance(got, Refused):
+        raise WorkspaceRefusal(f"model source preparation refused: {got.code}")
+    return got
 
 
 _PROVIDERS = {

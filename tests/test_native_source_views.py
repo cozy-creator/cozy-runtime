@@ -299,8 +299,8 @@ def test_source_view_stop_before_journal_completion_releases_native_root(tmp_pat
     workspace_sources.accepted(workspace, "owner", command)
     envelope = source_views.prepare(workspace, "owner", command, b"k" * 32)
     store = tensorfs.Store.open(str(workspace.store_root))
-    manifest = envelope["view_manifest"]
-    result = store.create_tree_root(envelope["view_owner"], manifest["digest"], manifest["length"])
+    manifest = envelope.manifest
+    result = store.create_tree_root(envelope.view_owner, manifest.digest, manifest.length)
     workspace_sources.stopped(workspace, "owner", command)
     with pytest.raises(WorkspaceRefusal, match="current native call"):
         source_views.complete(
@@ -310,11 +310,11 @@ def test_source_view_stop_before_journal_completion_releases_native_root(tmp_pat
             b"{}",
             b"k" * 32,
             result["receipt"],
-            envelope["view_owner"],
+            envelope.view_owner,
         )
     source_views.abort_unfinished(workspace, "owner", command)
     tensorfs.gc(str(workspace.store_root))
-    observed = store.tree_root(envelope["view_owner"])
+    observed = store.tree_root(envelope.view_owner)
     assert observed is not None and observed["released"]
 
 
@@ -328,21 +328,21 @@ def test_source_view_failed_completion_retries_original_intent_and_native_root(
     workspace_sources.accepted(workspace, "owner", command)
     envelope = source_views.prepare(workspace, "owner", command, b"k" * 32)
     store = tensorfs.Store.open(str(workspace.store_root))
-    manifest = envelope["view_manifest"]
-    native = store.create_tree_root(envelope["view_owner"], manifest["digest"], manifest["length"])
+    manifest = envelope.manifest
+    native = store.create_tree_root(envelope.view_owner, manifest.digest, manifest.length)
     with workspace.locked() as db:
         db.execute(
             "UPDATE native_calls SET state='failed' WHERE service_id=?", (command.service_id,)
         )
     source_views.abort_unfinished(workspace, "owner", command)
-    observed = store.tree_root(envelope["view_owner"])
+    observed = store.tree_root(envelope.view_owner)
     assert observed is not None and not observed["released"]
     retried = reattach(workspace, command)
     result = run_view(Workspace(workspace.store_root), retried)
     assert result.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, result.safe_code
     assert result.parent_attempt_ordinal == 2
     assert result.byte_output_attempt_ordinal == 1
-    assert result.byte_output.producer_root_id == envelope["view_owner"]
+    assert result.byte_output.producer_root_id == envelope.view_owner
     assert result.native_receipt_canonical_bytes == native["receipt"]
     with workspace.locked() as db:
         assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 1
@@ -363,7 +363,7 @@ def test_source_view_explicit_cancel_cannot_restart_same_logical_call(tmp_path: 
     with workspace.locked() as db:
         assert (
             db.execute(
-                "SELECT state FROM byte_outputs WHERE id=?", (envelope["view_owner"],)
+                "SELECT state FROM byte_outputs WHERE id=?", (envelope.view_owner,)
             ).fetchone()[0]
             == "released"
         )
