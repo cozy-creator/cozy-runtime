@@ -102,6 +102,7 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptRecord,
     AttemptRefusal,
     AttemptSlot,
+    Exchange,
     Released,
     safe,
 )
@@ -1189,6 +1190,9 @@ class Worker:
             weights=self.weights,
             owner_scope=lambda: self.fence.record_owner_id,
             tensorfs_root=options.tensorfs_root,
+            room=lambda attempt: self._room(
+                self.lanes.by_id[self.engine.slot_of(attempt).lane_id], attempt.placement_id
+            ),
             work_fingerprint=lambda attempt: weights_sink.work_fingerprint(
                 attempt.spec,
                 self.numerical_environment(),
@@ -6085,8 +6089,9 @@ class Worker:
         label = key.removeprefix("sha256:")[:12]
         if not first.weightless:
             # A CO-TENANT PROCESS on a shared single-device lane gives the card up first
-            # (cr-022); a lane with one process has no victim and moves nothing.
-            declared = sum(binding.model_weight_bytes for binding in group)
+            # (cr-022); a lane with one process has no victim and moves nothing. Bindings of
+            # one construction share its weights, so they are counted once.
+            declared = max(binding.model_weight_bytes for binding in group)
             lane.touch(slot)
             self._make_room(
                 lane,
@@ -6119,6 +6124,7 @@ class Worker:
                 on_progress=lambda frame: self.monitor.advance(
                     subject, int(frame.get("position", 0) or 0)
                 ),
+                on_request=self._room(lane, slot),
             )
         except ExecutorGone as exc:
             self.monitor.end(subject, "executor_gone")
@@ -6133,7 +6139,7 @@ class Worker:
                 # A load refused before it touched the process is this request's constraint
                 # (a pin, a fit, the device's free bytes); a poisoned one is the executor's.
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT
-                if reply.get("poisoned", "unreported")
+                if reply.get("poisoned", "unreported") and code not in DEVICE_SHORTFALL_CODES
                 else CAUSE.CAUSE_CODE_INVALID_REQUEST
                 if code.startswith("attention_kernel_")
                 else CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
@@ -6204,7 +6210,9 @@ class Worker:
         The executor reports `poisoned` on every refused load: empty when the load was
         refused before it touched the process (a plan, fit or device-shortfall refusal on one
         rank), so its other constructions keep serving and the next request tries again. An
-        older executor that does not report it is treated as poisoned.
+        older executor that does not report it is treated as poisoned. A capacity refusal
+        is never held against the binding: the card was short for this attempt, and the
+        next one prepares afresh even when the process had to be replaced.
         """
         placement_id = tenant.placement.placement_id
         first = group[0]
@@ -6243,17 +6251,21 @@ class Worker:
                 f"{code} - {detail}. The executor held nothing for it and keeps serving",
             )
             return
+        capacity = code in DEVICE_SHORTFALL_CODES
         with self.control_lock:
             current = self._current_tenant(tenant)
             for member in group:
                 # PER-BINDING (#572d), and it OUTLIVES the rebuild the refusal causes: the
                 # process is replaced, but this construction is not tried again until the
-                # desired state changes.
-                current.failed_bindings[member.entrypoint_binding_digest] = f"{code}: {detail}"
-                executor.ready_bindings.discard(member.entrypoint_binding_digest)
+                # desired state changes. A capacity refusal is this attempt's alone.
+                if not capacity:
+                    current.failed_bindings[member.entrypoint_binding_digest] = f"{code}: {detail}"
+                    executor.ready_bindings.discard(member.entrypoint_binding_digest)
                 self.engine.fault(
                     pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        kind=pb.FaultKind.FAULT_KIND_BINDING_DEGRADED
+                        if capacity
+                        else pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                         subject=member.entrypoint_binding_digest,
                         reason=code,
                         detail=safe(detail),
@@ -6293,6 +6305,7 @@ class Worker:
                         "authorized_device_limit_bytes": authorized,
                     },
                     timeout=None,
+                    on_request=self._room(tenant.lane, tenant.slot),
                 )
         except ExecutorGone as exc:
             raise AttemptRefusal(
@@ -6754,29 +6767,38 @@ class Worker:
         cannot read is left alone: the prepare or the plan refuses typed on the same fact.
         A victim's process stays — only its residency changes, so its executor epoch and
         its placement's serving state do not move; its next attempt re-stages on demand.
+        Idle allocator caches go back before any weights do: dropping one costs its owner
+        nothing, while a vacated tenant pays a re-stage on its next attempt.
         """
         kind = accel.host_backend_family()
-        tried: set[str] = set()
+        tried: set[tuple[str, bool]] = set()
         while True:
             measured = lane.measure(kind)
             memory = fold_memory(measured)
             if memory.state != "measured" or fits(memory):
                 return
             tightest = min(measured, key=lambda ordinal: measured[ordinal].free_bytes)
-            found = [v for v in self.lanes.victims(lane, slot, tightest) if v[0] not in tried]
+            found = [
+                (victim, row, residents)
+                for residents in (False, True)
+                for victim, row in self.lanes.victims(lane, slot, tightest)
+                if (victim, residents) not in tried and (not residents or row.resident_bytes())
+            ]
             if not found:
                 break
-            victim, row = found[0]
-            tried.add(victim)
+            victim, row, residents = found[0]
+            tried.add((victim, residents))
             executor = row.executor()
             if executor is None:
                 continue
-            freed, took = self._vacate(victim, row, executor, why)
+            freed, took = self._vacate(victim, row, executor, why, residents=residents)
+            moved = f"vacated {freed} B in {took:.0f} ms" if residents else "released its cache"
             self.note(
                 "residency",
                 f"{lane.lane_id}: {victim!r} (epoch {executor.epoch} pid {executor.pid}) "
-                f"vacated {freed} B in {took:.0f} ms from device {tightest} for {slot!r} on "
-                f"{why}; the driver reported {memory.free_bytes} B free before",
+                f"{moved} for {slot!r} on {why}; the driver reports "
+                f"{measured[tightest].free_bytes} -> {lane.measure(kind)[tightest].free_bytes} "
+                f"B free on device {tightest}",
             )
         self.note(
             "residency",
@@ -6784,19 +6806,40 @@ class Worker:
             f"back for {why}; the plan decides on {memory.free_bytes} B free",
         )
 
+    def _room(self, lane: DeviceLane, slot: str) -> Exchange:
+        """Answer an executor whose own evictions cannot fit what it must place now: idle
+        co-tenants of its devices give memory back, LRU-first, and it re-measures. What
+        stays short after that is held by running work, and the executor refuses on it."""
+
+        def answer(frame: Mapping[str, object]) -> dict[str, object]:
+            need = frame.get("free_bytes")
+            if frame.get("kind") != "device_room" or not isinstance(need, int):
+                return {"ok": False, "code": "no_durable_exchange", "detail": "device_room only"}
+            why = f"its executor needs {need} B free"
+            self._make_room(lane, slot, lambda memory: memory.free_bytes >= need, why)
+            try:
+                return {
+                    "ok": True,
+                    "authorized_device_limit_bytes": self._process_ceiling(lane, slot),
+                }
+            except LaneRefusal as exc:
+                return {"ok": False, "code": exc.code, "detail": exc.detail}
+
+        return answer
+
     def _vacate(
-        self, victim: str, row: LaneRow, executor: child.Executor, why: str
+        self, victim: str, row: LaneRow, executor: child.Executor, why: str, *, residents: bool
     ) -> tuple[int, float]:
-        """Ask one co-tenant's executor to free every component it holds; bank the
-        after-state on its row. Returns the bytes it reports freed and how long the free
-        took (0 on refusal or death: a dead executor freed everything, and the
-        re-measurement says so). HALF OF A SWAP IS AN EVICTION and the other half is a
-        re-fill; both halves are timed now, because the cost of alternating two models on
-        one card was being inferred from a construction's fill leg instead of measured
-        (cr-100)."""
+        """Ask one co-tenant's executor to free every component it holds (or, without
+        `residents`, only its allocator cache); bank the after-state on its row. Returns the
+        bytes it reports freed and how long the free took (0 on refusal or death: a dead
+        executor freed everything, and the re-measurement says so). HALF OF A SWAP IS AN
+        EVICTION and the other half is a re-fill; both halves are timed now, because the
+        cost of alternating two models on one card was being inferred from a construction's
+        fill leg instead of measured (cr-100)."""
         try:
             with executor.watched("vacate"):
-                reply = executor.call({"cmd": "vacate"}, timeout=None)
+                reply = executor.call({"cmd": "vacate", "residents": residents}, timeout=None)
         except ExecutorGone as exc:
             row.ledger.device_unreadable(f"the executor died while vacating: {exc}")
             self.note("residency", f"{victim!r} died while vacating: {exc}"[:256])

@@ -397,13 +397,13 @@ class LaneSet:
         ]
 
     def victims(self, lane: DeviceLane, slot: str, ordinal: int) -> list[tuple[str, LaneRow]]:
-        """`slot`'s co-tenants holding bytes on `ordinal`, one of `lane`'s devices, LRU
-        first. None is on the card: the caller holds `lane.device`, which any of them
-        needs to execute."""
+        """`slot`'s live co-tenants on `ordinal`, one of `lane`'s devices, LRU first. None
+        is on the card: the caller holds `lane.device`, which any of them needs to execute.
+        One holding no residents may still hold an allocator cache."""
         held = [
             (key, row)
             for key, row in self.tenants(lane, ordinal)
-            if key != slot and row.resident_bytes() > 0 and row.executor() is not None
+            if key != slot and row.executor() is not None
         ]
         return sorted(held, key=lambda item: item[1].last_used)
 

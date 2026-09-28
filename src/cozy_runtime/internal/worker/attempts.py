@@ -172,6 +172,9 @@ CAUSE = pb.CauseCode
 ORIGIN = pb.CauseOrigin
 STATUS = pb.OutcomeStatus
 
+#: The worker's answer to one durable request an executor makes mid-call.
+Exchange = Callable[[Mapping[str, object]], dict[str, object]]
+
 #: The author-surface outcome vocabulary, mapped onto the wire's NEUTRAL one. The mapping is
 #: total and closed: a new author terminal without a wire meaning is a compile-time hole.
 #: The executor's own faults under a group lane (cr-068): a follower died, diverged or
@@ -530,6 +533,7 @@ class AttemptEngine:
         tensorfs_root: Path | None = None,
         work_fingerprint: Callable[[AttemptRecord], str] | None = None,
         attention_pin: str = "",
+        room: Callable[[AttemptRecord], Exchange] | None = None,
     ) -> None:
         self.records = records
         self.authorizer = authorizer
@@ -561,6 +565,8 @@ class AttemptEngine:
         self.owner_scope = owner_scope
         self.tensorfs_root = tensorfs_root
         self.work_fingerprint = work_fingerprint
+        #: a serving attempt's answer to its executor asking for device room mid-call
+        self.room = room
         #: the demand falsifier. It ships first, it counts, and it decides nothing — the
         #: `timing-decides-nothing` fence proves the module it lives in cannot reach the
         #: planner, the ledger or the fill plane.
@@ -1792,7 +1798,7 @@ class AttemptEngine:
                 self._command(attempt, key, spool, seconds),
                 timeout=None,
                 on_progress=on_progress,
-                on_request=on_request if job else None,
+                on_request=on_request if job else self.room(attempt) if self.room else None,
             )
         except ExecutorGone as exc:
             attempt.resulted_at = time.perf_counter()
