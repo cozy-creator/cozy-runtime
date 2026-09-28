@@ -30,8 +30,10 @@ from __future__ import annotations
 import io
 import math
 import os
+import queue
+import threading
 from array import array
-from collections.abc import Buffer, Mapping
+from collections.abc import Buffer, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
@@ -68,6 +70,10 @@ AAC_FRAME_SAMPLES = 1024
 # native muxer queue. Payload bytes and packet count bound data and per-packet metadata.
 _MP4_PREAMBLE_BYTES = 8 << 20
 _MP4_PREAMBLE_PACKETS = 1024
+
+#: Converted frames waiting for the streaming encoder's x264 thread (~1.5 MB each at H3's
+#: 1344x768): enough to absorb a decode chunk while the caller converts the next one.
+_ENCODE_QUEUE_FRAMES = 16
 
 
 def x264_threads() -> int:
@@ -589,6 +595,10 @@ class StreamingMP4Encoder:
     """The one bounded fragmented H.264/AAC writer used by the author stream sinks.
 
     With `copy`, its video track is the planned tracks' packets, never re-encoded.
+    Otherwise the caller converts each RGB frame (swscale on the x264 thread count, bitwise
+    the single-threaded output) and encodes AAC, while one encode thread runs x264 and every
+    mux in submission order: the bytes are the serial writer's. H3's decode over four ranks
+    delivers ~80 fps; the serial writer kept ~33 (runs 1435-1441).
     """
 
     def __init__(
@@ -649,6 +659,10 @@ class StreamingMP4Encoder:
         self._preamble_packets = 0
         self._preamble_written = not bool(audio_channels)
         self._streams_started: set[int] = set()
+        self._jobs: queue.Queue[Callable[[], None] | None] = queue.Queue(_ENCODE_QUEUE_FRAMES)
+        self._failure: BaseException | None = None
+        self._stopping = False
+        self._worker: threading.Thread | None = None
         self._av = _av()
         try:
             # A copied track keeps its own colour tags; only the RGB converter needs them.
@@ -707,6 +721,15 @@ class StreamingMP4Encoder:
             self._raw.close()
             path.unlink(missing_ok=True)
             raise
+        if copy is None:
+            # Open both encoders and write the header here, as the first encode and mux
+            # would, so the encode thread (x264, mux) and the caller (AAC) never share them.
+            for stream in (self._video, self._audio):
+                if stream is not None:
+                    stream.codec_context.open(strict=False)
+            self._container.start_encoding()
+            self._worker = threading.Thread(target=self._drain, name="mp4-encode", daemon=True)
+            self._worker.start()
 
     def write_video(self, rgb: bytes) -> None:
         expected = self.width * self.height * 3
@@ -745,14 +768,17 @@ class StreamingMP4Encoder:
             dst_color_trc=self.color_transfer,
             dst_color_primaries=self.color_primaries,
             interpolation=interpolation,
-            threads=1,
+            threads=x264_threads(),
         )
         frame.pts = self.video_frames
         frame.time_base = Fraction(self.frame_rate.denominator, self.frame_rate.numerator)
+        self._submit(lambda: self._encode_video(frame))
+        self.video_frames += 1
+
+    def _encode_video(self, frame: Any) -> None:
         for packet in self._video.encode(frame):
             packet.duration = 1
             self._mux(packet)
-        self.video_frames += 1
 
     def copy_video(self, before: Any) -> None:
         """Mux the planned tracks' packets back to back; `before(t)` writes audio up to t."""
@@ -779,34 +805,70 @@ class StreamingMP4Encoder:
                 f"streaming audio has {planar.shape[0]} channels, expected {self.audio_channels}",
                 code="audio_shape",
             )
-        for frame in _audio_frames(
-            self._av,
-            planar,
-            self.audio_sample_rate,
-            "flt",
-            AAC_FRAME_SAMPLES,
-            # Keep the author's sample clock. The MP4 edit list accounts for the
-            # encoder's negative initial timestamp; it is not an extra PCM frame.
-            start_pts=self.audio_samples,
-        ):
-            for packet in self._audio.encode(frame):
-                self._mux(packet)
+        packets = [
+            packet
+            for frame in _audio_frames(
+                self._av,
+                planar,
+                self.audio_sample_rate,
+                "flt",
+                AAC_FRAME_SAMPLES,
+                # Keep the author's sample clock. The MP4 edit list accounts for the
+                # encoder's negative initial timestamp; it is not an extra PCM frame.
+                start_pts=self.audio_samples,
+            )
+            for packet in self._audio.encode(frame)
+        ]
+        self._submit(lambda: self._mux_all(packets))
         self.audio_samples += planar.shape[1]
 
     def finish(self) -> EncodedVideoFacts:
         if self.video_frames == 0:
             raise OutputError("streaming video contains no frames", code="frame_shape")
-        for packet in self._video.encode() if self.copy is None else ():
-            packet.duration = 1
-            self._mux(packet)
-        if self._audio is not None:
-            for packet in self._audio.encode():
-                self._mux(packet)
+        audio = self._audio.encode() if self._audio is not None else []
+        self._submit(lambda: self._flush(audio))
+        self._join()
         self._container.close()
         self._raw.flush()
         os.fsync(self._raw.fileno())
         self._raw.close()
         return probe_mp4(self.path)
+
+    def _flush(self, audio: list[Any]) -> None:
+        for packet in self._video.encode() if self.copy is None else ():
+            packet.duration = 1
+            self._mux(packet)
+        self._mux_all(audio)
+
+    def _mux_all(self, packets: list[Any]) -> None:
+        for packet in packets:
+            self._mux(packet)
+
+    def _submit(self, job: Callable[[], None]) -> None:
+        """Run `job` on the encode thread, after every job before it; inline for a copy."""
+        if self._failure is not None:
+            raise self._failure
+        if self._worker is None:
+            job()
+        else:
+            self._jobs.put(job)
+
+    def _drain(self) -> None:
+        while (job := self._jobs.get()) is not None:
+            if self._failure is None and not self._stopping:
+                try:
+                    job()
+                except BaseException as exc:
+                    self._failure = exc
+
+    def _join(self) -> None:
+        """Wait for every submitted job; the first failure is the writer's failure."""
+        if self._worker is not None:
+            self._jobs.put(None)
+            self._worker.join()
+            self._worker = None
+        if self._failure is not None:
+            raise self._failure
 
     def _mux(self, packet: Any) -> None:
         # Encoded payload is a lower bound on container bytes. Charge it before
@@ -840,6 +902,9 @@ class StreamingMP4Encoder:
             self._preamble_written = True
 
     def abort(self) -> None:
+        self._stopping = True
+        with suppress(BaseException):
+            self._join()
         with suppress(Exception):
             self._container.close()
         self._raw.close()

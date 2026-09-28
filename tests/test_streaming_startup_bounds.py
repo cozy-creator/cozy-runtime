@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
@@ -100,3 +101,54 @@ def test_missing_initial_track_refuses_before_unbounded_buffering(
     assert emitted < count
     assert not attempt.pending
     assert not list(tmp_path.glob(".video-*")) and not list(tmp_path.glob("video-*"))
+
+
+@pytest.mark.parametrize("fail_at", [0, 30])
+def test_a_stream_failing_under_the_encode_thread_leaves_no_file_or_thread(
+    tmp_path: Path, fail_at: int
+) -> None:
+    """The source fails while x264 frames are still queued on the encode thread (H3's
+    decode abandoning its stream): the author's error surfaces, the writer joins its
+    thread and unlinks the partial file."""
+    attempt = fakes.fake_attempt("abandoned", spool=tmp_path)
+    out = fakes.fake_outputs(attempt)
+    random = np.random.default_rng(3)
+
+    def events() -> Iterator[DecodedMediaEvent]:
+        yield DecodedMediaHeader(
+            video=DecodedVideoFormat(
+                width=256,
+                height=144,
+                time_base=Fraction(1, 24),
+                pixel_aspect_ratio=Fraction(1),
+                nominal_frame_rate=Fraction(24),
+                color_primaries=1,
+                color_transfer=1,
+                color_matrix=1,
+                color_range=1,
+            ),
+            audio=None,
+        )
+        for index in range(48):
+            if index == fail_at:
+                raise OutputError("the decode abandoned the video stream", code="output_integrity")
+            yield DecodedVideoFrame(
+                width=256,
+                height=144,
+                rgb=random.integers(0, 256, (144, 256, 3), dtype=np.uint8).tobytes(),
+                pts=index,
+                duration=1,
+                time_base=Fraction(1, 24),
+                pixel_aspect_ratio=Fraction(1),
+                color_primaries=1,
+                color_transfer=1,
+                color_matrix=1,
+                color_range=1,
+            )
+
+    with pytest.raises(OutputError) as caught:
+        out.save_video_stream(events())
+    assert caught.value.code == "output_integrity"
+    assert not attempt.pending
+    assert not list(tmp_path.glob(".video-*")) and not list(tmp_path.glob("video-*"))
+    assert not [t for t in threading.enumerate() if t.name == "mp4-encode"]
