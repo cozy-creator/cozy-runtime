@@ -92,8 +92,7 @@ FLASH_ATTENTION_CACHE_ENABLED_ENV = "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"
 
 # IMPOSE pass: the complete reviewed allowlist. Adding a row is a reviewed change; the
 # runtime refuses to project anything not listed here. Class-B impose vocabulary
-# (tracker-v2/spawn-allowlists.md #616.d; per-tool superset — COZY_BOOTSTRAP_CREDENTIAL
-# is the creator->worker leg's imposition, never the executor's).
+# (tracker-v2/spawn-allowlists.md #616.d).
 CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
     ProjectedVar(
         "CUDA_VISIBLE_DEVICES",

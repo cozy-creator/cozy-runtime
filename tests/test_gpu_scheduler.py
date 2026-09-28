@@ -26,6 +26,7 @@ from typing import Any, Literal
 
 import pytest
 
+import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import accel, child_env, package_interface
@@ -262,9 +263,7 @@ class Machine:
 
     def __init__(self, root: Path, devices: str, boot: str) -> None:
         base = {
-            k: v
-            for k, v in os.environ.items()
-            if not child_env.erased(k) and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+            k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"
         }
         config = RuntimeConfig(
             cozy_home=root / "home",
@@ -272,8 +271,10 @@ class Machine:
             child_base_env=tuple(sorted(base.items())),
         )
         self.worker = Worker(
-            replace(config, bootstrap_credential="test-bootstrap"),
+            replace(config, record_owner_public_key=signed_claims.PUBLIC_KEY),
             WorkerOptions(
+                worker_id=signed_claims.WORKER_ID,
+                worker_tls_certificate_digest=signed_claims.TLS_DIGEST,
                 root=root / "worker",
                 tensorfs_root=root / "store",
                 devices=devices,
@@ -281,12 +282,7 @@ class Machine:
             ),
             InMemoryControlHost(),
         )
-        claim = pb.Claim(
-            record_owner_id=OWNER,
-            record_owner_epoch=1,
-            wire_minor=WIRE_MINOR,
-            proof=b"test-bootstrap",
-        )
+        claim = signed_claims.claim(OWNER, boot=boot)
         assert self.worker.accept_claim(claim, lambda frame: None)[0] >= 1
         self.claim = claim
         assert self.worker.executions is not None and self.worker.machine_calls is not None

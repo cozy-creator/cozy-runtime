@@ -191,11 +191,7 @@ def stores(tmp_path_factory: pytest.TempPathFactory) -> dict[str, TenantStore]:
 
 
 def _config(home: Path) -> RuntimeConfig:
-    base = {
-        k: v
-        for k, v in os.environ.items()
-        if not child_env.erased(k) and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
-    }
+    base = {k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"}
     return RuntimeConfig(
         cozy_home=home,
         credentials=Credentials(),

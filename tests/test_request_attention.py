@@ -154,11 +154,7 @@ class Sequence(LocalRecordOwner):
 
 
 def _serve(root: Path, requests: list[LocalRequest]) -> tuple[Sequence, Worker, list[str]]:
-    base = {
-        k: v
-        for k, v in os.environ.items()
-        if not child_env.erased(k) and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
-    }
+    base = {k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"}
     config = RuntimeConfig(
         cozy_home=root / "home",
         credentials=Credentials(),

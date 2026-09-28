@@ -16,13 +16,13 @@ from typing import Any
 
 import pytest
 
+import signed_claims
 from cozy_runtime.cli.runtime_worker import _restart_handler, _watch_supervisor
 from cozy_runtime.internal import proctree
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_machine_execution import offer
 
@@ -55,14 +55,14 @@ def settled(ready: Any) -> None:
 def _worker(root: Path) -> tuple[Worker, pb.Claim]:
     worker = Worker(
         RuntimeConfig(
-            cozy_home=root / "home", credentials=Credentials(), bootstrap_credential="proof"
+            cozy_home=root / "home",
+            credentials=Credentials(),
+            record_owner_public_key=signed_claims.PUBLIC_KEY,
         ),
-        WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+        WorkerOptions(**signed_claims.IDENTITY, root=root / "worker", tensorfs_root=root / "store"),
         InMemoryControlHost(),
     )
-    claim = pb.Claim(
-        record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b"proof"
-    )
+    claim = signed_claims.claim()
     assert worker.accept_claim(claim, lambda frame: None)[0] == 1
     return worker, claim
 

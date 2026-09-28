@@ -64,13 +64,7 @@ def _still(verdict: str) -> float:
 
 
 def _base_env() -> tuple[tuple[str, str], ...]:
-    return tuple(
-        sorted(
-            (k, v)
-            for k, v in os.environ.items()
-            if not child_env.erased(k) and k != "COZY_BOOTSTRAP_CREDENTIAL"
-        )
-    )
+    return tuple(sorted((k, v) for k, v in os.environ.items() if not child_env.erased(k)))
 
 
 # ------------------------------------------------------------------ rows 8 and 20: the seam

@@ -86,8 +86,7 @@ def test_refused_load_then_success_on_the_same_executor() -> None:
                 sorted(
                     (key, value)
                     for key, value in os.environ.items()
-                    if not child_env.erased(key)
-                    and key not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                    if not child_env.erased(key) and key != "PYTHONPATH"
                 )
             ),
         )

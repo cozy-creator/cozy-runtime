@@ -54,7 +54,7 @@ def main() -> None:
     servers: list[tuple[Any, ThreadPoolExecutor]] = []
     key = "captured" if args.capture else "plain"
     fixture_token = "owned-capture-qualification"
-    config = replace(read_config(), cozy_home=root / "home", bootstrap_credential=fixture_token)
+    config = replace(read_config(), cozy_home=root / "home")
 
     def hook(owner: LocalRecordOwner, worker: Worker) -> None:
         # The ordinary in-memory owner has no external socket or credential. This proof
@@ -62,7 +62,6 @@ def main() -> None:
         initial = owner.host.inbound.get_nowait()
         assert initial is not None
         assert initial.WhichOneof("msg") == "claim"
-        initial.claim.proof = fixture_token.encode()
         owner.host.deliver(initial)
         handler = Handler()
         handler.workspace_service = worker.workspace_service

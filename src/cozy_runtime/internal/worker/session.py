@@ -35,7 +35,6 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
-import hmac
 import itertools
 import json
 import math
@@ -1351,12 +1350,6 @@ class Worker:
         self.job_caps = pb.ResourceCaps()
         self.reclaim_on_terminal = False
         self.boot_fatal: pb.BootFailure | None = None
-        #: The per-spawn bootstrap credential (#449/#463): the launcher that spawned this
-        #: worker handed it through the environment — read by the ONE config authority,
-        #: never here — and a Claim must present it as `proof`. The check is constant-time;
-        #: the value never appears in a log. Where no launcher minted one (a hand-started
-        #: serve), the fence is the socket's own filesystem authority and it is absent.
-        self.bootstrap = config.bootstrap_credential
         # Same-boot verification receipts. A worker restart intentionally loses this table
         # and re-hashes every retained cache file once before trusting it again.
         self.verified_artifacts = acquire.VerifiedArtifactCache()
@@ -2252,13 +2245,11 @@ class Worker:
                     except downloads.DownloadRefusal as exc:
                         raise WorkspaceRefusal("workspace owner proof was refused") from exc
                     self._proven_claim = proven
-            elif (
-                not self.bootstrap
-                or not hmac.compare_digest(claim.proof, self.bootstrap.encode())
-                or claim.worker_id not in ("", self.options.worker_id)
-                or claim.worker_boot_id not in ("", self.fence.worker_boot_id)
+            elif claim.worker_id not in ("", self.options.worker_id) or (
+                claim.worker_boot_id not in ("", self.fence.worker_boot_id)
             ):
-                raise WorkspaceRefusal("workspace bootstrap proof was refused")
+                # No key: the listener is a 0700 unix socket, whose permission is the proof.
+                raise WorkspaceRefusal("workspace call names another worker lifetime")
             return self.fence.record_owner_id
 
     def _execution_service(self, claim: pb.Claim) -> tuple[workspace_executions.Executions, str]:
@@ -3668,11 +3659,8 @@ class Worker:
             send(pb.WorkerFrame(claim_ack=ack))
             return 0, queue.Queue()
 
-        # THE CREDENTIAL CHECK, in whichever of the two launch modes this worker was
-        # started in (#560g). A rented pod verifies BY HASH — it holds no copy of the
-        # token, so neither does whoever provisioned it — and a self-spawned worker
-        # compares against the credential its own launcher minted. Both are constant-time
-        # and neither ever renders what it holds into a refusal.
+        # THE CREDENTIAL CHECK: a TCP listener verifies the RecordOwner's signed Claim; a
+        # keyless worker listens only on a 0700 unix socket, whose permission is the proof.
         if self.config.record_owner_public_key:
             try:
                 downloads.verify_claim_proof(
@@ -3687,13 +3675,6 @@ class Worker:
                     pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
                     exc.detail,
                 )
-        elif self.bootstrap and not hmac.compare_digest(
-            claim.proof.decode(errors="replace"), self.bootstrap
-        ):
-            return reject(
-                pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
-                "the bootstrap credential is absent or wrong",
-            )
         if claim.worker_id and claim.worker_id != self.options.worker_id:
             return reject(
                 pb.ClaimRejection.CLAIM_REJECTION_WORKER_ID_MISMATCH,
@@ -8382,10 +8363,10 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
             flush=True,
         )
         return int(Exit.structural)
-    if remote and not config.bootstrap_credential and not config.record_owner_public_key:
+    if not listen.startswith("unix:") and not config.record_owner_public_key:
         print(
-            f"[worker] refusing to bind {listen} without RecordOwner authority: use a "
-            "launcher bootstrap credential or the fixed product-host signed Claim lane",
+            f"[worker] refusing to bind {listen} without a signed Claim lane: a TCP "
+            "listener needs the RecordOwner's public key; a local worker uses a unix socket",
             file=sys.stderr,
             flush=True,
         )

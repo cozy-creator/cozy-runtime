@@ -63,11 +63,7 @@ needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 def _config(home: Path) -> RuntimeConfig:
     """The frozen config the CLI would read, built directly: `read_config` is once per
     process and the end-to-end suite already spends that read."""
-    base = {
-        k: v
-        for k, v in os.environ.items()
-        if not child_env.erased(k) and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
-    }
+    base = {k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"}
     return RuntimeConfig(
         cozy_home=home,
         credentials=Credentials(),

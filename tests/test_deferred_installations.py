@@ -14,6 +14,7 @@ from pathlib import Path
 import grpc
 import pytest
 
+import signed_claims
 from conftest import image_python
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env, package_interface, static_interface
@@ -22,7 +23,7 @@ from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from test_end_to_end import NO_EXECUTOR, _run
@@ -95,17 +96,17 @@ def test_deferred_callee_installs_on_first_selection(case: str) -> None:
             RuntimeConfig(
                 cozy_home=root / "home",
                 credentials=Credentials(),
-                bootstrap_credential="offline",
+                record_owner_public_key=signed_claims.PUBLIC_KEY,
                 child_base_env=tuple(
                     sorted(
                         (k, v)
                         for k, v in os.environ.items()
-                        if not child_env.erased(k)
-                        and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                        if not child_env.erased(k) and k != "PYTHONPATH"
                     )
                 ),
             ),
             WorkerOptions(
+                **signed_claims.IDENTITY,
                 root=root / "worker",
                 devices="",
                 accelerator_backend="none",
@@ -185,12 +186,7 @@ def test_deferred_callee_installs_on_first_selection(case: str) -> None:
             while not (root / "control.addr").exists():
                 assert thread.is_alive() and time.monotonic() < deadline
                 time.sleep(0.02)
-            claim = pb.Claim(
-                record_owner_id="owner",
-                record_owner_epoch=1,
-                wire_minor=WIRE_MINOR,
-                proof=b"offline",
-            )
+            claim = signed_claims.claim()
             worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda _: None)
             generator = LocalRecordOwner(
                 LocalRequest(

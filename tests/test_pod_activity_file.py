@@ -72,11 +72,7 @@ def _config(home: Path) -> RuntimeConfig:
         cozy_home=home,
         credentials=Credentials(),
         child_base_env=tuple(
-            sorted(
-                (k, v)
-                for k, v in os.environ.items()
-                if not child_env.erased(k) and k != "COZY_BOOTSTRAP_CREDENTIAL"
-            )
+            sorted((k, v) for k, v in os.environ.items() if not child_env.erased(k))
         ),
     )
 

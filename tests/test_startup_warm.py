@@ -29,6 +29,7 @@ from typing import Any
 
 import pytest
 
+import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover
@@ -167,25 +168,20 @@ class Warm(Machine):
         self.worker = Worker(
             replace(
                 _config(root / "home"),
-                bootstrap_credential="test-bootstrap",
+                record_owner_public_key=signed_claims.PUBLIC_KEY,
                 object_storage_hosts=("127.0.0.1",),
             ),
             WorkerOptions(
+                **signed_claims.IDENTITY,
                 root=root / "worker",
                 tensorfs_root=root / "store",
                 install_root=root / "install",
                 artifact_cache=root / "artifacts",
                 devices=devices,
-                worker_boot_id="boot-warm",
             ),
             InMemoryControlHost(),
         )
-        claim = pb.Claim(
-            record_owner_id=OWNER,
-            record_owner_epoch=1,
-            wire_minor=WIRE_MINOR,
-            proof=b"test-bootstrap",
-        )
+        claim = signed_claims.claim(OWNER)
         assert self.worker.accept_claim(claim, lambda frame: None)[0] >= 1
         assert self.worker.executions is not None and self.worker.machine_calls is not None
         self.executions = self.worker.executions

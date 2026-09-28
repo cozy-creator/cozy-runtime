@@ -23,6 +23,7 @@ import grpc
 import pytest
 import tensorfs
 
+import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import Executions
@@ -469,15 +470,15 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
     from cozy_runtime.internal.worker.attempts import InlineResult
     from cozy_runtime.internal.worker.control import InMemoryControlHost
     from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-    from cozy_runtime.protocol import WIRE_MINOR
 
     worker = Worker(
         RuntimeConfig(
             cozy_home=tmp_path / "home",
             credentials=Credentials(),
-            bootstrap_credential="test-bootstrap",
+            record_owner_public_key=signed_claims.PUBLIC_KEY,
         ),
         WorkerOptions(
+            **signed_claims.IDENTITY,
             root=tmp_path / "worker",
             tensorfs_root=tmp_path / "store",
             activity_path=tmp_path / "activity",
@@ -485,12 +486,7 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         InMemoryControlHost(),
     )
     frames: list[pb.WorkerFrame] = []
-    claim = pb.Claim(
-        record_owner_id="owner",
-        record_owner_epoch=1,
-        wire_minor=WIRE_MINOR,
-        proof=b"test-bootstrap",
-    )
+    claim = signed_claims.claim()
     try:
         assert worker.accept_claim(claim, frames.append)[0] == 1
         # No Control stream or watcher is running. Real admission produces a typed terminal.
@@ -556,12 +552,7 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
             "owner", "refused", 1, {"type": "log", "payload": "ignored after terminal"}
         )
         assert worker.execution_events(claim, "refused").head_sequence > 0
-        foreign = pb.Claim(
-            record_owner_id="foreign",
-            record_owner_epoch=2,
-            wire_minor=WIRE_MINOR,
-            proof=b"test-bootstrap",
-        )
+        foreign = signed_claims.claim("foreign", epoch=2)
         assert worker.accept_claim(foreign, frames.append)[0] == 0
         assert worker.fence.record_owner_id == "owner"
         with pytest.raises(WorkspaceRefusal, match="authenticated owner"):
@@ -702,17 +693,17 @@ def serve(payload: Request) -> Result:
             RuntimeConfig(
                 cozy_home=root / "home",
                 credentials=Credentials(),
-                bootstrap_credential="offline",
+                record_owner_public_key=signed_claims.PUBLIC_KEY,
                 child_base_env=tuple(
                     sorted(
                         (k, v)
                         for k, v in os.environ.items()
-                        if not child_env.erased(k)
-                        and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                        if not child_env.erased(k) and k != "PYTHONPATH"
                     )
                 ),
             ),
             WorkerOptions(
+                **signed_claims.IDENTITY,
                 root=root / "worker",
                 devices="",
                 accelerator_backend="none",
@@ -825,12 +816,7 @@ def serve(payload: Request) -> Result:
             while not (root / "control.addr").exists():
                 assert thread.is_alive() and time.monotonic() < until
                 time.sleep(0.02)
-            claim = pb.Claim(
-                record_owner_id="owner",
-                record_owner_epoch=1,
-                wire_minor=WIRE_MINOR,
-                proof=b"offline",
-            )
+            claim = signed_claims.claim()
             # End a real stream immediately. Neither a SnapshotAck nor a sender survives it.
             worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda frame: None)
             channel = grpc.insecure_channel((root / "control.addr").read_text().strip())

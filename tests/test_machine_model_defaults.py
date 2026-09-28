@@ -68,7 +68,7 @@ def peer(capture: dict[str, Any]) -> Worker:
     return cast(
         Worker,
         SimpleNamespace(
-            config=SimpleNamespace(bootstrap_credential="local-bootstrap"),
+            config=SimpleNamespace(),
             options=SimpleNamespace(accelerator_backend="none", publication_authority=None),
             host_facts=lambda: hostfacts.measure("none"),
             model_transfer_lock=threading.Lock(),
@@ -426,15 +426,11 @@ def test_cold_default_native_pull_requires_deployment_object_storage_host(
         "manifest": {"digest": manifest, "length": length},
     }
     try:
-        worker.config = cast(
-            Any, SimpleNamespace(bootstrap_credential="local", object_storage_hosts=())
-        )
+        worker.config = cast(Any, SimpleNamespace(object_storage_hosts=()))
         with ExitStack() as access, pytest.raises(WorkspaceRefusal, match="SOURCE_NOT_ALLOWED"):
             defaults.materialize(worker, [row], access)
         assert fetched == []
-        worker.config = cast(
-            Any, SimpleNamespace(bootstrap_credential="local", object_storage_hosts=("127.0.0.1",))
-        )
+        worker.config = cast(Any, SimpleNamespace(object_storage_hosts=("127.0.0.1",)))
         with ExitStack() as access:
             defaults.materialize(worker, [row], access)
             store.verify_checkpoint_source("proof/adapter", manifest, length)
@@ -534,9 +530,7 @@ def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hu
         worker.options = cast(
             Any, SimpleNamespace(accelerator_backend="none", publication_authority=authority)
         )
-        worker.config = cast(
-            Any, SimpleNamespace(bootstrap_credential="local", object_storage_hosts=("127.0.0.1",))
-        )
+        worker.config = cast(Any, SimpleNamespace(object_storage_hosts=("127.0.0.1",)))
         row = {
             "public_origin": public_origin,
             "repository": "fidika/private",

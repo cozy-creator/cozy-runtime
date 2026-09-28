@@ -836,11 +836,7 @@ def test_a_pin_that_cannot_be_honoured_refuses_through_the_whole_real_path() -> 
     run that reported success while serving something other than what was named would make
     the measurement worthless, so the runtime never quietly drops a pin.
     """
-    base = {
-        k: v
-        for k, v in os.environ.items()
-        if not child_env.erased(k) and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
-    }
+    base = {k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"}
     with tempfile.TemporaryDirectory(prefix="cz-pin.", dir="/tmp") as raw:
         root = Path(raw)
         config = RuntimeConfig(

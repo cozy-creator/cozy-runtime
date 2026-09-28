@@ -27,6 +27,7 @@ import grpc
 import pytest
 import tensorfs
 
+import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import canonical, child_env, liveness
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
@@ -199,9 +200,7 @@ def submit(
     )
 
 
-CLAIM = pb.Claim(
-    record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b"offline"
-)
+CLAIM = signed_claims.claim()
 
 
 def new_worker(root: Path, environment: Path) -> Worker:
@@ -211,17 +210,17 @@ def new_worker(root: Path, environment: Path) -> Worker:
         RuntimeConfig(
             cozy_home=root / "home",
             credentials=Credentials(),
-            bootstrap_credential="offline",
+            record_owner_public_key=signed_claims.PUBLIC_KEY,
             child_base_env=tuple(
                 sorted(
                     (key, value)
                     for key, value in os.environ.items()
-                    if not child_env.erased(key)
-                    and key not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                    if not child_env.erased(key) and key != "PYTHONPATH"
                 )
             ),
         ),
         WorkerOptions(
+            **signed_claims.IDENTITY,
             root=root / "worker",
             devices="",
             accelerator_backend="none",

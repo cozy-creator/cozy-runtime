@@ -144,8 +144,7 @@ def test_job_only_worker_preparation_preserves_running_job_and_exact_readiness()
                 sorted(
                     (k, v)
                     for k, v in os.environ.items()
-                    if not child_env.erased(k)
-                    and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                    if not child_env.erased(k) and k != "PYTHONPATH"
                 )
             ),
         )

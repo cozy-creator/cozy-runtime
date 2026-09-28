@@ -230,11 +230,7 @@ def test_a_live_row_carries_the_sequence_the_worker_deduplicates_by() -> None:
 def test_the_triage_bundle_keeps_the_record_and_each_row_once() -> None:
     """The real worker and executor child: the kept bundle carries the execution record, and
     rows the live lane delivered are not admitted again from the reply."""
-    base = {
-        k: v
-        for k, v in os.environ.items()
-        if not child_env.erased(k) and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
-    }
+    base = {k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"}
     with tempfile.TemporaryDirectory(prefix="cz-ev.", dir="/tmp") as raw:
         root = Path(raw)
         project = _project(root)

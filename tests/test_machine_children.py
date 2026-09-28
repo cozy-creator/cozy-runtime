@@ -16,6 +16,7 @@ from typing import Any, cast
 import grpc
 import pytest
 
+import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
@@ -25,7 +26,7 @@ from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from test_end_to_end import NO_EXECUTOR
@@ -510,17 +511,17 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             RuntimeConfig(
                 cozy_home=root / "home",
                 credentials=Credentials(),
-                bootstrap_credential="offline",
+                record_owner_public_key=signed_claims.PUBLIC_KEY,
                 child_base_env=tuple(
                     sorted(
                         (key, value)
                         for key, value in os.environ.items()
-                        if not child_env.erased(key)
-                        and key not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                        if not child_env.erased(key) and key != "PYTHONPATH"
                     )
                 ),
             ),
             WorkerOptions(
+                **signed_claims.IDENTITY,
                 root=root / "worker",
                 devices="",
                 accelerator_backend="none",
@@ -602,12 +603,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             while not (root / "address").exists():
                 assert advancing()
                 time.sleep(0.02)
-            claim = pb.Claim(
-                record_owner_id="owner",
-                record_owner_epoch=1,
-                wire_minor=WIRE_MINOR,
-                proof=b"offline",
-            )
+            claim = signed_claims.claim()
             worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda _: None)
             generator = LocalRecordOwner(
                 LocalRequest(
@@ -1004,16 +1000,13 @@ def test_canceling_root_also_abandons_failed_descendants(tmp_path: Path) -> None
     from test_machine_execution import complete, offer
 
     worker = Worker(
-        replace(_config(tmp_path / "home"), bootstrap_credential="test-bootstrap"),
-        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
+        replace(_config(tmp_path / "home"), record_owner_public_key=signed_claims.PUBLIC_KEY),
+        WorkerOptions(
+            **signed_claims.IDENTITY, root=tmp_path / "worker", tensorfs_root=tmp_path / "store"
+        ),
         InMemoryControlHost(),
     )
-    claim = pb.Claim(
-        record_owner_id="owner",
-        record_owner_epoch=1,
-        wire_minor=WIRE_MINOR,
-        proof=b"test-bootstrap",
-    )
+    claim = signed_claims.claim()
     try:
         worker.accept_claim(claim, lambda frame: None)
         executions = worker.executions

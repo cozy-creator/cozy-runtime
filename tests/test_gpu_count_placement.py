@@ -31,7 +31,7 @@ def test_counted_capture_verifies() -> None:
     interfaces = {
         "installed": {"entrypoints": [{"name": "run", "models": [{"path": "run.models.model"}]}]}
     }
-    worker = cast(Any, SimpleNamespace(config=SimpleNamespace(bootstrap_credential="")))
+    worker = cast(Any, SimpleNamespace(options=SimpleNamespace(publication_authority=None)))
     request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=WIRE_MINOR))
     machine_model_defaults.verify(worker, request, capture, interfaces)
     rung["gpus"] = 2

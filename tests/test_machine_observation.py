@@ -10,10 +10,10 @@ from pathlib import Path
 
 import grpc
 
+import signed_claims
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.session import REPORT_SECONDS, Worker, WorkerOptions
-from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
 
@@ -23,9 +23,16 @@ def test_claim_only_stream_reports_without_acknowledging_dispatch() -> None:
         root = Path(raw)
         worker = Worker(
             RuntimeConfig(
-                cozy_home=root / "home", credentials=Credentials(), bootstrap_credential="observer"
+                cozy_home=root / "home",
+                credentials=Credentials(),
+                record_owner_public_key=signed_claims.PUBLIC_KEY,
             ),
-            WorkerOptions(root=root / "worker", devices="", accelerator_backend="none"),
+            WorkerOptions(
+                **signed_claims.IDENTITY,
+                root=root / "worker",
+                devices="",
+                accelerator_backend="none",
+            ),
             GrpcControlHost("127.0.0.1:0", root / "address"),
         )
         thread = threading.Thread(target=worker.run, daemon=True)
@@ -39,16 +46,7 @@ def test_claim_only_stream_reports_without_acknowledging_dispatch() -> None:
                 assert thread.is_alive() and time.monotonic() < deadline
                 time.sleep(0.02)
             channel = grpc.insecure_channel((root / "address").read_text().strip())
-            inbound.put(
-                pb.RecordOwnerFrame(
-                    claim=pb.Claim(
-                        record_owner_id="owner",
-                        record_owner_epoch=1,
-                        wire_minor=WIRE_MINOR,
-                        proof=b"observer",
-                    )
-                )
-            )
+            inbound.put(pb.RecordOwnerFrame(claim=signed_claims.claim()))
             stream = rpc.WorkerControlStub(channel).Control(
                 iter(inbound.get, None), timeout=3 * REPORT_SECONDS + 5
             )

@@ -20,7 +20,6 @@ def test_reconnect_preserves_machine_collection_and_legacy_recovery(tmp_path: Pa
         RuntimeConfig(
             cozy_home=tmp_path / "home",
             credentials=Credentials(),
-            bootstrap_credential="test-bootstrap",
         ),
         WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
         InMemoryControlHost(),
@@ -29,7 +28,6 @@ def test_reconnect_preserves_machine_collection_and_legacy_recovery(tmp_path: Pa
         record_owner_id="owner",
         record_owner_epoch=1,
         wire_minor=WIRE_MINOR,
-        proof=b"test-bootstrap",
     )
     observed: queue.Queue[pb.WorkerFrame] = queue.Queue()
     try:

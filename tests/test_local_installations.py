@@ -33,8 +33,7 @@ def test_installation_reopens_after_runtime_restart_without_carriers() -> None:
                 sorted(
                     (k, v)
                     for k, v in os.environ.items()
-                    if not child_env.erased(k)
-                    and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                    if not child_env.erased(k) and k != "PYTHONPATH"
                 )
             ),
         )

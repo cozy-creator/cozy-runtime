@@ -89,9 +89,7 @@ _SERVE_FLAGS: dict[str, str] = {
     "--executor-uid": "--executor-uid",
     "--executor-gid": "--executor-gid",
     "--threads": "--threads",
-    # The REMOTE leg (cl-014 item 1): a non-loopback listener requires both, and the
-    # worker refuses plaintext off-loopback. The bearer owner token arrives via
-    # COZY_BOOTSTRAP_CREDENTIAL and is checked at Claim (#445).
+    # A TCP listener requires a signed Claim, and off-loopback also TLS.
     "--tls-cert": "--tls-cert",
     "--tls-key": "--tls-key",
 }

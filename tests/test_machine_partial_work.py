@@ -25,6 +25,7 @@ from typing import cast
 import grpc
 import pytest
 
+import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
@@ -33,7 +34,7 @@ from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.stage_progress import SAMPLE_SECONDS
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from test_end_to_end import NO_EXECUTOR
@@ -177,9 +178,7 @@ class Machine:
     def __init__(self, root: Path, worker: Worker, thread: threading.Thread) -> None:
         self.root, self.worker, self.thread = root, worker, thread
         self.prepared = pb.PreparePackageSetResult()
-        self.claim = pb.Claim(
-            record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b"offline"
-        )
+        self.claim = signed_claims.claim()
 
     def start(self, exports: tuple[str, ...]) -> None:
         prepared = self.prepared
@@ -312,17 +311,17 @@ def machine(monkeypatch: pytest.MonkeyPatch, script: str) -> Iterator[Machine]:
             RuntimeConfig(
                 cozy_home=root / "home",
                 credentials=Credentials(),
-                bootstrap_credential="offline",
+                record_owner_public_key=signed_claims.PUBLIC_KEY,
                 child_base_env=tuple(
                     sorted(
                         (key, value)
                         for key, value in os.environ.items()
-                        if not child_env.erased(key)
-                        and key not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                        if not child_env.erased(key) and key != "PYTHONPATH"
                     )
                 ),
             ),
             WorkerOptions(
+                **signed_claims.IDENTITY,
                 root=root / "worker",
                 devices="",
                 accelerator_backend="none",

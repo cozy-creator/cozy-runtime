@@ -8,6 +8,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+import signed_claims
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -19,9 +20,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from test_machine_execution import offer
 from test_same_release_placements import Context, Refused
 
-CLAIM = pb.Claim(
-    record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b"offline"
-)
+CLAIM = signed_claims.claim()
 
 
 @pytest.fixture
@@ -29,9 +28,13 @@ def owned(tmp_path: Path) -> Iterator[Worker]:
     """A real in-process Worker claimed by `owner`; only the gRPC context is a stand-in."""
     worker = Worker(
         RuntimeConfig(
-            cozy_home=tmp_path / "home", credentials=Credentials(), bootstrap_credential="offline"
+            cozy_home=tmp_path / "home",
+            credentials=Credentials(),
+            record_owner_public_key=signed_claims.PUBLIC_KEY,
         ),
-        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
+        WorkerOptions(
+            **signed_claims.IDENTITY, root=tmp_path / "worker", tensorfs_root=tmp_path / "store"
+        ),
         InMemoryControlHost(),
     )
     try:

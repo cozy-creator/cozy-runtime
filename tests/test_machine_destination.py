@@ -21,6 +21,7 @@ import grpc
 import pytest
 import tensorfs
 
+import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
@@ -139,17 +140,17 @@ def test_job_root_publishes_its_weights_output_to_the_granted_destination(
                 RuntimeConfig(
                     cozy_home=root / "home",
                     credentials=Credentials(),
-                    bootstrap_credential="offline",
+                    record_owner_public_key=signed_claims.PUBLIC_KEY,
                     child_base_env=tuple(
                         sorted(
                             (key, value)
                             for key, value in os.environ.items()
-                            if not child_env.erased(key)
-                            and key not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                            if not child_env.erased(key) and key != "PYTHONPATH"
                         )
                     ),
                 ),
                 WorkerOptions(
+                    **signed_claims.IDENTITY,
                     root=root / "worker",
                     devices="",
                     accelerator_backend="none",
@@ -200,12 +201,7 @@ def test_job_root_publishes_its_weights_output_to_the_granted_destination(
                 while not (root / "address").exists():
                     assert thread.is_alive() and time.monotonic() < deadline
                     time.sleep(0.02)
-                claim = pb.Claim(
-                    record_owner_id="owner",
-                    record_owner_epoch=1,
-                    wire_minor=WIRE_MINOR,
-                    proof=b"offline",
-                )
+                claim = signed_claims.claim()
                 worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda _: None)
                 client = rpc.WorkerControlStub(
                     grpc.insecure_channel((root / "address").read_text().strip())

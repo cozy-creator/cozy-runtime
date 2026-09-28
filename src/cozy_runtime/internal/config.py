@@ -70,13 +70,6 @@ class RuntimeConfig:
 
     cozy_home: Path
     credentials: Credentials
-    bootstrap_credential: str = ""
-    """The launcher's per-spawn control credential (#449/#463): a Claim must present it as
-    `proof`. STRUCTURALLY SECRET — never logged, never in a Report, and never inherited by
-    the device child (it is stripped from `child_base_env` below: the executor has no
-    business holding the control plane's credential).
-
-    Fixed private-rental workers use `record_owner_public_key` instead."""
     child_base_env: tuple[tuple[str, str], ...] = ()
     """The device-child environment with the ERASE pass ALREADY APPLIED (cr-007's seal;
     class B of tracker-v2/spawn-allowlists.md #616.d).
@@ -94,10 +87,8 @@ class RuntimeConfig:
     rest of the config and projected across the executor seal by the worker."""
 
     record_owner_public_key: bytes = b""
-    """Raw Ed25519 key that verifies private-rental Claim proofs.
-
-    Empty on local/public workers. It never enters an executor environment.
-    """
+    """Raw Ed25519 key that verifies Claim proofs: required on any TCP listener. Empty only
+    where the listener is a 0700 unix socket. It never enters an executor environment."""
 
     dependency_cache: Path | None = None
     """Creator-owned local cache of immutable dependency payloads; not executor authority."""
@@ -319,7 +310,6 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
             f"set COZY_HOME to an absolute directory (default {COZY_HOME_DEFAULT})",
         )
     creds = Credentials(**{source: (env.get(var) or None) for source, var in CREDENTIAL_ENV})
-    bootstrap = env.get("COZY_BOOTSTRAP_CREDENTIAL", "").strip()
     dependency_cache = env.get("COZY_DEPENDENCY_CACHE", "").strip()
     if dependency_cache and not Path(dependency_cache).is_absolute():
         raise ConfigError(
@@ -338,12 +328,11 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
     return RuntimeConfig(
         cozy_home=home,
         credentials=creds,
-        bootstrap_credential=bootstrap,
         child_base_env=tuple(
             sorted(
                 (k, v)
                 for k, v in env.items()
-                if not child_env.erased(k) and k != "COZY_BOOTSTRAP_CREDENTIAL"
+                if not child_env.erased(k)
             )
         ),
         fill_forensics_dir=env.get(child_env.FILL_FORENSICS_DIR, "").strip(),

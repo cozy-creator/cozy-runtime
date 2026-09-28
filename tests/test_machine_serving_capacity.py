@@ -7,13 +7,14 @@ from dataclasses import replace
 
 import pytest
 
+import signed_claims
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import (
     HostedPlacement,
     Worker,
     WorkerOptions,
 )
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config, _workspace
 from test_group_lanes import _placement
@@ -31,16 +32,13 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
 ) -> None:
     with _workspace() as root:
         worker = Worker(
-            replace(_config(root / "home"), bootstrap_credential="test-bootstrap"),
-            WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+            replace(_config(root / "home"), record_owner_public_key=signed_claims.PUBLIC_KEY),
+            WorkerOptions(
+                **signed_claims.IDENTITY, root=root / "worker", tensorfs_root=root / "store"
+            ),
             InMemoryControlHost(),
         )
-        claim = pb.Claim(
-            record_owner_id="owner",
-            record_owner_epoch=1,
-            wire_minor=WIRE_MINOR,
-            proof=b"test-bootstrap",
-        )
+        claim = signed_claims.claim()
         try:
             assert worker.accept_claim(claim, lambda frame: None)[0] == 1
             executions, calls = worker.executions, worker.machine_calls
@@ -142,16 +140,13 @@ def test_managed_child_waits_for_its_new_placement_despite_old_capacity(
     """A warm previous package is not readiness for the package being switched in."""
     with _workspace() as root:
         worker = Worker(
-            replace(_config(root / "home"), bootstrap_credential="test-bootstrap"),
-            WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+            replace(_config(root / "home"), record_owner_public_key=signed_claims.PUBLIC_KEY),
+            WorkerOptions(
+                **signed_claims.IDENTITY, root=root / "worker", tensorfs_root=root / "store"
+            ),
             InMemoryControlHost(),
         )
-        claim = pb.Claim(
-            record_owner_id="owner",
-            record_owner_epoch=1,
-            wire_minor=WIRE_MINOR,
-            proof=b"test-bootstrap",
-        )
+        claim = signed_claims.claim()
         try:
             worker.accept_claim(claim, lambda frame: None)
             executions, calls = worker.executions, worker.machine_calls

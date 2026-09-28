@@ -30,6 +30,7 @@ from typing import Any, NoReturn
 import pytest
 import tensorfs
 
+import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import (
     accel,
@@ -165,9 +166,7 @@ class Machine:
             lambda entry, kind: accel.DeviceMemory("measured", 80 * GiB, 80 * GiB),
         )
         base = {
-            k: v
-            for k, v in os.environ.items()
-            if not child_env.erased(k) and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+            k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"
         }
         self.worker = Worker(
             replace(
@@ -176,24 +175,19 @@ class Machine:
                     credentials=Credentials(),
                     child_base_env=tuple(sorted(base.items())),
                 ),
-                bootstrap_credential="test-bootstrap",
+                record_owner_public_key=signed_claims.PUBLIC_KEY,
             ),
             WorkerOptions(
+                **signed_claims.IDENTITY,
                 root=root / "worker",
                 tensorfs_root=self.store_root,
                 install_root=self.install_root,
                 artifact_cache=root / "artifacts",
                 devices="0,1,2,3",
-                worker_boot_id="boot-one",
             ),
             InMemoryControlHost(),
         )
-        self.claim = pb.Claim(
-            record_owner_id=OWNER,
-            record_owner_epoch=1,
-            wire_minor=WIRE_MINOR,
-            proof=b"test-bootstrap",
-        )
+        self.claim = signed_claims.claim(OWNER)
         describe = self.worker._describe_installed
 
         def described(installed: Any, distribution: str, **options: Any) -> bytes:

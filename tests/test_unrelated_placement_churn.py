@@ -28,6 +28,7 @@ from typing import Any
 import grpc
 import pytest
 
+import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import accel, child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
@@ -36,7 +37,7 @@ from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from test_end_to_end import NO_EXECUTOR
@@ -86,9 +87,7 @@ def test_a_queued_call_survives_another_roots_placement_removal(
         environment, preparation = fixture.package(root, "nested")
         (root / "artifacts").mkdir()
         base = {
-            k: v
-            for k, v in os.environ.items()
-            if not child_env.erased(k) and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+            k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"
         }
         worker = Worker(
             replace(
@@ -97,9 +96,10 @@ def test_a_queued_call_survives_another_roots_placement_removal(
                     credentials=Credentials(),
                     child_base_env=tuple(sorted(base.items())),
                 ),
-                bootstrap_credential="offline",
+                record_owner_public_key=signed_claims.PUBLIC_KEY,
             ),
             WorkerOptions(
+                **signed_claims.IDENTITY,
                 root=root / "worker",
                 devices="0,1,2,3",
                 python=str(image_python()),
@@ -157,9 +157,7 @@ def test_a_queued_call_survives_another_roots_placement_removal(
             binding = JobBinding.read(next(row for row in plans if row.get("job") == "nested"))
             thread.start()
             until(lambda: (root / "address").exists())
-            claim = pb.Claim(
-                record_owner_id=OWNER, record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b"offline"
-            )
+            claim = signed_claims.claim(OWNER)
             worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda _: None)
             owner = LocalRecordOwner(
                 LocalRequest(
