@@ -474,6 +474,34 @@ def test_h3_preference_records_skips_through_real_cpu_selection() -> None:
     assert "skipped" in applied.line()
 
 
+@pytest.mark.parametrize(
+    ("offered", "dense"),
+    [(("sageattention", "flash-attn3"), "sageattention"), (("flash-attn3",), "flash-attn3")],
+)
+def test_sol_recomputes_dense_rows_with_the_next_h3_preference(
+    offered: tuple[str, ...], dense: str
+) -> None:
+    """Sol's dense steps, prefix and paths run on the kernel after it in H3's preference, not
+    the ranked floor (run 1565: SDPA at 35 s/step where Sage takes ~24 s). An unready Sage is
+    recorded as skipped, so a later request boundary re-selects onto it."""
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
+    from cozy_runtime.internal import attention_sol
+    from cozy_runtime.models.minimax_h3.model import H3Model
+
+    skipped: dict[str, str] = {}
+    applied = attention.install(
+        _ready("sol-attn", *offered, "sdpa"),
+        _h3_roots("bfloat16"),
+        device=_cuda(90),
+        choose=object.__new__(H3Model).choose_attention,
+        skipped=skipped,
+    )
+    assert applied.hosts["ref2va_dit"] == {"sol-attn": 1}
+    assert attention_sol.dense_identity() == dense
+    assert ("sageattention" in skipped) == (dense != "sageattention")
+
+
 def test_a_pin_overrides_the_h3_preference() -> None:
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
