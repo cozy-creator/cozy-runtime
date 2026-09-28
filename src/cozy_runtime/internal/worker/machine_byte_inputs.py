@@ -134,9 +134,9 @@ def inputs(
                 length, media = source.source.manifest.length, byte_inputs.TREE_MIME
             else:
                 blob = byte_inputs.file_member(source, members)
-                if (digest, metadata["length"]) != ("sha256:" + blob["sha256"], blob["length"]):
+                if (digest, metadata["length"]) != ("sha256:" + blob.sha256, blob.length):
                     raise WorkspaceRefusal("native child file differs from its source payload")
-                length = blob["length"]
+                length = blob.length
             retained = machine_models.retain_bytes(
                 workspace, owner, recipient, "input/" + name, source.source
             )
@@ -205,7 +205,7 @@ def retain_root(
             else:
                 blob = byte_inputs.file_member(source, members)
                 if (
-                    (digest, entry.length) != ("sha256:" + blob["sha256"], blob["length"])
+                    (digest, entry.length) != ("sha256:" + blob.sha256, blob.length)
                     or not admits(kind, entry.kind_mime)
                     or (
                         capacity.get("media_types")

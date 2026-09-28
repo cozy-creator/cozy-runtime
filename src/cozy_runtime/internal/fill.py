@@ -83,6 +83,7 @@ from cozy_runtime.internal.paging import BlockLayout, PageUnit, partition
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan, TensorResolution
 
 if TYPE_CHECKING:
+    from tensorfs import ReadLease as ReadLease
     from tensorfs import Store as Store
 
 # ------------------------------------------------------------------------- refusals

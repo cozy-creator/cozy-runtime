@@ -95,7 +95,7 @@ def materialize(
             if (actual and declared != actual) or (kind != "file" and not actual):
                 raise WorkspaceRefusal("native child media type differs from its encoded bytes")
         if capture:
-            if {member["path"] for member in members} != {"capture.json", "sketches.f32"}:
+            if {member.path for member in members} != {"capture.json", "sketches.f32"}:
                 raise WorkspaceRefusal("capture tree does not contain exactly its two files")
             semantic = hashlib.sha256()
             for name in ("capture.json", "sketches.f32"):

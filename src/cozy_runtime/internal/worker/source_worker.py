@@ -86,9 +86,9 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
             or source["receipt_digest"] != args["source"]["tensorfs_receipt_digest"]
         ):
             raise ValueError("source view lost its exact native source")
-        body = bytes(store.manifest(manifest["digest"])["manifest"])
+        body = store.manifest(manifest["digest"])["manifest"]
         members = manifest_members(body, SOURCE_FILES_MAX_BYTES)
-        size = sum(member["blob"]["length"] for member in members)
+        size = sum(member.blob.length for member in members)
         if size != command["view_bytes"]:
             raise ValueError("source view content bound changed")
         produced = store.create_tree_root(

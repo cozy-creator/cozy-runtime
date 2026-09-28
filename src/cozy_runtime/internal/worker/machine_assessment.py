@@ -12,10 +12,15 @@ from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.internal.worker import machine_models, workspace_byte_outputs
 from cozy_runtime.internal.worker.machine_publication import PublicationRefusal
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace_byte_outputs import Blob, FileMember
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 MAX_BYTES = 8 << 20
+
+
+def _payload(sha256: str, length: int) -> tuple[FileMember, ...]:
+    return (FileMember("file", "payload", Blob(sha256, length)),)
 
 
 def read_file(
@@ -26,9 +31,7 @@ def read_file(
     held = pb.NativeByteRetentionRequest(source=retained.source, retention_id=retained.retention_id)
     with workspace_byte_outputs.leased(workspace, owner, held) as (_, lease, members):
         length = source.source.content_bytes
-        if not 0 < length <= MAX_BYTES or members != [
-            {"kind": "file", "path": "payload", "blob": {"sha256": digest[7:], "length": length}}
-        ]:
+        if not 0 < length <= MAX_BYTES or members != _payload(digest[7:], length):
             raise WorkspaceRefusal("assessment input changed its exact bounded file")
         raw = bytearray(length)
         lease.read_into(digest, length, 0, length, raw)
@@ -284,17 +287,7 @@ def verify(
                 ) as (_, _, members):
                     if claimed is not None:
                         _check(
-                            members
-                            == [
-                                {
-                                    "kind": "file",
-                                    "path": "payload",
-                                    "blob": {
-                                        "sha256": claimed["digest"][7:],
-                                        "length": claimed["length"],
-                                    },
-                                }
-                            ]
+                            members == _payload(claimed["digest"][7:], claimed["length"])
                             and source.content_bytes == claimed["length"]
                         )
     return str(facts["verdict"])

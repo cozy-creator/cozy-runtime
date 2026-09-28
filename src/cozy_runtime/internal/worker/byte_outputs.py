@@ -11,7 +11,7 @@ from typing import Any
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import workspace_byte_outputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
-from cozy_runtime.internal.worker.workspace_byte_outputs import TREE_MIME
+from cozy_runtime.internal.worker.workspace_byte_outputs import TREE_MIME, Blob, FileMember
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -48,10 +48,8 @@ def roster(root: Path, *, tree: bool, max_bytes: int) -> tuple[bytes, list[tuple
                 if total > max_bytes:
                     raise WorkspaceRefusal("output content exceeds its granted byte bound")
                 digest.update(block)
-        entries.append(
-            {"path": name, "kind": "file", "blob": {"sha256": digest.hexdigest(), "length": length}}
-        )
-    return canonical_json.encode({"entries": entries}), files
+        entries.append(FileMember("file", name, Blob(digest.hexdigest(), length)))
+    return workspace_byte_outputs.manifest_body(entries), files
 
 
 def commit(
@@ -82,8 +80,8 @@ def commit(
     if tree:
         digest, length = source.manifest.digest, source.manifest.length
     else:
-        body = canonical_json.decode(manifest)["entries"][0]["blob"]
-        digest, length = bytes.fromhex(body["sha256"]), body["length"]
+        blob = workspace_byte_outputs.manifest_members(manifest, max_bytes)[0].blob
+        digest, length = bytes.fromhex(blob.sha256), blob.length
     return pb.OutputEntry(
         output_id=output_id,
         digest=digest,
@@ -108,8 +106,8 @@ def reexport(
 ) -> pb.OutputEntry:
     """An explicit return creates ordinary output custody over a live received input."""
     with workspace_byte_outputs.leased(workspace, owner, retained) as (store, _, members):
-        body = bytes(store.manifest(documents.spell(retained.source.manifest.digest))["manifest"])
-        if not tree and (len(members) != 1 or members[0]["path"] != "payload"):
+        body = store.manifest(documents.spell(retained.source.manifest.digest))["manifest"]
+        if not tree and (len(members) != 1 or members[0].path != "payload"):
             raise WorkspaceRefusal("returned FileAsset has no single native payload")
     source = workspace_byte_outputs.commit(
         workspace, owner, request, ordinal, spec, output_id, body, [], max_bytes, retained=retained
@@ -117,8 +115,8 @@ def reexport(
     if tree:
         digest, length = source.manifest.digest, source.manifest.length
     else:
-        blob = members[0]["blob"]
-        digest, length = bytes.fromhex(blob["sha256"]), blob["length"]
+        blob = members[0].blob
+        digest, length = bytes.fromhex(blob.sha256), blob.length
     return pb.OutputEntry(
         output_id=output_id,
         digest=digest,

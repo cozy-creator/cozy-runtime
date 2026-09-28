@@ -18,6 +18,7 @@ from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from .workspace import Journal, Workspace, WorkspaceBusy, WorkspaceRefusal
+from .workspace_byte_outputs import FileMember, TreeManifest, manifest_body, manifest_members
 
 MAX_CONTENT_BYTES = 256 << 20
 SCHEMA10 = """
@@ -31,9 +32,7 @@ CREATE TABLE input_tree_intakes (
 """
 
 
-def _header(header: pb.InputTreeImportHeader) -> tuple[bytes, list[dict[str, Any]]]:
-    from .workspace_byte_outputs import manifest_members
-
+def _header(header: pb.InputTreeImportHeader) -> tuple[bytes, tuple[FileMember, ...]]:
     body = header.manifest_canonical_bytes
     if (
         re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", header.request_id) is None
@@ -46,21 +45,16 @@ def _header(header: pb.InputTreeImportHeader) -> tuple[bytes, list[dict[str, Any
     ):
         raise WorkspaceRefusal("input tree header has invalid identity or capacity")
     members = manifest_members(body, header.content_bytes)
-    if canonical_json.encode(canonical_json.decode(body)) != body:
+    if manifest_body(members) != body:
         raise WorkspaceRefusal("input tree manifest is not canonical")
     names: set[str] = set()
     blobs: dict[str, int] = {}
     total = 0
     previous = ""
     for row in members:
-        blob = row["blob"]
-        name = row.get("path")
+        blob, name = row.blob, row.path
         if (
-            set(row) != {"kind", "path", "blob"}
-            or set(blob) != {"sha256", "length"}
-            or not isinstance(blob.get("sha256"), str)
-            or not isinstance(name, str)
-            or not name
+            not name
             or name == "."
             or "\\" in name
             or "\x00" in name
@@ -71,13 +65,11 @@ def _header(header: pb.InputTreeImportHeader) -> tuple[bytes, list[dict[str, Any
             or name <= previous
         ):
             raise WorkspaceRefusal("input tree manifest has an unsafe or repeated path")
-        documents.raw("sha256:" + blob["sha256"])
-        if blob["sha256"] in blobs and blobs[blob["sha256"]] != blob["length"]:
+        if blobs.setdefault(blob.sha256, blob.length) != blob.length:
             raise WorkspaceRefusal("input tree object length changed")
-        blobs[blob["sha256"]] = blob["length"]
         names.add(name)
         previous = name
-        total += blob["length"]
+        total += blob.length
     for name in names:
         if any(str(parent) in names for parent in PurePosixPath(name).parents):
             raise WorkspaceRefusal("input tree file shadows a member directory")
@@ -325,7 +317,7 @@ def receive(
                     workspace.store_root, header.content_bytes * 2, len(members) * 2
                 )
             ):
-                objects = {row["blob"]["sha256"]: row["blob"]["length"] for row in members}
+                objects = {row.blob.sha256: row.blob.length for row in members}
                 _receive_objects(
                     workspace,
                     owner,
@@ -335,7 +327,7 @@ def receive(
                     stage,
                     complete=complete,
                 )
-                files = [(row["path"], stage / row["blob"]["sha256"]) for row in members]
+                files = [(row.path, stage / row.blob.sha256) for row in members]
                 return _finish(workspace, owner, identity, files)
         finally:
             shutil.rmtree(stage)
@@ -427,15 +419,17 @@ def _reuse(workspace: Workspace, owner: str, identity: str, wanted: set[str], st
             member = next(
                 (
                     entry
-                    for entry in canonical_json.decode(row["manifest_body"])["entries"]
-                    if entry["blob"]["sha256"] == digest
+                    for entry in canonical_json.decode_as(
+                        row["manifest_body"], TreeManifest
+                    ).entries
+                    if entry.blob.sha256 == digest
                 ),
                 None,
             )
             if member is None:
                 continue
             try:
-                store.materialize(bytes(row["manifest"]).hex(), member["path"], staged)
+                store.materialize(bytes(row["manifest"]).hex(), member.path, staged)
             except Exception:  # an earlier input released and collected: try another
                 staged.unlink(missing_ok=True)
                 continue

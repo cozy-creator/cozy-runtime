@@ -180,7 +180,7 @@ def test_real_tree_commit_replay_retention_gc_and_release(tmp_path: Path) -> Non
     with outputs.leased(reopened, "owner", hold) as (_, lease, members):
         assert len(members) == 1
         actual = bytearray(len(data))
-        lease.read_into("sha256:" + members[0]["blob"]["sha256"], len(data), 0, len(data), actual)
+        lease.read_into("sha256:" + members[0].blob.sha256, len(data), 0, len(data), actual)
         assert actual == data
     memo = workspace_memo.lookup(
         reopened,

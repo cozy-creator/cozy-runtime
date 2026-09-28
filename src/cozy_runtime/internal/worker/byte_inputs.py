@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any
 
+from cozy_runtime.internal import fill
 from cozy_runtime.internal.worker import workspace_byte_outputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace_byte_outputs import Blob, FileMember
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -26,7 +27,7 @@ def copy_retained(
     *,
     max_bytes: int = MAX_BYTES,
     expected_blob: tuple[str, int] | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[FileMember, ...]:
     """Stream through the native read lease; publish no paths before all bytes verify."""
     if grant.source.content_bytes > max_bytes:
         raise WorkspaceRefusal("native input exceeds its granted byte bound")
@@ -36,32 +37,32 @@ def copy_retained(
         with workspace_byte_outputs.leased(workspace, owner, grant) as (_store, lease, members):
             if expected_blob is not None:
                 blob = file_member(grant, members)
-                if expected_blob != ("sha256:" + blob["sha256"], blob["length"]):
+                if expected_blob != ("sha256:" + blob.sha256, blob.length):
                     raise WorkspaceRefusal("native FileAsset differs from its input identity")
             for member in members:
-                relative = PurePosixPath(member["path"])
+                relative = PurePosixPath(member.path)
                 if (
                     relative.is_absolute()
                     or not relative.parts
                     or any(part in ("", ".", "..") for part in relative.parts)
-                    or str(relative) != member["path"]
+                    or str(relative) != member.path
                 ):
                     raise WorkspaceRefusal("native input manifest has an invalid member path")
                 target = temporary.joinpath(*relative.parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                blob = member["blob"]
-                length = blob["length"]
+                blob = member.blob
+                length = blob.length
                 digest = hashlib.sha256()
                 offset = 0
                 with target.open("xb") as output:
                     while offset < length:
                         amount = min(1 << 20, length - offset)
                         buffer = bytearray(amount)
-                        lease.read_into("sha256:" + blob["sha256"], length, offset, amount, buffer)
+                        lease.read_into("sha256:" + blob.sha256, length, offset, amount, buffer)
                         output.write(buffer)
                         digest.update(buffer)
                         offset += amount
-                if digest.hexdigest() != blob["sha256"]:
+                if digest.hexdigest() != blob.sha256:
                     raise WorkspaceRefusal("native input member failed byte verification")
                 target.chmod(0o444)
             # No mutable checkout or publisher path crosses into the consumer.
@@ -77,13 +78,11 @@ def copy_retained(
         remove_checkout(temporary)
 
 
-def file_member(
-    grant: pb.NativeByteRetentionRequest, members: list[dict[str, Any]]
-) -> dict[str, Any]:
-    if len(members) != 1 or members[0]["path"] != "payload":
+def file_member(grant: pb.NativeByteRetentionRequest, members: Sequence[FileMember]) -> Blob:
+    if len(members) != 1 or members[0].path != "payload":
         raise WorkspaceRefusal("native FileAsset must retain exactly one payload member")
-    blob: dict[str, Any] = members[0]["blob"]
-    if blob["length"] != grant.source.content_bytes:
+    blob = members[0].blob
+    if blob.length != grant.source.content_bytes:
         raise WorkspaceRefusal("native FileAsset size differs from its retained payload")
     return blob
 
@@ -134,7 +133,7 @@ def remove_checkout(root: Path | None, *, keep_root: bool = False) -> int:
     return removed
 
 
-def chunks(lease: Any, digest: str, length: int) -> Iterator[bytes]:
+def chunks(lease: fill.ReadLease, digest: str, length: int) -> Iterator[bytes]:
     offset = 0
     while offset < length:
         amount = min(1 << 20, length - offset)

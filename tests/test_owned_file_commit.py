@@ -234,7 +234,7 @@ def test_commit_snapshots_large_file_replays_without_spool_and_ignores_parent_re
     tensorfs.gc(str(workspace.store_root))
     with outputs.leased(workspace, "owner", recipient) as (_, lease, members):
         actual = bytearray(len(data))
-        lease.read_into("sha256:" + members[0]["blob"]["sha256"], len(data), 0, len(data), actual)
+        lease.read_into("sha256:" + members[0].blob.sha256, len(data), 0, len(data), actual)
         assert actual == data
     outputs.change_hold(workspace, "owner", recipient, release=True)
 
@@ -473,7 +473,7 @@ def test_explicit_reexport_retains_final_bytes_before_parent_service_release(
     tensorfs.gc(str(workspace.store_root))
     with outputs.leased(workspace, "owner", final_hold) as (_, lease, members):
         actual = bytearray(len(data))
-        lease.read_into("sha256:" + members[0]["blob"]["sha256"], len(data), 0, len(data), actual)
+        lease.read_into("sha256:" + members[0].blob.sha256, len(data), 0, len(data), actual)
         assert actual == data
     with pytest.raises(WorkspaceRefusal, match="retention"):
         final_outputs.reexport(

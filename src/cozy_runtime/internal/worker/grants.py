@@ -789,7 +789,7 @@ def hydrate_inputs(
                                 members,
                             ):
                                 blob = byte_inputs.file_member(entry.native_tree, members)
-                                if (blob["sha256"], blob["length"]) != (
+                                if (blob.sha256, blob.length) != (
                                     entry.digest.hex(),
                                     entry.length,
                                 ):
@@ -801,7 +801,7 @@ def hydrate_inputs(
 
                                 receipt = copy_bounded(
                                     byte_inputs.chunks(
-                                        lease, "sha256:" + blob["sha256"], entry.length
+                                        lease, "sha256:" + blob.sha256, entry.length
                                     ),
                                     cast(BinaryIO, sink),
                                     expected_length=entry.length,

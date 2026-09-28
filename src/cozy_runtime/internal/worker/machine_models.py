@@ -10,8 +10,9 @@ import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.internal.worker import grants
+from cozy_runtime.internal.worker import grants, workspace_byte_outputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace_byte_outputs import Blob, FileMember
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -77,8 +78,6 @@ def byte_retention_id(owner: str, recipient: str, path: str, source: pb.NativeBy
 def retain_bytes(
     workspace: Workspace, owner: str, recipient: str, path: str, source: pb.NativeByteTreeRef
 ) -> pb.ChildByteResultGrant:
-    from . import workspace_byte_outputs
-
     identity = byte_retention_id(owner, recipient, path, source)
     request = pb.DerivedRetentionRequest(
         weights_transaction_id=source.producer_root_id,
@@ -121,8 +120,6 @@ def file_source(
     workspace: Workspace, owner: str, parent: str, digest: str, length: int | None = None
 ) -> pb.NativeByteRetentionRequest:
     """Resolve a typed file only among native payload trees actually received by this parent."""
-    from . import workspace_byte_outputs
-
     documents.raw(digest)
     if length is not None and (type(length) is not int or not 0 <= length <= 8 << 20):
         raise WorkspaceRefusal("received metadata file exceeds its 8 MiB bound")
@@ -158,13 +155,9 @@ def file_source(
                 )
     for candidate in candidates:
         with workspace_byte_outputs.leased(workspace, owner, candidate) as (_, _, members):
-            if members == [
-                {
-                    "kind": "file",
-                    "path": "payload",
-                    "blob": {"sha256": digest[7:], "length": candidate.source.content_bytes},
-                }
-            ]:
+            if members == (
+                FileMember("file", "payload", Blob(digest[7:], candidate.source.content_bytes)),
+            ):
                 return candidate
     raise WorkspaceRefusal("metadata file has no exact received native payload tree")
 

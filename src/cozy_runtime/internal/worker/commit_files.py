@@ -83,17 +83,7 @@ def prepare(
         spool = spool_root / opaque_key(
             "attempt-input-spool", call.parent_request_id, call.parent_attempt_ordinal
         )
-        body = canonical_json.encode(
-            {
-                "entries": [
-                    {
-                        "path": "payload",
-                        "kind": "file",
-                        "blob": {"sha256": args["digest"][7:], "length": args["size_bytes"]},
-                    }
-                ]
-            }
-        )
+        body = outputs.payload_manifest(outputs.Blob(args["digest"][7:], args["size_bytes"]))
     row = outputs.reserve_native(workspace, owner, command, body, MAX_OUTPUT_BYTES)
     with workspace.locked() as db:
         outputs.native_call(db, owner, command)

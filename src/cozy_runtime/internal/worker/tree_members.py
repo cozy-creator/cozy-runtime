@@ -38,7 +38,7 @@ def recorded_projection(db: Journal, row: Mapping[str, Any]) -> bool:
     ):
         return False
     members = workspace_byte_outputs.manifest_members(body, byte_inputs.MAX_BYTES)
-    if len(members) != 1 or members[0]["path"] != "payload":
+    if len(members) != 1 or members[0].path != "payload":
         return False
     source = workspace_byte_outputs.reference(dict(row))
     retention = pb.DerivedRetentionRequest(
@@ -119,11 +119,11 @@ def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> d
             if source is None or local is None:
                 raise WorkspaceRefusal("Tree member has no exact parent capability")
             with workspace_byte_outputs.leased(workspace, calls.owner(), source) as (_, _, members):
-                member = next((item for item in members if item["path"] == path), None)
+                member = next((item for item in members if item.path == path), None)
                 if member is None:
                     raise WorkspaceRefusal("Tree member path is absent from its native manifest")
-                blob = member["blob"]
-                if blob["length"] > limit:
+                blob = member.blob
+                if blob.length > limit:
                     raise WorkspaceRefusal("Tree member exceeds its declared byte bound")
                 # Materialized native trees are immutable and have no symlinks. Check
                 # every path component again before exposing an existing local file.
@@ -140,19 +140,17 @@ def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> d
                     while block := stream.read(1 << 20):
                         actual.update(block)
                 if (
-                    actual.hexdigest() != blob["sha256"]
-                    or local.stat().st_size != blob["length"]
+                    actual.hexdigest() != blob.sha256
+                    or local.stat().st_size != blob.length
                     or file_state(local) != state
                     or not admits(kind, media)
                     or (media_types and media not in media_types)
                 ):
                     raise WorkspaceRefusal("Tree member changed its native bytes or media type")
-                identity = canonical_json.encode([kind, "sha256:" + blob["sha256"], media]).decode()
+                identity = canonical_json.encode([kind, "sha256:" + blob.sha256, media]).decode()
                 held = calls.received.get(parent, {}).get(identity)
                 if held is None:
-                    body = canonical_json.encode(
-                        {"entries": [{"path": "payload", "kind": "file", "blob": blob}]}
-                    )
+                    body = workspace_byte_outputs.payload_manifest(blob)
                     slot = PROJECTION_PREFIX + hashlib.sha256(body).hexdigest()
                     native = workspace_byte_outputs.commit(
                         workspace,
@@ -170,9 +168,9 @@ def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> d
                     )
                     metadata = {
                         "kind": kind,
-                        "digest": "sha256:" + blob["sha256"],
-                        "length": blob["length"],
-                        "content_bytes": blob["length"],
+                        "digest": "sha256:" + blob.sha256,
+                        "length": blob.length,
+                        "content_bytes": blob.length,
                         "media_type": media,
                         "local": str(local),
                     }
@@ -189,8 +187,8 @@ def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> d
                     "ok": True,
                     "tree": digest,
                     "path": path,
-                    "digest": "sha256:" + blob["sha256"],
-                    "length": blob["length"],
+                    "digest": "sha256:" + blob.sha256,
+                    "length": blob.length,
                     "media_type": media,
                     "local": str(local),
                     "file_state": list(state),

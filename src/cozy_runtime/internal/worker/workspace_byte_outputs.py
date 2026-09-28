@@ -6,7 +6,9 @@ import hashlib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
+
+import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, storage_admission
@@ -16,6 +18,34 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 TREE_MIME = "application/vnd.cozy.tree-manifest"
 MAX_RESULTS = 32
+
+
+class Blob(msgspec.Struct, frozen=True):
+    sha256: Annotated[str, msgspec.Meta(pattern="^[0-9a-f]{64}$")]
+    length: Annotated[int, msgspec.Meta(ge=0)]
+
+
+class FileMember(msgspec.Struct, frozen=True):
+    kind: Literal["file"]
+    path: str
+    blob: Blob
+
+
+class TreeManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """An ordinary output's file manifest; native import stays its validation authority."""
+
+    entries: Annotated[tuple[FileMember, ...], msgspec.Meta(min_length=1)]
+
+
+def manifest_body(entries: Sequence[FileMember]) -> bytes:
+    return canonical_json.encode(msgspec.to_builtins(TreeManifest(tuple(entries))))
+
+
+def payload_manifest(blob: Blob) -> bytes:
+    """The manifest of one file, stored as `payload`."""
+    return manifest_body([FileMember("file", "payload", blob)])
+
+
 SCHEMA5 = """
 CREATE TABLE byte_outputs (
  id TEXT PRIMARY KEY, owner TEXT NOT NULL, request TEXT NOT NULL,
@@ -145,7 +175,7 @@ def recorded_native(
         ):
             return False
     elif not _single_payload(
-        canonical_json.decode(row["manifest_body"]),
+        row["manifest_body"],
         args["digest"].removeprefix("sha256:"),
         args["size_bytes"],
     ):
@@ -161,20 +191,13 @@ def recorded_native(
     )
 
 
-def _single_payload(body: Any, sha256: str, length: int) -> bool:
-    """One ``payload`` file of the accepted blob; additive manifest members are ignored."""
-    entries = body.get("entries") if isinstance(body, dict) else None
-    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+def _single_payload(body: bytes, sha256: str, length: int) -> bool:
+    """One ``payload`` file of the accepted blob; additive member fields are ignored."""
+    try:
+        entries = canonical_json.decode_as(body, TreeManifest).entries
+    except ValueError:
         return False
-    entry = entries[0]
-    blob = entry.get("blob")
-    return (
-        entry.get("path") == "payload"
-        and entry.get("kind") == "file"
-        and isinstance(blob, dict)
-        and blob.get("sha256") == sha256
-        and blob.get("length") == length
-    )
+    return entries == (FileMember("file", "payload", Blob(sha256, length)),)
 
 
 _RESULT_IDENTITY = ("kind", "digest", "size_bytes")
@@ -208,7 +231,7 @@ def reserve_native(
 ) -> dict[str, Any]:
     """Reserve once by accepted native call; later attempts keep the real producer."""
     members = manifest_members(manifest_body, max_bytes)
-    total = sum(member["blob"]["length"] for member in members)
+    total = sum(member.blob.length for member in members)
     with workspace.locked() as db:
         call = native_call(db, owner, command)
         slot = native_slot(call["operation"], call["call_index"])
@@ -384,29 +407,16 @@ def reference(row: Mapping[str, Any]) -> pb.NativeByteTreeRef:
     )
 
 
-def manifest_members(body: bytes, max_bytes: int) -> list[dict[str, Any]]:
+def manifest_members(body: bytes, max_bytes: int) -> tuple[FileMember, ...]:
     """Read capacity facts; native import remains the manifest validation authority."""
     if not 0 < len(body) <= 1 << 20 or max_bytes < 0:
         raise WorkspaceRefusal("ordinary output manifest exceeds its metadata bound")
-    value = canonical_json.decode(body)
-    if not isinstance(value, dict) or set(value) != {"entries"}:
-        raise WorkspaceRefusal("ordinary output requires one file manifest")
-    entries = value["entries"]
-    if not isinstance(entries, list) or not entries:
-        raise WorkspaceRefusal("ordinary output has no manifest members")
-    total = 0
-    for entry in entries:
-        if (
-            not isinstance(entry, dict)
-            or entry.get("kind") != "file"
-            or not isinstance(entry.get("blob"), dict)
-            or type(entry["blob"].get("length")) is not int
-            or entry["blob"]["length"] < 0
-        ):
-            raise WorkspaceRefusal("ordinary output contains a non-file member")
-        total += entry["blob"]["length"]
-        if total > max_bytes:
-            raise WorkspaceRefusal("ordinary output exceeds its granted content bytes")
+    try:
+        entries = canonical_json.decode_as(body, TreeManifest).entries
+    except ValueError as exc:
+        raise WorkspaceRefusal(f"ordinary output requires one file manifest: {exc}") from exc
+    if sum(entry.blob.length for entry in entries) > max_bytes:
+        raise WorkspaceRefusal("ordinary output exceeds its granted content bytes")
     return entries
 
 
@@ -426,7 +436,7 @@ def commit(
     if slot.startswith(("runtime.source_files.", "runtime.commit_file.")):
         raise WorkspaceRefusal("author outputs cannot enter the native byte namespace")
     entries = manifest_members(manifest_body, max_bytes)
-    content_bytes = sum(entry["blob"]["length"] for entry in entries)
+    content_bytes = sum(entry.blob.length for entry in entries)
     root_id = identity(owner, request, ordinal, spec, slot)
     workspace.owner(owner)
     with workspace.locked() as db:
@@ -574,7 +584,7 @@ def change_hold(
             raise WorkspaceRefusal("ordinary tree is not retained by this owner")
         store = fill.store(workspace.store_root)
         body = db.native(
-            lambda: bytes(store.manifest(documents.spell(source.manifest.digest))["manifest"])
+            lambda: store.manifest(documents.spell(source.manifest.digest))["manifest"]
         )
         check_manifest(source, body)
         internal = pb.DerivedRetentionRequest(
@@ -590,14 +600,14 @@ def change_hold(
         )
 
 
-def check_manifest(source: pb.NativeByteTreeRef, body: bytes) -> list[dict[str, Any]]:
+def check_manifest(source: pb.NativeByteTreeRef, body: bytes) -> tuple[FileMember, ...]:
     if (
         len(body) != source.manifest.length
         or hashlib.sha256(body).digest() != source.manifest.digest
     ):
         raise WorkspaceRefusal("ordinary artifact manifest identity changed")
     members = manifest_members(body, source.content_bytes)
-    if sum(item["blob"]["length"] for item in members) != source.content_bytes:
+    if sum(item.blob.length for item in members) != source.content_bytes:
         raise WorkspaceRefusal("ordinary artifact content byte count changed")
     return members
 
@@ -619,7 +629,7 @@ def _held(db: Journal, owner: str, request: pb.NativeByteRetentionRequest) -> bo
 
 def _retained(
     db: Journal, workspace: Workspace, owner: str, request: pb.NativeByteRetentionRequest
-) -> Any:
+) -> fill.Store:
     if not _held(db, owner, request):
         raise WorkspaceRefusal("ordinary artifact has no exact received retention")
     store = fill.store(workspace.store_root)
@@ -636,7 +646,7 @@ def _retained(
 
 def retained(
     workspace: Workspace, owner: str, request: pb.NativeByteRetentionRequest
-) -> tuple[Any, Callable[[], bool]]:
+) -> tuple[fill.Store, Callable[[], bool]]:
     """Check one independently held recipient without leasing its tree.
 
     Returns the store and a re-check of the hold. The retention keeps the tree from
@@ -655,7 +665,7 @@ def retained(
 @contextmanager
 def leased(
     workspace: Workspace, owner: str, request: pb.NativeByteRetentionRequest
-) -> Iterator[tuple[Any, Any, list[dict[str, Any]]]]:
+) -> Iterator[tuple[fill.Store, fill.ReadLease, tuple[FileMember, ...]]]:
     """Acquire the native read lease while checking one independently held recipient."""
     source = request.source
     lease = None
@@ -664,7 +674,7 @@ def leased(
             store = _retained(db, workspace, owner, request)
             manifest = documents.spell(source.manifest.digest)
             lease = db.native(lambda: store.acquire_manifest(manifest))
-            body = db.native(lambda: bytes(store.manifest(manifest)["manifest"]))
+            body = db.native(lambda: store.manifest(manifest)["manifest"])
             members = check_manifest(source, body)
             if not _held(db, owner, request):
                 raise WorkspaceRefusal(

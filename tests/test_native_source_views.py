@@ -202,7 +202,7 @@ def test_source_view_replays_one_producer_and_retained_child_survives_parent_ack
     assert observed is not None and observed["released"]
     with byte_outputs.leased(workspace, "owner", recipient) as (_, lease, members):
         data = bytearray(len(b"metadata bytes"))
-        lease.read_into("sha256:" + members[0]["blob"]["sha256"], len(data), 0, len(data), data)
+        lease.read_into("sha256:" + members[0].blob.sha256, len(data), 0, len(data), data)
         assert data == b"metadata bytes"
     byte_outputs.change_hold(workspace, "owner", recipient, release=True)
     byte_outputs.change_hold(workspace, "owner", recipient, release=True)
@@ -270,7 +270,7 @@ def test_source_view_lost_reply_reattaches_without_rebinding_original_producer(
     assert observed is not None and observed["released"]
     with byte_outputs.leased(restarted, "owner", recipient) as (_, lease, members):
         data = bytearray(len(b"original metadata"))
-        lease.read_into("sha256:" + members[0]["blob"]["sha256"], len(data), 0, len(data), data)
+        lease.read_into("sha256:" + members[0].blob.sha256, len(data), 0, len(data), data)
         assert data == b"original metadata"
     byte_outputs.change_hold(restarted, "owner", recipient, release=True)
 

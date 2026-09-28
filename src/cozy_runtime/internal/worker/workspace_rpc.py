@@ -169,7 +169,7 @@ class WorkspaceRPC:
             ):
                 source = request.source.source
                 manifest = documents.spell(source.manifest.digest)
-                objects = {"sha256:" + m["blob"]["sha256"]: m["blob"]["length"] for m in members}
+                objects = {"sha256:" + m.blob.sha256: m.blob.length for m in members}
                 objects[manifest] = source.manifest.length
                 selected = documents.spell(request.object.digest)
                 if (
