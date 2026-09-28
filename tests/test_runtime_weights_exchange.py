@@ -33,7 +33,7 @@ from cozy_runtime.internal.worker.control import (
     _PreparationServicer,
     _RuntimeWeightsServicer,
 )
-from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.internal.worker.workspace import WeightsRow, Workspace
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
@@ -117,7 +117,7 @@ class Rig:
             request_id="req-1", attempt=ordinal, digest=digest, canceling="", weights_receipts={}
         )
 
-    def begin(self, attempt: Any = None) -> dict[str, Any]:
+    def begin(self, attempt: Any = None) -> WeightsRow:
         attempt = self.accept() if attempt is None else attempt
         return self.workspace.begin_weights(
             OWNER,

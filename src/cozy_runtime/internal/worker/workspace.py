@@ -16,12 +16,12 @@ import re
 import sqlite3
 import threading
 import weakref
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 import msgspec
 
@@ -31,6 +31,41 @@ from cozy_runtime.internal.weights_sink import weights_transaction_id
 from cozy_runtime.internal.worker import derived_retention
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+
+
+class WeightsRow(TypedDict):
+    """One ``weights`` row."""
+
+    id: str
+    owner: str
+    request: str
+    ordinal: int
+    spec: bytes
+    slot: str
+    declaration_digest: bytes
+    declaration: bytes
+    epoch: int
+    state: Literal["intent", "receipt", "released"]
+    ready: int
+    restore_checkpoint: bytes
+    checkpoint: bytes
+    receipt: bytes
+    receipt_digest: bytes
+    native_digest: bytes
+    manifest: bytes
+    manifest_length: int
+    objects: bytes
+    adoption_source: str
+    adoption_epoch: int
+    adoption_checkpoint: bytes
+    retired_ms: int
+
+
+class WeightsTransaction(WeightsRow):
+    """A weights row with its writer attempt's fence and state."""
+
+    attempt_fenced: int
+    attempt_state: str
 
 
 class WorkspaceRefusal(ValueError):
@@ -633,18 +668,16 @@ class Workspace:
                 )
             ]
 
-    def projected_weights(self, owner: str, worker_boot: str) -> list[dict[str, Any]]:
+    def projected_weights(self, owner: str, worker_boot: str) -> list[WeightsRow]:
         with self.locked(allow_frozen=True) as db:
-            return [
-                dict(row)
-                for row in db.execute(
-                    "SELECT w.* FROM weights AS w JOIN attempts AS a ON "
-                    "a.owner=w.owner AND a.request=w.request AND a.ordinal=w.ordinal "
-                    "WHERE w.owner=? AND a.state<>'released' AND w.state<>'released' "
-                    "AND (a.state='outcome' OR a.worker_boot=?) ORDER BY w.id",
-                    (owner, worker_boot),
-                )
-            ]
+            return db.all(
+                WeightsRow,
+                "SELECT w.* FROM weights AS w JOIN attempts AS a ON "
+                "a.owner=w.owner AND a.request=w.request AND a.ordinal=w.ordinal "
+                "WHERE w.owner=? AND a.state<>'released' AND w.state<>'released' "
+                "AND (a.state='outcome' OR a.worker_boot=?) ORDER BY w.id",
+                (owner, worker_boot),
+            )
 
     @staticmethod
     def _model_held(
@@ -707,9 +740,9 @@ class Workspace:
     ) -> pb.DerivedResultReleaseResult:
         self.owner(owner)
         with self.locked() as db:
-            row = db.execute(
-                "SELECT * FROM weights WHERE id=?", (request.weights_transaction_id,)
-            ).fetchone()
+            row = db.one(
+                WeightsRow, "SELECT * FROM weights WHERE id=?", (request.weights_transaction_id,)
+            )
             if (
                 row is None
                 or row["owner"] != owner
@@ -908,7 +941,7 @@ class Workspace:
         for root in byte_releases:
             workspace_byte_outputs.release(self, owner, root)
 
-    def begin_weights(self, owner: str, intent: pb.WeightsIntentFrame) -> dict[str, Any]:
+    def begin_weights(self, owner: str, intent: pb.WeightsIntentFrame) -> WeightsRow:
         """Assign the epoch once, before native begin; the Host observes this decision."""
         self.owner(owner)
         declaration = intent.tensorfs_declaration_canonical_bytes
@@ -938,9 +971,9 @@ class Workspace:
                 or attempt["fenced"]
             ):
                 raise WorkspaceRefusal("weights intent requires its live accepted invocation")
-            row = db.execute(
-                "SELECT * FROM weights WHERE id=?", (intent.weights_transaction_id,)
-            ).fetchone()
+            row = db.one(
+                WeightsRow, "SELECT * FROM weights WHERE id=?", (intent.weights_transaction_id,)
+            )
             if row is not None:
                 if (
                     row["owner"] != owner
@@ -1013,9 +1046,9 @@ class Workspace:
         if documents.spell(native_digest) != receipt.tensorfs_receipt_digest:
             raise WorkspaceRefusal("native receipt digest differs")
         with self.locked() as db:
-            row = db.execute(
-                "SELECT * FROM weights WHERE id=?", (frame.weights_transaction_id,)
-            ).fetchone()
+            row = db.one(
+                WeightsRow, "SELECT * FROM weights WHERE id=?", (frame.weights_transaction_id,)
+            )
             if (
                 row is None
                 or row["owner"] != owner
@@ -1072,18 +1105,19 @@ class Workspace:
                 ),
             )
 
-    def weights_row(self, owner: str, transaction: str) -> dict[str, Any]:
+    def weights_row(self, owner: str, transaction: str) -> WeightsTransaction:
         with self.locked() as db:
-            row = db.execute(
+            row = db.one(
+                WeightsTransaction,
                 "SELECT w.*,a.fenced AS attempt_fenced,a.state AS attempt_state FROM weights w "
                 "JOIN attempts a ON a.owner=w.owner AND a.request=w.request "
                 "AND a.ordinal=w.ordinal "
                 "WHERE w.owner=? AND w.id=?",
                 (owner, transaction),
-            ).fetchone()
+            )
             if row is None:
                 raise WorkspaceRefusal("workspace has no owned weights transaction")
-            return dict(row)
+            return row
 
     def refuse_weights(self, owner: str, transaction: str) -> bool:
         """Tombstone one transaction the Host refused and stop its native writer.
@@ -1098,13 +1132,14 @@ class Workspace:
                 db.native(partial(_stop_native_transaction, self.store_root, transaction))
             return bool(changed)
 
-    def ready_weights(self, owner: str, request: pb.WeightsIntentReadyRequest) -> dict[str, Any]:
+    def ready_weights(self, owner: str, request: pb.WeightsIntentReadyRequest) -> WeightsRow:
         subject = request.weights
         with self.locked() as db:
-            row = db.execute(
+            row = db.one(
+                WeightsRow,
                 "SELECT * FROM weights WHERE owner=? AND id=?",
                 (owner, subject.weights_transaction_id),
-            ).fetchone()
+            )
             if (
                 row is None
                 or row["request"] != subject.request_id
@@ -1128,12 +1163,12 @@ class Workspace:
             if row["ready"]:
                 if checkpoint != row["restore_checkpoint"]:
                     raise WorkspaceRefusal("writer readiness already captured another checkpoint")
-                return dict(row)
+                return row
             if attempt["state"] not in ("accepted", "running"):
                 raise WorkspaceRefusal("checkpoint writer attempt has stopped")
             if checkpoint:
                 db.native(lambda: self._validate_checkpoint(row, request.checkpoint))
-            current = db.execute("SELECT * FROM weights WHERE id=?", (row["id"],)).fetchone()
+            current = self._weights(db, row["id"])
             attempt = db.execute(
                 "SELECT state,fenced FROM attempts WHERE owner=? AND request=? AND ordinal=?",
                 (owner, row["request"], row["ordinal"]),
@@ -1149,14 +1184,14 @@ class Workspace:
             if current["ready"]:
                 if checkpoint != current["restore_checkpoint"]:
                     raise WorkspaceRefusal("writer readiness already captured another checkpoint")
-                return dict(current)
+                return current
             if attempt["state"] not in ("accepted", "running"):
                 raise WorkspaceRefusal("writer stopped during checkpoint validation")
             db.execute(
                 "UPDATE weights SET ready=1,restore_checkpoint=? WHERE id=?",
                 (checkpoint, row["id"]),
             )
-            return dict(db.execute("SELECT * FROM weights WHERE id=?", (row["id"],)).fetchone())
+            return self._weights(db, row["id"])
 
     def checkpoint(self, owner: str, frame: pb.WeightsCheckpointFrame) -> None:
         """Record this worker's own native writer's latest checkpoint.
@@ -1166,10 +1201,11 @@ class Workspace:
         to restore from, is validated in full by `ready_weights`.
         """
         with self.locked() as db:
-            row = db.execute(
+            row = db.one(
+                WeightsRow,
                 "SELECT * FROM weights WHERE owner=? AND id=?",
                 (owner, frame.weights_transaction_id),
-            ).fetchone()
+            )
             if (
                 row is None
                 or row["request"] != frame.request_id
@@ -1198,9 +1234,14 @@ class Workspace:
             ):
                 raise WorkspaceRefusal("checkpoint changed or regressed its native chain")
 
-    def _validate_checkpoint(
-        self, row: sqlite3.Row | Mapping[str, Any], checkpoint: pb.CheckpointRef
-    ) -> None:
+    @staticmethod
+    def _weights(db: Journal, transaction: str) -> WeightsRow:
+        row = db.one(WeightsRow, "SELECT * FROM weights WHERE id=?", (transaction,))
+        if row is None:
+            raise WorkspaceRefusal("weights transaction row was removed")
+        return row
+
+    def _validate_checkpoint(self, row: WeightsRow, checkpoint: pb.CheckpointRef) -> None:
         store = fill.store(self.store_root)
         page = store.checkpoint_page(
             documents.spell(checkpoint.head.digest),
@@ -1223,10 +1264,7 @@ class Workspace:
         )
 
     @staticmethod
-    def status(row: dict[str, Any]) -> pb.WeightsTransactionStatus:
-        # SQLite rows have closed schema types; these are transport projections,
-        # never another writer epoch or custody decision.
-        value = row
+    def status(value: WeightsRow) -> pb.WeightsTransactionStatus:
         status = pb.WeightsTransactionStatus(
             weights_transaction_id=value["id"],
             request_id=value["request"],

@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 
 from cozy_runtime.internal import egress, fill
 from cozy_runtime.internal.weights_writer import WriterBroker
-from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.internal.worker.workspace import WeightsTransaction, Workspace
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -248,7 +248,7 @@ class WeightsExchange:
         *,
         attempt_ordinal: int | None = None,
         declaration: bytes | None = None,
-    ) -> dict[str, Any]:
+    ) -> WeightsTransaction:
         current = self.stamp(pb.WeightsIntentFrame())
         if (
             request.record_owner_epoch != current.record_owner_epoch

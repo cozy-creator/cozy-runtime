@@ -10,12 +10,12 @@ takes the whole store.
 from __future__ import annotations
 
 from functools import partial
-from typing import Any
 
 from cozy_runtime.internal import fill
 from cozy_runtime.internal.worker import store_gc, workspace_sources
 from cozy_runtime.internal.worker.workspace import (
     Journal,
+    WeightsRow,
     Workspace,
     WorkspaceBusy,
     WorkspaceRefusal,
@@ -84,14 +84,12 @@ def reclaim(workspace: Workspace, target_bytes: int) -> int:
     return reclaimed
 
 
-def adopt(workspace: Workspace, db: Journal, owner: str, transaction: str) -> dict[str, Any]:
-    row = db.execute(
-        "SELECT * FROM weights WHERE owner=? AND id=?", (owner, transaction)
-    ).fetchone()
+def adopt(workspace: Workspace, db: Journal, owner: str, transaction: str) -> WeightsRow:
+    row = db.one(WeightsRow, "SELECT * FROM weights WHERE owner=? AND id=?", (owner, transaction))
     if row is None:
         raise WorkspaceRefusal("partial recipient has no accepted writer intent")
     if row["state"] != "intent" or row["checkpoint"] or row["ready"]:
-        return dict(row)
+        return row
     attempt = db.execute(
         "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
         (owner, row["request"], row["ordinal"]),
@@ -99,9 +97,10 @@ def adopt(workspace: Workspace, db: Journal, owner: str, transaction: str) -> di
     if attempt is None or attempt["fenced"] or attempt["state"] not in ("accepted", "running"):
         raise WorkspaceRefusal("partial recipient attempt has stopped")
     if not attempt["memoize"]:
-        return dict(row)
+        return row
     if not row["adoption_source"]:
-        candidates = db.execute(
+        candidates = db.all(
+            WeightsRow,
             "SELECT w.* FROM weights w JOIN attempts a ON "
             "a.owner=w.owner AND a.request=w.request AND a.ordinal=w.ordinal "
             "WHERE w.owner=? AND w.id<>? AND w.slot=? AND w.state='intent' "
@@ -110,9 +109,9 @@ def adopt(workspace: Workspace, db: Journal, owner: str, transaction: str) -> di
             "OR ((a.state='outcome' OR a.fenced=1) AND a.state<>'released')) "
             "ORDER BY w.rowid DESC LIMIT 32",
             (owner, transaction, row["slot"], row["declaration_digest"], row["declaration"]),
-        ).fetchall()
+        )
         if not candidates:
-            return dict(row)
+            return row
         source = max(
             candidates, key=lambda item: pb.CheckpointRef.FromString(item["checkpoint"]).bytes
         )
@@ -121,7 +120,7 @@ def adopt(workspace: Workspace, db: Journal, owner: str, transaction: str) -> di
             "WHERE id=?",
             (source["id"], source["epoch"], source["checkpoint"], transaction),
         )
-        row = db.execute("SELECT * FROM weights WHERE id=?", (transaction,)).fetchone()
+        row = Workspace._weights(db, transaction)
 
     def acquire() -> pb.CheckpointRef:
         store = fill.store(workspace.store_root)
@@ -146,7 +145,7 @@ def adopt(workspace: Workspace, db: Journal, owner: str, transaction: str) -> di
         )
 
     checkpoint = db.native(acquire)
-    current = db.execute("SELECT * FROM weights WHERE id=?", (transaction,)).fetchone()
+    current = db.one(WeightsRow, "SELECT * FROM weights WHERE id=?", (transaction,))
     attempt = db.execute(
         "SELECT state,fenced FROM attempts WHERE owner=? AND request=? AND ordinal=?",
         (owner, row["request"], row["ordinal"]),
@@ -173,4 +172,4 @@ def adopt(workspace: Workspace, db: Journal, owner: str, transaction: str) -> di
     ).fetchone()
     if donor is not None and donor["retired_ms"]:
         _spend_weights(db, workspace, row["adoption_source"])
-    return dict(db.execute("SELECT * FROM weights WHERE id=?", (transaction,)).fetchone())
+    return Workspace._weights(db, transaction)
