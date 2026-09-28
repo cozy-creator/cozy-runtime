@@ -2,10 +2,16 @@
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 from cozy_runtime import canonical_json
+from cozy_runtime.internal.worker import machine_model_defaults
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
+from cozy_runtime.internal.worker.session import Worker
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace_rpc import Service, WorkspaceRPC
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_weights_upload import ObjectStore, serving
@@ -306,3 +312,78 @@ def test_byte_tree_upload_leases_only_the_object_it_sends(tmp_path: Path) -> Non
             assert transfers.execute(command).outcome == pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
     finally:
         transfers.pool.shutdown(wait=True)
+
+
+def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Path) -> None:
+    """`cozy run upload` over the machine connection: the claim authorizes the call, and the
+    command pages the retained closure and uploads a granted object, with no control stream."""
+    _store, workspace, receipt = produced(tmp_path)
+    source = pb.DerivedRetentionRequest(
+        weights_transaction_id=receipt.weights_transaction_id,
+        tensorfs_receipt_digest=documents.raw(receipt.tensorfs_receipt_digest),
+        retention_id="sha256:" + "e" * 64,
+    )
+    held = workspace.retain("owner", source)
+
+    def authorize(claim: pb.Claim) -> str:
+        if claim.record_owner_id != "owner":
+            raise WorkspaceRefusal("claim names another owner")
+        return "owner"
+
+    class Machine(WorkspaceRPC):
+        workspace_service = Service(
+            workspace, authorize, lambda _ready: pb.WeightsHostAck(), allow_private_egress=True
+        )
+
+    class Context:
+        def is_active(self) -> bool:
+            return True
+
+        def abort(self, code: object, detail: str) -> None:
+            raise AssertionError(f"{code}: {detail}")
+
+    machine, claim = Machine(), pb.Claim(record_owner_id="owner")
+    command = pb.NativeArtifactTransfer(
+        effect_id="upload-one", source=source, manifest=held.manifest, command_id=1, limit=128
+    )
+    call = pb.NativeArtifactTransferCall(claim=claim, request=command)
+    inventory = machine.WorkspaceNativeArtifactTransfer(call, Context())  # type: ignore[arg-type]
+    assert not inventory.safe_code and inventory.objects and not inventory.has_more
+    manifest_id = documents.spell(held.manifest.digest)
+    row = next(row for row in inventory.objects if row.object_id != manifest_id)
+    sink = ObjectStore()
+    with serving(sink) as url:
+        call.request.command_id, call.request.grant_revision = 2, 1
+        call.request.server_time_unix = 100
+        call.request.grant.CopyFrom(
+            pb.WeightsUploadGrant(
+                object_id=row.object_id, length=row.length, url=url, expires_at_unix=200
+            )
+        )
+        upload = machine.WorkspaceNativeArtifactTransfer(call, Context())  # type: ignore[arg-type]
+    assert upload.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED and len(sink.body) == row.length
+
+    # A machine whose own Hub is not local never uploads to a private address.
+    class Production(WorkspaceRPC):
+        workspace_service = Service(workspace, authorize, lambda _ready: pb.WeightsHostAck())
+
+    with serving(ObjectStore()) as url:
+        call.request.command_id, call.request.grant.url = 3, url
+        refused = Production().WorkspaceNativeArtifactTransfer(call, Context())  # type: ignore[arg-type]
+    assert refused.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED, refused
+    for origin, bootstrap, private in (
+        ("https://tensorhub.example", "b", False),
+        ("http://127.0.0.1:8819", "b", True),
+        ("http://127.0.0.1:8819", "", False),
+    ):
+        worker = cast(
+            Worker, SimpleNamespace(config=SimpleNamespace(bootstrap_credential=bootstrap))
+        )
+        assert machine_model_defaults.local_development(worker, origin) is private, origin
+    call.claim.record_owner_id = "stranger"
+    try:
+        machine.WorkspaceNativeArtifactTransfer(call, Context())  # type: ignore[arg-type]
+    except AssertionError as refused:
+        assert "claim names another owner" in str(refused)
+    else:
+        raise AssertionError("another owner's claim moved a retained output")

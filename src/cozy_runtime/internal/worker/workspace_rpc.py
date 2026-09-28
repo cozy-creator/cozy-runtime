@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Iterator
 import grpc
 
 from cozy_runtime.internal.worker import (
+    artifact_transfer,
     workspace_byte_outputs,
     workspace_input_trees,
     workspace_memo,
@@ -30,8 +31,27 @@ class Service:
         workspace: Workspace,
         authorize: Callable[[pb.Claim], str],
         ready: Callable[[pb.WeightsIntentReadyCall], pb.WeightsHostAck],
+        *,
+        allow_private_egress: bool = False,
     ):
         self.workspace, self.authorize, self.ready = workspace, authorize, ready
+        #: Uploads may reach private addresses only for a machine whose own Hub is local.
+        self.allow_private_egress = allow_private_egress
+        self._transfers: dict[str, artifact_transfer.NativeArtifactTransfers] = {}
+
+    def transfers(self, owner: str) -> artifact_transfer.NativeArtifactTransfers:
+        """One owner's retained-artifact transfers on the machine connection. Its claim was
+        checked by the call, so each command is valid as it stands."""
+        held = self._transfers.get(owner)
+        if held is None:
+            held = self._transfers[owner] = artifact_transfer.NativeArtifactTransfers(
+                self.workspace,
+                lambda: owner,
+                lambda _frame: None,
+                lambda _command: True,
+                allow_private_egress=self.allow_private_egress,
+            )
+        return held
 
 
 class WorkspaceRPC:
@@ -142,6 +162,13 @@ class WorkspaceRPC:
                 request.request,
                 release=True,
             ),
+        )
+
+    def WorkspaceNativeArtifactTransfer(
+        self, request: pb.NativeArtifactTransferCall, context: ServicerContext
+    ) -> pb.NativeArtifactTransferStatus:
+        return self._workspace_call(
+            request.claim, context, lambda s, owner: s.transfers(owner).execute(request.request)
         )
 
     def WorkspaceReadByteTreeObject(

@@ -3809,6 +3809,14 @@ class TriageBundleRef(_message.Message):
     length: int
     def __init__(self, subject_id: _Optional[str] = ..., write_receipt_digest: _Optional[bytes] = ..., length: _Optional[int] = ...) -> None: ...
 
+class NativeArtifactTransferCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: NativeArtifactTransfer
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[NativeArtifactTransfer, _Mapping]] = ...) -> None: ...
+
 class NativeArtifactTransfer(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "effect_id", "source", "manifest", "command_id", "offset", "limit", "grant", "grant_revision", "server_time_unix", "byte_source")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]

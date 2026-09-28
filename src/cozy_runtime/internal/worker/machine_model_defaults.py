@@ -31,6 +31,12 @@ def local_origin(origin: str) -> bool:
         return False
 
 
+def local_development(worker: Worker, origin: str) -> bool:
+    """A machine of a loopback Hub, for local development: it may reach the private
+    addresses that Hub hands it (checkpoint pulls, object uploads)."""
+    return bool(worker.config.bootstrap_credential) and local_origin(origin)
+
+
 def _same_origin(a: str, b: str) -> bool:
     try:
         left, right = urlsplit(a.rstrip("/")), urlsplit(b.rstrip("/"))
@@ -274,8 +280,7 @@ def materialize(
                             row["repository"] + "@" + manifest["digest"],
                             credential=credential(worker, row["public_origin"]),
                             allowed_hosts=worker.config.object_storage_hosts,
-                            allow_local=bool(worker.config.bootstrap_credential)
-                            and local_origin(row["public_origin"]),
+                            allow_local=local_development(worker, row["public_origin"]),
                             streams=8,
                             cancellation=cancellation,
                             progress=progress,

@@ -100,6 +100,7 @@ from cozy_runtime.internal.worker import (
     machine_byte_inputs,
     machine_capture,
     machine_lanes,
+    machine_model_defaults,
     machine_release_catalog,
     machine_slots,
     model_source_prepare,
@@ -1173,7 +1174,14 @@ class Worker:
                 lambda target: workspace_memo.reclaim_unused(workspace, target_bytes=target),
             )
         self.workspace_service = (
-            WorkspaceService(self.workspace, self.authorize_workspace, self.workspace_weights_ready)
+            WorkspaceService(
+                self.workspace,
+                self.authorize_workspace,
+                self.workspace_weights_ready,
+                allow_private_egress=machine_model_defaults.local_development(
+                    self, getattr(self.options.publication_authority, "origin", "")
+                ),
+            )
             if self.workspace is not None
             else None
         )
