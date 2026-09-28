@@ -21,6 +21,7 @@ from cozy_runtime.internal.worker.workspace import (
     WorkspaceRefusal,
     _stop_native_transaction,
 )
+from cozy_runtime.internal.worker.workspace_sources import NativeCall
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -49,23 +50,22 @@ def _spend_weights(db: Journal, workspace: Workspace, transaction: str) -> None:
 def evict(db: Journal, workspace: Workspace, *, target_bytes: int) -> tuple[int, int, bool]:
     """Release retired partials, oldest first; returns reclaimed bytes, count, store busy."""
     victims = [
-        (row["retired_ms"], "weights", dict(row))
+        (row["retired_ms"], partial(_spend_weights, db, workspace, row["id"]))
         for row in db.execute(
             "SELECT id,retired_ms FROM weights WHERE state='intent' AND retired_ms>0 "
             "ORDER BY retired_ms LIMIT 256"
         )
     ] + [
-        (row["retired_ms"], "source", dict(row))
-        for row in db.execute(workspace_sources.PARTIALS + " ORDER BY n.retired_ms LIMIT 256")
+        (row.retired_ms, partial(workspace_sources.spend, db, workspace, row))
+        for row in db.all(
+            NativeCall, workspace_sources.PARTIALS + " ORDER BY n.retired_ms LIMIT 256"
+        )
     ]
     reclaimed = removed = 0
-    for _, kind, row in sorted(victims, key=lambda victim: victim[0]):
+    for _, spend in sorted(victims, key=lambda victim: victim[0]):
         if reclaimed >= target_bytes:
             break
-        if kind == "weights":
-            _spend_weights(db, workspace, row["id"])
-        else:
-            workspace_sources.spend(db, workspace, row)
+        spend()
         removed += 1
         collected = db.native(lambda: store_gc.collect(workspace.store_root))
         reclaimed += collected.reclaimed_bytes

@@ -159,6 +159,33 @@ def _decode_row[T](row: sqlite3.Row, into: type[T]) -> T:
         raise WorkspaceRefusal(f"journal row is not a {into.__name__}: {exc}") from exc
 
 
+class NativeHold(msgspec.Struct, frozen=True, kw_only=True):
+    """One ``holds`` row."""
+
+    id: str
+    owner: str
+    transaction_id: str
+    native_digest: bytes
+    state: Literal["retaining", "held", "releasing", "released"]
+    manifest: bytes = b""
+    manifest_length: int = 0
+    kind: Literal["derived", "tree"] = "derived"
+
+
+class HeldTree(NativeHold, frozen=True, kw_only=True):
+    """A ``holds`` row joined with its producing byte output's size."""
+
+    content_bytes: int
+
+    def source(self) -> pb.NativeByteTreeRef:
+        return pb.NativeByteTreeRef(
+            producer_root_id=self.transaction_id,
+            receipt_digest=self.native_digest,
+            manifest=pb.Ref(digest=self.manifest, length=self.manifest_length),
+            content_bytes=self.content_bytes,
+        )
+
+
 _LOG = logging.getLogger(__name__)
 
 
@@ -683,15 +710,15 @@ class Workspace:
     def _model_held(
         db: Journal, owner: str, source: pb.DerivedRetentionRequest, manifest: pb.Ref
     ) -> bool:
-        row = db.execute(
-            "SELECT * FROM holds WHERE id=? AND owner=?", (source.retention_id, owner)
-        ).fetchone()
+        row = db.one(
+            NativeHold, "SELECT * FROM holds WHERE id=? AND owner=?", (source.retention_id, owner)
+        )
         return row is not None and (
-            row["state"] == "held"
-            and row["transaction_id"] == source.weights_transaction_id
-            and row["native_digest"] == source.tensorfs_receipt_digest
-            and row["manifest"] == manifest.digest
-            and row["manifest_length"] == manifest.length
+            row.state == "held"
+            and row.transaction_id == source.weights_transaction_id
+            and row.native_digest == source.tensorfs_receipt_digest
+            and row.manifest == manifest.digest
+            and row.manifest_length == manifest.length
         )
 
     def model_held(self, owner: str, source: pb.DerivedRetentionRequest, manifest: pb.Ref) -> bool:
@@ -1301,14 +1328,12 @@ class Workspace:
             or len(request.tensorfs_receipt_digest) != 32
         ):
             raise WorkspaceRefusal("native retention requires exact bounded identities")
-        row = db.execute("SELECT * FROM holds WHERE id=?", (request.retention_id,)).fetchone()
+        row = db.one(NativeHold, "SELECT * FROM holds WHERE id=?", (request.retention_id,))
         subject = (owner, request.weights_transaction_id, request.tensorfs_receipt_digest)
         if row is not None:
-            if (row["owner"], row["transaction_id"], row["native_digest"]) != subject or row[
-                "kind"
-            ] != kind:
+            if (row.owner, row.transaction_id, row.native_digest) != subject or row.kind != kind:
                 raise WorkspaceRefusal("retention identity already belongs to another subject")
-            if not release and row["state"] in ("releasing", "released"):
+            if not release and row.state in ("releasing", "released"):
                 raise WorkspaceRefusal("released retention cannot be recreated")
         else:
             original = db.execute(

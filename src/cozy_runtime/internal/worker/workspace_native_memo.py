@@ -11,7 +11,7 @@ from msgspec.structs import replace
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill
 from cozy_runtime.internal.worker import derived_retention
-from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import Journal, NativeHold, Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_memo_rows import (
     Artifact,
     Hold,
@@ -23,7 +23,13 @@ from cozy_runtime.internal.worker.workspace_memo_rows import (
     hold_id,
     lookup_row,
 )
-from cozy_runtime.internal.worker.workspace_sources import NativeCall, native_owner
+from cozy_runtime.internal.worker.workspace_sources import (
+    HeldAccess,
+    NativeCall,
+    SourceAccess,
+    call_row,
+    native_owner,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -36,16 +42,17 @@ def native_receipt_owned(
     *,
     release: bool = False,
 ) -> bool | None:
-    rows = db.execute(
-        "SELECT operation,native_receipt FROM native_calls WHERE owner=? AND native_owner=? "
+    rows = db.all(
+        NativeCall,
+        "SELECT * FROM native_calls WHERE owner=? AND native_owner=? "
         "AND (state='complete' OR (? AND state='releasing'))",
         (owner, request.weights_transaction_id, release),
-    ).fetchall()
+    )
     for row in rows:
-        actual = "derived" if row["operation"] == "convert_cozytensors" else "tree"
+        actual = "derived" if row.operation == "convert_cozytensors" else "tree"
         if (
             actual == kind
-            and hashlib.sha256(row["native_receipt"]).digest() == request.tensorfs_receipt_digest
+            and hashlib.sha256(row.native_receipt).digest() == request.tensorfs_receipt_digest
         ):
             return True
     return None
@@ -116,12 +123,10 @@ def change_native_hold(
 
 
 def _row(db: Journal, owner: str, service: str) -> NativeCall:
-    row = db.execute(
-        "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, service)
-    ).fetchone()
+    row = call_row(db, owner, service)
     if row is None:
         raise WorkspaceRefusal("native memo call has no accepted service intent")
-    return msgspec.convert(dict(row), NativeCall)
+    return row
 
 
 def _payload(db: Journal, owner: str, service: str, *, releasing: bool = False) -> Memo:
@@ -189,7 +194,8 @@ def retain_native_result(workspace: Workspace, owner: str, service_id: str) -> b
     with workspace.locked() as db:
         row = _row(db, owner, service_id)
         (hold,) = _payload(db, owner, service_id).holds
-        access = db.execute(
+        access = db.one(
+            HeldAccess,
             "SELECT a.*,h.kind FROM source_access a LEFT JOIN holds h ON h.id=a.retention_id "
             "WHERE a.owner=? AND a.request=? AND a.call_index=? AND a.producer=? "
             "AND a.native_digest=?",
@@ -200,12 +206,12 @@ def retain_native_result(workspace: Workspace, owner: str, service_id: str) -> b
                 hold.transaction_id,
                 documents.raw(hold.native_receipt_digest),
             ),
-        ).fetchone()
+        )
         lookup = lookup_row(db, owner, service_id)
         if access is not None:
-            if access["state"] != "held" or access["kind"] != hold.kind:
+            if access.state != "held" or access.kind != hold.kind:
                 raise WorkspaceRefusal("native source access was changed or released")
-            hold = replace(hold, retention_id=access["retention_id"])
+            hold = replace(hold, retention_id=access.retention_id)
         elif lookup is not None and lookup.state != "miss":
             if lookup.key != row.computation_digest or lookup.state not in (
                 "ready",
@@ -248,10 +254,10 @@ def retain_native_result(workspace: Workspace, owner: str, service_id: str) -> b
                 hold.retention_id,
             ),
         )
-        access = db.execute(
-            "SELECT * FROM source_access WHERE retention_id=?", (hold.retention_id,)
-        ).fetchone()
-        if access["state"] != "held" or access["producer"] != hold.transaction_id:
+        stored = db.one(
+            SourceAccess, "SELECT * FROM source_access WHERE retention_id=?", (hold.retention_id,)
+        )
+        if stored is None or stored.state != "held" or stored.producer != hold.transaction_id:
             raise WorkspaceRefusal("native source access was changed or released")
         return row.result
 
@@ -305,13 +311,13 @@ def record_reuse(workspace: Workspace, owner: str, service_id: str) -> bytes:
         lookup.memo.require("native")
         source = lookup.memo.source
         (hold,) = lookup.memo.holds
-        native = db.execute("SELECT * FROM holds WHERE id=?", (hold.retention_id,)).fetchone()
+        native = db.one(NativeHold, "SELECT * FROM holds WHERE id=?", (hold.retention_id,))
         if (
             native is None
-            or native["owner"] != owner
-            or native["state"] != "held"
-            or native["transaction_id"] != hold.transaction_id
-            or documents.spell(native["native_digest"]) != hold.native_receipt_digest
+            or native.owner != owner
+            or native.state != "held"
+            or native.transaction_id != hold.transaction_id
+            or documents.spell(native.native_digest) != hold.native_receipt_digest
         ):
             raise WorkspaceRefusal("native reuse lost its recipient custody")
         parent = db.execute(
@@ -342,9 +348,9 @@ def record_reuse(workspace: Workspace, owner: str, service_id: str) -> bytes:
                         row.parent_request,
                         row.call_index,
                         hold.transaction_id,
-                        native["native_digest"],
-                        native["manifest"],
-                        native["manifest_length"],
+                        native.native_digest,
+                        native.manifest,
+                        native.manifest_length,
                         hold.retention_id,
                     ),
                 )
@@ -384,13 +390,14 @@ def release_native_result(workspace: Workspace, owner: str, service_id: str) -> 
     release_native_lookup(workspace, owner, service_id)
     with workspace.locked() as db:
         row = _row(db, owner, service_id)
-        access = db.execute(
+        accesses = db.all(
+            HeldAccess,
             "SELECT a.*,h.kind FROM source_access a JOIN holds h ON h.id=a.retention_id "
             "WHERE a.owner=? AND a.request=? AND a.call_index=? AND a.state<>'released'",
             (owner, row.parent_request, row.call_index),
-        ).fetchall()
+        )
         if (
-            not access
+            not accesses
             and row.state in ("complete", "releasing")
             and row.native_receipt
             and row.native_owner == native_owner(owner, service_id)
@@ -405,23 +412,23 @@ def release_native_result(workspace: Workspace, owner: str, service_id: str) -> 
                 ),
             )
             workspace._change_hold(db, owner, hold.request(), kind=hold.kind, release=True)
-        for held in access:
+        for held in accesses:
             db.execute(
                 "UPDATE source_access SET state='releasing' WHERE retention_id=?",
-                (held["retention_id"],),
+                (held.retention_id,),
             )
             workspace._change_hold(
                 db,
                 owner,
                 pb.DerivedRetentionRequest(
-                    weights_transaction_id=held["producer"],
-                    retention_id=held["retention_id"],
-                    tensorfs_receipt_digest=held["native_digest"],
+                    weights_transaction_id=held.producer,
+                    retention_id=held.retention_id,
+                    tensorfs_receipt_digest=held.native_digest,
                 ),
-                kind=held["kind"],
+                kind=held.kind,
                 release=True,
             )
             db.execute(
                 "UPDATE source_access SET state='released' WHERE retention_id=?",
-                (held["retention_id"],),
+                (held.retention_id,),
             )

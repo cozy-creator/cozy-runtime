@@ -44,10 +44,11 @@ def recorded_projection(db: Journal, row: workspace_byte_outputs.ByteOutput) -> 
         tensorfs_receipt_digest=source.receipt_digest,
         retention_id=machine_models.byte_retention_id(row.owner, row.request, row.slot, source),
     )
-    binding = db.execute(
-        "SELECT retention FROM execution_model_holds WHERE owner=? AND recipient=? AND path=?",
+    binding = db.one(
+        machine_models.ModelHold,
+        "SELECT * FROM execution_model_holds WHERE owner=? AND recipient=? AND path=?",
         (row.owner, row.request, row.slot),
-    ).fetchone()
+    )
     held = db.execute(
         "SELECT 1 FROM holds WHERE id=? AND owner=? AND transaction_id=? AND native_digest=? "
         "AND kind='tree' AND state='held'",
@@ -55,7 +56,7 @@ def recorded_projection(db: Journal, row: workspace_byte_outputs.ByteOutput) -> 
     ).fetchone()
     return (
         binding is not None
-        and binding["retention"] == retention.SerializeToString(deterministic=True)
+        and binding.retention == retention.SerializeToString(deterministic=True)
         and held is not None
     )
 

@@ -13,7 +13,13 @@ import msgspec
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, storage_admission
 from cozy_runtime.internal.worker import workspace_sources
-from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal, same_ref
+from cozy_runtime.internal.worker.workspace import (
+    Journal,
+    NativeHold,
+    Workspace,
+    WorkspaceRefusal,
+    same_ref,
+)
 from cozy_runtime.internal.worker.workspace_sources import NativeCall
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -89,11 +95,7 @@ def native_slot(operation: str, index: int) -> str:
 def native_call(db: Journal, owner: str, command: pb.NativeSourceCommand) -> NativeCall:
     call = command.parent_call
     workspace_sources._parent(db, owner, call)
-    row = db.one(
-        NativeCall,
-        "SELECT * FROM native_calls WHERE owner=? AND service_id=?",
-        (owner, command.service_id),
-    )
+    row = workspace_sources.call_row(db, owner, command.service_id)
     if (
         row is None
         or row.operation not in ("source_files", "commit_file")
@@ -140,11 +142,7 @@ def recorded_native(
     service = row.native_service_id
     if not service or row.id != identity(row.owner, row.request, row.ordinal, row.spec, row.slot):
         return False
-    call = db.one(
-        NativeCall,
-        "SELECT * FROM native_calls WHERE owner=? AND service_id=?",
-        (row.owner, service),
-    )
+    call = workspace_sources.call_row(db, row.owner, service)
     if (
         call is None
         or call.operation not in ("source_files", "commit_file")
@@ -363,10 +361,8 @@ def release_native(workspace: Workspace, owner: str, service_id: str) -> None:
             return
         if not recorded_native(db, row, complete=False):
             raise WorkspaceRefusal("native byte release has no accepted producer")
-        call = db.execute(
-            "SELECT state FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
-        ).fetchone()
-        if call["state"] not in ("stopped", "releasing", "released"):
+        call = workspace_sources.call_row(db, owner, service_id)
+        if call is None or call.state not in ("stopped", "releasing", "released"):
             raise WorkspaceRefusal("native byte release has no permanent stop intent")
         db.execute("UPDATE byte_outputs SET state='releasing' WHERE id=?", (row.id,))
         root_id = row.id
@@ -607,16 +603,16 @@ def check_manifest(source: pb.NativeByteTreeRef, body: bytes) -> tuple[FileMembe
 
 def _held(db: Journal, owner: str, request: pb.NativeByteRetentionRequest) -> bool:
     source = request.source
-    row = db.execute(
-        "SELECT * FROM holds WHERE id=? AND owner=?", (request.retention_id, owner)
-    ).fetchone()
+    row = db.one(
+        NativeHold, "SELECT * FROM holds WHERE id=? AND owner=?", (request.retention_id, owner)
+    )
     return row is not None and (
-        row["state"] == "held"
-        and row["kind"] == "tree"
-        and row["transaction_id"] == source.producer_root_id
-        and row["native_digest"] == source.receipt_digest
-        and row["manifest"] == source.manifest.digest
-        and row["manifest_length"] == source.manifest.length
+        row.state == "held"
+        and row.kind == "tree"
+        and row.transaction_id == source.producer_root_id
+        and row.native_digest == source.receipt_digest
+        and row.manifest == source.manifest.digest
+        and row.manifest_length == source.manifest.length
     )
 
 

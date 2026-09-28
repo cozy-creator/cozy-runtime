@@ -17,6 +17,7 @@ from cozy_runtime.internal.worker import store_gc, workspace_partial
 from cozy_runtime.internal.worker.workspace import (
     _ID,
     Journal,
+    NativeHold,
     WorkspaceBusy,
     WorkspaceRefusal,
     same_ref,
@@ -156,11 +157,11 @@ def compact_released(db: Journal, owner: str) -> None:
         memo = decode(row["body"], Memo)
         settled = True
         for hold in memo.holds:
-            native = db.execute("SELECT * FROM holds WHERE id=?", (hold.retention_id,)).fetchone()
-            if native is None or native["state"] != "released":
+            native = db.one(NativeHold, "SELECT * FROM holds WHERE id=?", (hold.retention_id,))
+            if native is None or native.state != "released":
                 settled = False
                 break
-            if (native["owner"], native["transaction_id"], native["native_digest"]) != (
+            if (native.owner, native.transaction_id, native.native_digest) != (
                 owner,
                 hold.transaction_id,
                 documents.raw(hold.native_receipt_digest),

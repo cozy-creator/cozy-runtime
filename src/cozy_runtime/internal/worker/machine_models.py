@@ -11,7 +11,7 @@ import msgspec
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.internal.worker import grants, workspace_byte_outputs
-from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import HeldTree, NativeHold, Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_byte_outputs import Blob, FileMember
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -23,6 +23,15 @@ CREATE TABLE execution_model_holds (
  PRIMARY KEY(owner,recipient,path)
 ) STRICT;
 """
+
+
+class ModelHold(msgspec.Struct, frozen=True):
+    """One ``execution_model_holds`` row."""
+
+    owner: str
+    recipient: str
+    path: str
+    retention: bytes
 
 
 def retain(
@@ -56,11 +65,12 @@ def register(
             "ON CONFLICT(owner,recipient,path) DO NOTHING",
             (owner, recipient, path, raw),
         )
-        row = db.execute(
-            "SELECT retention FROM execution_model_holds WHERE owner=? AND recipient=? AND path=?",
+        row = db.one(
+            ModelHold,
+            "SELECT * FROM execution_model_holds WHERE owner=? AND recipient=? AND path=?",
             (owner, recipient, path),
-        ).fetchone()
-        if row["retention"] != raw:
+        )
+        if row is None or row.retention != raw:
             raise WorkspaceRefusal("execution Model hold changed its exact subject")
         workspace.reserve_hold(db, owner, request, release=False, kind=kind)
 
@@ -97,18 +107,17 @@ def retain_bytes(
 def release(workspace: Workspace, owner: str, recipient: str) -> None:
     """Collection or explicit abandonment releases this recipient's own native holds."""
     with workspace.locked() as db:
-        rows = db.execute(
-            "SELECT retention FROM execution_model_holds WHERE owner=? AND recipient=?",
+        rows = db.all(
+            ModelHold,
+            "SELECT * FROM execution_model_holds WHERE owner=? AND recipient=?",
             (owner, recipient),
-        ).fetchall()
+        )
     for row in rows:
-        request = pb.DerivedRetentionRequest.FromString(row["retention"])
+        request = pb.DerivedRetentionRequest.FromString(row.retention)
         with workspace.locked() as db:
-            held = db.execute(
-                "SELECT kind FROM holds WHERE id=?", (request.retention_id,)
-            ).fetchone()
+            held = db.one(NativeHold, "SELECT * FROM holds WHERE id=?", (request.retention_id,))
             workspace._change_hold(
-                db, owner, request, release=True, kind=held["kind"] if held else "derived"
+                db, owner, request, release=True, kind=held.kind if held else "derived"
             )
     from . import machine_checkpoint_inputs
 
@@ -124,33 +133,26 @@ def file_source(
     if length is not None and (type(length) is not int or not 0 <= length <= 8 << 20):
         raise WorkspaceRefusal("received metadata file exceeds its 8 MiB bound")
     with workspace.locked() as db:
-        rows = db.execute(
-            "SELECT retention FROM execution_model_holds "
-            "WHERE owner=? AND recipient=? ORDER BY path",
+        rows = db.all(
+            ModelHold,
+            "SELECT * FROM execution_model_holds WHERE owner=? AND recipient=? ORDER BY path",
             (owner, parent),
-        ).fetchall()
+        )
         candidates = []
         for row in rows:
-            hold = pb.DerivedRetentionRequest.FromString(row["retention"])
-            held = db.execute(
+            hold = pb.DerivedRetentionRequest.FromString(row.retention)
+            held = db.one(
+                HeldTree,
                 "SELECT h.*,b.content_bytes FROM holds h JOIN byte_outputs b ON b.owner=h.owner "
                 "AND b.id=h.transaction_id WHERE h.owner=? AND h.id=? AND h.state='held' "
                 "AND h.kind='tree' AND h.native_digest=? AND b.content_bytes<=? "
                 "AND (? IS NULL OR b.content_bytes=?)",
                 (owner, hold.retention_id, hold.tensorfs_receipt_digest, 8 << 20, length, length),
-            ).fetchone()
+            )
             if held is not None:
                 candidates.append(
                     pb.NativeByteRetentionRequest(
-                        retention_id=hold.retention_id,
-                        source=pb.NativeByteTreeRef(
-                            producer_root_id=held["transaction_id"],
-                            receipt_digest=held["native_digest"],
-                            manifest=pb.Ref(
-                                digest=held["manifest"], length=held["manifest_length"]
-                            ),
-                            content_bytes=held["content_bytes"],
-                        ),
+                        retention_id=hold.retention_id, source=held.source()
                     )
                 )
     for candidate in candidates:

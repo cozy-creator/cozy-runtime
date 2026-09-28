@@ -86,6 +86,32 @@ class NativeCall(msgspec.Struct, frozen=True):
     retired_ms: int
 
 
+class SourceAccess(msgspec.Struct, frozen=True):
+    """One ``source_access`` row."""
+
+    owner: str
+    request: str
+    call_index: int
+    producer: str
+    native_digest: bytes
+    manifest: bytes
+    manifest_length: int
+    retention_id: str
+    state: Literal["retaining", "held", "releasing", "released"]
+
+
+class HeldAccess(SourceAccess, frozen=True):
+    """A ``source_access`` row joined with its hold's kind; every access has its hold."""
+
+    kind: Literal["derived", "tree"]
+
+
+def call_row(db: Journal, owner: str, service_id: str) -> NativeCall | None:
+    return db.one(
+        NativeCall, "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
+    )
+
+
 def identity(owner: str, parent: str, index: int) -> str:
     return (
         "source-" + hashlib.sha256(canonical_json.encode([owner, parent, index])).hexdigest()[:48]
@@ -135,10 +161,11 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
         raise WorkspaceRefusal("native source service id differs from parent call")
     with workspace.locked() as db:
         _parent(db, owner, call)
-        row = db.execute(
+        row = db.one(
+            NativeCall,
             "SELECT * FROM native_calls WHERE owner=? AND parent_request=? AND call_index=?",
             (owner, call.parent_request_id, call.call_index),
-        ).fetchone()
+        )
         if row is None:
             db.execute(
                 "INSERT INTO native_calls(owner,parent_request,call_index,parent_ordinal,"
@@ -159,18 +186,17 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
                 ),
             )
         elif (
-            row["intent_digest"] != call.intent_digest
-            or row["accepted"] != call.request_canonical_bytes
+            row.intent_digest != call.intent_digest or row.accepted != call.request_canonical_bytes
         ):
             raise WorkspaceRefusal("parent call already names another native source intent")
         else:
-            if row["state"] in ("releasing", "released"):
+            if row.state in ("releasing", "released"):
                 raise WorkspaceRefusal("native source call was permanently released")
-            if row["state"] == "failed" and call.parent_attempt_ordinal > row["parent_ordinal"]:
+            if row.state == "failed" and call.parent_attempt_ordinal > row.parent_ordinal:
                 db.execute(
                     "UPDATE native_calls SET state=?,native_error='' "
                     "WHERE owner=? AND service_id=?",
-                    ("resolved" if row["pinned"] else "accepted", owner, command.service_id),
+                    ("resolved" if row.pinned else "accepted", owner, command.service_id),
                 )
             db.execute(
                 "UPDATE native_calls SET parent_ordinal=?,parent_spec=? "
@@ -182,11 +208,9 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
                     command.service_id,
                 ),
             )
-        row = db.execute(
-            "SELECT * FROM native_calls WHERE owner=? AND service_id=?",
-            (owner, command.service_id),
-        ).fetchone()
-        return msgspec.convert(dict(row), NativeCall)
+        row = call_row(db, owner, command.service_id)
+        assert row is not None
+        return row
 
 
 def selection_content(selection: pb.NativeSourceSelection) -> dict[str, Any]:
@@ -220,10 +244,8 @@ def record_pin(
         raise WorkspaceRefusal("source selection exceeds its bounded roster")
     with workspace.locked() as db:
         _parent(db, owner, command.parent_call)
-        row = db.execute(
-            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, command.service_id)
-        ).fetchone()
-        if row is None or (row["pinned"] and row["pinned"] != content):
+        row = call_row(db, owner, command.service_id)
+        if row is None or (row.pinned and row.pinned != content):
             raise WorkspaceRefusal("native call changed its accepted immutable pin")
         db.execute(
             "UPDATE native_calls SET pinned=?,"
@@ -249,17 +271,16 @@ def record_complete(
         raise WorkspaceRefusal("native source completion exceeds its result identity bound")
     with workspace.locked() as db:
         _parent(db, owner, command.parent_call)
-        row = db.execute(
-            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, command.service_id)
-        ).fetchone()
-        if row is None or row["state"] in ("releasing", "released"):
+        row = call_row(db, owner, command.service_id)
+        if row is None or row.state in ("releasing", "released"):
             raise WorkspaceRefusal("source completion has no active accepted call")
         store = fill.store(workspace.store_root)
-        source = row["operation"] != "convert_cozytensors"
+        source = row.operation != "convert_cozytensors"
+        producer = row.native_owner
 
         def validate_native() -> None:
             if source:
-                observed = store.tree_root(row["native_owner"])
+                observed = store.tree_root(producer)
                 if (
                     not observed
                     or not observed["complete"]
@@ -270,7 +291,7 @@ def record_complete(
                         "source completion lacks its exact retained native receipt"
                     )
             else:
-                derived = store.derived_lookup(row["native_owner"])
+                derived = store.derived_lookup(producer)
                 if derived.get("state") != "committed" or not weights_sink.same_receipt(
                     derived["receipt"], canonical_json.decode(native_receipt)
                 ):
@@ -291,20 +312,17 @@ def record_complete(
 
         db.native(validate_native)
         _parent(db, owner, command.parent_call)
-        row = db.execute(
-            "SELECT * FROM native_calls WHERE owner=? AND service_id=?",
-            (owner, command.service_id),
-        ).fetchone()
+        row = call_row(db, owner, command.service_id)
         if (
             row is None
-            or row["state"] in ("releasing", "released")
-            or row["intent_digest"] != command.parent_call.intent_digest
+            or row.state in ("releasing", "released")
+            or row.intent_digest != command.parent_call.intent_digest
         ):
             raise WorkspaceRefusal("source call changed during native result validation")
-        if row["result"] and (
-            artifact_identity(canonical_json.decode(row["result"])) != artifact_identity(value)
-            or row["computation_digest"] != computation
-            or row["native_receipt"] != native_receipt
+        if row.result and (
+            artifact_identity(canonical_json.decode(row.result)) != artifact_identity(value)
+            or row.computation_digest != computation
+            or row.native_receipt != native_receipt
         ):
             raise WorkspaceRefusal("source completion contradicts its prior result")
         db.execute(
@@ -327,17 +345,15 @@ def record_upload(
         raise WorkspaceRefusal("upload completion exceeds its result identity bound")
     with workspace.locked() as db:
         _parent(db, owner, command.parent_call)
-        row = db.execute(
-            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, command.service_id)
-        ).fetchone()
+        row = call_row(db, owner, command.service_id)
         if (
             row is None
-            or row["state"] in ("releasing", "released")
-            or row["operation"] not in source_interfaces.UPLOADS
-            or row["intent_digest"] != command.parent_call.intent_digest
+            or row.state in ("releasing", "released")
+            or row.operation not in source_interfaces.UPLOADS
+            or row.intent_digest != command.parent_call.intent_digest
         ):
             raise WorkspaceRefusal("upload completion has no active accepted call")
-        if row["result"] and (row["result"] != result or row["computation_digest"] != computation):
+        if row.result and (row.result != result or row.computation_digest != computation):
             raise WorkspaceRefusal("upload completion contradicts its prior result")
         db.execute(
             "UPDATE native_calls SET result=?,computation_digest=?,state='complete',"
@@ -349,19 +365,18 @@ def record_upload(
 def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -> bool:
     """Independently acquire only a stopped predecessor with the exact native work key."""
     with workspace.locked() as db:
-        current = db.execute(
-            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
-        ).fetchone()
-        if current is None or current["operation"] == "convert_cozytensors":
+        current = call_row(db, owner, service_id)
+        if current is None or current.operation == "convert_cozytensors":
             return False
-        candidates = db.execute(
-            "SELECT n.native_owner,n.service_id FROM native_calls n LEFT JOIN attempts a "
+        candidates = db.all(
+            NativeCall,
+            "SELECT n.* FROM native_calls n LEFT JOIN attempts a "
             "ON a.owner=n.owner AND a.request=n.parent_request AND a.ordinal=n.parent_ordinal "
             "WHERE n.owner=? AND n.service_id<>? AND n.computation_digest=? AND n.operation=? "
             "AND length(n.result)=0 AND n.state<>'released' AND (n.state IN ('failed','stopped') "
             "OR a.fenced=1 OR a.state IN ('outcome','released')) ORDER BY n.service_id",
-            (owner, service_id, current["computation_digest"], current["operation"]),
-        ).fetchall()
+            (owner, service_id, current.computation_digest, current.operation),
+        )
         store = fill.store(workspace.store_root)
         adopted = ""
         for candidate in candidates:
@@ -369,8 +384,8 @@ def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -
                 db.native(
                     partial(
                         store.adopt_source_progress,
-                        candidate["native_owner"],
-                        current["native_owner"],
+                        candidate.native_owner,
+                        current.native_owner,
                     )
                 )
             except Exception as exc:
@@ -382,7 +397,7 @@ def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -
                 }:
                     continue
                 raise
-            adopted = str(candidate["service_id"])
+            adopted = candidate.service_id
             break
     if not adopted:
         return False
@@ -394,26 +409,25 @@ def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -
 def conversion_predecessor(workspace: Workspace, owner: str, service_id: str) -> str | None:
     """Discover an exact stopped conversion; native readback/adoption proves the heads."""
     with workspace.locked() as db:
-        current = db.execute(
-            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
-        ).fetchone()
-        if current is None or current["operation"] != "convert_cozytensors":
+        current = call_row(db, owner, service_id)
+        if current is None or current.operation != "convert_cozytensors":
             return None
-        candidates = db.execute(
-            "SELECT n.service_id FROM native_calls n LEFT JOIN attempts a "
+        candidates = db.all(
+            NativeCall,
+            "SELECT n.* FROM native_calls n LEFT JOIN attempts a "
             "ON a.owner=n.owner AND a.request=n.parent_request AND a.ordinal=n.parent_ordinal "
             "WHERE n.owner=? AND n.service_id<>? AND n.computation_digest=? "
             "AND n.operation='convert_cozytensors' AND length(n.result)=0 AND n.state<>'released' "
             "AND (n.state IN ('failed','stopped') OR a.fenced=1 "
             "OR a.state IN ('outcome','released')) "
             "ORDER BY n.service_id",
-            (owner, service_id, current["computation_digest"]),
-        ).fetchall()
+            (owner, service_id, current.computation_digest),
+        )
         store = fill.store(workspace.store_root)
         retained = set(db.native(store.model_source_operations))
         for candidate in candidates:
-            if candidate["service_id"] in retained:
-                return str(candidate["service_id"])
+            if candidate.service_id in retained:
+                return candidate.service_id
         return None
 
 
@@ -421,16 +435,14 @@ def stopped(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) -
     """Authenticate a stop against recorded call identity, including after parent exit."""
     call = command.parent_call
     with workspace.locked() as db:
-        row = db.execute(
-            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, command.service_id)
-        ).fetchone()
+        row = call_row(db, owner, command.service_id)
         if (
             row is None
-            or row["parent_request"] != call.parent_request_id
-            or row["call_index"] != call.call_index
-            or row["intent_digest"] != call.intent_digest
-            or row["parent_ordinal"] != call.parent_attempt_ordinal
-            or row["parent_spec"] != call.parent_invocation_spec_digest
+            or row.parent_request != call.parent_request_id
+            or row.call_index != call.call_index
+            or row.intent_digest != call.intent_digest
+            or row.parent_ordinal != call.parent_attempt_ordinal
+            or row.parent_spec != call.parent_invocation_spec_digest
         ):
             raise WorkspaceRefusal("source stop changed its recorded parent call")
         db.execute(
@@ -495,66 +507,61 @@ def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
-def _has_progress(store: Any, row: dict[str, Any]) -> bool:
-    if row["operation"] == "convert_cozytensors":
-        return row["service_id"] in store.model_source_operations()
-    root = store.tree_root(row["native_owner"])
-    return root is not None and not root.get("released") and not root.get("complete")
+def _has_progress(store: fill.Store, row: NativeCall) -> bool:
+    if row.operation == "convert_cozytensors":
+        return row.service_id in store.model_source_operations()
+    root = store.tree_root(row.native_owner)
+    return root is not None and not root["released"] and not root["complete"]
 
 
 def _release_native(
-    store: Any, owner: str, row: dict[str, Any], workspace: Workspace, live: set[str]
+    store: fill.Store, owner: str, row: NativeCall, workspace: Workspace, live: set[str]
 ) -> None:
-    if row["native_owner"] != native_owner(owner, row["service_id"]):
+    if row.native_owner != native_owner(owner, row.service_id):
         return
-    if row["operation"] in source_interfaces.UPLOADS:
-        source_upload.release(
-            store, workspace.directory, row["service_id"], row["native_owner"], live
-        )
+    if row.operation in source_interfaces.UPLOADS:
+        source_upload.release(store, workspace.directory, row.service_id, row.native_owner, live)
         return
-    if row["operation"] == "convert_cozytensors":
-        state = store.derived_lookup(row["native_owner"])
+    if row.operation == "convert_cozytensors":
+        state = store.derived_lookup(row.native_owner)
         if state.get("state") == "committed":
-            store.derived_dispose(row["native_owner"])
+            store.derived_dispose(row.native_owner)
         elif state.get("state") == "open":
             epoch = state.get("writer_session_id")
             if epoch:
-                store.derived_fence(row["native_owner"], epoch)
-            store.derived_abandon(row["native_owner"])
-        store.release_model_source(row["service_id"])
-    elif store.tree_root(row["native_owner"]) is not None:
-        store.release_tree_root(row["native_owner"])
+                store.derived_fence(row.native_owner, epoch)
+            store.derived_abandon(row.native_owner)
+        store.release_model_source(row.service_id)
+    elif store.tree_root(row.native_owner) is not None:
+        store.release_tree_root(row.native_owner)
 
 
 def release(workspace: Workspace, owner: str, service_id: str) -> None:
     from . import workspace_memo
 
     with workspace.locked() as db:
-        row = db.execute(
-            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
-        ).fetchone()
-        if row is None or row["state"] == "released":
+        row = call_row(db, owner, service_id)
+        if row is None or row.state == "released":
             return
-        if row["state"] != "releasing":
+        if row.state != "releasing":
             raise WorkspaceRefusal("native cleanup has no permanent release intent")
-        row = dict(row)
-    if row["operation"] not in ("source_files", "commit_file", *source_interfaces.UPLOADS):
+    if row.operation not in ("source_files", "commit_file", *source_interfaces.UPLOADS):
         workspace_memo.release_native_result(workspace, owner, service_id)
         workspace_memo.release_native_lookup(workspace, owner, service_id)
     store = fill.store(workspace.store_root)
     final = "released"
-    if row["operation"] in ("commit_file", "source_files"):
+    if row.operation in ("commit_file", "source_files"):
         from . import workspace_byte_outputs
 
         workspace_byte_outputs.release_native(workspace, owner, service_id)
     elif (
-        row["operation"] in _PARTIAL_OPERATIONS
-        and not row["result"]
-        and row["computation_digest"]
+        row.operation in _PARTIAL_OPERATIONS
+        and not row.result
+        and row.computation_digest
         and _has_progress(store, row)
     ) or (
-        row["operation"] in source_interfaces.UPLOADS
-        and source_upload.retire(store, workspace.directory, service_id, row["native_owner"])
+        row.operation in source_interfaces.UPLOADS
+        and source_upload.retire(store, workspace.directory, service_id, row.native_owner)
     ):
         final = "stopped"
     else:
@@ -570,23 +577,24 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         )
 
 
-def spend(db: Journal, workspace: Workspace, row: dict[str, Any]) -> None:
+def spend(db: Journal, workspace: Workspace, row: NativeCall) -> None:
     live = live_uploads(db)
     store = fill.store(workspace.store_root)
-    db.native(partial(_release_native, store, row["owner"], row, workspace, live))
+    db.native(partial(_release_native, store, row.owner, row, workspace, live))
     db.execute(
         "UPDATE native_calls SET state='released' WHERE owner=? AND service_id=? "
         "AND state='stopped'",
-        (row["owner"], row["service_id"]),
+        (row.owner, row.service_id),
     )
 
 
 def consume_partial(workspace: Workspace, owner: str, service_id: str) -> bool:
     """Spend a retired partial that a later call adopted."""
     with workspace.locked() as db:
-        row = db.execute(PARTIALS + " AND n.owner=? AND n.service_id=?", (owner, service_id))
-        found = row.fetchone()
+        found = db.one(
+            NativeCall, PARTIALS + " AND n.owner=? AND n.service_id=?", (owner, service_id)
+        )
         if found is None:
             return False
-        spend(db, workspace, dict(found))
+        spend(db, workspace, found)
     return True

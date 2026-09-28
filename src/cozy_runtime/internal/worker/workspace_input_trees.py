@@ -10,14 +10,16 @@ import shutil
 from collections.abc import Iterable
 from itertools import chain
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
+
+import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, storage_admission
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from .workspace import Journal, Workspace, WorkspaceBusy, WorkspaceRefusal
+from .workspace import Journal, NativeHold, Workspace, WorkspaceBusy, WorkspaceRefusal
 from .workspace_byte_outputs import FileMember, TreeManifest, manifest_body, manifest_members
 
 MAX_CONTENT_BYTES = 256 << 20
@@ -30,6 +32,24 @@ CREATE TABLE input_tree_intakes (
  receipt BLOB NOT NULL DEFAULT x'', UNIQUE(owner,request,input_id)
 ) STRICT;
 """
+
+
+class Intake(msgspec.Struct, frozen=True, kw_only=True):
+    """One ``input_tree_intakes`` row."""
+
+    id: str
+    owner: str
+    request: str
+    input_id: str
+    header: bytes
+    manifest: bytes
+    manifest_length: int
+    manifest_body: bytes
+    content_bytes: int
+    intake_hold: str
+    state: Literal["receiving", "prepared", "aborting", "released"] = "receiving"
+    native_digest: bytes = b""
+    receipt: bytes = b""
 
 
 def _header(header: pb.InputTreeImportHeader) -> tuple[bytes, tuple[FileMember, ...]]:
@@ -81,69 +101,71 @@ def _header(header: pb.InputTreeImportHeader) -> tuple[bytes, tuple[FileMember, 
     return copied.SerializeToString(deterministic=True), members
 
 
-def _row(db: Journal, owner: str, identity: str) -> Any:
-    row = db.execute(
-        "SELECT * FROM input_tree_intakes WHERE id=? AND owner=?", (identity, owner)
-    ).fetchone()
+def _row(db: Journal, owner: str, identity: str) -> Intake:
+    row = db.one(
+        Intake, "SELECT * FROM input_tree_intakes WHERE id=? AND owner=?", (identity, owner)
+    )
     if row is None:
         raise WorkspaceRefusal("input tree intake is absent")
     return row
 
 
-def _source(row: Any) -> pb.NativeByteTreeRef:
+def _source(row: Intake) -> pb.NativeByteTreeRef:
     return pb.NativeByteTreeRef(
-        producer_root_id=row["id"],
-        receipt_digest=row["native_digest"],
-        manifest=pb.Ref(digest=row["manifest"], length=row["manifest_length"]),
-        content_bytes=row["content_bytes"],
+        producer_root_id=row.id,
+        receipt_digest=row.native_digest,
+        manifest=pb.Ref(digest=row.manifest, length=row.manifest_length),
+        content_bytes=row.content_bytes,
     )
 
 
 def owned(db: Journal, owner: str, source: pb.NativeByteTreeRef, *, released: bool = False) -> bool:
-    row = db.execute(
-        "SELECT * FROM input_tree_intakes WHERE owner=? AND id=?", (owner, source.producer_root_id)
-    ).fetchone()
+    row = db.one(
+        Intake,
+        "SELECT * FROM input_tree_intakes WHERE owner=? AND id=?",
+        (owner, source.producer_root_id),
+    )
     return (
         row is not None
-        and row["state"] in (("prepared", "aborting", "released") if released else ("prepared",))
+        and row.state in (("prepared", "aborting", "released") if released else ("prepared",))
         and _source(row) == source
     )
 
 
-def _observe(workspace: Workspace, db: Journal, row: Any, observed: dict[str, Any]) -> Any:
+def _observe(workspace: Workspace, db: Journal, row: Intake, observed: dict[str, Any]) -> Intake:
     receipt = bytes(observed.get("receipt", b""))
     if (
         not observed.get("complete")
-        or observed.get("producer") != row["id"]
-        or observed.get("manifest_digest") != documents.spell(row["manifest"])
-        or observed.get("manifest_length") != row["manifest_length"]
+        or observed.get("producer") != row.id
+        or observed.get("manifest_digest") != documents.spell(row.manifest)
+        or observed.get("manifest_length") != row.manifest_length
         or not receipt
         or observed.get("receipt_digest") != documents.spell(hashlib.sha256(receipt).digest())
-        or row["receipt"] not in (b"", receipt)
+        or row.receipt not in (b"", receipt)
     ):
         raise WorkspaceRefusal("native input tree differs from its accepted intake")
     db.execute(
         "UPDATE input_tree_intakes SET receipt=?,native_digest=? WHERE id=?",
-        (receipt, hashlib.sha256(receipt).digest(), row["id"]),
+        (receipt, hashlib.sha256(receipt).digest(), row.id),
     )
-    return _row(db, row["owner"], row["id"])
+    return _row(db, row.owner, row.id)
 
 
-def _recover(workspace: Workspace, db: Journal, row: Any) -> Any:
-    observed = db.native(lambda: fill.store(workspace.store_root).tree_root(row["id"]))
+def _recover(workspace: Workspace, db: Journal, row: Intake) -> Intake:
+    observed = db.native(lambda: fill.store(workspace.store_root).tree_root(row.id))
     if observed is not None:
         row = _observe(workspace, db, row, dict(observed))
     return row
 
 
-def _abort(workspace: Workspace, db: Journal, row: Any) -> pb.NativeByteRetentionResult:
+def _abort(workspace: Workspace, db: Journal, row: Intake) -> pb.NativeByteRetentionResult:
     row = _recover(workspace, db, row)
-    source = _source(row) if row["receipt"] else None
+    source = _source(row) if row.receipt else None
     if source is not None:
         if (
             db.execute(
                 "SELECT 1 FROM executions WHERE owner=? AND request=?",
-                (row["owner"], row["request"]),
+                (row.owner, row.request),
             ).fetchone()
             is None
         ):
@@ -154,35 +176,33 @@ def _abort(workspace: Workspace, db: Journal, row: Any) -> pb.NativeByteRetentio
             # retain crossed the abort; an already accepted root keeps its hold.
             workspace._change_hold(
                 db,
-                row["owner"],
+                row.owner,
                 pb.DerivedRetentionRequest(
-                    weights_transaction_id=row["id"],
-                    tensorfs_receipt_digest=row["native_digest"],
+                    weights_transaction_id=row.id,
+                    tensorfs_receipt_digest=row.native_digest,
                     retention_id=machine_models.byte_retention_id(
-                        row["owner"], row["request"], "input/" + row["input_id"], source
+                        row.owner, row.request, "input/" + row.input_id, source
                     ),
                 ),
                 release=True,
                 kind="tree",
             )
-        hold = db.execute("SELECT 1 FROM holds WHERE id=?", (row["intake_hold"],)).fetchone()
+        hold = db.execute("SELECT 1 FROM holds WHERE id=?", (row.intake_hold,)).fetchone()
         if hold is not None:
             workspace._change_hold(
                 db,
-                row["owner"],
+                row.owner,
                 pb.DerivedRetentionRequest(
-                    weights_transaction_id=row["id"],
-                    tensorfs_receipt_digest=row["native_digest"],
-                    retention_id=row["intake_hold"],
+                    weights_transaction_id=row.id,
+                    tensorfs_receipt_digest=row.native_digest,
+                    retention_id=row.intake_hold,
                 ),
                 release=True,
                 kind="tree",
             )
-        db.native(lambda: fill.store(workspace.store_root).release_tree_root(row["id"]))
-    db.execute("UPDATE input_tree_intakes SET state='released' WHERE id=?", (row["id"],))
-    return pb.NativeByteRetentionResult(
-        source=source, retention_id=row["intake_hold"], released=True
-    )
+        db.native(lambda: fill.store(workspace.store_root).release_tree_root(row.id))
+    db.execute("UPDATE input_tree_intakes SET state='released' WHERE id=?", (row.id,))
+    return pb.NativeByteRetentionResult(source=source, retention_id=row.intake_hold, released=True)
 
 
 def _finish(
@@ -190,44 +210,43 @@ def _finish(
 ) -> pb.NativeByteRetentionResult:
     with workspace.locked() as db:
         row = _recover(workspace, db, _row(db, owner, identity))
-        if row["state"] in ("aborting", "released"):
+        if row.state in ("aborting", "released"):
             return _abort(workspace, db, row)
-        if not row["receipt"]:
+        if not row.receipt:
             observed = db.native(
                 lambda: dict(
                     fill.store(workspace.store_root).import_tree(
-                        identity, row["manifest_body"], [(name, str(path)) for name, path in files]
+                        identity, row.manifest_body, [(name, str(path)) for name, path in files]
                     )
                 )
             )
             row = _observe(workspace, db, _row(db, owner, identity), observed)
-            if row["state"] in ("aborting", "released"):
+            if row.state in ("aborting", "released"):
                 return _abort(workspace, db, row)
         db.execute("UPDATE input_tree_intakes SET state='prepared' WHERE id=?", (identity,))
-        held = db.execute("SELECT state FROM holds WHERE id=?", (row["intake_hold"],)).fetchone()
-        if held is None or held["state"] not in ("releasing", "released"):
+        held = db.one(NativeHold, "SELECT * FROM holds WHERE id=?", (row.intake_hold,))
+        released = held is not None and held.state in ("releasing", "released")
+        if not released:
             workspace._change_hold(
                 db,
                 owner,
                 pb.DerivedRetentionRequest(
                     weights_transaction_id=identity,
-                    tensorfs_receipt_digest=row["native_digest"],
-                    retention_id=row["intake_hold"],
+                    tensorfs_receipt_digest=row.native_digest,
+                    retention_id=row.intake_hold,
                 ),
                 release=False,
                 kind="tree",
             )
         row = _row(db, owner, identity)
-        if row["state"] in ("aborting", "released"):
+        if row.state in ("aborting", "released"):
             return _abort(workspace, db, row)
         db.native(lambda: fill.store(workspace.store_root).release_tree_root(identity))
         row = _row(db, owner, identity)
-        if row["state"] in ("aborting", "released"):
+        if row.state in ("aborting", "released"):
             return _abort(workspace, db, row)
         return pb.NativeByteRetentionResult(
-            source=_source(row),
-            retention_id=row["intake_hold"],
-            released=held is not None and held["state"] in ("releasing", "released"),
+            source=_source(row), retention_id=row.intake_hold, released=released
         )
 
 
@@ -243,9 +262,7 @@ def receive(
     )
     retention = canonical_json.digest(["cozy.input-tree-recipient/1", identity])
     with workspace.locked() as db:
-        existing = db.execute(
-            "SELECT header FROM input_tree_intakes WHERE id=?", (identity,)
-        ).fetchone()
+        existing = db.one(Intake, "SELECT * FROM input_tree_intakes WHERE id=?", (identity,))
         if existing is None:
             if (
                 db.execute(
@@ -278,7 +295,7 @@ def receive(
                     retention,
                 ),
             )
-        elif existing["header"] != raw:
+        elif existing.header != raw:
             raise WorkspaceRefusal("input tree replay changed its accepted subject")
     iterator = iter(frames)
     first = next(iterator, None)
@@ -304,9 +321,9 @@ def receive(
                 return _abort(workspace, db, _row(db, owner, identity))
         with workspace.locked() as db:
             row = _recover(workspace, db, _row(db, owner, identity))
-            if row["state"] in ("aborting", "released"):
+            if row.state in ("aborting", "released"):
                 raise WorkspaceRefusal("aborted input tree cannot be reopened")
-            complete = bool(row["receipt"])
+            complete = bool(row.receipt)
         stage = root / "staging"
         if stage.exists():
             shutil.rmtree(stage)
@@ -352,7 +369,7 @@ def _receive_objects(
     try:
         for frame in frames:
             with workspace.locked() as db:
-                if _row(db, owner, identity)["state"] in ("aborting", "released"):
+                if _row(db, owner, identity).state in ("aborting", "released"):
                     raise WorkspaceRefusal("input tree intake was aborted")
             kind = frame.WhichOneof("body")
             if committed or kind not in ("blob", "commit"):
@@ -409,19 +426,18 @@ def _reuse(workspace: Workspace, owner: str, identity: str, wanted: set[str], st
     store = fill.store(workspace.store_root)
     for digest in sorted(wanted):
         with workspace.locked() as db:
-            rows = db.execute(
-                "SELECT manifest,manifest_body FROM input_tree_intakes WHERE owner=? AND id<>? "
+            rows = db.all(
+                Intake,
+                "SELECT * FROM input_tree_intakes WHERE owner=? AND id<>? "
                 "AND instr(manifest_body,?)>0 ORDER BY rowid DESC LIMIT 8",
                 (owner, identity, digest.encode()),
-            ).fetchall()
+            )
         staged = stage / digest
         for row in rows:
             member = next(
                 (
                     entry
-                    for entry in canonical_json.decode_as(
-                        row["manifest_body"], TreeManifest
-                    ).entries
+                    for entry in canonical_json.decode_as(row.manifest_body, TreeManifest).entries
                     if entry.blob.sha256 == digest
                 ),
                 None,
@@ -429,7 +445,7 @@ def _reuse(workspace: Workspace, owner: str, identity: str, wanted: set[str], st
             if member is None:
                 continue
             try:
-                store.materialize(bytes(row["manifest"]).hex(), member.path, staged)
+                store.materialize(row.manifest.hex(), member.path, staged)
             except Exception:  # an earlier input released and collected: try another
                 staged.unlink(missing_ok=True)
                 continue
@@ -446,18 +462,18 @@ def verify_adoption(db: Journal, owner: str, offer: pb.AttemptOffer) -> None:
     for access in offer.grant.inputs:
         if not access.HasField("native_tree"):
             continue
-        row = db.execute(
-            "SELECT state,request,input_id,intake_hold FROM input_tree_intakes "
-            "WHERE owner=? AND id=?",
+        row = db.one(
+            Intake,
+            "SELECT * FROM input_tree_intakes WHERE owner=? AND id=?",
             (owner, access.native_tree.source.producer_root_id),
-        ).fetchone()
+        )
         if (
             row is not None
-            and row["intake_hold"] == access.native_tree.retention_id
+            and row.intake_hold == access.native_tree.retention_id
             and (
-                row["state"] != "prepared"
-                or row["request"] != offer.request_id
-                or row["input_id"] != access.input_id
+                row.state != "prepared"
+                or row.request != offer.request_id
+                or row.input_id != access.input_id
             )
         ):
             raise WorkspaceRefusal(
