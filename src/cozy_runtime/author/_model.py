@@ -192,6 +192,10 @@ class _ScopedModel(Protocol):
 
     def _cozy_scope(self, method: str, components: tuple[str, ...]) -> _Scope: ...
 
+    def _cozy_run[R](
+        self, method: str, body: Callable[[], R], args: tuple[object, ...], kwargs: object
+    ) -> R: ...
+
 
 M = TypeVar("M", bound=_ScopedModel)
 
@@ -395,10 +399,13 @@ def _sync_wrapper[M: _ScopedModel, **P, R](
 ) -> Callable[Concatenate[M, P], R]:
     @functools.wraps(fn)
     def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> R:
-        with self._cozy_scope(fn.__name__, components):
-            result = fn(self, *args, **kwargs)
-            _refuse_lazy(fn.__name__, result)
-            return result
+        def body() -> R:
+            with self._cozy_scope(fn.__name__, components):
+                result = fn(self, *args, **kwargs)
+                _refuse_lazy(fn.__name__, result)
+                return result
+
+        return self._cozy_run(fn.__name__, body, args, kwargs)
 
     return wrapper
 
@@ -665,6 +672,14 @@ class Model[PipelineT]:
 
     def _cozy_scope(self, method: str, components: tuple[str, ...]) -> _Scope:
         return _ComponentScope(self, method, components)
+
+    def _cozy_run[R](
+        self, method: str, body: Callable[[], R], args: tuple[object, ...], kwargs: object
+    ) -> R:
+        """One declared method call; the runtime's residency may run it again after an
+        out-of-memory error its forwards could not absorb."""
+        run = getattr(self._cozy_residency, "run", None)
+        return run(method, body, args, kwargs) if run is not None else body()
 
     def _cozy_require_scope(self, what: str) -> None:
         """A derived-cache entry is legal only inside an active component-use scope."""

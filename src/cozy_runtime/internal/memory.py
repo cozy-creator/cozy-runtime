@@ -971,6 +971,36 @@ class ComponentResidency:
         finally:
             self.running.pop()
 
+    def run[R](
+        self, method: str, body: Callable[[], R], args: tuple[object, ...], kwargs: object
+    ) -> R:
+        """A declared method call. An out-of-memory error its forwards could not absorb
+        (glue between them, a weight cast) runs it again while idle co-tenants or this
+        process's idle components still give room, and its inputs are intact."""
+        if self.running or not self.recoverable or self.torch.is_grad_enabled():
+            return body()
+        named = dict(kwargs) if isinstance(kwargs, dict) else {}
+        while True:
+            versions = self._versions(args, named)
+            try:
+                return body()
+            except Exception as exc:
+                if not is_device_oom(exc):
+                    raise
+                asked = requested_bytes(exc)
+                recover(self.torch, self.kind, exc)
+                if self._versions(args, named) != versions:
+                    raise
+                victims = self._victims(())
+                for victim in victims:
+                    self._evict(victim)
+                before = self._allocatable()
+                if self.room is not None:
+                    self.room(before + max(asked, 1))
+                if not victims and self._allocatable() <= before:
+                    raise
+                self.recoveries.append(f"{method}(): out of memory -> room and idle components")
+
     def _resident(self, name: str) -> None:
         """A component an eviction took comes back before its forward runs."""
         if name in self.backend.components or name not in self.backend.parked:
