@@ -47,7 +47,7 @@ from cozy_runtime.internal.worker.stage_progress import Emit
 
 if TYPE_CHECKING:
     from .machine_child_target import Target
-    from .session import Worker
+    from .session import HostedPlacement, Worker
 
 
 class _Cards(msgspec.Struct, frozen=True):
@@ -72,6 +72,8 @@ class Slot:
     #: set by every scheduling pass, claim and drop: the warm thread looks again
     nudge: threading.Event = field(default_factory=threading.Event)
     executor: Executor | None = None
+    #: the dead replica of these cards whose own slot this starts its successor in
+    replica: str = ""
     #: where phase rows go; rows wait here until a root's journal takes them
     sink: Emit | None = None
     frames: list[dict[str, Json]] = field(default_factory=list)
@@ -160,17 +162,23 @@ class Prespawns:
         width = width_for(model_degrees(models), len(readable))
         unreadable = set(range(len(entries))) - set(readable)
         ordinals = worker.gpu.spare(root, width, exclude=unreadable)
-        if ordinals is None or self._warm(installation, ordinals):
+        replica = None if ordinals is None else self._replica(installation, ordinals)
+        if ordinals is None or (replica is not None and replica.supervision.current is not None):
             return
         slot_id = "warm-" + _digest([installation, list(ordinals)])
         with self.lock:
             if (installation, ordinals) in self.slots:
                 return
-            supervision = worker._new_placement_supervision(
-                slot_id, uid_key=uid_key(installation, ordinals)
-            )
-            slot = Slot(installation, ordinals, root, supervision, sink=emit)
-            supervision.on_exit = functools.partial(_forget, supervision)
+            if replica is not None:
+                # A dead replica of these cards: its successor starts early, in its own slot.
+                slot = Slot(installation, ordinals, root, replica.supervision, sink=emit)
+                slot.replica = replica.placement.placement_id
+            else:
+                supervision = worker._new_placement_supervision(
+                    slot_id, uid_key=uid_key(installation, ordinals)
+                )
+                slot = Slot(installation, ordinals, root, supervision, sink=emit)
+                supervision.on_exit = functools.partial(_forget, supervision)
             self.slots[(slot.installation, ordinals)] = slot
         threading.Thread(
             target=self._finishing,
@@ -186,18 +194,17 @@ class Prespawns:
             slot.started.set()
             slot.finished.set()
 
-    def _warm(self, installation: str, ordinals: Ordinals) -> bool:
-        """A replica of this installation already runs on these cards."""
-        for hosted in list(self.worker.hosted.values()):
-            executor = hosted.supervision.current
-            if (
-                hosted.placement.installation_id == installation
+    def _replica(self, installation: str, ordinals: Ordinals) -> HostedPlacement | None:
+        """The replica of this installation already bound to these cards, alive or not."""
+        return next(
+            (
+                hosted
+                for hosted in list(self.worker.hosted.values())
+                if hosted.placement.installation_id == installation
                 and hosted.placement.device_pin == ordinals
-                and executor is not None
-                and executor.alive()
-            ):
-                return True
-        return False
+            ),
+            None,
+        )
 
     def _run(self, slot: Slot, raw: bytes) -> None:
         worker = self.worker
@@ -400,7 +407,8 @@ class Prespawns:
         executor = slot.supervision.current
         if executor is not None:
             self._reclaim(slot.supervision, executor, "prespawned executor yields")
-        slot.supervision.close()
+        if not slot.replica:
+            slot.supervision.close()
 
     def _reclaim(self, supervision: ExecutorSupervision, executor: Executor, why: str) -> None:
         try:

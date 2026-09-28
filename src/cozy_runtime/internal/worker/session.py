@@ -2604,6 +2604,10 @@ class Worker:
         lane = self.lanes.lane_of(placement_id)
         placement = self._placement_by_id(placement_id)
         if executor is not None and lane is not None and placement is not None:
+            # Its successor may already be starting beside this root's downloads.
+            warm = self.prespawns.claim(placement.installation_id, placement.device_pin or ())
+            if warm is not None:
+                warm.started.wait()
             self._rebuild_lane(lane, placement_id, executor, granted=True)
 
     def _cpu_job(self, job: pb.JobDirective) -> bool:

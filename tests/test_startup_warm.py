@@ -605,3 +605,32 @@ def test_a_host_started_warm_yields_to_a_root_of_another_installation(
         lambda: not executor.alive() and slot.supervision.current is None,
         "the unadopted prespawn reclaimed off B's card",
     )
+
+
+@needs_gpu
+def test_a_dead_replica_starts_its_successor_beside_the_next_download(
+    warm: Callable[..., Warm],
+) -> None:
+    """Run 1516: a dead replica's cards were prespawned in a fresh slot whose root the
+    replica's own slot still owned, so every prefetch failed and the group start was paid
+    at the grant. The successor now starts early in the replica's own slot."""
+    machine = warm()
+    machine.submit_root("A")
+    target = machine.target({"digest": "sha256:" + "0" * 64, "length": 1})
+    placement = machine.worker._placement_from_entry(
+        {**target.prepared_installation["placement"], "placement_id": "machine-dead"}, b""
+    )
+    placement.device_pin = (0,)
+    supervision = machine.worker._new_placement_supervision("machine-dead")
+    hosted = HostedPlacement(placement, supervision)
+    machine.worker.hosted[placement.placement_id] = hosted
+    notes = len(machine.worker.activity)
+    machine.worker.prespawns.request(OWNER, "A", target, lambda frame: None)
+    (slot,) = machine.worker.prespawns.slots.values()
+    assert slot.replica == "machine-dead" and slot.supervision is supervision
+    assert slot.started.wait(60)
+    executor = supervision.current
+    assert executor is not None and executor.alive() and executor.started
+    failed = [e.step for e in list(machine.worker.activity)[notes:] if "no prespawn" in e.step]
+    assert failed == [], failed
+    assert machine.worker.prespawns.claim(INSTALLATION, (0,)) is slot
