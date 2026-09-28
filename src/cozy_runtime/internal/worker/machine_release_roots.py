@@ -1,7 +1,8 @@
-"""A root named by its published release: this machine installs it when it holds no
-installation, resolves every Model slot for its own devices, prepares the placement, and
-mints the capture and offer a controller used to build. Nothing is journaled before the
-receipt, so an interrupted preparation restarts on the next identical submission."""
+"""A root named by its published release: this machine installs its closure when it holds no
+installation, reading install facts and callees at its catalog, resolves every Model slot for
+its own devices, prepares the placement, and mints the capture and offer a controller used to
+build. Nothing is journaled before the receipt, so an interrupted preparation restarts on the
+next identical submission."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import threading
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +30,7 @@ from . import (
     machine_deferred,
     machine_model_defaults,
     machine_model_resolve,
+    machine_release_catalog,
     machine_source_models,
 )
 from .machine_child_target import Target
@@ -44,6 +46,13 @@ if TYPE_CHECKING:
 MAX_OUTPUT_BYTES = 512 << 20
 #: Finished preparations held for a submission that has not come back; oldest leave first.
 MAX_HELD = 32
+#: Release install facts held; each is immutable, the oldest leaves first.
+MAX_FACTS = 128
+#: A root's published callee closure.
+MAX_CLOSURE = 128
+
+#: An installation this machine holds: its placement document and installation id.
+type _Held = dict[str, Any]
 #: A device job's resident-memory ceiling, as the controller's root jobs are given it.
 JOB_RSS_CAP = 8 << 30
 #: The accelerator half of the base-owned Python stack: requiring one needs a device.
@@ -60,20 +69,13 @@ class Preparing(Exception):
     """The release root is still being prepared; the message is its progress."""
 
 
-class InstallationsAbsent(WorkspaceRefusal):
-    """These releases have no installation here and no install facts rode the submission."""
-
-    def __init__(self, keys: list[str]) -> None:
-        super().__init__("install facts are absent for " + ", ".join(keys))
-        self.keys = keys
-
-
 @dataclass
 class _Prepared:
     target: Target
     placement: dict[str, Any]
     models: list[dict[str, Any]]
-    installed: dict[str, dict[str, Any]]
+    installed: dict[str, _Held]
+    edges: list[tuple[str, str]]
 
 
 @dataclass
@@ -85,7 +87,6 @@ class _Job:
     done: bool = False
     result: _Prepared | None = None
     error: BaseException | None = None
-    installed: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _key(package: str, release: str) -> str:
@@ -97,8 +98,7 @@ class ReleaseRoots:
         self.worker = worker
         self.changed = threading.Condition()
         self.jobs: dict[tuple[str, str], _Job] = {}
-        # Install facts a submission carried, by release: one immutable document each, so a
-        # later root naming an uninstalled callee need not carry them again.
+        # Install facts by release, read at this machine's catalog: immutable, read once.
         self.facts: dict[str, pb.DeferredInstallation] = {}
 
     def submit(
@@ -124,7 +124,8 @@ class ReleaseRoots:
             if job is not None and job.request != raw:
                 job = None  # the controller changed what it asks: prepare that instead
             if job is None:
-                job = _Job(raw, installed=self._plan(request.release_root))
+                self._plan(request.release_root)
+                job = _Job(raw)
                 self.jobs[identity] = job
                 held = [key for key, held in self.jobs.items() if held.done]
                 for key in held[: max(0, len(self.jobs) - MAX_HELD)]:
@@ -167,7 +168,7 @@ class ReleaseRoots:
             job.version += 1
             self.changed.notify_all()
 
-    def _installed(self, key: str) -> dict[str, Any] | None:
+    def _installed(self, key: str) -> _Held | None:
         """The placement this machine holds for a release with the fewest bound Models."""
         package, _, release = key.partition("@")
         with self.worker.control_lock:
@@ -183,32 +184,76 @@ class ReleaseRoots:
         selected = min(held, key=lambda placement: len(placement.models))
         return {"placement": dict(selected.document), "installation_id": selected.installation_id}
 
-    def _plan(self, root: pb.ReleaseRoot) -> dict[str, dict[str, Any]]:
-        """Every release the closure names that this machine holds; refuse what has no facts."""
+    def _plan(self, root: pb.ReleaseRoot) -> None:
         if not root.package or not root.release or not root.entrypoint.isidentifier():
             raise WorkspaceRefusal("release root names no package release and entrypoint")
-        local = bool(self.worker.config.bootstrap_credential)
-        if root.catalog_origin and not machine_model_defaults.valid_origin(
-            root.catalog_origin, local=local
-        ):
-            raise WorkspaceRefusal("release root names an invalid catalog origin")
-        for row in root.installations:
-            if row.key != _key(row.package, row.release):
-                raise WorkspaceRefusal("release root misnames install facts")
-            with self.changed:
-                self.facts[row.key] = row
-        keys = {_key(root.package, root.release)}
-        keys.update(key for edge in root.callees for key in (edge.caller, edge.callee))
-        installed = {key: held for key in keys if (held := self._installed(key)) is not None}
-        with self.changed:
-            absent = sorted(keys - installed.keys() - self.facts.keys())
-        if absent:
-            raise InstallationsAbsent(absent)
-        return installed
 
     def _facts(self, key: str) -> pb.DeferredInstallation:
+        """A release's install facts, read at this machine's catalog once."""
         with self.changed:
-            return self.facts[key]
+            held = self.facts.get(key)
+        if held is None:
+            package, _, release = key.partition("@")
+            held = machine_release_catalog.facts(
+                machine_model_resolve.own(self.worker), package, release
+            )
+            with self.changed:
+                self.facts[key] = held
+                for old in list(self.facts)[: max(0, len(self.facts) - MAX_FACTS)]:
+                    del self.facts[old]
+        return held
+
+    def _locked(self, key: str, held: _Held | None) -> bytes:
+        """A release's lock: its installation's here, else its install facts'."""
+        if held is not None:
+            path = (
+                Path(self.worker.options.install_root or "")
+                / "installations"
+                / str(held["installation_id"])
+                / "requirements.txt"
+            )
+            if path.is_file():
+                return path.read_bytes()
+        return self._facts(key).preparation.locked_requirements
+
+    def _closure(self, root: pb.ReleaseRoot) -> tuple[dict[str, _Held], list[tuple[str, str]]]:
+        """The releases of the root's closure this machine holds, and the closure's edges,
+        each release's callees read from its own lock."""
+        installed: dict[str, _Held] = {}
+        edges: set[tuple[str, str]] = set()
+        pending, seen = [_key(root.package, root.release)], set[str]()
+        while pending:
+            key = pending.pop()
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(seen) > MAX_CLOSURE:
+                raise WorkspaceRefusal("published callable closure exceeds its bound")
+            held = self._installed(key)
+            if held is not None:
+                installed[key] = held
+            package = key.partition("@")[0]
+            lock = self._locked(key, held)
+            for callee in machine_release_catalog.callees(package, lock):
+                edges.add((key, callee))
+                pending.append(callee)
+        return installed, sorted(edges)
+
+    def describe(self, selection: pb.PackageSelection) -> pb.DescribedRelease:
+        """A published release as this machine reads it: the newest when none is named."""
+        package, release = selection.package, selection.release
+        if not release:
+            release = machine_release_catalog.newest(
+                machine_model_resolve.own(self.worker), package
+            )
+        key = _key(package, release)
+        held = self._installed(key)
+        raw = (
+            base64.b64decode(held["placement"]["package_interface"], validate=True)
+            if held is not None
+            else self._facts(key).preparation.package_interface
+        )
+        return pb.DescribedRelease(package=package, release=release, package_interface=raw)
 
     def _run(self, owner: str, request: pb.MachineExecutionSubmit, job: _Job) -> None:
         try:
@@ -225,7 +270,7 @@ class ReleaseRoots:
                 job.version += 1
                 self.changed.notify_all()
 
-    def _install(self, row: pb.DeferredInstallation) -> dict[str, Any]:
+    def _install(self, row: pb.DeferredInstallation) -> _Held:
         from .session import read_placement_set  # session imports this module's RPC
 
         prepared = pb.PreparePackageSetRequest()
@@ -240,7 +285,7 @@ class ReleaseRoots:
         root, worker = request.release_root, self.worker
         assert worker.machine_calls is not None
         key = _key(root.package, root.release)
-        installed = dict(job.installed)
+        installed, edges = self._closure(root)
         if key not in installed:
             self._note(job, f"installing {key}")
             installed[key] = self._install(self._facts(key))
@@ -290,7 +335,7 @@ class ReleaseRoots:
                     job, "downloading model weights", 100 * done // total if total else -1
                 ),
             )
-            return _Prepared(target, dict(prepared["placement"]), models, installed)
+            return _Prepared(target, dict(prepared["placement"]), models, installed, edges)
         serving = worker.machine_calls.serving
         call = Call(
             request.offer.request_id,
@@ -322,7 +367,7 @@ class ReleaseRoots:
             serving.observers.pop(call.child_request, None)
             serving._release_preparation(owner, call.child_request)
         self._register(target, ready.placement)
-        return _Prepared(target, ready.placement, models, installed)
+        return _Prepared(target, ready.placement, models, installed, edges)
 
     def _resolve(
         self,
@@ -355,9 +400,12 @@ class ReleaseRoots:
             if not choices.get(parameter, {}).get("source")
             and not choices.get(parameter, {}).get("manifest", {}).get("length")
         ]
-        if open_slots and not root.catalog_origin:
-            raise WorkspaceRefusal("release root needs a catalog origin to resolve its Models")
-        catalog = machine_model_resolve.Catalog(root.catalog_origin)
+        # Pinned and sourced slots read nothing; an open one reads this machine's own Hub.
+        catalog = (
+            machine_model_resolve.own(self.worker)
+            if open_slots
+            else machine_model_resolve.Catalog("")
+        )
         fits = machine_model_defaults.fitter(self.worker)
         laddered = [
             model
@@ -432,7 +480,7 @@ class ReleaseRoots:
         packages: list[pb.InstalledPackage] = []
         rows: list[pb.DeferredInstallation] = []
         keys = {_key(root.package, root.release)}
-        keys.update(key for edge in root.callees for key in (edge.caller, edge.callee))
+        keys.update(key for edge in prepared.edges for key in edge)
         for key in sorted(keys):
             held = installed.get(key)
             if held is not None:
@@ -472,7 +520,7 @@ class ReleaseRoots:
 
         root_key = _key(root.package, root.release)
         bind(root_key, root_key, True)
-        for edge in sorted({(edge.caller, edge.callee) for edge in root.callees}):
+        for edge in prepared.edges:
             bind(*edge, False)
         bindings.sort(
             key=lambda row: (
@@ -487,7 +535,6 @@ class ReleaseRoots:
             installed_packages=packages,
             deferred_installations=rows,
             bindings=bindings,
-            catalog_origin=root.catalog_origin,
         )
         raw, digest = documents.identity(capture)
         return raw, digest, {key: held for key, held in installed.items() if key in keys}
@@ -673,7 +720,7 @@ class ReleaseRoots:
             spec.job.publication_contract.CopyFrom(
                 pb.PublicationContract(grant_id=root.publication_grant, outputs=spec.outputs)
             )
-        device = self._needs_device(root, target)
+        device = self._needs_device(root, prepared)
         return pb.DesiredWorkerState(
             wire_minor=self.worker.fence.wire_minor,
             posture=pb.POSTURE_ACCEPTING,
@@ -689,9 +736,10 @@ class ReleaseRoots:
             ),
         )
 
-    def _needs_device(self, root: pb.ReleaseRoot, target: Target) -> bool:
+    def _needs_device(self, root: pb.ReleaseRoot, prepared: _Prepared) -> bool:
         """A job's own `accelerator` decides; an undeclared one follows its locked closure,
         except a composer that holds no Model or weights and only calls published callees."""
+        target = prepared.target
         declaration = target.declaration
         if declaration.get("accelerator") is not None:
             return bool(declaration["accelerator"])
@@ -707,7 +755,7 @@ class ReleaseRoots:
             names = set()
         if not names & ACCELERATOR_DISTRIBUTIONS:
             return False
-        composes = any(edge.caller == _key(root.package, root.release) for edge in root.callees)
+        composes = any(caller == _key(root.package, root.release) for caller, _ in prepared.edges)
         return not (
             composes and not declaration.get("models") and not declaration.get("weights_outputs")
         )

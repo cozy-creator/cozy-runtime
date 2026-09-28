@@ -165,17 +165,16 @@ def request_control_metadata(
 
 @contextmanager
 def _catalog_get(
-    host: str, port: int | None, tls: bool, path: str
+    host: str, port: int | None, tls: ssl.SSLContext | None, path: str
 ) -> Iterator[http.client.HTTPResponse]:
-    """One anonymous GET at the public catalog, which the caller checked. Plain HTTP is for
-    a loopback development catalog only. No credential is sent and nothing is retried."""
+    """One anonymous GET at the public catalog, which the caller checked. Plain HTTP (no
+    TLS context) is for a loopback development catalog only. No credential is sent and
+    nothing is retried."""
     if not path.startswith("/v1/"):
         raise EgressRefusal("catalog_route_invalid", "catalog route is invalid")
     connection: http.client.HTTPConnection = (
-        http.client.HTTPSConnection(
-            host, port, context=ssl.create_default_context(), timeout=SILENCE_SECONDS
-        )
-        if tls
+        http.client.HTTPSConnection(host, port, context=tls, timeout=SILENCE_SECONDS)
+        if tls is not None
         else http.client.HTTPConnection(host, port, timeout=SILENCE_SECONDS)
     )
     try:
@@ -190,7 +189,7 @@ def _catalog_get(
 
 
 def request_catalog_metadata(
-    host: str, port: int | None, tls: bool, path: str, *, limit: int
+    host: str, port: int | None, tls: ssl.SSLContext | None, path: str, *, limit: int
 ) -> tuple[int, bytes]:
     """Bounded public catalog metadata (bindings, lane resolutions): status and body."""
     if not 0 < limit <= 8 << 20:
@@ -203,7 +202,7 @@ def request_catalog_metadata(
 
 
 def measure_catalog_document(
-    host: str, port: int | None, tls: bool, path: str, *, limit: int
+    host: str, port: int | None, tls: ssl.SSLContext | None, path: str, *, limit: int
 ) -> tuple[int, int, bytes]:
     """A public catalog document streamed, never held: status, length and SHA-256.
     `limit` is the document kind's own cap."""

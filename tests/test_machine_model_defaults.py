@@ -68,7 +68,7 @@ def peer(capture: dict[str, Any]) -> Worker:
         Worker,
         SimpleNamespace(
             config=SimpleNamespace(bootstrap_credential="local-bootstrap"),
-            options=SimpleNamespace(accelerator_backend="none"),
+            options=SimpleNamespace(accelerator_backend="none", publication_authority=None),
             host_facts=lambda: hostfacts.measure("none"),
             model_transfer_lock=threading.Lock(),
             model_transfers={},
@@ -232,10 +232,11 @@ def test_unavailable_default_refuses_before_accelerator_discovery(
 
     monkeypatch.setattr(hostfacts, "measure", forbidden)
     call = cast(Call, SimpleNamespace(parent_request="root"))
-    captures: list[dict[str, Any]] = [captured(), {"model_defaults": []}]
-    for capture in captures:
-        with pytest.raises(WorkspaceRefusal, match="captured Model default is unavailable"):
-            defaults.select(peer(capture), "owner", call, target(), {"adapter": {}})
+    with pytest.raises(WorkspaceRefusal, match="captured Model default is unavailable"):
+        defaults.select(peer(captured()), "owner", call, target(), {"adapter": {}})
+    # An open slot is read at the machine's own Hub; a machine without a grant has none.
+    with pytest.raises(WorkspaceRefusal, match="no Hub grant"):
+        defaults.select(peer({"model_defaults": []}), "owner", call, target(), {"adapter": {}})
 
 
 @pytest.mark.parametrize("mutation", ["repository", "asset"])

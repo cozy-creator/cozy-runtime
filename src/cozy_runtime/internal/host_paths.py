@@ -96,6 +96,11 @@ class Layout:
         return self.bootstrap / "machine-publication-authority.json"
 
     @property
+    def tensorhub_ca(self) -> Path:
+        """The grant's private Hub CA, which the Host writes when its Hub uses one."""
+        return self.bootstrap / "tensorhub-ca.crt"
+
+    @property
     def worker_state(self) -> Path:
         return self._at("run/cozy/worker")
 

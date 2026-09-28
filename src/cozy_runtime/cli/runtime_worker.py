@@ -238,6 +238,7 @@ def _worker_options(
             config.tensorhub_origin,
             config.worker_id,
             config.tensorhub_worker_token,
+            layout.tensorhub_ca if layout.tensorhub_ca.is_file() else None,
         )
         if config.tensorhub_origin
         else None,

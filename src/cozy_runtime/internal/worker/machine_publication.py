@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
@@ -59,15 +60,21 @@ class PublicationClient(Protocol):
 
 @dataclass(frozen=True)
 class PublicationAuthority:
+    """This machine's Hub grant: the Hub it belongs to, and its worker capability."""
+
     origin: str
     worker_id: str
     worker_token: str = field(repr=False)
+    ca: Path | None = None  # the grant's private Hub CA, when its Hub uses one
+
+    def context(self) -> ssl.SSLContext:
+        return ssl.create_default_context(cafile=str(self.ca) if self.ca else None)
 
     def client(self, authorization_id: str) -> MachinePublicationClient:
         return MachinePublicationClient(
             self.origin,
             authorization_id,
-            ssl.create_default_context(),
+            self.context(),
             worker_id=self.worker_id,
             worker_token=self.worker_token,
         )

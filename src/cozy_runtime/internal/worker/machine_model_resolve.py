@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode, urlsplit
 
 from cozy_runtime.author import ConformanceError
@@ -17,6 +18,9 @@ from cozy_runtime.internal import egress, fill
 from cozy_runtime.protocol import documents
 
 from .workspace import WorkspaceRefusal
+
+if TYPE_CHECKING:
+    from .session import Worker
 
 MAX_METADATA = 1 << 20
 _REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -27,27 +31,35 @@ type Fits = Callable[[Mapping[str, Any]], bool]
 class Catalog:
     """Anonymous public reads at one catalog origin; a package's bindings are read once."""
 
-    def __init__(self, origin: str) -> None:
+    def __init__(self, origin: str, context: ssl.SSLContext | None = None) -> None:
         parts = urlsplit(origin)
-        self.origin, self.scheme = origin, parts.scheme
+        self.origin = origin
         self.host, self.port = parts.hostname or "", parts.port
+        self.tls = (context or ssl.create_default_context()) if parts.scheme == "https" else None
         self.bindings: dict[str, dict[str, Any]] = {}
 
-    def get(self, path: str) -> Any:
+    def text(self, path: str, limit: int = MAX_METADATA) -> bytes | None:
+        """One bounded public document's bytes, or None when the catalog has none."""
         try:
             status, raw = egress.request_catalog_metadata(
-                self.host, self.port, self.scheme == "https", path, limit=MAX_METADATA
+                self.host, self.port, self.tls, path, limit=limit
             )
         except egress.EgressRefusal as exc:
-            raise WorkspaceRefusal(f"model catalog read failed: {exc.code}") from exc
+            raise WorkspaceRefusal(f"catalog read failed: {exc.code}") from exc
         if status == 404:
             return None
         if status != 200:
-            raise WorkspaceRefusal(f"model catalog answered {status} for {path[:200]}")
+            raise WorkspaceRefusal(f"catalog answered {status} for {path[:200]}")
+        return raw
+
+    def get(self, path: str, limit: int = MAX_METADATA) -> Any:
+        raw = self.text(path, limit)
+        if raw is None:
+            return None
         try:
             return json.loads(raw)
         except ValueError as exc:
-            raise WorkspaceRefusal("model catalog answered invalid JSON") from exc
+            raise WorkspaceRefusal("catalog answered invalid JSON") from exc
 
     def binding(self, package: str, slot: str) -> dict[str, Any] | None:
         """The owner's current binding of one slot, or None."""
@@ -90,7 +102,7 @@ class Catalog:
             status, length, sha256 = egress.measure_catalog_document(
                 self.host,
                 self.port,
-                self.scheme == "https",
+                self.tls,
                 path,
                 limit=fill.tensorfs_module().manifest_max_bytes(),
             )
@@ -101,6 +113,14 @@ class Catalog:
         if sha256 != documents.raw(digest):
             raise WorkspaceRefusal(f"model catalog manifest bytes do not match {digest}")
         return length
+
+
+def own(worker: Worker) -> Catalog:
+    """This machine's own Hub, as its grant names it: where it reads packages and Models."""
+    authority = worker.options.publication_authority
+    if authority is None:
+        raise WorkspaceRefusal("this machine has no Hub grant to read the catalog at")
+    return Catalog(authority.origin, authority.context())
 
 
 def _ladder(

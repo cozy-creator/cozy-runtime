@@ -64,9 +64,6 @@ def verify(
     capture: dict[str, Any],
     interfaces: dict[str, dict[str, Any]],
 ) -> None:
-    origin = capture.get("catalog_origin", "")
-    if origin and not valid_origin(origin, local=bool(worker.config.bootstrap_credential)):
-        raise WorkspaceRefusal("execution capture names an invalid catalog origin")
     rows = capture.get("model_defaults", [])
     if not rows:
         return
@@ -186,14 +183,14 @@ def select(
         if (callee(row), row["entrypoint"])
         == (target.callee or target.installation_id, target.entrypoint)
     }
-    # A slot the capture left open is resolved here, at the capture's catalog origin.
-    origin = capture.get("catalog_origin", "")
+    # A slot the capture left open is resolved here, at this machine's own Hub.
     for parameter in sorted(missing):
         row = defaults.get(parameter)
-        if (row is None and not origin) or (row is not None and row.get("unavailable_code")):
+        if row is not None and row.get("unavailable_code"):
             raise WorkspaceRefusal("captured Model default is unavailable for " + parameter)
+    open_slots = any(parameter not in defaults for parameter in missing)
+    catalog = machine_model_resolve.own(worker) if open_slots else None
     fits = fitter(worker)
-    catalog = machine_model_resolve.Catalog(origin) if origin else None
     package = str(
         (
             target.prepared_installation.get("placement", {}).get("package")

@@ -82,6 +82,7 @@ from cozy_runtime.internal.worker import (
     machine_byte_inputs,
     machine_capture,
     machine_lanes,
+    machine_release_catalog,
     machine_slots,
     model_source_prepare,
     observe,
@@ -2075,7 +2076,7 @@ class Worker:
 
         published: list[package_installation.InstalledEnvironment] = []
         result = package_prepare.prepare_package_set(
-            request,
+            machine_release_catalog.complete(self, request),
             describe=self._describe_published,
             python_root=self.config.managed_python_root,
             cancel=self.stop.is_set,

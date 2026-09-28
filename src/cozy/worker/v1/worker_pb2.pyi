@@ -682,13 +682,17 @@ class MachineCallableBinding(_message.Message):
     def __init__(self, module: _Optional[str] = ..., export: _Optional[str] = ..., entrypoint: _Optional[str] = ..., caller_installation_id: _Optional[str] = ..., callee_installation_id: _Optional[str] = ..., callee_deferred_key: _Optional[str] = ..., caller_deferred_key: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionWorkspaceQuery(_message.Message):
-    __slots__ = ("claim",)
+    __slots__ = ("claim", "describe", "catalog_origin")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
+    DESCRIBE_FIELD_NUMBER: _ClassVar[int]
+    CATALOG_ORIGIN_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
+    describe: PackageSelection
+    catalog_origin: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., describe: _Optional[_Union[PackageSelection, _Mapping]] = ..., catalog_origin: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus", "owner_publication_reconciliation", "source_credentials", "deferred_installations", "resolves_model_defaults", "release_roots", "input_object_reuse", "event_wait", "memo_lookup", "release_root_sources", "release_root_jobs")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus", "owner_publication_reconciliation", "source_credentials", "deferred_installations", "resolves_model_defaults", "release_roots", "input_object_reuse", "event_wait", "memo_lookup", "release_root_sources", "release_root_jobs", "release_root_installs", "described_release")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -707,6 +711,8 @@ class MachineExecutionWorkspace(_message.Message):
     MEMO_LOOKUP_FIELD_NUMBER: _ClassVar[int]
     RELEASE_ROOT_SOURCES_FIELD_NUMBER: _ClassVar[int]
     RELEASE_ROOT_JOBS_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_ROOT_INSTALLS_FIELD_NUMBER: _ClassVar[int]
+    DESCRIBED_RELEASE_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -725,7 +731,19 @@ class MachineExecutionWorkspace(_message.Message):
     memo_lookup: bool
     release_root_sources: bool
     release_root_jobs: bool
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ..., owner_publication_reconciliation: bool = ..., source_credentials: bool = ..., deferred_installations: bool = ..., resolves_model_defaults: bool = ..., release_roots: bool = ..., input_object_reuse: bool = ..., event_wait: bool = ..., memo_lookup: bool = ..., release_root_sources: bool = ..., release_root_jobs: bool = ...) -> None: ...
+    release_root_installs: bool
+    described_release: DescribedRelease
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ..., owner_publication_reconciliation: bool = ..., source_credentials: bool = ..., deferred_installations: bool = ..., resolves_model_defaults: bool = ..., release_roots: bool = ..., input_object_reuse: bool = ..., event_wait: bool = ..., memo_lookup: bool = ..., release_root_sources: bool = ..., release_root_jobs: bool = ..., release_root_installs: bool = ..., described_release: _Optional[_Union[DescribedRelease, _Mapping]] = ...) -> None: ...
+
+class DescribedRelease(_message.Message):
+    __slots__ = ("package", "release", "package_interface")
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
+    package: str
+    release: str
+    package_interface: bytes
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., package_interface: _Optional[bytes] = ...) -> None: ...
 
 class MachineDevice(_message.Message):
     __slots__ = ("ordinal", "name", "uuid", "memory_bytes", "pci_bus_id", "driver_version")

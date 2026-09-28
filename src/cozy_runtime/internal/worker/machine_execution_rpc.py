@@ -62,14 +62,6 @@ class MachineExecutionRPC:
         except machine_release_roots.Preparing as exc:
             context.set_trailing_metadata((("cozy-error-code", "release_root_preparing"),))
             context.abort(grpc.StatusCode.UNAVAILABLE, str(exc)[:512])
-        except machine_release_roots.InstallationsAbsent as exc:
-            context.set_trailing_metadata(
-                (
-                    ("cozy-error-code", "release_root_installations_absent"),
-                    *(("cozy-absent-release", key) for key in exc.keys),
-                )
-            )
-            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
         except ExecutionWorkspaceRefusal as exc:
             context.set_trailing_metadata((("cozy-error-code", exc.code),))
             context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
@@ -115,7 +107,12 @@ class MachineExecutionRPC:
     ) -> pb.MachineExecutionWorkspace:
         def get() -> pb.MachineExecutionWorkspace:
             assert self.worker.executions is not None
-            options = self.worker.options
+            options, calls = self.worker.options, self.worker.machine_calls
+            described = (
+                calls.release_roots.describe(request.describe)
+                if calls is not None and request.HasField("describe")
+                else None
+            )
             return pb.MachineExecutionWorkspace(
                 worker_id=options.worker_id,
                 worker_boot_id=self.worker.fence.worker_boot_id,
@@ -145,6 +142,7 @@ class MachineExecutionRPC:
                 release_roots=self.worker.machine_calls is not None,
                 release_root_sources=self.worker.machine_calls is not None,
                 release_root_jobs=self.worker.machine_calls is not None,
+                described_release=described,
                 input_object_reuse=True,
                 event_wait=True,
                 memo_lookup=self.worker.owner_memo is not None,
@@ -274,7 +272,7 @@ class MachineExecutionRPC:
     def _submit_release_root(
         self, request: pb.MachineExecutionSubmit, context: ServicerContext
     ) -> pb.MachineExecutionReceipt:
-        """Answer a receipt, the preparation's progress, or the releases lacking facts."""
+        """Answer a receipt or the preparation's progress."""
 
         def submit() -> pb.MachineExecutionReceipt:
             calls, executions = self.worker.machine_calls, self.worker.executions
@@ -291,8 +289,6 @@ class MachineExecutionRPC:
             owner = self.worker.authorize_workspace(request.claim)
             try:
                 return calls.release_roots.submit(owner, request, context)
-            except machine_release_roots.InstallationsAbsent:
-                raise
             except WorkspaceRefusal:
                 # Nothing is journaled before the receipt: the refusal is definitive.
                 if executions.submission_absent(
