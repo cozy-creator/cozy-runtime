@@ -14,9 +14,28 @@ import textwrap
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
-from cozy_runtime.author._memo import MemoDistribution, MemoResource
+import msgspec
+
+from cozy_runtime.author._memo import MemoDependency, MemoDistribution, MemoResource
 
 MAX_SOURCE_BYTES = 1 << 20
+
+
+class _Archive(msgspec.Struct, frozen=True):
+    hash: str = ""
+    hashes: dict[str, str] = {}
+
+
+class _Vcs(msgspec.Struct, frozen=True):
+    commit_id: str = ""
+
+
+class _DirectUrl(msgspec.Struct, frozen=True):
+    """PEP 610 `direct_url.json`: exactly one of the three origins is present."""
+
+    archive_info: _Archive | None = None
+    vcs_info: _Vcs | None = None
+    dir_info: dict[str, object] | None = None
 
 
 def describe(fn: Callable[..., object]) -> dict[str, str]:
@@ -26,7 +45,10 @@ def describe(fn: Callable[..., object]) -> dict[str, str]:
     caller scripts, package inventories and client SDKs never participate. Missing
     source disables the shortcut; it cannot refuse an otherwise valid invocation.
     """
-    version, dependencies = getattr(fn, "_cozy_memo_declaration", ("", ()))
+    declaration: tuple[str, tuple[MemoDependency, ...]] = getattr(
+        fn, "_cozy_memo_declaration", ("", ())
+    )
+    version, dependencies = declaration
     try:
         definitions = [_definition(fn)]
         for dependency in dependencies:
@@ -112,26 +134,21 @@ def _native_identity(name: str) -> str | None:
         provenance: dict[str, object] = {}
         direct = distribution.read_text("direct_url.json")
         if direct:
-            source = json.loads(direct)
-            if not isinstance(source, dict) or "dir_info" in source:
+            source = msgspec.json.decode(direct, type=_DirectUrl)
+            archive, vcs = source.archive_info, source.vcs_info
+            if source.dir_info is not None or (vcs is None and archive is None):
                 return None
-            archive = source.get("archive_info", {})
-            vcs = source.get("vcs_info", {})
-            if not isinstance(archive, dict) or not isinstance(vcs, dict):
-                return None
-            if archive.get("hashes"):
-                provenance["archive_hashes"] = archive["hashes"]
-            elif archive.get("hash"):
-                provenance["archive_hash"] = archive["hash"]
-            if vcs.get("commit_id"):
-                provenance["commit"] = vcs["commit_id"]
             # uv may record a local immutable wheel with archive_info={}.
             # Its version and wheel tags still supply the declared native build
             # contract; include archive hashes when the installer retains them.
-            if "vcs_info" in source and not vcs.get("commit_id"):
-                return None
-            if "archive_info" not in source and "vcs_info" not in source:
-                return None
+            if archive is not None and archive.hashes:
+                provenance["archive_hashes"] = archive.hashes
+            elif archive is not None and archive.hash:
+                provenance["archive_hash"] = archive.hash
+            if vcs is not None:
+                if not vcs.commit_id:
+                    return None
+                provenance["commit"] = vcs.commit_id
         return json.dumps(
             {
                 "version": version,

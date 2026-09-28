@@ -15,6 +15,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal import source_interfaces
 from cozy_runtime.internal.worker import workspace_memo, workspace_sources
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace_memo_rows import Memo, decode
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -184,25 +185,24 @@ def test_cancel_before_native_recipient_creation_prevents_late_tree_retain(tmp_p
     second = accepted(workspace, "second")
     with workspace.locked() as db:
         cached = db.execute("SELECT * FROM operation_cache").fetchone()
-        payload = canonical_json.decode(cached["body"])
-        (hold,) = payload["holds"]
-        hold["retention_id"] = workspace_memo._hold_id(
-            "consumer", "owner", second.service_id, b"k" * 32, hold["transaction_id"]
+        memo = decode(cached["body"], Memo).assigned(
+            "consumer", "owner", second.service_id, b"k" * 32
         )
+        (hold,) = memo.holds
         db.execute("BEGIN IMMEDIATE")
         db.execute(
             "INSERT INTO operation_lookups(owner,consumer,key,cache_id,body,state) "
             "VALUES(?,?,?,?,?,'retaining')",
-            ("owner", second.service_id, b"k" * 32, cached["id"], canonical_json.encode(payload)),
+            ("owner", second.service_id, b"k" * 32, cached["id"], memo.encode()),
         )
-        workspace_memo._reserve_holds(workspace, db, "owner", payload["holds"])
+        workspace_memo._reserve_holds(workspace, db, "owner", memo.holds)
         db.commit()
     workspace_memo.release_native_lookup(workspace, "owner", second.service_id)
     store = tensorfs.Store.open(str(workspace.store_root))
-    released = store.tree_root(hold["retention_id"])
+    released = store.tree_root(hold.retention_id)
     assert released is not None and released["released"]
     with pytest.raises(tensorfs.errors.Refusal):
-        store.retain_tree_root(root["owner"], hold["retention_id"])
+        store.retain_tree_root(root["owner"], hold.retention_id)
 
 
 def test_released_cache_consumer_cannot_reacquire_as_native_producer(tmp_path: Path) -> None:
