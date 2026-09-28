@@ -41,6 +41,7 @@ from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import HostedPlacement, Placement, Worker, WorkerOptions
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
+from test_machine_execution import complete, offer
 
 DRIVER = Path(podactivity_driver.__file__).resolve()
 #: The document the pod supervisor parses, byte for byte, in BOTH repositories. tensorhub
@@ -247,9 +248,18 @@ def test_model_warmup_is_active_but_a_resident_model_is_idle() -> None:
             worker.shutdown()
 
 
-def test_running_parent_is_active_but_paused_and_completed_roots_are_not() -> None:
-    from test_machine_execution import complete, offer
+def _accepted(executions: Any, request: str, ordinal: int = 1) -> None:
+    executions.observe(
+        "owner",
+        pb.WorkerFrame(
+            attempt_accepted=pb.AttemptAccepted(request_id=request, attempt_ordinal=ordinal)
+        ),
+    )
 
+
+def test_accepted_executions_are_active_until_terminal_and_paused_ones_are_not() -> None:
+    """A request queued behind running work holds the rental after that work ends and until
+    it ends itself; so does a running parent awaiting children, and cooperative stopping."""
     with _short_tmp() as root:
         worker = Worker(
             _config(root / "home"),
@@ -259,46 +269,64 @@ def test_running_parent_is_active_but_paused_and_completed_roots_are_not() -> No
         executions = worker.executions
         assert executions is not None
         try:
-            selected = offer("parent")
-            executions.submit(
-                "owner",
-                "submission",
-                b"c" * 32,
-                selected,
-                expected_execution_workspace_id=executions.workspace_id,
-            )
-            assert not activity.active_work(worker)  # accepted queue has not started
-            executions.observe(
-                "owner",
-                pb.WorkerFrame(
-                    attempt_accepted=pb.AttemptAccepted(
-                        request_id="parent",
-                        attempt_ordinal=1,
-                    )
-                ),
-            )
-            # The parent has no device attempt here: waiting for children remains work.
-            assert activity.active_work(worker)
-            executions.control("owner", "parent", "pause", 1, "pause")
+            for request in ("first", "queued"):
+                executions.submit(
+                    "owner",
+                    request,
+                    b"c" * 32,
+                    offer(request),
+                    expected_execution_workspace_id=executions.workspace_id,
+                )
+            assert activity.active_work(worker)  # accepted, not yet started
+            _accepted(executions, "first")
+            complete(executions, "first", {"finished": True})
+            assert executions.status("owner", "queued").state == "queued"
+            assert activity.active_work(worker)  # the queued request still holds the rental
+            _accepted(executions, "queued")
+            executions.control("owner", "queued", "pause", 1, "pause")
             assert activity.active_work(worker)  # cooperative stopping is still work
-            executions.stop_queued("owner", "parent")
-            assert executions.status("owner", "parent").state == "paused"
-            assert executions.retention_required("owner")
+            executions.stop_queued("owner", "queued")
+            assert executions.status("owner", "queued").state == "paused"
             assert not activity.active_work(worker)
-            executions.control("owner", "parent", "resume", 2, "resume")
-            executions.observe(
-                "owner",
-                pb.WorkerFrame(
-                    attempt_accepted=pb.AttemptAccepted(
-                        request_id="parent",
-                        attempt_ordinal=2,
-                    )
-                ),
-            )
+            executions.control("owner", "queued", "resume", 2, "resume")
+            _accepted(executions, "queued", 2)
             assert activity.active_work(worker)
-            complete(executions, "parent", {"finished": True})
+            complete(executions, "queued", {"finished": True})
             assert executions.retention_required("owner")  # uncollected output
             assert not activity.active_work(worker)
+        finally:
+            worker.shutdown()
+
+
+def test_a_delayed_retry_holds_the_rental() -> None:
+    with _short_tmp() as root:
+        worker = Worker(
+            _config(root / "home"),
+            WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+            InMemoryControlHost(),
+        )
+        executions = worker.executions
+        assert executions is not None
+        try:
+            executions.submit(
+                "owner",
+                "flaky",
+                b"c" * 32,
+                offer("flaky"),
+                max_attempts=2,
+                retry_delay_ms=3_600_000,
+                expected_execution_workspace_id=executions.workspace_id,
+            )
+            _accepted(executions, "flaky")
+            complete(
+                executions,
+                "flaky",
+                status=pb.OUTCOME_STATUS_FAILED,
+                cause=pb.CAUSE_CODE_EXECUTOR_FAULT,
+            )
+            executions.retry_due("owner")
+            assert executions.status("owner", "flaky").state == "retrying"
+            assert activity.active_work(worker)
         finally:
             worker.shutdown()
 

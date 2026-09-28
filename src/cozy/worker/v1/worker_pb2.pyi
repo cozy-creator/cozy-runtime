@@ -4026,16 +4026,18 @@ class HeldAttempt(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., kind: _Optional[_Union[AttemptKind, str]] = ..., state: _Optional[_Union[AttemptState, str]] = ..., invocation_spec_digest: _Optional[bytes] = ..., placement_id: _Optional[str] = ..., executor_epoch: _Optional[int] = ..., outcome_id: _Optional[str] = ..., outcome_digest: _Optional[bytes] = ..., lane_id: _Optional[str] = ..., queue_position: _Optional[int] = ..., overtaken: _Optional[int] = ..., overtake_budget: _Optional[int] = ..., plan_digest: _Optional[bytes] = ...) -> None: ...
 
 class Fault(_message.Message):
-    __slots__ = ("kind", "subject", "reason", "detail")
+    __slots__ = ("kind", "subject", "reason", "detail", "desired_state_revision")
     KIND_FIELD_NUMBER: _ClassVar[int]
     SUBJECT_FIELD_NUMBER: _ClassVar[int]
     REASON_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
+    DESIRED_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
     kind: FaultKind
     subject: str
     reason: str
     detail: str
-    def __init__(self, kind: _Optional[_Union[FaultKind, str]] = ..., subject: _Optional[str] = ..., reason: _Optional[str] = ..., detail: _Optional[str] = ...) -> None: ...
+    desired_state_revision: int
+    def __init__(self, kind: _Optional[_Union[FaultKind, str]] = ..., subject: _Optional[str] = ..., reason: _Optional[str] = ..., detail: _Optional[str] = ..., desired_state_revision: _Optional[int] = ...) -> None: ...
 
 class OutputManifest(_message.Message):
     __slots__ = ("publication_receipt_digest", "outputs")

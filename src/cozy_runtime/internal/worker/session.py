@@ -541,6 +541,11 @@ def _stamped(message: Any, fence: OwnershipFence) -> Any:
     return message
 
 
+def _refused(revision: int, **fault: Any) -> pb.Fault:
+    """A desired revision left unapplied: structured, and in the subject older Hosts parse."""
+    return pb.Fault(subject=f"revision {revision}", desired_state_revision=revision, **fault)
+
+
 def _capability_unavailable(operation: str, minor: int) -> str:
     return (
         f"{operation} needs wire minor {MIN_COMPATIBLE_WIRE_MINOR} or newer and the owner "
@@ -2295,6 +2300,7 @@ class Worker:
                 raise WorkspaceRefusal("worker is stopping; root admission is closed")
             executions, owner = self._execution_service(claim)
             executions.require_workspace(expected_execution_workspace_id)
+            machine_lanes.admit(self, "", preparation, offer)
             if publication_authorization_id and self.options.publication_authority is None:
                 raise WorkspaceRefusal("worker has no independent publication authority configured")
             result_schema, memoize = b"", False
@@ -2590,32 +2596,18 @@ class Worker:
                         request, "cpu", refusal=f"gpu_shape_unreadable: {type(exc).__name__}: {exc}"
                     )
             shape = self._gpu_shapes[request]
-            if shape.kind == "cpu" or shape.refusal:
+            if shape.kind == "serving" and readable is None:
+                readable = self.readable_gpus()
+            if refusal := machine_lanes.unrunnable(shape, readable or ()):
+                self._gpu_shapes[request] = dataclasses.replace(shape, refusal=refusal)
+            if shape.kind == "cpu" or refusal:
                 continue
             exclude = set(outside)
             width = len(self.lanes.entries)
             if shape.kind == "serving":
-                if readable is None:
-                    family = accel.host_backend_family()
-                    readable = tuple(
-                        o
-                        for o, entry in enumerate(self.lanes.entries)
-                        if accel.device_memory(entry, family).state == "measured"
-                    )
-                if not readable:
-                    self._gpu_shapes[request] = dataclasses.replace(
-                        shape, refusal="gpu_unavailable: no GPU on this worker is readable"
-                    )
-                    continue
+                assert readable is not None
                 exclude.update(set(range(width)) - set(readable))
                 width = width_for(shape.degrees, len(readable), shape.gpus)
-                if not width:
-                    self._gpu_shapes[request] = dataclasses.replace(
-                        shape,
-                        refusal=f"gpu_count_unavailable: exactly {shape.gpus} GPUs is not a "
-                        f"group every model slot declares on {len(readable)} readable GPUs",
-                    )
-                    continue
             demands.append(
                 Demand(key, shape.root, width, self._warm(shape.template), tuple(sorted(exclude)))
             )
@@ -2629,6 +2621,15 @@ class Worker:
             if event == "gpu.wait":
                 self._gpu_waiting(owner, body)
         return grants
+
+    def readable_gpus(self) -> tuple[int, ...]:
+        """Ordinals whose memory the driver answers; an unreadable GPU cannot fit anything."""
+        family = accel.host_backend_family()
+        return tuple(
+            o
+            for o, entry in enumerate(self.lanes.entries)
+            if accel.device_memory(entry, family).state == "measured"
+        )
 
     def gpu_status(self, request: str) -> pb.MachineExecutionGpu:
         """What the GPU scheduler holds for this execution and, for a root, its calls."""
@@ -4030,9 +4031,9 @@ class Worker:
             minor = inner.wire_minor or self.fence.wire_minor
             if minor < MIN_COMPATIBLE_WIRE_MINOR:
                 self.engine.fault(
-                    pb.Fault(
+                    _refused(
+                        inner.revision,
                         kind=pb.FAULT_KIND_CONFIG_REFUSED,
-                        subject=f"revision {inner.revision}",
                         reason=CAPABILITY_UNAVAILABLE_CODE,
                         detail=_capability_unavailable("package preparation", minor),
                     )
@@ -4041,9 +4042,9 @@ class Worker:
                 return
             if self.executions is not None and self.executions.active(self.fence.record_owner_id):
                 self.engine.fault(
-                    pb.Fault(
+                    _refused(
+                        inner.revision,
                         kind=pb.FAULT_KIND_CONFIG_REFUSED,
-                        subject=f"revision {inner.revision}",
                         reason="machine_execution_owns_worker",
                         detail="Accepted execution controls its prepared state; "
                         "submit through the execution API.",
@@ -4056,9 +4057,9 @@ class Worker:
             except ExecutorGone as exc:
                 self.note("desired_state", f"apply failed: {exc}")
                 self.latch(
-                    pb.Fault(
+                    _refused(
+                        inner.revision,
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=f"revision {inner.revision}",
                         reason="desired_state_preparation_failed",
                         detail=safe(f"{type(exc).__name__}: {exc}"),
                     )
@@ -4362,9 +4363,9 @@ class Worker:
                 or supplied_parent.resource_caps.device_required
             ):
                 self.engine.fault(
-                    pb.Fault(
+                    _refused(
+                        desired.revision,
                         kind=pb.FAULT_KIND_CONFIG_REFUSED,
-                        subject=f"revision {desired.revision}",
                         reason="orchestration_parent_changed",
                         detail="serving must retain the exact already-prepared CPU parent",
                     )
@@ -4387,9 +4388,9 @@ class Worker:
             )
         ):
             self.engine.fault(
-                pb.Fault(
+                _refused(
+                    desired.revision,
                     kind=pb.FAULT_KIND_CONFIG_REFUSED,
-                    subject=f"revision {desired.revision}",
                     reason="job_set_busy",
                     detail="stop unpublished package attempts before replacing their job set",
                 )
@@ -4413,9 +4414,9 @@ class Worker:
                     f"{exc.code} — UNAPPLIED, the previous set keeps serving",
                 )
                 self.engine.fault(
-                    pb.Fault(
+                    _refused(
+                        desired.revision,
                         kind=kind,
-                        subject=f"revision {desired.revision}",
                         reason=exc.code,
                         detail=safe(exc.detail),
                     )
@@ -4433,9 +4434,9 @@ class Worker:
                     "desired state; a changed body must carry a new revision",
                 )
                 self.engine.fault(
-                    pb.Fault(
+                    _refused(
+                        desired.revision,
                         kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        subject=f"revision {desired.revision}",
                         reason="same_revision_changed_body",
                         detail="a DesiredWorkerState body is a complete replacement; changing "
                         "it without a new revision is unrepresentable",
@@ -4534,9 +4535,9 @@ class Worker:
             self.latched = "device_lanes_unsupported"
             self._published_latch = self.latched  # this fault IS the publication
             self.engine.fault(
-                pb.Fault(
+                _refused(
+                    desired.revision,
                     kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    subject=f"revision {desired.revision}",
                     reason=self.latched,
                     detail=(
                         f"this worker's envelope {self.options.devices!r} is "

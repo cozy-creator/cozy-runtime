@@ -30,6 +30,7 @@ from . import (
     machine_capture,
     machine_checkpoint_inputs,
     machine_child_target,
+    machine_lanes,
     machine_model_defaults,
     machine_models,
     package_prepare,
@@ -467,6 +468,7 @@ class Serving:
             )
             capture = canonical_json.encode(executions.capture(owner, call.parent_request))
             attempts, delay = executions.retry_policy(owner, call.parent_request)
+            machine_lanes.admit(self.worker, call.parent_request, preparation, offer)
             with (
                 self.phase(call, request, "Checking model inputs"),
                 machine_checkpoint_inputs.admission(workspace, owner, offer.request_id),

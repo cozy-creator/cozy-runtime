@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.worker import machine_capture
-from cozy_runtime.internal.worker.gpu_scheduler import Ordinals, model_degrees
+from cozy_runtime.internal.worker.gpu_scheduler import Ordinals, model_degrees, width_for
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -42,12 +44,17 @@ def shape(worker: Worker, owner: str, request: str) -> Shape:
     assert executions is not None
     root, parent = executions.scheduling_root(owner, request)
     preparation = executions.preparation(owner, request)
+    return _shape(worker, root, parent, preparation, executions.offer(owner, request))
+
+
+def _shape(
+    worker: Worker, root: str, parent: str, preparation: dict[str, Any], offered: pb.AttemptOffer
+) -> Shape:
     desired = state(preparation) if preparation else pb.DesiredWorkerState()
     mode = desired.WhichOneof("mode")
     if mode == "job":
         found = Shape(root, "cpu" if worker._cpu_job(desired.job) else "job")
     elif mode == "placement_set":
-        offered = executions.offer(owner, request)
         spec = documents.read(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
         row = _selected(desired, offered.placement_id)
         interface = package_interface.read_bytes(base64.b64decode(row["package_interface"]))
@@ -73,6 +80,32 @@ def shape(worker: Worker, owner: str, request: str) -> Shape:
             "await another GPU call; make the caller a CPU orchestration job",
         )
     return found
+
+
+def unrunnable(found: Shape, readable: Sequence[int]) -> str:
+    """Why this machine can never run `found` on its `readable` GPUs; empty when it can."""
+    if found.refusal or found.kind != "serving":
+        return found.refusal
+    if not readable:
+        return "gpu_unavailable: no GPU on this worker is readable"
+    if not width_for(found.degrees, len(readable), found.gpus):
+        return (
+            f"gpu_count_unavailable: exactly {found.gpus} GPUs is not a group every model "
+            f"slot declares on {len(readable)} readable GPUs"
+        )
+    return ""
+
+
+def admit(worker: Worker, parent: str, preparation: bytes, offered: pb.AttemptOffer) -> None:
+    """Refuse at admission what this machine can never run, so it is never queued."""
+    try:
+        found = _shape(
+            worker, "", parent, canonical_json.decode(preparation) if preparation else {}, offered
+        )
+    except Exception as exc:
+        raise WorkspaceRefusal(f"gpu_shape_unreadable: {type(exc).__name__}: {exc}") from exc
+    if refusal := unrunnable(found, worker.readable_gpus() if found.kind == "serving" else ()):
+        raise WorkspaceRefusal(refusal)
 
 
 def _selected(desired: pb.DesiredWorkerState, placement_id: str) -> dict[str, Any]:

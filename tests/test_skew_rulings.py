@@ -149,6 +149,7 @@ def test_stale_placement_shape_asks_its_owner_to_prepare_again(tmp_path: Path) -
         worker._apply_desired_state(pb.DesiredWorkerState(revision=3, placement_set=desired))
         (fault,) = [row for row in worker.engine.faults if row.reason == REPREPARE]
         assert fault.kind == pb.FAULT_KIND_ARTIFACT_FETCH_FAILED
-        assert fault.subject == "revision 3" and not worker.latched
+        assert fault.desired_state_revision == 3 and fault.subject == "revision 3"
+        assert not worker.latched
     finally:
         worker.shutdown()
