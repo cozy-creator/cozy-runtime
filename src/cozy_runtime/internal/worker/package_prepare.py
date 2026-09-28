@@ -547,6 +547,7 @@ def prepare_local_package(
     cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
     python_root: Path | None = None,
+    hub: package_installation.HubIndex | None = None,
 ) -> pb.PreparePackageSetResult:
     """Install a private source sync without publishing it to a repository."""
 
@@ -590,6 +591,7 @@ def prepare_local_package(
         dependency_requirements=bytes(request.dependency_requirements),
         python_requires=request.python_requires,
         python_version=request.python_version,
+        hub=hub,
     )
 
 
@@ -754,6 +756,7 @@ def prepare_package(
     cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
     python_root: Path | None = None,
+    hub: package_installation.HubIndex | None = None,
 ) -> pb.PreparePackageSetResult:
     """Install a synchronized source project or ordinary wheels; describe installed code."""
     if development is None:
@@ -795,6 +798,7 @@ def prepare_package(
             cancel=cancel,
             progress=progress,
             python_root=python_root,
+            hub=hub,
         )
     if materialized is not None:
         materialized(installed)
@@ -878,6 +882,7 @@ def _install_private_files(
     cancel: Callable[[], bool] | None,
     progress: Callable[[str], None] | None,
     python_root: Path | None,
+    hub: package_installation.HubIndex | None,
 ) -> package_installation.InstalledEnvironment:
     """Read transferred carriers only when this installation does not exist yet."""
     python, base = _select_python(
@@ -936,6 +941,7 @@ def _install_private_files(
             requirements=dependency_requirements,
             wheels=tuple(wheels),
             cache=dependency_cache,
+            hub=hub,
         )
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc

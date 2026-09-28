@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -27,6 +28,8 @@ MAX_SOURCE_FILES = 100_000
 IMAGE_UV_CACHE = Path("/opt/cozy/dependency-seed/uv-cache")
 #: Installation ids of published environments keyed by their content (release, lock, ABI).
 PUBLISHED_PREFIX = "release-"
+#: An account-index URL: its origin, then the path that names it (account, then page or file).
+_ACCOUNT_INDEX = re.compile(rb"https?://[^/\s'\"]+(/v1/index/[A-Za-z0-9._-]+/(?:simple|files)/)")
 
 
 class InstallationRecord(TypedDict):
@@ -35,6 +38,14 @@ class InstallationRecord(TypedDict):
     python: NotRequired[str]
     generation: NotRequired[str]
     site_packages: NotRequired[str]
+
+
+@dataclass(frozen=True, slots=True)
+class HubIndex:
+    """This machine's own Hub: where a synced project's account-index rows resolve."""
+
+    origin: str
+    ca: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +157,30 @@ def _extract(archive: Path, destination: Path) -> None:
         )
 
 
+def _bind_account_index(source: Path, hub: HubIndex | None, environment: dict[str, str]) -> None:
+    """Point a synced project's account-index URLs at this machine's own Hub. A lock names
+    that index by its path (account, page, file digest), never by the Hub its author used."""
+    for name in ("pyproject.toml", "uv.lock"):
+        path = source / name
+        raw = path.read_bytes()
+        if not _ACCOUNT_INDEX.search(raw):
+            continue
+        if hub is None:
+            raise EnvironmentRefusal(
+                "package_account_index_unreachable",
+                "the project resolves account-index packages but this machine has no Hub grant",
+            )
+        path.write_bytes(_ACCOUNT_INDEX.sub(hub.origin.rstrip("/").encode() + rb"\1", raw))
+        if hub.ca is not None:
+            # uv trusts one certificate set: the platform's, plus the grant's private Hub CA.
+            trusted = source.parent / "hub-ca"
+            trusted.mkdir(exist_ok=True)
+            shutil.copyfile(hub.ca, trusted / "tensorhub-ca.pem")
+            environment["SSL_CERT_DIR"] = (
+                f"{ssl.get_default_verify_paths().openssl_capath}:{trusted}"
+            )
+
+
 def _install(
     root: Path,
     *,
@@ -157,6 +192,7 @@ def _install(
     requirements: bytes = b"",
     wheels: tuple[Path, ...] = (),
     cache: Path | None = None,
+    hub: HubIndex | None = None,
     lock_fd: int = -1,
 ) -> InstalledEnvironment:
     """Create a venv without package fingerprints; existing IDs are operation replays only."""
@@ -195,6 +231,7 @@ def _install(
                     shutil.rmtree(staged_source)
                 _extract(source_archive, staged_source)
                 os.replace(staged_source, source)
+            _bind_account_index(source, hub, environment)
             _run(
                 [
                     uv,
@@ -386,6 +423,7 @@ def install(
     requirements: bytes = b"",
     wheels: tuple[Path, ...] = (),
     cache: Path | None = None,
+    hub: HubIndex | None = None,
 ) -> InstalledEnvironment:
     identifier = installation_id or "install-" + uuid.uuid4().hex
     with _installation_lock(root, identifier) as lock_fd:
@@ -399,5 +437,6 @@ def install(
             requirements=requirements,
             wheels=wheels,
             cache=cache,
+            hub=hub,
             lock_fd=lock_fd,
         )

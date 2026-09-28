@@ -2005,6 +2005,9 @@ class Worker:
             materialized=materialized.append,
             dependency_python=self.options.environment_python,
             dependency_cache=self.config.dependency_cache,
+            hub=package_installation.HubIndex(authority.origin, authority.ca)
+            if (authority := self.options.publication_authority) is not None
+            else None,
         )
         installed = materialized[0]
         return self._register_local_package(request, result, installed)
