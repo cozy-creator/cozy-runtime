@@ -154,7 +154,9 @@ def test_warm_runs_once_per_fill_before_the_placement_is_dispatchable(
     filled = [
         row for row in worker.boot.steps if row["step"] == "load" and row["outcome"] == "filled"
     ]
-    assert len(filled) == 2 and all(row["warm_ms"] > 0 for row in filled), filled
+    assert len(filled) == 2 and all(
+        isinstance(ms := row["warm_ms"], float) and ms > 0 for row in filled
+    ), filled
 
     # BEFORE DISPATCHABLE: each placement's `prepare legs` note (the warm leg is on it)
     # precedes its own dispatchable edge — the primary's is the serving transition, a
