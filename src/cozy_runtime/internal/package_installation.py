@@ -26,6 +26,7 @@ from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 
+from cozy_runtime.internal import host_paths
 from cozy_runtime.internal.config import package_install_environment
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
 
@@ -65,10 +66,12 @@ def machine_sdk() -> dict[str, str]:
     return found
 
 
-def machine_wheels() -> Path:
-    """Where the Host keeps the wheels this machine's Runtime and TensorFS were installed
-    from: beside the Runtime's interpreter (`<machine root>/opt/cozy/wheels`)."""
-    return Path(sys.prefix).parent / "wheels"
+def machine_wheels(install_root: Path) -> Path | None:
+    """Where `cozy machine install` keeps the wheels this machine's Runtime and TensorFS were
+    installed from (`<machine root>/opt/cozy/wheels`); None for an install root outside a
+    machine layout."""
+    layout = host_paths.Layout.of_install_root(install_root)
+    return layout.machine_wheels if layout is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,7 +262,7 @@ def _select_sdk(
     install: Callable[[list[str]], None],
     as_locked: Callable[[], None],
     mine: dict[str, str],
-    wheels: Path,
+    wheels: Path | None,
 ) -> None:
     """Install the SDK the requirements admit (the installed distributions' and `declared`):
     this machine's own Runtime and TensorFS (`mine`, found on the index or among `wheels`),
@@ -296,7 +299,7 @@ def _select_sdk(
         else named[name] + str(specifier)
         for name, (specifier, _) in bounds.items()
     ]
-    links = ["--find-links", str(wheels)] if wheels.is_dir() else []
+    links = ["--find-links", str(wheels)] if wheels is not None and wheels.is_dir() else []
     local = {name: version for name, version in mine.items() if "+" in version}
     if local:
         # A local build is what the owner is testing: the package runs it or nothing.
@@ -401,7 +404,7 @@ def _build(
             lambda rows: run(*pip, "--constraints", str(constraints), *rows),
             as_locked,
             machine_sdk(),
-            machine_wheels(),
+            machine_wheels(directory.parent.parent),
         )
     return {
         name: distribution.version

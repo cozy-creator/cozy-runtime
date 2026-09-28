@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import package_installation
+from cozy_runtime.internal import host_paths, package_installation
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
 
 LOCAL = "0.18.77+probe"
@@ -100,6 +100,14 @@ def test_a_local_build_installs_from_the_machines_wheels(
         d.metadata["Name"]: d.version for d in importlib.metadata.distributions(path=[str(site)])
     }
     assert installed["cozy-runtime"] == LOCAL
+
+
+def test_the_machine_wheels_live_in_the_machine_layout(tmp_path: Path) -> None:
+    layout = host_paths.Layout(tmp_path / "machine")
+    assert package_installation.machine_wheels(layout.install_root) == layout.machine_wheels
+    assert layout.machine_wheels == tmp_path / "machine/opt/cozy/wheels"
+    assert host_paths.Layout().machine_wheels == Path("/opt/cozy/wheels")
+    assert package_installation.machine_wheels(tmp_path / "installs") is None
 
 
 def test_a_local_build_without_its_wheel_refuses_rather_than_substitute(
