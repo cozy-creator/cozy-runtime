@@ -3,20 +3,13 @@ from typing import Any, cast
 
 import pytest
 
-from cozy_runtime.internal import hostfacts, package_interface
+from cozy_runtime.internal import hostfacts
 from cozy_runtime.internal.worker import machine_model_defaults
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def test_counted_capture_verifies() -> None:
-    slot = package_interface.ModelSlot(path="run.models.model", class_name="M", component_use={})
-    run = package_interface.CallableDoc(name="run", request={}, result={}, models=(slot,))
-    interfaces = {
-        "installed": package_interface.PackageInterface(
-            format=package_interface.SCHEMA, application="app", entrypoints=(run,), jobs=()
-        )
-    }
     rung = pb.MachineModelDefaultRung(
         gpu="H100", repository="proof/h3", manifest=pb.Ref(digest=b"\xaa" * 32, length=1)
     )
@@ -35,12 +28,22 @@ def test_counted_capture_verifies() -> None:
     worker = cast(
         Any, SimpleNamespace(options=SimpleNamespace(publication_authority=None, hubs=()))
     )
-    machine_model_defaults.verify(worker, capture, interfaces)
+    machine_model_defaults.verify(worker, capture)
     rungs = capture.model_defaults[0].rungs
     rungs[0].gpus = 2
     rungs.add().CopyFrom(rungs[0])
     rungs[1].gpus = 4
-    machine_model_defaults.verify(worker, capture, interfaces)
+    machine_model_defaults.verify(worker, capture)
+    # Rows in the Creator's order, and one for a slot this interface lacks, still verify;
+    # only two defaults for one slot are ambiguous.
+    extra = capture.model_defaults.add()
+    extra.CopyFrom(capture.model_defaults[0])
+    extra.parameter = "another"
+    capture.model_defaults.reverse()
+    machine_model_defaults.verify(worker, capture)
+    extra.parameter = "model"
+    with pytest.raises(WorkspaceRefusal):
+        machine_model_defaults.verify(worker, capture)
 
 
 def test_selection_counts_the_granted_pool_and_uncounted_rows_need_no_count(

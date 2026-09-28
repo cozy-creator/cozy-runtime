@@ -159,7 +159,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             raise WorkspaceRefusal("execution callable does not identify the installed export")
     if len(targets) > 4096:
         raise WorkspaceRefusal("execution callable inventory exceeds its bound")
-    machine_model_defaults.verify(worker, capture, interfaces)
+    machine_model_defaults.verify(worker, capture)
     spec = documents.parse(request.offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
     state = request.prepared_state
     root_interface = interfaces[root]

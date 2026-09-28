@@ -498,7 +498,8 @@ def test_a_pin_overrides_the_h3_preference() -> None:
     assert whole.totals() == {"sdpa": 4} and not consulted
 
 
-def test_an_unknown_preferred_kernel_refuses() -> None:
-    with pytest.raises(attention.AttentionRefusal) as refused:
-        attention.select(_device(), _roots(), choose=lambda context: ("sdpa-typo", "sdpa"))
-    assert refused.value.code == "attention_kernel_unknown"
+def test_a_kernel_this_runtime_lacks_is_skipped_for_the_next_preference() -> None:
+    """A package written for a newer Runtime prefers a kernel an older machine lacks; the
+    load used to refuse `attention_kernel_unknown` instead of serving its next choice."""
+    applied = attention.select(_device(), _roots(), choose=lambda context: ("sol-next", "sdpa"))
+    assert applied.totals() == {"sdpa": 2}
