@@ -75,9 +75,41 @@ def burst(ctx: Context, payload: BurstInput, model: TenantModel, tel: Telemetry)
     torch.cuda.synchronize()
     del scratch
     return TouchOutput(checksum=checksum, components=sorted(model.pipe.components))
+
+
+from typing import Annotated
+
+from cozy_runtime.author import Shape, invocable
+
+
+class SegmentInput(msgspec.Struct, forbid_unknown_fields=True):
+    seconds: Annotated[int, msgspec.Meta(ge=1, le=4), Shape(frames={1: 24, 2: 48, 3: 72, 4: 96})]
+    scratch_per_second: int = 0
+
+
+@invocable
+async def segment(
+    ctx: Context, *, payload: SegmentInput, model: TenantModel, tel: Telemetry
+) -> TouchOutput:
+    """`burst` as H3's `long_form` calls a segment: its length is one level down, in `payload`."""
+    import torch
+
+    view = model.for_request(ctx, seed=1)
+    checksum = model.touch(view._seed)
+    size = payload.seconds * payload.scratch_per_second
+    scratch = torch.empty(size, dtype=torch.uint8, device="cuda")
+    scratch.fill_(1)
+    torch.cuda.synchronize()
+    del scratch
+    return TouchOutput(checksum=checksum, components=sorted(model.pipe.components))
+
+
+app.entrypoint(segment)
 '''
-BINDING = (
-    '\n[bindings."burst.models.model"]\nmodel = "cozytest/tenant"\nrelease = "1"\nlane = "bf16"\n'
+BINDING = "".join(
+    f'\n[bindings."{entrypoint}.models.model"]\nmodel = "cozytest/tenant"\nrelease = "1"\n'
+    'lane = "bf16"\n'
+    for entrypoint in ("burst", "segment")
 )
 
 
@@ -248,7 +280,8 @@ class Card:
 
     def __init__(self, root: Path, store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
         self.store = store
-        self.tag = root.name.rsplit(".", 1)[-1]
+        # A request id starts alphanumeric; a temporary name may start with "_".
+        self.tag = "c" + root.name.rsplit(".", 1)[-1]
         self.install_root = root / "installs"
         #: request -> the plan's placement rung, and the replica that served it
         self.plans: dict[str, str] = {}
@@ -497,8 +530,8 @@ def store(tmp_path_factory: pytest.TempPathFactory) -> Store:
     return write_store(tmp_path_factory.mktemp("gpu-store"), blocks=24, models=("p", "q", "r"))
 
 
-@pytest.fixture
-def card(store: Store, monkeypatch: pytest.MonkeyPatch) -> Iterator[Card]:
+@contextlib.contextmanager
+def serving(store: Store, monkeypatch: pytest.MonkeyPatch) -> Iterator[Card]:
     # Short: an executor's control socket lives under it and `sun_path` holds 108 bytes.
     with tempfile.TemporaryDirectory(prefix="cz-card.", dir="/tmp") as root:
         made = Card(Path(root), store, monkeypatch)
@@ -506,6 +539,12 @@ def card(store: Store, monkeypatch: pytest.MonkeyPatch) -> Iterator[Card]:
             yield made
         finally:
             made.worker.shutdown()
+
+
+@pytest.fixture
+def card(store: Store, monkeypatch: pytest.MonkeyPatch) -> Iterator[Card]:
+    with serving(store, monkeypatch) as made:
+        yield made
 
 
 def succeeded(body: dict[str, Any]) -> bool:
@@ -548,6 +587,30 @@ def test_a_call_that_needs_room_evicts_the_idle_neighbour_instead_of_running_out
     assert len(evicted_for_burst) >= 2, card.vacated()
     assert set(card.epochs().values()) == {1}, "vacated, not killed"
     assert not any("out of memory" in step.lower() for step in card.steps())
+
+
+@needs_card
+def test_a_longer_segment_is_not_admitted_on_a_shorter_ones_peak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 1560: H3's 12 s segment ran on its 6 s segment's measured peak, because the length
+    sat in an invocable's `payload` and both were one shape. A 4 s call after a 1 s one of the
+    same entrypoint is unmeasured, so the idle neighbour goes instead of the call running out.
+    Small weights, so both tenants stay resident beside another process's memory."""
+    small = write_store(tmp_path, blocks=2, models=("p", "q"))
+    with serving(small, monkeypatch) as card:
+        assert succeeded(card.call("q-touch", "touch", "q"))
+        assert succeeded(card.call("s-1", "segment", "p", payload={"seconds": 1}))
+        assert succeeded(card.call("q-again", "touch", "q"))
+        # Beside Q it does not fit; with Q vacated it does.
+        per_second = (free() + small.weight_bytes // 2) // 4
+        body = card.call(
+            "s-4", "segment", "p", payload={"seconds": 4, "scratch_per_second": per_second}
+        )
+        assert succeeded(body), body
+        whom = card.replicas["s-4"]
+        assert card.replicas["q-again"] in [v for v, by in card.vacated() if by == whom]
+        assert set(card.epochs().values()) == {1}
 
 
 @needs_card
