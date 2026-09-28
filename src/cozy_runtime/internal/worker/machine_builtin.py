@@ -114,7 +114,9 @@ class Builtins:
         installed = package_installation.open_installation(
             Path(worker.options.install_root or ""), captured.installation_id
         )
-        placement = worker._placement_from_entry(captured.placement, b"")
+        placement = worker._placement_from_entry(
+            documents.from_body(captured.placement, pb.Placement), b""
+        )
         placement.installed = installed
         worker.prepared_installations[placement.prepared_key] = placement
         body = package_interface.read_bytes(placement.package_interface)
@@ -145,7 +147,7 @@ class Builtins:
             export,
             declared,
             {
-                "placement": placement.document,
+                "placement": captured.placement,
                 "installation_id": installed.installation_id,
                 "runtime_builtin": msgspec.to_builtins(captured),
             },

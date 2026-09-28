@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import functools
 import hashlib
 import http.server
@@ -111,7 +110,7 @@ def test_prepare_and_desired_state_accept_additive_fields(tmp_path: Path) -> Non
             placement_set_digest=documents.digest_of(raw), placement_set_canonical_bytes=raw
         )
     )
-    assert base64.b64decode(placement["package_interface"]) == interface
+    assert placement.package_interface == interface
 
     # A job plan written by another Runtime version with a field this one does not read.
     (plan,) = (tmp_path / "plans").glob("*/*.json")

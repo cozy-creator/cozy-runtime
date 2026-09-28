@@ -9,7 +9,7 @@ import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, TypedDict, cast
+from typing import Any, TypedDict
 
 import pytest
 import tensorfs
@@ -29,7 +29,7 @@ from cozy_runtime.internal.worker.package_prepare import (
     _selected_models,
     selections,
 )
-from cozy_runtime.internal.worker.session import Placement
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 # Canonical CozyTensors header produced by TensorFS itself. It contains one inline JCS config, one
@@ -107,9 +107,10 @@ def _acquirer(tmp_path: Path, store_root: Path) -> Acquirer:
 
 def test_model_prep_ignores_absent_snapshot_siblings(tmp_path: Path) -> None:
     store_root, manifest_id, manifest_length, store = _snapshot(tmp_path, include_asset=True)
-    placement = cast(
-        Placement,
-        SimpleNamespace(models=({"manifest": {"digest": manifest_id, "length": manifest_length}},)),
+    placement = pb.Placement(
+        models=[
+            pb.Model(manifest=pb.Ref(digest=documents.raw(manifest_id), length=manifest_length))
+        ]
     )
 
     count = _acquirer(tmp_path, store_root)._models(placement)
@@ -133,9 +134,10 @@ def test_held_manifest_census_comes_from_tensorfs(tmp_path: Path) -> None:
 
 def test_model_prep_still_requires_header_assets(tmp_path: Path) -> None:
     store_root, manifest_id, manifest_length, _store = _snapshot(tmp_path, include_asset=False)
-    placement = cast(
-        Placement,
-        SimpleNamespace(models=({"manifest": {"digest": manifest_id, "length": manifest_length}},)),
+    placement = pb.Placement(
+        models=[
+            pb.Model(manifest=pb.Ref(digest=documents.raw(manifest_id), length=manifest_length))
+        ]
     )
 
     with pytest.raises(AcquisitionRefusal) as refused:
@@ -263,35 +265,32 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         "jobs": [],
     }
     interface_bytes = package_interface.canonical_bytes(body)
-    slot = {
-        "slot": "model",
-        "reference_model_id": "model-0000",
-        "components": [{"component": "unet", "model_id": "model-0000"}],
-    }
-    binding_digest = (
-        "sha256:"
-        + hashlib.sha256(canonical.write({"name": "generate", "slots": [slot]})).hexdigest()
+    slot = pb.Slot(
+        slot="model",
+        reference_model_id="model-0000",
+        components=[pb.Component(component="unet", model_id="model-0000")],
     )
-    placement = cast(
-        Placement,
-        SimpleNamespace(
-            package_interface=interface_bytes,
-            models=(
-                {
-                    "id": "model-0000",
-                    "repo": "example/model",
-                    "version": "1",
-                    "lane": "main",
-                    "manifest": {"digest": manifest_id, "length": manifest_length},
-                },
-            ),
-            entrypoints=(
-                {"name": "generate", "entrypoint_binding_digest": binding_digest, "slots": [slot]},
-            ),
-            package={"package": "example/package", "release": "1"},
-            development={},
-            installation_id="local-" + "33" * 16,
-        ),
+    binding_digest = canonical.digest({"name": "generate", "slots": [documents.body(slot)]})
+    placement = pb.Placement(
+        package_interface=interface_bytes,
+        models=[
+            pb.Model(
+                id="model-0000",
+                repo="example/model",
+                version="1",
+                lane="main",
+                manifest=pb.Ref(digest=documents.raw(manifest_id), length=manifest_length),
+            )
+        ],
+        entrypoints=[
+            pb.Entrypoint(
+                name="generate",
+                entrypoint_binding_digest=documents.raw(binding_digest),
+                slots=[slot],
+            )
+        ],
+        package=pb.PackageSelection(package="example/package", release="1"),
+        installation_id="local-" + "33" * 16,
     )
 
     assert acquirer._models(placement) == 1
@@ -441,8 +440,8 @@ def test_checkpoint_selection_refuses_corrupt_header(tmp_path: Path) -> None:
 
 def test_evicted_preparation_rechecks_native_bytes(tmp_path: Path) -> None:
     root, manifest, length, _native = _snapshot(tmp_path, include_asset=True)
-    placement = cast(
-        Placement, SimpleNamespace(models=({"manifest": {"digest": manifest, "length": length}},))
+    placement = pb.Placement(
+        models=[pb.Model(manifest=pb.Ref(digest=documents.raw(manifest), length=length))]
     )
     acquirer = _acquirer(tmp_path, root)
     assert acquirer._models(placement) == 1

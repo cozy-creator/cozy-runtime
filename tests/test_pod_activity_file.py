@@ -198,17 +198,7 @@ def test_model_warmup_is_active_but_a_resident_model_is_idle() -> None:
             InMemoryControlHost(),
         )
         placement = Placement(
-            placement_id="model",
-            placement_set_digest=b"",
-            package={},
-            development={},
-            installation_id="",
-            package_interface=b"",
-            bindings_digest=b"",
-            models=(),
-            entrypoints=(),
-            document={},
-            serving=pb.SERVING_STATE_ACTIVATING,
+            pb.Placement(placement_id="model"), b"", serving=pb.SERVING_STATE_ACTIVATING
         )
         try:
             worker.placement = placement

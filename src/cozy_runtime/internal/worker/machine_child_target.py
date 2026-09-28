@@ -144,7 +144,7 @@ def _deferred_key(worker: Worker, installation: str) -> str:
     """A running deferred callee's key, from its installed package and release."""
     for placement in worker.prepared_installations.values():
         if placement.installation_id == installation:
-            return f"{placement.package.get('package', '')}@{placement.package.get('release', '')}"
+            return f"{placement.document.package.package}@{placement.document.package.release}"
     return ""
 
 

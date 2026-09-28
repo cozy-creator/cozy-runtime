@@ -90,13 +90,14 @@ def collect_worker(worker: Worker) -> pb.CollectStoreGarbageResult:
             if worker.accepted.desired_state_body:
                 desired = pb.DesiredWorkerState.FromString(worker.accepted.desired_state_body)
                 if desired.HasField("placement_set"):
-                    body = documents.read(
-                        desired.placement_set.placement_set_canonical_bytes, pb.PlacementSet
+                    docs.extend(
+                        documents.parse(
+                            desired.placement_set.placement_set_canonical_bytes, pb.PlacementSet
+                        ).placements
                     )
-                    docs.extend(body.get("placements", []))
             for document in docs:
-                for model in document.get("models", []):
-                    keep.add(model["manifest"]["digest"])
+                for model in document.models:
+                    keep.add(documents.spell(model.manifest.digest))
             result = collect(root, keep_manifests=sorted(keep))
             if not result.store_busy:
                 # Routing must stop advertising bytes a successful pressure pass removed.

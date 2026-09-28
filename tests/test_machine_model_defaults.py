@@ -24,14 +24,13 @@ from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
 from cozy_runtime.internal.worker.machine_serving import Serving
-from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config
-from test_group_lanes import _placement
 from test_machine_execution import ack, complete, offer
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
@@ -303,8 +302,7 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
             }
         ],
     }
-    placement = _placement("registered")
-    placement.document = document
+    placement = Placement(documents.from_body(document, pb.Placement), b"")
     worker.prepared_installations[placement.prepared_key] = placement
     selected = dataclasses.replace(
         target(),

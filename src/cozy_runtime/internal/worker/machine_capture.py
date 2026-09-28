@@ -116,7 +116,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         interfaces[identifier] = package_interface.parse(
             selected.package_interface, "installed package"
         )
-        installations[identifier] = Installation(selected.document, identifier)
+        installations[identifier] = Installation(documents.body(selected.document), identifier)
     if root not in installations:
         raise WorkspaceRefusal("execution capture root is not installed")
     if len(capture.deferred_installations) > 128:
@@ -212,7 +212,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         )
         if held is None or selected_entry is None or selected_entry.installation_id != root:
             raise WorkspaceRefusal("execution inference does not name the captured root")
-        installations[root] = Installation(held.document, root)
+        installations[root] = Installation(documents.body(held.document), root)
         # The held placement's bindings digest is the selected entry's: the same entrypoints.
         bound = next(
             (
@@ -258,7 +258,9 @@ def restore(worker: Worker, document: Mapping[str, object]) -> pb.DesiredWorkerS
     """Reopen worker-owned installation lifetimes after restart."""
     retained = preparation(document)
     for identifier, row in retained.installations.items():
-        placement = worker._placement_from_entry(row.placement, b"")
+        placement = worker._placement_from_entry(
+            documents.from_body(row.placement, pb.Placement), b""
+        )
         placement.installed = package_installation.open_installation(
             Path(worker.options.install_root or ""),
             identifier,

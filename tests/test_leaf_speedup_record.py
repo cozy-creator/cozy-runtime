@@ -40,7 +40,7 @@ from cozy_runtime.internal.fill import dtype_name
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import NativeEvidence, Observation, QualificationResult
 from cozy_runtime.internal.resolution import ConstructionFacts, ResolvedModelPlan, Variant, resolve
-from cozy_runtime.internal.worker.session import _delivery_observation
+from cozy_runtime.internal.worker.session import _Delivery, _delivery_observation
 
 OBSERVATION = Path(__file__).resolve().parent / "observations" / "probe-cuda-sm89.json"
 
@@ -53,6 +53,10 @@ RECORDED_SPECS = {
 }
 
 LEAF = "cozy.fp8-rowwise.native-leaf/1"
+
+
+def _narrated(wire: dict[str, object]) -> str:
+    return _delivery_observation(msgspec.convert(wire, _Delivery))
 
 
 def recorded() -> QualificationResult:
@@ -198,7 +202,7 @@ def test_resolution_carries_the_leaf_speedup_onto_the_plan_the_walk_and_the_line
 
     wire = plan.wire_document()
     assert wire["leaf_speedup_x"] == 0.6122
-    line = _delivery_observation(wire)
+    line = _narrated(wire)
     assert (
         "routes encoded_gemm x1; kernels encoded_gemm x1; leaf 0.61x its float GEMM; "
         "uncalibrated) chosen on the latency axis"
@@ -211,7 +215,7 @@ def test_a_leaf_that_wins_is_reported_without_the_loss_verdict() -> None:
     assert plan.derived_leaf_speedup_x() == 2.03
     assert "measured these leaves at 2.03x their float GEMM" in plan.confession
     assert "SLOWER" not in plan.confession
-    assert "leaf 2.03x its float GEMM" in _delivery_observation(plan.wire_document())
+    assert "leaf 2.03x its float GEMM" in _narrated(plan.wire_document())
 
 
 def test_the_decode_floor_carries_no_leaf_speedup_and_the_line_says_nothing() -> None:
@@ -222,7 +226,7 @@ def test_the_decode_floor_carries_no_leaf_speedup_and_the_line_says_nothing() ->
     assert plan.derived_leaf_speedup_x() == -1.0
     wire = plan.wire_document()
     assert wire["leaf_speedup_x"] == -1.0
-    assert "leaf " not in _delivery_observation(wire)
+    assert "leaf " not in _narrated(wire)
     assert "float GEMM" not in plan.confession
 
 
@@ -234,7 +238,7 @@ def test_a_leaf_with_no_bench_reads_as_not_measured() -> None:
     assert plan.route_census() == {"encoded_gemm": 1}
     assert plan.derived_leaf_speedup_x() == -1.0
     assert "float GEMM" not in plan.confession
-    assert "leaf " not in _delivery_observation(plan.wire_document())
+    assert "leaf " not in _narrated(plan.wire_document())
     assert probe.leaf_speedups(result) == {}
 
 

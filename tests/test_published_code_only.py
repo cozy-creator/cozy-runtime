@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import sys
 from pathlib import Path
@@ -115,17 +114,19 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
             return
         result = prepare()
         (placement,) = read_placement_set(result.placement_set)
-        assert placement["entrypoints"] == placement["models"] == []
-        assert placement["package"] == {"package": "proof/serving-child", "release": "1.0.0"}
+        assert not placement.entrypoints and not placement.models
+        assert placement.package == pb.PackageSelection(
+            package="proof/serving-child", release="1.0.0"
+        )
         assert len(retained) == 1
-        assert placement["installation_id"] == retained[0].installation_id
+        assert placement.installation_id == retained[0].installation_id
         assert (retained[0].site_packages / "serving_child.py").is_file()
         reopened = package_installation.open_installation(root, retained[0].installation_id)
         assert reopened.site_packages == retained[0].site_packages
         again = read_placement_set(prepare().placement_set)[0]
         # The same release and lock reuse one environment.
-        assert again["installation_id"] == placement["installation_id"]
-        assert again["placement_id"] == placement["placement_id"]
+        assert again.installation_id == placement.installation_id
+        assert again.placement_id == placement.placement_id
     finally:
         index.close()
 
@@ -272,16 +273,14 @@ async def generate(payload: Request, model: Reference) -> Reply:
                 if value.document == placement
             )
             assert retained.installed is not None
-            assert retained.models == retained.entrypoints == ()
+            assert not retained.document.models and not retained.document.entrypoints
             assert (retained.installed.site_packages / "serving_child.py").read_bytes() == source
             reopened = package_installation.open_installation(
                 root / "installs", retained.installed.installation_id
             )
             assert reopened.site_packages == retained.installed.site_packages
             # The worker described the installed code; the request's copy is advisory.
-            interface = package_interface.read_bytes(
-                base64.b64decode(placement["package_interface"])
-            )
+            interface = package_interface.read_bytes(placement.package_interface)
             assert interface["jobs"] == [] and interface["entrypoints"][0]["name"] == "generate"
             acquirer = Acquirer(
                 cache_root=root / "artifacts",
@@ -291,11 +290,11 @@ async def generate(payload: Request, model: Reference) -> Reply:
                 python=python,
                 base=worker.base,
             )
-            bindings, count = acquirer._bindings(retained)
+            bindings, count = acquirer._bindings(retained.document)
             assert bindings == {} and count == 1
             (repeated,) = read_placement_set(worker.prepare_package_set(request).placement_set)
-            assert repeated["placement_id"] == placement["placement_id"]
-            assert repeated["entrypoints"] == repeated["models"] == []
+            assert repeated.placement_id == placement.placement_id
+            assert not repeated.entrypoints and not repeated.models
         finally:
             worker.shutdown()
             index.close()
@@ -391,8 +390,8 @@ def test_a_landing_preparation_installs_the_release_and_reads_no_model(tmp_path:
         landed = prepare(request)
         assert not (tmp_path / "store").exists(), "a landing preparation opened the Store"
         (placement,) = read_placement_set(landed.placement_set)
-        assert placement["models"] == placement["entrypoints"] == []
-        assert placement["installation_id"] == retained[0].installation_id
+        assert not placement.models and not placement.entrypoints
+        assert placement.installation_id == retained[0].installation_id
         assert (retained[0].site_packages / "serving_child.py").is_file()
         # The executor starts at the width of what the selection binds whole: `generate`.
         assert landing_models(request, bytes(landed.installed_package.package_interface)) == [slot]

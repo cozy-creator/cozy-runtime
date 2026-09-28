@@ -39,6 +39,7 @@ from cozy_runtime.internal.worker.session import (
     WorkerOptions,
     executor_load_command,
 )
+from cozy_runtime.protocol import worker_pb2 as pb
 from local_owner import claimable
 from test_end_to_end import NO_EXECUTOR
 
@@ -245,20 +246,12 @@ def test_the_ledger_row_survives_a_switch_to_another_placement() -> None:
         try:
             worker.accepted.mode = "serving"
             primary = Placement(
-                placement_id="p0",
-                placement_set_digest=b"",
-                package={},
-                development={},
-                installation_id="",
-                package_interface=b"",
-                bindings_digest=b"b" * 32,
-                models=(),
-                entrypoints=(),
-                document={},
-                lane_id="lane-0",
+                pb.Placement(placement_id="p0", bindings_digest=b"b" * 32), b"", lane_id="lane-0"
             )
             worker.placement = primary
-            hosted = dataclasses.replace(primary, placement_id="p1")
+            hosted = dataclasses.replace(
+                primary, document=pb.Placement(placement_id="p1", bindings_digest=b"b" * 32)
+            )
             worker.hosted["p1"] = HostedPlacement(
                 placement=hosted, supervision=worker._new_placement_supervision("p1")
             )

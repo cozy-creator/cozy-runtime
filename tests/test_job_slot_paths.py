@@ -47,8 +47,9 @@ from cozy_runtime.internal.worker.package_prepare import (
     _slot_paths,
     selections,
 )
-from cozy_runtime.internal.worker.session import Placement, read_placement_set
+from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
 
 ROOT = Path(__file__).resolve().parent.parent
 TENANT = ROOT / "corpus" / "tenant"
@@ -228,7 +229,7 @@ def test_a_job_shaped_selection_prepares(
     placement = json.loads(result.placement_set.placement_set_canonical_bytes)["placements"][0]
     assert placement["entrypoints"] == []
     assert [row["repo"] for row in placement["models"]] == [PACKAGE]
-    assert read_placement_set(result.placement_set)[0] == placement
+    assert documents.body(read_placement_set(result.placement_set)[0]) == placement
     assert placement["models"][0].get("version", "") == ("" if checkpoint_only else RELEASE)
     assert placement["models"][0].get("lane", "") == ("" if checkpoint_only else LANE)
     # The job plan the JobDirective will resolve against exists.
@@ -284,21 +285,21 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
         python=Path(sys.executable),
         base=base_observation.current(),
     )
-    model_rows = tuple(documents.body(row) for row in models)
-    entry_rows = tuple(documents.body(row) for row in entrypoints)
-    placement = Placement(
+    placement = pb.Placement(
         placement_id="modeled",
-        placement_set_digest=b"a" * 32,
-        package={"package": PACKAGE, "release": RELEASE},
-        development={},
+        package=pb.PackageSelection(package=PACKAGE, release=RELEASE),
         installation_id="install-modeled",
         package_interface=raw,
         bindings_digest=documents.digest_of(
-            canonical.write({"models": list(model_rows), "entrypoints": list(entry_rows)})
+            canonical.write(
+                {
+                    "models": [documents.body(row) for row in models],
+                    "entrypoints": [documents.body(row) for row in entrypoints],
+                }
+            )
         ),
-        models=model_rows,
-        entrypoints=entry_rows,
-        document={},
+        models=models,
+        entrypoints=entrypoints,
     )
     assert acquired._models(placement) == 1
     bindings, _ = acquired._bindings(placement)

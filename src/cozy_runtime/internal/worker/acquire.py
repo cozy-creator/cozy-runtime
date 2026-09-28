@@ -18,7 +18,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import Annotated, Literal
 
 import msgspec
 
@@ -34,19 +34,12 @@ from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     ModelBinding,
 )
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-
-if TYPE_CHECKING:
-    from .session import Placement
 
 type FaultKind = pb.FaultKind
 type LegName = Literal["package", "model"]
 type ObservationCallback = Callable[[pb.PlacementAcquisitionObservation], object]
-
-
-class _ArtifactReference(msgspec.Struct):
-    digest: str
-    length: int
 
 
 class _Blob(msgspec.Struct, frozen=True):
@@ -237,6 +230,11 @@ class AcquiredPlacement:
     trusted_reuse_bytes: int
 
 
+def package_selection(placement: pb.Placement) -> pb.PackageSelection | pb.DevelopmentPackage:
+    """The placement's one package mode: a published selection or a development package."""
+    return placement.development if placement.HasField("development") else placement.package
+
+
 class Acquirer:
     """One placement's concurrent package/model acquisition."""
 
@@ -328,7 +326,7 @@ class Acquirer:
                     )
         return path
 
-    def acquire(self, placement: Placement) -> AcquiredPlacement:
+    def acquire(self, placement: pb.Placement) -> AcquiredPlacement:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cozy-acquire") as pool:
             model_future = pool.submit(self._run_model, placement)
             package_future = pool.submit(self._run_package, placement, model_future)
@@ -346,7 +344,7 @@ class Acquirer:
         )
 
     def _run_package(
-        self, placement: Placement, models: Future[int]
+        self, placement: pb.Placement, models: Future[int]
     ) -> tuple[package_installation.InstalledEnvironment, Mapping[str, DeclaredBinding], int]:
         self._thread.leg = "package"
         self.observation.start("package")
@@ -360,7 +358,7 @@ class Acquirer:
         finally:
             self.observation.finish("package")
 
-    def _run_model(self, placement: Placement) -> int:
+    def _run_model(self, placement: pb.Placement) -> int:
         self._thread.leg = "model"
         self.observation.start("model")
         try:
@@ -368,7 +366,7 @@ class Acquirer:
         finally:
             self.observation.finish("model")
 
-    def _environment(self, placement: Placement) -> package_installation.InstalledEnvironment:
+    def _environment(self, placement: pb.Placement) -> package_installation.InstalledEnvironment:
         """Reopen the generation this placement's prepare published; move no wheel bytes.
 
         Wire 30 deletes wheel members and grants from the download path outright: a
@@ -392,14 +390,17 @@ class Acquirer:
                 getattr(exc, "detail", str(exc)),
             ) from exc
 
-    def _models(self, placement: Placement) -> int:
+    def _models(self, placement: pb.Placement) -> int:
         """Hold every distinct selected manifest with ONE verified walk each; returns the
         number of manifests held."""
         if not placement.models:
             return 0
         try:
             store = fill.open_store(self.tensorfs_root)
-            manifests = {_ref(model["manifest"], "model.manifest") for model in placement.models}
+            manifests = {
+                (documents.spell(model.manifest.digest), model.manifest.length)
+                for model in placement.models
+            }
             for manifest_digest, manifest_length in sorted(manifests):
                 # TensorFS owns model materialization. A cache miss asks the owner to
                 # ensure this exact selection again, including manifest and header.
@@ -430,19 +431,19 @@ class Acquirer:
                 f"{type(exc).__name__}: {exc}",
             ) from exc
 
-    def _bindings(self, placement: Placement) -> tuple[Mapping[str, DeclaredBinding], int]:
-        development = placement.development
+    def _bindings(self, placement: pb.Placement) -> tuple[Mapping[str, DeclaredBinding], int]:
+        selection = package_selection(placement)
         interface_path = self.selection_root / placement.installation_id / "package-interface.json"
         package_interface.publish(interface_path, placement.package_interface)
         interface = _interface(placement.package_interface, str(interface_path))
         visible = _entrypoints_by_name(interface)
-        models = {str(row["id"]): row for row in placement.models}
+        models = {row.id: row for row in placement.models}
         package_code_digest = placement.installation_id
         bindings: dict[str, DeclaredBinding] = {}
         count = 1
         for entrypoint in placement.entrypoints:
-            name = str(entrypoint["name"])
-            binding_digest = str(entrypoint["entrypoint_binding_digest"])
+            name = entrypoint.name
+            binding_digest = documents.spell(entrypoint.entrypoint_binding_digest)
             described = visible.get(name)
             if described is None:
                 raise AcquisitionRefusal(
@@ -450,7 +451,7 @@ class Acquirer:
                     "binding_package_interface_invalid",
                     f"interface has no entrypoint {name!r}",
                 )
-            slots = entrypoint.get("slots", [])
+            slots = entrypoint.slots
             if len(slots) != len(described.models):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "binding_slot_set_mismatch", name
@@ -479,7 +480,7 @@ class Acquirer:
                 )
             members: list[ModelBinding] = []
             for slot in slots:
-                path = f"{name}.models.{slot['slot']}"
+                path = f"{name}.models.{slot.slot}"
                 declared = described_by_path.get(path)
                 if declared is None:
                     raise AcquisitionRefusal(
@@ -487,9 +488,9 @@ class Acquirer:
                         "binding_package_interface_invalid",
                         path,
                     )
-                reference = models[str(slot["reference_model_id"])]
-                reference_manifest = str(reference["manifest"]["digest"])
-                components = tuple(str(row["component"]) for row in slot.get("components", []))
+                reference = models[slot.reference_model_id]
+                reference_manifest = documents.spell(reference.manifest.digest)
+                components = tuple(row.component for row in slot.components)
                 if not components or len(set(components)) != len(components):
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -497,8 +498,8 @@ class Acquirer:
                         f"{path}: selected model has no complete unique component set",
                     )
                 snapshots = {
-                    str(row["component"]): str(models[str(row["model_id"])]["manifest"]["digest"])
-                    for row in slot.get("components", [])
+                    row.component: documents.spell(models[row.model_id].manifest.digest)
+                    for row in slot.components
                 }
                 try:
                     logical = fill.logical_weight_bytes(self.tensorfs_root, snapshots)
@@ -517,7 +518,7 @@ class Acquirer:
                     ModelBinding(
                         model_class=declared.class_name,
                         model_binding_path=path,
-                        model_parameter_name=str(slot["slot"]),
+                        model_parameter_name=slot.slot,
                         store=str(self.tensorfs_root),
                         variant="",
                         reference_snapshot=reference_manifest,
@@ -527,17 +528,17 @@ class Acquirer:
                         sequence_parallel_degrees=degrees,
                         # The manifest is identity; lane remains the human repo pointer the
                         # desired download set carried beside it.
-                        model=str(reference["repo"])
-                        + (f"@{reference['version']}" if reference.get("version") else "")
-                        + (f"/{reference['lane']}" if reference.get("lane") else ""),
+                        model=reference.repo
+                        + (f"@{reference.version}" if reference.version else "")
+                        + (f"/{reference.lane}" if reference.lane else ""),
                         adapters=tuple(
                             {
-                                "component": str(adapter.get("component", "")),
-                                "model_id": str(adapter.get("model_id", "")),
-                                "source_component": str(adapter.get("source_component", "")),
-                                "scale": str(adapter.get("scale", "")),
+                                "component": adapter.component,
+                                "model_id": adapter.model_id,
+                                "source_component": adapter.source_component,
+                                "scale": adapter.scale,
                             }
-                            for adapter in slot.get("adapters", [])
+                            for adapter in slot.adapters
                         ),
                     )
                 )
@@ -562,13 +563,9 @@ class Acquirer:
                 components=first.components,
                 snapshots=first.snapshots,
                 logical_weight_bytes=sum(member.logical_weight_bytes for member in model_set),
-                package=(
-                    f"{development['package']}@{development['release']}"
-                    if development
-                    else f"{placement.package['package']}@{placement.package['release']}"
-                ),
+                package=f"{selection.package}@{selection.release}",
             )
-        selected_entrypoints = {str(row["name"]) for row in placement.entrypoints}
+        selected_entrypoints = {row.name for row in placement.entrypoints}
         # Preparation selects the entrypoints whose model slots were supplied. Each
         # selected entrypoint and its complete slot set was checked above; the package
         # may also declare other entrypoints that this placement does not bind.
@@ -578,7 +575,11 @@ class Acquirer:
         code_only_preparation = not models and all(
             entrypoint.models for entrypoint in visible.values()
         )
-        if not selected_entrypoints and (development or visible) and not code_only_preparation:
+        if (
+            not selected_entrypoints
+            and (placement.HasField("development") or visible)
+            and not code_only_preparation
+        ):
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "binding_entrypoint_set_mismatch",
@@ -615,24 +616,6 @@ def _verify_bytes(raw: bytes, digest: str, length: int) -> None:
             "local_artifact_identity_mismatch",
             f"measured {measured}/{len(raw)}, expected {digest}/{length}",
         )
-
-
-def _ref(value: object, name: str) -> tuple[str, int]:
-    try:
-        reference = msgspec.convert(value, type=_ArtifactReference)
-        if (
-            not reference.digest.startswith("sha256:")
-            or len(reference.digest) != 71
-            or reference.length <= 0
-        ):
-            raise ValueError("invalid reference")
-    except (msgspec.ValidationError, ValueError) as exc:
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            f"{name}_ref_invalid",
-            "reference is exactly {digest,length}",
-        ) from exc
-    return reference.digest, reference.length
 
 
 def cozytensors_ref(raw: bytes) -> tuple[str, int]:

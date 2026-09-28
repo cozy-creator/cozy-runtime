@@ -83,10 +83,13 @@ class Deferred:
             request.install_root = str(Path(self.worker.options.install_root or ""))
             self.worker.note("preparation", f"installing {key} on its first selection")
             entries = read_placement_set(self.worker.prepare_package_set(request).placement_set)
-            if len(entries) != 1 or entries[0].get("package", {}).get("package") != row.package:
+            if len(entries) != 1 or entries[0].package.package != row.package:
                 raise WorkspaceRefusal("deferred preparation returned another installation")
             future.set_result(
-                {"placement": entries[0], "installation_id": entries[0]["installation_id"]}
+                {
+                    "placement": documents.body(entries[0]),
+                    "installation_id": entries[0].installation_id,
+                }
             )
         except Exception as exc:  # the calls that selected it fail, nothing else
             future.set_exception(

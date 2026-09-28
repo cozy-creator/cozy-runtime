@@ -12,15 +12,15 @@ from pathlib import Path
 from cozy_runtime.internal import base_observation, canonical, package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
-from cozy_runtime.internal.worker.session import Placement
 from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
 
 REPLICAS = 4
 ROUNDS = 200
 ENTRYPOINTS = tuple(f"generate_{index}" for index in range(32))
 
 
-def _placement() -> Placement:
+def _placement() -> pb.Placement:
     schema: dict[str, Json] = {"fields": []}
     interface = canonical.write(
         {
@@ -32,24 +32,21 @@ def _placement() -> Placement:
             "jobs": [],
         }
     )
-    return Placement(
+    return pb.Placement(
         placement_id="replica",
-        placement_set_digest=b"\x11" * 32,
-        package={"package": "proof/replicas", "release": "1.0.0"},
-        development={},
+        package=pb.PackageSelection(package="proof/replicas", release="1.0.0"),
         installation_id="install-replicas",
         package_interface=interface,
         bindings_digest=documents.digest_of(canonical.write({"entrypoints": [], "models": []})),
-        models=(),
-        entrypoints=tuple(
-            {
-                "name": name,
-                "entrypoint_binding_digest": canonical.digest({"entrypoint": name}),
-                "slots": [],
-            }
+        entrypoints=[
+            pb.Entrypoint(
+                name=name,
+                entrypoint_binding_digest=documents.digest_of(
+                    canonical.write({"entrypoint": name})
+                ),
+            )
             for name in ENTRYPOINTS
-        ),
-        document={},
+        ],
     )
 
 

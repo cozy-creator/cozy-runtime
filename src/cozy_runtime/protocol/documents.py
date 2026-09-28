@@ -107,7 +107,7 @@ def spell(raw: bytes) -> str:
 
 def raw(spelled: str) -> bytes:
     """`sha256:<hex>` -> the 32 raw bytes protobuf transports."""
-    if not spelled.startswith("sha256:") or len(spelled) != 71:
+    if canonical.DIGEST_RE.fullmatch(spelled) is None:
         raise DocumentError("malformed_digest", f"{spelled!r} is not a lowercase sha256: digest")
     return bytes.fromhex(spelled[7:])
 
@@ -226,6 +226,9 @@ def _fill(message: Message, fields: dict[str, object]) -> None:
         if fd is None:
             continue
         where = fd.full_name
+        oneof = fd.containing_oneof
+        if oneof is not None and message.WhichOneof(oneof.name) not in (None, name):
+            raise DocumentError("oneof_conflict", f"{where} is one choice of several set")
         if fd.is_repeated:
             if not isinstance(value, list):
                 raise DocumentError("wrong_type", f"{where} is not a list")

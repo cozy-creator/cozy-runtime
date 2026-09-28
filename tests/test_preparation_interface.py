@@ -8,7 +8,6 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
 
 import grpc
 import pytest
@@ -77,9 +76,10 @@ class ObservedWorker(Worker):
             assert not Path(supervision.socket_path).exists()
 
 
-def _placement(result: pb.PreparePackageSetResult) -> dict[str, Any]:
+def _placement(result: pb.PreparePackageSetResult) -> pb.Placement:
     (placement,) = read_placement_set(result.placement_set)
-    assert placement.pop("installation_id") == result.installed_package.installation_id
+    assert placement.installation_id == result.installed_package.installation_id
+    placement.ClearField("installation_id")
     return placement
 
 
@@ -185,7 +185,7 @@ def test_absent_and_present_interface_share_preparation(metadata: bool) -> None:
                         installations = (root / "installs/installations").glob("release-*")
                         assert len(list(installations)) == 1
                         (placement,) = read_placement_set(legacy.placement_set)
-                        assert placement["entrypoints"][0]["name"] == "serve"
+                        assert placement.entrypoints[0].name == "serve"
                         # Caller copies of installed facts are advisory.
                         request.application = "compat_package:wrong"
                         request.model_slot_paths.append("serve.models.unexpected")

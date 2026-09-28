@@ -40,18 +40,7 @@ def public_bindings(root: Path) -> tuple[Placement, dict[str, DeclaredBinding]]:
     raw, entry = current_placement((FIXTURE / "placement.json").read_bytes(), interface)
     cache = root / "artifacts"
     cache.mkdir()
-    placement = Placement(
-        placement_id=entry["placement_id"],
-        placement_set_digest=documents.digest_of(raw),
-        package=entry["package"],
-        development={},
-        installation_id=entry["installation_id"],
-        package_interface=interface,
-        bindings_digest=documents.raw(entry["bindings_digest"]),
-        models=tuple(entry["models"]),
-        entrypoints=tuple(entry["entrypoints"]),
-        document=entry,
-    )
+    placement = Placement(entry, documents.digest_of(raw))
     result, _ = Acquirer(
         cache_root=cache,
         install_root=root / "environment",
@@ -59,7 +48,7 @@ def public_bindings(root: Path) -> tuple[Placement, dict[str, DeclaredBinding]]:
         tensorfs_root=store_root,
         base=base_observation.current(),
         python=Path("/usr/bin/python3"),
-    )._bindings(placement)
+    )._bindings(entry)
     return placement, dict(result)
 
 
@@ -69,7 +58,7 @@ def test_public_alternative_entrypoints_preserve_the_joint_call_cost(
 ) -> None:
     placement, bindings = public_bindings(tmp_path)
     assert {b.entrypoint for b in bindings.values()} == {"fl2va_turbo", "ref2va_turbo"}
-    assert len(placement.models) == 4  # Equal checkpoints were not deduplicated.
+    assert len(placement.document.models) == 4  # Equal checkpoints were not deduplicated.
     assert all(len(b.model_bindings()) == 2 for b in bindings.values())
     assert len({b.construction_key() for b in bindings.values()}) == 1
     placement.device_pin = tuple(range(degree))

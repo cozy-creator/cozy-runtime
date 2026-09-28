@@ -202,14 +202,14 @@ class ReleaseRoots:
             held = [
                 placement
                 for placement in self.worker.prepared_installations.values()
-                if not placement.development
-                and placement.package.get("package") == package
-                and placement.package.get("release") == release
+                if placement.document.HasField("package")
+                and placement.document.package.package == package
+                and placement.document.package.release == release
             ]
         if not held:
             return None
-        selected = min(held, key=lambda placement: len(placement.models))
-        return Installation(dict(selected.document), selected.installation_id)
+        selected = min(held, key=lambda placement: len(placement.document.models))
+        return Installation(documents.body(selected.document), selected.installation_id)
 
     def _plan(self, root: pb.ReleaseRoot) -> None:
         if (
@@ -232,7 +232,8 @@ class ReleaseRoots:
                     placement
                     for placement in self.worker.prepared_installations.values()
                     if placement.installation_id == root.installation_id
-                    and placement.development.get("package") == root.package
+                    and placement.document.HasField("development")
+                    and placement.document.development.package == root.package
                 ),
                 None,
             )
@@ -241,8 +242,8 @@ class ReleaseRoots:
                 "release_root_installation_absent",
                 f"this machine holds no installation {root.installation_id} of {root.package}",
             )
-        return _key(root.package, str(held.development["release"])), Installation(
-            dict(held.document), held.installation_id
+        return _key(root.package, held.document.development.release), Installation(
+            documents.body(held.document), held.installation_id
         )
 
     def _facts(self, key: str) -> pb.DeferredInstallation:
@@ -337,9 +338,9 @@ class ReleaseRoots:
         prepared.CopyFrom(row.preparation)
         prepared.install_root = str(Path(self.worker.options.install_root or ""))
         entries = read_placement_set(self.worker.prepare_package_set(prepared).placement_set)
-        if len(entries) != 1 or entries[0].get("package", {}).get("package") != row.package:
+        if len(entries) != 1 or entries[0].package.package != row.package:
             raise WorkspaceRefusal("release root preparation returned another installation")
-        return Installation(entries[0], entries[0]["installation_id"])
+        return Installation(documents.body(entries[0]), entries[0].installation_id)
 
     def _prepare(self, owner: str, request: pb.MachineExecutionSubmit, job: _Job) -> _Prepared:
         root, worker = request.release_root, self.worker
@@ -531,7 +532,9 @@ class ReleaseRoots:
     def _register(self, target: Target, placement: dict[str, Json], placement_set: bytes) -> None:
         """Keep the prepared placement, so the next identical root matches it at once."""
         worker = self.worker
-        stored = worker._placement_from_entry(placement, hashlib.sha256(placement_set).digest())
+        stored = worker._placement_from_entry(
+            documents.from_body(placement, pb.Placement), hashlib.sha256(placement_set).digest()
+        )
         stored.installed = package_installation.open_installation(
             Path(worker.options.install_root or ""), target.installation_id
         )

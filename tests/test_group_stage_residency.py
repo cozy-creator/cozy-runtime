@@ -8,7 +8,6 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any
 
 import pytest
 import tensorfs
@@ -17,7 +16,7 @@ from cozy_runtime.internal import accel, base_observation, canonical
 from cozy_runtime.internal.worker.acquire import Acquirer
 from cozy_runtime.internal.worker.lanes import DeviceLane, LaneSet
 from cozy_runtime.internal.worker.plan import DeclaredBinding
-from cozy_runtime.internal.worker.session import Placement, read_placement_set
+from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -27,7 +26,7 @@ TEXT_ENCODER = 51_506_191_840
 INSTALLATION = "local-h3-fixture"
 
 
-def current_placement(raw: bytes, interface: bytes) -> tuple[bytes, dict[str, Any]]:
+def current_placement(raw: bytes, interface: bytes) -> tuple[bytes, pb.Placement]:
     """The captured H3 placement on the current wire: an installation, and interface bytes."""
     document = json.loads(raw)
     (row,) = document["placements"]
@@ -69,7 +68,7 @@ def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> Decla
     model = described["models"][0]
     if scope == "simultaneous":
         model["component_use"] = {
-            "all": [row["component"] for row in entry["entrypoints"][0]["slots"][0]["components"]]
+            "all": [row.component for row in entry.entrypoints[0].slots[0].components]
         }
     elif scope == "unknown":
         model["component_use"] = {"unknown": ["not-a-selected-component"]}
@@ -78,8 +77,8 @@ def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> Decla
     elif scope == "absent":
         model["component_use"] = {}
     elif scope == "missing_component":
-        missing = entry["entrypoints"][0]["slots"][0]["components"][0]["component"]
-        entry["entrypoints"][0]["slots"][0]["components"][0]["component"] = "absent"
+        missing = entry.entrypoints[0].slots[0].components[0].component
+        entry.entrypoints[0].slots[0].components[0].component = "absent"
         model["component_use"] = {
             method: ["absent" if name == missing else name for name in names]
             for method, names in model["component_use"].items()
@@ -88,24 +87,11 @@ def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> Decla
         second = copy.deepcopy(model)
         second["path"] = "fl2va.models.other"
         described["models"].append(second)
-        selected = copy.deepcopy(entry["entrypoints"][0]["slots"][0])
-        selected["slot"] = "other"
-        entry["entrypoints"][0]["slots"].append(selected)
+        entry.entrypoints[0].slots.add().CopyFrom(entry.entrypoints[0].slots[0])
+        entry.entrypoints[0].slots[-1].slot = "other"
     cache = tmp_path / "artifacts"
     cache.mkdir()
-    placement = Placement(
-        placement_id=entry["placement_id"],
-        placement_set_digest=documents.digest_of(raw),
-        package={},
-        development=entry["development"],
-        installation_id=entry["installation_id"],
-        package_interface=canonical.write(interface),
-        bindings_digest=documents.raw(entry["bindings_digest"]),
-        models=tuple(entry["models"]),
-        entrypoints=tuple(entry["entrypoints"]),
-        document=entry,
-        device_pin=(0, 1),
-    )
+    entry.package_interface = canonical.write(interface)
     resolved, _ = Acquirer(
         cache_root=cache,
         install_root=tmp_path / "environment",
@@ -113,7 +99,7 @@ def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> Decla
         tensorfs_root=store_root,
         base=base_observation.current(),
         python=Path("/usr/bin/python3"),
-    )._bindings(placement)
+    )._bindings(entry)
     return next(iter(resolved.values()))
 
 

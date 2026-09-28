@@ -12,6 +12,7 @@ import pytest
 import tensorfs
 
 from cozy_runtime.internal.worker import store_gc
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
@@ -31,8 +32,14 @@ def worker(tmp_path: Path, *, owns: bool = True) -> Any:
     )
 
 
-def placement(digest: str) -> SimpleNamespace:
-    return SimpleNamespace(document={"models": [{"manifest": {"digest": digest}}]})
+def manifest(name: str) -> bytes:
+    return documents.digest_of(name.encode())
+
+
+def placement(name: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        document=pb.Placement(models=[pb.Model(manifest=pb.Ref(digest=manifest(name)))])
+    )
 
 
 def test_collection_protects_active_intent_without_treating_prepared_metadata_as_custody(
@@ -57,12 +64,10 @@ def test_collection_protects_active_intent_without_treating_prepared_metadata_as
         (
             tmp_path,
             {
-                "keep_manifests": [
-                    "current",
-                    "hosted",
-                    "incoming",
-                    "pending",
-                ]
+                "keep_manifests": sorted(
+                    documents.spell(manifest(name))
+                    for name in ("current", "hosted", "incoming", "pending")
+                )
             },
         )
     ]

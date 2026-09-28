@@ -180,7 +180,20 @@ PROGRESS_QUEUE = 256
 REPORT_SECONDS = 2.0
 
 
-def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
+class _Progress(msgspec.Struct, frozen=True):
+    """A `progress` frame's measured coordinates; an unknown one stays None and is omitted."""
+
+    stage: str = ""
+    step_ms: float = 0.0
+    stage_fraction: float | None = None
+    position: int | None = None
+    total: int | None = None
+    overall_fraction: float | None = None
+    unit: str | None = None
+    rate: float | None = None
+
+
+def _progress_document(frame: Mapping[str, canonical.Json]) -> dict[str, canonical.Json]:
     """Preserve the measured progress coordinates the executor already supplied.
 
     Stage-local and overall fractions stay separate. Optional coordinates are omitted when
@@ -191,53 +204,54 @@ def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
     not its message, and a load's value may be None beside a measured position.
     """
     kind = frame.get("kind", "progress")
-    payload: Any = {
-        key: value for key, value in frame.items() if key not in {"event", "request_id", "kind"}
-    }
-    if kind == "progress":
-        payload = {
-            "stage": str(frame.get("stage", ""))[:120],
-            "step_ms": frame.get("step_ms", 0.0),
-        }
-        for field in ("stage_fraction", "position", "total", "overall_fraction", "unit", "rate"):
-            if frame.get(field) is not None:
-                payload[field] = frame[field]
+    if kind != "progress":
+        routing = {"event", "request_id", "kind"}
+        return {"type": kind, "payload": {k: v for k, v in frame.items() if k not in routing}}
+    progress = msgspec.convert(frame, _Progress)
+    payload = {k: v for k, v in msgspec.structs.asdict(progress).items() if v is not None}
+    payload["stage"] = progress.stage[:120]
     return {"type": kind, "payload": payload}
 
 
-def _delivery_observation(delivery: Mapping[str, Any]) -> str:
+class _Delivery(msgspec.Struct, frozen=True):
+    """A load reply's `delivery` (`resolution.Plan.wire_document`), as the worker narrates it."""
+
+    variant: str = ""
+    label: str = "unlabelled"
+    rung: str = "unreported"
+    delivery: str = "unreported"
+    materialization: str = ""
+    """Empty when nothing decodes: the bytes are served verbatim."""
+    routes: dict[str, int] | None = None
+    kernels: dict[str, int] | None = None
+    leaf_speedup_x: float = -1.0
+    calibrated: bool = False
+    objective: str = "unreported"
+    confession: str = ""
+    models: dict[str, object] = {}
+
+
+def _delivery_observation(delivery: _Delivery) -> str:
     """Render only the current resolution-plan projection; narration never gates serving."""
 
-    def census(name: str) -> str:
-        value = delivery.get(name)
-        if not isinstance(value, Mapping):
+    def census(value: dict[str, int] | None) -> str:
+        if value is None:
             return "unreported"
-        rows = ", ".join(f"{key} x{count}" for key, count in sorted(value.items()))
-        return rows or "none"
+        return ", ".join(f"{key} x{count}" for key, count in sorted(value.items())) or "none"
 
-    materialization = str(delivery.get("materialization") or "verbatim")
-    calibrated = "calibrated" if delivery.get("calibrated") else "uncalibrated"
-    confession = str(delivery.get("confession") or "")
     # The leaf-speed evidence rides BESIDE the route census it qualifies: a plan that routes
     # `encoded_gemm x453` on a card whose probe measured the leaf at 0.61x its float GEMM
     # says so on the same line, rather than banking the number where nothing reads it.
-    speedup = delivery.get("leaf_speedup_x")
-    leaf = (
-        f"; leaf {speedup:.2f}x its float GEMM"
-        if isinstance(speedup, int | float) and speedup >= 0.0
-        else ""
-    )
-    selection = (
-        "per-model delivery"
-        if delivery.get("models")
-        else f"on rung {delivery.get('rung', 'unreported')}"
-    )
+    speedup = delivery.leaf_speedup_x
+    leaf = f"; leaf {speedup:.2f}x its float GEMM" if speedup >= 0.0 else ""
+    selection = "per-model delivery" if delivery.models else f"on rung {delivery.rung}"
+    calibrated = "calibrated" if delivery.calibrated else "uncalibrated"
     return (
-        f"{delivery.get('variant', '')!r} / {delivery.get('label', 'unlabelled')} {selection} "
-        f"({delivery.get('delivery', 'unreported')}/{materialization}; "
-        f"routes {census('routes')}; kernels {census('kernels')}{leaf}; {calibrated}) chosen "
-        f"on the {delivery.get('objective', 'unreported')} axis"
-        + (f" - {confession}" if confession else "")
+        f"{delivery.variant!r} / {delivery.label} {selection} "
+        f"({delivery.delivery}/{delivery.materialization or 'verbatim'}; "
+        f"routes {census(delivery.routes)}; kernels {census(delivery.kernels)}{leaf}; "
+        f"{calibrated}) chosen on the {delivery.objective} axis"
+        + (f" - {delivery.confession}" if delivery.confession else "")
     )
 
 
@@ -370,16 +384,9 @@ class Placement:
     replace is this SAME `placement_id` in a new set, which is why routing survives rollout.
     """
 
-    placement_id: str
+    document: pb.Placement
+    """The accepted Placement, decoded and checked once by `read_placement_set`."""
     placement_set_digest: bytes
-    package: dict[str, Any]
-    development: dict[str, Any]
-    installation_id: str
-    package_interface: bytes
-    bindings_digest: bytes
-    models: tuple[dict[str, Any], ...]
-    entrypoints: tuple[dict[str, Any], ...]
-    document: dict[str, Any]
     acquisition: pb.PlacementAcquisitionObservation = field(
         default_factory=pb.PlacementAcquisitionObservation
     )
@@ -401,6 +408,22 @@ class Placement:
     #: so the placement over that revision serves from this environment instead of
     #: re-acquiring bytes nothing on the pod still holds.
     installed: package_installation.InstalledEnvironment | None = None
+
+    @property
+    def placement_id(self) -> str:
+        return self.document.placement_id
+
+    @property
+    def installation_id(self) -> str:
+        return self.document.installation_id
+
+    @property
+    def package_interface(self) -> bytes:
+        return self.document.package_interface
+
+    @property
+    def bindings_digest(self) -> bytes:
+        return self.document.bindings_digest
 
     @property
     def prepared_key(self) -> tuple[str, str, bytes]:
@@ -567,47 +590,6 @@ def desired_state_body(desired: pb.DesiredWorkerState) -> bytes:
     return documents.canonical_bytes(body)
 
 
-def _digest_field(spelled: Any) -> bytes:
-    """A document spells a digest `sha256:<hex>`; the wire carries the 32 raw bytes. Absent
-    is absent — an empty field is not a zero digest (#494g)."""
-    return documents.raw(str(spelled)) if spelled else b""
-
-
-def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, Any]]:
-    """§4's ORDER OF OPERATIONS, and it is not negotiable.
-
-    RECOMPUTE `sha256(placement_set_canonical_bytes)` and compare BEFORE parsing a single
-    field. The frozen wire "digest-addressed" the set by an ECHOED claim, which is a
-    statement the sender makes about bytes it also sent; this is a fence the receiver
-    computes. Only on a match is the document parsed. Fields this worker does not consume
-    are ignored at every depth, and the nested binding digests are the producer's names.
-
-    Raises `documents.DocumentError`; the caller turns that into the typed fault and leaves
-    the previous set serving.
-    """
-    recomputed = documents.digest_of(desired_set.placement_set_canonical_bytes)
-    if recomputed != desired_set.placement_set_digest:
-        raise documents.DocumentError(
-            "placement_set_digest_mismatch",
-            f"the set claims {desired_set.placement_set_digest.hex()[:16]}… and its own "
-            f"{len(desired_set.placement_set_canonical_bytes)} B hash to "
-            f"{recomputed.hex()[:16]}… — nothing in it has been parsed",
-        )
-    document = documents.read(desired_set.placement_set_canonical_bytes, pb.PlacementSet)
-    placements = document.get("placements", [])
-    if not isinstance(placements, list):
-        raise documents.DocumentError("wrong_type", "`placements` is a list of Placement")
-    for entry in placements:
-        if not isinstance(entry, dict):
-            raise documents.DocumentError("wrong_type", "a Placement is a JSON object")
-        _placement_profile(entry)
-    placement_ids = [str(entry["placement_id"]) for entry in placements]
-    if len(placement_ids) != len(set(placement_ids)):
-        raise documents.DocumentError("duplicate_placement", "placement_id must be unique")
-    return [entry for entry in placements if isinstance(entry, dict)]
-
-
-HASH_ENTRY = re.compile(r"^sha256:[0-9a-f]{64}$")
 #: The fault reason asking the owner to prepare a stale-shaped placement set again.
 REPREPARE = "placement_set_reprepare_required"
 SEMVER = re.compile(
@@ -617,196 +599,143 @@ SEMVER = re.compile(
 )
 
 
-def _document(value: object, name: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise documents.DocumentError("wrong_type", f"{name} is a JSON object")
-    return value
+class _StalePlacement(msgspec.Struct, frozen=True):
+    """The shape an older Runtime prepared: the interface by Ref, no installation."""
+
+    package_interface: dict[str, object]
 
 
-def _unique(values: list[str], name: str) -> None:
+class _StaleSet(msgspec.Struct, frozen=True):
+    placements: tuple[_StalePlacement, ...]
+
+
+def _stale(data: bytes) -> bool:
+    try:
+        return bool(msgspec.json.decode(data, type=_StaleSet).placements)
+    except msgspec.DecodeError:
+        return False
+
+
+def _reprepare() -> documents.DocumentError:
+    # Nothing is wrong with the request: its owner prepares the set again on this worker.
+    return documents.DocumentError(
+        REPREPARE,
+        "this placement set was prepared by an older Runtime; prepare the package set again "
+        "on this worker",
+    )
+
+
+def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[pb.Placement]:
+    """§4's ORDER OF OPERATIONS, and it is not negotiable.
+
+    RECOMPUTE `sha256(placement_set_canonical_bytes)` and compare BEFORE parsing a single
+    field. The frozen wire "digest-addressed" the set by an ECHOED claim, which is a
+    statement the sender makes about bytes it also sent; this is a fence the receiver
+    computes. Only on a match is the document decoded, once, into the typed message.
+    Fields this worker does not consume are ignored at every depth, and the nested binding
+    digests are the producer's names.
+
+    Raises `documents.DocumentError`; the caller turns that into the typed fault and leaves
+    the previous set serving.
+    """
+    data = desired_set.placement_set_canonical_bytes
+    recomputed = documents.digest_of(data)
+    if recomputed != desired_set.placement_set_digest:
+        raise documents.DocumentError(
+            "placement_set_digest_mismatch",
+            f"the set claims {desired_set.placement_set_digest.hex()[:16]}… and its own "
+            f"{len(data)} B hash to {recomputed.hex()[:16]}… — nothing in it has been parsed",
+        )
+    try:
+        placements = list(documents.parse(data, pb.PlacementSet).placements)
+    except documents.DocumentError as exc:
+        if _stale(data):
+            raise _reprepare() from exc
+        raise
+    for placement in placements:
+        _check_placement(placement)
+    if len({placement.placement_id for placement in placements}) != len(placements):
+        raise documents.DocumentError("duplicate_placement", "placement_id must be unique")
+    return placements
+
+
+def _unique(values: list[str], name: str) -> set[str]:
     if len(values) != len(set(values)):
         raise documents.DocumentError("duplicate_entry", f"{name} repeats an entry")
+    return set(values)
 
 
-def _required(value: Mapping[str, Any], fields: set[str], name: str) -> None:
-    missing = fields - set(value)
-    if missing:
-        raise documents.DocumentError("missing_field", f"{name} lacks {sorted(missing)[0]}")
-
-
-def _exact_ref(value: object, name: str) -> dict[str, Any]:
-    row = _document(value, name)
-    _required(row, {"digest", "length"}, name)
-    digest = row["digest"]
-    length = row["length"]
-    if (
-        not isinstance(digest, str)
-        or HASH_ENTRY.fullmatch(digest) is None
-        or not isinstance(length, int)
-        or isinstance(length, bool)
-        or length <= 0
-    ):
-        raise documents.DocumentError("invalid_ref", f"{name} is not an exact positive Ref")
-    return row
-
-
-def _identifier(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
+def _identifier(value: str, name: str) -> str:
+    if not value or value.strip() != value:
         raise documents.DocumentError("invalid_identifier", f"{name} is empty or padded")
     if len(value) > 256 or any(not 0x20 <= ord(char) <= 0x7E for char in value):
         raise documents.DocumentError("invalid_identifier", f"{name} is not bounded ASCII")
     return value
 
 
-def _strings(value: object, name: str) -> list[str]:
-    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-        raise documents.DocumentError("wrong_type", f"{name} is a list of strings")
-    return value
-
-
-def _wheel_fact(value: object, name: str) -> dict[str, Any]:
-    row = _document(value, name)
-    _required(row, {"ref", "distribution", "version", "filename"}, name)
-    _exact_ref(row["ref"], f"{name}.ref")
-    distribution = _identifier(row["distribution"], f"{name}.distribution")
-    if distribution != distribution.lower() or any(
-        not part or not part.isalnum() for part in distribution.split("-")
-    ):
-        raise documents.DocumentError("wheel_fact_invalid", f"{name}.distribution")
-    _identifier(row["version"], f"{name}.version")
-    _identifier(row["filename"], f"{name}.filename")
-    _strings(row.get("import_roots", []), f"{name}.import_roots")
-    _strings(row.get("tags", []), f"{name}.tags")
-    return row
-
-
-def _package_selection(value: object) -> dict[str, Any]:
-    row = _document(value, "PackageSelection")
-    _required(row, {"package", "release"}, "PackageSelection")
-    package = _identifier(row["package"], "PackageSelection.package")
-    _identifier(row["release"], "PackageSelection.release")
-    if package.count("/") != 1 or not all(package.split("/")):
-        raise documents.DocumentError("package_invalid", "package identity is invalid")
-    return row
-
-
-def _development_package(value: object) -> dict[str, Any]:
-    row = _document(value, "DevelopmentPackage")
-    _required(row, {"package", "release", "installation_id"}, "DevelopmentPackage")
-    _identifier(row["package"], "DevelopmentPackage.package")
-    _identifier(row["release"], "DevelopmentPackage.release")
-    _identifier(row["installation_id"], "DevelopmentPackage.installation_id")
-    return row
-
-
-def _placement_profile(entry: dict[str, Any]) -> None:
-    if "installation_id" not in entry or isinstance(entry.get("package_interface"), dict):
-        # The shape an older Runtime prepared (interface by Ref, no installation). Nothing
-        # is wrong with the request: its owner prepares the set again on this worker.
-        raise documents.DocumentError(
-            REPREPARE,
-            "this placement set was prepared by an older Runtime; prepare the package set "
-            "again on this worker",
-        )
-    _required(
-        entry,
-        {"placement_id", "installation_id", "package_interface", "bindings_digest", "entrypoints"},
-        "Placement",
-    )
-    _identifier(entry["placement_id"], "Placement.placement_id")
-    _identifier(entry["installation_id"], "Placement.installation_id")
-    try:
-        interface = base64.b64decode(entry["package_interface"], validate=True)
-        if not 0 < len(interface) <= canonical.DOC_MAX_BYTES:
-            raise ValueError("interface bound")
-    except (ValueError, TypeError) as exc:
-        raise documents.DocumentError(
-            "package_interface_invalid", "invalid interface bytes"
-        ) from exc
-    if (
-        not isinstance(entry["bindings_digest"], str)
-        or HASH_ENTRY.fullmatch(entry["bindings_digest"]) is None
-    ):
+def _check_placement(placement: pb.Placement) -> None:
+    """What the schema cannot say: bounded identifiers, exact refs, one package mode, and
+    every model a slot, component or adapter names declared once in `models`."""
+    if not placement.installation_id:
+        raise _reprepare()
+    _identifier(placement.placement_id, "Placement.placement_id")
+    _identifier(placement.installation_id, "Placement.installation_id")
+    if not 0 < len(placement.package_interface) <= canonical.DOC_MAX_BYTES:
+        raise documents.DocumentError("package_interface_invalid", "invalid interface bytes")
+    if not placement.bindings_digest:
         raise documents.DocumentError("malformed_digest", "Placement.bindings_digest")
-    published, development = "package" in entry, "development" in entry
-    if published == development:
-        raise documents.DocumentError("package_mode_invalid", "select exactly one package mode")
-    if published:
-        _package_selection(entry["package"])
-    else:
-        _development_package(entry["development"])
-
-    models = entry.get("models", [])
-    if not isinstance(models, list):
-        raise documents.DocumentError("wrong_type", "Placement.models")
-    model_ids: list[str] = []
-    for index, value in enumerate(models):
-        model = _document(value, "Model")
-        _required(model, {"id", "repo", "manifest"}, "Model")
-        model_ids.append(_identifier(model["id"], f"models[{index}].id"))
-        _identifier(model["repo"], f"models[{index}].repo")
-        if "version" in model:
-            _identifier(model["version"], f"models[{index}].version")
-        if "lane" in model:
-            _identifier(model["lane"], f"models[{index}].lane")
-        _exact_ref(model["manifest"], f"models[{index}].manifest")
-    _unique(model_ids, "Placement.models")
-    known_models = set(model_ids)
-
-    entrypoints = entry["entrypoints"]
-    if not isinstance(entrypoints, list):
-        raise documents.DocumentError("wrong_type", "Placement.entrypoints")
-    entrypoint_names: list[str] = []
-    for entrypoint_index, value in enumerate(entrypoints):
-        entrypoint = _document(value, "Entrypoint")
-        _required(entrypoint, {"name", "entrypoint_binding_digest"}, "Entrypoint")
-        entrypoint_names.append(
-            _identifier(entrypoint["name"], f"entrypoints[{entrypoint_index}].name")
-        )
-        slots = entrypoint.get("slots", [])
-        if not isinstance(slots, list):
-            raise documents.DocumentError("wrong_type", "Entrypoint.slots")
-        slot_names: list[str] = []
-        for slot_index, value in enumerate(slots):
-            slot = _document(value, "Slot")
-            _required(slot, {"slot", "reference_model_id"}, "Slot")
-            # Retired `stamps` and `model_construction_contract` from older writers are
-            # ignored like any other unknown key: fit is the header and the census.
-            slot_names.append(_identifier(slot["slot"], f"slots[{slot_index}].slot"))
-            if slot["reference_model_id"] not in known_models:
-                raise documents.DocumentError("unknown_model", "Slot.reference_model_id")
-            components = slot.get("components", [])
-            if not isinstance(components, list):
-                raise documents.DocumentError("wrong_type", "Slot.components")
-            component_names: list[str] = []
-            for value in components:
-                component = _document(value, "Component")
-                _required(component, {"component", "model_id"}, "Component")
-                component_names.append(_identifier(component["component"], "Component.component"))
-                if component["model_id"] not in known_models:
-                    raise documents.DocumentError("unknown_model", "Component.model_id")
-            _unique(component_names, "Slot.components")
-            adapters = slot.get("adapters", [])
-            if not isinstance(adapters, list):
-                raise documents.DocumentError("wrong_type", "Slot.adapters")
-            for adapter in adapters:
-                row = _document(adapter, "ModelAdapter")
-                _required(
-                    row, {"component", "model_id", "source_component", "scale"}, "ModelAdapter"
-                )
-                if row["model_id"] not in known_models:
-                    raise documents.DocumentError("unknown_model", "ModelAdapter.model_id")
-                _identifier(row["component"], "ModelAdapter.component")
-                _identifier(row["source_component"], "ModelAdapter.source_component")
-                if not isinstance(row["scale"], str) or not row["scale"].strip():
-                    raise documents.DocumentError("invalid_scale", "ModelAdapter.scale")
-        _unique(slot_names, "Entrypoint.slots")
-        digest = entrypoint["entrypoint_binding_digest"]
-        if not isinstance(digest, str) or HASH_ENTRY.fullmatch(digest) is None:
+    match placement.WhichOneof("package_mode"):
+        case "package":
+            package = _identifier(placement.package.package, "PackageSelection.package")
+            _identifier(placement.package.release, "PackageSelection.release")
+            if package.count("/") != 1 or not all(package.split("/")):
+                raise documents.DocumentError("package_invalid", "package identity is invalid")
+        case "development":
+            development = placement.development
+            _identifier(development.package, "DevelopmentPackage.package")
+            _identifier(development.release, "DevelopmentPackage.release")
+            _identifier(development.installation_id, "DevelopmentPackage.installation_id")
+        case _:
+            raise documents.DocumentError("package_mode_invalid", "select exactly one package mode")
+    known = _unique([_identifier(model.id, "Model.id") for model in placement.models], "models")
+    for model in placement.models:
+        _identifier(model.repo, f"{model.id}.repo")
+        if model.version:
+            _identifier(model.version, f"{model.id}.version")
+        if model.lane:
+            _identifier(model.lane, f"{model.id}.lane")
+        if not model.manifest.digest or model.manifest.length <= 0:
+            raise documents.DocumentError("invalid_ref", f"{model.id}.manifest is not exact")
+    names = [
+        _identifier(entrypoint.name, "Entrypoint.name") for entrypoint in placement.entrypoints
+    ]
+    _unique(names, "Placement.entrypoints")
+    for entrypoint in placement.entrypoints:
+        if not entrypoint.entrypoint_binding_digest:
             raise documents.DocumentError(
                 "malformed_digest", "Entrypoint.entrypoint_binding_digest"
             )
-    _unique(entrypoint_names, "Placement.entrypoints")
+        _unique([_slot(slot, known) for slot in entrypoint.slots], "Entrypoint.slots")
+
+
+def _slot(slot: pb.Slot, known: set[str]) -> str:
+    # Retired `stamps` and `model_construction_contract` are read and never consulted:
+    # fit is the header and the census.
+    named = [slot.reference_model_id, *(row.model_id for row in slot.components)]
+    if any(model_id not in known for model_id in named):
+        raise documents.DocumentError("unknown_model", f"Slot {slot.slot!r} names a model")
+    _unique(
+        [_identifier(row.component, "Component.component") for row in slot.components],
+        "Slot.components",
+    )
+    for adapter in slot.adapters:
+        if adapter.model_id not in known:
+            raise documents.DocumentError("unknown_model", "ModelAdapter.model_id")
+        _identifier(adapter.component, "ModelAdapter.component")
+        _identifier(adapter.source_component, "ModelAdapter.source_component")
+        if not adapter.scale.strip():
+            raise documents.DocumentError("invalid_scale", "ModelAdapter.scale")
+    return _identifier(slot.slot, "Slot.slot")
 
 
 def _rank_degree(lane: DeviceLane, bindings: Iterable[DeclaredBinding]) -> int:
@@ -1087,7 +1016,7 @@ class Worker:
         #: Each gets its own immutable uv environment and executor, sealed to the lane the
         #: worker assigned it; an attempt takes its own placement's lane seat and no other.
         self.hosted: dict[str, HostedPlacement] = {}
-        self.pending_hosted: list[dict[str, Any]] = []
+        self.pending_hosted: list[pb.Placement] = []
         #: Job mode has no placement, so it carries its own dispatchability edge (cr-009).
         self.job_ready = False
         #: An activation failure LATCHES for the accepted revision (§8): non-empty means the
@@ -1684,7 +1613,7 @@ class Worker:
         from cozy_runtime.internal.worker import package_prepare
 
         prepared = read_placement_set(result.placement_set)
-        if len(prepared) != 1 or not prepared[0].get("development"):
+        if len(prepared) != 1 or not prepared[0].HasField("development"):
             raise package_prepare.PreparationRefusal(
                 "local_package_result_invalid",
                 "local preparation did not return one development Placement",
@@ -1747,7 +1676,7 @@ class Worker:
                 if request.native_models:
                     self.authorize_workspace(request.claim)
             joined = read_placement_set(result.placement_set)
-            if len(joined) != 1 or joined[0].get("installation_id") != revision:
+            if len(joined) != 1 or joined[0].installation_id != revision:
                 raise package_prepare.PreparationRefusal(
                     "private_placement_result_invalid", revision
                 )
@@ -2031,7 +1960,7 @@ class Worker:
             dependency_cache=self.config.dependency_cache,
         )
         entries = read_placement_set(result.placement_set)
-        if len(entries) != 1 or not entries[0].get("package") or len(published) != 1:
+        if len(entries) != 1 or not entries[0].HasField("package") or len(published) != 1:
             raise package_prepare.PreparationRefusal(
                 "published_package_result_invalid", "published preparation needs one exact revision"
             )
@@ -2485,7 +2414,8 @@ class Worker:
                     for placement in placements
                     if placement is not None
                     and placement.placement_id.startswith(machine_lanes.REPLICA)
-                    and (placement.installation_id, placement.document.get("bindings_digest"))
+                    and placement.bindings_digest
+                    and (placement.installation_id, documents.spell(placement.bindings_digest))
                     == template
                     for ordinal in placement.device_pin or ()
                 }
@@ -2817,7 +2747,7 @@ class Worker:
         (row,) = read_placement_set(desired.placement_set)
         pins = desired.placement_set.device_pins
         pin = tuple(pins[0].device_ordinals) if pins else None
-        placement_id = str(row["placement_id"])
+        placement_id = row.placement_id
         while True:
             with self.control_lock:
                 hosted = self.hosted.get(placement_id)
@@ -2879,7 +2809,7 @@ class Worker:
 
     def _activate_replica(
         self,
-        row: dict[str, Any],
+        row: pb.Placement,
         desired: pb.DesiredWorkerState,
         preparation: dict[str, Any],
         pin: tuple[int, ...] | None,
@@ -3970,21 +3900,11 @@ class Worker:
 
     # ------------------------------------------------------------- the desired state
 
-    def _placement_from_entry(
-        self, entry: Mapping[str, Any], placement_set_digest: bytes
-    ) -> Placement:
+    def _placement_from_entry(self, entry: pb.Placement, placement_set_digest: bytes) -> Placement:
         return Placement(
-            placement_id=str(entry.get("placement_id", "")),
-            placement_set_digest=placement_set_digest,
-            package=dict(entry.get("package", {})),
-            development=dict(entry.get("development", {})),
-            installation_id=str(entry.get("installation_id", "")),
-            package_interface=base64.b64decode(entry.get("package_interface", ""), validate=True),
-            bindings_digest=_digest_field(entry.get("bindings_digest")),
-            models=tuple(dict(row) for row in entry.get("models", [])),
-            entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
-            document=dict(entry),
-            device_pin=self.accepted.device_pins.get(str(entry.get("placement_id", ""))),
+            entry,
+            placement_set_digest,
+            device_pin=self.accepted.device_pins.get(entry.placement_id),
         )
 
     def _apply_desired_state(self, desired: pb.DesiredWorkerState) -> None:
@@ -4048,7 +3968,7 @@ class Worker:
                 )
             )
             return
-        placements: list[dict[str, Any]] = []
+        placements: list[pb.Placement] = []
         if mode == "placement_set":
             try:
                 placements = read_placement_set(desired.placement_set)
@@ -4207,15 +4127,15 @@ class Worker:
                 (
                     index
                     for index, row in enumerate(placements)
-                    if str(row.get("placement_id", "")) == previous.placement_id
+                    if row.placement_id == previous.placement_id
                 ),
                 0,
             )
         entry = placements[primary_index]
         self.pending_hosted = [
-            dict(row) for index, row in enumerate(placements) if index != primary_index
+            row for index, row in enumerate(placements) if index != primary_index
         ]
-        placement_id = str(entry.get("placement_id", ""))
+        placement_id = entry.placement_id
         candidate = self._placement_from_entry(entry, desired_set.placement_set_digest)
         if (
             previous is not None
@@ -4334,7 +4254,7 @@ class Worker:
             self._reconcile_hosted(revision)
             return
         desired_hosted = {
-            str(entry.get("placement_id", "")): self._placement_from_entry(
+            entry.placement_id: self._placement_from_entry(
                 entry, self.accepted.accepted_placement_set_digest
             )
             for entry in self.pending_hosted
@@ -4442,7 +4362,7 @@ class Worker:
                 f"{candidate.placement_id or '(unnamed)'} in set "
                 f"{documents.spell(candidate.placement_set_digest)[:23]}… "
                 f"with {len(self.bindings)} of "
-                f"{len(candidate.entrypoints)} binding(s) resolved, "
+                f"{len(candidate.document.entrypoints)} binding(s) resolved, "
                 f"posture={pb.Posture.Name(self.accepted.posture)}",
             )
         self.activate_executor()
@@ -4473,8 +4393,8 @@ class Worker:
 
         return bool(
             outgoing.placement_id == candidate.placement_id
-            and outgoing.package == candidate.package
-            and outgoing.development == candidate.development
+            and outgoing.document.package == candidate.document.package
+            and outgoing.document.development == candidate.document.development
             and outgoing.installation_id == candidate.installation_id
             and outgoing.device_pin == candidate.device_pin
             and outgoing.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
@@ -4701,7 +4621,7 @@ class Worker:
         if revision != self.accepted.accepted_desired_state_revision:
             return
         desired = {
-            str(entry.get("placement_id", "")): self._placement_from_entry(
+            entry.placement_id: self._placement_from_entry(
                 entry, self.accepted.accepted_placement_set_digest
             )
             for entry in self.pending_hosted
@@ -4860,14 +4780,12 @@ class Worker:
         Returns the installed generation, or None having already typed the fault and left the
         outgoing placement serving.
         """
-        from .machine_capture import installation_identity
-
         prepared_environment = next(
             (
                 prepared.installed
                 for prepared in self.prepared_installations.values()
                 if prepared.placement_id == placement.placement_id
-                and prepared.installation_id == installation_identity(placement.document)
+                and prepared.installation_id == placement.installation_id
             ),
             None,
         )
@@ -4910,8 +4828,8 @@ class Worker:
                 installed_environment = package_installation.open_existing_environment(
                     self.options.environment_python,
                     placement.installation_id,
-                    package=(placement.package or placement.development).get("package", ""),
-                    release=(placement.package or placement.development).get("release", ""),
+                    package=acquire.package_selection(placement.document).package,
+                    release=acquire.package_selection(placement.document).release,
                 )
             install_root = self.options.install_root or (
                 installed_environment.generation if installed_environment is not None else None
@@ -4930,7 +4848,7 @@ class Worker:
                 on_observation=lambda value: self._observe_acquisition(placement, value),
             )
 
-            acquired = acquirer.acquire(placement)
+            acquired = acquirer.acquire(placement.document)
             self.note(
                 "materialization",
                 f"revision {revision}: {acquired.manifests} manifest(s) held; "
@@ -5719,6 +5637,7 @@ class Worker:
         facts = dict(reply.get("facts") or {})
         try:
             resolved = PreparedModel.from_reply(reply)
+            delivery = msgspec.convert(reply.get("delivery"), _Delivery | None)
         except (KeyError, TypeError, ValueError) as exc:
             # An executor from another Runtime version answered without a fact this worker
             # needs: refuse this attempt, never the lane or the worker.
@@ -5763,8 +5682,7 @@ class Worker:
             + (", reused" if reply.get("reused") else "")
             + ")",
         )
-        delivery = reply.get("delivery") or {}
-        if delivery:
+        if delivery is not None:
             self.note("delivery", _delivery_observation(delivery))
 
     def _load_refused(
@@ -6258,9 +6176,7 @@ class Worker:
             declared = bindings.get(attempt.spec["serving"]["entrypoint_binding_digest"])
             if declared is not None and declared.internal:
                 placement = self._placement_by_id(offered.placement_id)
-                revision = (
-                    machine_capture.installation_identity(placement.document) if placement else ""
-                )
+                revision = placement.installation_id if placement else ""
                 internal = revision, declared.entrypoint
         elif "job" in attempt.spec:
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
@@ -7085,7 +7001,8 @@ class Worker:
         dispatchable = sorted(executor.ready_bindings) if executor is not None else []
         loaded = sorted(executor.loaded_bindings()) if executor is not None else []
         selected = {
-            str(entrypoint["entrypoint_binding_digest"]) for entrypoint in placement.entrypoints
+            documents.spell(entrypoint.entrypoint_binding_digest)
+            for entrypoint in placement.document.entrypoints
         }
         fault_subjects = selected | {placement.placement_id}
         # DISJOINT by construction (the proto says so): a binding is either servable now or

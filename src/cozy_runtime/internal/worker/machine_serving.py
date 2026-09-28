@@ -661,7 +661,8 @@ class Serving:
             expected.update({row.parameter: msgspec.to_builtins(row.manifest) for row in selected})
             with worker.control_lock:
                 candidates = [
-                    dict(value.document) for value in worker.prepared_installations.values()
+                    documents.body(value.document)
+                    for value in worker.prepared_installations.values()
                 ]
             matched = None
             for candidate in candidates:
@@ -726,7 +727,7 @@ class Serving:
                                 }
                                 for row in selected
                             ],
-                            prepared=prepared,
+                            prepared=documents.from_body(prepared, pb.Placement),
                             installed=installed,
                             artifact_cache=Path(worker.options.artifact_cache or ""),
                             tensorfs_root=workspace.store_root,

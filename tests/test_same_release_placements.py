@@ -427,12 +427,9 @@ def test_a_serving_root_waits_behind_a_job_of_its_own_release(machine: Machine) 
     workflow = machine.prepare("touch.models.model", "retouch.models.model")
     (served,) = read_placement_set(serving)
     (every,) = read_placement_set(workflow)
-    installation = served["installation_id"]
-    assert (every["placement_id"], every["installation_id"]) == (
-        served["placement_id"],
-        installation,
-    )
-    assert every["bindings_digest"] != served["bindings_digest"]
+    installation = served.installation_id
+    assert (every.placement_id, every.installation_id) == (served.placement_id, installation)
+    assert every.bindings_digest != served.bindings_digest
 
     interface = package_interface.read_bytes(machine.interface)
     descriptor = package_interface.job_descriptor_id(interface, "workflow")
@@ -448,21 +445,21 @@ def test_a_serving_root_waits_behind_a_job_of_its_own_release(machine: Machine) 
 
     # The serving root reuses its own earlier preparation, as a pod host answers an
     # identical preparation from its retained result without reaching Runtime.
-    touch = next(row for row in served["entrypoints"] if row["name"] == "touch")
+    touch = next(row for row in served.entrypoints if row.name == "touch")
     machine.submit(
         "B",
         {
             "serving": pb.ServingInvocationSpec(
-                entrypoint_binding_digest=touch["entrypoint_binding_digest"],
-                attempt_binding_id=touch["entrypoint_binding_digest"],
-                bindings_digest=served["bindings_digest"],
+                entrypoint_binding_digest=documents.spell(touch.entrypoint_binding_digest),
+                attempt_binding_id=documents.spell(touch.entrypoint_binding_digest),
+                bindings_digest=documents.spell(served.bindings_digest),
             )
         },
         pb.DesiredWorkerState(placement_set=serving),
-        placement=served["placement_id"],
+        placement=served.placement_id,
     )
     held = machine.executions.preparation(OWNER, "B")["installations"][installation]
-    assert held["placement"]["bindings_digest"] == served["bindings_digest"]
+    assert held["placement"]["bindings_digest"] == documents.spell(served.bindings_digest)
     machine.tick()
     waits = [body for _, kind, body in machine.journal("B") if kind == "gpu.wait"]
     assert waits == [{"key": "B#1", "width": 1, "blocked_by": ["A"]}]

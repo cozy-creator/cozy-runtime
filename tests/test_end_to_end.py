@@ -16,7 +16,6 @@ UNAVAILABLE, because that is the condition under test, and it asserts the proces
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import email.parser
 import hashlib
@@ -51,7 +50,7 @@ from cozy_runtime.internal.worker.package_prepare import (
     prepare_package,
     prepare_unpublished_placement,
 )
-from cozy_runtime.internal.worker.session import Placement, read_placement_set
+from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -267,21 +266,6 @@ def _runtime_closure(wheel_set: Path, *extra: str, index: str = "") -> bytes:
     return locked.read_bytes()
 
 
-def _placement(entry: dict[str, Any], placement_set_digest: bytes) -> Placement:
-    return Placement(
-        placement_id=entry["placement_id"],
-        placement_set_digest=placement_set_digest,
-        package={},
-        development=entry["development"],
-        installation_id=entry["installation_id"],
-        package_interface=base64.b64decode(entry["package_interface"], validate=True),
-        bindings_digest=documents.raw(entry["bindings_digest"]),
-        models=tuple(entry["models"]),
-        entrypoints=tuple(entry["entrypoints"]),
-        document=entry,
-    )
-
-
 @pytest.fixture(scope="session")
 def installed_cli() -> Iterator[str]:
     """The PUBLIC CLI, built into a wheel and installed into a venv that has nothing else.
@@ -411,8 +395,8 @@ def test_editable_installations_materialize_from_supplied_wheels() -> None:
         prepared, first = prepare(first_id)
         assert not first.reused
         (placement,) = read_placement_set(prepared.placement_set)
-        assert placement["installation_id"] == first_id
-        assert placement["development"]["installation_id"] == first_id
+        assert placement.installation_id == first_id
+        assert placement.development.installation_id == first_id
         assert prepared.installed_package.installation_id == first_id
         _run(str(first.python), "-I", "-c", "import marco_polo_package", cwd="/")
         assert value(first) == "0.0.5"
@@ -527,9 +511,8 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
         materialized=installed.append,
     )
     (entry,) = read_placement_set(prepared.placement_set)
-    assert entry["entrypoints"] == entry["models"] == []
-    assert entry["installation_id"] == installed[0].installation_id == installation_id
-    placement = _placement(entry, prepared.placement_set.placement_set_digest)
+    assert not entry.entrypoints and not entry.models
+    assert entry.installation_id == installed[0].installation_id == installation_id
     acquirer = Acquirer(
         cache_root=artifacts,
         install_root=environment,
@@ -539,7 +522,7 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
         base=base,
         installed_environment=installed[0],
     )
-    acquired = acquirer.acquire(placement)
+    acquired = acquirer.acquire(entry)
     assert acquired.bindings == {}
     assert acquired.manifests == 0 and acquired.documents == 1
     assert acquired.installed == installed[0]
@@ -618,10 +601,9 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
             with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
                 prepare_selection(undeclared)
         (joined,) = read_placement_set(modeled.placement_set)
-        assert [row["name"] for row in joined["entrypoints"]] == ["generate"]
-        assert len(joined["models"]) == (2 if model_source == "mixed" else 1)
-        assert {row["manifest"]["digest"] for row in joined["models"]} == {manifest}
-        bound = _placement(joined, modeled.placement_set.placement_set_digest)
+        assert [row.name for row in joined.entrypoints] == ["generate"]
+        assert len(joined.models) == (2 if model_source == "mixed" else 1)
+        assert {documents.spell(row.manifest.digest) for row in joined.models} == {manifest}
         selected = Acquirer(
             cache_root=artifacts,
             install_root=environment,
@@ -630,7 +612,7 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
             python=python,
             base=base,
             installed_environment=installed[0],
-        ).acquire(bound)
+        ).acquire(joined)
         assert {binding.entrypoint for binding in selected.bindings.values()} == {"generate"}
         assert selected.manifests == 1
         (tmp_path / "prepared-model.json").write_bytes(

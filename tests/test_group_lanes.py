@@ -275,16 +275,8 @@ def test_a_call_whose_need_does_not_fit_is_staged_with_its_measured_headroom(
 
 def _placement(placement_id: str, lane_id: str = "") -> Placement:
     return Placement(
-        placement_id=placement_id,
-        placement_set_digest=b"",
-        package={},
-        development={},
-        installation_id="",
-        package_interface=b"",
-        bindings_digest=b"",
-        models=(),
-        entrypoints=(),
-        document={},
+        pb.Placement(placement_id=placement_id),
+        b"",
         serving=pb.ServingState.SERVING_STATE_DISPATCHABLE,
         lane_id=lane_id,
     )

@@ -404,7 +404,7 @@ class Card:
         request = f"{self.tag}-{name}"
         state = self.prepare(f"{entrypoint}.models.model", model)
         (placement,) = read_placement_set(state)
-        row = next(e for e in placement["entrypoints"] if e["name"] == entrypoint)
+        row = next(e for e in placement.entrypoints if e.name == entrypoint)
         assert self.installed is not None
         installation = self.installed.installation_id
         capture, capture_digest = documents.identity(
@@ -428,9 +428,9 @@ class Card:
                 ],
                 deadline_unix_ms=int(time.time() * 1000) + 600_000,
                 serving=pb.ServingInvocationSpec(
-                    entrypoint_binding_digest=row["entrypoint_binding_digest"],
-                    attempt_binding_id=row["entrypoint_binding_digest"],
-                    bindings_digest=placement["bindings_digest"],
+                    entrypoint_binding_digest=documents.spell(row.entrypoint_binding_digest),
+                    attempt_binding_id=documents.spell(row.entrypoint_binding_digest),
+                    bindings_digest=documents.spell(placement.bindings_digest),
                 ),
             )
         )
@@ -446,7 +446,7 @@ class Card:
                 offer=pb.AttemptOffer(
                     request_id=request,
                     attempt_ordinal=1,
-                    placement_id=placement["placement_id"],
+                    placement_id=placement.placement_id,
                     invocation_spec_canonical_bytes=raw,
                     invocation_spec_digest=spec_digest,
                     grant=pb.DeliveryGrant(

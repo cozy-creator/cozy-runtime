@@ -263,7 +263,9 @@ class Warm(Machine):
                 }
             ],
         }
-        prepared = self.worker._placement_from_entry(placement, b"")
+        prepared = self.worker._placement_from_entry(
+            documents.from_body(placement, pb.Placement), b""
+        )
         self.worker.prepared_installations[prepared.prepared_key] = prepared
         models = [{"path": "marco.models.model"}]
         if degrees:
@@ -420,7 +422,11 @@ def test_a_ready_request_takes_the_started_process_and_skips_the_probes_it_does_
 
     # The replica's own prepare reuses the process: no second spawn, no second start.
     placement = machine.worker._placement_from_entry(
-        {**target.prepared_installation["placement"], "placement_id": "machine-adopter"}, b""
+        documents.from_body(
+            {**target.prepared_installation["placement"], "placement_id": "machine-adopter"},
+            pb.Placement,
+        ),
+        b"",
     )
     placement.device_pin = (0,)
     binding = DeclaredBinding(
@@ -618,7 +624,11 @@ def test_a_dead_replica_starts_its_successor_beside_the_next_download(
     machine.submit_root("A")
     target = machine.target({"digest": "sha256:" + "0" * 64, "length": 1})
     placement = machine.worker._placement_from_entry(
-        {**target.prepared_installation["placement"], "placement_id": "machine-dead"}, b""
+        documents.from_body(
+            {**target.prepared_installation["placement"], "placement_id": "machine-dead"},
+            pb.Placement,
+        ),
+        b"",
     )
     placement.device_pin = (0,)
     supervision = machine.worker._new_placement_supervision("machine-dead")

@@ -67,16 +67,8 @@ def test_cold_model_queue_validates_without_loading_or_losing_faults(tmp_path: P
         InMemoryControlHost(),
     )
     worker.placement = Placement(
-        placement_id="model",
-        placement_set_digest=b"p" * 32,
-        package={},
-        development={},
-        installation_id=INSTALLATION,
-        package_interface=b"",
-        bindings_digest=b"s" * 32,
-        models=(),
-        entrypoints=(),
-        document={},
+        pb.Placement(placement_id="model", installation_id=INSTALLATION, bindings_digest=b"s" * 32),
+        b"p" * 32,
     )
     worker.bindings[BINDING] = DeclaredBinding(
         entrypoint_binding_digest=BINDING,

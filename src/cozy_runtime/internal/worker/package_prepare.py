@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import copy
 import hashlib
 import importlib.metadata
 import os
@@ -598,7 +597,7 @@ def prepare_local_package(
 def prepare_unpublished_placement(
     request: pb.PreparePrivatePlacementRequest,
     *,
-    prepared: Mapping[str, object],
+    prepared: pb.Placement,
     installed: package_installation.InstalledEnvironment | None,
     artifact_cache: Path,
     tensorfs_root: Path | None,
@@ -615,7 +614,7 @@ def prepare_unpublished_placement(
     if (
         _OPERATION_ID.fullmatch(request.operation_id) is None
         or request.installation_id != installed.installation_id
-        or prepared.get("installation_id") != installed.installation_id
+        or prepared.installation_id != installed.installation_id
     ):
         raise PreparationRefusal("private_placement_identity_invalid", request.operation_id)
     models: Sequence[pb.DownloadModelRef] = ()
@@ -645,21 +644,9 @@ def prepare_unpublished_placement(
     )
 
 
-class _Package(msgspec.Struct, frozen=True):
-    package: str = ""
-
-
-class _PlacementHead(msgspec.Struct, frozen=True):
-    """The facts a Model binding reads of the placement document it extends."""
-
-    package_interface: bytes = b""
-    package: _Package | None = None
-    development: _Package | None = None
-
-
 def prepare_model_placement(
     *,
-    prepared: Mapping[str, object],
+    prepared: pb.Placement,
     installed: package_installation.InstalledEnvironment,
     native_models: Sequence[pb.NativeModelBinding],
     artifact_cache: Path,
@@ -668,11 +655,7 @@ def prepare_model_placement(
     models: Sequence[Mapping[str, object] | pb.DownloadModelRef] = (),
 ) -> pb.PreparePackageSetResult:
     """Derive new Model bindings from either origin's exact immutable preparation."""
-    try:
-        head = msgspec.convert(prepared, _PlacementHead)
-    except msgspec.ValidationError as exc:
-        raise PreparationRefusal("prepared_placement_interface_invalid", str(exc)) from exc
-    package = (head.package or head.development or _Package()).package
+    package = acquire.package_selection(prepared).package
     slots = [row.slot for row in native_models]
     if slots != sorted(set(slots)) or not all(slots):
         raise PreparationRefusal(
@@ -697,7 +680,7 @@ def prepare_model_placement(
         )
     try:
         interface_body = package_interface.parse(
-            head.package_interface, "prepared package interface"
+            prepared.package_interface, "prepared package interface"
         )
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("prepared_placement_interface_invalid", str(exc)) from exc
@@ -709,23 +692,24 @@ def prepare_model_placement(
         verified=verified,
         census=_census(installed, interface_body.application, artifact_cache),
     )
-    entrypoint_bodies = [documents.body(row) for row in entrypoints]
-    model_bodies = [documents.body(row) for row in selected_models]
-    joined = copy.deepcopy(dict(prepared))
-    joined["models"] = model_bodies
-    joined["entrypoints"] = entrypoint_bodies
-    joined["bindings_digest"] = documents.spell(
-        documents.digest_of(
-            canonical.write({"entrypoints": entrypoint_bodies, "models": model_bodies})
+    joined = pb.Placement()
+    joined.CopyFrom(prepared)
+    joined.ClearField("models")
+    joined.models.extend(selected_models)
+    joined.ClearField("entrypoints")
+    joined.entrypoints.extend(entrypoints)
+    joined.bindings_digest = documents.digest_of(
+        canonical.write(
+            {
+                "entrypoints": [documents.body(row) for row in entrypoints],
+                "models": [documents.body(row) for row in selected_models],
+            }
         )
     )
-    placement_bytes = canonical.write(
-        {"format": "cozy.worker.v1.PlacementSet/1", "placements": [joined]}
-    )
+    placement_bytes, digest = documents.identity(pb.PlacementSet(placements=[joined]))
     return pb.PreparePackageSetResult(
         placement_set=pb.DesiredPlacementSet(
-            placement_set_digest=documents.digest_of(placement_bytes),
-            placement_set_canonical_bytes=placement_bytes,
+            placement_set_digest=digest, placement_set_canonical_bytes=placement_bytes
         )
     )
 

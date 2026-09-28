@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import json
 
+import msgspec
 import torch
 
 from cozy_runtime.internal import probe
@@ -25,7 +26,7 @@ from cozy_runtime.internal.encoding import (
 from cozy_runtime.internal.fill import dtype_name
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.resolution import ConstructionFacts, Variant, resolve
-from cozy_runtime.internal.worker.session import _delivery_observation
+from cozy_runtime.internal.worker.session import _Delivery, _delivery_observation
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -87,7 +88,7 @@ def main() -> None:
                     if r.delivery_route == "encoded_gemm"
                 ),
                 "wire": wire,
-                "line": _delivery_observation(wire),
+                "line": _delivery_observation(msgspec.convert(wire, _Delivery)),
                 "confession": plan.confession,
             }
         )

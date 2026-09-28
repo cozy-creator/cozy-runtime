@@ -214,7 +214,7 @@ def test_deferred_callee_installs_on_first_selection(case: str) -> None:
 
             def installed(label: str) -> bool:
                 return any(
-                    placement.package.get("package") == f"published/prepare-{label}"
+                    placement.document.package.package == f"published/prepare-{label}"
                     for placement in worker.prepared_installations.values()
                 )
 

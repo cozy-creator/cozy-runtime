@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import pytest
 import tensorfs
@@ -26,8 +24,9 @@ from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker import package_prepare
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.plan import DeclaredBinding
-from cozy_runtime.internal.worker.session import Placement, read_placement_set
+from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def _schema() -> dict[str, Json]:
@@ -57,8 +56,8 @@ def _bindings(
     selected: tuple[str, ...] = (),
     *,
     development: bool = False,
-    models: tuple[dict[str, Json], ...] = (),
-    prepared: Placement | None = None,
+    models: tuple[pb.Model, ...] = (),
+    prepared: pb.Placement | None = None,
 ) -> tuple[Mapping[str, DeclaredBinding], int]:
     raw = canonical.write(body)
     cache = tmp_path / "cache"
@@ -73,27 +72,30 @@ def _bindings(
         python=Path("/usr/bin/python3"),
         base=base_observation.current(),
     )
-    placement = Placement(
+    placement = pb.Placement(
         placement_id="package-job-only",
-        placement_set_digest=b"\x11" * 32,
-        package={} if development else {"package": "proof/job-only", "release": "1.0.0"},
-        development={"package": "local/job-only", "release": "0.0.0", "installation_id": "local-1"}
-        if development
-        else {},
         installation_id="local-1" if development else "install-1",
         package_interface=raw,
         bindings_digest=documents.digest_of(canonical.write({"entrypoints": [], "models": []})),
         models=models,
-        entrypoints=tuple(
-            {
-                "name": name,
-                "entrypoint_binding_digest": canonical.digest({"entrypoint": name}),
-                "slots": [],
-            }
+        entrypoints=[
+            pb.Entrypoint(
+                name=name,
+                entrypoint_binding_digest=documents.digest_of(
+                    canonical.write({"entrypoint": name})
+                ),
+            )
             for name in selected
-        ),
-        document={},
+        ],
     )
+    if development:
+        placement.development.CopyFrom(
+            pb.DevelopmentPackage(
+                package="local/job-only", release="0.0.0", installation_id="local-1"
+            )
+        )
+    else:
+        placement.package.CopyFrom(pb.PackageSelection(package="proof/job-only", release="1.0.0"))
     return acquirer._bindings(prepared or placement)
 
 
@@ -157,17 +159,14 @@ def test_h3_prepared_code_only_set_has_no_executable_bindings(tmp_path: Path) ->
     ).read_bytes()
     body = json.loads(interface)
     assert body["entrypoints"] and all(row["models"] for row in body["entrypoints"])
-    placement = Placement(
+    placement = pb.Placement(
         placement_id="package-h3",
-        placement_set_digest=b"\x11" * 32,
-        package={},
-        development={"package": "local/h3", "release": "0.0.0", "installation_id": "local-h3"},
+        development=pb.DevelopmentPackage(
+            package="local/h3", release="0.0.0", installation_id="local-h3"
+        ),
         installation_id="local-h3",
         package_interface=interface,
         bindings_digest=documents.digest_of(canonical.write({"entrypoints": [], "models": []})),
-        models=(),
-        entrypoints=(),
-        document={},
     )
     bindings, count = _bindings(tmp_path, body, prepared=placement)
     assert bindings == {} and count == 1
@@ -190,7 +189,10 @@ def test_empty_selection_cannot_hide_selected_models(tmp_path: Path, development
     }
     with pytest.raises(AcquisitionRefusal) as refused:
         _bindings(
-            tmp_path, _interface([modeled]), development=development, models=({"id": "selected"},)
+            tmp_path,
+            _interface([modeled]),
+            development=development,
+            models=(pb.Model(id="selected"),),
         )
     assert refused.value.code == "binding_entrypoint_set_mismatch"
 
@@ -332,7 +334,7 @@ def modeled(tmp_path_factory: pytest.TempPathFactory) -> ModeledRelease:
     )
 
 
-def _prepare_modeled(release: ModeledRelease, root: Path, slots: tuple[str, ...]) -> dict[str, Any]:
+def _prepare_modeled(release: ModeledRelease, root: Path, slots: tuple[str, ...]) -> pb.Placement:
     result = package_prepare._prepare_published(
         package_name=MODELED,
         release="1.0.0",
@@ -362,21 +364,6 @@ def _prepare_modeled(release: ModeledRelease, root: Path, slots: tuple[str, ...]
     )
     (placement,) = read_placement_set(result.placement_set)
     return placement
-
-
-def _placement(body: dict[str, Any], digest: bytes) -> Placement:
-    return Placement(
-        placement_id=body["placement_id"],
-        placement_set_digest=digest,
-        package=body["package"],
-        development={},
-        installation_id=body["installation_id"],
-        package_interface=base64.b64decode(body["package_interface"]),
-        bindings_digest=documents.raw(body["bindings_digest"]),
-        models=tuple(body["models"]),
-        entrypoints=tuple(body["entrypoints"]),
-        document=body,
-    )
 
 
 def test_census_runs_once_per_content_and_ids_stay_stable_as_the_set_grows(
@@ -412,14 +399,12 @@ def test_census_runs_once_per_content_and_ids_stay_stable_as_the_set_grows(
 
     # Stable identity: the placement id and generate's binding digest survive the growth.
     assert (
-        first["placement_id"]
-        == grown["placement_id"]
-        == package_prepare.placement_id(MODELED, "1.0.0")
+        first.placement_id == grown.placement_id == package_prepare.placement_id(MODELED, "1.0.0")
     )
-    digest = {row["name"]: row["entrypoint_binding_digest"] for row in grown["entrypoints"]}
-    (before,) = first["entrypoints"]
-    assert digest["generate"] == before["entrypoint_binding_digest"]
-    assert {row["id"] for row in grown["models"]} == {
+    digest = {row.name: row.entrypoint_binding_digest for row in grown.entrypoints}
+    (before,) = first.entrypoints
+    assert digest["generate"] == before.entrypoint_binding_digest
+    assert {row.id for row in grown.models} == {
         package_prepare.model_id(GENERATE),
         package_prepare.model_id(TURBO),
     }
@@ -440,7 +425,7 @@ def test_a_census_miss_loads_checkpoint_assets_in_the_fenced_child_without_a_wri
     whose sandbox refuses every filesystem write, and the census still lands."""
 
     body = _prepare_modeled(modeled, tmp_path, (TOKENIZED,))
-    assert {row["id"] for row in body["models"]} == {package_prepare.model_id(TOKENIZED)}
+    assert {row.id for row in body.models} == {package_prepare.model_id(TOKENIZED)}
     (census,) = (tmp_path / "artifacts" / "census").glob("*.json")
     assert json.loads(census.read_bytes())["components"] == ["unet"]
 
@@ -465,8 +450,7 @@ def test_a_warm_prepare_and_acquire_walk_each_manifest_once(
         base=base_observation.current(),
         installed_environment=modeled.installed,
     )
-    raw = canonical.write({"format": "cozy.worker.v1.PlacementSet/1", "placements": [body]})
-    acquired = acquirer.acquire(_placement(body, documents.digest_of(raw)))
+    acquired = acquirer.acquire(body)
     after = tensorfs.stats()
     assert acquired.manifests == 1 and len(acquired.bindings) == 2
     # A census hit takes no closure lease; acquisition walks the one distinct manifest once.

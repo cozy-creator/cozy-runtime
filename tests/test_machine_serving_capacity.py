@@ -54,8 +54,8 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
             incoming = request(running(executions))
             child = calls.journal.accept("owner", incoming)
             placement = _placement("gpu")
-            placement.installation_id = "local-current"
-            placement.bindings_digest = b"b" * 32
+            placement.document.installation_id = "local-current"
+            placement.document.bindings_digest = b"b" * 32
             placement.materialization = pb.MATERIALIZATION_STATE_STAGED
             placement.serving = pb.SERVING_STATE_OFFLINE
             if hosted:
@@ -92,8 +92,8 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
                 grant=pb.DeliveryGrant(invocation_spec_digest=digest),
             )
             if fault_kind == "absent-identity":
-                placement.installation_id = ""
-                placement.bindings_digest = b""
+                placement.document.installation_id = ""
+                placement.document.bindings_digest = b""
             executions.submit(
                 "owner",
                 "child",

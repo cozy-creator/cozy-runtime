@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import threading
@@ -21,6 +22,7 @@ from cozy_runtime.internal.worker.machine_serving import Serving, arguments
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Call
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
@@ -87,7 +89,7 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
     checkpoint = {"digest": manifest, "length": length}
     placement = {
         "installation_id": "installed-model",
-        "package_interface": "exact-interface",
+        "package_interface": base64.b64encode(b"exact-interface").decode(),
         "models": [{"id": "model", "manifest": checkpoint}],
         "entrypoints": [
             {
@@ -97,6 +99,7 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
                         "slot": "model",
                         "reference_model_id": "model",
                         "components": [{"component": "unet", "model_id": "model"}],
+                        "stamps": [],
                     }
                 ],
             }
@@ -126,7 +129,9 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             control_lock=threading.RLock(),
             model_transfer_lock=threading.Lock(),
             model_transfers={},
-            prepared_installations={"model": SimpleNamespace(document=placement)},
+            prepared_installations={
+                "model": SimpleNamespace(document=documents.from_body(placement, pb.Placement))
+            },
             calls=SimpleNamespace(progress_label=lambda *_: ""),
             emit_progress=lambda _parent, _ordinal, frame: progress.append(frame),
             # This host harness has no GPUs; the process warm is `test_startup_warm`'s.
