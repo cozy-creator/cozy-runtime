@@ -46,7 +46,7 @@ def choose(models: dict[str, dict[str, Any]], *, staged: bool = False) -> Any:
         model_binding_path="generate.models.base",
         model_parameter_name="base",
         release="fixture",
-        model_weight_bytes=32,
+        logical_weight_bytes=32,
     )
     return PlanChooser(ledger).choose(
         binding,

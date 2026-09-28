@@ -39,7 +39,7 @@ def test_h3_encoder_block_floor_reaches_the_attempt_planner(degree: int) -> None
         model_binding_path="h3:H3Model",
         model_parameter_name="model",
         release="fixture@1",
-        model_weight_bytes=nominal,
+        logical_weight_bytes=nominal,
     )
     chooser = lane.row("fixture").chooser
     walk = chooser._walk(binding, "fixture")

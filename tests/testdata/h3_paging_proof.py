@@ -279,7 +279,7 @@ def main() -> None:
                 model_binding_path="fixture:model",
                 model_parameter_name="model",
                 release="fixture/1",
-                model_weight_bytes=total,
+                logical_weight_bytes=total,
             ),
             PreparedModel(delivery_rung="verbatim"),
             PreparedRequest.unresolved("forward", {}),

@@ -326,8 +326,8 @@ class PreparedModel:
     model_deliveries: tuple[tuple[str, ModelDelivery], ...] = ()
     """Named child deliveries when this prepare constructed several models."""
     weight_bytes: int = 0
-    """What the fill COMMITTED, measured. Distinct from the deployment's declared
-    `model_weight_bytes` and from the ledger's live resident map — three different facts
+    """What the fill COMMITTED, measured. Distinct from the binding's declared
+    `logical_weight_bytes` and from the ledger's live resident map — three different facts
     that were all called some form of "vram bytes"."""
     attention: Boot | None = None
     """WHAT THE RUNTIME PINNED on this generation's attention sites (cr-124): kernel per
@@ -363,7 +363,7 @@ class ModelBinding:
     snapshots: Mapping[str, str]
     objective: str = "latency"
     steps_basis: int = 20
-    model_weight_bytes: int = 0
+    logical_weight_bytes: int = 0
     custody: str = "canonical"
     sequence_parallel_degrees: tuple[int, ...] = ()
     """The interface slot's `sequence_parallel.degrees` (cr-068): what the author said the
@@ -386,7 +386,7 @@ class ModelBinding:
             "snapshots": dict(self.snapshots),
             "objective": self.objective,
             "steps_basis": self.steps_basis,
-            "model_weight_bytes": self.model_weight_bytes,
+            "logical_weight_bytes": self.logical_weight_bytes,
             "custody": self.custody,
             "adapters": [dict(row) for row in self.adapters],
         }
@@ -435,12 +435,10 @@ class DeclaredBinding:
     steps_basis: int = 20
     """The declared step count the `latency` objective prices a per-step cost against. It
     is a LABEL on the arithmetic, not a claim about any one request."""
-    model_weight_bytes: int = 0
-    """The DECLARED total weight of this model. Not what is resident, and not what an
-    attempt reserves. RESOLUTION (#569b): it is the artifact's own byte total, read from the
-    index row on the machine that holds it. A launcher constant here was the ninth field of
-    the same mistake — `vramBudget = 7 * gib` priced every model ever bound, and the fill
-    of a 92.42 GiB artifact refused `budget_overrun` against it."""
+    logical_weight_bytes: int = 0
+    """The LOGICAL weight bytes of this model's constructed components, from their checkpoint
+    headers: what their destinations hold, never the smaller stored closure of an encoded
+    checkpoint. Not what is resident, and not what an attempt reserves."""
     staged_weight_bytes: int | None = None
     """Header-derived weight requirement of the largest declared component-use scope,
     summed across independent model slots. A preflight bound, excluding derived buffers,
@@ -489,7 +487,7 @@ class DeclaredBinding:
                 snapshots=self.snapshots,
                 objective=self.objective,
                 steps_basis=self.steps_basis,
-                model_weight_bytes=self.model_weight_bytes,
+                logical_weight_bytes=self.logical_weight_bytes,
                 custody=self.custody,
             ),
         )
@@ -506,7 +504,7 @@ class DeclaredBinding:
     def group_weight_bytes(self) -> int:
         """Declared per-rank weight requirement before measured executor preparation."""
         return (
-            self.model_weight_bytes
+            self.logical_weight_bytes
             if self.staged_weight_bytes is None
             else self.staged_weight_bytes
         )
@@ -710,7 +708,7 @@ class PlanChooser:
         terms = [
             Coefficient(
                 "weights",
-                weights or declared.model_weight_bytes,
+                weights or declared.logical_weight_bytes,
                 "ledger" if resident or absent else "bound",
                 "the fill plane's committed destination bytes per component, resident and "
                 "parked alike"
@@ -807,7 +805,7 @@ class PlanChooser:
             sum(sizes.get(name, 0) for name in dict.fromkeys(names))
             for names in self.ledger.declared_scopes.values()
         ]
-        largest = max([max(sizes.values(), default=declared.model_weight_bytes), *scoped])
+        largest = max([max(sizes.values(), default=declared.logical_weight_bytes), *scoped])
         activations = terms["activations"]
         free = self.ledger.device_free
         # WHAT MAY DENY A RUNG, AND WHAT MAY ONLY DESCRIBE ONE (cr-100). A `bound` envelope
@@ -997,7 +995,7 @@ class PlanChooser:
         allocatable = self.ledger.allocatable
         resident, absent = walk.resident, walk.absent
         absent_bytes = sum(absent.values())
-        weights = walk.declared_bytes or declared.model_weight_bytes
+        weights = walk.declared_bytes or declared.logical_weight_bytes
         chosen = walk.chosen
         if not chosen:
             proven = tuple(placement for placement, _why, status in RUNGS if status == "proven")

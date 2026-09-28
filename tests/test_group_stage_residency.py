@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -132,13 +133,28 @@ def test_actual_h3_scopes_fit_each_rank_without_dividing_weights(
     tmp_path: Path, degree: int
 ) -> None:
     selected = binding(tmp_path)
-    assert selected.model_weight_bytes == 104_738_993_849
     lane = assign(selected, degree)
     assert lane.degree == degree
     assert selected.group_weight_bytes() == TEXT_ENCODER
     # Header estimates must not reject the text encoder before construction can
     # discover its smaller no-split block working set.
     assert assign(selected, degree, TEXT_ENCODER - 1).degree == degree
+
+
+def test_the_binding_declares_logical_bytes_not_the_stored_fp8_closure(tmp_path: Path) -> None:
+    """The H3 lane is fp8-rowwise: its closure stores 104.7 GB and its constructed
+    components' destinations hold 144.8 GB. The binding declares what the destinations hold."""
+    selected = binding(tmp_path)
+    store = tensorfs.Store.ensure(str(tmp_path / "store"))
+    stored = sum(int(row["length"]) for row in store.walk_cozytensors(selected.reference_snapshot))
+    header = tensorfs.parse_header((FIXTURE / "header.cbor").read_bytes())
+    logical = sum(
+        math.prod(entry["logical"]["shape"]) * tensorfs.DTYPES[entry["logical"]["logical_dtype"]]
+        for component in selected.components
+        for entry in header["components"][component].values()
+    )
+    assert stored == 104_738_993_849
+    assert selected.logical_weight_bytes == logical == 144_844_705_956
 
 
 @pytest.mark.parametrize(
@@ -158,7 +174,7 @@ def test_independent_slots_of_the_same_checkpoint_still_sum(tmp_path: Path) -> N
 
 def test_missing_component_still_refuses_native_model_fit(tmp_path: Path) -> None:
     selected = binding(tmp_path, scope="missing_component")
-    assert selected.group_weight_bytes() >= selected.model_weight_bytes > 0
+    assert selected.group_weight_bytes() >= selected.logical_weight_bytes > 0
     # The same native fit used by StreamingFillBackend before it reserves any
     # destinations still judges the deliberately incomplete construction.
     verdict = tensorfs.fit(

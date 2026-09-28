@@ -198,7 +198,7 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                 model_binding_path="fixture",
                 model_parameter_name="model",
                 release="fixture/1",
-                model_weight_bytes=12,
+                logical_weight_bytes=12,
             )
             assert row.chooser.fits(binding, "-") == ""
             plan = row.chooser.choose(

@@ -900,7 +900,7 @@ def executor_load_command(
                     package=binding.package,
                     model=model.model,
                 ),
-                budgets=Budgets(declared_weight_bytes=model.model_weight_bytes),
+                budgets=Budgets(logical_weight_bytes=model.logical_weight_bytes),
             )
         )
     command = Load(
@@ -1452,7 +1452,7 @@ class Worker:
         model_bearing = any(not binding.weightless for binding in bindings.values())
         # A placement executes one entrypoint at a time. Each binding already sums
         # its independent model slots; other entrypoints are alternative calls.
-        declared = max((binding.model_weight_bytes for binding in bindings.values()), default=0)
+        declared = max((binding.logical_weight_bytes for binding in bindings.values()), default=0)
         measured: dict[int, accel.DeviceMemory] = {}
         if model_bearing:
             kind = accel.host_backend_family()
@@ -5788,7 +5788,7 @@ class Worker:
             # A CO-TENANT PROCESS on a shared single-device lane gives the card up first
             # (cr-022); a lane with one process has no victim and moves nothing. Bindings of
             # one construction share its weights, so they are counted once.
-            declared = max(binding.model_weight_bytes for binding in group)
+            declared = max(binding.logical_weight_bytes for binding in group)
             lane.touch(slot)
             self._make_room(
                 lane,

@@ -268,7 +268,6 @@ class Acquirer:
         self._new_digests: set[str] = set()
         self._metric_digests: set[str] = set()
         self._observed_digests: dict[LegName, set[str]] = {"package": set(), "model": set()}
-        self._manifest_bytes: dict[str, int] = {}
         self._thread = local()
         self.observation = AcquisitionObservation(on_observation)
 
@@ -395,7 +394,7 @@ class Acquirer:
 
     def _models(self, placement: Placement) -> int:
         """Hold every distinct selected manifest with ONE verified walk each; returns the
-        number of manifests held. The walk's object list prices the bindings."""
+        number of manifests held."""
         if not placement.models:
             return 0
         try:
@@ -410,8 +409,7 @@ class Acquirer:
                 # TensorFS's one transport before the placement is acquired. The leg ends
                 # on TensorFS's verified walk over the manifest's runtime closure; the
                 # same walk is the residency fact `held_manifests` reports.
-                objects = self.held_manifests.hold(store, manifest_digest)
-                self._manifest_bytes[manifest_digest] = sum(length for _ref_, length in objects)
+                self.held_manifests.hold(store, manifest_digest)
             return len(manifests)
         except AcquisitionRefusal:
             raise
@@ -431,16 +429,6 @@ class Acquirer:
                 else "tensorfs_refused",
                 f"{type(exc).__name__}: {exc}",
             ) from exc
-
-    def _closure_bytes(self, digest: str) -> int:
-        """The manifest's runtime-closure bytes from the model leg's one verified walk;
-        listed (not verified) only when that leg did not run."""
-        if digest not in self._manifest_bytes:
-            store = fill.open_store(self.tensorfs_root)
-            self._manifest_bytes[digest] = sum(
-                int(row["length"]) for row in store.walk_cozytensors(digest)
-            )
-        return self._manifest_bytes[digest]
 
     def _bindings(self, placement: Placement) -> tuple[Mapping[str, DeclaredBinding], int]:
         development = placement.development
@@ -514,21 +502,16 @@ class Acquirer:
                     for row in slot.get("components", [])
                 }
                 try:
-                    model_weight_bytes = self._closure_bytes(reference_manifest)
-                    staged_weights.append(
-                        _model_group_weight_bytes(
-                            self.tensorfs_root,
-                            snapshots,
-                            declared.component_use,
-                            model_weight_bytes,
-                        )
-                    )
+                    logical = fill.logical_weight_bytes(self.tensorfs_root, snapshots)
                 except Exception as exc:
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                         "selected_model_manifest_unavailable",
                         f"{type(exc).__name__}: {exc}",
                     ) from exc
+                staged_weights.append(
+                    _staged_weight_bytes(logical, snapshots, declared.component_use)
+                )
                 degrees = (
                     ()
                     if declared.sequence_parallel is msgspec.UNSET
@@ -544,7 +527,7 @@ class Acquirer:
                         reference_snapshot=reference_manifest,
                         components=components,
                         snapshots=snapshots,
-                        model_weight_bytes=model_weight_bytes,
+                        logical_weight_bytes=sum(logical.values()),
                         sequence_parallel_degrees=degrees,
                         # The manifest is identity; lane remains the human repo pointer the
                         # desired download set carried beside it.
@@ -582,7 +565,7 @@ class Acquirer:
                 reference_snapshot=first.reference_snapshot,
                 components=first.components,
                 snapshots=first.snapshots,
-                model_weight_bytes=sum(member.model_weight_bytes for member in model_set),
+                logical_weight_bytes=sum(member.logical_weight_bytes for member in model_set),
                 staged_weight_bytes=sum(staged_weights),
                 package=(
                     f"{development['package']}@{development['release']}"
@@ -609,40 +592,18 @@ class Acquirer:
         return bindings, count
 
 
-def _model_group_weight_bytes(
-    root: Path,
+def _staged_weight_bytes(
+    logical: Mapping[str, int],
     snapshots: Mapping[str, str],
     scopes: Mapping[str, Sequence[str]],
-    artifact_bytes: int,
 ) -> int:
-    """Price complete staging declarations; otherwise retain full artifact accounting."""
+    """The largest declared component-use scope's logical bytes. The whole model when the
+    scopes do not cover every constructed component, or one of them is absent from its
+    header: only model-code-fit judges that mismatch, and it cannot justify cheap staging."""
     covered = {name for names in scopes.values() for name in names}
-    if not scopes or covered != set(snapshots):
-        return artifact_bytes
-    checkpoints = {
-        snapshot: fill.Checkpoint(root, snapshot) for snapshot in set(snapshots.values())
-    }
-    checkpoint_sizes: dict[str, dict[str, int]] = {}
-    for snapshot, checkpoint in checkpoints.items():
-        sizes: dict[str, int] = {}
-        for component in checkpoint.header["components"]:
-            rows = checkpoint.rows(component)
-            # Fill adds scratch/derived buffers to this header bound later.
-            sizes[component] = max(
-                sum(row.nbytes for row in rows), sum(row.stored_nbytes for row in rows)
-            )
-        checkpoint_sizes[snapshot] = sizes
-    full = max(artifact_bytes, sum(sum(sizes.values()) for sizes in checkpoint_sizes.values()))
-    if any(
-        component not in checkpoint_sizes[snapshot] for component, snapshot in snapshots.items()
-    ):
-        # The derive's constructed components need not be in the checkpoint.
-        # Only model-code-fit judges that mismatch; it cannot justify cheap staging.
-        return full
-    components = {name: checkpoint_sizes[snapshot][name] for name, snapshot in snapshots.items()}
-    return max(
-        (sum(components[name] for name in set(names)) for names in scopes.values()), default=full
-    )
+    if not scopes or covered != set(snapshots) or set(logical) != set(snapshots):
+        return sum(logical.values())
+    return max(sum(logical[name] for name in set(names)) for names in scopes.values())
 
 
 def _verify_file(path: Path, digest: str, length: int | None) -> None:

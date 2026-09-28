@@ -235,7 +235,7 @@ def _binding() -> DeclaredBinding:
         model_binding_path="serve.models.m",
         model_parameter_name="m",
         release="r",
-        model_weight_bytes=GiB,
+        logical_weight_bytes=GiB,
     )
 
 
@@ -335,7 +335,7 @@ def test_a_pin_through_the_worker_binds_a_group_without_moving_admission() -> No
             worker.accepted.mode = "serving"
             placement = _placement("g")
             binding = dataclasses.replace(
-                _binding(), model_weight_bytes=1 << 20, models=(_worker_slot((2,)),)
+                _binding(), logical_weight_bytes=1 << 20, models=(_worker_slot((2,)),)
             )
             assert binding.sequence_parallel_degrees() == (2,)
             bindings = {binding.entrypoint_binding_digest: binding}

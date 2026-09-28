@@ -65,7 +65,7 @@ def _binding() -> DeclaredBinding:
         model_binding_path="pkg:Pipeline",
         model_parameter_name="model",
         release="pkg@1",
-        model_weight_bytes=sum(WEIGHTS.values()),
+        logical_weight_bytes=sum(WEIGHTS.values()),
     )
 
 
@@ -482,7 +482,7 @@ def test_uncalibrated_reserve_does_not_become_a_scope_requirement() -> None:
         model_binding_path="small:Model",
         model_parameter_name="model",
         release="fixture/1",
-        model_weight_bytes=weights,
+        logical_weight_bytes=weights,
     )
     prepared = PreparedRequest.unresolved("generate", {})
     chooser = PlanChooser(ledger)

@@ -430,7 +430,7 @@ def test_a_ready_request_takes_the_started_process_and_skips_the_probes_it_does_
         model_binding_path="marco.models.model",
         model_parameter_name="model",
         release="r",
-        model_weight_bytes=1 << 30,
+        logical_weight_bytes=1 << 30,
         models=(
             WorkerSlot(
                 *("M", "marco.models.model", "model", "", "", ""),

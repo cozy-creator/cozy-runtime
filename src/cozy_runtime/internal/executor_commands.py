@@ -155,7 +155,8 @@ class Binding(Release, frozen=True, kw_only=True):
 
 
 class Budgets(msgspec.Struct, frozen=True, kw_only=True):
-    declared_weight_bytes: int = 0
+    # Older executors read the wire key `declared_weight_bytes`; 0.18.69 and earlier index it.
+    logical_weight_bytes: int = msgspec.field(default=0, name="declared_weight_bytes")
 
 
 class ModelLoad(msgspec.Struct, frozen=True, kw_only=True):

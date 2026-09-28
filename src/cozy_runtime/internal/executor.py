@@ -2231,13 +2231,12 @@ class Executor:
             custody=binding.custody,
         )
         stage("backend_ctor")
-        # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The provisioned binding derives its
-        # destination residency from the MCC's complete logical+derived tensor census. The
-        # header independently prices logical rows and the selected route's native/decode
-        # overhead. Derived buffers remain live beside that overhead, so the complete peak
-        # is additive and the larger destination census wins if the two have not yet met.
-        # This refusal runs before allocation instead of discovering an OOM mid-fill.
-        declared = budgets.declared_weight_bytes
+        # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The binding declares its components'
+        # logical bytes from their headers; the header envelope prices the rows this plan
+        # fills and the selected route's native/decode overhead, and the larger destination
+        # count wins where the two have not met. Derived buffers are not priced until
+        # construction. This refusal runs before allocation instead of an OOM mid-fill.
+        declared = budgets.logical_weight_bytes
         envelope = complete_device_envelope(backend.device_envelope(), declared)
         destinations = int(envelope["base_bytes"])
         overhead = int(envelope["fill_overhead_bytes"])
@@ -2362,11 +2361,11 @@ class Executor:
                     f"against {authorized_here} B left of the {authorized} B process "
                     f"ceiling and {allocatable} B allocatable - refused on the arithmetic, "
                     "before a byte moved. The "
-                    f"binding's MCC priced {declared} B of logical plus derived "
-                    "destinations; the header independently prices stored encoding overhead"
+                    f"binding declared {declared} B of logical destinations; the header "
+                    "independently prices stored encoding overhead"
                 ),
                 "envelope": envelope,
-                "declared_weight_bytes": declared,
+                "logical_weight_bytes": declared,
                 "shortfall": {
                     "resource": "vram",
                     "scope": "component_generation",
@@ -2546,7 +2545,7 @@ class Executor:
                 reply["shortfall"] = {
                     "resource": "vram",
                     "scope": "component_generation",
-                    "needed_bytes": budgets.declared_weight_bytes,
+                    "needed_bytes": budgets.logical_weight_bytes,
                     "available_bytes": int(free),
                     "evidence_class": "measured",
                 }

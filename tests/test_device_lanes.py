@@ -191,6 +191,8 @@ def test_a_load_without_an_assigned_ceiling_is_a_worker_defect() -> None:
     # a weightless one included (0.18.70/0.18.71 omitted a default `budgets`).
     wire = executor_commands.encode(command)
     assert {"binding", "budgets"} <= set(wire) and "models" not in wire
+    # ...and index the weight budget by its wire key.
+    assert wire["budgets"] == {"declared_weight_bytes": 0}
 
 
 # --------------------------------------------------------------------------- step 3/4

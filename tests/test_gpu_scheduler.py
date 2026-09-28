@@ -513,7 +513,7 @@ class Machine:
             model_binding_path="marco.models.model",
             model_parameter_name="model",
             release="r",
-            model_weight_bytes=GiB,
+            logical_weight_bytes=GiB,
             models=(
                 WorkerSlot(
                     *("M", "marco.models.model", "model", "", "", ""),

@@ -809,6 +809,19 @@ class Checkpoint:
         return assets
 
 
+def logical_weight_bytes(root: str | Path, snapshots: Mapping[str, str]) -> dict[str, int]:
+    """Each constructed component's LOGICAL bytes, from the header of the snapshot it fills
+    from: what its destinations hold. An encoded checkpoint stores fewer bytes than that
+    (fp8 SDXL: 4.71 GB stored, 6.94 GB logical), so the stored closure never prices one. A
+    component its header lacks has no entry; model-code-fit judges that mismatch."""
+    checkpoints = {snapshot: Checkpoint(root, snapshot) for snapshot in set(snapshots.values())}
+    return {
+        component: sum(row.nbytes for row in checkpoints[snapshot].rows(component))
+        for component, snapshot in snapshots.items()
+        if checkpoints[snapshot].has(component)
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class Servability:
     """This runtime's OWN answer to "can I serve these bytes", given before any of them move.
