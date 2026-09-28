@@ -472,6 +472,24 @@ class MachineExecutionRPC:
 
         return self._call(request.execution.claim, context, read)
 
+    # Wire 66: registration names every WorkerControl method. Served in full by the change
+    # that follows this one; until then each answers UNIMPLEMENTED, as an older Runtime does.
+    def ListMachineExecutions(
+        self, request: pb.MachineExecutionListQuery, context: ServicerContext
+    ) -> pb.MachineExecutionList:
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, "update the Runtime to list its runs")
+
+    def ListPackages(self, request: pb.PackageListQuery, context: ServicerContext) -> pb.PackageList:
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, "update the Runtime to list its packages")
+
+    def ListModels(self, request: pb.ModelListQuery, context: ServicerContext) -> pb.ModelList:
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, "update the Runtime to list its models")
+
+    def DescribeMachine(
+        self, request: pb.DescribeMachineQuery, context: ServicerContext
+    ) -> pb.MachineDescription:
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, "update the Runtime to describe it")
+
     def AcknowledgeMachineExecutionCollection(
         self, request: pb.MachineExecutionCollectionAck, context: ServicerContext
     ) -> pb.MachineExecutionState:
