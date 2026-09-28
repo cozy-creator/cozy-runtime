@@ -94,8 +94,8 @@ CALLED: dict[str, str] = {
         "(component: 'str', key: 'str', shape: 'Sequence[int]', "
         "logical_dtype: 'str | None' = None) -> None"
     ),
-    "Store.open": "(root=None, *, receipts='inline')",
-    "Store.ensure": "(root=None, *, receipts='inline')",
+    "Store.open": "(root=None)",
+    "Store.ensure": "(root=None)",
     "Store.resolve_source": (
         "(self, /, source_uri, carriers=Ellipsis, *, profiles=Ellipsis, files=Ellipsis, "
         "credential=Ellipsis, huggingface=None, civitai=None, allow_local=False, registry=None)"

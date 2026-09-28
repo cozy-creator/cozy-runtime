@@ -100,7 +100,7 @@ def _committed(tmp_path: Path) -> tuple[pb.WeightsFinalizeRequest, Path, Any]:
     request = _request()
     _writer(store, request, manifest, length).commit()
     # The worker's own Stores name a receipt's declaration by digest.
-    store = tensorfs.Store.open(str(root), receipts="digest")
+    store = tensorfs.Store.open(str(root))
     facts = store.derived_lookup(_transaction(request))["receipt"]
     receipt = weights_sink.receipt_from_native(
         "model", _transaction(request), facts, replayed=True, request_id=request.request_id
