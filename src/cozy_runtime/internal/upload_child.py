@@ -383,8 +383,7 @@ def _union_writer(
         configs,
         order,
         sum(len(body) for body in added.values()),
-        # tensorfs 0.3.71's stub predates object companions, which its binding accepts.
-        _asset_files(store, plan.metadata) or None,  # type: ignore[arg-type]
+        _asset_files(store, plan.metadata) or None,
         work_fingerprint=plan.computation_digest,
     )
     for name, body in sorted(added.items()):

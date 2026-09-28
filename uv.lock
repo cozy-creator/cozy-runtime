@@ -459,8 +459,8 @@ requires-dist = [
     { name = "protobuf", specifier = ">=6.31" },
     { name = "safetensors", marker = "extra == 'minimax-h3'", specifier = ">=0.8.0" },
     { name = "safetensors", marker = "extra == 'qwen-image21'", specifier = ">=0.8" },
-    { name = "tensorfs", specifier = ">=0.3.71" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.71" },
+    { name = "tensorfs", specifier = ">=0.3.73" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.73" },
     { name = "tokenizers", marker = "extra == 'minimax-h3'", specifier = ">=0.23.1" },
     { name = "tokenizers", marker = "extra == 'qwen-image21'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13" },
@@ -482,7 +482,7 @@ dev = [
     { name = "mypy", specifier = ">=1.13" },
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.3.71,<0.4" },
+    { name = "tensorfs", specifier = ">=0.3.73,<0.4" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
 
@@ -1750,14 +1750,14 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.3.71"
+version = "0.3.73"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ed/02/a6c010ed29c8126188d3cd8cf27731e0dfa6175512a3d1667ce2e5eb3931/tensorfs-0.3.71.tar.gz", hash = "sha256:dda503346d1182498bde4ad99bea5a851a9cf3c720e54e5a4f464b143993a9fe", size = 944737, upload-time = "2026-09-28T03:27:44.861Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/17/ab/570c3c2666c86bacc2b4897e4813a39542f7bf2c3c08a97da79df4a1e84b/tensorfs-0.3.73.tar.gz", hash = "sha256:7fbbd0edf90b5b569340e4232391a4394fb488bf2f832d5f20fe91689e126fdb", size = 942216, upload-time = "2026-09-28T06:38:34.378Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e0/c5/22c5c59a00df709f02f2011da489cd3dc333c95740604c3b47111d570686/tensorfs-0.3.71-cp312-abi3-macosx_10_13_x86_64.whl", hash = "sha256:8192bd78d0bc61c483dbb4ffb8543715cdf85eb43e8e6448be6002a5467d0cf2", size = 8447668, upload-time = "2026-09-28T03:27:36.893Z" },
-    { url = "https://files.pythonhosted.org/packages/da/9c/64b3dae7121b4f813ee738e31cb47239d15d5c1f811dbc39931784f15ec4/tensorfs-0.3.71-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:81ba92d499da166dd2462b2614987d48b53c832fdcfe3addcf0d375c544cf526", size = 7977556, upload-time = "2026-09-28T03:27:39.071Z" },
-    { url = "https://files.pythonhosted.org/packages/09/cd/fafde2385f15a7c5e6444f08927fe84bd909ddaa6039ed9c7d721ae8e6b7/tensorfs-0.3.71-cp312-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:6ad53cc3becfb0a965263c30c0c44bc0551905daf1eccc8b5e9a331c77fd014b", size = 8300334, upload-time = "2026-09-28T03:27:40.83Z" },
-    { url = "https://files.pythonhosted.org/packages/be/63/4362c7aef16eb1bcb6310215bc9b4bf110f717aa703a2b186b917b3b0c7f/tensorfs-0.3.71-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:dd7f8250a754c7bab5f36c6470e4d5ecdf7387753600ce79f0fcafcdaf244a0c", size = 8552257, upload-time = "2026-09-28T03:27:42.766Z" },
+    { url = "https://files.pythonhosted.org/packages/f9/8c/92c77b763988aa92232aa26495a79c19fe2ed2f1e14d7d1bed9f86ae9021/tensorfs-0.3.73-cp312-abi3-macosx_10_13_x86_64.whl", hash = "sha256:c47ec0fc33061a480b95db0b999eb35cae87a75578967a6288a9e3241f546417", size = 8437608, upload-time = "2026-09-28T06:38:26.851Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/33/b1d0566381f2fe28bd4d0da07290101f5b3cbb409323b914181b01567b2f/tensorfs-0.3.73-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:353e987eea3e3e76ca1bf830ca06f5d393eb85261542a471f2de0d747123d309", size = 7977752, upload-time = "2026-09-28T06:38:29.015Z" },
+    { url = "https://files.pythonhosted.org/packages/87/a5/3b58172c02aef2cae68797664013df6e0bb45b7fc1edc21ebe837408680e/tensorfs-0.3.73-cp312-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e9abf778397f1300b8ca2dacda65df81bc88d73a52ae95eed7d0485344eb4381", size = 8302693, upload-time = "2026-09-28T06:38:30.79Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/15/fc27ecc9d7bd05b6f7f01b32743fcca0715492d524b81da63b96c5b9dd99/tensorfs-0.3.73-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:dda6cc7aefafe2e442bbc425f5ca36659ceebd0d41d4d3692e05049a05e6ac45", size = 8545025, upload-time = "2026-09-28T06:38:32.34Z" },
 ]
 
 [[package]]
