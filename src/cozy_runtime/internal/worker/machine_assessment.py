@@ -187,7 +187,11 @@ def verify(
         report.contract_check()
     except Exception as exc:
         raise PublicationRefusal("assessment.report_invalid") from exc
-    _check(sealed.schema == "cozy-eval/checkpoint-validation@5")
+    # A floor, not a pin: cozy-eval validated the body; a newer revision is additive.
+    family, _, revision = sealed.schema.rpartition("@")
+    _check(
+        family == "cozy-eval/checkpoint-validation" and revision.isdigit() and int(revision) >= 5
+    )
     subject = report.subject
     _check(subject.candidate_checkpoint == checkpoint.checkpoint)
     plans = canonical_json.decode(workloads)
