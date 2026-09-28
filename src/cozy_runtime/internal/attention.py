@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -27,6 +28,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._attention_scope import _EXPECTED
+from cozy_runtime.author._numeric import within, worst_of
 from cozy_runtime.internal import attention_sol, attention_ulysses, kernel_site
 from cozy_runtime.internal import attention_upstream as upstream
 from cozy_runtime.internal.attention_ulysses import Local
@@ -557,8 +559,7 @@ def probe(
         got = dispatch_attention_fn(query, key, value, backend=entry.member)
         got = _validate_probe_contract(entry, device, got, query)
         by_rows, floor, checked = _disagreement(got, query, key, value, seed)
-    worst = max(by_rows, key=by_rows.__getitem__)
-    disagreement = by_rows[worst]
+    worst, disagreement = worst_of(by_rows)
     measured = {
         "shape": list(query.shape),
         "checked_rows": checked,
@@ -661,9 +662,13 @@ def _gate(
     attention at all (a kernel returning its uninitialized buffer raises nothing and has the
     right shape, h3a-013); below it, the kernel runs and is out of budget, said so by name."""
     budget = entry.candidate.rel_l2_max
-    if disagreement <= budget:
+    if within(disagreement, budget):
         return
-    code = "attention_kernel_wrong" if disagreement >= 1 else "attention_kernel_out_of_budget"
+    code = (
+        "attention_kernel_out_of_budget"
+        if math.isfinite(disagreement) and disagreement < 1
+        else "attention_kernel_wrong"
+    )
     raise AttentionRefusal(
         code,
         f"{entry.name} disagrees with exact attention at rel L2 {disagreement:.4g} on "

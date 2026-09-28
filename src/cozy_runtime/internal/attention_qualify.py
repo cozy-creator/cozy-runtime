@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
+from cozy_runtime.author._numeric import within
 from cozy_runtime.internal import attention, attention_sol, attention_ulysses, kernel_site
 from cozy_runtime.internal.encoding import DeviceFacts
 
@@ -83,7 +84,7 @@ def _kernel(
         attention_sol._SITE.reset(token)
     difference = float((got.double() - one.double()).norm() / one.double().norm())
     row.update(
-        status="ready" if difference <= EQUIVALENT_REL_L2 else "not_equivalent",
+        status="ready" if within(difference, EQUIVALENT_REL_L2) else "not_equivalent",
         impl=impl,
         probe=ready.admission,
         shape=list(shape),

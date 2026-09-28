@@ -69,6 +69,7 @@ from typing import Any
 
 import msgspec
 
+from cozy_runtime.author._numeric import within, worst
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding import (
     MX_BLOCK,
@@ -347,26 +348,31 @@ def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
     destination = torch.empty(16, 16, dtype=dtype, device=device)
     provider.decode(torch, {"data": data, "weight_scale": weight_scale}, destination)
     got = destination.reshape(-1).double().cpu().tolist()
+    return _grade_scaled(_eps(torch, dtype), got, scale_value)
 
+
+def _grade_scaled(eps: float, got: Sequence[float], scale_value: float) -> Sweep:
+    """Grade the 256 decoded patterns: NaN stays NaN, zero stays exactly zero, and every
+    other value is within two roundings relative. A non-finite error never passes."""
     worst_rel, worst_abs, nan_ok = 0.0, 0.0, True
-    for index, byte in enumerate(patterns):
+    for byte, have in enumerate(got):
         want = e4m3_value(byte) * scale_value
-        have = got[index]
         if math.isnan(want):
             nan_ok = nan_ok and math.isnan(have)
             continue
         error = abs(have - want)
-        worst_abs = max(worst_abs, error)
-        if want != 0.0:
-            worst_rel = max(worst_rel, error / abs(want))
-    bound = 2.0 * _eps(torch, dtype)
+        worst_abs = worst(worst_abs, error)
+        worst_rel = worst(
+            worst_rel, error / abs(want) if want else (0.0 if error == 0 else math.inf)
+        )
+    bound = 2.0 * eps
     return Sweep(
-        patterns=256,
+        patterns=len(got),
         max_abs_error=worst_abs,
         max_rel_error=worst_rel,
         tolerance=bound,
         nan_preserved=nan_ok,
-        passed=worst_rel <= bound and nan_ok,
+        passed=within(worst_rel, bound) and nan_ok,
     )
 
 
@@ -445,8 +451,8 @@ def _domain_sweep(
             elif abs(want) < smallest_normal:
                 counts["subnormal"] += 1
                 error = abs(have - want)
-                worst_abs = max(worst_abs, error)
-                if error > abs_bound:
+                worst_abs = worst(worst_abs, error)
+                if not within(error, abs_bound):
                     note(
                         "subnormal",
                         f"{where}: {have} != {want} (abs {error:.3e} > {abs_bound:.3e})",
@@ -454,10 +460,10 @@ def _domain_sweep(
             else:
                 counts["normal"] += 1
                 error = abs(have - want)
-                worst_abs = max(worst_abs, error)
+                worst_abs = worst(worst_abs, error)
                 relative = error / abs(want)
-                worst_rel = max(worst_rel, relative)
-                if relative > rel_bound:
+                worst_rel = worst(worst_rel, relative)
+                if not within(relative, rel_bound):
                     note(
                         "normal",
                         f"{where}: {have} != {want} (rel {relative:.3e} > {rel_bound:.3e})",
@@ -524,7 +530,7 @@ def _native_agreement(
     finite = bool(torch.isfinite(got).all())
     contract = str(got.dtype) == str(x.dtype)
     return NativeAgreement(
-        passed=deviation <= NATIVE_DEVIATION_BOUND and finite and contract,
+        passed=within(deviation, NATIVE_DEVIATION_BOUND) and finite and contract,
         shape=[int(x.shape[0]), *[int(n) for n in weight.shape]],
         deviation_rel=deviation,
         tolerance=NATIVE_DEVIATION_BOUND,

@@ -29,6 +29,7 @@ from cozy_runtime.author import (
     Model,
     Telemetry,
     UnsupportedInput,
+    _numeric,
 )
 
 from . import safetensors_io as st
@@ -322,21 +323,21 @@ def write_bf16(
                 raw = st.from_f32(values, "BF16")
                 error = np.abs(values - st.to_f32(raw, "BF16", list(values.shape)))
                 if values.size:
-                    amax = max(amax, float(np.max(np.abs(values))))
-                    max_error = max(max_error, float(np.max(error)))
+                    amax = _numeric.worst(amax, float(np.max(np.abs(values))))
+                    max_error = _numeric.worst(max_error, float(np.max(error)))
                 sse += float(np.sum(error.astype(np.float64) ** 2))
                 energy += float(np.sum(values.astype(np.float64) ** 2))
                 length += values.size * {"bf16": 2, "f16": 2, "f32": 4}[tensor.source_dtype]
                 size += spill.write(raw)
             bound = amax * BF16_ROUND_TRIP_BOUND
-            if max_error > bound:
+            if not _numeric.within(max_error, bound):
                 raise UnsupportedInput(
                     f"{tensor.component}.{tensor.key}: bf16 round-trip error "
                     f"{max_error:.4g} exceeds the representational bound {bound:.4g}",
                     code="quantization_tripwire",
                 )
             relative = math.sqrt(sse / energy) if energy else 0.0
-            worst = max(worst, relative) if worst is not None else None
+            worst = _numeric.worst(worst, relative) if worst is not None else None
             spill.seek(0)
             transaction.add_part(tensor.component, tensor.key, "value", spill)
         transaction.checkpoint()
@@ -439,7 +440,7 @@ def quantize_component_into(
             result = next(results)
             with result.spill as spill:
                 bound = result.amax * encoder.round_trip_bound
-                if result.max_error > bound:
+                if not _numeric.within(result.max_error, bound):
                     raise UnsupportedInput(
                         f"{source_component}.{tensor.key}: round-trip error "
                         f"{result.max_error:.4g} exceeds the {encoding} bound {bound:.4g}",
@@ -448,9 +449,8 @@ def quantize_component_into(
                 if result.rows != tensor.shape[0]:
                     raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
                 relative = math.sqrt(result.sse / result.energy) if result.energy > 0 else 0.0
-                if (
-                    payload.max_relative_frobenius is not None
-                    and relative > payload.max_relative_frobenius
+                if payload.max_relative_frobenius is not None and not _numeric.within(
+                    relative, payload.max_relative_frobenius
                 ):
                     raise UnsupportedInput(
                         f"{source_component}.{tensor.key}: relative Frobenius {relative:.6f} "
@@ -470,7 +470,7 @@ def quantize_component_into(
                     if (target_component, tensor.key, role) not in completed:
                         written += part_bytes
             transaction.checkpoint()
-            worst = max(worst, relative)
+            worst = _numeric.worst(worst, relative)
             source_bytes += result.read
             new_bytes += written
             saturated += result.saturated
@@ -553,8 +553,8 @@ def _encode_tensor(
             ):
                 raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
             if values.size:
-                amax = max(amax, float(values.max()), -float(values.min()))
-            max_error = max(max_error, encoded.max_abs_err)
+                amax = _numeric.worst(amax, float(np.max(np.abs(values))))
+            max_error = _numeric.worst(max_error, encoded.max_abs_err)
             sse += encoded.sse
             energy += encoded.energy
             saturated += encoded.saturated
