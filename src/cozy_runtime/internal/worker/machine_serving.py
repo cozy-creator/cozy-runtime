@@ -245,9 +245,12 @@ class Serving:
             self.worker.emit_progress(call.parent_request, request.parent_attempt_ordinal, frame)
 
     @contextlib.contextmanager
-    def phase(self, call: Call, request: pb.ChildCallRequest, name: str) -> Iterator[None]:
-        """Separate immutable preparation and per-child custody in the parent journal."""
-        started = time.perf_counter()
+    def phase(
+        self, call: Call, request: pb.ChildCallRequest, name: str, since: float = 0.0
+    ) -> Iterator[None]:
+        """Separate immutable preparation and per-child custody in the parent journal. `since`
+        (a `perf_counter` reading) starts the timing at work done before the phase opened."""
+        started = since or time.perf_counter()
         label = self.worker.calls.progress_label(
             call.parent_request, request.parent_attempt_ordinal, call.call_index
         )
@@ -501,6 +504,9 @@ class Serving:
             live_parent = self.worker.engine.live.get(call.parent_request)
             if live_parent is None or live_parent.attempt != request.parent_attempt_ordinal:
                 raise WorkspaceRefusal("native child input parent is no longer active")
+            # Custody of the call's byte inputs is part of checking them: one durable hold per
+            # input, six per H3 segment. Run 1516 showed it only as a gap before the phase.
+            checking = time.perf_counter()
             byte_bindings, byte_access = machine_byte_inputs.inputs(
                 workspace,
                 owner,
@@ -566,7 +572,7 @@ class Serving:
             capture = canonical_json.encode(executions.capture(owner, call.parent_request))
             machine_lanes.admit(self.worker, call.parent_request, preparation, offer)
             with (
-                self.phase(call, request, "Checking model inputs"),
+                self.phase(call, request, "Checking model inputs", checking),
                 machine_checkpoint_inputs.admission(workspace, owner, offer.request_id),
             ):
                 catalog = grants.model_inputs(

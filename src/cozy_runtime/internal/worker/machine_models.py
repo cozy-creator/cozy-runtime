@@ -14,6 +14,7 @@ from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker import grants, workspace_byte_outputs
 from cozy_runtime.internal.worker.workspace import HeldTree, NativeHold, Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_byte_outputs import Blob, FileMember
+from cozy_runtime.internal.worker.workspace_executions import transaction
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -60,7 +61,9 @@ def register(
     kind: str = "derived",
 ) -> None:
     raw = request.SerializeToString(deterministic=True)
-    with workspace.locked() as db:
+    # One commit for the path and its reservation: each is a synchronous journal write, and
+    # a child binding run 1516's five references and context paid both per input.
+    with workspace.locked() as db, transaction(db):
         db.execute(
             "INSERT INTO execution_model_holds(owner,recipient,path,retention) VALUES(?,?,?,?) "
             "ON CONFLICT(owner,recipient,path) DO NOTHING",
