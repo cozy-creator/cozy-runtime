@@ -3391,6 +3391,10 @@ class Executor:
         working_peak = _working_peak(peak_vram, allocated_at_start, residency_document)
         if self.group is not None:
             working_peak = max(working_peak, *self.group.working_peaks.values(), 0)
+        if torch is not None:
+            # An idle tenant holds its weights, not its last call's scratch: the cache goes
+            # back to the card, where the next tenant the worker admits can use it.
+            accel.release_cached(torch, self.device_kind)
         # step 3: the lease releases here, and nothing after this line touches the device.
         # DEVICE RELEASE IS THIS REPLY (cr-079): the handler registered its outputs as raw
         # host frames, so `device_lease_ms` is device time and the encode is the worker's.

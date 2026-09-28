@@ -1026,9 +1026,8 @@ class ComponentResidency:
             f"({need} B of weights, {headroom} B of forward headroom, including overlapping "
             f"fill storage); {allocatable} B are allocatable "
             f"({free} B driver-free of {total} B) with {sorted(resident)} resident, short by "
-            f"{max(required - allocatable, 0)} B. Every evictable component was already freed, so "
-            "this is a capacity fact, not an allocation to retry - the ladder chooses a "
-            f"deeper rung or the request refuses. ({detail[:160]})",
+            f"{max(required - allocatable, 0)} B after the worker made room for this call. "
+            f"({detail[:160]})",
             {
                 "resource": "vram",
                 "scope": "component_use",
