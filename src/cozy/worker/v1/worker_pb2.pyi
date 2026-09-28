@@ -771,7 +771,7 @@ class SourceCredential(_message.Message):
     def __init__(self, provider: _Optional[_Union[NativeSourceOperation, str]] = ..., credential: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionReceipt(_message.Message):
-    __slots__ = ("request_id", "submission_id", "capture_digest", "invocation_spec_digest", "accepted_at_ms", "worker_id", "worker_boot_id", "execution_workspace_id", "publication_authorization_id")
+    __slots__ = ("request_id", "submission_id", "capture_digest", "invocation_spec_digest", "accepted_at_ms", "worker_id", "worker_boot_id", "execution_workspace_id", "publication_authorization_id", "number")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -781,6 +781,7 @@ class MachineExecutionReceipt(_message.Message):
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
     PUBLICATION_AUTHORIZATION_ID_FIELD_NUMBER: _ClassVar[int]
+    NUMBER_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     submission_id: str
     capture_digest: bytes
@@ -790,7 +791,8 @@ class MachineExecutionReceipt(_message.Message):
     worker_boot_id: str
     execution_workspace_id: str
     publication_authorization_id: str
-    def __init__(self, request_id: _Optional[str] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., invocation_spec_digest: _Optional[bytes] = ..., accepted_at_ms: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., publication_authorization_id: _Optional[str] = ...) -> None: ...
+    number: int
+    def __init__(self, request_id: _Optional[str] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., invocation_spec_digest: _Optional[bytes] = ..., accepted_at_ms: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., publication_authorization_id: _Optional[str] = ..., number: _Optional[int] = ...) -> None: ...
 
 class MachineExecutionQuery(_message.Message):
     __slots__ = ("claim", "request_id", "expected_execution_workspace_id")
@@ -803,7 +805,7 @@ class MachineExecutionQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionState(_message.Message):
-    __slots__ = ("request_id", "attempt_ordinal", "generation", "state", "collected", "sequence", "worker_id", "worker_boot_id", "execution_workspace_id", "gpu", "awaiting_source_credentials")
+    __slots__ = ("request_id", "attempt_ordinal", "generation", "state", "collected", "sequence", "worker_id", "worker_boot_id", "execution_workspace_id", "gpu", "awaiting_source_credentials", "number", "accepted_at_ms", "finished_at_ms", "target")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
     GENERATION_FIELD_NUMBER: _ClassVar[int]
@@ -815,6 +817,10 @@ class MachineExecutionState(_message.Message):
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
     GPU_FIELD_NUMBER: _ClassVar[int]
     AWAITING_SOURCE_CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
+    NUMBER_FIELD_NUMBER: _ClassVar[int]
+    ACCEPTED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    FINISHED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    TARGET_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     attempt_ordinal: int
     generation: int
@@ -826,7 +832,25 @@ class MachineExecutionState(_message.Message):
     execution_workspace_id: str
     gpu: MachineExecutionGpu
     awaiting_source_credentials: _containers.RepeatedScalarFieldContainer[NativeSourceOperation]
-    def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., generation: _Optional[int] = ..., state: _Optional[str] = ..., collected: bool = ..., sequence: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., gpu: _Optional[_Union[MachineExecutionGpu, _Mapping]] = ..., awaiting_source_credentials: _Optional[_Iterable[_Union[NativeSourceOperation, str]]] = ...) -> None: ...
+    number: int
+    accepted_at_ms: int
+    finished_at_ms: int
+    target: MachineExecutionTarget
+    def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., generation: _Optional[int] = ..., state: _Optional[str] = ..., collected: bool = ..., sequence: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., gpu: _Optional[_Union[MachineExecutionGpu, _Mapping]] = ..., awaiting_source_credentials: _Optional[_Iterable[_Union[NativeSourceOperation, str]]] = ..., number: _Optional[int] = ..., accepted_at_ms: _Optional[int] = ..., finished_at_ms: _Optional[int] = ..., target: _Optional[_Union[MachineExecutionTarget, _Mapping]] = ...) -> None: ...
+
+class MachineExecutionTarget(_message.Message):
+    __slots__ = ("package", "release", "entrypoint", "installation_id", "job")
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
+    ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
+    JOB_FIELD_NUMBER: _ClassVar[int]
+    package: str
+    release: str
+    entrypoint: str
+    installation_id: str
+    job: bool
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., entrypoint: _Optional[str] = ..., installation_id: _Optional[str] = ..., job: bool = ...) -> None: ...
 
 class MachineExecutionGpu(_message.Message):
     __slots__ = ("phase", "width", "ordinals", "blocked_by")
@@ -979,6 +1003,218 @@ class MachineExecutionTriage(_message.Message):
     bundle: TriageBundleRef
     bundle_canonical_bytes: bytes
     def __init__(self, bundle: _Optional[_Union[TriageBundleRef, _Mapping]] = ..., bundle_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+
+class MachineExecutionListQuery(_message.Message):
+    __slots__ = ("claim", "after_number", "newest_first", "before_number", "limit", "states", "wait")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    AFTER_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    NEWEST_FIRST_FIELD_NUMBER: _ClassVar[int]
+    BEFORE_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_FIELD_NUMBER: _ClassVar[int]
+    STATES_FIELD_NUMBER: _ClassVar[int]
+    WAIT_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    after_number: int
+    newest_first: bool
+    before_number: int
+    limit: int
+    states: _containers.RepeatedScalarFieldContainer[str]
+    wait: bool
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., after_number: _Optional[int] = ..., newest_first: bool = ..., before_number: _Optional[int] = ..., limit: _Optional[int] = ..., states: _Optional[_Iterable[str]] = ..., wait: bool = ...) -> None: ...
+
+class MachineExecutionList(_message.Message):
+    __slots__ = ("executions", "head_number", "execution_workspace_id")
+    EXECUTIONS_FIELD_NUMBER: _ClassVar[int]
+    HEAD_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    executions: _containers.RepeatedCompositeFieldContainer[MachineExecutionState]
+    head_number: int
+    execution_workspace_id: str
+    def __init__(self, executions: _Optional[_Iterable[_Union[MachineExecutionState, _Mapping]]] = ..., head_number: _Optional[int] = ..., execution_workspace_id: _Optional[str] = ...) -> None: ...
+
+class PackageListQuery(_message.Message):
+    __slots__ = ("claim",)
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
+
+class PackageList(_message.Message):
+    __slots__ = ("packages",)
+    PACKAGES_FIELD_NUMBER: _ClassVar[int]
+    packages: _containers.RepeatedCompositeFieldContainer[MachinePackage]
+    def __init__(self, packages: _Optional[_Iterable[_Union[MachinePackage, _Mapping]]] = ...) -> None: ...
+
+class MachinePackage(_message.Message):
+    __slots__ = ("installation_id", "package", "release", "origin", "installed_at_ms", "sdk", "entrypoints")
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
+    ORIGIN_FIELD_NUMBER: _ClassVar[int]
+    INSTALLED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    SDK_FIELD_NUMBER: _ClassVar[int]
+    ENTRYPOINTS_FIELD_NUMBER: _ClassVar[int]
+    installation_id: str
+    package: str
+    release: str
+    origin: str
+    installed_at_ms: int
+    sdk: _containers.RepeatedCompositeFieldContainer[ImageDistribution]
+    entrypoints: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, installation_id: _Optional[str] = ..., package: _Optional[str] = ..., release: _Optional[str] = ..., origin: _Optional[str] = ..., installed_at_ms: _Optional[int] = ..., sdk: _Optional[_Iterable[_Union[ImageDistribution, _Mapping]]] = ..., entrypoints: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class ModelListQuery(_message.Message):
+    __slots__ = ("claim",)
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
+
+class ModelList(_message.Message):
+    __slots__ = ("models", "repositories", "store")
+    MODELS_FIELD_NUMBER: _ClassVar[int]
+    REPOSITORIES_FIELD_NUMBER: _ClassVar[int]
+    STORE_FIELD_NUMBER: _ClassVar[int]
+    models: _containers.RepeatedCompositeFieldContainer[MachineModel]
+    repositories: _containers.RepeatedCompositeFieldContainer[RepositoryUsage]
+    store: StoreUsage
+    def __init__(self, models: _Optional[_Iterable[_Union[MachineModel, _Mapping]]] = ..., repositories: _Optional[_Iterable[_Union[RepositoryUsage, _Mapping]]] = ..., store: _Optional[_Union[StoreUsage, _Mapping]] = ...) -> None: ...
+
+class MachineModel(_message.Message):
+    __slots__ = ("kind", "repository", "version", "lane", "source_selection", "manifest", "complete")
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    LANE_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    COMPLETE_FIELD_NUMBER: _ClassVar[int]
+    kind: str
+    repository: str
+    version: str
+    lane: str
+    source_selection: str
+    manifest: Ref
+    complete: bool
+    def __init__(self, kind: _Optional[str] = ..., repository: _Optional[str] = ..., version: _Optional[str] = ..., lane: _Optional[str] = ..., source_selection: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., complete: bool = ...) -> None: ...
+
+class RepositoryUsage(_message.Message):
+    __slots__ = ("repository", "bytes_total", "bytes_unique")
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
+    BYTES_TOTAL_FIELD_NUMBER: _ClassVar[int]
+    BYTES_UNIQUE_FIELD_NUMBER: _ClassVar[int]
+    repository: str
+    bytes_total: int
+    bytes_unique: int
+    def __init__(self, repository: _Optional[str] = ..., bytes_total: _Optional[int] = ..., bytes_unique: _Optional[int] = ...) -> None: ...
+
+class StoreUsage(_message.Message):
+    __slots__ = ("bytes_total", "bytes_unique_sum", "bytes_unreferenced", "filesystem")
+    BYTES_TOTAL_FIELD_NUMBER: _ClassVar[int]
+    BYTES_UNIQUE_SUM_FIELD_NUMBER: _ClassVar[int]
+    BYTES_UNREFERENCED_FIELD_NUMBER: _ClassVar[int]
+    FILESYSTEM_FIELD_NUMBER: _ClassVar[int]
+    bytes_total: int
+    bytes_unique_sum: int
+    bytes_unreferenced: int
+    filesystem: MachineFilesystem
+    def __init__(self, bytes_total: _Optional[int] = ..., bytes_unique_sum: _Optional[int] = ..., bytes_unreferenced: _Optional[int] = ..., filesystem: _Optional[_Union[MachineFilesystem, _Mapping]] = ...) -> None: ...
+
+class MachineFilesystem(_message.Message):
+    __slots__ = ("path", "total_bytes", "available_bytes")
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    path: str
+    total_bytes: int
+    available_bytes: int
+    def __init__(self, path: _Optional[str] = ..., total_bytes: _Optional[int] = ..., available_bytes: _Optional[int] = ...) -> None: ...
+
+class DescribeMachineQuery(_message.Message):
+    __slots__ = ("claim",)
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
+
+class MachineDescription(_message.Message):
+    __slots__ = ("worker_id", "worker_boot_id", "host", "runtime", "runtime_absent")
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    HOST_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_ABSENT_FIELD_NUMBER: _ClassVar[int]
+    worker_id: str
+    worker_boot_id: str
+    host: MachineHost
+    runtime: MachineRuntime
+    runtime_absent: str
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., host: _Optional[_Union[MachineHost, _Mapping]] = ..., runtime: _Optional[_Union[MachineRuntime, _Mapping]] = ..., runtime_absent: _Optional[str] = ...) -> None: ...
+
+class MachineHost(_message.Message):
+    __slots__ = ("version", "wire_minor", "minimum_wire_minor", "platform", "os_release", "hostname", "phase", "idle_deadline_unix_ms", "hubs", "filesystems", "started_at_unix_ms")
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
+    MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
+    PLATFORM_FIELD_NUMBER: _ClassVar[int]
+    OS_RELEASE_FIELD_NUMBER: _ClassVar[int]
+    HOSTNAME_FIELD_NUMBER: _ClassVar[int]
+    PHASE_FIELD_NUMBER: _ClassVar[int]
+    IDLE_DEADLINE_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    HUBS_FIELD_NUMBER: _ClassVar[int]
+    FILESYSTEMS_FIELD_NUMBER: _ClassVar[int]
+    STARTED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    version: str
+    wire_minor: int
+    minimum_wire_minor: int
+    platform: str
+    os_release: str
+    hostname: str
+    phase: str
+    idle_deadline_unix_ms: int
+    hubs: _containers.RepeatedCompositeFieldContainer[MachineHub]
+    filesystems: _containers.RepeatedCompositeFieldContainer[MachineFilesystem]
+    started_at_unix_ms: int
+    def __init__(self, version: _Optional[str] = ..., wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., platform: _Optional[str] = ..., os_release: _Optional[str] = ..., hostname: _Optional[str] = ..., phase: _Optional[str] = ..., idle_deadline_unix_ms: _Optional[int] = ..., hubs: _Optional[_Iterable[_Union[MachineHub, _Mapping]]] = ..., filesystems: _Optional[_Iterable[_Union[MachineFilesystem, _Mapping]]] = ..., started_at_unix_ms: _Optional[int] = ...) -> None: ...
+
+class MachineHub(_message.Message):
+    __slots__ = ("origin", "machine_id")
+    ORIGIN_FIELD_NUMBER: _ClassVar[int]
+    MACHINE_ID_FIELD_NUMBER: _ClassVar[int]
+    origin: str
+    machine_id: str
+    def __init__(self, origin: _Optional[str] = ..., machine_id: _Optional[str] = ...) -> None: ...
+
+class MachineRuntime(_message.Message):
+    __slots__ = ("version", "wire_minor", "minimum_wire_minor", "tensorfs_version", "python_version", "torch_version", "uv_version", "accelerator_backend", "executor_uid_isolation", "devices", "resources", "execution_workspace_id", "started_at_unix_ms", "store", "interpreters")
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
+    MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_VERSION_FIELD_NUMBER: _ClassVar[int]
+    PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
+    TORCH_VERSION_FIELD_NUMBER: _ClassVar[int]
+    UV_VERSION_FIELD_NUMBER: _ClassVar[int]
+    ACCELERATOR_BACKEND_FIELD_NUMBER: _ClassVar[int]
+    EXECUTOR_UID_ISOLATION_FIELD_NUMBER: _ClassVar[int]
+    DEVICES_FIELD_NUMBER: _ClassVar[int]
+    RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    STARTED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    STORE_FIELD_NUMBER: _ClassVar[int]
+    INTERPRETERS_FIELD_NUMBER: _ClassVar[int]
+    version: str
+    wire_minor: int
+    minimum_wire_minor: int
+    tensorfs_version: str
+    python_version: str
+    torch_version: str
+    uv_version: str
+    accelerator_backend: str
+    executor_uid_isolation: bool
+    devices: _containers.RepeatedCompositeFieldContainer[MachineDevice]
+    resources: WorkerResources
+    execution_workspace_id: str
+    started_at_unix_ms: int
+    store: MachineFilesystem
+    interpreters: _containers.RepeatedCompositeFieldContainer[PythonInterpreter]
+    def __init__(self, version: _Optional[str] = ..., wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., tensorfs_version: _Optional[str] = ..., python_version: _Optional[str] = ..., torch_version: _Optional[str] = ..., uv_version: _Optional[str] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., resources: _Optional[_Union[WorkerResources, _Mapping]] = ..., execution_workspace_id: _Optional[str] = ..., started_at_unix_ms: _Optional[int] = ..., store: _Optional[_Union[MachineFilesystem, _Mapping]] = ..., interpreters: _Optional[_Iterable[_Union[PythonInterpreter, _Mapping]]] = ...) -> None: ...
 
 class ProtocolInfoResult(_message.Message):
     __slots__ = ("wire_minor", "minimum_wire_minor")

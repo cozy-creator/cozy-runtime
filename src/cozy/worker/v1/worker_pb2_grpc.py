@@ -75,6 +75,26 @@ class WorkerControlStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriageQuery.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriage.FromString,
                 _registered_method=True)
+        self.ListMachineExecutions = channel.unary_unary(
+                '/cozy.worker.v1.WorkerControl/ListMachineExecutions',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionListQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionList.FromString,
+                _registered_method=True)
+        self.ListPackages = channel.unary_unary(
+                '/cozy.worker.v1.WorkerControl/ListPackages',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PackageListQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PackageList.FromString,
+                _registered_method=True)
+        self.ListModels = channel.unary_unary(
+                '/cozy.worker.v1.WorkerControl/ListModels',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelListQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelList.FromString,
+                _registered_method=True)
+        self.DescribeMachine = channel.unary_unary(
+                '/cozy.worker.v1.WorkerControl/DescribeMachine',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DescribeMachineQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineDescription.FromString,
+                _registered_method=True)
         self.Control = channel.stream_stream(
                 '/cozy.worker.v1.WorkerControl/Control',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOwnerFrame.SerializeToString,
@@ -134,7 +154,9 @@ class WorkerControlServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def AcknowledgeMachineExecutionCollection(self, request, context):
-        """The owner holds every product of the log and the terminal: Runtime releases the log's holds.
+        """The owner holds every product of the log and the terminal. Wire 66: this means delivered, and
+        the products stay until the store's GC evicts them (delivered first); before 66 Runtime
+        released the log's holds here.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -144,6 +166,32 @@ class WorkerControlServicer(object):
         """The triage bundle one terminal attempt's outcome names, read over the same authenticated
         seam as the outcome.
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListMachineExecutions(self, request, context):
+        """Wire 66: the machine's own reads, authenticated like the calls above. A Runtime before 66
+        answers UNIMPLEMENTED, and its caller names the Runtime update for that read only.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListPackages(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListModels(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DescribeMachine(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -211,6 +259,26 @@ def add_WorkerControlServicer_to_server(servicer, server):
                     servicer.ReadMachineExecutionTriage,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriageQuery.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriage.SerializeToString,
+            ),
+            'ListMachineExecutions': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListMachineExecutions,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionListQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionList.SerializeToString,
+            ),
+            'ListPackages': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListPackages,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PackageListQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PackageList.SerializeToString,
+            ),
+            'ListModels': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListModels,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelListQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelList.SerializeToString,
+            ),
+            'DescribeMachine': grpc.unary_unary_rpc_method_handler(
+                    servicer.DescribeMachine,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DescribeMachineQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineDescription.SerializeToString,
             ),
             'Control': grpc.stream_stream_rpc_method_handler(
                     servicer.Control,
@@ -440,6 +508,114 @@ class WorkerControl(object):
             '/cozy.worker.v1.WorkerControl/ReadMachineExecutionTriage',
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriageQuery.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionTriage.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListMachineExecutions(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.WorkerControl/ListMachineExecutions',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionListQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListPackages(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.WorkerControl/ListPackages',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PackageListQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PackageList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListModels(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.WorkerControl/ListModels',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelListQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DescribeMachine(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.WorkerControl/DescribeMachine',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DescribeMachineQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineDescription.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1966,6 +2142,26 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
                 _registered_method=True)
+        self.ListMachineExecutions = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ListMachineExecutions',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionListQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionList.FromString,
+                _registered_method=True)
+        self.ListPackages = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ListPackages',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PackageListQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PackageList.FromString,
+                _registered_method=True)
+        self.ListModels = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ListModels',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelListQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelList.FromString,
+                _registered_method=True)
+        self.DescribeMachine = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/DescribeMachine',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DescribeMachineQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineDescription.FromString,
+                _registered_method=True)
 
 
 class PodHostServicer(object):
@@ -2208,6 +2404,34 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListMachineExecutions(self, request, context):
+        """Wire 66: the machine's truth, read directly. The Host forwards ListMachineExecutions and
+        ListPackages; it answers ListModels from its TensorFS store and DescribeMachine with its own
+        facts beside its Runtime's, so both work while the Runtime is stopped. A Host before 66
+        answers UNIMPLEMENTED; a Runtime before 66 leaves only the reads it serves unanswered.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListPackages(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListModels(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DescribeMachine(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PodHostServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -2380,6 +2604,26 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.LocalPackageUpload,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.SerializeToString,
+            ),
+            'ListMachineExecutions': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListMachineExecutions,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionListQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionList.SerializeToString,
+            ),
+            'ListPackages': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListPackages,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PackageListQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PackageList.SerializeToString,
+            ),
+            'ListModels': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListModels,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelListQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelList.SerializeToString,
+            ),
+            'DescribeMachine': grpc.unary_unary_rpc_method_handler(
+                    servicer.DescribeMachine,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DescribeMachineQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineDescription.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -3325,6 +3569,114 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/LocalPackageUpload',
             cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListMachineExecutions(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ListMachineExecutions',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionListQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListPackages(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ListPackages',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PackageListQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PackageList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListModels(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ListModels',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelListQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DescribeMachine(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/DescribeMachine',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DescribeMachineQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineDescription.FromString,
             options,
             channel_credentials,
             insecure,
