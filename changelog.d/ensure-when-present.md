@@ -1,0 +1,1 @@
+Model fetch uses TensorFS `ensure` when the installed TensorFS names `"ensure/1"` in `tensorfs.CAPABILITIES`: one flight per manifest across processes, disk admission that never evicts the preparation's own models, and the machine's Hub CA. An older TensorFS keeps `pull`. Delivered products are detected by `"deliver/1"` the same way.

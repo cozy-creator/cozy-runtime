@@ -112,6 +112,14 @@ def _same_origin(a: str, b: str) -> bool:
         return False
 
 
+def hub_ca(worker: Worker, origin: str) -> str | None:
+    """The private CA of this machine's own Hub, when it uses one; no other origin's."""
+    authority = worker.options.publication_authority
+    if authority is None or authority.ca is None or not _same_origin(authority.origin, origin):
+        return None
+    return str(authority.ca)
+
+
 def credential(worker: Worker, origin: str) -> str:
     """This machine's worker capability, for its own Hub only: there it reads its owner's
     unpublished checkpoints. Any other origin gets nothing, and a refusal is never retried
@@ -323,6 +331,7 @@ def materialize(
     store = fill.store(worker.workspace.store_root)
     pulled: dict[str, tuple[int, int]] = {}
     lock = threading.Lock()
+    keep = sorted({row.manifest.digest for row in selected})
 
     def report(digest: str, sample: Sample | None, available: int, total: int) -> None:
         if sample is not None:
@@ -350,19 +359,40 @@ def materialize(
                 store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
             except facade.errors.Refusal:
                 with downloading(row) as sample:
-                    facade.pull(
-                        store,
-                        row.public_origin,
-                        row.repository + "@" + manifest.digest,
-                        credential=credential(worker, row.public_origin),
-                        allowed_hosts=worker.config.object_storage_hosts,
-                        allow_local=local_development(worker),
-                        streams=8,
-                        cancellation=cancellation,
-                        progress=None
+                    moved = (
+                        None
                         if progress is None and sample is None
-                        else partial(report, manifest.digest, sample),
+                        else partial(report, manifest.digest, sample)
                     )
+                    if "ensure/1" in fill.capabilities():
+                        # TensorFS owns the fetch: one flight per manifest, disk admission
+                        # that never evicts this preparation's own models, the Hub CA.
+                        facade.ensure(
+                            store,
+                            row.repository + "@" + manifest.digest,
+                            hub=row.public_origin,
+                            credential=credential(worker, row.public_origin),
+                            ca_file=hub_ca(worker, row.public_origin),
+                            allowed_hosts=worker.config.object_storage_hosts,
+                            allow_local=local_development(worker),
+                            keep=keep,
+                            cancellation=cancellation,
+                            progress=None
+                            if moved is None
+                            else lambda event: moved(event["bytes_done"], event["bytes_total"]),
+                        )
+                    else:
+                        facade.pull(
+                            store,
+                            row.public_origin,
+                            row.repository + "@" + manifest.digest,
+                            credential=credential(worker, row.public_origin),
+                            allowed_hosts=worker.config.object_storage_hosts,
+                            allow_local=local_development(worker),
+                            streams=8,
+                            cancellation=cancellation,
+                            progress=moved,
+                        )
                 store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
 
     try:

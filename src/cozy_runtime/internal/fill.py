@@ -473,6 +473,12 @@ def tensorfs_module() -> ModuleType:
     return tensorfs
 
 
+def capabilities() -> frozenset[str]:
+    """The features this process's TensorFS build names (`tensorfs.CAPABILITIES`, e.g.
+    "ensure/1", "deliver/1"); an older build names none. Detected by name, never by version."""
+    return frozenset(getattr(tensorfs, "CAPABILITIES", ()))
+
+
 _stores: dict[tuple[int, str], Store] = {}
 _stores_lock = threading.Lock()
 

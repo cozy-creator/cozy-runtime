@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast
 
 from cozy_runtime.author._executor_requests import Answer, Publish, Published, refuse
 from cozy_runtime.internal import fill
@@ -38,10 +38,9 @@ SET, APPEND = pb.RUN_PRODUCT_OP_SET, pb.RUN_PRODUCT_OP_APPEND
 MAX_PARTS = 128
 
 
-@runtime_checkable
 class DeliveringStore(Protocol):
-    """A TensorFS store that tells delivered tree roots from live ones (TensorFS 0.3.78):
-    its GC may evict a delivered one under pressure, oldest delivery first."""
+    """A TensorFS store that tells delivered tree roots from live ones ("deliver/1"): its GC
+    may evict a delivered one under pressure, oldest delivery first."""
 
     def deliver_tree_root(self, owner: str) -> object: ...
 
@@ -326,10 +325,10 @@ class Products:
     def deliver(self, owner: str, request: str) -> None:
         """The owner holds the whole log. Its products stay until the store's GC evicts them;
         a store that cannot tell delivered bytes from live ones gets them released now."""
-        store = fill.store(self.workspace.store_root)
-        if not isinstance(store, DeliveringStore):
+        if "deliver/1" not in fill.capabilities():
             machine_models.release(self.workspace, owner, recipient(request))
             return
+        store = cast(DeliveringStore, fill.store(self.workspace.store_root))
         with self.workspace.locked() as db:
             rows = db.all(
                 machine_models.ModelHold,
