@@ -394,13 +394,10 @@ class Harness:
             self.root / ("grants-" + request_id),
             package_installation_id=binding.installation_id,
         )
-        owner.host.inbound.get_nowait()  # the helper's Claim is not transmitted
-        owner._dispatch()
-        offered = owner.host.inbound.get_nowait()
-        assert offered is not None
-        state = owner._desired_state()
+        offered = owner.offer()
+        state = owner.desired_state()
         state.job.orchestration = True
-        self.submit(offered.attempt_offer, state, canonical_json.encode(payload))
+        self.submit(offered, state, canonical_json.encode(payload))
         return self.settle(request_id)
 
 

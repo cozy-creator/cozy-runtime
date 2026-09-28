@@ -230,7 +230,7 @@ class SourceCalls:
         self,
         workspace: Workspace,
         owner: Callable[[], str],
-        send: Callable[[pb.WorkerFrame], None],
+        observe: Callable[[pb.NativeSourceStatus], None],
         current: Callable[[pb.NativeSourceCommand], bool],
         *,
         endpoints: dict[str, str] | None = None,
@@ -240,7 +240,7 @@ class SourceCalls:
         publication: Callable[[str, str, int], PublicationClient] | None = None,
         memo: OwnerMemo | None = None,
     ):
-        self.workspace, self.owner, self.send, self.current = workspace, owner, send, current
+        self.workspace, self.owner, self.observe, self.current = workspace, owner, observe, current
         self.memo = memo
         self.progress = progress
         # The latest failure detail per native call, for the machine child-call result.
@@ -405,7 +405,7 @@ class SourceCalls:
             status.selection.CopyFrom(selection)
         if byte_output is not None:
             status.byte_output.CopyFrom(byte_output)
-        self.send(pb.WorkerFrame(native_source_status=status))
+        self.observe(status)
 
     def active(self) -> set[str]:
         """Native calls running now; pressure reclamation never touches their bytes."""

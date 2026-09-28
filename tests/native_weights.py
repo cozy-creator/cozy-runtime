@@ -84,11 +84,9 @@ class NativeExecution:
                 invocation_spec_canonical_bytes=raw,
             ),
         )
-        self.frames: list[pb.WorkerFrame] = []
         self.owner = WeightsExchange(
             store_root=Path(store.root),
             workspace=workspace,
-            send=self.frames.append,
             stop=threading.Event(),
             owner_scope=lambda: "package-proof",
         )
@@ -113,10 +111,6 @@ class NativeExecution:
         row = self.owner.workspace.weights_row("package-proof", facts["transaction_id"])
         assert hashlib.sha256(row["declaration"]).hexdigest() == facts["declaration_digest"][7:]
         return cast(dict[str, Any], canonical_json.decode(row["declaration"]))
-
-    @property
-    def checkpointed(self) -> bool:
-        return any(frame.HasField("weights_checkpoint") for frame in self.frames)
 
     def exchange[A: Answer](self, request: Request, into: type[A], /) -> A:
         return seam(broker_lane(self.owner.writer_broker, self.attempt))(request, into)

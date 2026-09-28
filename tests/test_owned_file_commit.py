@@ -175,12 +175,12 @@ def test_commit_snapshots_large_file_replays_without_spool_and_ignores_parent_re
     tmp_path: Path,
 ) -> None:
     workspace, command, path, data = pending(tmp_path)
-    frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    frames: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
     calls = SourceCalls(
         workspace, lambda: "owner", frames.put, lambda _: True, spool_root=tmp_path / "spool"
     )
     calls.handle(command)
-    first = frames.get(timeout=30).native_source_status
+    first = frames.get(timeout=30)
     assert first.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, first.safe_code
     assert first.byte_output.content_bytes == len(data) > 48 << 10
     assert first.byte_output_attempt_ordinal == 1
@@ -194,7 +194,7 @@ def test_commit_snapshots_large_file_replays_without_spool_and_ignores_parent_re
     )
     path.unlink()
     calls.handle(command)
-    replay = frames.get(timeout=30).native_source_status
+    replay = frames.get(timeout=30)
     assert replay.byte_output == first.byte_output
     recipient = pb.NativeByteRetentionRequest(
         source=first.byte_output, retention_id="sha256:" + "ab" * 32
@@ -365,13 +365,13 @@ def test_interrupted_commit_reattaches_original_file_and_producer(
     spool = tmp_path / "spool" / opaque_key("attempt-input-spool", "script", 2)
     spool.mkdir(parents=True)
     (spool / "file-0001").write_bytes(data)
-    frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    frames: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
     restarted = Workspace(workspace.store_root)
     calls = SourceCalls(
         restarted, lambda: "owner", frames.put, lambda _: True, spool_root=tmp_path / "spool"
     )
     calls.handle(retry)
-    result = frames.get(timeout=30).native_source_status
+    result = frames.get(timeout=30)
     assert result.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, result.safe_code
     assert result.parent_attempt_ordinal == 2 and result.byte_output_attempt_ordinal == 1
     assert result.byte_output.producer_root_id == plan.view_owner
@@ -390,12 +390,12 @@ def test_explicit_reexport_retains_final_bytes_before_parent_service_release(
     tmp_path: Path, tree: bool, empty: bool
 ) -> None:
     workspace, command, path, data = pending(tmp_path, b"" if empty else None)
-    frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    frames: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
     calls = SourceCalls(
         workspace, lambda: "owner", frames.put, lambda _: True, spool_root=tmp_path / "spool"
     )
     calls.handle(command)
-    produced = frames.get(timeout=30).native_source_status
+    produced = frames.get(timeout=30)
     assert produced.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, produced.safe_code
     received = pb.NativeByteRetentionRequest(
         source=produced.byte_output, retention_id="sha256:" + "a1" * 32

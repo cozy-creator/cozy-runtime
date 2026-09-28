@@ -639,7 +639,6 @@ class Workspace:
                 )
             ]
 
-
     @staticmethod
     def _model_held(
         db: Journal, owner: str, source: pb.DerivedRetentionRequest, manifest: pb.Ref
@@ -1079,7 +1078,6 @@ class Workspace:
                 raise WorkspaceRefusal("workspace has no owned weights transaction")
             return row
 
-
     def ready_weights(self, owner: str, request: pb.WeightsIntentReadyRequest) -> WeightsRow:
         subject = request.weights
         with self.locked() as db:
@@ -1210,26 +1208,6 @@ class Workspace:
             slot=row["slot"],
             plan_digest=documents.spell(checkpoint.plan_digest),
         )
-
-    @staticmethod
-    def status(value: WeightsRow) -> pb.WeightsTransactionStatus:
-        status = pb.WeightsTransactionStatus(
-            weights_transaction_id=value["id"],
-            request_id=value["request"],
-            attempt_ordinal=value["ordinal"],
-            invocation_spec_digest=documents.spell(value["spec"]),
-            output_slot=value["slot"],
-            writer_epoch=value["epoch"],
-            state=pb.WEIGHTS_TRANSACTION_STATE_RECEIPT
-            if value["receipt"]
-            else pb.WEIGHTS_TRANSACTION_STATE_INTENT,
-            tensorfs_declaration_digest=value["declaration_digest"],
-            weights_receipt_digest=value["receipt_digest"],
-            intent_ready=bool(value["ready"]),
-        )
-        if value["checkpoint"]:
-            status.checkpoint.CopyFrom(pb.CheckpointRef.FromString(value["checkpoint"]))
-        return status
 
     def reserve_hold(
         self,

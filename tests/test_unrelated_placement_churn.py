@@ -173,11 +173,8 @@ def test_a_queued_call_survives_another_roots_placement_removal(
                 root / "grants",
                 package_installation_id=binding.installation_id,
             )
-            owner.host.inbound.get_nowait()
-            owner._dispatch()
-            offered = owner.host.inbound.get_nowait()
-            assert offered is not None
-            state = owner._desired_state()
+            offered = owner.offer()
+            state = owner.desired_state()
             state.job.orchestration = True
             client = rpc.WorkerControlStub(
                 grpc.insecure_channel((root / "address").read_text().strip())
@@ -188,7 +185,7 @@ def test_a_queued_call_survives_another_roots_placement_removal(
                     submission_id="A",
                     capture_digest=capture_digest,
                     capture_canonical_bytes=captured,
-                    offer=offered.attempt_offer,
+                    offer=offered,
                     prepared_state=state,
                     payload_canonical_bytes=canonical_json.encode({}),
                     expected_execution_workspace_id=client.GetMachineExecutionWorkspace(

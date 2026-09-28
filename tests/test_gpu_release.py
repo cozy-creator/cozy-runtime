@@ -359,11 +359,8 @@ def test_a_workflow_releases_from_its_executor_and_b_starts_during_its_cpu_tail(
                 root / "grants",
                 package_installation_id=binding.installation_id,
             )
-            owner.host.inbound.get_nowait()
-            owner._dispatch()
-            offered = owner.host.inbound.get_nowait()
-            assert offered is not None
-            state = owner._desired_state()
+            offered = owner.offer()
+            state = owner.desired_state()
             state.job.orchestration = True
             client = rpc.WorkerControlStub(
                 grpc.insecure_channel((root / "address").read_text().strip())
@@ -374,7 +371,7 @@ def test_a_workflow_releases_from_its_executor_and_b_starts_during_its_cpu_tail(
                     submission_id="root",
                     capture_digest=capture_digest,
                     capture_canonical_bytes=captured,
-                    offer=offered.attempt_offer,
+                    offer=offered,
                     prepared_state=state,
                     payload_canonical_bytes=canonical_json.encode({}),
                     expected_execution_workspace_id=client.GetMachineExecutionWorkspace(

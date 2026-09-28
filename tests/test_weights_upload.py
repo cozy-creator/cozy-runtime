@@ -84,7 +84,6 @@ def exchange(tmp_path: Path, *, allow_private: bool) -> weights.WeightsExchange:
     """One exchange already holding a committed receipt for the manifest object."""
     made = weights.WeightsExchange(
         store_root=tmp_path,
-        send=lambda _frame: None,
         stop=threading.Event(),
         owner_scope=lambda: "test-owner",
         allow_private_egress=allow_private,
@@ -216,7 +215,6 @@ def test_native_output_leases_belong_only_to_active_transfers(tmp_path: Path) ->
     )
     exchange = weights.WeightsExchange(
         store_root=tmp_path / "store",
-        send=lambda _: None,
         stop=threading.Event(),
         owner_scope=lambda: "resume-proof",
         allow_private_egress=True,

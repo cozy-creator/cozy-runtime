@@ -537,7 +537,6 @@ class AttemptEngine:
         jobs: Mapping[str, JobBinding],
         spool_root: Path,
         instance_id: str,
-        send: Callable[[pb.WorkerFrame], None],
         progress: Callable[[str, int, dict[str, Any]], None],
         dispatched: Callable[[AttemptRecord], None] = lambda attempt: None,
         bundles: triage.BundleStore,
@@ -557,7 +556,6 @@ class AttemptEngine:
         self.job_device_count = 0
         self.spool_root = spool_root
         self.instance_id = instance_id
-        self.send = send
         self.progress = progress
         #: journals that execution STARTED, immediately before the executor is handed the
         #: command: the one boundary between work the machine never got and work it ran
@@ -1574,25 +1572,6 @@ class AttemptEngine:
         )
         self.records.append("job_checkpoint", msgspec.to_builtins(record))
         self.receipts[key] = record
-        # The RecordOwner's copy rides the DURABLE control lane, after the worker's own
-        # record, at-least-once like every other control message. `artifact` stays
-        # UNSET: this checkpoint declaration does not have a native writer to fill
-        # it, so the RecordOwner is being told an attempt DECLARED a checkpoint and nothing
-        # more (#552/#553a).
-        # The envelope is stamped centrally by the worker's `send` (#454: three fields, one
-        # stamp — no constructor can forget one).
-        self.send(
-            pb.WorkerFrame(
-                checkpoint_request=pb.JobCheckpointRequest(
-                    request_id=attempt.request_id,
-                    attempt_ordinal=attempt.attempt,
-                    operation_key=operation_key,
-                    logical_key=logical_key,
-                    content_digest=documents.raw(content_digest),
-                    seq=len(self.receipts),
-                )
-            )
-        )
         attempt.ring.emit(
             "log",
             f"checkpoint {logical_key!r} DECLARED (bytes not stored: no weights sink)",

@@ -83,12 +83,12 @@ def test_runtime_refuses_only_the_commit_carrying_an_unknown_option(tmp_path: Pa
     workspace, command, _, data = pending(tmp_path)
     arguments = canonical_json.decode(command.parent_call.request_canonical_bytes)
     replace_arguments(command, {**arguments, "overwrite": True})
-    frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    frames: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
     calls = SourceCalls(
         workspace, lambda: "owner", frames.put, lambda _: True, spool_root=tmp_path / "spool"
     )
     calls.handle(command)
-    refused = frames.get(timeout=30).native_source_status
+    refused = frames.get(timeout=30)
     assert refused.state == pb.NATIVE_SOURCE_STATE_FAILED
     assert refused.safe_code == "commit_request_unsupported"
     assert "does not support overwrite" in refused.safe_detail and UPDATE in refused.safe_detail
@@ -113,7 +113,7 @@ def test_runtime_refuses_only_the_commit_carrying_an_unknown_option(tmp_path: Pa
     second.service_id = workspace_sources.identity("owner", "script", 2)
     replace_arguments(second, {**arguments, "slot": "file/0002"})
     calls.handle(second)
-    committed = frames.get(timeout=30).native_source_status
+    committed = frames.get(timeout=30)
     assert committed.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, committed.safe_code
     assert committed.byte_output.content_bytes == len(data)
     assert hashlib.sha256(data).hexdigest() in committed.result_canonical_bytes.decode()

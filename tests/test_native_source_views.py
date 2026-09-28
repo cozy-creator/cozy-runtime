@@ -21,12 +21,12 @@ from test_workspace_native_memo import accepted, completed
 
 
 def run_view(workspace: Workspace, command: pb.NativeSourceCommand) -> pb.NativeSourceStatus:
-    frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    frames: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
     calls = SourceCalls(workspace, lambda: "owner", frames.put, lambda _: True)
     calls.handle(command)
     with calls.lock:
         done = calls.tasks.get(command.service_id)
-    result = frames.get(timeout=30).native_source_status
+    result = frames.get(timeout=30)
     if done is not None:
         assert done.wait(30)
     return result
@@ -135,17 +135,17 @@ def test_source_view_replays_one_producer_and_retained_child_survives_parent_ack
     source = accepted(workspace, "script")
     value, _ = completed(workspace, source, b"metadata bytes")
     command = view_call(source, value)
-    frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    frames: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
     detached_before_reply: list[bool] = []
 
-    def receive(frame: pb.WorkerFrame) -> None:
+    def receive(status: pb.NativeSourceStatus) -> None:
         with calls.lock:
             detached_before_reply.append(command.service_id not in calls.tasks)
-        frames.put(frame)
+        frames.put(status)
 
     calls = SourceCalls(workspace, lambda: "owner", receive, lambda _: True)
     calls.handle(command)
-    first = frames.get(timeout=30).native_source_status
+    first = frames.get(timeout=30)
     assert detached_before_reply == [True]
     assert first.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, first.safe_code
     assert first.HasField("byte_output")
@@ -155,7 +155,7 @@ def test_source_view_replays_one_producer_and_retained_child_survives_parent_ack
     )
     assert first.byte_output.content_bytes == len(b"metadata bytes")
     calls.handle(command)
-    repeated = frames.get(timeout=30).native_source_status
+    repeated = frames.get(timeout=30)
     assert repeated.byte_output == first.byte_output
     assert repeated.native_receipt_canonical_bytes == first.native_receipt_canonical_bytes
     with workspace.locked() as db:
@@ -215,10 +215,10 @@ def test_source_view_rejects_forged_producer_without_reserving_bytes(tmp_path: P
     forged = canonical_json.decode(value)
     forged["producer_request_id"] = "another-source"
     command = view_call(source, canonical_json.encode(forged))
-    frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    frames: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
     calls = SourceCalls(workspace, lambda: "owner", frames.put, lambda _: True)
     calls.handle(command)
-    assert frames.get(timeout=30).native_source_status.state == pb.NATIVE_SOURCE_STATE_FAILED
+    assert frames.get(timeout=30).state == pb.NATIVE_SOURCE_STATE_FAILED
     with workspace.locked() as db:
         assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 0
 

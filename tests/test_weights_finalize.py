@@ -242,9 +242,7 @@ def test_abandon_drops_upload_lease_and_late_receipt_cannot_reopen_it(tmp_path: 
         request_id=request.request_id,
         invocation_spec_digest="sha256:" + request.invocation_spec_digest.hex(),
     )
-    exchange = WeightsExchange(
-        store_root=root, send=lambda _frame: None, stop=Event(), owner_scope=lambda: "owner"
-    )
+    exchange = WeightsExchange(store_root=root, stop=Event(), owner_scope=lambda: "owner")
     exchange._hold(_transaction(request), 1, reference)
     request.disposition = pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON
     request.scratch_root_id = ""
@@ -260,8 +258,6 @@ def test_abandon_drops_upload_lease_and_late_receipt_cannot_reopen_it(tmp_path: 
     assert _transaction(request) not in exchange._held
     with pytest.raises(WeightsExchangeError, match="released"):
         exchange._hold(_transaction(request), 1, reference)
-    restarted = WeightsExchange(
-        store_root=root, send=lambda _frame: None, stop=Event(), owner_scope=lambda: "owner"
-    )
+    restarted = WeightsExchange(store_root=root, stop=Event(), owner_scope=lambda: "owner")
     with pytest.raises(WeightsExchangeError, match="released"):
         restarted._hold(_transaction(request), 1, reference)

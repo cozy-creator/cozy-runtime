@@ -291,27 +291,22 @@ def test_real_native_tree_rpc_stream_is_membership_checked(tmp_path: Path) -> No
                 pb.NativeByteRetentionCall(claim=claim, request=hold)
             )
             assert held.source == source and not held.released
-            transfers = NativeArtifactTransfers(
-                workspace, lambda: "owner", lambda _: None, lambda _: True
-            )
-            try:
-                inventory = transfers.execute(
-                    pb.NativeArtifactTransfer(
-                        effect_id="attachment",
-                        command_id=1,
-                        byte_source=hold,
-                        manifest=source.manifest,
-                        limit=32,
-                    )
+            transfers = NativeArtifactTransfers(workspace, lambda: "owner")
+            inventory = transfers.execute(
+                pb.NativeArtifactTransfer(
+                    effect_id="attachment",
+                    command_id=1,
+                    byte_source=hold,
+                    manifest=source.manifest,
+                    limit=32,
                 )
-                assert not inventory.safe_code and inventory.byte_source == hold
-                assert not inventory.HasField("source")
-                assert {obj.object_id for obj in inventory.objects} == {
-                    documents.spell(source.manifest.digest),
-                    documents.spell(hashlib.sha256(data).digest()),
-                }
-            finally:
-                transfers.close()
+            )
+            assert not inventory.safe_code and inventory.byte_source == hold
+            assert not inventory.HasField("source")
+            assert {obj.object_id for obj in inventory.objects} == {
+                documents.spell(source.manifest.digest),
+                documents.spell(hashlib.sha256(data).digest()),
+            }
             read = pb.NativeByteReadCall(
                 claim=claim,
                 source=hold,

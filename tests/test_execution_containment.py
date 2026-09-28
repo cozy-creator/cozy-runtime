@@ -186,11 +186,8 @@ def submit(
         root / f"grants-{request_id}",
         package_installation_id=binding.installation_id,
     )
-    owner.host.inbound.get_nowait()
-    owner._dispatch()
-    offered = owner.host.inbound.get_nowait()
-    assert offered is not None
-    state = owner._desired_state()
+    offered = owner.offer()
+    state = owner.desired_state()
     state.job.orchestration = True
     client.SubmitMachineExecution(
         pb.MachineExecutionSubmit(
@@ -198,7 +195,7 @@ def submit(
             submission_id=request_id,
             capture_digest=capture[1],
             capture_canonical_bytes=capture[0],
-            offer=offered.attempt_offer,
+            offer=offered,
             prepared_state=state,
             payload_canonical_bytes=canonical_json.encode(payload),
             expected_execution_workspace_id=client.GetMachineExecutionWorkspace(

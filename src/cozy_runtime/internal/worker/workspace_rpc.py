@@ -50,8 +50,6 @@ class Service:
             held = self._transfers[owner] = artifact_transfer.NativeArtifactTransfers(
                 self.workspace,
                 lambda: owner,
-                lambda _frame: None,
-                lambda _command: True,
                 allow_private_egress=self.allow_private_egress,
             )
         return held

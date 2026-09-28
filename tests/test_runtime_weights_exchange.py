@@ -1,4 +1,4 @@
-"""Native custody is committed by Runtime before ordered control observations.
+"""Native custody is committed by the Runtime's workspace journal, never by a Host ACK.
 
 The loopback preparation RPC checks exact restored checkpoint identity. There is
 no supervisor ACK authority and no fallback execution lane.
@@ -10,7 +10,7 @@ import io
 import threading
 from collections.abc import Iterator
 from concurrent import futures
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,35 +69,11 @@ class Fence:
 
 
 @dataclass
-class ControlLane:
-    fence: Fence
-    workspace: Workspace
-    frames: list[pb.WorkerFrame] = field(default_factory=list)
-
-    def send(self, frame: pb.WorkerFrame) -> None:
-        kind = frame.WhichOneof("msg")
-        assert kind is not None
-        self.fence.stamp(getattr(frame, kind))
-        if kind == "weights_intent":
-            observed = frame.weights_intent
-            row = self.workspace.weights_row(OWNER, observed.weights_transaction_id)
-            assert row["epoch"] == observed.requested_writer_epoch > 0
-        if kind == "weights_receipt":
-            observed_receipt = frame.weights_receipt
-            row = self.workspace.weights_row(OWNER, observed_receipt.weights_transaction_id)
-            assert (
-                row["receipt"] == observed_receipt.weights_receipt.weights_receipt_canonical_bytes
-            )
-        self.frames.append(frame)
-
-
-@dataclass
 class Rig:
     exchange: weights.WeightsExchange
     workspace: Workspace
     store: Any
     fence: Fence
-    control: ControlLane
     preparation: Any
     invocation: bytes
     declaration: bytes
@@ -148,11 +124,9 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
     store = tensorfs.Store.init(tmp_path / "store")
     workspace = Workspace(Path(store.root))
     fence = Fence()
-    control = ControlLane(fence, workspace)
     exchange = weights.WeightsExchange(
         store_root=Path(store.root),
         workspace=workspace,
-        send=control.send,
         stamp=fence.stamp,
         stop=threading.Event(),
         owner_scope=lambda: OWNER,
@@ -196,7 +170,6 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
             workspace,
             store,
             fence,
-            control,
             pb_grpc.RuntimePreparationStub(channel),
             invocation,
             declaration,
@@ -251,20 +224,15 @@ def ready(rig: Rig, checkpoint: pb.CheckpointRef | None = None) -> pb.WeightsInt
     return value
 
 
-def test_intent_uses_durable_epoch_and_ordered_control_without_host_ack(rig: Rig) -> None:
+def test_intent_uses_a_durable_epoch_without_host_ack(rig: Rig) -> None:
     attempt = rig.accept()
     first = rig.intent(attempt)
     assert first == 1
-    assert [frame.WhichOneof("msg") for frame in rig.control.frames] == [
-        "weights_intent",
-        "weights_transaction",
-    ]
-    assert rig.control.frames[-1].weights_transaction.intent_ready
+    assert rig.workspace.weights_row(OWNER, TRANSACTION)["ready"]
     # Stream reconnection cannot allocate or grant a new native writer epoch.
     rig.fence.control_stream_epoch += 1
     second = rig.intent(attempt)
     assert second == first
-    assert rig.control.frames[-2].weights_intent.control_stream_epoch == 2
     assert Workspace(Path(rig.store.root)).weights_row(OWNER, TRANSACTION)["epoch"] == 1
 
 
@@ -379,25 +347,21 @@ def test_native_receipt_is_durable_before_control_observation(rig: Rig) -> None:
     receipt = receipt_from_native(
         OUTPUT_SLOT, facts["transaction_id"], facts, replayed=False, request_id=attempt.request_id
     )
-    assert [f.WhichOneof("msg") for f in rig.control.frames] == [
-        "weights_intent",
-        "weights_transaction",
-        "weights_receipt",
-        "weights_transaction",
-    ]
     row = rig.workspace.weights_row(OWNER, receipt.weights_transaction_id)
     assert row["state"] == "receipt"
     assert rig.store.derived_lookup(receipt.weights_transaction_id)["state"] == "committed"
-    observed = rig.control.frames[2].weights_receipt
+    recorded = bytes(row["receipt"])
     with pytest.raises(weights.WeightsExchangeError):
         rig.exchange.receipt(
             attempt,
             output_slot=OUTPUT_SLOT,
             transaction_id=receipt.weights_transaction_id,
-            receipt_digest=observed.weights_receipt.weights_receipt_digest,
-            canonical_receipt=observed.weights_receipt.weights_receipt_canonical_bytes + b" ",
+            receipt_digest=sha256(recorded).digest(),
+            canonical_receipt=recorded + b" ",
         )
-    assert len(rig.control.frames) == 4
+    assert bytes(rig.workspace.weights_row(OWNER, receipt.weights_transaction_id)["receipt"]) == (
+        recorded
+    )
 
 
 @pytest.mark.parametrize(

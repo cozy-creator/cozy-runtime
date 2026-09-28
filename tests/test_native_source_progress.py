@@ -81,11 +81,13 @@ def origin(body: bytes, pieces: int, pause: threading.Event, gap: float) -> Iter
 
 
 def resolved(
-    calls: SourceCalls, messages: queue.Queue[pb.WorkerFrame], command: pb.NativeSourceCommand
+    calls: SourceCalls,
+    messages: queue.Queue[pb.NativeSourceStatus],
+    command: pb.NativeSourceCommand,
 ) -> pb.NativeSourceCommand:
     command.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
     calls.handle(command)
-    status = messages.get(timeout=60).native_source_status
+    status = messages.get(timeout=60)
     assert status.state == pb.NATIVE_SOURCE_STATE_RESOLVED, status.safe_code
     command.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
     command.selection.CopyFrom(status.selection)
@@ -120,7 +122,7 @@ def test_download_and_conversion_report_bytes_rate_and_stage_timings(tmp_path: P
     body = (FIXTURE / "first.safetensors").read_bytes()
     with origin(body, 4, threading.Event(), 0.8) as port:
         workspace = Workspace(tmp_path / "store")
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         frames: list[tuple[str, int, int, dict[str, Any]]] = []
         calls = SourceCalls(
             workspace,
@@ -133,10 +135,10 @@ def test_download_and_conversion_report_bytes_rate_and_stage_timings(tmp_path: P
         )
         source = resolved(calls, messages, accepted(workspace, "ingest"))
         calls.handle(source)
-        downloaded = messages.get(timeout=60).native_source_status
+        downloaded = messages.get(timeout=60)
         assert downloaded.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, downloaded.safe_code
         calls.handle(conversion(source, downloaded.result_canonical_bytes))
-        converted = messages.get(timeout=60).native_source_status
+        converted = messages.get(timeout=60)
         assert converted.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, converted.safe_code
 
     # Every frame reaches the parent attempt's lane under its own call index.
@@ -169,7 +171,7 @@ def test_crashed_source_worker_failure_carries_its_signal_and_stderr_tail(tmp_pa
     held = threading.Event()
     with origin(body, 2, held, 60) as port:
         workspace = Workspace(tmp_path / "store")
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         frames: list[tuple[str, int, int, dict[str, Any]]] = []
         calls = SourceCalls(
             workspace,
@@ -189,7 +191,7 @@ def test_crashed_source_worker_failure_carries_its_signal_and_stderr_tail(tmp_pa
             assert process is not None
         # A native fault: the worker's own fault handler writes every thread's stack.
         os.kill(process.pid, signal.SIGSEGV)
-        failed = messages.get(timeout=60).native_source_status
+        failed = messages.get(timeout=60)
     assert failed.state == pb.NATIVE_SOURCE_STATE_FAILED
     assert failed.safe_code == "native_source_failed"
     # The fault's headline and the newest stack frames both survive the 1 KiB detail.

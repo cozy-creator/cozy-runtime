@@ -7,7 +7,6 @@ import io
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from typing import BinaryIO, cast
 from urllib.parse import urlparse
 
@@ -39,62 +38,13 @@ class NativeArtifactTransfers:
         self,
         workspace: Workspace,
         owner: Callable[[], str],
-        send: Callable[[pb.WorkerFrame], None],
-        valid: Callable[[pb.NativeArtifactTransfer], bool],
         *,
         allow_private_egress: bool = False,
     ) -> None:
-        self.workspace, self.owner, self.send, self.valid = workspace, owner, send, valid
+        self.workspace, self.owner = workspace, owner
         self.allow_private_egress = allow_private_egress
-        self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="native-artifact")
         self.lock = threading.Lock()
-        self.active: dict[tuple[str, int, int, str, str, int], bytes] = {}
         self.closures: OrderedDict[tuple[str, bool], _Closure] = OrderedDict()
-
-    def handle(self, command: pb.NativeArtifactTransfer) -> None:
-        if not self.valid(command):
-            raise WorkspaceRefusal("native artifact command has a stale claim")
-        copied = pb.NativeArtifactTransfer.FromString(command.SerializeToString())
-        key = (
-            self.owner(),
-            command.record_owner_epoch,
-            command.control_stream_epoch,
-            command.worker_boot_id,
-            command.effect_id,
-            command.command_id,
-        )
-        fingerprint = hashlib.sha256(copied.SerializeToString(deterministic=True)).digest()
-        refusal = ""
-        with self.lock:
-            previous = self.active.get(key)
-            if previous == fingerprint:
-                return
-            if previous is not None:
-                refusal = "native_artifact_refused"
-            elif len(self.active) >= 32:
-                refusal = "native_artifact_busy"
-            else:
-                self.active[key] = fingerprint
-        if refusal:
-            result = self._status(copied)
-            result.outcome = pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
-            result.safe_code = refusal
-            result.safe_detail = "native artifact command changed or has no available transfer slot"
-            self.send(pb.WorkerFrame(native_artifact_transfer_status=result))
-            return
-
-        def run() -> None:
-            try:
-                result = self.execute(copied)
-                self.send(pb.WorkerFrame(native_artifact_transfer_status=result))
-            finally:
-                with self.lock:
-                    self.active.pop(key, None)
-
-        self.pool.submit(run)
-
-    def close(self) -> None:
-        self.pool.shutdown(wait=False, cancel_futures=True)
 
     def _held(self, command: pb.NativeArtifactTransfer) -> Callable[[], bool]:
         """Check the retained owner obligation; the native retention keeps the closure.
@@ -103,8 +53,7 @@ class NativeArtifactTransfers:
         """
         source = command.source
         if (
-            not self.valid(command)
-            or not command.effect_id
+            not command.effect_id
             or len(command.effect_id) > 128
             or not command.command_id
             or len(command.manifest.digest) != 32
@@ -167,8 +116,7 @@ class NativeArtifactTransfers:
             trees = command.HasField("byte_source")
             if trees:
                 if (
-                    not self.valid(command)
-                    or not command.effect_id
+                    not command.effect_id
                     or len(command.effect_id) > 128
                     or not command.command_id
                     or command.manifest != command.byte_source.source.manifest

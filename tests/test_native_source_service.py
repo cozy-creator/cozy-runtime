@@ -62,7 +62,7 @@ def test_native_source_resolve_execute_and_independent_parent_cache(tmp_path: Pa
     thread.start()
     try:
         workspace = Workspace(tmp_path / "store")
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         calls = SourceCalls(
             workspace,
             lambda: "owner",
@@ -75,12 +75,12 @@ def test_native_source_resolve_execute_and_independent_parent_cache(tmp_path: Pa
             command = accepted(workspace, parent)
             command.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
             calls.handle(command)
-            resolved = messages.get(timeout=30).native_source_status
+            resolved = messages.get(timeout=30)
             assert resolved.state == pb.NATIVE_SOURCE_STATE_RESOLVED, resolved.safe_code
             command.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
             command.selection.CopyFrom(resolved.selection)
             calls.handle(command)
-            result = messages.get(timeout=30).native_source_status
+            result = messages.get(timeout=30)
             assert result.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, result.safe_code
             assert result.memo_hit is (parent == "edited-script")
             if original is None:
@@ -154,7 +154,7 @@ def test_real_retained_source_conversion_reuses_and_registry_edit_invalidates(
     thread.start()
     try:
         workspace = Workspace(tmp_path / "store")
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         calls = SourceCalls(
             workspace,
             lambda: "owner",
@@ -172,12 +172,12 @@ def test_real_retained_source_conversion_reuses_and_registry_edit_invalidates(
             source = accepted(workspace, parent)
             source.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
             calls.handle(source)
-            resolution = messages.get(timeout=30).native_source_status
+            resolution = messages.get(timeout=30)
             assert resolution.state == pb.NATIVE_SOURCE_STATE_RESOLVED, resolution.safe_code
             source.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
             source.selection.CopyFrom(resolution.selection)
             calls.handle(source)
-            downloaded = messages.get(timeout=30).native_source_status
+            downloaded = messages.get(timeout=30)
             assert downloaded.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, downloaded.safe_code
             command = pb.NativeSourceCommand()
             command.CopyFrom(source)
@@ -201,7 +201,7 @@ def test_real_retained_source_conversion_reuses_and_registry_edit_invalidates(
             ).digest()
             command.service_id = workspace_sources.identity("owner", parent, 1)
             calls.handle(command)
-            converted = messages.get(timeout=30).native_source_status
+            converted = messages.get(timeout=30)
             assert converted.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, converted.safe_code
             assert converted.memo_hit is (index == 1)
             result = canonical_json.decode(converted.result_canonical_bytes)
@@ -302,7 +302,7 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
     thread.start()
     try:
         workspace = Workspace(tmp_path / "store")
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         calls = SourceCalls(
             workspace,
             lambda: "owner",
@@ -314,7 +314,7 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
         first = accepted(workspace, "crashing-script")
         first.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
         calls.handle(first)
-        resolved = messages.get(timeout=30).native_source_status
+        resolved = messages.get(timeout=30)
         assert resolved.state == pb.NATIVE_SOURCE_STATE_RESOLVED
         first.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         first.selection.CopyFrom(resolved.selection)
@@ -324,7 +324,7 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
         second = accepted(workspace, "corrected-script")
         second.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
         calls.handle(second)
-        resolved = messages.get(timeout=30).native_source_status
+        resolved = messages.get(timeout=30)
         assert resolved.state == pb.NATIVE_SOURCE_STATE_RESOLVED
         deadline = time.monotonic() + 60
         while not any(frame.get("position") == checkpoint for frame in frames):
@@ -334,13 +334,13 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(
             process = calls.processes[first.service_id]
             assert process is not None
             process.kill()
-        stopped = messages.get(timeout=30).native_source_status
+        stopped = messages.get(timeout=30)
         assert stopped.state == pb.NATIVE_SOURCE_STATE_FAILED
         release.set()
         second.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         second.selection.CopyFrom(resolved.selection)
         calls.handle(second)
-        finished = messages.get(timeout=30).native_source_status
+        finished = messages.get(timeout=30)
         assert finished.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, finished.safe_code
         assert not finished.memo_hit
         # Exactly the bytes the killed script had not made durable are fetched again.
@@ -392,7 +392,7 @@ def test_permanent_ack_releases_native_producer_and_access_but_keeps_cache(tmp_p
     stopped = pb.NativeSourceCommand()
     stopped.CopyFrom(command)
     stopped.phase = pb.NATIVE_SOURCE_PHASE_CANCEL
-    messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
     calls = SourceCalls(workspace, lambda: "owner", messages.put, lambda _: True)
     calls.handle(stopped)
     ack = pb.AttemptOutcomeAck(
@@ -591,7 +591,7 @@ def test_several_reviewed_profiles_compose_one_model_and_memoize(tmp_path: Path)
     thread.start()
     try:
         workspace = Workspace(tmp_path / "store")
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         calls = SourceCalls(
             workspace,
             lambda: "owner",
@@ -605,12 +605,12 @@ def test_several_reviewed_profiles_compose_one_model_and_memoize(tmp_path: Path)
             source = accepted(workspace, parent, {"carriers": sorted(files)})
             source.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
             calls.handle(source)
-            resolution = messages.get(timeout=30).native_source_status
+            resolution = messages.get(timeout=30)
             assert resolution.state == pb.NATIVE_SOURCE_STATE_RESOLVED, resolution.safe_code
             source.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
             source.selection.CopyFrom(resolution.selection)
             calls.handle(source)
-            downloaded = messages.get(timeout=30).native_source_status
+            downloaded = messages.get(timeout=30)
             assert downloaded.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, downloaded.safe_code
             command = pb.NativeSourceCommand()
             command.CopyFrom(source)
@@ -631,7 +631,7 @@ def test_several_reviewed_profiles_compose_one_model_and_memoize(tmp_path: Path)
             ).digest()
             command.service_id = workspace_sources.identity("owner", parent, 1)
             calls.handle(command)
-            return messages.get(timeout=30).native_source_status
+            return messages.get(timeout=30)
 
         profiles = ["fixture/first/1", "fixture/second/1"]
         both: dict[str, object] = {"profiles": profiles}

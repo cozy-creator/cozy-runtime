@@ -25,7 +25,6 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal import egress, fill, weights_sink
 from cozy_runtime.internal.weights_writer import WriterAttempt, WriterBinding, WriterBroker
 from cozy_runtime.internal.worker.workspace import WeightsTransaction, Workspace
-from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -127,7 +126,6 @@ class WeightsExchange:
         self,
         *,
         store_root: Path | None,
-        send: Callable[[pb.WorkerFrame], None],
         stop: threading.Event,
         owner_scope: Callable[[], str],
         stamp: Callable[[pb.WeightsIntentFrame], pb.WeightsIntentFrame] | None = None,
@@ -135,8 +133,6 @@ class WeightsExchange:
         allow_private_egress: bool = False,
         workspace: Workspace | None = None,
     ) -> None:
-        #: Native observations and outcomes share the ordered WorkerControl stream.
-        self.send = send
         #: The current owner envelope qualifies restore and object transfer requests.
         #: The identity default is used only by isolated native transport tests.
         self.stamp = stamp or (lambda message: message)
@@ -227,35 +223,25 @@ class WeightsExchange:
             index=observed.index,
             bytes=observed.bytes,
         )
-        frame = pb.WorkerFrame(
-            weights_checkpoint=pb.WeightsCheckpointFrame(
-                request_id=attempt.request_id,
-                attempt_ordinal=attempt.attempt,
-                invocation_spec_digest=attempt.digest,
-                output_slot=binding.slot,
-                weights_transaction_id=transaction,
-                writer_epoch=binding.epoch,
-                tensorfs_declaration_digest=binding.declaration_digest,
-                checkpoint=checkpoint,
-            )
+        observed_checkpoint = pb.WeightsCheckpointFrame(
+            request_id=attempt.request_id,
+            attempt_ordinal=attempt.attempt,
+            invocation_spec_digest=attempt.digest,
+            output_slot=binding.slot,
+            weights_transaction_id=transaction,
+            writer_epoch=binding.epoch,
+            tensorfs_declaration_digest=binding.declaration_digest,
+            checkpoint=checkpoint,
         )
         if self.workspace is None:
             raise WeightsExchangeError("workspace_unavailable", "worker has no workspace custody")
         try:
-            self.workspace.checkpoint(self.owner_scope(), frame.weights_checkpoint)
+            self.workspace.checkpoint(self.owner_scope(), observed_checkpoint)
         except Exception as exc:
             raise WeightsExchangeError(
                 str(getattr(exc, "code", "workspace_refused")),
                 "workspace checkpoint recording refused",
             ) from exc
-        self.send(frame)
-        self.send(
-            pb.WorkerFrame(
-                weights_transaction=self.workspace.status(
-                    self.workspace.weights_row(self.owner_scope(), transaction)
-                )
-            )
-        )
 
     def _checkpoint_pending(
         self,
@@ -369,14 +355,7 @@ class WeightsExchange:
         try:
             row = self.workspace.begin_weights(self.owner_scope(), intent)
             epoch = int(row["epoch"])
-            intent.requested_writer_epoch = epoch
-            if len(declaration) > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES:
-                # Over the Host's inline bound the declaration rides by reference: its
-                # digest and length; the workspace journal above holds the bytes.
-                intent.ClearField("tensorfs_declaration_canonical_bytes")
-            # One FIFO carries the projection and its eventual outcome. The
-            # native writer is authorized by Workspace, never by a Host ACK.
-            self.send(pb.WorkerFrame(weights_intent=intent))
+            # The native writer is authorized by Workspace, never by a Host ACK.
             ready = pb.WeightsIntentReadyRequest(
                 attempt_ordinal=attempt.attempt,
                 weights=pb.WeightsCheckpointSubject(
@@ -393,26 +372,15 @@ class WeightsExchange:
             try:
                 row = self.workspace.ready_weights(self.owner_scope(), ready)
             except Exception as exc:
-                if not ready.HasField("checkpoint") or getattr(exc, "code", None) not in {
+                if ready.HasField("checkpoint") and getattr(exc, "code", None) in {
                     "ROOT_ABSENT",
                     "OBJECT_ABSENT",
                 }:
-                    raise
-                if Executions(self.workspace).owns(self.owner_scope(), attempt.request_id):
                     raise WeightsExchangeError(
                         "weights_checkpoint_unavailable",
                         "accepted execution checkpoint is unavailable",
                     ) from exc
-                self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(row)))
-                # An owner may restore an acknowledged remote checkpoint. Its
-                # Ready RPC commits to the same journal; no network wait owns a lock.
-                while not row["ready"]:
-                    if attempt.canceling or self.stop.wait(0.05):
-                        raise WeightsExchangeError(
-                            "weights_canceled", "writer restoration stopped"
-                        ) from exc
-                    row = self.workspace.weights_row(self.owner_scope(), transaction_id)
-            self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(row)))
+                raise
             with self._lock:
                 self._bindings[transaction_id] = (epoch, declaration_digest)
             restored = (
@@ -476,38 +444,28 @@ class WeightsExchange:
                 "weights_receipt_identity_mismatch", "receipt does not bind this attempt/output"
             )
         held = self._hold(transaction_id, self._writer_epoch(transaction_id), reference)
-        frame = pb.WorkerFrame(
-            weights_receipt=pb.WeightsReceiptFrame(
-                request_id=attempt.request_id,
-                attempt_ordinal=attempt.attempt,
-                invocation_spec_digest=attempt.digest,
-                output_slot=output_slot,
-                weights_transaction_id=transaction_id,
-                writer_epoch=held.writer_epoch,
-                tensorfs_declaration_digest=self._declaration_digest(transaction_id),
-                weights_receipt=reference,
-                objects=[held.objects[key] for key in sorted(held.objects)],
-                manifest=held.manifest,
-            )
+        observed_receipt = pb.WeightsReceiptFrame(
+            request_id=attempt.request_id,
+            attempt_ordinal=attempt.attempt,
+            invocation_spec_digest=attempt.digest,
+            output_slot=output_slot,
+            weights_transaction_id=transaction_id,
+            writer_epoch=held.writer_epoch,
+            tensorfs_declaration_digest=self._declaration_digest(transaction_id),
+            weights_receipt=reference,
+            objects=[held.objects[key] for key in sorted(held.objects)],
+            manifest=held.manifest,
         )
         if self.workspace is None:
             raise WeightsExchangeError("workspace_unavailable", "worker has no workspace custody")
         try:
-            self.workspace.record_receipt(self.owner_scope(), frame.weights_receipt)
+            self.workspace.record_receipt(self.owner_scope(), observed_receipt)
         except Exception as exc:
             self._drop(transaction_id)
             raise WeightsExchangeError(
                 str(getattr(exc, "code", "workspace_refused")),
                 "workspace receipt recording refused",
             ) from exc
-        self.send(frame)
-        self.send(
-            pb.WorkerFrame(
-                weights_transaction=self.workspace.status(
-                    self.workspace.weights_row(self.owner_scope(), transaction_id)
-                )
-            )
-        )
         attempt.weights_receipts[output_slot] = reference
 
     def close(self) -> None:

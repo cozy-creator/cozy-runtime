@@ -237,18 +237,15 @@ class Machine:
             self.root / ("grants-" + request),
             package_installation_id=self.binding.installation_id,
         )
-        generator.host.inbound.get_nowait()
-        generator._dispatch()
-        offered = generator.host.inbound.get_nowait()
-        assert offered is not None
-        state = generator._desired_state()
+        offered = generator.offer()
+        state = generator.desired_state()
         state.job.orchestration = True
         submission = pb.MachineExecutionSubmit(
             claim=self.claim,
             submission_id=request,
             capture_digest=self.capture_digest,
             capture_canonical_bytes=self.captured,
-            offer=offered.attempt_offer,
+            offer=offered,
             prepared_state=state,
             payload_canonical_bytes=canonical_json.encode({}),
             expected_execution_workspace_id=self.client.GetMachineExecutionWorkspace(

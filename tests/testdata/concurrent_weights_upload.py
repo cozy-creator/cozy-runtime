@@ -73,7 +73,6 @@ with tempfile.TemporaryDirectory(prefix="runtime-native-uploads-") as directory:
     )
     exchange = WeightsExchange(
         store_root=root / "store",
-        send=lambda _: None,
         stop=threading.Event(),
         owner_scope=lambda: "upload-owner",
         allow_private_egress=True,

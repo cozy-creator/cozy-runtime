@@ -120,7 +120,7 @@ def _upload(
     with origin.running() as url, hub.running(), Supervisor(root, 1 << 30, 0).running() as channel:
         monkeypatch.setattr(storage_admission, "_channel", channel)
         workspace = Workspace(root)
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         calls = SourceCalls(
             workspace,
             lambda: "owner",
@@ -133,12 +133,12 @@ def _upload(
         command = _command(workspace, export, request)
         command.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
         calls.handle(command)
-        resolved = messages.get(timeout=120).native_source_status
+        resolved = messages.get(timeout=120)
         assert resolved.state == pb.NATIVE_SOURCE_STATE_RESOLVED, resolved.safe_detail
         command.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         command.selection.CopyFrom(resolved.selection)
         calls.handle(command)
-        finished = messages.get(timeout=600).native_source_status
+        finished = messages.get(timeout=600)
     return {row.member for row in resolved.selection.members}, finished, frames
 
 

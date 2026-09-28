@@ -1154,7 +1154,6 @@ class Worker:
         )
         self.weights = weights.WeightsExchange(
             store_root=options.tensorfs_root,
-            send=self.send,
             stamp=self.stamp,
             stop=self.stop,
             owner_scope=lambda: self.fence.record_owner_id,
@@ -1167,7 +1166,6 @@ class Worker:
             jobs={},
             spool_root=self.root / "spool",
             instance_id=options.instance_id,
-            send=self.send,
             progress=self.emit_progress,
             dispatched=self._dispatched,
             bundles=self.bundles,
@@ -1243,7 +1241,7 @@ class Worker:
             SourceCalls(
                 self.workspace,
                 lambda: self.fence.record_owner_id,
-                self.send,
+                self.machine_sources.observe,
                 lambda command: (
                     command.record_owner_epoch == self.fence.record_owner_epoch
                     and command.control_stream_epoch == self.fence.control_stream_epoch
@@ -1261,22 +1259,6 @@ class Worker:
         )
         if self.source_calls is not None:
             self.source_calls.finished = self.machine_sources.poke
-        from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
-
-        self.artifact_transfers = (
-            NativeArtifactTransfers(
-                self.workspace,
-                lambda: self.fence.record_owner_id,
-                self.send,
-                lambda command: (
-                    command.record_owner_epoch == self.fence.record_owner_epoch
-                    and command.control_stream_epoch == self.fence.control_stream_epoch
-                    and command.worker_boot_id == self.fence.worker_boot_id
-                ),
-            )
-            if self.workspace is not None
-            else None
-        )
 
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
         #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
@@ -2965,9 +2947,7 @@ class Worker:
         owner = self.authorize_workspace(call.claim)
         if self.workspace is None:
             raise WorkspaceRefusal("worker has no workspace")
-        value = self.workspace.ready_weights(owner, call.request)
-        row = value
-        self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(value)))
+        row = self.workspace.ready_weights(owner, call.request)
         ack = pb.WeightsHostAck(
             request_id=row["request"],
             attempt_ordinal=row["ordinal"],
@@ -3081,24 +3061,15 @@ class Worker:
 
     def send(self, frame: pb.WorkerFrame) -> None:
         """Durable. Queued, never shed; the inner message is stamped with the CURRENT fence
-        so a frame authored before a re-claim still leaves under the live envelope. A frame
-        about an execution never reaches the stream: the execution records its effect.
+        so a frame authored before a re-claim still leaves under the live envelope.
 
         STAMP AND ENQUEUE ARE ONE STEP, under the same lock claim acceptance takes: the
         envelope a frame carries and the stream it is queued on are then the same epoch
         by construction, with no window where a frame is stamped for one stream and handed to
         another's sender.
         """
-        inner = getattr(frame, frame.WhichOneof("msg"))
-        owner = self.fence.record_owner_id
-        subject = getattr(inner, "request_id", "") or getattr(inner, "parent_request_id", "")
-        if subject and self.executions is not None and self.executions.owns(owner, subject):
-            if frame.HasField("native_source_status"):
-                self.machine_sources.observe(frame.native_source_status)
-            return
         with self.claim_lock:
-            if frame.WhichOneof("msg") != "weights_transaction":
-                self.stamp(inner)
+            self.stamp(getattr(frame, frame.WhichOneof("msg")))
             self.outbound.put(frame)
 
     def settle(self, outcome: pb.AttemptOutcome) -> None:
@@ -7345,8 +7316,6 @@ class Worker:
         if self.machine_effects is not None:
             self.machine_effects.close()
         self.weights.close()
-        if self.artifact_transfers is not None:
-            self.artifact_transfers.close()
         self.convergences.put(None)
         self.watches.end_all()
         self.host.stop()

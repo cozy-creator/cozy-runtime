@@ -624,11 +624,8 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 root / "grants",
                 package_installation_id=binding.installation_id,
             )
-            generator.host.inbound.get_nowait()
-            generator._dispatch()
-            offered = generator.host.inbound.get_nowait()
-            assert offered is not None
-            state = generator._desired_state()
+            offered = generator.offer()
+            state = generator.desired_state()
             state.job.orchestration = True
             channel = grpc.insecure_channel((root / "address").read_text().strip())
             client = rpc.WorkerControlStub(channel)
@@ -637,7 +634,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 submission_id="root",
                 capture_digest=capture_digest,
                 capture_canonical_bytes=captured,
-                offer=offered.attempt_offer,
+                offer=offered,
                 prepared_state=state,
                 payload_canonical_bytes=canonical_json.encode({}),
                 expected_execution_workspace_id=client.GetMachineExecutionWorkspace(

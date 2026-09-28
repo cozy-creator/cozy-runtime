@@ -832,7 +832,7 @@ def serve(payload: Request) -> Result:
             generator = LocalRecordOwner(
                 request, {}, root / "grants-first", package_installation_id=binding.installation_id
             )
-            worker._apply_desired_state(generator._desired_state())
+            worker._apply_desired_state(generator.desired_state())
             while not worker.job_ready:
                 assert time.monotonic() < until, worker.latched
                 time.sleep(0.02)
@@ -872,17 +872,14 @@ def serve(payload: Request) -> Result:
                     root / ("grants-" + identifier),
                     package_installation_id=selected.installation_id,
                 )
-                generator.host.inbound.get_nowait()  # helper's Claim is not transmitted
-                generator._dispatch()
-                message = generator.host.inbound.get_nowait()
-                assert message is not None
+                message = generator.offer()
                 submission = pb.MachineExecutionSubmit(
                     claim=claim,
                     submission_id=identifier,
                     capture_digest=capture_digest,
                     capture_canonical_bytes=capture,
-                    offer=message.attempt_offer,
-                    prepared_state=generator._desired_state(),
+                    offer=message,
+                    prepared_state=generator.desired_state(),
                     payload_canonical_bytes=canonical_json.encode(generator.request.payload),
                     expected_execution_workspace_id=client.GetMachineExecutionWorkspace(
                         pb.MachineExecutionWorkspaceQuery(claim=claim)
@@ -908,10 +905,7 @@ def serve(payload: Request) -> Result:
                         root / "internal-grants",
                         package_installation_id=helper.installation_id,
                     )
-                    internal_generator.host.inbound.get_nowait()
-                    internal_generator._dispatch()
-                    internal_offer = internal_generator.host.inbound.get_nowait()
-                    assert internal_offer is not None
+                    internal_offer = internal_generator.offer()
                     with pytest.raises(grpc.RpcError, match="internal_callable") as private_root:
                         client.SubmitMachineExecution(
                             pb.MachineExecutionSubmit(
@@ -919,8 +913,8 @@ def serve(payload: Request) -> Result:
                                 submission_id="internal-root",
                                 capture_digest=capture_digest,
                                 capture_canonical_bytes=capture,
-                                offer=internal_offer.attempt_offer,
-                                prepared_state=internal_generator._desired_state(),
+                                offer=internal_offer,
+                                prepared_state=internal_generator.desired_state(),
                                 payload_canonical_bytes=canonical_json.encode({"n": 7}),
                                 expected_execution_workspace_id=client.GetMachineExecutionWorkspace(
                                     pb.MachineExecutionWorkspaceQuery(claim=claim)
