@@ -23,14 +23,16 @@ import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import canonical, hostfacts
+from cozy_runtime.internal import canonical, hostfacts, storage_admission
 from cozy_runtime.internal.worker import machine_model_defaults
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from test_diffusers_upload_configs import PROFILE, _registry, _repository
 from test_same_release_placements import LANE, LOCKED, OWNER, PACKAGE, RELEASE, Machine
+from upload_standins import HuggingFace, Supervisor
 
 SLOT = "touch.models.model"
 
@@ -376,3 +378,63 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_the_capture_origin() -
         assert catalog.reads == []
     finally:
         catalog.close()
+
+
+def test_a_provider_source_choice_is_made_by_the_machine_once(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--model model=hf://…@<commit>`: the machine resolves the headers, selects the profile,
+    lands only its members and converts them; an identical root touches no provider."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    origin = HuggingFace(_repository(modular=False))
+    source = "hf://example/diffusers@" + "c" * 40
+    calls = machine.worker.source_calls
+    assert calls is not None
+    supervisor = Supervisor(machine.store_root, 1 << 30, 0)
+    with origin.running() as hf, supervisor.running() as channel:
+        monkeypatch.setattr(storage_admission, "_channel", channel)
+        monkeypatch.setattr(calls, "endpoints", {"huggingface": hf})
+        monkeypatch.setattr(calls, "native_registry", _registry())
+
+        def sourced(request: str, *installs: Any) -> pb.MachineExecutionSubmit:
+            submitted = submission(machine, request, "", *installs)
+            submitted.release_root.models.append(pb.ModelChoice(parameter="model", source=source))
+            return submitted
+
+        receipt, _ = submit(machine, sourced("first", facts(machine, CALLEE), facts(machine)))
+        assert receipt.request_id == "first"
+        (resolved,) = [
+            canonical_json.decode(event.body)["models"]
+            for event in machine.executions.events(OWNER, "first").events
+            if event.kind == "resolved"
+        ]
+        (model,) = resolved
+        assert model["source"] == source and model["profiles"] == [PROFILE]
+        assert model["resolved"].startswith("hf://example/diffusers@" + "c" * 40)
+        assert model["repository"].startswith("local/source-")
+        store = tensorfs.Store.open(str(machine.store_root))
+        store.verify_checkpoint_source(
+            model["repository"], model["manifest"]["digest"], model["manifest"]["length"]
+        )
+        # The profile's carriers and the pipeline's configs were read; the tokenizer never.
+        assert {
+            "encoder/diffusion_pytorch_model.safetensors",
+            "decoder/diffusion_pytorch_model.safetensors",
+        } <= origin.touched
+        assert not any(member.startswith("tokenizer/") for member in origin.touched)
+        cold = origin.requests
+
+        receipt, _ = submit(machine, sourced("second"))
+        assert receipt.request_id == "second"
+        assert origin.requests == cold, "a warm identical root read the provider again"
+        (again,) = [
+            canonical_json.decode(event.body)["models"]
+            for event in machine.executions.events(OWNER, "second").events
+            if event.kind == "resolved"
+        ]
+        assert again == resolved

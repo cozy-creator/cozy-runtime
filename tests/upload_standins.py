@@ -50,6 +50,8 @@ class HuggingFace:
         self.files = files
         self.served: Counter[str] = Counter()  # body bytes per carrier, header probes apart
         self.probed = 0
+        self.requests = 0  # every request, listings included
+        self.touched: set[str] = set()  # members read at all, header or body
         self.lock = threading.Lock()
         self.watch: Callable[[int], None] = lambda _total: None
 
@@ -67,6 +69,8 @@ class HuggingFace:
                 pass
 
             def do_GET(self) -> None:
+                with origin.lock:
+                    origin.requests += 1
                 if self.path.startswith("/api/models/"):
                     listing = [
                         {
@@ -84,6 +88,8 @@ class HuggingFace:
                     self.wfile.write(data)
                     return
                 member = next(path for path in origin.files if self.path.endswith("/" + path))
+                with origin.lock:
+                    origin.touched.add(member)
                 body = origin.files[member]
                 start, end = 0, len(body) - 1
                 if "Range" in self.headers:

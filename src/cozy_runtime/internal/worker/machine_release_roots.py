@@ -26,6 +26,7 @@ from . import (
     machine_deferred,
     machine_model_defaults,
     machine_model_resolve,
+    machine_source_models,
 )
 from .machine_child_target import Target
 from .workspace import WorkspaceRefusal
@@ -251,7 +252,12 @@ class ReleaseRoots:
             False,
             prepared["installation_id"],
         )
-        models = self._resolve(root, declaration)
+        models = self._resolve(
+            root,
+            declaration,
+            machine_source_models.credentials(request.source_credentials),
+            lambda stage, done, total: self._note(job, stage, 100 * done // total if total else -1),
+        )
         serving = worker.machine_calls.serving
         call = Call(
             request.offer.request_id,
@@ -286,7 +292,11 @@ class ReleaseRoots:
         return _Prepared(target, ready.placement, models, installed)
 
     def _resolve(
-        self, root: pb.ReleaseRoot, declaration: Mapping[str, Any]
+        self,
+        root: pb.ReleaseRoot,
+        declaration: Mapping[str, Any],
+        credentials: Mapping[str, str],
+        note: machine_source_models.Note,
     ) -> list[dict[str, Any]]:
         slots = declaration.get("models", [])
         if not slots:
@@ -295,9 +305,13 @@ class ReleaseRoots:
             choice.parameter: json_format.MessageToDict(choice, preserving_proto_field_name=True)
             for choice in root.models
         }
+        pinned = {
+            parameter
+            for parameter, choice in choices.items()
+            if choice.get("source") or choice.get("manifest", {}).get("length")
+        }
         if not root.catalog_origin and any(
-            not choices.get(model["path"].rpartition(".")[2], {}).get("manifest", {}).get("length")
-            for model in slots
+            model["path"].rpartition(".")[2] not in pinned for model in slots
         ):
             raise WorkspaceRefusal("release root needs a catalog origin to resolve its Models")
         catalog = machine_model_resolve.Catalog(root.catalog_origin)
@@ -306,6 +320,12 @@ class ReleaseRoots:
         for model in slots:
             parameter = model["path"].rpartition(".")[2]
             choice = choices.get(parameter)
+            if choice and choice.get("source"):
+                # A provider source is made here: headers first, only its profile's members.
+                rows.append(
+                    machine_source_models.slot(self.worker, parameter, choice, credentials, note)
+                )
+                continue
             if choice and "manifest" in choice:
                 choice["manifest"] = {
                     "digest": documents.spell(base64.b64decode(choice["manifest"]["digest"])),
@@ -538,6 +558,9 @@ class ReleaseRoots:
                             "lane",
                             "gpus",
                             "manifest",
+                            "source",
+                            "resolved",
+                            "profiles",
                         )
                         if name in row
                     }
