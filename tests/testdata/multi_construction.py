@@ -22,13 +22,15 @@ from typing import Any
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))  # followers run isolated (`python -I`)
+import msgspec
 import native_parallel_models as native  # type: ignore[import-not-found]
 
 from cozy_runtime.author import Config
-from cozy_runtime.internal import accel, package_interface
+from cozy_runtime.internal import accel, executor_commands, package_interface
 from cozy_runtime.internal.development_launch import stage_development_placement
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import main as executor_main
+from cozy_runtime.internal.executor_commands import ModelLoad
 from cozy_runtime.internal.parallel import group as group_module
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, listener
 from cozy_runtime.internal.worker.session import executor_load_command
@@ -138,7 +140,7 @@ class Driver:
 
 def _load_command(
     binding: Any, key: str, degree: int, backend: str, authorized: int
-) -> dict[str, Any]:
+) -> dict[str, object]:
     command = executor_load_command(
         binding,
         construction=key,
@@ -146,12 +148,25 @@ def _load_command(
         sequence_parallel_degree=degree,
         authorized_device_limit_bytes=authorized,
     )
-    rows = command.get("models") or [command]
-    for row in rows:
-        row["binding"].update(window_bytes=4 * MIB, slots=4, readers=2, inflight=2)
-        if backend == "cpu":
-            row["binding"]["variant"] = "cpu"
-    return command
+    rows = tuple(
+        ModelLoad(
+            binding=msgspec.structs.replace(
+                row.binding,
+                window_bytes=4 * MIB,
+                slots=4,
+                readers=2,
+                inflight=2,
+                variant="cpu" if backend == "cpu" else row.binding.variant,
+            ),
+            budgets=row.budgets,
+        )
+        for row in command.rows()
+    )
+    if command.models is msgspec.UNSET:
+        command = msgspec.structs.replace(command, binding=rows[0].binding)
+    else:
+        command = msgspec.structs.replace(command, models=rows)
+    return executor_commands.encode(command)
 
 
 def _stage(root: Path, project: Path, name: str, overrides: dict[str, str], store: Path) -> Any:

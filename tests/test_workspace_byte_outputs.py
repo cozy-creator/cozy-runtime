@@ -9,10 +9,12 @@ from types import SimpleNamespace
 from typing import cast
 
 import grpc
+import msgspec
 import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
+from cozy_runtime.internal.executor_replies import AttemptReply
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker import workspace_memo
 from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
@@ -99,11 +101,13 @@ def test_reserved_capture_grant_commits_native_tree_without_author_asset(tmp_pat
     # Only the post-processing collaborators are needed; TensorFS custody is real.
     post = cast(AttemptEngine, engine)
     record = cast(AttemptRecord, attempt)
-    result, error = AttemptEngine._tail(post, record, {"outputs": [], "capture": capture})
+    result, error = AttemptEngine._tail(
+        post, record, msgspec.convert({"ok": True, "capture": capture}, AttemptReply)
+    )
     assert error is None and result is not None
     assert [entry.output_id for entry in result.outputs] == ["runtime.capture"]
     assert result.outputs[0].native_tree.content_bytes == len(metadata) + len(sketches)
-    missing, error = AttemptEngine._tail(post, record, {"outputs": []})
+    missing, error = AttemptEngine._tail(post, record, AttemptReply(ok=True))
     assert missing is None and error is not None and error.startswith("capture_output_absent:")
 
 

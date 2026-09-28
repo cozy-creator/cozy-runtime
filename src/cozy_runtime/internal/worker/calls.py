@@ -6,7 +6,7 @@ import contextlib
 import hashlib
 import socket
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -40,6 +40,7 @@ from cozy_runtime.internal import (
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.capture_observation import document as observation_document
 from cozy_runtime.internal.executor_commands import CallInterface
+from cozy_runtime.internal.executor_replies import OutputRow
 from cozy_runtime.internal.seam import MAX_FRAME
 from cozy_runtime.internal.worker import byte_inputs, child_byte_results
 from cozy_runtime.internal.worker.workspace import Workspace
@@ -500,21 +501,20 @@ class Calls:
             ]
 
     def received_output(
-        self, attempt: AttemptRecord, row: Mapping[str, Any]
+        self, attempt: AttemptRecord, row: OutputRow
     ) -> tuple[Path, pb.NativeByteRetentionRequest] | None:
         """Resolve an explicit returned handle only against this parent's actual grants."""
-        ref = str(row.get("asset_ref", ""))
+        ref = row.asset_ref
         if not ref.startswith("sha256:"):
             return None
-        kind = row.get("kind")
-        media = byte_inputs.TREE_MIME if kind == "tree" else row.get("media_type")
-        identity = canonical.write([kind, ref, media]).decode()
+        media = byte_inputs.TREE_MIME if row.kind == "tree" else row.media_type
+        identity = canonical.write([row.kind, ref, media]).decode()
         with self.lock:
             grant = self.received.get((attempt.request_id, attempt.attempt), {}).get(identity)
             if (
                 grant is None
-                or row.get("digest") != ref
-                or row.get("size_bytes") != grant.metadata["content_bytes"]
+                or row.digest != ref
+                or row.size_bytes != grant.metadata["content_bytes"]
             ):
                 raise ValueError("returned native handle has no exact received grant")
             return Path(grant.metadata["local"]), grant.source

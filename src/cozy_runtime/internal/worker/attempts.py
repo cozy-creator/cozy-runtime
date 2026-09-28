@@ -63,8 +63,10 @@ from cozy_runtime.author._executor_requests import (
     refuse,
 )
 from cozy_runtime.author._observations import EventRing, Observation
+from cozy_runtime.author._observations import Kind as ObservationKind
 from cozy_runtime.internal import (
     canonical,
+    executor_replies,
     fill,
     liveness,
     output_budget,
@@ -79,6 +81,16 @@ from cozy_runtime.internal.executor_commands import (
     PrepareRequest,
     Probe,
     RunJob,
+)
+from cozy_runtime.internal.executor_replies import (
+    Adjustment,
+    AttemptReply,
+    CaptureWritten,
+    Metrics,
+    ObservationRow,
+    Outcome,
+    PreparedReply,
+    Shortfall,
 )
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
@@ -115,7 +127,7 @@ def safe(text: str, cap: int = 1024) -> str:
     return ascii_only[:cap]
 
 
-def _coded(outcome: Mapping[str, Any]) -> str:
+def _coded(outcome: Outcome) -> str:
     """`<code>: <message>` — the AUTHOR's typed code in front of its own sentence.
 
     The wire carries a small neutral `CauseCode` on purpose (a RecordOwner classifies, it
@@ -123,8 +135,7 @@ def _coded(outcome: Mapping[str, Any]) -> str:
     not survive the boundary at all. Every other refusal on this path already renders this
     way; author outcomes were the exception.
     """
-    code = str(outcome.get("code") or "")
-    message = str(outcome.get("message") or "")
+    code, message = outcome.code, outcome.message
     if not message:
         return code
     return message if not code or message.startswith(f"{code}:") else f"{code}: {message}"
@@ -202,7 +213,7 @@ class InlineResult:
 
     canonical: bytes
     schema_digest: str
-    adjustments: tuple[Mapping[str, Any], ...]
+    adjustments: tuple[Adjustment, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,7 +223,7 @@ class Released:
     on the lane's post thread; nothing in it reaches the executor again."""
 
     attempt: AttemptRecord
-    reply: dict[str, Any]
+    reply: AttemptReply
     spool: Path
     key: str
 
@@ -400,7 +411,7 @@ class AttemptRecord:
     execution_observation: dict[str, Any] = dataclasses_field(default_factory=dict)
     #: the executor's `execution` record: degree, per-rank rows, executor and construction
     execution: dict[str, Any] = dataclasses_field(default_factory=dict)
-    capture_result: dict[str, Any] = dataclasses_field(default_factory=dict)
+    capture_result: CaptureWritten | None = None
 
     #: the record the plan was PRICED against, resolved once by the executor's kernel
     prepared: PreparedRequest | None = None
@@ -816,7 +827,7 @@ class AttemptEngine:
         was touched, and the executor is exactly as it was.
         """
         try:
-            reply = executor.call(
+            raw = executor.call(
                 PrepareRequest(
                     construction=declared.construction_key(),
                     request_id=f"{attempt.request_id}#{attempt.attempt}",
@@ -844,8 +855,9 @@ class AttemptEngine:
                 f"the executor died while resolving this request: {exc}",
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             ) from exc
-        if not reply.get("ok"):
-            code = str(reply.get("code", "request_unresolvable"))
+        reply = executor_replies.decode(raw, PreparedReply)
+        if not reply.ok:
+            code = reply.code
             if code == "poisoned_generation":
                 # The poison lives executor-side (a failed load, a broken env seal or a
                 # frozen attention refusal; request refusals and cooperative cancels no
@@ -853,24 +865,24 @@ class AttemptEngine:
                 # signal — invalidate HERE so the lane's rebuild pass replaces the
                 # generation instead of refusing forever (lifecycle-live §4).
                 self.supervision_for(attempt).invalidate(
-                    executor, str(reply.get("detail", "poisoned"))[:256]
+                    executor, (reply.detail or "poisoned")[:256]
                 )
             raise AttemptRefusal(
                 code,
-                str(reply.get("detail", ""))[:1024],
+                reply.detail[:1024],
                 cause=CAUSE.CAUSE_CODE_INVALID_REQUEST
-                if str(reply.get("origin")) in ("request", "author")
+                if reply.origin in ("request", "author")
                 else CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                origin=_ORIGIN.get(str(reply.get("origin")), ORIGIN.CAUSE_ORIGIN_EXECUTOR),
+                origin=_ORIGIN.get(reply.origin, ORIGIN.CAUSE_ORIGIN_EXECUTOR),
             )
         return PreparedRequest(
             request_id=f"{attempt.request_id}#{attempt.attempt}",
             entrypoint=declared.entrypoint,
-            features={str(k): int(v) for k, v in (reply.get("features") or {}).items()},
-            features_digest=str(reply.get("features_digest", "")),
-            overlay_digest=str(reply.get("overlay_digest", "")),
-            facts_digest=str(reply.get("facts_digest", "")),
-            adjustments=tuple(dict(row) for row in reply.get("adjustments", ())),
+            features=reply.features,
+            features_digest=reply.features_digest,
+            overlay_digest=reply.overlay_digest,
+            facts_digest=reply.facts_digest,
+            adjustments=reply.adjustments,
         )
 
     def _hydrate_inputs(self, attempt: AttemptRecord) -> None:
@@ -1746,11 +1758,14 @@ class AttemptEngine:
             return self.durable_exchange(attempt, request)
 
         try:
-            reply = executor.call(
-                command,
-                timeout=None,
-                on_progress=on_progress,
-                on_request=on_request if job else self.room(attempt) if self.room else None,
+            reply = executor_replies.decode(
+                executor.call(
+                    command,
+                    timeout=None,
+                    on_progress=on_progress,
+                    on_request=on_request if job else self.room(attempt) if self.room else None,
+                ),
+                AttemptReply,
             )
         except ExecutorGone as exc:
             attempt.resulted_at = time.perf_counter()
@@ -1865,7 +1880,7 @@ class AttemptEngine:
         )
 
     def release(
-        self, attempt: AttemptRecord, reply: dict[str, Any], spool: Path, key: str
+        self, attempt: AttemptRecord, reply: AttemptReply, spool: Path, key: str
     ) -> Released:
         """DEVICE RELEASE (cr-079 §3): the executor answered, and this is everything that
         must happen while it is still the executor that ran the attempt — on the lane
@@ -1880,9 +1895,9 @@ class AttemptEngine:
         attempt.await_reclaim_before_finalizing()
         attempt.resulted_at = time.perf_counter()
         self.monitor.end(key, "returned")
-        attempt.execution_observation = dict(reply.get("execution_observation") or {})
-        attempt.execution = dict(reply.get("execution") or {})
-        attempt.capture_result = dict(reply.get("capture") or {})
+        attempt.execution_observation = dict(reply.execution_observation)
+        attempt.execution = dict(reply.execution)
+        attempt.capture_result = reply.capture
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
         # whatever came back, success or fault: a failed attempt's activation peak is
         # exactly the number an operator needs, and dropping it on the failure path would
@@ -1906,11 +1921,11 @@ class AttemptEngine:
                         attempt.residency.get("attempt_stages")
                         or attempt.residency.get("attempt_evictions")
                     )
-                    terminal = str((reply.get("outcome") or {}).get("terminal", ""))
-                    failed_code = str((reply.get("outcome") or {}).get("code", ""))
+                    terminal = reply.outcome.terminal if reply.outcome else ""
+                    failed_code = reply.outcome.code if reply.outcome else ""
                     ledger = self.ledger_for(attempt)
                     ledger.observe_attempt(
-                        reply.get("metrics", {}),
+                        reply.metrics,
                         resident_moved=moved,
                         cell=cell,
                         succeeded=terminal == "succeeded",
@@ -1921,7 +1936,7 @@ class AttemptEngine:
                         # it died under — recorded so the next attempt for this shape can
                         # refuse typed instead of spending the handler to rediscover it.
                         ledger.observe_device_shortfall(cell, ledger.device_free)
-                    self.bank_demand(attempt, reply.get("metrics", {}), moved)
+                    self.bank_demand(attempt, reply.metrics, moved)
                 else:
                     attempt.confess(
                         "unavailable",
@@ -1929,16 +1944,14 @@ class AttemptEngine:
                         "before its terminal telemetry could be applied; successor telemetry "
                         "was left untouched",
                     )
-        if reply.get("ok") and executor is not None:
+        if reply.ok and executor is not None:
             supervision = self.supervision_for(attempt)
-            if not reply.get("quiescent"):
+            if not reply.quiescent:
                 # No terminal is recorded while author computation might still mutate GPU
                 # or output state. Unproven quiescence is an executor fault, not a success.
                 supervision.invalidate(executor, "unproven quiescence")
-            elif not reply.get("env_intact", True):
-                supervision.invalidate(executor, "env seal broken")
-            elif reply.get("poisoned"):
-                supervision.invalidate(executor, str(reply["poisoned"]))
+            elif reply.poisoned:
+                supervision.invalidate(executor, reply.poisoned)
         # ONE ENVELOPE, ONE CLOSE, at release: the probe reads the executor's after-state
         # for THIS attempt, before the lane hands the device to the next one.
         if attempt.opened:
@@ -1962,7 +1975,7 @@ class AttemptEngine:
             self.monitor.end(f"{key}/post", attempt.state)
 
     def _terminal(
-        self, attempt: AttemptRecord, reply: dict[str, Any], spool: Path, key: str
+        self, attempt: AttemptRecord, reply: AttemptReply, spool: Path, key: str
     ) -> pb.AttemptOutcome:
         if attempt.canceling:
             return self.finish_cancel(attempt, attempt.canceling)
@@ -1977,17 +1990,17 @@ class AttemptEngine:
                 ORIGIN.CAUSE_ORIGIN_WORKER,
                 f"weights_custody_refused: {attempt.weights_refused}",
             )
-        if not reply.get("ok"):
+        if not reply.ok or reply.outcome is None:
             grants.abort_outputs(spool)
             return self.outcome(
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
                 CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                 ORIGIN.CAUSE_ORIGIN_EXECUTOR,
-                f"{reply.get('code')}: {reply.get('detail', '')}",
-                shortfall=reply.get("shortfall") or None,
+                f"{reply.code or 'executor_outcome_absent'}: {reply.detail}",
+                shortfall=reply.shortfall,
             )
-        if not reply.get("quiescent"):
+        if not reply.quiescent:
             grants.abort_outputs(spool)
             return self.outcome(
                 attempt,
@@ -1998,35 +2011,10 @@ class AttemptEngine:
                 "terminal recorded under unproven quiescence would be a claim about state "
                 "that may still be moving",
             )
-        if not reply.get("env_intact", True):
-            grants.abort_outputs(spool)
-            changed = ", ".join(str(name) for name in (reply.get("env_changed") or ()))
-            names = f"; changed sealed names: {changed}" if changed else ""
-            return self.outcome(
-                attempt,
-                STATUS.OUTCOME_STATUS_FAILED,
-                CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                ORIGIN.CAUSE_ORIGIN_WORKER,
-                "env_seal_broken: the executor's environment changed after CUDA init — the "
-                f"allocator read it once, so the imposition was a silent no-op{names}",
-            )
-        if "state_seq" in reply:
-            # Monotone wire counters belong to the WORKER. A disposable process that
-            # restarts a counter at 1 must never become the worker's truth.
-            self.fault(
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
-                    subject=key,
-                    reason="executor_owned_counter",
-                    detail=f"the executor claimed state_seq={reply['state_seq']}; monotone "
-                    "wire counters are the worker's and this claim is dropped",
-                )
-            )
-
-        outcome = reply["outcome"]
-        status, cause = _TERMINAL[outcome["terminal"]]
-        attempt.traceback = str(outcome.get("traceback") or "")[-16384:]
-        breach = outcome["code"] == DEVICE_OOM
+        outcome = reply.outcome
+        status, cause = _TERMINAL[outcome.terminal]
+        attempt.traceback = outcome.traceback[-16384:]
+        breach = outcome.code == DEVICE_OOM
         if breach:
             # THE ACCEPTED ENVELOPE WAS BREACHED. `_TERMINAL["failed"]` defaults to
             # AUTHOR_EXCEPTION because most failures are the handler's, and a device that ran
@@ -2037,20 +2025,20 @@ class AttemptEngine:
             # capacity result, and nobody goes to look at the planner. The runtime priced
             # this attempt and admitted it, so the fault is the runtime's.
             cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
-        if outcome["terminal"] == "failed" and outcome["code"] in GROUP_FAULT_CODES:
+        if outcome.terminal == "failed" and outcome.code in GROUP_FAULT_CODES:
             cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
-        if outcome["terminal"] == "refused" and outcome["code"] in (
+        if outcome.terminal == "refused" and outcome.code in (
             "unsupported_input",
             "tree_ungranted",
         ):
             cause = CAUSE.CAUSE_CODE_UNSUPPORTED_INPUT
-        if outcome["terminal"] == "canceled":
+        if outcome.terminal == "canceled":
             cause = (
                 CAUSE.CAUSE_CODE_DEADLINE_EXPIRED
-                if outcome["code"] == "deadline"
+                if outcome.code == "deadline"
                 else CAUSE.CAUSE_CODE_CLIENT_CANCEL
             )
-        oversize = int(reply.get("oversize_result_bytes", 0))
+        oversize = reply.oversize_result_bytes
         if oversize:
             grants.abort_outputs(spool)
             return self.outcome(
@@ -2092,7 +2080,7 @@ class AttemptEngine:
                     CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
                     ORIGIN.CAUSE_ORIGIN_WORKER,
                     tail_error,
-                    metrics=reply.get("metrics", {}),
+                    metrics=reply.metrics,
                 )
             if inline is not None and manifest is not None:
                 from .byte_outputs import settle_result
@@ -2111,13 +2099,13 @@ class AttemptEngine:
                         CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                         ORIGIN.CAUSE_ORIGIN_WORKER,
                         f"native_output_result: {exc}",
-                        metrics=reply.get("metrics", {}),
+                        metrics=reply.metrics,
                     )
         else:
             grants.abort_outputs(spool)
-        origin = _ORIGIN[outcome["origin"]]
-        shortfall = reply.get("shortfall") or None
-        if shortfall:
+        origin = _ORIGIN[outcome.origin]
+        shortfall = reply.shortfall
+        if shortfall is not None:
             # A capacity fact reached the handler as an exception, so the author-error
             # classifier saw an author error. It is not one: the runtime could not admit a
             # declared component set, which is CONSTRAINT_INFEASIBLE from the RUNTIME, and
@@ -2136,7 +2124,7 @@ class AttemptEngine:
             # exists only inside prose and nothing downstream can key on it (cr-012).
             f"accepted_envelope_breach: {_coded(outcome)}" if breach else _coded(outcome),
             manifest=manifest,
-            metrics=reply.get("metrics", {}),
+            metrics=reply.metrics,
             result=inline,
             shortfall=shortfall,
         )
@@ -2148,26 +2136,29 @@ class AttemptEngine:
         attempt = self.live.get(request_id)
         if attempt is None or attempt.attempt != number or frame.get("kind") == "load":
             return
-        attempt.ring.admit(self._row(frame))
-        attempt.forwarded_seq = max(attempt.forwarded_seq, int(frame.get("seq", 0)))
+        try:
+            row = msgspec.convert(frame, ObservationRow)
+        except msgspec.ValidationError:
+            return  # the lossy lane sheds a row it cannot read
+        attempt.ring.admit(self._row(row))
+        attempt.forwarded_seq = max(attempt.forwarded_seq, row.seq)
 
     @staticmethod
-    def _row(frame: Mapping[str, Any]) -> Observation:
+    def _row(row: ObservationRow) -> Observation:
         """One executor-side row, re-bounded on this side. A disposable process is not
         trusted to bound the worker's memory, so every cap is re-applied here."""
-        fields = frame.get("fields") or {}
         return Observation(
-            cast("Any", frame.get("kind", "log")),
-            str(frame.get("name", ""))[:200],
-            cast("Any", frame.get("value")),
-            {str(k)[:48]: v for k, v in list(fields.items())[:8]},
-            int(frame.get("at_unix_ms", 0)),
+            cast(ObservationKind, row.kind),
+            row.name[:200],
+            row.value,
+            {key[:48]: value for key, value in list(row.fields.items())[:8]},
+            row.at_unix_ms,
         )
 
     def absorb(
         self,
         attempt: AttemptRecord,
-        reply: Mapping[str, Any],
+        reply: AttemptReply,
         *,
         apply_ledger: bool = True,
     ) -> None:
@@ -2178,19 +2169,19 @@ class AttemptEngine:
         bound the worker's memory) and keeps the rows as they came. Whatever the ring
         already shed is carried through as a number, never inferred.
         """
-        caps = dict(reply.get("observation_caps") or {})
-        attempt.attribution = dict(reply.get("attribution") or {})
-        rows = list(reply.get("observations") or ())
+        caps = dict(reply.observation_caps)
+        attempt.attribution = dict(reply.attribution)
+        rows = reply.observations
         kept = 0
         for row in rows[-attempt.ring.max_events :]:
             # Anything the lossy lane already delivered is skipped by the EXECUTOR's own
             # sequence. Both sides shed oldest first, so this fills the gap after the last
             # forwarded row and can never double-count one.
-            if not isinstance(row, dict) or int(row.get("seq", 0)) <= attempt.forwarded_seq:
+            if row.seq <= attempt.forwarded_seq:
                 continue
             attempt.ring.admit(self._row(row))
             kept += 1
-        residency = reply.get("residency") or {}
+        residency = reply.residency
         if residency:
             attempt.residency = dict(residency)
             # THE DECLARED TRANSITION, into the ledger BEFORE it reconciles. Under a staged
@@ -2214,13 +2205,13 @@ class AttemptEngine:
                     f"{residency.get('attempt_evicted_ms', 0)} ms - the weights did not all "
                     "fit at once and the runtime moved them rather than refusing",
                 )
-        shortfall = reply.get("shortfall")
-        if shortfall:
+        shortfall = reply.shortfall
+        if shortfall is not None:
             attempt.confess(
                 "degraded",
-                f"{shortfall['resource']} shortfall at {shortfall['scope']}: needed "
-                f"{shortfall['needed_bytes']} B, {shortfall['available_bytes']} B available, "
-                f"short by {shortfall['needed_bytes'] - shortfall['available_bytes']} B",
+                f"{shortfall.resource} shortfall at {shortfall.scope}: needed "
+                f"{shortfall.needed_bytes} B, {shortfall.available_bytes} B available, "
+                f"short by {shortfall.needed_bytes - shortfall.available_bytes} B",
             )
         caps["executor_rows"] = len(rows)
         caps["forwarded_live"] = attempt.forwarded_seq
@@ -2230,14 +2221,14 @@ class AttemptEngine:
         # Every caller-visible divergence is ALSO an operator-visible confession. The
         # envelope tells the caller what changed; the confession tells the operator why,
         # with the numbers, in the record that outlives the process.
-        for row in reply.get("adjustments", ()):
+        for adjusted in reply.adjustments:
             attempt.confess(
-                "substituted" if str(row.get("reason", "")).startswith("adjusted") else "degraded",
-                f"{row.get('field')}: requested {row.get('requested')}, served "
-                f"{row.get('applied')} - {row.get('reason')}",
+                "substituted" if adjusted.reason.startswith("adjusted") else "degraded",
+                f"{adjusted.field}: requested {adjusted.requested}, served "
+                f"{adjusted.applied} - {adjusted.reason}",
             )
 
-    def bank_demand(self, attempt: AttemptRecord, metrics: Mapping[str, Any], moved: bool) -> None:
+    def bank_demand(self, attempt: AttemptRecord, metrics: Metrics, moved: bool) -> None:
         """Every serve evaluates DECLARED versus ACTUAL and banks the pair (§3.2).
 
         The actual is the attempt's own peak above what it started holding — a number that
@@ -2248,8 +2239,7 @@ class AttemptEngine:
         plan = attempt.plan
         if plan is None:
             return
-        peak = int(metrics.get("peak_vram_bytes", 0))
-        started = int(metrics.get("allocated_at_start_bytes", -1))
+        peak, started = metrics.peak_vram_bytes, metrics.allocated_at_start_bytes
         actual = peak - started if peak and started >= 0 else -1
         if moved:
             # The resident set moved under the attempt, so `peak - start` is not the
@@ -2291,7 +2281,7 @@ class AttemptEngine:
         return value
 
     def _tail(
-        self, attempt: AttemptRecord, reply: dict[str, Any], key: str = ""
+        self, attempt: AttemptRecord, reply: AttemptReply, key: str = ""
     ) -> tuple[pb.OutputManifest | None, str | None]:
         """§3.4 steps 4-5, worker-side: the device lease is already released, the raw
         snapshots are already immutable in the attempt spool, and this is where they are
@@ -2309,7 +2299,7 @@ class AttemptEngine:
         output the RecordOwner did not grant, or a granted destination the attempt did not
         fill, refuses the tail WHOLE — an output transaction is not partially successful.
         """
-        rows = list(reply.get("outputs", ()))
+        rows = reply.outputs
         weights_outputs: set[str] = set()
         if attempt.job is not None:
             declared = self._job_declaration(attempt.job, attempt.job.job_descriptor_id)
@@ -2322,18 +2312,18 @@ class AttemptEngine:
             )
         granted = set(attempt.grant.outputs) - weights_outputs
         if attempt.spec.get("capture"):
-            if not reply.get("capture"):
+            if reply.capture is None:
                 return None, "capture_output_absent: requested activation capture was not produced"
             # Runtime writes this reserved native tree after normal author outputs.
             granted.discard("runtime.capture")
         if not weights_outputs <= set(attempt.grant.outputs):
             return None, "weights_receipt_set_mismatch: a weights output has no granted destination"
         spool = attempt.spool
-        if not rows and not granted and not reply.get("capture"):
+        if not rows and not granted and reply.capture is None:
             return None, None
         if spool is None:
             return None, "the attempt has no spool to read outputs from"
-        produced = {str(row["output_id"]): row for row in rows}
+        produced = {row.output_id: row for row in rows}
         if set(produced) != granted:
             grants.abort_outputs(spool)
             return None, (
@@ -2349,7 +2339,7 @@ class AttemptEngine:
         entries = []
         native = self.tensorfs_root is not None and self.calls is not None
         try:
-            if len(rows) + bool(reply.get("capture")) > 32:
+            if len(rows) + (reply.capture is not None) > 32:
                 raise grants.GrantRefusal(
                     "output_count", "native outputs and capture exceed 32 slots"
                 )
@@ -2361,12 +2351,10 @@ class AttemptEngine:
                 row = produced[output_id]
                 received = (
                     self.calls.received_output(attempt, row)
-                    if native
-                    and self.calls is not None
-                    and str(row["asset_ref"]).startswith("sha256:")
+                    if native and self.calls is not None and row.asset_ref.startswith("sha256:")
                     else None
                 )
-                tree = row.get("kind") == "tree"
+                tree = row.kind == "tree"
                 if tree or (native and not attempt.grant.outputs[output_id].url):
                     if not native:
                         raise grants.GrantRefusal(
@@ -2379,9 +2367,9 @@ class AttemptEngine:
                     root = (
                         received[0]
                         if received
-                        else self._blob_path(spool, str(row["asset_ref"]))
+                        else self._blob_path(spool, row.asset_ref)
                         if tree
-                        else self._blob(spool, str(row["asset_ref"]))
+                        else self._blob(spool, row.asset_ref)
                     )
                     if root is None or self.tensorfs_root is None:
                         raise grants.GrantRefusal(
@@ -2391,7 +2379,7 @@ class AttemptEngine:
                     media_type = grants._output_media_type(
                         output_id,
                         destination.mime_type,
-                        TREE_MIME if tree else str(row.get("media_type") or ""),
+                        TREE_MIME if tree else row.media_type,
                     )
                     if received:
                         entry = byte_outputs.reexport(
@@ -2421,7 +2409,7 @@ class AttemptEngine:
                         )
                     entries.append(entry)
                     continue
-                blob = received[0] if received else self._blob(spool, str(row["asset_ref"]))
+                blob = received[0] if received else self._blob(spool, row.asset_ref)
                 if blob is None:
                     return None, (f"output {output_id} has no bytes in the attempt spool")
                 entries.append(
@@ -2433,7 +2421,7 @@ class AttemptEngine:
                         # The AUTHOR's observed media type. write_output joins it to the
                         # invocation's bound type before spending the destination; when the
                         # invocation leaves MIME open, this remains the honest carried fact.
-                        media_type=str(row.get("media_type") or ""),
+                        media_type=row.media_type,
                     )
                 )
                 if native:
@@ -2476,7 +2464,7 @@ class AttemptEngine:
                             "output changed between granted write and native import",
                         )
                     entries[-1].native_tree.CopyFrom(committed.native_tree)
-            if capture := reply.get("capture"):
+            if (capture := reply.capture) is not None:
                 if not native or not attempt.spec.get("capture") or "runtime.capture" in produced:
                     raise grants.GrantRefusal(
                         "capture_ungranted", "capture output has no exact requested slot"
@@ -2487,10 +2475,7 @@ class AttemptEngine:
 
                 assert self.tensorfs_root is not None
                 root = spool / "runtime.capture"
-                if (
-                    capture.get("root") != str(root)
-                    or capture.get("output_id") != "runtime.capture"
-                ):
+                if capture.root != str(root) or capture.output_id != "runtime.capture":
                     raise grants.GrantRefusal(
                         "capture_output", "capture output changed its owned spool"
                     )
@@ -2506,7 +2491,7 @@ class AttemptEngine:
                     max_bytes=128 << 20,
                     media_type=TREE_MIME,
                 )
-                if entry.native_tree.content_bytes != capture.get("length"):
+                if entry.native_tree.content_bytes != capture.length:
                     raise grants.GrantRefusal(
                         "capture_output", "capture output changed its measured length"
                     )
@@ -2515,7 +2500,7 @@ class AttemptEngine:
                     with (root / name).open("rb") as member:
                         while block := member.read(1 << 20):
                             content.update(block)
-                if documents.spell(content.digest()) != capture.get("content_digest"):
+                if documents.spell(content.digest()) != capture.content_digest:
                     raise grants.GrantRefusal(
                         "capture_output", "capture semantic digest differs from retained bytes"
                     )
@@ -2523,7 +2508,7 @@ class AttemptEngine:
             if sum(
                 entry.native_tree.content_bytes if entry.HasField("native_tree") else entry.length
                 for entry in entries
-            ) > output_budget.effective(attempt.spec, reply):
+            ) > output_budget.effective(attempt.spec, executor_replies.budget_claim(reply)):
                 raise grants.GrantRefusal(
                     "output_too_large", "returned bytes exceed the output budget"
                 )
@@ -2563,42 +2548,36 @@ class AttemptEngine:
         )
 
     def _encode_frames(
-        self, attempt: AttemptRecord, spool: Path, reply: Mapping[str, Any], key: str
+        self, attempt: AttemptRecord, spool: Path, reply: AttemptReply, key: str
     ) -> str | None:
         """Encode every host frame the handler REGISTERED (cr-079 §5): first-party codecs,
         the aggregate ceiling re-checked on the ENCODED bytes, each blob taking its
         handle's spool name so the write below finds it as it always did. A fault here is
         typed and the worker's own; the executor was not involved."""
-        frames = list(reply.get("frames") or ())
+        frames = reply.frames
         if not frames:
             return None
         try:
-            budget = output_budget.effective(attempt.spec, reply)
+            budget = output_budget.effective(attempt.spec, executor_replies.budget_claim(reply))
         except ValueError as exc:
             return f"output_budget_invalid: {exc}"
-        total = sum(
-            int(row.get("size_bytes") or 0)
-            for row in reply.get("outputs", ())
-            if str(row.get("asset_ref")) not in {str(f.get("handle")) for f in frames}
-        )
+        handles = {frame.handle for frame in frames}
+        total = sum(row.size_bytes or 0 for row in reply.outputs if row.asset_ref not in handles)
         for index, frame in enumerate(frames):
-            handle = str(frame.get("handle", ""))
-            name = str(frame.get("raw", ""))
+            handle, name = frame.handle, frame.raw
             blob = self._blob_path(spool, handle)
             if blob is None or not name or name != Path(name).name:
                 return f"output_frame_invalid: frame {handle!r} names no spool blob"
             raw = spool / name
             try:
                 data = raw.read_bytes()
-                if len(data) != int(frame.get("raw_bytes", -1)):
+                if len(data) != frame.raw_bytes:
                     return (
-                        f"output_frame_invalid: {handle} registered {frame.get('raw_bytes')} "
+                        f"output_frame_invalid: {handle} registered {frame.raw_bytes} "
                         f"raw bytes and the spool holds {len(data)}"
                     )
                 started = time.perf_counter()
-                encoded = _codec.encode_frame(
-                    str(frame.get("codec", "")), dict(frame.get("facts") or {}), data
-                )
+                encoded = _codec.encode_frame(frame.codec, dict(frame.facts), data)
                 del data
                 total += len(encoded)
                 if total > budget:
@@ -2617,9 +2596,9 @@ class AttemptEngine:
             self.monitor.advance(f"{key}/post", index + 1)
             attempt.ring.emit(
                 "log",
-                f"encoded {handle} as {frame.get('codec')}",
+                f"encoded {handle} as {frame.codec}",
                 "info",
-                raw_bytes=int(frame.get("raw_bytes", 0)),
+                raw_bytes=frame.raw_bytes,
                 encoded_bytes=len(encoded),
                 encode_ms=round((time.perf_counter() - started) * 1000, 3),
             )
@@ -2648,9 +2627,9 @@ class AttemptEngine:
         detail: str,
         *,
         manifest: pb.OutputManifest | None = None,
-        metrics: Mapping[str, Any] | None = None,
+        metrics: Metrics | None = None,
         result: InlineResult | None = None,
-        shortfall: Mapping[str, Any] | None = None,
+        shortfall: Shortfall | None = None,
     ) -> pb.AttemptOutcome:
         """CLOSE the ledger, commit the triage bundle, build, RECORD, then return to send.
 
@@ -2692,26 +2671,26 @@ class AttemptEngine:
             )
         if manifest is not None:
             body.output_manifest.CopyFrom(manifest)
-            if attempt.capture_result and any(
+            if attempt.capture_result is not None and any(
                 row.output_id == "runtime.capture" for row in manifest.outputs
             ):
                 body.observation.capture.CopyFrom(
                     pb.ActivationCaptureResult(
                         output_id="runtime.capture",
-                        content_digest=documents.raw(attempt.capture_result["content_digest"]),
+                        content_digest=documents.raw(attempt.capture_result.content_digest),
                     )
                 )
         if shortfall is not None:
             body.cause.shortfall.CopyFrom(
                 pb.ResourceShortfall(
-                    resource=str(shortfall["resource"]),
-                    scope=str(shortfall["scope"]),
-                    needed_bytes=int(shortfall["needed_bytes"]),
-                    available_bytes=int(shortfall["available_bytes"]),
-                    evidence_class=str(shortfall.get("evidence_class", "measured")),
+                    resource=shortfall.resource,
+                    scope=shortfall.scope,
+                    needed_bytes=shortfall.needed_bytes,
+                    available_bytes=shortfall.available_bytes,
+                    evidence_class=shortfall.evidence_class,
                 )
             )
-        if metrics:
+        if metrics is not None:
             body.metrics.CopyFrom(self.attest(attempt, metrics, manifest))
         if result is not None:
             body.result.CopyFrom(self._envelope(result))
@@ -2955,7 +2934,7 @@ class AttemptEngine:
         )
 
     def _inline_result(
-        self, attempt: AttemptRecord, reply: Mapping[str, Any]
+        self, attempt: AttemptRecord, reply: AttemptReply
     ) -> tuple[InlineResult | None, str | None]:
         """Read the result bytes the executor spooled, and hold them to their declared identity.
 
@@ -2966,8 +2945,8 @@ class AttemptEngine:
 
         The worker names the file. Nothing here is read from a path the child chose.
         """
-        ref = reply.get("result_ref")
-        if not isinstance(ref, Mapping):
+        ref = reply.result_ref
+        if ref is None:
             return None, None
         if attempt.spool is None:
             return None, "the attempt has no spool to read its result document from"
@@ -2976,22 +2955,22 @@ class AttemptEngine:
             data = path.read_bytes()
         except OSError as exc:
             return None, f"result_document_unreadable: {type(exc).__name__}"
-        if len(data) != int(ref.get("length", -1)):
+        if len(data) != ref.length:
             return None, (
-                f"result_document_length: the executor declared {ref.get('length')} B and "
+                f"result_document_length: the executor declared {ref.length} B and "
                 f"the spool holds {len(data)} B"
             )
         spelled = "sha256:" + hashlib.sha256(data).hexdigest()
-        if spelled != str(ref.get("digest", "")):
+        if spelled != ref.digest:
             return None, (
-                f"result_document_digest: the executor declared {str(ref.get('digest'))[:23]}… "
+                f"result_document_digest: the executor declared {ref.digest[:23]}… "
                 f"and the spooled bytes hash to {spelled[:23]}…"
             )
         return (
             InlineResult(
                 canonical=data,
-                schema_digest=str(reply.get("result_schema_digest") or spelled),
-                adjustments=tuple(dict(row) for row in reply.get("adjustments", ())),
+                schema_digest=reply.result_schema_digest or spelled,
+                adjustments=reply.adjustments,
             ),
             None,
         )
@@ -3011,10 +2990,7 @@ class AttemptEngine:
             result_schema_digest=documents.raw(result.schema_digest),
             adjustments=[
                 pb.AdjustmentRow(
-                    field=row["field"],
-                    requested=row["requested"],
-                    applied=row["applied"],
-                    reason=row["reason"],
+                    field=row.field, requested=row.requested, applied=row.applied, reason=row.reason
                 )
                 for row in result.adjustments
             ],
@@ -3028,7 +3004,7 @@ class AttemptEngine:
     def attest(
         self,
         attempt: AttemptRecord,
-        claim: Mapping[str, Any],
+        claim: Metrics,
         manifest: pb.OutputManifest | None,
     ) -> pb.AttemptMetrics:
         """The executor's numbers are a CLAIM; this is the worker's attestation.
@@ -3039,20 +3015,20 @@ class AttemptEngine:
         window_ms = (attempt.resulted_at - attempt.dispatched_at) * 1000
         queue_ms = (attempt.dispatched_at - (attempt.queued_at or attempt.accepted_at)) * 1000
         return pb.AttemptMetrics(
-            runtime_ms=int(min(float(claim.get("handler_ms", 0.0)), window_ms)),
+            runtime_ms=int(min(claim.handler_ms, window_ms)),
             queue_ms=int(max(queue_ms, 0.0)),
-            peak_device_memory_bytes=int(claim.get("peak_vram_bytes", 0)),
-            rss_at_end_bytes=int(claim.get("rss_at_end_bytes", 0)),
+            peak_device_memory_bytes=claim.peak_vram_bytes,
+            rss_at_end_bytes=claim.rss_at_end_bytes,
             output_count=len(manifest.outputs) if manifest is not None else 0,
-            device_lease_ms=int(min(float(claim.get("device_lease_ms", 0.0)), window_ms)),
-            device_count=int(claim.get("gpu_count", 0)),
-            handler_ms=int(min(float(claim.get("handler_ms", 0.0)), window_ms)),
+            device_lease_ms=int(min(claim.device_lease_ms, window_ms)),
+            device_count=claim.gpu_count,
+            handler_ms=int(min(claim.handler_ms, window_ms)),
             finalization_ms=int(max((time.perf_counter() - attempt.resulted_at) * 1000, 0)),
             unverified_fields=list(UNVERIFIABLE),
-            working_peak_device_bytes=int(claim.get("working_peak_vram_bytes", 0)),
+            working_peak_device_bytes=claim.working_peak_vram_bytes,
             # The worker's own plan names the cell it priced; the claim only fills a gap.
             shape_cell=(attempt.plan.shape_cell if attempt.plan is not None else "")
-            or str(claim.get("shape_cell", "")),
+            or claim.shape_cell,
         )
 
     # ------------------------------------------------------------------ cancel / abandon

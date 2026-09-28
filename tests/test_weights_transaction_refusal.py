@@ -13,6 +13,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 from cozy_runtime import canonical_json
 from cozy_runtime.author import CapabilityError
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal.executor_replies import AttemptReply
 from cozy_runtime.internal.weights_writer import ExecutionStorage
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -147,7 +148,7 @@ def test_a_refused_transaction_fails_only_its_attempt(tmp_path: Path) -> None:
 
         # The refused attempt's terminal is weights_custody_refused, whatever it returned.
         assert refused.spool is not None
-        outcome = worker.engine._terminal(refused, {"ok": True}, refused.spool, "refused")
+        outcome = worker.engine._terminal(refused, AttemptReply(ok=True), refused.spool, "refused")
         body = canonical_json.decode(outcome.outcome_canonical_bytes)
         assert body["status"] == pb.OUTCOME_STATUS_FAILED
         assert body["safe_message"].startswith("weights_custody_refused: output 'model'")

@@ -34,6 +34,7 @@ import msgspec
 
 from cozy_runtime.internal import proctree
 from cozy_runtime.internal.canonical import Json
+from cozy_runtime.internal.executor_replies import Metrics
 
 #: Every byte class this ledger carries, in report order. A class is added here only when a
 #: real producer exists for it; a row nothing writes is not a ledger entry, it is decoration.
@@ -202,12 +203,6 @@ class ConstructionFacts(msgspec.Struct, frozen=True, kw_only=True):
     declared_scopes: dict[str, tuple[str, ...]] = {}
     paging: dict[str, dict[str, int]] = {}
     pinned: _Pinned = msgspec.field(default_factory=_Pinned)
-
-
-class AttemptMetrics(msgspec.Struct, frozen=True, kw_only=True):
-    activation_peaks: dict[str, int] = {}
-    activation_peak_bytes: int = 0
-    peak_vram_bytes: int = 0
 
 
 class _Transition(msgspec.Struct, frozen=True):
@@ -506,7 +501,7 @@ class Ledger:
 
     def observe_attempt(
         self,
-        metrics: Mapping[str, object],
+        metrics: Metrics,
         resident_moved: bool = False,
         cell: str = "",
         succeeded: bool = False,
@@ -526,9 +521,8 @@ class Ledger:
             previous = self.carried_resident_free_by_cell.get(cell)
             if previous is None or self.device_free < previous:
                 self.carried_resident_free_by_cell[cell] = self.device_free
-        read = msgspec.convert(metrics, AttemptMetrics)
-        scopes = {method: value for method, value in read.activation_peaks.items() if value > 0}
-        direct = max(scopes.values(), default=read.activation_peak_bytes)
+        scopes = {method: value for method, value in metrics.activation_peaks.items() if value > 0}
+        direct = max(scopes.values(), default=metrics.activation_peak_bytes)
         if direct > 0:
             measured = direct
         elif resident_moved:
@@ -537,7 +531,7 @@ class Ledger:
                 self.unreadable.append("activations_scratch")
             return
         else:
-            peak = read.peak_vram_bytes
+            peak = metrics.peak_vram_bytes
             measured = peak - self.device_baseline if peak and self.device_baseline >= 0 else 0
         if measured > 0:
             self.activations_peak = max(self.activations_peak, measured)

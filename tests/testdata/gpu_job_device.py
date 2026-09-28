@@ -12,6 +12,7 @@ import tensorfs
 
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.executor_commands import JobBudget, RunJob
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError
 
 
@@ -65,14 +66,16 @@ def compute(payload: Request, ctx: Context) -> Result:
         process.surface_names = {surface.name: surface for surface in found.surfaces}
         spool = root / "spool"
         reply = process.run_job(
-            {
-                "job": "compute",
-                "request_id": "job-device",
-                "payload": {},
-                "deadline_s": 60,
-                "spool": str(spool),
-                "budget": {"gpu_count": 0 if mode == "cpu" else 1},
-            }
+            RunJob(
+                job="compute",
+                request_id="job-device",
+                payload={},
+                deadline_s=60,
+                spool=str(spool),
+                application="",
+                package_interface="",
+                budget=JobBudget(gpu_count=0 if mode == "cpu" else 1),
+            )
         )
         left.shutdown(socket.SHUT_WR)
         reader.join(timeout=5)

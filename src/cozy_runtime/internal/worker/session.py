@@ -7631,15 +7631,15 @@ class Worker:
         outlives the rebuild — `lane.forget` runs only when the placement LEAVES the lane —
         so the next attempt can see what the last one hit.
         """
-        outcome = released.reply.get("outcome") or {}
+        outcome = released.reply.outcome
         row = lane.rows.get(attempt.placement_id)
-        if row is None:
+        if row is None or outcome is None:
             return
-        if str(outcome.get("terminal", "")) == "succeeded":
+        if outcome.terminal == "succeeded":
             # This invocation got through, so its earlier OOM is no longer a trap.
             row.oom_signatures.pop(attempt.digest, None)
             return
-        if str(outcome.get("code", "")) in DEVICE_SHORTFALL_CODES:
+        if outcome.code in DEVICE_SHORTFALL_CODES:
             signature = self.lanes.signature(lane)
             # An entry under another picture describes a lane that no longer exists.
             row.oom_signatures = {

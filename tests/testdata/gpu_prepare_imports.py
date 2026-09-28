@@ -12,6 +12,7 @@ from pathlib import Path
 
 def main() -> None:
     from cozy_runtime.internal.executor import _CONSTRUCTION_MODULES, Executor, _capture_seal
+    from cozy_runtime.internal.executor_commands import Binding, Load
 
     _capture_seal()
     import torch
@@ -34,12 +35,12 @@ def main() -> None:
         sys.meta_path.insert(0, finder)
         try:
             executor._prepare_first(
-                {
-                    "devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
-                    "authorized_device_limit_bytes": 1 << 30,
-                    "binding": {"model_class": "Model", "model_parameter_name": "model"},
-                    "budgets": {},
-                }
+                Load(
+                    construction="model",
+                    devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                    authorized_device_limit_bytes=1 << 30,
+                    binding=Binding(model_class="Model", model_parameter_name="model"),
+                )
             )
         except ReachedKernelImport:
             print(json.dumps({"runtime_device_boundary_before_kernel_import": True}))
@@ -63,12 +64,12 @@ def main() -> None:
     # missing-package-identity check before loading any model or weight bytes.
     try:
         reply = executor._prepare_first(
-            {
-                "devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
-                "authorized_device_limit_bytes": 1 << 30,
-                "binding": {"model_class": "Model", "model_parameter_name": "model"},
-                "budgets": {},
-            }
+            Load(
+                construction="model",
+                devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                authorized_device_limit_bytes=1 << 30,
+                binding=Binding(model_class="Model", model_parameter_name="model"),
+            )
         )
     except RuntimeError as exc:
         assert str(exc) == "executor requires the canonical installed release identity"

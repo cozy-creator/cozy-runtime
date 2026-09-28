@@ -26,6 +26,7 @@ from cozy_runtime.author import (
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._executor_requests import Answer, CallState, ChildForget, ChildPoll
+from cozy_runtime.internal.executor_replies import OutputRow
 from cozy_runtime.internal.worker import byte_inputs, child_byte_results, grants
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
@@ -471,17 +472,23 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
     assert Path(local).read_bytes() == data
     assert not sent
     returned = canonical_json.decode(reply.result_canonical_bytes)["report"]
-    forwarded = worker.received_output(parent, returned)
+    forwarded = worker.received_output(
+        parent, msgspec.convert({**returned, "output_id": "report"}, OutputRow)
+    )
     assert forwarded is not None and forwarded[0].read_bytes() == data
     changed = dict(returned, size_bytes=len(data) + 1)
     with pytest.raises(ValueError, match="exact received"):
-        worker.received_output(parent, changed)
+        worker.received_output(
+            parent, msgspec.convert({**changed, "output_id": "report"}, OutputRow)
+        )
     worker.close("parent", 1)
     assert not Path(local).exists()
     assert not worker.pending
     assert not worker.materialized
     with pytest.raises(ValueError, match="exact received"):
-        worker.received_output(parent, returned)
+        worker.received_output(
+            parent, msgspec.convert({**returned, "output_id": "report"}, OutputRow)
+        )
 
 
 class ImageResult(msgspec.Struct):

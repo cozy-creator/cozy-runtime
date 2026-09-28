@@ -30,6 +30,7 @@ from cozy_runtime.author import (
     prepare,
 )
 from cozy_runtime.author._assets import GrantedInput
+from cozy_runtime.internal.executor_replies import Metrics
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import shape_cell
 
@@ -112,7 +113,9 @@ def test_a_longer_first_request_is_unmeasured_so_staging_frees_the_card(tmp_path
     ledger.begin_generation(1)
     ledger.device_free = 60 << 30
     peaks = {"condition_text": 2 << 30, "sample_ref2va_turbo": 5 << 30}
-    ledger.observe_attempt({"activation_peaks": peaks}, cell=ten, succeeded=True)
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": peaks}, Metrics), cell=ten, succeeded=True
+    )
     assert ledger.measured_scopes(ten) == frozenset(peaks)
     assert ledger.measured_scopes(fifteen) == frozenset()
     assert ledger.measured_scopes(_cell(tmp_path, seconds=10, references=5)) == frozenset()

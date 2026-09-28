@@ -19,6 +19,9 @@ No device, no executor, no torch: the ledger's arithmetic is the whole subject.
 
 from __future__ import annotations
 
+import msgspec
+
+from cozy_runtime.internal.executor_replies import Metrics
 from cozy_runtime.internal.worker.ledger import Ledger
 
 CELL = "height=1024,width=1024"
@@ -43,7 +46,11 @@ def test_a_failed_attempts_peak_never_becomes_an_envelope() -> None:
     """THE TRAP. A truncated peak may not calibrate the next generation."""
     ledger = Ledger(worker_pid=1)
     _generation(ledger)
-    ledger.observe_attempt({"activation_peaks": {"generate": 3 << 30}}, cell=CELL, succeeded=False)
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": {"generate": 3 << 30}}, Metrics),
+        cell=CELL,
+        succeeded=False,
+    )
     # The generation's own map still records it -- that is what an operator reads.
     assert ledger.activations_by_cell[CELL] == 3 << 30
     # The CARRIED map must not, because the attempt died climbing and 3 GiB is a floor.
@@ -59,7 +66,11 @@ def test_a_succeeding_serve_calibrates_the_next_generation() -> None:
     """THE POINT. A completed serve's peak is a measurement and outlives the process."""
     ledger = Ledger(worker_pid=1)
     _generation(ledger)
-    ledger.observe_attempt({"activation_peaks": {"generate": 4 << 30}}, cell=CELL, succeeded=True)
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": {"generate": 4 << 30}}, Metrics),
+        cell=CELL,
+        succeeded=True,
+    )
     _generation(ledger, pid=4243)
     # The generation holds nothing of its own -- a rebuild cleared it -- and the carried
     # measurement prices the next attempt instead of the 1 GiB placeholder.
@@ -76,7 +87,11 @@ def test_a_carried_measurement_is_never_read_for_another_shape_unlabelled() -> N
     upper bound and SAYS so."""
     ledger = Ledger(worker_pid=1)
     _generation(ledger)
-    ledger.observe_attempt({"activation_peaks": {"generate": 4 << 30}}, cell=CELL, succeeded=True)
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": {"generate": 4 << 30}}, Metrics),
+        cell=CELL,
+        succeeded=True,
+    )
     _generation(ledger, pid=4243)
     value, source = ledger.activations_for(OTHER)
     assert value == 4 << 30
@@ -134,12 +149,20 @@ def test_a_measurement_carries_the_conditions_it_was_taken_under() -> None:
     ledger = Ledger(worker_pid=1)
     _generation(ledger)
     ledger.observe_device_free(15 << 30, 16 << 30)
-    ledger.observe_attempt({"activation_peaks": {"generate": 4 << 30}}, cell=CELL, succeeded=True)
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": {"generate": 4 << 30}}, Metrics),
+        cell=CELL,
+        succeeded=True,
+    )
     assert ledger.activation_basis_free(CELL) == 15 << 30
     # A bigger measurement moves the conditions with it; a smaller one leaves both alone,
     # so the pair always describes the same observation.
     ledger.observe_device_free(7 << 30, 16 << 30)
-    ledger.observe_attempt({"activation_peaks": {"generate": 2 << 30}}, cell=CELL, succeeded=True)
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": {"generate": 2 << 30}}, Metrics),
+        cell=CELL,
+        succeeded=True,
+    )
     assert ledger.carried_activations_by_cell[CELL] == 4 << 30
     assert ledger.activation_basis_free(CELL) == 15 << 30
 
@@ -156,7 +179,11 @@ def test_an_envelope_measured_on_a_roomier_card_may_not_refuse() -> None:
     ledger = Ledger(worker_pid=1)
     _generation(ledger)
     ledger.observe_device_free(15 << 30, 16 << 30)
-    ledger.observe_attempt({"activation_peaks": {"generate": 4 << 30}}, cell=CELL, succeeded=True)
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": {"generate": 4 << 30}}, Metrics),
+        cell=CELL,
+        succeeded=True,
+    )
     _generation(ledger, pid=4243)
     basis = ledger.activation_basis_free(CELL)
     # A co-tenant has taken the card down to less room than the measurement was taken in:
@@ -190,7 +217,11 @@ def test_the_carried_scope_headrooms_obey_the_same_conditions_rule() -> None:
     ledger = Ledger(worker_pid=1)
     _generation(ledger)
     ledger.observe_device_free(15 << 30, 16 << 30)
-    ledger.observe_attempt({"activation_peaks": {"generate": 4 << 30}}, cell=CELL, succeeded=True)
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": {"generate": 4 << 30}}, Metrics),
+        cell=CELL,
+        succeeded=True,
+    )
     _generation(ledger, pid=4243)
     # A co-tenant has taken the card below the conditions the scopes were measured under.
     ledger.observe_device_free(7 << 30, 16 << 30)

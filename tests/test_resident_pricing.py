@@ -27,8 +27,10 @@ The arithmetic arms below use the pod's own numbers and no device. The end-to-en
 
 from __future__ import annotations
 
+import msgspec
 import pytest
 
+from cozy_runtime.internal.executor_replies import Metrics
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     UNCALIBRATED_ACTIVATION_BYTES,
@@ -111,13 +113,16 @@ def _bank_solo_serve(
     """
     was, ledger.device_free = ledger.device_free, free
     ledger.observe_attempt(
-        {
-            "activation_peaks": {
-                "encode_prompt": peak // 8,
-                "denoise": peak,
-                "decode": peak // 3,
-            }
-        },
+        msgspec.convert(
+            {
+                "activation_peaks": {
+                    "encode_prompt": peak // 8,
+                    "denoise": peak,
+                    "decode": peak // 3,
+                }
+            },
+            Metrics,
+        ),
         resident_moved=moved,
         cell=CELL,
         succeeded=True,
@@ -200,7 +205,10 @@ def test_staged_success_cannot_promote_restored_weights_after_driver_free_drift(
     ledger = _resident_ledger(free=818_282_496)
     scopes = {"encode_prompt": 16 << 20, "denoise": 400 << 20, "decode": 2 * GiB}
     ledger.observe_attempt(
-        {"activation_peaks": scopes}, resident_moved=True, cell=CELL, succeeded=True
+        msgspec.convert({"activation_peaks": scopes}, Metrics),
+        resident_moved=True,
+        cell=CELL,
+        succeeded=True,
     )
     ledger.observe_device_free(free, 8 * GiB)
     assert ledger.resident_sufficiency(CELL) == 0
@@ -213,7 +221,10 @@ def test_staged_success_cannot_promote_restored_weights_after_driver_free_drift(
     # fully resident request. A roomier device can still fit the measured demand.
     for _ in range(5):
         ledger.observe_attempt(
-            {"activation_peaks": scopes}, resident_moved=True, cell=CELL, succeeded=True
+            msgspec.convert({"activation_peaks": scopes}, Metrics),
+            resident_moved=True,
+            cell=CELL,
+            succeeded=True,
         )
         assert _walk(ledger)[0] == "component_staged"
     ledger.observe_device_free(17 * GiB, 24 * GiB)
@@ -223,7 +234,7 @@ def test_staged_success_cannot_promote_restored_weights_after_driver_free_drift(
 def test_staged_only_history_skips_pointless_full_restore_until_it_fits() -> None:
     ledger = _resident_ledger(free=818_282_496)
     ledger.observe_attempt(
-        {"activation_peaks": {"decode": 2 * GiB}},
+        msgspec.convert({"activation_peaks": {"decode": 2 * GiB}}, Metrics),
         resident_moved=True,
         cell=CELL,
         succeeded=True,
@@ -252,7 +263,7 @@ def test_staged_only_history_skips_pointless_full_restore_until_it_fits() -> Non
     )
     smaller = PreparedRequest.unresolved("generate", {"height": 512, "width": 512})
     ledger.observe_attempt(
-        {"activation_peaks": {"decode": 256 << 20}},
+        msgspec.convert({"activation_peaks": {"decode": 256 << 20}}, Metrics),
         resident_moved=True,
         cell=smaller.cell(),
         succeeded=True,
@@ -426,7 +437,7 @@ def test_a_serve_that_finished_without_moving_a_byte_outranks_the_envelope() -> 
     assert _walk(ledger)[0] == "component_staged"
     # ... and then the same shape completes on this card with nothing moving
     ledger.observe_attempt(
-        {"activation_peaks": {"denoise": int(1.92 * GiB)}},
+        msgspec.convert({"activation_peaks": {"denoise": int(1.92 * GiB)}}, Metrics),
         resident_moved=False,
         cell=CELL,
         succeeded=True,
@@ -444,7 +455,7 @@ def test_an_attempt_that_moved_components_proves_nothing_about_full_residency() 
     error one level down."""
     ledger = _resident_ledger()
     ledger.observe_attempt(
-        {"activation_peaks": {"denoise": int(1.92 * GiB)}},
+        msgspec.convert({"activation_peaks": {"denoise": int(1.92 * GiB)}}, Metrics),
         resident_moved=True,
         cell=CELL,
         succeeded=True,

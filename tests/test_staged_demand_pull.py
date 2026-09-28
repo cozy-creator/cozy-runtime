@@ -12,9 +12,11 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, cast
 
+import msgspec
 import pytest
 
 from cozy_runtime.internal import accel
+from cozy_runtime.internal.executor_replies import Metrics
 from cozy_runtime.internal.fill import StreamingFillBackend
 from cozy_runtime.internal.residency import ComponentResidency
 from cozy_runtime.internal.worker.ledger import Ledger
@@ -190,7 +192,9 @@ CELL = "assets=2,frames=243"
 
 def _served(ledger: Ledger, cell: str, free: int) -> None:
     ledger.device_free = free
-    ledger.observe_attempt({"activation_peaks": dict(SCOPES)}, cell=cell, succeeded=True)
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": dict(SCOPES)}, Metrics), cell=cell, succeeded=True
+    )
 
 
 def test_only_an_exact_cell_measurement_under_current_room_may_keep_components() -> None:

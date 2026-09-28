@@ -22,6 +22,7 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _serialize_result
+from cozy_runtime.internal.executor_replies import AttemptReply
 from cozy_runtime.internal.worker import (
     commit_files,
     grants,
@@ -269,10 +270,10 @@ def test_two_large_outputs_commit_within_their_admitted_aggregate(tmp_path: Path
     manifest, error = AttemptEngine._tail(
         cast(AttemptEngine, engine),
         record,
-        {
-            "outputs": rows,
-            "max_output_bytes": output_budget.admitted(body),
-        },
+        msgspec.convert(
+            {"ok": True, "outputs": rows, "max_output_bytes": output_budget.admitted(body)},
+            AttemptReply,
+        ),
     )
     assert error is None and manifest is not None, error
     assert sum(row.native_tree.content_bytes for row in manifest.outputs) == size * 2
@@ -318,10 +319,10 @@ def test_two_large_outputs_commit_within_their_admitted_aggregate(tmp_path: Path
     manifest, error = AttemptEngine._tail(
         cast(AttemptEngine, engine),
         record,
-        {
-            "outputs": rows,
-            "max_output_bytes": output_budget.admitted(body) + 1,
-        },
+        msgspec.convert(
+            {"ok": True, "outputs": rows, "max_output_bytes": output_budget.admitted(body) + 1},
+            AttemptReply,
+        ),
     )
     assert manifest is None and error and "budget" in error
 
