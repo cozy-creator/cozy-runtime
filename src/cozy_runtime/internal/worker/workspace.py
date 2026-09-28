@@ -122,6 +122,8 @@ class Journal(sqlite3.Connection):
     lock_fd: int
     mutex: threading.Lock
     guard: Callable[[], None]
+    #: A newer Runtime's journal has been given this Runtime's schema on this connection.
+    converged: bool = False
 
     def one[T](self, into: type[T], sql: str, parameters: Sequence[object] = ()) -> T | None:
         """The row `sql` selects, decoded once into `into`; None when it selects none."""
@@ -278,19 +280,12 @@ def _handle(directory: Path) -> _Handle:
         return handle
 
 
-#: The journal schema this Runtime writes; a journal at any other version refuses.
+#: The journal schema this Runtime writes. Every change is additive: a new table, index or
+#: column with a default, so a journal any other Runtime wrote converges (`_converge`).
 SCHEMA_VERSION = 14
 
 
-def _migrate(db: Journal) -> None:
-    version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version == SCHEMA_VERSION:
-        return
-    if version != 0:
-        raise WorkspaceRefusal(
-            f"workspace journal schema {version} is not {SCHEMA_VERSION}; "
-            "start this machine with an empty workspace"
-        )
+def _schema() -> str:
     from .machine_checkpoint_inputs import SCHEMA11
     from .machine_models import SCHEMA9
     from .workspace_byte_outputs import SCHEMA5
@@ -300,9 +295,8 @@ def _migrate(db: Journal) -> None:
     from .workspace_partial import SCHEMA12
     from .workspace_sources import SCHEMA4
 
-    db.executescript(
-        "BEGIN IMMEDIATE;"
-        + "".join((_SCHEMA, SCHEMA4, SCHEMA5, SCHEMA7, SCHEMA8, SCHEMA9, SCHEMA10))
+    return (
+        "".join((_SCHEMA, SCHEMA4, SCHEMA5, SCHEMA7, SCHEMA8, SCHEMA9, SCHEMA10))
         + SCHEMA11
         + SCHEMA12
         # Providers an execution was given a credential for; never a credential value.
@@ -310,8 +304,69 @@ def _migrate(db: Journal) -> None:
         # The record owner answers this execution's memo lookups (MachineExecutionSubmit).
         + "ALTER TABLE executions ADD COLUMN owner_memo INTEGER NOT NULL DEFAULT 0 "
         + "CHECK(owner_memo IN (0,1));"
-        + f"PRAGMA user_version={SCHEMA_VERSION}; COMMIT;"
     )
+
+
+def _converge(db: Journal) -> list[str]:
+    """What gives a journal another Runtime wrote, older or newer, everything this Runtime's
+    schema holds: its missing tables, indexes and columns. What a newer Runtime added stays.
+    A missing column without a default cannot be added, and refuses."""
+    target = sqlite3.connect(":memory:")
+    try:
+        target.executescript(_schema())
+        statements = []
+        for kind, name, sql in target.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid"
+        ):
+            held = db.execute("SELECT 1 FROM sqlite_master WHERE type=? AND name=?", (kind, name))
+            if held.fetchone() is None:
+                statements.append(sql)
+                continue
+            if kind != "table":
+                continue
+            columns = {row[1] for row in db.execute(f"PRAGMA table_info({name})")}
+            for _, column, type_, required, default, _ in target.execute(
+                f"PRAGMA table_info({name})"
+            ):
+                if column in columns:
+                    continue
+                if required and default is None:
+                    raise WorkspaceRefusal(
+                        f"workspace journal table {name} lacks column {column}, which has no "
+                        "default; start this machine with an empty workspace"
+                    )
+                statements.append(
+                    f"ALTER TABLE {name} ADD COLUMN {column} {type_}"
+                    + (" NOT NULL" if required else "")
+                    + ("" if default is None else f" DEFAULT {default}")
+                )
+        return statements
+    finally:
+        target.close()
+
+
+def _migrate(db: Journal) -> None:
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version == SCHEMA_VERSION or (version > SCHEMA_VERSION and db.converged):
+        return
+    if version == 0:
+        db.executescript(
+            f"BEGIN IMMEDIATE;{_schema()}PRAGMA user_version={SCHEMA_VERSION}; COMMIT;"
+        )
+    else:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in _converge(db):
+                db.execute(statement)
+            if db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+        db.converged = True
 
 
 _OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")

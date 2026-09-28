@@ -277,14 +277,41 @@ def test_native_commit_before_journal_result_replays_original_adoption(tmp_path:
     )
 
 
-@pytest.mark.parametrize("version", [2, 13, 99])
-def test_a_journal_schema_other_than_this_runtimes_refuses(tmp_path: Path, version: int) -> None:
+@pytest.mark.parametrize("version", [13, 99])
+def test_a_journal_another_runtime_wrote_converges_and_keeps_its_rows(
+    tmp_path: Path, version: int
+) -> None:
+    """An older journal lacks a table and a column; a newer one holds one this Runtime does
+    not know. Either opens with this Runtime's schema added, and its work continues."""
+    workspace = Workspace(tmp_path / "store")
+    accepted(workspace, "before")
+    with sqlite3.connect(workspace.directory / "journal.sqlite3") as db:
+        db.execute("DROP TABLE holds")
+        db.execute("ALTER TABLE executions DROP COLUMN owner_memo")
+        db.execute("CREATE TABLE newer_runtime (id TEXT PRIMARY KEY) STRICT")
+        db.execute("ALTER TABLE attempts ADD COLUMN newer_column TEXT NOT NULL DEFAULT ''")
+        db.execute(f"PRAGMA user_version={version}")
+    reopened = Workspace(tmp_path / "store")
+    accepted(reopened, "after")
+    with reopened.locked() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == max(version, 14)
+        assert {row[0] for row in db.execute("SELECT request FROM attempts")} == {"before", "after"}
+        assert db.execute("SELECT count(*) FROM holds").fetchone()[0] == 0
+        assert "owner_memo" in {row[1] for row in db.execute("PRAGMA table_info(executions)")}
+        assert db.execute("SELECT count(*) FROM newer_runtime").fetchone()[0] == 0
+
+
+def test_a_journal_missing_a_required_column_refuses_by_name(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     with workspace.locked():
         pass
     with sqlite3.connect(workspace.directory / "journal.sqlite3") as db:
-        db.execute(f"PRAGMA user_version={version}")
-    with pytest.raises(WorkspaceRefusal, match="schema"), Workspace(tmp_path / "store").locked():
+        db.execute("ALTER TABLE attempts DROP COLUMN spec")
+        db.execute("PRAGMA user_version=13")
+    with (
+        pytest.raises(WorkspaceRefusal, match="lacks column spec"),
+        Workspace(tmp_path / "store").locked(),
+    ):
         pass
 
 
