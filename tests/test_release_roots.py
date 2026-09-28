@@ -490,12 +490,17 @@ def test_a_provider_source_choice_is_made_by_the_machine_once(
         store.verify_checkpoint_source(
             model["repository"], model["manifest"]["digest"], model["manifest"]["length"]
         )
-        # The profile's carriers and the pipeline's configs were read; the tokenizer never.
-        assert {
-            "encoder/diffusion_pytorch_model.safetensors",
-            "decoder/diffusion_pytorch_model.safetensors",
-        } <= origin.touched
-        assert not any(member.startswith("tokenizer/") for member in origin.touched)
+        # The profile's carriers, the pipeline's configs and its tokenizer were read: the
+        # choice lands the same self-contained checkpoint an upload does, tokenizer files as
+        # assets. Nothing outside the pipeline was.
+        repository = _repository(modular=False)
+        assert origin.touched == set(repository) - {"README.md"}
+        header = store.manifest(model["manifest"]["digest"])["header"]
+        assert header is not None
+        assert sorted(tensorfs.parse_header(header)["assets"]) == [
+            "tokenizer/tokenizer_config.json",
+            "tokenizer/vocab.json",
+        ]
         cold = origin.requests
 
         receipt, _ = submit(machine, sourced("second"))

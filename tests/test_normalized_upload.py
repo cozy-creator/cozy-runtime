@@ -14,6 +14,7 @@ import hashlib
 import json
 import queue
 import struct
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 from weakref import WeakValueDictionary
@@ -29,7 +30,7 @@ from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
-from test_machine_partial_work import machine
+from test_machine_partial_work import Machine, machine
 from test_owner_memo import observed, recorded, succeeded
 from upload_standins import Civitai, Hub, HuggingFace, Supervisor
 
@@ -101,7 +102,7 @@ def command(
     parent: str,
     export: str = "upload_civitai",
     index: int = 0,
-    operation: pb.NativeSourceOperation.ValueType = pb.NATIVE_SOURCE_OPERATION_CIVITAI,
+    operation: pb.NativeSourceOperation = pb.NATIVE_SOURCE_OPERATION_CIVITAI,
 ) -> pb.NativeSourceCommand:
     raw = documents.canonical_bytes(
         pb.InvocationSpec(
@@ -154,7 +155,9 @@ def isolated_admission(monkeypatch: pytest.MonkeyPatch) -> None:
 REQUEST = {"version": VERSION, "destination": "example/sdxl", "profiles": [], "file": ""}
 
 
-def upload(calls: SourceCalls, workspace: Workspace, messages: queue.Queue, parent: str):
+def upload(
+    calls: SourceCalls, workspace: Workspace, messages: queue.Queue[pb.WorkerFrame], parent: str
+) -> tuple[pb.NativeSourceStatus, pb.NativeSourceStatus | None]:
     built = command(workspace, REQUEST, parent)
     built.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
     calls.handle(built)
@@ -205,8 +208,7 @@ def test_a_civitai_sdxl_upload_is_normalized_with_its_reference_configs_and_toke
         assert again.computation_digest == finished.computation_digest
         assert canonical_json.decode(again.result_canonical_bytes)["manifest"] == manifest
 
-    store = tensorfs.Store.open(str(workspace.store_root))
-    header = tensorfs.parse_header(store.manifest(manifest["digest"])["header"])
+    header = checkpoint_header(workspace, manifest["digest"])
     components = header["components"]
     assert list(components) == ["text_encoder", "text_encoder_2", "unet", "vae"]
     assert [len(components[name]) for name in components] == [196, 517, 1680, 248]
@@ -222,13 +224,20 @@ def test_a_civitai_sdxl_upload_is_normalized_with_its_reference_configs_and_toke
     for index, member in enumerate(("q_proj", "k_proj", "v_proj")):
         row = layer[f"text_model.encoder.layers.0.self_attn.{member}.weight"]
         assert row["logical"]["shape"] == [2, 2]
-        assert row["parts"]["value"]["inline"] == fused[index * 8 : (index + 1) * 8]
+        inline = fused[index * 8 : (index + 1) * 8]
+        assert row["parts"]["value"] == {"dtype": "f16", "shape": [2, 2], "inline": inline}
     assert "position_ids" not in json.dumps(list(components["text_encoder"]))
 
     self_contained(header)
 
 
-def self_contained(header: dict[str, Any]) -> None:
+def checkpoint_header(workspace: Workspace, digest: str) -> tensorfs.Header:
+    header = tensorfs.Store.open(str(workspace.store_root)).manifest(digest)["header"]
+    assert header is not None
+    return tensorfs.parse_header(header)
+
+
+def self_contained(header: tensorfs.Header) -> None:
     """Configs, index and marker inline; tokenizers as assets; nothing fetched to run."""
     configs = {name: json.loads(value) for name, value in header["configs"].items()}
     assert configs == {
@@ -299,8 +308,7 @@ def test_convert_cozytensors_of_a_civitai_sdxl_file_is_the_same_self_contained_c
             convert.service_id
         )
         manifest = canonical_json.decode(converted.result_canonical_bytes)["manifest"]
-    store = tensorfs.Store.open(str(workspace.store_root))
-    header = tensorfs.parse_header(store.manifest(manifest["digest"])["header"])
+    header = checkpoint_header(workspace, manifest["digest"])
     assert [len(table) for table in header["components"].values()] == [196, 517, 1680, 248]
     self_contained(header)
 
@@ -366,7 +374,7 @@ def test_a_repeated_civitai_upload_is_the_owners_memo_hit(
     origin, reference = Civitai(VERSION, FILE_ID, body), HuggingFace(REFERENCE)
     with origin.running() as civitai, reference.running() as hf, hub.running():
 
-        def pod():  # type: ignore[no-untyped-def]
+        def pod() -> tuple[AbstractContextManager[Machine], Machine]:
             rented = machine(monkeypatch, SCRIPT.replace("GATE", repr(str(gate))))
             machine_ = rented.__enter__()
             calls = machine_.worker.source_calls
