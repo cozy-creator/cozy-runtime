@@ -639,16 +639,6 @@ class Workspace:
                 )
             ]
 
-    def projected_weights(self, owner: str, worker_boot: str) -> list[WeightsRow]:
-        with self.locked() as db:
-            return db.all(
-                WeightsRow,
-                "SELECT w.* FROM weights AS w JOIN attempts AS a ON "
-                "a.owner=w.owner AND a.request=w.request AND a.ordinal=w.ordinal "
-                "WHERE w.owner=? AND a.state<>'released' AND w.state<>'released' "
-                "AND (a.state='outcome' OR a.worker_boot=?) ORDER BY w.id",
-                (owner, worker_boot),
-            )
 
     @staticmethod
     def _model_held(
@@ -1089,18 +1079,6 @@ class Workspace:
                 raise WorkspaceRefusal("workspace has no owned weights transaction")
             return row
 
-    def refuse_weights(self, owner: str, transaction: str) -> bool:
-        """Tombstone one transaction the Host refused and stop its native writer.
-
-        Returns false when it was already released (a duplicate refusal)."""
-        with self.locked() as db:
-            changed = db.execute(
-                "UPDATE weights SET state='released' WHERE owner=? AND id=? AND state<>'released'",
-                (owner, transaction),
-            ).rowcount
-            if changed:
-                db.native(partial(_stop_native_transaction, self.store_root, transaction))
-            return bool(changed)
 
     def ready_weights(self, owner: str, request: pb.WeightsIntentReadyRequest) -> WeightsRow:
         subject = request.weights

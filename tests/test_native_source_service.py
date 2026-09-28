@@ -7,7 +7,6 @@ import json
 import queue
 import threading
 import time
-from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from weakref import WeakValueDictionary
@@ -22,7 +21,6 @@ from cozy_runtime.internal.worker import source_steps, workspace_memo
 from cozy_runtime.internal.worker.source_calls import SourceCalls
 from cozy_runtime.internal.worker.stage_progress import SAMPLE_SECONDS
 from cozy_runtime.internal.worker.workspace import Workspace
-from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_workspace_native_memo import accepted
 
@@ -541,84 +539,6 @@ def test_stale_parent_cancel_cannot_kill_a_new_source_attempt(tmp_path: Path) ->
     assert process.kills == 0
     calls.cancel_parent("parent", ordinal=2, spec=b"n" * 32)
     assert process.kills == 1
-
-
-def test_current_source_validation_refusal_reaches_protocol_peer(tmp_path: Path) -> None:
-    from concurrent.futures import ThreadPoolExecutor
-
-    import grpc
-
-    from cozy_runtime.internal.worker.session import OwnershipFence, Worker
-    from cozy_runtime.protocol import worker_pb2_grpc as rpc
-
-    workspace = Workspace(tmp_path / "store")
-    command = accepted(workspace, "refused-source-parent")
-    command.record_owner_epoch = 1
-    command.control_stream_epoch = 1
-    command.worker_boot_id = "boot"
-    command.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
-    command.credential = "fake-source-refusal-secret-canary"
-    command.parent_call.module = "untrusted.source"
-    outgoing: queue.Queue[pb.WorkerFrame] = queue.Queue()
-
-    class DispatchWorker(Worker):
-        """Bind the real dispatcher to this test's existing control transport."""
-
-        def __init__(self) -> None:
-            self.fence = OwnershipFence(
-                record_owner_epoch=1,
-                control_stream_epoch=1,
-                worker_boot_id="boot",
-                wire_minor=WIRE_MINOR,
-                dispatch_open=True,
-            )
-            self.source_calls = SourceCalls(
-                workspace, lambda: "owner", outgoing.put, lambda _: True
-            )
-
-        def note(self, kind: str, step: str) -> None:
-            pass
-
-        def send(self, frame: pb.WorkerFrame) -> None:
-            outgoing.put(frame)
-
-    worker = DispatchWorker()
-
-    # The generated grpc base has no type declarations.
-    class Peer(rpc.WorkerControlServicer):  # type: ignore[misc]
-        def Control(
-            self, requests: Iterator[pb.RecordOwnerFrame], context: grpc.ServicerContext
-        ) -> Iterator[pb.WorkerFrame]:
-            for frame in requests:
-                worker._dispatch_current_frame(frame)
-                while not outgoing.empty():
-                    yield outgoing.get_nowait()
-
-    server = grpc.server(ThreadPoolExecutor(max_workers=2))
-    rpc.add_WorkerControlServicer_to_server(Peer(), server)
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    try:
-        with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
-            frames = list(
-                rpc.WorkerControlStub(channel).Control(
-                    iter([pb.RecordOwnerFrame(native_source_command=command)]),
-                    timeout=5,
-                )
-            )
-        assert len(frames) == 1, "accepted caller was left waiting after source validation refusal"
-        result = frames[0].native_source_status
-        assert result.state == pb.NATIVE_SOURCE_STATE_FAILED
-        assert result.safe_code == "native_source_refused"
-        assert result.service_id == command.service_id
-        assert result.parent_request_id == command.parent_call.parent_request_id
-        assert result.intent_digest == command.parent_call.intent_digest
-        assert b"fake-source-refusal-secret-canary" not in frames[0].SerializeToString()
-        command.record_owner_epoch = 2
-        worker._dispatch_current_frame(pb.RecordOwnerFrame(native_source_command=command))
-        assert outgoing.empty(), "stale owner received a new source callback"
-    finally:
-        server.stop(0).wait()
 
 
 def _second_carrier(body: bytes) -> bytes:

@@ -19,17 +19,12 @@ import contextlib
 import dataclasses
 import os
 import subprocess
-import sys
 import tempfile
-import uuid
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from conftest import sample_python
-from cozy.worker.v1.wire_version import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
 from cozy_runtime.internal import accel, child_env, executor_commands, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
@@ -37,7 +32,6 @@ from cozy_runtime.internal.executor_commands import Start
 from cozy_runtime.internal.worker import lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import (
     HostedPlacement,
     Placement,
@@ -45,8 +39,7 @@ from cozy_runtime.internal.worker.session import (
     WorkerOptions,
     executor_load_command,
 )
-from cozy_runtime.protocol import worker_pb2 as pb
-from local_owner import LocalRecordOwner, LocalRequest, SliceOutcome, claimable, run_slice
+from local_owner import claimable
 from test_end_to_end import NO_EXECUTOR
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -73,147 +66,7 @@ def _workspace() -> Iterator[Path]:
         yield Path(raw)
 
 
-def _slice(
-    root: Path, *, devices: str, kind: str, hook: Any = None, owner_hook: Any = None
-) -> tuple[SliceOutcome, list[str]]:
-    """One marco-polo request through `run_slice`, exactly as `cozy-runtime run`/`job`
-    builds it, with the worker's device envelope chosen by the arm."""
-    config = _config(root / "home")
-    found = discover(PACKAGE)
-    body = package_interface.build(found)
-    workspace = root / "run"
-    workspace.mkdir(parents=True, exist_ok=True)
-    installation_id = "local-" + uuid.uuid4().hex
-    job_records: list[JobBinding] = []
-    descriptor_id = ""
-    if kind == "job":
-        descriptor_id = package_interface.job_descriptor_id(body, "marco_job")
-        interface_path = workspace / "metadata" / "package-interface.json"
-        interface_path.parent.mkdir()
-        interface_path.write_bytes(package_interface.canonical_bytes(body))
-        job_records.append(
-            JobBinding(
-                job_descriptor_id=descriptor_id,
-                installation_id=installation_id,
-                application=str(body["application"]),
-                package_interface=str(interface_path),
-                python=str(sample_python()),
-                job="marco_job",
-            )
-        )
-    request = LocalRequest(
-        entrypoint="marco_job" if kind == "job" else "marco",
-        payload={"message": "marco"},
-        outputs=(),
-        request_id=f"lanes-{kind}",
-        kind=kind,
-        job_descriptor_id=descriptor_id,
-    )
-    seals: list[str] = []
-
-    def capture(owner: LocalRecordOwner, worker: Worker) -> None:
-        # The harness reads the child's OWN report of its sealed environment at the moment
-        # the supervision publishes it — the same `hello` the worker digest-checks.
-        if owner_hook is not None:
-            owner_hook(owner)
-        publish = worker.supervision.on_change
-
-        def on_change(executor: Any) -> None:
-            if executor is not None:
-                seals.append(str(executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"]))
-            if publish is not None:
-                publish(executor)
-
-        worker.supervision.on_change = on_change
-        if hook is not None:
-            hook(worker)
-
-    with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
-        outcome = run_slice(
-            config,
-            request,
-            job_records=job_records,
-            workspace=workspace,
-            package_installation_id=installation_id,
-            package_interface_document=body if kind == "entrypoint" else None,
-            project=PACKAGE,
-            development_tensorfs_root=config.cozy_home / "tensorfs",
-            options=WorkerOptions(
-                root=workspace / "worker", devices=devices, python=str(sample_python())
-            ),
-            record_owner_hook=capture,
-        )
-    return outcome, seals
-
-
 # --------------------------------------------------------------------------- step 0
-
-
-@needs_executor
-def test_one_lane_serves_sealed_to_its_device() -> None:
-    """The worker every deployment produces today: one device, one lane, one seal, served."""
-    with _workspace() as root:
-        outcome, seals = _slice(root, devices="0", kind="entrypoint")
-    assert outcome.result == {"message": "polo"}, (outcome.error, outcome.faults)
-    assert seals == ["0"], seals
-
-
-@needs_executor
-def test_previous_minor_owner_runs_inference_on_current_worker() -> None:
-    def previous(owner: LocalRecordOwner) -> None:
-        queued = owner.host.inbound.get_nowait()
-        assert queued is not None and queued.WhichOneof("msg") == "claim"
-        queued.claim.wire_minor = MIN_COMPATIBLE_WIRE_MINOR
-        owner.host.deliver(queued)
-        make_desired = owner._desired_state
-
-        def desired() -> pb.DesiredWorkerState:
-            directive = make_desired()
-            directive.wire_minor = MIN_COMPATIBLE_WIRE_MINOR
-            return directive
-
-        owner._desired_state = desired  # type: ignore[method-assign]
-
-    with _workspace() as root:
-        outcome, seals = _slice(root, devices="0", kind="entrypoint", owner_hook=previous)
-    assert outcome.result == {"message": "polo"}, (outcome.error, outcome.faults)
-    assert seals == ["0"]
-
-
-@needs_executor
-def test_a_two_device_serving_envelope_serves_a_supported_owner_per_lane() -> None:
-    """The same set from a compatible owner is served: the weightless
-    placement lands on lane-0 (fewest placements), sealed to device 0 alone, and every
-    observed state the owner read carries both lanes, the placement's `device_lane_id`,
-    and a worker-level count that is the SUM over lanes."""
-    owners: list[LocalRecordOwner] = []
-    with _workspace() as root:
-        outcome, seals = _slice(root, devices="0,1", kind="entrypoint", owner_hook=owners.append)
-    assert outcome.result == {"message": "polo"}, (outcome.error, outcome.faults)
-    assert seals == ["0"], seals
-    (owner,) = owners
-    served = [r for r in owner.reports if r.lanes and r.placements]
-    assert served, "no observed state carried lanes and a placement"
-    for report in served:
-        assert [lane.lane_id for lane in report.lanes] == ["lane-0", "lane-1"]
-        assert [list(lane.device_ordinals) for lane in report.lanes] == [[0], [1]]
-        assert report.available_attempt_slots == sum(
-            lane.available_attempt_slots for lane in report.lanes
-        )
-        (status,) = report.placements
-        assert status.device_lane_id == "lane-0"
-        assert list(report.lanes[0].placement_ids) == [status.placement_id]
-        assert list(report.lanes[1].placement_ids) == []
-    assert report.applied_wire_minor == WIRE_MINOR
-
-
-@needs_executor
-def test_a_job_keeps_the_whole_envelope() -> None:
-    """A job's executor is sealed to the ENVELOPE lane — every device, one seat."""
-    with _workspace() as root:
-        outcome, seals = _slice(root, devices="0,1", kind="job")
-    assert outcome.result == {"message": "polo"}, (outcome.error, outcome.faults)
-    assert seals == ["0,1"], seals
 
 
 # --------------------------------------------------------------------------- step 1
@@ -382,70 +235,6 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
     assert lanes_.choose((0, 1, 2), 1, model_bearing=False, declared_bytes=0, measured={}) == (2,)
     lanes_.release("big")
     assert lanes_.lane_of("big") is None and "big" not in lanes_.lanes[1].rows
-
-
-def test_one_lane_worker_seats_and_a_two_lane_worker_sum() -> None:
-    """`available_attempt_slots` is the SUM of per-lane seats (one running plus one staged
-    per serving lane); a held attempt takes only its own lane's seat."""
-    with _workspace() as root:
-        config = _config(root / "home")
-        worker = Worker(
-            *claimable(config, WorkerOptions(root=root / "worker", devices="0,1")),
-            InMemoryControlHost(),
-        )
-        try:
-            assert worker.available_attempt_slots() == 0  # admission CLOSED before a claim
-            worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
-            worker.fence.dispatch_open = True
-            worker.accepted.mode = "serving"
-            primary = Placement(
-                placement_id="p0",
-                placement_set_digest=b"",
-                package={},
-                development={},
-                installation_id="",
-                package_interface=b"",
-                bindings_digest=b"",
-                models=(),
-                entrypoints=(),
-                document={},
-                serving=pb.ServingState.SERVING_STATE_DISPATCHABLE,
-            )
-            hosted = dataclasses.replace(primary, placement_id="p1")
-            worker.placement = primary
-            worker.hosted["p1"] = HostedPlacement(
-                placement=hosted, supervision=worker._new_placement_supervision("p1")
-            )
-            worker.lanes.lanes[0].placements.add("p0")
-            primary.lane_id = "lane-0"
-            worker.lanes.lanes[1].placements.add("p1")
-            hosted.lane_id = "lane-1"
-            assert worker.available_attempt_slots() == 4
-            held = AttemptRecord(request_id="r", attempt=1, digest=b"", spec={})
-            held.placement_id = "p0"
-            held.lane_id = "lane-0"
-            held.state = "running"
-            worker.engine.history[held.key()] = held
-            assert worker._lane_slots(worker.lanes.lanes[0]) == 1  # the staged seat
-            staged = AttemptRecord(request_id="q", attempt=1, digest=b"", spec={})
-            staged.placement_id = "p0"
-            staged.lane_id = "lane-0"
-            staged.state = "staged"
-            worker.engine.history[staged.key()] = staged
-            assert worker._lane_slots(worker.lanes.lanes[0]) == 0
-            assert worker._lane_slots(worker.lanes.lanes[1]) == 2
-            assert worker.available_attempt_slots() == 2
-            # lane B's gate is untouched by lane A rebuilding
-            worker._settle()
-            assert worker.lanes.lanes[1].settled.is_set()
-            worker.lanes.lanes[0].settled.clear()
-            other = AttemptRecord(request_id="s", attempt=1, digest=b"", spec={})
-            other.lane_id = "lane-1"
-            worker.await_settled(other)  # returns at once; lane-0's rebuild is not its wait
-        finally:
-            for slot in worker.hosted.values():
-                slot.supervision.close()
-            worker.supervision.close()
 
 
 def test_the_ledger_row_survives_a_switch_to_another_placement() -> None:

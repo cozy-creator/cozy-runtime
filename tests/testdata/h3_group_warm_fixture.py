@@ -1,20 +1,11 @@
-"""Create a tiny checkpoint and run the real Worker prepare/warm under the pod UID.
-
-No fake CUDA transport or accountancy is installed. This local RecordOwner pins
-its own placement to the requested devices; all worker/executor behavior is real.
-Run as root on an explicitly owned GPU host. --prepare-only uses CPU and no worker.
-"""
+"""Create the tiny native H3 checkpoints the CPU content/forward qualification reads."""
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import io
 import json
-import os
-import subprocess
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -24,14 +15,9 @@ from tensorfs.derived import Config as NativeConfig
 from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import Config
-from cozy_runtime.internal import canonical, child_env, package_interface
-from cozy_runtime.internal.config import Credentials, RuntimeConfig
-from cozy_runtime.internal.development_launch import LOCAL_PLACEMENT
-from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal import canonical
 from cozy_runtime.internal.encoding import SPEC_PLAIN
 from cozy_runtime.internal.weights_sink import weights_transaction_id
-from cozy_runtime.internal.worker.session import WorkerOptions
-from cozy_runtime.protocol import documents
 
 PACKAGE = Path(__file__).parent / "h3_group_warm"
 sys.path[:0] = [str(PACKAGE), str(Path(__file__).parents[1])]
@@ -41,8 +27,6 @@ from h3_group_warm import (  # type: ignore[import-not-found]  # noqa: E402
     BasePipe,
     OverlayPipe,
 )
-
-from local_owner import LocalRequest, run_slice  # noqa: E402
 
 
 def checkpoint(
@@ -93,37 +77,6 @@ def checkpoint(
     return {"name": name, "manifest": manifest, "length": length, "weight_bytes": total}
 
 
-def preflight_uid(root: Path) -> None:
-    """Prove actual UID65533 can traverse the interpreter and immutable fixture paths."""
-    import cozy_runtime
-
-    paths = [sys.executable, str(PACKAGE), str(Path(__file__).resolve()), cozy_runtime.__file__]
-    code = (
-        "import json,os,sys; from pathlib import Path; "
-        "rows=[{'path':p,'readable':os.access(p,os.R_OK),"
-        "'parents_searchable':all(os.access(x,os.X_OK) for x in Path(p).parents)} "
-        "for p in sys.argv[1:]]; print(json.dumps({'uid':os.getuid(),'paths':rows})); "
-        "sys.exit(0 if all(r['readable'] and r['parents_searchable'] for r in rows) else 1)"
-    )
-    checked = subprocess.run(
-        [sys.executable, "-I", "-S", "-c", code, *paths],
-        user=65533,
-        group=65533,
-        extra_groups=[],
-        env={},
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    (root / "uid-preflight.stdout").write_text(checked.stdout)
-    (root / "uid-preflight.stderr").write_text(checked.stderr)
-    if checked.returncode:
-        raise RuntimeError(
-            "fixture/interpreter paths are not readable and traversable by UID65533; "
-            "stage them under a traversable owned test directory before GPU execution"
-        )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -134,7 +87,7 @@ def main() -> None:
         choices=("expandable_segments:True", "expandable_segments:False"),
         default="expandable_segments:True",
     )
-    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--prepare-only", action="store_true")  # the only mode
     args = parser.parse_args()
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -156,71 +109,6 @@ def main() -> None:
         flush=True,
     )
     del base, overlay
-    if args.prepare_only:
-        return
-    if os.geteuid() != 0:
-        parser.error("actual pod executor UID qualification requires root")
-    # TensorFS owns its lease/recovery path policy for separate reader UIDs.
-    tensorfs.Store.ensure(str(store)).prepare_readers()
-    preflight_uid(root)
-    config = RuntimeConfig(
-        cozy_home=root / "home",
-        credentials=Credentials(),
-        child_base_env=tuple(
-            sorted((key, value) for key, value in os.environ.items() if not child_env.erased(key))
-        ),
-    )
-    found = discover(PACKAGE)
-    body = package_interface.build(found)
-    installation_id = "local-" + uuid.uuid4().hex
-
-    def pin_devices(owner: Any, _worker: Any) -> None:
-        original = owner._desired_state
-
-        def desired() -> Any:
-            directive = original()
-            directive.placement_set.device_pins.add(
-                placement_id=LOCAL_PLACEMENT, device_ordinals=range(args.degree)
-            )
-            return directive
-
-        owner._desired_state = desired
-
-    with contextlib.chdir(PACKAGE):
-        outcome = run_slice(
-            config,
-            LocalRequest("generate", {"value": 1}, outputs=(), request_id="h3a093"),
-            workspace=root / "run",
-            package_installation_id=installation_id,
-            package_interface_document=body,
-            project=PACKAGE,
-            development_tensorfs_root=store,
-            options=WorkerOptions(
-                root=root / "run" / "worker",
-                devices=",".join(str(i) for i in range(args.degree)),
-                accelerator_backend="cuda",
-                executor_uid=65533,
-                executor_gid=65533,
-                alloc_conf=args.allocator,
-                attention_pin="base/fl2va_dit=" + args.attention,
-            ),
-            delete_workspace=False,
-            record_owner_hook=pin_devices,
-        )
-    report = {
-        "status": outcome.status,
-        "ended": outcome.ended,
-        "error": outcome.error,
-        "exit_code": outcome.exit_code,
-        "faults": outcome.faults,
-        "result": outcome.result,
-        "accepted": documents.body(outcome.accepted),
-        "executions": outcome.executions,
-    }
-    (root / "outcome.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps(report), flush=True)
-    if outcome.exit_code or outcome.status != "OUTCOME_STATUS_SUCCEEDED":
-        raise SystemExit(outcome.exit_code or 1)
 
 
 if __name__ == "__main__":

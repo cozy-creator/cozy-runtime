@@ -847,7 +847,6 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 if case in ("model", "model_sequence")
                 else 12
             }
-            assert not worker.connected.is_set()
             assert worker.workspace is not None
             with worker.workspace.locked() as db:
                 if case in ("serving", "internal_serving"):

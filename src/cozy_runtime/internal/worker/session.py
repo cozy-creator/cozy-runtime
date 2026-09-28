@@ -502,9 +502,7 @@ class OwnershipFence:
     #: TRUE once this pod boot accepted a (record_owner_epoch, record_owner_id) pair.
     record_owner_recorded: bool = False
     control_stream_epoch: int = 0  # worker-minted; 0 = never claimed
-    snapshot_id: str = ""  # the snapshot the CURRENT stream must ack
-    snapshot_digest: bytes = b""  # ...bound by BOTH; an ack naming either alone is not one
-    dispatch_open: bool = False
+    snapshot_id: str = ""  # the snapshot the CURRENT stream was sent
     wire_minor: int = 0
 
 
@@ -1325,11 +1323,8 @@ class Worker:
         self.supervision.on_invalidate = self.capacity_dropped
         self.supervision.on_exit = self.executor_exited
         self.supervision.on_lane_failure = self.fail_machine
-        self.connected = threading.Event()
         #: The `control_stream_epoch` of every accepted RecordOwner stream being served right
-        #: now. `connected` is narrower — it opens only at SnapshotAck — and a claim that has
-        #: been accepted but not yet acked is still an owner holding this pod, which is the
-        #: fact the supervisor's release decision rests on.
+        #: now: an owner holding this pod, the fact the supervisor's release decision rests on.
         self.attached_streams: set[int] = set()
         #: What this worker is doing, for the pod supervisor that outlives it. Absent off a
         #: pod: there is no second process there to publish to. (`self.activity` above is
@@ -3166,8 +3161,6 @@ class Worker:
     def _residency_changed(self) -> None:
         """A residency set moved (a manifest held or gone, a fill or a vacate): the owner
         reads it from the next state, so one goes now rather than at the next tick."""
-        if self.connected.is_set():
-            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
     def _rebuild_held_manifests(self) -> None:
         """Boot: `held_manifests` from the store's own verified walk, no network. A worker
@@ -3199,8 +3192,6 @@ class Worker:
             else:
                 lane.settled.clear()
         self._capacity_changed()
-        if self.connected.is_set():
-            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
     def _lane_latched(self, lane: DeviceLane) -> bool:
         """Every placement on the lane has stopped moving for the accepted revision."""
@@ -3271,18 +3262,9 @@ class Worker:
         )
 
     def admission_state(self) -> pb.AdmissionState:
-        """CLOSED is STRUCTURAL (#486c): before the snapshot barrier, while draining, while
-        the placement is not dispatchable. OPEN with zero slots is TRANSIENT saturation, and
-        a RecordOwner backs off differently for each — so the two never collapse into one
-        counter here either."""
-        if (
-            not self.fence.dispatch_open
-            or self.accepted.posture == pb.Posture.POSTURE_DRAINING
-            or self.phase != pb.WorkerPhase.WORKER_PHASE_ONLINE
-            or not self.dispatchable()
-        ):
-            return pb.AdmissionState.ADMISSION_STATE_CLOSED
-        return pb.AdmissionState.ADMISSION_STATE_OPEN
+        """CLOSED: no attempt is offered over the Control stream; work arrives through the
+        execution API."""
+        return pb.AdmissionState.ADMISSION_STATE_CLOSED
 
     def available_attempt_slots(self) -> int:
         """Free seats across this worker's lanes, NOW — the SUM of each lane's free seat.
@@ -3614,9 +3596,6 @@ class Worker:
             # Unconditional: a SUPERSEDED stream is gone too, and leaving its epoch here
             # would report an owner that has been fenced out as still holding the pod.
             self.attached_streams.discard(epoch)
-            if self.fence.control_stream_epoch == epoch:
-                self.connected.clear()
-                self.fence.dispatch_open = False
 
     def accept_claim(
         self, claim: pb.Claim, send: Callable[[pb.WorkerFrame], None]
@@ -3708,7 +3687,6 @@ class Worker:
                 self.record_ownership(claim)
             except (OSError, ValueError):
                 self.claim_ready.clear()
-                self.fence.dispatch_open = False
                 self.request_stop()
                 return reject(
                     pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
@@ -3721,7 +3699,6 @@ class Worker:
             self.fence.record_owner_id = claim.record_owner_id
             self.fence.record_owner_recorded = True
             self.fence.control_stream_epoch += 1
-            self.fence.dispatch_open = False
             self.fence.wire_minor = min(WIRE_MINOR, claim.wire_minor)
             epoch = self.fence.control_stream_epoch
             # A FRESH queue for this stream. The superseded sender keeps its own and drains
@@ -3852,12 +3829,9 @@ class Worker:
         return body
 
     def _send_snapshot(self, send: Callable[[pb.WorkerFrame], None]) -> None:
-        """ONE `WorkerSnapshot`, digest-fenced. Dispatch stays CLOSED until the
-        RecordOwner's `SnapshotAck` names exactly this `snapshot_id` AND this
-        `snapshot_digest` — an ack naming a different one is NOT an ack (02 §6, §5)."""
+        """ONE digest-fenced `WorkerSnapshot`: what this worker holds, for its RecordOwner."""
         canonical_bytes, digest = documents.identity(self.snapshot_body())
         self.fence.snapshot_id = f"snp-{uuid.uuid4().hex[:16]}"
-        self.fence.snapshot_digest = digest
         held = len(self.snapshot_body().held_attempts)
         send(
             self.stamp(
@@ -3879,8 +3853,7 @@ class Worker:
         self.note(
             "snapshot",
             f"snapshot {self.fence.snapshot_id} ({len(canonical_bytes)} B, "
-            f"{documents.spell(digest)[:23]}…) reports {held} held attempt(s); the "
-            "RecordOwner reconciles them durably before any dispatch",
+            f"{documents.spell(digest)[:23]}…) reports {held} held attempt(s)",
         )
 
     def _pump_outbound(
@@ -3935,234 +3908,11 @@ class Worker:
                 return
             self._dispatch_current_frame(frame)
 
-    def _weights_refused(self, refused: pb.WeightsTransactionRefused) -> None:
-        """The Host holds no custody for one transaction: stop it and fail only its attempt.
-
-        The envelope was fenced by the caller. A refusal naming no transaction this worker
-        opened, or one already refused, is a no-op; the control stream always continues.
-        """
-        owner = self.fence.record_owner_id
-        transaction = refused.weights_transaction_id
-        if self.workspace is None:
-            return
-        try:
-            row = self.workspace.weights_row(owner, transaction)
-        except WorkspaceRefusal:
-            row = None
-        if (
-            row is None
-            or row["request"] != refused.request_id
-            or row["ordinal"] != refused.attempt_ordinal
-            or row["epoch"] != refused.writer_epoch
-        ):
-            self.note("weights", f"ignored a custody refusal for unknown {transaction[:23]}")
-            return
-        self.weights.abandon(transaction)
-        if not self.workspace.refuse_weights(owner, transaction):
-            return
-        detail = safe(
-            f"output {refused.output_slot!r}: the Host refused "
-            f"{pb.WeightsHostStage.Name(refused.stage)} "
-            f"({pb.WeightsHostRefusal.Name(refused.refusal)}): {refused.safe_detail}"
-        )
-        attempt = self.engine.history.get((refused.request_id, refused.attempt_ordinal))
-        if attempt is not None and attempt.state not in ("outcome", "closed"):
-            attempt.weights_refused = detail
-        self.note("weights", f"{refused.request_id}#{refused.attempt_ordinal} {detail}")
-
     def _dispatch_current_frame(self, frame: pb.RecordOwnerFrame) -> None:
+        """The Control stream carries only the Claim; work arrives through the execution API."""
         kind = frame.WhichOneof("msg")
-        if kind is None:
-            return
-        inner = getattr(frame, kind)
-        if kind == "claim":
-            self.note("claim", "PROTOCOL: a second Claim on an established stream; ignored")
-            return
-        if self.fenced(inner):
-            return
-        if kind == "weights_transaction_refused":
-            self._weights_refused(inner)
-            return
-        if kind == "snapshot_ack":
-            # THE BARRIER IS BOUND BY BOTH (§5). An ack naming a different `snapshot_id` OR
-            # a different `snapshot_digest` is NOT an ack: it would open dispatch against a
-            # reconciliation of some other snapshot, which is the one thing the barrier
-            # exists to prevent.
-            if (
-                inner.snapshot_id != self.fence.snapshot_id
-                or inner.snapshot_digest != self.fence.snapshot_digest
-            ):
-                self.note(
-                    "fence",
-                    f"SnapshotAck names {inner.snapshot_id!r}/"
-                    f"{inner.snapshot_digest.hex()[:12]} and this snapshot is "
-                    f"{self.fence.snapshot_id!r}/{self.fence.snapshot_digest.hex()[:12]}: "
-                    "not an ack, the barrier stays closed",
-                )
-                return
-            self.fence.dispatch_open = True
-            self.connected.set()
-            self.bump_admission(f"snapshot {inner.snapshot_id} acknowledged; dispatch opens")
-            self.note("session", f"snapshot {inner.snapshot_id} acknowledged; dispatch is open")
-            for attempt in self.engine.pending_outcomes():
-                self.note(
-                    "outcome",
-                    f"replaying the recorded outcome for {attempt.request_id}#"
-                    f"{attempt.attempt} in a fresh envelope ({attempt.outcome_id})",
-                )
-                self.send(pb.WorkerFrame(attempt_outcome=self.engine.wrap(attempt)))
-            if self.workspace is not None:
-                # Completed historical work may belong to an executor that no
-                # longer exists. Never project another worker's live attempt.
-                for value in self.workspace.projected_weights(
-                    self.fence.record_owner_id, self.fence.worker_boot_id
-                ):
-                    row = value
-                    if row["receipt"]:
-                        self.send(
-                            pb.WorkerFrame(
-                                weights_receipt=pb.WeightsReceiptFrame(
-                                    request_id=row["request"],
-                                    attempt_ordinal=row["ordinal"],
-                                    invocation_spec_digest=row["spec"],
-                                    output_slot=row["slot"],
-                                    weights_transaction_id=row["id"],
-                                    writer_epoch=row["epoch"],
-                                    tensorfs_declaration_digest=row["declaration_digest"],
-                                    weights_receipt=pb.WeightsReceiptRef(
-                                        weights_receipt_digest=row["receipt_digest"],
-                                        weights_receipt_canonical_bytes=row["receipt"],
-                                    ),
-                                    manifest=pb.Ref(
-                                        digest=row["manifest"], length=row["manifest_length"]
-                                    ),
-                                    objects=[
-                                        pb.WeightsObjectSource(**obj)
-                                        for obj in json.loads(row["objects"])
-                                    ],
-                                )
-                            )
-                        )
-                    self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(value)))
-                for outcome in self.workspace.retained_outcomes(self.fence.record_owner_id):
-                    self.send(pb.WorkerFrame(attempt_outcome=outcome))
-            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
-            return
-        if kind == "desired_state":
-            minor = inner.wire_minor or self.fence.wire_minor
-            if minor < MIN_COMPATIBLE_WIRE_MINOR:
-                self.engine.fault(
-                    _refused(
-                        inner.revision,
-                        kind=pb.FAULT_KIND_CONFIG_REFUSED,
-                        reason=CAPABILITY_UNAVAILABLE_CODE,
-                        detail=_capability_unavailable("package preparation", minor),
-                    )
-                )
-                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
-                return
-            if self.executions is not None and self.executions.active(self.fence.record_owner_id):
-                self.engine.fault(
-                    _refused(
-                        inner.revision,
-                        kind=pb.FAULT_KIND_CONFIG_REFUSED,
-                        reason="machine_execution_owns_worker",
-                        detail="Accepted execution controls its prepared state; "
-                        "submit through the execution API.",
-                    )
-                )
-                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
-                return
-            try:
-                self._apply_desired_state(inner)
-            except ExecutorGone as exc:
-                self.note("desired_state", f"apply failed: {exc}")
-                self.latch(
-                    _refused(
-                        inner.revision,
-                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        reason="desired_state_preparation_failed",
-                        detail=safe(f"{type(exc).__name__}: {exc}"),
-                    )
-                )
-            return
-        if not self.fence.dispatch_open:
-            self.note("fence", f"dropped a {kind} before SnapshotAck: dispatch is closed")
-            return
-        if (
-            kind in ("attempt_offer", "cancel_attempt", "outcome_ack", "weights_finalize_request")
-            and self.executions is not None
-            and self.executions.owns(self.fence.record_owner_id, inner.request_id)
-        ):
-            self.note("execution", "machine-owned request requires the execution control API")
-            return
-        if kind == "attempt_offer":
-            self.on_offer(inner)
-        elif kind == "cancel_attempt":
-            if self.source_calls is not None:
-                self.source_calls.cancel_parent(
-                    inner.request_id,
-                    ordinal=inner.attempt_ordinal,
-                    spec=inner.invocation_spec_digest,
-                )
-            self.note("cancel", self.cancel(inner))
-        elif kind == "outcome_ack":
-            self.on_outcome_ack(inner)
-        elif kind == "checkpoint_receipt":
-            self.engine.absorb_receipt(inner)
-            ack = pb.JobCheckpointAck(
-                request_id=inner.request_id,
-                attempt_ordinal=inner.attempt_ordinal,
-                operation_key=inner.operation_key,
-                receipt_id=inner.receipt_id,
-                content_digest=inner.content_digest,
-            )
-            self.send(pb.WorkerFrame(checkpoint_ack=ack))
-        elif kind == "native_source_command":
-            from cozy_runtime.internal.worker.source_calls import refusal_frame
-
-            if self.source_calls is None:
-                self.send(refusal_frame(inner, "native_source_unavailable"))
-            else:
-                try:
-                    self.source_calls.handle(inner)
-                except Exception:
-                    self.send(refusal_frame(inner, "native_source_refused"))
-        elif kind == "native_artifact_transfer":
-            if self.artifact_transfers is not None:
-                self.artifact_transfers.handle(inner)
-        elif kind == "child_call_result":
-            if not self.calls.absorb(inner):
-                self.note("child", "dropped stale or invalid child-call result")
-            elif inner.state == pb.CHILD_CALL_STATE_SUCCEEDED and self.workspace is not None:
-                from . import workspace_memo
-
-                try:
-                    workspace_memo.delivered(
-                        self.workspace, self.fence.record_owner_id, inner.child_request_id
-                    )
-                except Exception as exc:
-                    # The owner already committed this result. Optional metadata
-                    # compaction cannot turn its successful computation into a failure.
-                    self.note("workspace", f"result compaction deferred ({type(exc).__name__})")
-        elif kind == "weights_finalize_request":
-            from . import workspace_finalize
-
-            try:
-                if self.workspace is None:
-                    raise ValueError("workspace custody is unavailable")
-                result = workspace_finalize.finalize(
-                    self.workspace,
-                    self.fence.record_owner_id,
-                    inner,
-                    on_abandon=self.weights.abandon,
-                )
-            except Exception as exc:
-                self.note(
-                    "artifact", f"weights finalization refused: {type(exc).__name__}: {exc}"[:512]
-                )
-            else:
-                self.send(pb.WorkerFrame(weights_finalize_result=result))
+        if kind is not None:
+            self.note("control", f"dropped a {kind}: the Control stream carries only the Claim")
 
     def on_outcome_ack(
         self, acked: pb.AttemptOutcomeAck, *, native_finalized: bool = False
@@ -4208,8 +3958,6 @@ class Worker:
         # A closed child is its parent's result: its unit settles custody now.
         self.supervisor.poke(execution_unit.key(acked.request_id))
         self._capacity_changed()
-        if self.connected.is_set():
-            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         # An acknowledged stopped attempt can leave retained work for another
         # attempt on this worker. The owner's per-outcome retention decision
         # overrides the job's ordinary one-shot process recycling policy.
@@ -4973,8 +4721,6 @@ class Worker:
                     f"{placement_id!r} construction {label} unloaded "
                     f"(freed {int(reply.get('freed_bytes', 0))} B)",
                 )
-                if self.connected.is_set():
-                    self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
         threading.Thread(
             target=self._lane(f"unload:{placement_id}", run, fatal=False),
@@ -5413,11 +5159,6 @@ class Worker:
         """Publish observation-only partial/terminal progress; never decide convergence."""
 
         placement.acquisition.CopyFrom(value)
-        if (
-            placement is self.placement
-            or any(hosted.placement is placement for hosted in self.hosted.values())
-        ) and self.connected.is_set():
-            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
     def _materialization_failed(
         self, placement: Placement, fault: pb.Fault, *, terminal: bool
@@ -6890,196 +6631,6 @@ class Worker:
 
     # ------------------------------------------------------------------ dispatch
 
-    def on_offer(self, offered: pb.AttemptOffer) -> None:
-        """STREAM THREAD: fence and hold a direct offer, then run it on its own unit.
-
-        EVERY OFFER GETS A JOURNALED OUTCOME (§7): `AttemptAccepted` or a journaled
-        `AttemptOutcome(REFUSED)`, never silence. A pre-execution refusal consumes the
-        `attempt_ordinal` and ZERO billed execution budget (`execution_started` stays false).
-        """
-        # THE ADMISSION FENCE FIRST (§6): the cheapest deterministic verdict, and a stale
-        # epoch means the RecordOwner dispatched against a picture that no longer holds.
-        if self.stop.is_set():
-            self.refuse(
-                offered,
-                "worker_stopping",
-                "the worker is stopping and admits no new attempts",
-                CAUSE.CAUSE_CODE_NO_CAPACITY,
-            )
-            return
-        if self.fence.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
-            self.refuse(
-                offered,
-                CAPABILITY_UNAVAILABLE_CODE,
-                _capability_unavailable("execution", self.fence.wire_minor),
-                CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
-            )
-            return
-        if offered.admission_epoch != self.admission_epoch:
-            self.refuse(
-                offered,
-                "admission_epoch_stale",
-                f"the offer echoes admission epoch {offered.admission_epoch} and "
-                f"this worker is at {self.admission_epoch}; the verdict is the same on "
-                "every replay of these bytes, and the ordinal is consumed with no budget draw",
-                CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
-            )
-            return
-        if self.accepted.mode == "serving":
-            selected = self._placement_by_id(offered.placement_id)
-            if selected is None:
-                hosted_ids = sorted(self.hosted)
-                if self.placement is not None:
-                    hosted_ids.insert(0, self.placement.placement_id)
-                self.engine.fault(
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_UNKNOWN_PLACEMENT,
-                        subject=offered.placement_id,
-                        reason="unknown_placement",
-                        detail=f"the offer names placement {offered.placement_id!r} and this "
-                        f"worker hosts {hosted_ids!r}",
-                    )
-                )
-                self.refuse(
-                    offered,
-                    "unknown_placement",
-                    f"no placement {offered.placement_id!r} is hosted here",
-                    CAUSE.CAUSE_CODE_UNKNOWN_PLACEMENT,
-                )
-                return
-            if not self._placement_dispatchable(offered.placement_id):
-                hosted = self.hosted.get(offered.placement_id)
-                latched = hosted.latched if hosted is not None else self.latched
-                self.refuse(
-                    offered,
-                    "placement_not_dispatchable",
-                    f"placement {offered.placement_id!r} is "
-                    + pb.ServingState.Name(selected.serving)
-                    + (f" (LATCHED: {latched})" if latched else ""),
-                    CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
-                )
-                return
-        if self.accepted.posture == pb.Posture.POSTURE_DRAINING:
-            self.refuse(
-                offered,
-                "draining",
-                "the worker is draining and admits no new attempts",
-                CAUSE.CAUSE_CODE_NO_CAPACITY,
-            )
-            return
-        try:
-            attempt = self.engine.offer(offered)
-        except AttemptRefusal as exc:
-            self.note(
-                "attempt", f"{offered.request_id}#{offered.attempt_ordinal} refused: {exc.code}"
-            )
-            self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
-            return
-        if attempt.state not in ("outcome", "closed"):
-            if refusal := self._admission_refusal(offered, attempt, machine_owned=False):
-                self.refuse(offered, *refusal)
-                return
-            result_schema, memoize = self._result_schema(attempt)
-            replay = (
-                self.workspace.accept(
-                    self.fence.record_owner_id,
-                    offered,
-                    result_schema=result_schema,
-                    worker_boot=self.fence.worker_boot_id,
-                    memoize=memoize,
-                )
-                if self.workspace is not None
-                else None
-            )
-            if replay is not None:
-                self.send(pb.WorkerFrame(attempt_outcome=replay))
-                return
-        if attempt.state in ("outcome", "closed"):
-            self.note(
-                "attempt",
-                f"duplicate AttemptOffer for {offered.request_id}#{offered.attempt_ordinal}: "
-                f"replaying the recorded outcome, executing NOTHING "
-                f"(executions={attempt.executions})",
-            )
-            self.send(pb.WorkerFrame(attempt_outcome=self.engine.wrap(attempt)))
-            return
-        if attempt.state != "validating":
-            self.note(
-                "attempt",
-                "duplicate AttemptOffer for a held attempt: re-accepting "
-                "the SAME acceptance; nothing starts a second time",
-            )
-            if attempt.state != "queued":
-                self.send(pb.WorkerFrame(attempt_accepted=self.engine.accepted_message(attempt)))
-            return
-        # THE SEAT IS THE PLACEMENT'S LANE'S (#494f/§7), checked and taken in one step: two
-        # offers cannot both see the last seat.
-        lane = self._offer_lane(offered.placement_id, attempt)
-        with self.control_lock:
-            seated = (
-                self.admission_state() == pb.AdmissionState.ADMISSION_STATE_OPEN
-                and self._lane_slots(lane) >= 1
-            )
-            if seated:
-                attempt.lane_id = lane.lane_id
-                self.engine.hold(attempt)
-        if not seated:
-            busy = [
-                held
-                for held in list(self.engine.history.values())
-                if held is not attempt
-                and held.state in self.engine.HELD
-                and held.lane_id == lane.lane_id
-            ]
-            other = busy[0] if busy else None
-            self.note(
-                "attempt",
-                f"{offered.request_id}#{offered.attempt_ordinal} over {lane.lane_id}'s seat",
-            )
-            self.refuse(
-                offered,
-                "no_capacity",
-                f"{lane.lane_id} admits {self._lane_capacity(lane)} attempt(s) to its "
-                "queue and device at a time and "
-                + (
-                    f"holds {other.request_id}#{other.attempt} ({other.state})"
-                    if other is not None
-                    else "its seat is closed"
-                )
-                + "; the seat frees at device release, and the device waits while more "
-                f"than {LANE_RELEASED} released attempt awaits AttemptOutcomeAck, so acking "
-                "frees one",
-                CAUSE.CAUSE_CODE_NO_CAPACITY,
-            )
-            return
-        if attempt.deadline_ms:
-            self._guarded(attempt)
-
-        def faulted(exc: BaseException) -> bool:
-            self._attempt_faulted(attempt, exc)
-            return False
-
-        self.supervisor.spawn(
-            f"attempt:{offered.request_id}#{offered.attempt_ordinal}",
-            lambda _: self.run_attempt(attempt),
-            faulted,
-        )
-
-    def _result_schema(self, attempt: AttemptRecord) -> tuple[bytes, bool]:
-        """(the result schema, memoize) a direct job's journal row records."""
-        if "job" not in attempt.spec:
-            return b"", False
-        descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
-        slot = self.job_slots.get(machine_slots.key(attempt.request_id))
-        binding = slot.binding if slot is not None else self.engine.jobs.get(descriptor)
-        if binding is None:
-            return b"", False
-        declaration = self.engine._job_declaration(binding, descriptor)
-        return (
-            canonical.write(declaration["result"]),
-            declaration.get("invocable", {}).get("memoize", False) is True,
-        )
-
     def _admission_refusal(
         self, offered: pb.AttemptOffer, attempt: AttemptRecord, *, machine_owned: bool
     ) -> tuple[str, str, pb.CauseCode] | None:
@@ -7413,8 +6964,6 @@ class Worker:
         if attempt.canceling and self.engine.claim_staged(attempt):
             # cancelled while it hydrated: nothing reached the device
             self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
-        if self.connected.is_set():
-            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         return attempt.state == "staged"
 
     def enter(self, attempt: AttemptRecord) -> bool:
@@ -7477,8 +7026,6 @@ class Worker:
             return done
         if self.engine.claim_staged(held):
             self.terminate(held, self.engine.finish_cancel, held.canceling)
-            if self.connected.is_set():
-                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
             return f"cancelled while staged ({held.canceling}); nothing reached the device"
         self._guarded(held)
         return done
@@ -7488,7 +7035,7 @@ class Worker:
         # Desired-state convergence and executor rebuilds take this same lock. Recheck the
         # offer's immutable routing facts under it, then hold it through the acceptance:
         # a queued offer cannot be accepted on the far side of a change to ITS placement
-        # merely because it passed `on_offer()` earlier. The construction the attempt needs
+        # merely because it was admitted earlier. The construction the attempt needs
         # is loaded between the two holds, under the lane's device lock alone, so a load
         # never stalls the control plane.
         key = f"{attempt.request_id}#{attempt.attempt}"
@@ -7616,8 +7163,6 @@ class Worker:
             self.send(pb.WorkerFrame(attempt_outcome=released))
             return None
         self._mark_device_outcome(attempt, released, lane)
-        if self.connected.is_set():
-            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         return released
 
     def _mark_device_outcome(

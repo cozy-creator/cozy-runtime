@@ -821,7 +821,6 @@ def serve(payload: Request) -> Result:
             worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda frame: None)
             channel = grpc.insecure_channel((root / "control.addr").read_text().strip())
             client = rpc.WorkerControlStub(channel)
-            assert not worker.connected.is_set() and not worker.fence.dispatch_open
             request = LocalRequest(
                 entrypoint="offline",
                 payload={"entered": str(root / "entered"), "gate": str(root / "gate")},
@@ -849,18 +848,7 @@ def serve(payload: Request) -> Result:
             control = client.Control(frames(), timeout=30)
             admitted = next(control).claim_ack
             assert admitted.accepted
-            snapshot = next(control).snapshot
-            incoming.put(
-                pb.RecordOwnerFrame(
-                    snapshot_ack=pb.SnapshotAck(
-                        record_owner_epoch=admitted.record_owner_epoch,
-                        control_stream_epoch=admitted.control_stream_epoch,
-                        worker_boot_id=admitted.worker_boot_id,
-                        snapshot_id=snapshot.snapshot_id,
-                        snapshot_digest=snapshot.snapshot_digest,
-                    )
-                )
-            )
+            next(control)  # the snapshot
 
             def watch_control() -> None:
                 with contextlib.suppress(grpc.RpcError):
@@ -868,9 +856,6 @@ def serve(payload: Request) -> Result:
 
             observer = threading.Thread(target=watch_control, daemon=True)
             observer.start()
-            while not worker.connected.is_set():
-                assert time.monotonic() < until
-                time.sleep(0.02)
             for identifier in ("first", "second", "canceled", "paused"):
                 selected = second_binding if identifier == "second" else binding
                 capture, capture_digest = captures[
@@ -1035,9 +1020,6 @@ def serve(payload: Request) -> Result:
             incoming.put(None)
             control.cancel()
             observer.join(5)
-            while worker.connected.is_set():
-                assert time.monotonic() < until
-                time.sleep(0.02)
             worker.control_execution(claim, "canceled", "cancel", 1, "cancel")
             while worker.execution_status(claim, "canceled").state != "canceled":
                 assert time.monotonic() < until
@@ -1080,7 +1062,6 @@ def serve(payload: Request) -> Result:
                     pb.MachineExecutionCollectionAck(execution=query, outcome=ack(outcome)),
                     timeout=5,
                 ).collected
-            assert not worker.connected.is_set() and not worker.fence.dispatch_open
             assert thread.is_alive()  # completed results still await collection
             query.expected_execution_workspace_id = "replaced-workspace"
             with pytest.raises(grpc.RpcError) as mismatched:
@@ -1244,7 +1225,6 @@ def serve(payload: Request) -> Result:
             assert client.GetMachineExecution(query, timeout=5).state == "succeeded", child_failures
             assert client.ControlMachineExecution(resume, timeout=5) == resumed
             assert worker.prepared_installations and worker.engine.jobs
-            assert not worker.connected.is_set() and not worker.fence.dispatch_open
             channel.close()
         finally:
             for index in indexes:

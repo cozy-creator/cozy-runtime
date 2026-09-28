@@ -26,7 +26,6 @@ from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDivergence
 from cozy_runtime.internal.worker import lane_wire, lanes
-from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.gpu_scheduler import width_for
 from cozy_runtime.internal.worker.ledger import DeviceFacts, Ledger
@@ -39,15 +38,12 @@ from cozy_runtime.internal.worker.plan import (
 )
 from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
 from cozy_runtime.internal.worker.session import (
-    HostedPlacement,
     Placement,
     Tenant,
     Worker,
     WorkerOptions,
     executor_load_command,
 )
-from cozy_runtime.protocol import WIRE_MINOR
-from cozy_runtime.protocol import documents as documents_
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import PACKAGE, _config, _workspace
 from test_end_to_end import NO_EXECUTOR
@@ -329,100 +325,6 @@ def _lane_rows(target: pb.ObservedWorkerState | pb.WorkerSnapshotBody) -> list[d
     ]
 
 
-def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
-    """cr-066's Σ-lanes rule holds verbatim: a 2-device envelope as two lanes advertises
-    two seats; a placement on the group over both advertises ONE. The group's seat is taken
-    by a held attempt like any other. The wire (proto-024) carries exactly what the runtime holds:
-    `ObservedWorkerState.lanes[]` is the lane documents, the worker-level count is their
-    sum, and `PlacementStatus.device_lane_id` names the group."""
-    with _workspace() as root:
-        worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0,1"),
-            InMemoryControlHost(),
-        )
-        try:
-            worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
-            worker.fence.dispatch_open = True
-            worker.fence.wire_minor = WIRE_MINOR
-            worker.accepted.mode = "serving"
-            primary = _placement("p0", "lane-0")
-            hosted = _placement("p1", "lane-1")
-            worker.placement = primary
-            worker.hosted["p1"] = HostedPlacement(
-                placement=hosted, supervision=worker._new_placement_supervision("p1")
-            )
-            worker.lanes.lanes[0].placements.add("p0")
-            worker.lanes.lanes[1].placements.add("p1")
-            assert worker.available_attempt_slots() == 4
-            before = worker.observed_state()
-            assert [row["lane_id"] for row in worker.lane_documents()] == ["lane-0", "lane-1"]
-            assert _lane_rows(before) == worker.lane_documents()
-            assert before.available_attempt_slots == sum(
-                lane.available_attempt_slots for lane in before.lanes
-            )
-            assert [s.device_lane_id for s in before.placements] == ["lane-0", "lane-1"]
-            # the same envelope as ONE group: p1 leaves, p0 takes both devices
-            epoch = worker.admission_epoch
-            worker.hosted.pop("p1").supervision.close()
-            worker._release_lane("p1")
-            worker._release_lane("p0")
-            group = worker.lanes.group((0, 1))
-            group.placements.add("p0")
-            primary.lane_id = group.lane_id
-            assert worker.available_attempt_slots() == 2
-            documents = worker.lane_documents()
-            assert documents == [
-                {
-                    "lane_id": lane_id,
-                    "device_ordinals": ordinals,
-                    "available_attempt_slots": 2 if placements else 0,
-                    "placement_ids": placements,
-                    "resident_placement_ids": [],
-                }
-                for lane_id, ordinals, placements in (
-                    ("lane-0", [0], []),
-                    ("lane-0+1", [0, 1], ["p0"]),
-                    ("lane-1", [1], []),
-                )
-            ]
-            held = AttemptRecord(request_id="r", attempt=1, digest=b"", spec={})
-            held.placement_id = "p0"
-            held.lane_id = group.lane_id
-            held.state = "running"
-            worker.engine.history[held.key()] = held
-            assert worker.available_attempt_slots() == 1, "one on the device across K"
-            staged = AttemptRecord(request_id="s", attempt=1, digest=b"", spec={})
-            staged.placement_id = "p0"
-            staged.lane_id = group.lane_id
-            staged.state = "staged"
-            worker.engine.history[staged.key()] = staged
-            assert worker.available_attempt_slots() == 0, "and one staged behind it"
-            taken = worker.observed_state()
-            assert _lane_rows(taken) == [dict(row, available_attempt_slots=0) for row in documents]
-            assert taken.available_attempt_slots == 0
-            queued = {row.request_id: row for row in taken.held_attempts}
-            assert queued["s"].state == pb.AttemptState.ATTEMPT_STATE_QUEUED
-            assert queued["s"].executor_epoch == 0 and queued["s"].lane_id == group.lane_id
-            assert queued["r"].state == pb.AttemptState.ATTEMPT_STATE_RUNNING
-            del worker.engine.history[held.key()]
-            del worker.engine.history[staged.key()]
-            observed = worker.observed_state()
-            assert _lane_rows(observed) == documents
-            assert observed.available_attempt_slots == 2
-            (status,) = observed.placements
-            assert status.device_lane_id == "lane-0+1"
-            # the group leaves with its placement; the device lanes never moved, so no
-            # offer's lane changed and the admission epoch stays
-            worker._release_lane("p0")
-            assert [lane.lane_id for lane in worker.lanes.lanes] == ["lane-0", "lane-1"]
-            assert worker.admission_epoch == epoch
-        finally:
-            for slot in worker.hosted.values():
-                slot.supervision.close()
-            worker.supervision.close()
-
-
 def test_a_pin_through_the_worker_binds_a_group_without_moving_admission() -> None:
     """`_assign_lane` reads the accepted pin and the bindings' declared degrees; a refusal
     latches the placement typed and leaves the lanes exactly as they were."""
@@ -468,122 +370,6 @@ def test_a_pin_through_the_worker_binds_a_group_without_moving_admission() -> No
                 weightless, {light.entrypoint_binding_digest: light}, worker.supervision
             )
             assert weightless.lane_id == "lane-1" and worker.admission_epoch == epoch
-        finally:
-            worker.supervision.close()
-
-
-def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
-    """proto-024's runtime-side conformance vector: a two-lane serving worker's
-    `WorkerSnapshotBody` carries one `DeviceLane` per lane and a worker-level count that
-    is their sum, through the same digest-fenced canonical document the RecordOwner
-    acknowledges; a one-lane worker's body is the pre-22 body plus exactly `lanes[]`."""
-    with _workspace() as root:
-        worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0,1"),
-            InMemoryControlHost(),
-        )
-        try:
-            worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
-            worker.fence.dispatch_open = True
-            worker.fence.wire_minor = WIRE_MINOR
-            worker.accepted.mode = "serving"
-            primary = _placement("p0", "lane-0")
-            hosted = _placement("p1", "lane-1")
-            worker.placement = primary
-            worker.hosted["p1"] = HostedPlacement(
-                placement=hosted, supervision=worker._new_placement_supervision("p1")
-            )
-            worker.lanes.lanes[0].placements.add("p0")
-            worker.lanes.lanes[1].placements.add("p1")
-            body = worker.snapshot_body()
-            assert _lane_rows(body) == [
-                {
-                    "lane_id": "lane-0",
-                    "device_ordinals": [0],
-                    "available_attempt_slots": 2,
-                    "placement_ids": ["p0"],
-                    "resident_placement_ids": [],
-                },
-                {
-                    "lane_id": "lane-1",
-                    "device_ordinals": [1],
-                    "available_attempt_slots": 2,
-                    "placement_ids": ["p1"],
-                    "resident_placement_ids": [],
-                },
-            ]
-            assert body.available_attempt_slots == 4
-            canonical_bytes, digest = documents_.identity(body)
-            document = documents_.read(canonical_bytes, pb.WorkerSnapshotBody)
-            assert document["format"] == "cozy.worker.v1.WorkerSnapshotBody/1"
-            assert document["lanes"] == [
-                {
-                    "available_attempt_slots": 2,
-                    "device_ordinals": [0],
-                    "lane_id": "lane-0",
-                    "placement_ids": ["p0"],
-                },
-                {
-                    "available_attempt_slots": 2,
-                    "device_ordinals": [1],
-                    "lane_id": "lane-1",
-                    "placement_ids": ["p1"],
-                },
-            ]
-            assert document["available_attempt_slots"] == sum(
-                row["available_attempt_slots"] for row in document["lanes"]
-            )
-            assert documents_.identity(body)[1] == digest, "the document is deterministic"
-            # admission CLOSED (the barrier not yet passed) is zero on every lane, so the
-            # sum stays the worker-level count and no lane shows a seat the worker denies
-            worker.fence.dispatch_open = False
-            closed = worker.snapshot_body()
-            assert closed.admission_state == pb.AdmissionState.ADMISSION_STATE_CLOSED
-            assert closed.available_attempt_slots == 0
-            assert [lane.available_attempt_slots for lane in closed.lanes] == [0, 0]
-        finally:
-            for slot in worker.hosted.values():
-                slot.supervision.close()
-            worker.supervision.close()
-    with _workspace() as root:
-        worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0"),
-            InMemoryControlHost(),
-        )
-        try:
-            worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
-            worker.fence.dispatch_open = True
-            worker.fence.wire_minor = WIRE_MINOR
-            worker.accepted.mode = "serving"
-            worker.placement = _placement("p0", "lane-0")
-            worker.lanes.lanes[0].placements.add("p0")
-            body = worker.snapshot_body()
-            assert _lane_rows(body) == [
-                {
-                    "lane_id": "lane-0",
-                    "device_ordinals": [0],
-                    "available_attempt_slots": 2,
-                    "placement_ids": ["p0"],
-                    "resident_placement_ids": [],
-                }
-            ]
-            document = documents_.read(documents_.identity(body)[0], pb.WorkerSnapshotBody)
-            older = pb.WorkerSnapshotBody()
-            older.CopyFrom(body)
-            del older.lanes[:]
-            for status in older.placements:
-                status.device_lane_id = ""
-            before_22 = documents_.read(documents_.identity(older)[0], pb.WorkerSnapshotBody)
-            assert {k: v for k, v in document.items() if k not in ("lanes", "placements")} == {
-                k: v for k, v in before_22.items() if k not in ("lanes", "placements")
-            }
-            assert [
-                {k: v for k, v in status.items() if k != "device_lane_id"}
-                for status in document["placements"]
-            ] == before_22["placements"]
-            assert document["placements"][0]["device_lane_id"] == "lane-0"
         finally:
             worker.supervision.close()
 

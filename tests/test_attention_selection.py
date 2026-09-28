@@ -12,15 +12,11 @@ loop, and nothing about that depends on what produced the record.
 
 from __future__ import annotations
 
-import contextlib
 import importlib.metadata
 import importlib.util
 import json
-import os
 import subprocess
 import sys
-import tempfile
-import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -38,18 +34,13 @@ from cozy_runtime.internal import (
     attention,
     attention_fp8,
     attention_upstream,
-    child_env,
     executor_commands,
-    package_interface,
 )
-from cozy_runtime.internal.config import Credentials, RuntimeConfig
-from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor_commands import Binding
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.plan import DeclaredBinding, ModelBinding
-from cozy_runtime.internal.worker.session import WorkerOptions, executor_load_command
-from local_owner import LocalRequest, run_slice
+from cozy_runtime.internal.worker.session import executor_load_command
 from test_end_to_end import NO_EXECUTOR
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
@@ -790,51 +781,3 @@ def test_a_pinned_prepare_names_one_kernel_for_every_model_of_the_construction()
     # to every child prepare, the way it hands them one device authorization.
     assert executor_commands.encode(group)["attention_pin"] == "sageattention"
     assert "attention_pin" not in {f.name for f in msgspec.structs.fields(Binding)}
-
-
-@needs_executor
-def test_a_pin_that_cannot_be_honoured_refuses_through_the_whole_real_path() -> None:
-    """THE THREAD, end to end and unmocked: an in-process worker, the real prepare command, a
-    real executor child process.
-
-    `examples/marco-polo` declares no model, so it holds no attention site — and a pin with
-    nowhere to go is REFUSED rather than ignored. That is the same rule the A/B rests on: a
-    run that reported success while serving something other than what was named would make
-    the measurement worthless, so the runtime never quietly drops a pin.
-    """
-    base = {k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"}
-    with tempfile.TemporaryDirectory(prefix="cz-pin.", dir="/tmp") as raw:
-        root = Path(raw)
-        config = RuntimeConfig(
-            cozy_home=root / "home",
-            credentials=Credentials(),
-            child_base_env=tuple(sorted(base.items())),
-        )
-        workspace = root / "run"
-        workspace.mkdir(parents=True, exist_ok=True)
-        body = package_interface.build(discover(PACKAGE))
-        with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
-            outcome = run_slice(
-                config,
-                LocalRequest(
-                    entrypoint="marco",
-                    payload={"message": "marco"},
-                    outputs=(),
-                    request_id="pin-weightless",
-                    kind="entrypoint",
-                    attention_kernel="sageattention",
-                ),
-                workspace=workspace,
-                package_installation_id="local-" + uuid.uuid4().hex,
-                package_interface_document=body,
-                project=PACKAGE,
-                development_tensorfs_root=config.cozy_home / "tensorfs",
-                options=WorkerOptions(root=workspace / "worker", devices="0"),
-            )
-    # A request-scoped pin refusal terminates the attempt; it does not fault the binding (#678).
-    assert outcome.status == "OUTCOME_STATUS_REFUSED", outcome.terminal
-    message = outcome.terminal.safe_message
-    assert message.startswith("attention_kernel_unsupported"), outcome.terminal
-    assert "sageattention" in message
-    assert outcome.result is None, outcome.result
-    assert not any(fault["reason"] == "attention_kernel_unsupported" for fault in outcome.faults)

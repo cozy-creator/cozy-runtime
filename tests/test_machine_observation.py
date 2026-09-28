@@ -61,7 +61,6 @@ def test_claim_only_stream_reports_without_acknowledging_dispatch() -> None:
             assert observed.worker_phase == pb.WORKER_PHASE_ONLINE
             assert observed.admission_state == pb.ADMISSION_STATE_CLOSED
             assert observed.available_attempt_slots == 0
-            assert not worker.fence.dispatch_open and not worker.connected.is_set()
             assert not worker.engine.history
         finally:
             inbound.put(None)

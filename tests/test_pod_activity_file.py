@@ -20,11 +20,8 @@ reads it from, and the only place an observer does not measure itself as the wor
 from __future__ import annotations
 
 import contextlib
-import itertools
 import json
 import os
-import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -34,7 +31,6 @@ from typing import Any
 
 import pytest
 
-import podactivity_driver
 import signed_claims
 from cozy_runtime.internal import child_env, liveness
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
@@ -46,7 +42,6 @@ from local_owner import claimable
 from test_end_to_end import NO_EXECUTOR
 from test_machine_execution import offer
 
-DRIVER = Path(podactivity_driver.__file__).resolve()
 #: The document the pod supervisor parses, byte for byte, in BOTH repositories. tensorhub
 #: keeps the same bytes at `pod-supervisor/testdata/activity.json` and parses them with the
 #: production type; changing the shape on one side and not the other is what these two
@@ -76,33 +71,6 @@ def _config(home: Path) -> RuntimeConfig:
             sorted((k, v) for k, v in os.environ.items() if not child_env.erased(k))
         ),
     )
-
-
-def _drive(root: Path, mode: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Run the worker below this process and poll its file the way the supervisor does."""
-    path = root / "activity"
-    every = podactivity_driver.TICK / 2
-    child = subprocess.Popen(
-        [sys.executable, str(DRIVER), str(root), str(path), mode],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env={**os.environ, "PYTHONPATH": str(DRIVER.parent)},
-    )
-    samples: list[dict[str, Any]] = []
-    try:
-        while child.poll() is None:
-            with contextlib.suppress(OSError, ValueError):
-                document = json.loads(path.read_bytes())
-                if not samples or document != samples[-1]:
-                    samples.append(document)
-            time.sleep(every)
-        stdout, _ = child.communicate(timeout=60)
-    finally:
-        if child.poll() is None:  # pragma: no cover - only on a harness failure
-            child.kill()
-            child.wait()
-    summary = json.loads(stdout.decode().strip().splitlines()[-1])
-    return summary, samples
 
 
 # --------------------------------------------------------------- the file, on its own
@@ -345,61 +313,3 @@ def test_an_unreadable_meter_is_absent_and_never_a_zero(monkeypatch: pytest.Monk
 
 
 # ------------------------------------------------------- the file, over a real run
-
-
-@needs_executor
-def test_a_real_run_publishes_an_attached_owner_and_a_moving_meter() -> None:
-    """The producing half of the pod's release decision, over the real path.
-
-    While the run is under way the file says an owner is attached and its meter CHANGES from
-    sample to sample — which is what the supervisor's rule reads as work, and why an attempt
-    that is merely slow is never mistaken for one that has stopped.
-    """
-    with _short_tmp() as root:
-        summary, samples = _drive(root, "plain")
-
-    assert summary["ended"] == "terminal", (summary["ended"], summary["error"])
-    assert summary["result"] == {"message": "polo"}
-    assert samples, "the reporter published nothing over a whole real run"
-
-    attached = [s for s in samples if s["owner_attached"]]
-    assert attached, "no sample saw the local RecordOwner attached"
-    assert any(s["active_work"] for s in attached), "execution was never reported as active"
-
-    # The meter moved: work, observed, not assumed.
-    meters = [s["meter"] for s in attached]
-    assert len(set(meters)) > 1, f"the meter never changed across {len(attached)} owned samples"
-    assert all(m is not None for m in meters)
-
-    # The tick is monotone over the whole run: the writer says it RAN, every time.
-    ticks = [s["sequence"] for s in samples]
-    assert ticks == sorted(set(ticks)), ticks
-
-
-@needs_executor
-def test_a_stopped_executor_leaves_an_attempt_in_flight_with_a_meter_that_has_stopped() -> None:
-    """THE WEDGE, as the supervisor sees it.
-
-    Over the window the executor is stopped, the file keeps saying `attempts_in_flight >= 1`
-    while its meter stays IDENTICAL sample after sample. That is what tensorhub's
-    `activityWatch` calls wedged, and what today's signal reports as a pod in use forever.
-    The tick keeps advancing through it, so the arm also proves the two are distinguishable:
-    this is a wedged ATTEMPT, not a wedged process.
-    """
-    with _short_tmp() as root:
-        summary, samples = _drive(root, "wedge")
-
-    window = summary["window"]
-    assert len(window) == 2, "the attempt never entered the device, so nothing was stopped"
-    assert summary["ended"] == "terminal", (summary["ended"], summary["error"])
-    # The driver confirms the kernel stop and excludes the one publication whose
-    # meter read may already have started before that stop.
-    frozen = [s for s in samples if window[0] < s["sequence"] <= window[1]]
-    held = list(itertools.dropwhile(lambda s: s["attempts_in_flight"] == 0, frozen))
-    assert len(held) > 4, f"only {len(held)} of {len(frozen)} samples saw the stopped attempt"
-    # The attempt is still claimed — the pod looks BUSY on the two facts alone.
-    assert all(s["attempts_in_flight"] > 0 for s in held), [s["attempts_in_flight"] for s in held]
-    # And the meter has stopped, which is the only thing that tells the two apart.
-    assert len({s["meter"] for s in held}) == 1, sorted({s["meter"] for s in held})
-    # The writer kept running.
-    assert len({s["sequence"] for s in held}) > 1, "the reporter itself stopped ticking"

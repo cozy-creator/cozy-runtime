@@ -6,15 +6,13 @@ through an in-memory host, so worker behaviour is tested without a network.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import hashlib
 import os
 import shutil
 import threading
 import time
-import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -26,26 +24,17 @@ from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._media import SNIFF_BYTES, sniff
 from cozy_runtime.internal import (
     canonical,
-    job_plan,
     liveness,
     proctree,
 )
-from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.development_launch import (
     LOCAL_PLACEMENT,
-    StagedDevelopmentPlacement,
-    stage_development_placement,
 )
 from cozy_runtime.internal.pathkey import opaque_key
-from cozy_runtime.internal.worker import byte_inputs, triage, workspace_byte_outputs
+from cozy_runtime.internal.worker import byte_inputs, workspace_byte_outputs
 from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.ledger import Measurement, Reconciliation
-from cozy_runtime.internal.worker.plan import (
-    JobBinding,
-)
-from cozy_runtime.internal.worker.records import Record
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -137,100 +126,6 @@ class LocalCheckpoint(msgspec.Struct, frozen=True):
     content_digest: str
     seq: int
     outcome: str
-
-
-@dataclass(slots=True)
-class SliceOutcome:
-    """Everything one local run OBSERVED. No field is inferred; each has a producer.
-
-    Protocol facts are the worker's own messages; a field at its proto3 default means the run
-    never observed that fact (no terminal, no acceptance, no dispatch).
-    """
-
-    status: str = ""
-    terminal: pb.AttemptOutcomeBody = field(default_factory=pb.AttemptOutcomeBody)
-    #: the package's inline typed result, decoded by the canonical reader that wrote it
-    result: dict[str, object] | None = None
-    invocation: pb.InvocationSpec = field(default_factory=pb.InvocationSpec)
-    invocation_digest: str = ""
-    invocation_canonical_bytes: bytes = b""
-    accepted: pb.AttemptAccepted = field(default_factory=pb.AttemptAccepted)
-    #: cr-009's typed publication receipt — ONE canonical bundle snapshot per publication,
-    #: recorded before the terminal named it. `manifest_id` on the terminal IS its digest.
-    publication: grants_module.Publication | None = None
-    outputs: dict[str, str] = field(default_factory=dict)
-    terminal_digest: str = ""
-    terminal_canonical_bytes: bytes = b""
-    placement_set_digest: str = ""
-    placement_set_canonical_bytes: bytes = b""
-    worker_resources: pb.WorkerResources = field(default_factory=pb.WorkerResources)
-    accelerator_qualification: pb.AcceleratorQualification = field(
-        default_factory=pb.AcceleratorQualification
-    )
-    ledger: Measurement | None = None
-    reconciliation: Reconciliation | None = None
-    attempt_records: list[Record] = field(default_factory=list)
-    timings: dict[str, float] = field(default_factory=dict)
-    faults: list[dict[str, str]] = field(default_factory=list)
-    progress: int = 0
-    executions: int = 0
-    #: cr-011: the OPAQUE triage handle from the terminal, and the bundle read back by it.
-    #: The subject is the ONLY way in — there is no path anywhere in this outcome.
-    triage_subject: str = ""
-    triage: triage.Assembly | None = None
-    exit_code: int = 0
-    workspace_deleted: bool = False
-    #: JOB mode: the durable checkpoint requests this run received, in arrival order, and
-    #: the scratch model its outputs were rewritten into.
-    checkpoints: list[LocalCheckpoint] = field(default_factory=list)
-    publication_scope: str = ""
-    #: how the run ENDED, which is not always "it produced a terminal": `terminal`,
-    #: `worker_error` (the worker reported it could not become ready), `worker_wedged` (it
-    #: provably stopped working before it was ready — `LocalRecordOwner.watch`), or
-    #: `record_owner_error` (this side failed). A one-shot run that cannot say this would
-    #: have to pretend a hang was a result.
-    ended: str = "unstarted"
-    error: str = ""
-    #: The RecordOwner's PROJECTION over (status, cause, origin) — see `redispatchable()`.
-    #: True means the ordinal was consumed and the BUDGET was not, so the next ordinal may
-    #: go elsewhere immediately. It is never a worker wire fact and is computed here.
-    redispatchable: bool = False
-
-
-#: THE REFUSED PROJECTION, SPLIT BY (cause, origin) — rev-2 §7/#480b.
-#:
-#: 02 §2's table used to read "REFUSED => settle refused; never re-dispatch". That was
-#: written when every REFUSED was a judgment about the WORK. These four are judgments about
-#: the WORKER, made before the author ran: the ordinal is consumed, the budget is untouched,
-#: and the RecordOwner may mint `attempt_ordinal + 1` and dispatch it elsewhere immediately —
-#: no cooldown, no budget draw. The author/runtime causes (INVALID_REQUEST,
-#: UNSUPPORTED_INPUT, LOCAL_SAFETY, CONSTRAINT_INFEASIBLE) still settle refused forever.
-#:
-#: Retryability is exactly this: a RecordOwner projection, unrepresentable as a worker wire
-#: fact, which is why the worker sends the neutral triple and this side reads it.
-PRE_EXECUTION_REFUSALS = frozenset(
-    {
-        pb.CauseCode.CAUSE_CODE_NO_CAPACITY,
-        pb.CauseCode.CAUSE_CODE_ADMISSION_EPOCH_STALE,
-        pb.CauseCode.CAUSE_CODE_UNKNOWN_PLACEMENT,
-        pb.CauseCode.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
-    }
-)
-
-
-def redispatchable(body: pb.AttemptOutcomeBody) -> bool:
-    """Can this attempt's ordinal + 1 go straight to another worker?
-
-    `execution_started` is the BILLING FACT and it is STRUCTURAL (#480c) — the worker states
-    it rather than leaving a RecordOwner to infer it from a cause-code allowlist. Both are
-    checked: the cause says whose judgment it was, and the bit says whether anything ran.
-    """
-    return (
-        body.status == pb.OutcomeStatus.OUTCOME_STATUS_REFUSED
-        and body.cause.code in PRE_EXECUTION_REFUSALS
-        and body.cause.origin == pb.CauseOrigin.CAUSE_ORIGIN_WORKER
-        and not body.execution_started
-    )
 
 
 class LocalRecordOwner:
@@ -1022,215 +917,3 @@ def _input_facts(path: Path) -> tuple[str, int, str]:
         length,
         sniff(bytes(head)) or "application/octet-stream",
     )
-
-
-def stage_job_plans(cozy_home: Path, records: Sequence[JobBinding]) -> dict[str, str]:
-    """Write the local JOB plan records the worker resolves job descriptor ids against.
-
-    On the network path th-004 ships the build and the JobDescriptor and tfs-003 the
-    materialized input trees. Locally it is a
-    plain file under `<cozy_home>/job-plans/`, and the worker cannot tell the difference
-    because a RecordOwner never ships a path either way.
-    """
-    directory = cozy_home / "job-plans"
-    directory.mkdir(parents=True, exist_ok=True)
-    plans: dict[str, str] = {}
-    for record in records:
-        job_plan.write(directory, msgspec.to_builtins(record))
-        plans[record.job] = record.job_descriptor_id
-    return plans
-
-
-def run_slice(
-    config: RuntimeConfig,
-    request: LocalRequest,
-    *,
-    workspace: Path,
-    package_installation_id: str,
-    package_interface_document: Mapping[str, Json] | None = None,
-    project: Path | None = None,
-    development_tensorfs_root: Path | None = None,
-    development_binding_overrides: Mapping[str, str] | None = None,
-    job_records: Sequence[JobBinding] = (),
-    options: WorkerOptions | None = None,
-    delete_workspace: bool = True,
-    auto_ack: bool = True,
-    record_owner_hook: Callable[[LocalRecordOwner, Worker], None] | None = None,
-) -> SliceOutcome:
-    """One request in, one typed result out, through the whole real path.
-
-    `record_owner_hook` is handed the live `LocalRecordOwner` before the worker starts — that
-    is how a driver injects a cancel at a chosen moment WITHOUT a plant switch inside the
-    runtime (decisions #249: fault injection belongs to the harness).
-    """
-    workspace.mkdir(parents=True, exist_ok=True)
-    bindings: dict[str, str] = {}
-    staged: StagedDevelopmentPlacement | None = None
-    if package_interface_document is not None:
-        if request.kind != "entrypoint":
-            raise RuntimeError("only a serving run accepts a package binding closure")
-        installation_id = "local-" + uuid.uuid4().hex
-        staged = stage_development_placement(
-            config.cozy_home,
-            package_interface_document,
-            package="local/development-package",
-            release="0.0.0",
-            installation_id=installation_id,
-            artifact_cache=workspace / "artifact-cache",
-            tensorfs_root=development_tensorfs_root or workspace / "tensorfs",
-            project=project,
-            binding_overrides=development_binding_overrides,
-        )
-        bindings.update(staged.bindings)
-    stage_job_plans(config.cozy_home, job_records)
-    record_owner = LocalRecordOwner(
-        request,
-        bindings,
-        workspace,
-        package_installation_id=(
-            staged.placement.development.installation_id
-            if staged is not None
-            else package_installation_id
-        ),
-        placement=staged.placement if staged is not None else None,
-        auto_ack=auto_ack,
-    )
-    config, options = claimable(config, options or WorkerOptions(root=workspace / "worker"))
-    if staged is not None:
-        if options.tensorfs_root not in (None, staged.tensorfs_root):
-            raise RuntimeError("local closure and worker name different TensorFS roots")
-        options = dataclasses.replace(
-            options,
-            tensorfs_root=staged.tensorfs_root,
-            artifact_cache=staged.artifact_cache,
-            development_project=Path.cwd().resolve(),
-            development_package=staged.placement.development.package,
-            development_release=staged.placement.development.release,
-            development_installation_id=staged.placement.development.installation_id,
-            development_binding_overrides=dict(development_binding_overrides or {}),
-        )
-    if not options.instance_id:
-        options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")
-    worker = Worker(config, options, record_owner.host)
-    record_owner.native_workspace = worker.workspace
-    worker.watches.tap = record_owner.tap_progress
-    record_owner.watch(worker)
-    if record_owner_hook is not None:
-        record_owner_hook(record_owner, worker)
-    started = time.perf_counter()
-    exit_code = worker.run()
-    return _collect(record_owner, worker, started, exit_code, delete_workspace)
-
-
-def _collect(
-    record_owner: LocalRecordOwner,
-    worker: Worker,
-    started: float,
-    exit_code: int,
-    delete_workspace: bool,
-) -> SliceOutcome:
-    outcome = SliceOutcome(exit_code=exit_code, ended=record_owner.ended, error=record_owner.error)
-    outcome.attempt_records = list(worker.records.records)
-    ledger = worker.primary_ledger()
-    outcome.reconciliation = ledger.reconciliations[-1] if ledger.reconciliations else None
-    # The ledger as it stood AT ATTEMPT CLOSE, not after shutdown. Reading it here would
-    # report the executor's RSS as unreadable and its device classes as stale, because by
-    # now the process that owned them is gone — true, and useless. The reconciliation record
-    # is the measurement; this is only where it is published.
-    outcome.ledger = (
-        Measurement(classes=outcome.reconciliation.classes)
-        if outcome.reconciliation is not None
-        else ledger.measurement()
-    )
-    outcome.faults = [
-        {"reason": fault.reason, "detail": fault.detail} for fault in worker.engine.faults
-    ]
-    outcome.progress = len(record_owner.progress_frames)
-    outcome.executions = worker.engine.executed
-    outcome.checkpoints = list(record_owner.checkpoints)
-    outcome.publication_scope = (
-        record_owner.scratch_model() if record_owner.request.kind == "job" else ""
-    )
-    if record_owner.spec_digest:
-        outcome.invocation = record_owner.spec
-        outcome.invocation_digest = _spell(record_owner.spec_digest)
-        outcome.invocation_canonical_bytes = record_owner.spec_canonical_bytes
-    if record_owner.accepted is not None:
-        outcome.accepted = record_owner.accepted
-    if record_owner.terminal is not None:
-        outcome.terminal_digest = _spell(record_owner.terminal.outcome_digest)
-        outcome.terminal_canonical_bytes = bytes(record_owner.terminal.outcome_canonical_bytes)
-        body = documents.parse(outcome.terminal_canonical_bytes, pb.AttemptOutcomeBody)
-        outcome.terminal = body
-        # The triage read, exactly as cl-006 will do it: take the opaque subject off the
-        # terminal, and read the bundle BY KEY, verified against its in-memory receipt.
-        # Nothing here holds a path to it.
-        outcome.triage_subject = body.triage_bundle.subject_id
-        if outcome.triage_subject:
-            with contextlib.suppress(triage.TriageError, canonical.CanonicalError):
-                outcome.triage = triage.BundleStore.read(
-                    worker.root / "triage",
-                    outcome.triage_subject,
-                    worker.records,
-                )
-        outcome.status = pb.OutcomeStatus.Name(body.status)
-        outcome.redispatchable = redispatchable(body)
-        if body.result.inline_result:
-            # The typed result rode the terminal INLINE. Read it with the canonical reader
-            # that wrote it, never a looser JSON parser: the whole point of the envelope is
-            # that the bytes a RecordOwner holds and the value a caller sees are one thing.
-            decoded = canonical.parse(body.result.inline_result)
-            outcome.result = decoded if isinstance(decoded, dict) else {"value": decoded}
-        outcome.publication = next(
-            (
-                msgspec.convert(row.body, grants_module.Publication)
-                for row in outcome.attempt_records
-                if row.kind == "publication"
-            ),
-            None,
-        )
-        for row in body.output_manifest.outputs:
-            path = record_owner.destination(row.output_id)
-            if path.is_file() or path.is_dir():
-                outcome.outputs[row.output_id] = str(path)
-
-    outcome.placement_set_digest = _spell(record_owner.placement_set_digest)
-    outcome.placement_set_canonical_bytes = record_owner.placement_set_canonical_bytes
-    outcome.worker_resources = record_owner.worker_resources
-    placement = next(
-        (
-            item
-            for report in reversed(record_owner.reports)
-            for item in report.placements
-            if item.placement_id == LOCAL_PLACEMENT
-        ),
-        None,
-    )
-    if placement is not None:
-        outcome.accelerator_qualification = placement.accelerator
-
-    marks = record_owner.marks
-    outcome.timings = {
-        name: round((marks[key] - marks[base]) * 1000, 2)
-        for name, key, base in (
-            ("boot_to_register_ms", "registered", "start"),
-            ("register_to_ready_ms", "ready", "registered"),
-            ("dispatch_to_accept_ms", "accepted", "dispatched"),
-            ("accept_to_terminal_ms", "terminal", "accepted"),
-            ("request_to_result_ms", "terminal", "dispatched"),
-        )
-        if key in marks and base in marks
-    }
-    outcome.timings["wall_ms"] = round((time.perf_counter() - started) * 1000, 2)
-
-    # A closed one-shot run has no remaining reader for its disposable workspace.
-    closed = any(row.kind == "closed" for row in outcome.attempt_records)
-    if delete_workspace and closed:
-        shutil.rmtree(worker.root, ignore_errors=True)
-        outcome.workspace_deleted = True
-    return outcome
-
-
-def _spell(raw: bytes) -> str:
-    """`sha256:<hex>`, or the empty string for a digest a mode genuinely does not have."""
-    return documents.spell(raw) if len(raw) == 32 else ""

@@ -13,7 +13,6 @@ from cozy_runtime.internal import job_plan, package_installation, package_interf
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.worker.package_prepare import _stage_job_plans
 from cozy_runtime.internal.worker.plan import JobBinding
-from local_owner import stage_job_plans
 
 
 def test_two_installations_with_one_interface_keep_exact_resumable_plans(tmp_path: Path) -> None:
@@ -72,11 +71,6 @@ def compute(payload:Input)->Output:
     old_binding, new_binding = JobBinding.read(old_record), JobBinding.read(new_record)
     assert old_binding.installation_id == first
     assert new_binding.installation_id == second
-    local = tmp_path / "local"
-    stage_job_plans(local, [old_binding])
-    stage_job_plans(local, [new_binding])
-    assert job_plan.path(local / "job-plans", first, descriptor).exists()
-    assert job_plan.path(local / "job-plans", second, descriptor).exists()
     _stage_job_plans(
         exact,
         root=root,

@@ -1648,26 +1648,6 @@ class AttemptEngine:
                 )
         return self.weights.writer_broker.handle(attempt, request)
 
-    def absorb_receipt(self, receipt: pb.JobCheckpointReceipt) -> None:
-        """Record the RecordOwner's verdict on a checkpoint this worker already recorded.
-
-        It is a second observer, not a second authority: the declaration is already in this
-        worker's process records. A RecordOwner conflict is recorded as a fault,
-        because it means the run's identity is contested upstream — but it cannot
-        retroactively un-write a declaration that is durable here.
-        """
-        if receipt.outcome == pb.CheckpointOutcome.CHECKPOINT_OUTCOME_CONFLICT:
-            self.fault(
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
-                    subject=f"{receipt.request_id}#{receipt.attempt_ordinal}",
-                    reason="checkpoint_conflict_upstream",
-                    detail=safe(
-                        f"the RecordOwner reports {receipt.logical_key!r} under operation key "
-                        f"{receipt.operation_key!r} conflicts: {receipt.fault.detail}"
-                    ),
-                )
-            )
 
     def _run(self, attempt: AttemptRecord) -> pb.AttemptOutcome | Released:
         """ONE attempt: dispatch, freeze point, release.
@@ -3273,8 +3253,6 @@ class AttemptEngine:
             held.outcome_digest = attempt.outcome_digest
         return held
 
-    def pending_outcomes(self) -> list[AttemptRecord]:
-        return [a for a in self.history.values() if a.state == "outcome"]
 
     #: Every state in which this worker still holds an attempt and owes the owner something.
     #: `staged` is accepted into its lane's queue (wire QUEUED); `entering` is claimed off

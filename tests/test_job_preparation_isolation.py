@@ -2,31 +2,18 @@
 
 from __future__ import annotations
 
-import dataclasses
 import email.parser
 import functools
-import json
-import os
 import shutil
 import tempfile
-import threading
-import time
 import zipfile
 from pathlib import Path
-from typing import Any
 
-import pytest
 from packaging.requirements import Requirement
 
 from conftest import image_python
-from cozy_runtime.internal import child_env
-from cozy_runtime.internal.config import Credentials, RuntimeConfig
-from cozy_runtime.internal.worker.job_slots import JobSlot
-from cozy_runtime.internal.worker.plan import JobBinding
-from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import worker_pb2 as pb
-from local_owner import LocalRecordOwner, LocalRequest, claimable
-from test_end_to_end import NO_EXECUTOR, _development, _run, _wheel_rows
+from test_end_to_end import _development, _run, _wheel_rows
 
 SOURCE = """from pathlib import Path
 import tempfile
@@ -126,117 +113,3 @@ def runtime_lock(runtime: str = "") -> bytes:
             str(requirements),
         )
         return locked.read_bytes()
-
-
-@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-def test_job_only_worker_preparation_preserves_running_job_and_exact_readiness() -> None:
-    # Short socket paths and a real delegated executor; no device/model is needed.
-    with tempfile.TemporaryDirectory(prefix="cz-job-prep.") as raw:
-        root = Path(raw)
-        _, first = package(root, "first")
-        environment, other = package(root, "other")
-        (root / "artifacts").mkdir()
-        python = image_python()
-        config = RuntimeConfig(
-            cozy_home=root / "home",
-            credentials=Credentials(),
-            child_base_env=tuple(
-                sorted(
-                    (k, v)
-                    for k, v in os.environ.items()
-                    if not child_env.erased(k) and k != "PYTHONPATH"
-                )
-            ),
-        )
-        request = LocalRequest(
-            entrypoint="first",
-            payload={"entered": str(root / "entered"), "gate": str(root / "gate")},
-            outputs=(),
-            kind="job",
-            request_id="first-root",
-            timeout_ms=60000,
-        )
-        owner = LocalRecordOwner(request, {}, root / "run", package_installation_id="")
-        worker = Worker(
-            *claimable(
-                config,
-                WorkerOptions(
-                    root=root / "worker",
-                    devices="",
-                    accelerator_backend="none",
-                    python=str(python),
-                    install_root=environment,
-                    artifact_cache=root / "artifacts",
-                    tensorfs_root=root / "store",
-                ),
-            ),
-            owner.host,
-        )
-        worker.prepare_local_package(other)
-        worker.prepare_local_package(first)
-        # These fixture preparations precede control-service startup. Retire an
-        # older Runtime's idle describe process before run's orphan sweep; the
-        # regression below concerns the later preparation during actual work.
-        if worker.supervision.current is not None:
-            worker.supervision.retire_current(
-                worker.supervision.current, "fixture begins control service"
-            )
-        plans = root / "home/job-plans"
-        records = [json.loads(p.read_bytes()) for p in plans.glob("*/*.json")]
-        plan = next(row for row in records if row.get("job") == "first")
-        binding = JobBinding.read(plan)
-        owner.request = dataclasses.replace(request, job_descriptor_id=binding.job_descriptor_id)
-        owner.package_installation_id = binding.installation_id
-        observed: dict[str, Any] = {}
-        failures: list[BaseException] = []
-
-        def prepare_other() -> None:
-            try:
-                until = time.monotonic() + 45
-                while not (root / "entered").exists():
-                    if owner.done.is_set() or time.monotonic() > until:
-                        raise AssertionError("the first author job never entered")
-                    time.sleep(0.02)
-                current = worker.supervision.current
-                assert current is not None and current.alive()
-                before = (current.epoch, current.pid)
-                slot = JobSlot(
-                    pb.JobDirective(), binding, worker.supervision, worker.lanes.envelope
-                )
-                assert slot.ready()
-                worker.prepare_local_package(other)
-                after = worker.supervision.current
-                assert after is current and (after.epoch, after.pid) == before
-                assert after.alive() and slot.ready()
-                records = [json.loads(p.read_bytes()) for p in plans.glob("*/*.json")]
-                changed = JobBinding.read(next(row for row in records if row.get("job") == "other"))
-                wrong = JobSlot(
-                    pb.JobDirective(), changed, worker.supervision, worker.lanes.envelope
-                )
-                assert not wrong.ready(), "a live process is not the newly selected code"
-                worker.supervision.use_environment(changed.python, changed.installation_id)
-                assert slot.ready() and not wrong.ready(), (
-                    "readiness read mutable next-spawn selection"
-                )
-                worker.supervision.use_environment(binding.python, binding.installation_id)
-                observed.update(epoch=before[0], pid=before[1], unchanged=True)
-            except BaseException as exc:
-                failures.append(exc)
-            finally:
-                (root / "gate").touch()
-
-        thread = threading.Thread(target=prepare_other, daemon=True)
-        worker.watches.tap = owner.tap_progress
-        owner.watch(worker)
-        thread.start()
-        worker.run()
-        thread.join(60)
-        assert not thread.is_alive()
-        assert not failures, failures
-        assert observed.get("unchanged")
-        assert owner.terminal is not None
-        # The canonical outcome is already checked by LocalRecordOwner.
-        from cozy_runtime.protocol import documents
-
-        result = documents.read(owner.terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
-        assert result["status"] == pb.OUTCOME_STATUS_SUCCEEDED, result

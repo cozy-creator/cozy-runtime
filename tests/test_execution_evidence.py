@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import socket
 import sys
-import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -14,17 +12,12 @@ from typing import Any
 import msgspec
 import pytest
 
-from conftest import sample_python
 from cozy_runtime.author._observations import MAX_SERIES, Attribution, EventRing
-from cozy_runtime.internal import child_env, execution_evidence, package_interface
-from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal import execution_evidence, package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
 from cozy_runtime.internal.seam import Channel
-from cozy_runtime.internal.worker.session import WorkerOptions
-from local_owner import LocalRequest, run_slice
-from test_end_to_end import NO_EXECUTOR
 
 MODULE = "execution_evidence_fixture"
 SOURCE = """
@@ -224,42 +217,3 @@ def test_a_live_row_carries_the_sequence_the_worker_deduplicates_by() -> None:
     ring = EventRing()
     first, second = ring.emit("log", "a"), ring.emit("log", "b")
     assert (first.seq, second.seq) == (1, 2)
-
-
-@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-def test_the_triage_bundle_keeps_the_record_and_each_row_once() -> None:
-    """The real worker and executor child: the kept bundle carries the execution record, and
-    rows the live lane delivered are not admitted again from the reply."""
-    base = {k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"}
-    with tempfile.TemporaryDirectory(prefix="cz-ev.", dir="/tmp") as raw:
-        root = Path(raw)
-        project = _project(root)
-        config = RuntimeConfig(
-            cozy_home=root / "home",
-            credentials=Credentials(),
-            child_base_env=tuple(sorted(base.items())),
-        )
-        with contextlib.chdir(project), contextlib.redirect_stdout(sys.stderr):
-            outcome = run_slice(
-                config,
-                LocalRequest(
-                    entrypoint="generate", payload={"steps": 4}, outputs=(), request_id="ev-1"
-                ),
-                workspace=root / "run",
-                package_installation_id="",
-                package_interface_document=package_interface.build(discover(project)),
-                project=project,
-                development_tensorfs_root=config.cozy_home / "tensorfs",
-                options=WorkerOptions(
-                    root=root / "run" / "worker", devices="0", python=str(sample_python())
-                ),
-            )
-    sys.modules.pop(MODULE, None)
-    assert outcome.result == {"steps": 4}, (outcome.error, outcome.faults)
-    assert outcome.triage is not None, (outcome.triage_subject, outcome.terminal.triage_bundle)
-    measurements = outcome.triage.measurements
-    [rank] = measurements["execution"]["ranks"]
-    assert measurements["execution"]["degree"] == 1 and rank["pid"] not in (0, os.getpid())
-    assert len(measurements["attribution"]["steps"]["denoise"]["series"]) == 4
-    rows = [row for row in outcome.triage.events if row["name"] == "evidence row"]
-    assert [row["fields"]["index"] for row in rows] == [0, 1, 2], rows

@@ -45,8 +45,7 @@ try:
     ack=next(frame.claim_ack for frame in frames if frame.WhichOneof('msg')=='claim_ack')
     old=pb.CancelAttempt(record_owner_epoch=8,control_stream_epoch=1,worker_boot_id=boot)
     print('PROOF '+json.dumps({'accepted':ack.accepted,'stream':ack.control_stream_epoch,
-        'rejection':pb.ClaimRejection.Name(ack.rejection),'old_fenced':worker.fenced(old),
-        'dispatch_open':worker.fence.dispatch_open}),flush=True)
+        'rejection':pb.ClaimRejection.Name(ack.rejection),'old_fenced':worker.fenced(old)}),flush=True)
     if mode=='hold':sys.stdin.readline()
 finally:
     worker.shutdown()
@@ -76,7 +75,6 @@ def test_claim_authority_survives_worker_process_replacement(tmp_path: Path) -> 
     assert first["accepted"] and first["stream"] == 1
     same = _run(tmp_path, "same")
     assert same["accepted"] and same["stream"] == 2 and same["old_fenced"]
-    assert not same["dispatch_open"]  # every new stream still owes SnapshotAck
     held = (tmp_path / "worker/ownership.json").read_bytes()
     for mode, epoch, identity, refusal in [
         ("stale", 7, "owner-A", "STALE_RECORD_OWNER_EPOCH"),
@@ -91,7 +89,7 @@ def test_claim_authority_survives_worker_process_replacement(tmp_path: Path) -> 
     assert not _run(tmp_path, "old", 8)["accepted"]
     # An owner on an old wire minor still claims; operations it cannot use fail alone.
     legacy = _run(tmp_path, "legacy", 10, "owner-B")
-    assert legacy["accepted"] and legacy["stream"] == 4 and not legacy["dispatch_open"]
+    assert legacy["accepted"] and legacy["stream"] == 4
 
 
 def test_claim_ack_is_durable_before_process_is_killed(tmp_path: Path) -> None:
@@ -149,7 +147,7 @@ def test_failed_counter_write_never_accepts_claim(tmp_path: Path) -> None:
     pending.mkdir()  # an actual filesystem refusal, not a mocked durability answer
     refused = _run(tmp_path, "same")
     assert not refused["accepted"] and refused["rejection"] == "CLAIM_REJECTION_UNDURABLE"
-    assert not refused["dispatch_open"] and path.read_bytes() == held
+    assert path.read_bytes() == held
     pending.rmdir()
     assert _run(tmp_path, "same")["stream"] == 2
 
@@ -165,5 +163,4 @@ def test_previous_minor_owner_remains_compatible_with_current_worker(tmp_path: P
     assert _run(tmp_path, "first")["accepted"]
     older = _run(tmp_path, "previous")
     assert older["accepted"] and older["stream"] == 2
-    assert not older["dispatch_open"]  # skew does not bypass SnapshotAck
     assert _run(tmp_path, "same")["stream"] == 3

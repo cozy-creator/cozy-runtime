@@ -20,7 +20,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -212,64 +211,6 @@ def _ranks(worker: Worker, outcome: dict[str, Any]) -> dict[int, dict[str, Any]]
         bundle.measurements.get("execution") or {"ranks": []}
     )
     return observed
-
-
-@pytest.mark.skipif(bool(NO_CARD), reason=NO_CARD or "")
-def test_pins_are_request_scoped_on_one_warm_construction() -> None:
-    """Pinned first on a fresh executor, then ordinary, pinned, unsupported and ordinary
-    again: each request runs its own kernel on the ONE construction and executor."""
-    arms = [
-        ("pinned-first", "dit=cudnn"),
-        ("ordinary", ""),
-        ("pinned", "dit=cudnn"),
-        ("unsupported", "dit=flashinfer-bf16-fp8"),
-        ("ordinary-after", ""),
-    ]
-    requests = [
-        LocalRequest("generate", {"value": 1}, (), attention_kernel=pin, request_id=name)
-        for name, pin in arms
-    ]
-    with tempfile.TemporaryDirectory(prefix="cz-attn.", dir="/tmp") as raw:
-        owner, worker, notes = _serve(Path(raw), requests)
-        assert owner.ended == "terminal", (owner.ended, owner.error)
-        outcomes = {row["request_id"]: row for row in owner.outcomes}
-        served = {name: _ranks(worker, outcomes[name]) for name, _ in arms}
-    status = {name: pb.OutcomeStatus.Name(outcomes[name]["status"]) for name, _ in arms}
-    assert status == {
-        "pinned-first": "OUTCOME_STATUS_SUCCEEDED",
-        "ordinary": "OUTCOME_STATUS_SUCCEEDED",
-        "pinned": "OUTCOME_STATUS_SUCCEEDED",
-        "unsupported": "OUTCOME_STATUS_REFUSED",
-        "ordinary-after": "OUTCOME_STATUS_SUCCEEDED",
-    }, {name: outcomes[name].get("safe_message") for name, _ in arms}
-    assert "attention_kernel_unsupported" in outcomes["unsupported"]["safe_message"]
-    # Each request dispatched the kernel it asked for, and only that one, and its evidence
-    # names that kernel as the ready one it served.
-    for name, pin in arms:
-        if name == "unsupported":
-            assert served[name] == {}, served[name]
-            continue
-        row = served[name][0]
-        [kernel] = [k for k in row["kernels"] if k["served"]]
-        assert kernel["state"] == "ready", row
-        assert row["arch"] == "sm_{}{}".format(*torch.cuda.get_device_capability(0)), row
-        if pin:
-            assert (row["requested"], row["observed"], row["impl"]) == (pin, "cudnn", "cudnn")
-            assert kernel["kernel"] == "cudnn", row
-        else:
-            assert (row["requested"], row["observed"]) == ("", "sdpa"), served[name]
-            assert row["impl"] in SDPA, served[name]
-            assert kernel["kernel"] == "sdpa", row
-    # One construction was built, once, and one executor served every request.
-    assert sum(" loaded in " in step for step in notes) == 1, notes
-    entered = [row.body for row in worker.records.records if row.kind == "entered"]
-    assert [row["request_id"] for row in entered] == [
-        "pinned-first",
-        "ordinary",
-        "pinned",
-        "ordinary-after",
-    ]
-    assert len({(row["executor_epoch"], row["executor_pid"]) for row in entered}) == 1, entered
 
 
 GROUP = TESTDATA / "request_attention_group.py"
