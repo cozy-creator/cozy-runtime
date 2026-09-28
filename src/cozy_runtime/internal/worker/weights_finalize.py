@@ -111,40 +111,28 @@ def _record(path: Path, data: bytes) -> None:
             temporary.unlink()
 
 
-def inline_receipt(
-    request: pb.WeightsFinalizeRequest, root: str | Path, transaction_id: str
-) -> object:
-    """The native receipt with its declaration inline, as an owner recorded it before this
-    Runtime named declarations by digest; only needed to match a recorded digest."""
-    if not request.weights_receipt_digest:
-        return None
-    handle = fill.tensorfs_module().Store.open(str(root), receipts="inline")
-    return handle.derived_lookup(transaction_id).get("receipt")
-
-
 def _receipt(
-    request: pb.WeightsFinalizeRequest, transaction_id: str, facts: object, inline: object = None
+    request: pb.WeightsFinalizeRequest, transaction_id: str, native: object
 ) -> pb.WeightsReceiptRef:
-    """The recorded protocol receipt, in whichever form its owner recorded it."""
-    for native in [facts, inline] if inline is not None else [facts]:
-        if not isinstance(native, dict) or native.get("transaction_id") != transaction_id:
-            raise FinalizationRefusal("TensorFS finalization returned another transaction receipt")
-        receipt = weights_sink.receipt_from_native(
-            request.output_slot,
-            transaction_id,
-            native,
-            replayed=True,
-            request_id=request.request_id,
-        )
-        ref, _raw, digest = weights_sink.protocol_receipt(
-            receipt,
-            owner_scope=request.owner_authority_scope,
-            request_id=request.request_id,
-            invocation_spec_digest=documents.spell(bytes(request.invocation_spec_digest)),
-        )
-        if not request.weights_receipt_digest or request.weights_receipt_digest == digest:
-            return ref
-    raise FinalizationRefusal("weights finalization receipt differs from the committed receipt")
+    """The recorded protocol receipt."""
+    if not isinstance(native, dict) or native.get("transaction_id") != transaction_id:
+        raise FinalizationRefusal("TensorFS finalization returned another transaction receipt")
+    receipt = weights_sink.receipt_from_native(
+        request.output_slot,
+        transaction_id,
+        native,
+        replayed=True,
+        request_id=request.request_id,
+    )
+    ref, _raw, digest = weights_sink.protocol_receipt(
+        receipt,
+        owner_scope=request.owner_authority_scope,
+        request_id=request.request_id,
+        invocation_spec_digest=documents.spell(bytes(request.invocation_spec_digest)),
+    )
+    if request.weights_receipt_digest and request.weights_receipt_digest != digest:
+        raise FinalizationRefusal("weights finalization receipt differs from the committed receipt")
+    return ref
 
 
 def _authorize(
@@ -215,15 +203,11 @@ def finalize(
         return result
     store = fill.ensure_store(tensorfs_root)
     observed = store.derived_lookup(transaction_id)
-
-    def inline() -> object:
-        return inline_receipt(request, tensorfs_root, transaction_id)
-
     committed_receipt = None
     if request.disposition != pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED:
         if observed["state"] != "committed":
             raise FinalizationRefusal("weights finalization requires an existing committed receipt")
-        committed_receipt = _receipt(request, transaction_id, observed["receipt"], inline())
+        committed_receipt = _receipt(request, transaction_id, observed["receipt"])
     if previous is None:
         _authorize(request, attempts, bool(observed.get("writer_session_id")))
         _record(intent, encoded)
@@ -241,9 +225,7 @@ def finalize(
         if not (retain_partial and observed["state"] == "open"):
             observed = store.derived_abandon(transaction_id)
         if observed["state"] == "committed":
-            result.weights_receipt.CopyFrom(
-                _receipt(request, transaction_id, observed["receipt"], inline())
-            )
+            result.weights_receipt.CopyFrom(_receipt(request, transaction_id, observed["receipt"]))
             store.derived_dispose(transaction_id)
         result.outcome = pb.WEIGHTS_FINALIZE_OUTCOME_ABANDONED
     else:
