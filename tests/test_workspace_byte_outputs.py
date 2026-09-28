@@ -275,7 +275,7 @@ def test_real_native_tree_rpc_stream_is_membership_checked(tmp_path: Path) -> No
 
     handler = Handler()
     handler.workspace_service = Service(
-        workspace, authorize, lambda _: pb.WeightsHostAck(), Resolutions()
+        workspace, authorize, Resolutions()
     )
     pool = ThreadPoolExecutor(max_workers=2)
     server = grpc.server(pool)
@@ -351,7 +351,7 @@ def test_native_integrity_fault_is_permanent_rpc_refusal(tmp_path: Path, fault: 
 
     handler = Handler()
     handler.workspace_service = Service(
-        workspace, lambda _: "owner", lambda _: pb.WeightsHostAck(), Resolutions()
+        workspace, lambda _: "owner", Resolutions()
     )
     pool = ThreadPoolExecutor(max_workers=2)
     server = grpc.server(pool)

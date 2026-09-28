@@ -1029,8 +1029,8 @@ def serve(payload: Request) -> Result:
                 assert time.monotonic() < until
                 time.sleep(0.02)
             assert worker.execution_status(claim, "second").state == "queued"
-            assert not any(
-                frame.HasField("attempt_accepted") or frame.HasField("attempt_outcome")
+            assert all(
+                frame.WhichOneof("msg") in {"claim_ack", "snapshot", "observed_state"}
                 for frame in observed
             )
             incoming.put(None)

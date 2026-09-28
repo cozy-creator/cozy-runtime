@@ -397,7 +397,6 @@ def _submit(
                     orchestration=orchestration,
                     resource_caps=pb.ResourceCaps(device_required=False),
                     publication_contract=pb.PublicationContract(grant_id="local/_job-rooted"),
-                    reclaim_on_terminal=True,
                 ),
             ),
             payload_canonical_bytes=payload,

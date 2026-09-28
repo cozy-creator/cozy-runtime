@@ -783,7 +783,6 @@ class ReleaseRoots:
                 ),
                 device_count=1 if device else 0,
                 orchestration=not device,
-                reclaim_on_terminal=True,
             ),
         )
 
