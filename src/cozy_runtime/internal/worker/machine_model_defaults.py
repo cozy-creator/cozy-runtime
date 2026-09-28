@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 import msgspec
 
-from cozy_runtime.internal import fill, package_interface
+from cozy_runtime.internal import fill
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -148,20 +148,9 @@ def valid_origin(origin: str, *, local: bool) -> bool:
         return False
 
 
-def verify(
-    worker: Worker,
-    capture: pb.MachineExecutionCapture,
-    interfaces: Mapping[str, package_interface.PackageInterface],
-) -> None:
+def verify(worker: Worker, capture: pb.MachineExecutionCapture) -> None:
     if not capture.model_defaults:
         return
-    expected = {
-        (callee(binding), entry.name, model.parameter)
-        for binding in capture.bindings
-        for entry in interfaces[callee(binding)].entrypoints
-        if entry.name == binding.entrypoint
-        for model in entry.models
-    }
     keys = []
     for row in capture.model_defaults:
         if not callee(row) or not row.entrypoint or not row.parameter:
@@ -188,8 +177,10 @@ def verify(
         selectors = [(rung.gpu.lower(), rung.gpus) for rung in row.rungs]
         if len(set(selectors)) != len(selectors):
             raise WorkspaceRefusal("captured Model default repeats a GPU and count selector")
-    if len(keys) > 4096 or keys != sorted(set(keys)) or set(keys) != expected:
-        raise WorkspaceRefusal("captured Model default inventory is incomplete or ambiguous")
+    # A slot the capture left open resolves at this machine's Hub; one for a slot this
+    # interface lacks is never read. Only two defaults for one slot are ambiguous.
+    if len(keys) > 4096 or len(set(keys)) != len(keys):
+        raise WorkspaceRefusal("captured Model default inventory is ambiguous")
 
 
 def callee(row: pb.MachineCallableBinding | pb.MachineModelDefault | Captured) -> str:
@@ -224,10 +215,9 @@ def catalog_fits(fits: Callable[[Selector], bool]) -> Callable[[Mapping[str, obj
 
     def check(rung: Mapping[str, object]) -> bool:
         try:
-            selector = msgspec.convert(rung, Selector)
-        except msgspec.ValidationError as exc:
-            raise WorkspaceRefusal(f"catalog ladder rung is malformed: {exc}") from exc
-        return fits(selector)
+            return fits(msgspec.convert(rung, Selector))
+        except msgspec.ValidationError:
+            return False  # a rung this machine cannot read is a rung it does not take
 
     return check
 

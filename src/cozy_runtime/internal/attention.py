@@ -922,10 +922,9 @@ def _preferred(
     for name in order:
         candidate = BY_NAME.get(name)
         if candidate is None:
-            raise AttentionRefusal(
-                "attention_kernel_unknown",
-                f"model attention preference names {name!r}; this runtime knows {sorted(BY_NAME)}",
-            )
+            # A package written for a newer Runtime may prefer a kernel this one lacks.
+            refused[name] = "unknown to this runtime"
+            continue
         if name in refused:
             continue
         entry = resolved.get(name)

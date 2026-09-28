@@ -17,7 +17,7 @@ import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import fill, hostfacts, package_interface
+from cozy_runtime.internal import fill, hostfacts
 from cozy_runtime.internal.worker import grants, machine_checkpoint_inputs
 from cozy_runtime.internal.worker import machine_model_defaults as defaults
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -90,18 +90,6 @@ def parsed(capture: dict[str, Any]) -> pb.MachineExecutionCapture:
     return documents.parse(raw, pb.MachineExecutionCapture)
 
 
-def interfaces() -> dict[str, package_interface.PackageInterface]:
-    models = tuple(
-        package_interface.ModelSlot(path=model["path"], class_name="M", component_use={})
-        for model in target().declaration["models"]
-    )
-    generate = package_interface.CallableDoc(name="generate", request={}, result={}, models=models)
-    interface = package_interface.PackageInterface(
-        format=package_interface.SCHEMA, application="app", entrypoints=(generate,), jobs=()
-    )
-    return {INSTALLATION: interface}
-
-
 def target() -> Target:
     return Target(
         installation_id=INSTALLATION,
@@ -132,13 +120,21 @@ def fetch(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> st
     return str(request.param)
 
 
-def test_default_capture_requires_complete_exact_inventory() -> None:
+def test_default_capture_admits_any_order_and_open_slots_but_not_forged_rungs() -> None:
     body = captured()
-    defaults.verify(peer(body), parsed(body), interfaces())
-    mutations: list[Callable[[dict[str, Any]], Any]] = [
+    defaults.verify(peer(body), parsed(body))
+    # The Creator's order, a slot left open (resolved at the machine's Hub) and a row for a
+    # slot this interface lacks are all an inventory this machine can serve.
+    tolerated_changes: list[Callable[[dict[str, Any]], Any]] = [
         lambda value: value["model_defaults"].pop(),
         lambda value: value["model_defaults"].reverse(),
         lambda value: value["model_defaults"][0].update(parameter="foreign"),
+    ]
+    for tolerated in tolerated_changes:
+        changed = copy.deepcopy(body)
+        tolerated(changed)
+        defaults.verify(peer(changed), parsed(changed))
+    mutations: list[Callable[[dict[str, Any]], Any]] = [
         lambda value: value["model_defaults"][0].update(
             public_origin="https://user:secret@catalog.example"
         ),
@@ -155,7 +151,7 @@ def test_default_capture_requires_complete_exact_inventory() -> None:
         changed = copy.deepcopy(body)
         mutate(changed)
         with pytest.raises(WorkspaceRefusal):
-            defaults.verify(peer(changed), parsed(changed), interfaces())
+            defaults.verify(peer(changed), parsed(changed))
     assert defaults.valid_origin("http://127.0.0.1:8819", local=True)
     assert not defaults.valid_origin("http://127.0.0.1:8819", local=False)
     assert not defaults.valid_origin("http://169.254.169.254", local=True)
