@@ -15,9 +15,17 @@ numbers, because reading it would only evict what a neighbour just warmed.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Required, TypedDict
 
 from cozy_runtime.internal import fill
+
+
+class WarmReport(TypedDict, total=False):
+    component: Required[str]
+    skipped: str
+    bytes: int
+    ms: float
+    read_bytes: int
 
 
 def available_memory_bytes() -> int:
@@ -32,7 +40,7 @@ def available_memory_bytes() -> int:
     return -1
 
 
-def warm_component(store_root: str, manifest: str, component: str) -> dict[str, Any]:
+def warm_component(store_root: str, manifest: str, component: str) -> WarmReport:
     """Stream one component's stored bytes through the store, for the page cache alone."""
     checkpoint = fill.Checkpoint(store_root, manifest)
     table = checkpoint.header["components"].get(component) or {}
@@ -62,9 +70,9 @@ def warm_component(store_root: str, manifest: str, component: str) -> dict[str, 
     }
 
 
-def describe(report: dict[str, Any]) -> str:
+def describe(report: WarmReport) -> str:
     """One line for the worker's residency notes, in the words the restore path uses."""
-    moved, took, read = int(report["bytes"]), float(report["ms"]), int(report["read_bytes"])
+    moved, took, read = report["bytes"], report["ms"], report["read_bytes"]
     rate = f"{moved / took / 1e6:.1f} GB/s" if took > 0 else "instant"
     if read < 0:
         served = "block-device reads unreadable"

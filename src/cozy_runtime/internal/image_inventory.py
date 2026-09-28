@@ -10,11 +10,10 @@ falsifies the inventory rather than silently rewiring the pod.
 
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated
 
+import msgspec
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
@@ -41,109 +40,71 @@ class Inventory:
         return dict(self.distributions)
 
 
+class _Distribution(msgspec.Struct, frozen=True):
+    name: str
+    version: str
+
+
+class _Interpreter(msgspec.Struct, frozen=True):
+    version: str
+    abi: str
+
+
+_Minor = Annotated[str, msgspec.Meta(pattern=r"^3\.[0-9]+$")]
+
+
+class _Document(msgspec.Struct, frozen=True):
+    format: str
+    profile: Annotated[str, msgspec.Meta(min_length=1)]
+    python: str
+    distributions: Annotated[tuple[_Distribution, ...], msgspec.Meta(min_length=1)]
+    interpreters: Annotated[tuple[_Interpreter, ...], msgspec.Meta(max_length=3)] = ()
+    provisionable_minors: Annotated[tuple[_Minor, ...], msgspec.Meta(max_length=3)] = ()
+
+
+def _version(spelled: str, what: str) -> Version:
+    try:
+        return Version(spelled)
+    except InvalidVersion as exc:
+        raise ImageInventoryRefusal(f"{what} {spelled!r}") from exc
+
+
 def read_bytes(raw: bytes) -> Inventory:
     """Read required inventory facts while tolerating additive producer metadata."""
 
     try:
-        value: Any = json.loads(raw)
-    except ValueError as exc:
-        raise ImageInventoryRefusal(f"not JSON: {exc}") from exc
-    if not isinstance(value, dict) or not {
-        "distributions",
-        "format",
-        "profile",
-        "python",
-    }.issubset(value):
-        raise ImageInventoryRefusal("wrong fields")
-    if value["format"] != INVENTORY_FORMAT:
-        raise ImageInventoryRefusal(f"format {value['format']!r}")
-    profile = value["profile"]
-    python = value["python"]
-    rows = value["distributions"]
-    if not isinstance(profile, str) or not profile or not isinstance(rows, list) or not rows:
-        raise ImageInventoryRefusal("profile or distributions absent")
-    try:
-        Version(str(python))
-    except InvalidVersion as exc:
-        raise ImageInventoryRefusal(f"python {python!r}") from exc
-    distributions: list[tuple[str, str]] = []
+        document = msgspec.json.decode(raw, type=_Document)
+    except msgspec.DecodeError as exc:
+        raise ImageInventoryRefusal(f"invalid inventory: {exc}") from exc
+    if document.format != INVENTORY_FORMAT:
+        raise ImageInventoryRefusal(f"format {document.format!r}")
+    _version(document.python, "python")
     prior = ""
-    for row in rows:
-        if not isinstance(row, dict) or not {"name", "version"}.issubset(row):
-            raise ImageInventoryRefusal("distribution row fields")
-        name = row["name"]
-        version = row["version"]
-        if (
-            not isinstance(name, str)
-            or not isinstance(version, str)
-            or canonicalize_name(name) != name
-            or name <= prior
+    for row in document.distributions:
+        if canonicalize_name(row.name) != row.name or row.name <= prior:
+            raise ImageInventoryRefusal(f"distribution {row.name!r}")
+        _version(row.version, f"{row.name} version")
+        prior = row.name
+    interpreters = []
+    for interpreter in document.interpreters:
+        version = _version(interpreter.version, "interpreter version")
+        if len(version.release) != 3 or interpreter.abi != "cp" + "".join(
+            map(str, version.release[:2])
         ):
-            raise ImageInventoryRefusal(f"distribution {name!r}")
-        try:
-            Version(version)
-        except InvalidVersion as exc:
-            raise ImageInventoryRefusal(f"{name} version {version!r}") from exc
-        prior = name
-        distributions.append((name, version))
-    return Inventory(
-        profile=profile,
-        python=str(python),
-        distributions=tuple(distributions),
-        interpreters=_interpreters(value.get("interpreters", [])),
-        provisionable_minors=_provisionable_minors(value.get("provisionable_minors", [])),
-    )
-
-
-def from_wire(profile: str, python: str, rows: Any, interpreters: Any = ()) -> Inventory:
-    """Admit the request-carried inventory rows (wire 30); same rules as the staged document."""
-
-    if not isinstance(profile, str) or not profile:
-        raise ImageInventoryRefusal("profile absent")
-    try:
-        Version(str(python))
-    except InvalidVersion as exc:
-        raise ImageInventoryRefusal(f"python {python!r}") from exc
-    distributions: list[tuple[str, str]] = []
-    prior = ""
-    for row in rows:
-        name = str(getattr(row, "distribution", ""))
-        version = str(getattr(row, "version", ""))
-        if canonicalize_name(name) != name or name <= prior:
-            raise ImageInventoryRefusal(f"distribution {name!r}")
-        try:
-            Version(version)
-        except InvalidVersion as exc:
-            raise ImageInventoryRefusal(f"{name} version {version!r}") from exc
-        prior = name
-        distributions.append((name, version))
-    return Inventory(
-        profile=profile,
-        python=str(python),
-        distributions=tuple(distributions),
-        interpreters=_interpreters(
-            [{"version": row.version, "abi": row.abi} for row in interpreters]
-        ),
-    )
-
-
-def _interpreters(rows: Any) -> tuple[tuple[str, str], ...]:
-    if not isinstance(rows, list) or len(rows) > 3:
-        raise ImageInventoryRefusal("interpreter inventory must contain at most three versions")
-    result = []
-    for row in rows:
-        if not isinstance(row, dict) or not {"version", "abi"}.issubset(row):
-            raise ImageInventoryRefusal("interpreter inventory row fields")
-        try:
-            version = Version(row["version"])
-        except (InvalidVersion, TypeError) as exc:
-            raise ImageInventoryRefusal("interpreter version is invalid") from exc
-        if len(version.release) != 3 or row["abi"] != "cp" + "".join(map(str, version.release[:2])):
             raise ImageInventoryRefusal("interpreter version and ABI disagree")
-        result.append((str(version), row["abi"]))
-    if result != sorted(set(result), key=lambda row: Version(row[0])):
+        interpreters.append((str(version), interpreter.abi))
+    if interpreters != sorted(set(interpreters), key=lambda row: Version(row[0])):
         raise ImageInventoryRefusal("interpreters must be sorted and unique")
-    return tuple(result)
+    minors = document.provisionable_minors
+    if list(minors) != sorted(set(minors), key=Version):
+        raise ImageInventoryRefusal("provisionable Python minors must be sorted and unique")
+    return Inventory(
+        profile=document.profile,
+        python=document.python,
+        distributions=tuple((row.name, row.version) for row in document.distributions),
+        interpreters=tuple(interpreters),
+        provisionable_minors=minors,
+    )
 
 
 def disagreement(inventory: Inventory, observed_versions: dict[str, str]) -> str | None:
@@ -164,15 +125,3 @@ def disagreement(inventory: Inventory, observed_versions: dict[str, str]) -> str
         if not agreed:
             return f"distribution={name} inventory={version} image={observed}"
     return None
-
-
-def _provisionable_minors(rows: Any) -> tuple[str, ...]:
-    if (
-        not isinstance(rows, list)
-        or len(rows) > 3
-        or any(not isinstance(row, str) or not re.fullmatch(r"3\.[0-9]+", row) for row in rows)
-    ):
-        raise ImageInventoryRefusal("invalid provisionable Python minors")
-    if rows != sorted(set(rows), key=Version):
-        raise ImageInventoryRefusal("provisionable Python minors must be sorted and unique")
-    return tuple(rows)

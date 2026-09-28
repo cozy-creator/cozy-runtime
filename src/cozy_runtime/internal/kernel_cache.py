@@ -34,7 +34,8 @@ import shutil
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+
+import msgspec
 
 SCHEMA = 1
 _KERNEL = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -46,7 +47,13 @@ class KernelCacheRefusal(Exception):
     pass
 
 
-def _canonical(value: Any) -> Any:
+class _Entry(msgspec.Struct, frozen=True):
+    key: object
+    sha256: str
+    size: int
+
+
+def _canonical(value: object) -> object:
     if isinstance(value, Mapping):
         return {str(k): _canonical(v) for k, v in sorted(value.items())}
     if isinstance(value, (list, tuple)):
@@ -63,12 +70,12 @@ class Key:
     """Canonical JSON of every compile input, so equality is exact equality of the document."""
 
     @classmethod
-    def of(cls, kernel: str, inputs: Mapping[str, Any]) -> Key:
+    def of(cls, kernel: str, inputs: Mapping[str, object]) -> Key:
         if _KERNEL.fullmatch(kernel) is None:
             raise KernelCacheRefusal(f"invalid kernel name {kernel!r}")
         return cls(kernel, json.dumps(_canonical(inputs), sort_keys=True, separators=(",", ":")))
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, object]:
         return {"schema": SCHEMA, "kernel": self.kernel, "inputs": json.loads(self.inputs)}
 
     @property
@@ -93,7 +100,7 @@ class Store:
             found = _read(self.trusted, key, repair=False)
         return found
 
-    def put(self, key: Key, data: bytes, producer: Mapping[str, Any]) -> None:
+    def put(self, key: Key, data: bytes, producer: Mapping[str, object]) -> None:
         """Publish under the key's lock; the first complete entry wins, a later one is dropped.
 
         Every object is a pure function of its key, so a lost race loses nothing."""
@@ -159,18 +166,19 @@ class Store:
 
 def _read(namespace: Path, key: Key, *, repair: bool) -> bytes | None:
     entry_dir = namespace / key.kernel / key.digest
+    entry: _Entry | None
     try:
-        entry = json.loads((entry_dir / _ENTRY).read_bytes())
+        entry = msgspec.json.decode((entry_dir / _ENTRY).read_bytes(), type=_Entry)
         data = (entry_dir / _OBJECT).read_bytes()
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
         entry, data = None, b""
     if (
-        isinstance(entry, dict)
-        and entry.get("key") == key.document()
-        and entry.get("size") == len(data)
-        and entry.get("sha256") == hashlib.sha256(data).hexdigest()
+        entry is not None
+        and entry.key == key.document()
+        and entry.size == len(data)
+        and entry.sha256 == hashlib.sha256(data).hexdigest()
     ):
         return data
     if repair:

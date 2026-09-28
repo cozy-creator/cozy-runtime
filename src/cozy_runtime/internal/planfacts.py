@@ -13,7 +13,6 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any
 
 from cozy_runtime.internal import canonical
 
@@ -94,7 +93,7 @@ class PlanFact:
     def single_sample(self) -> bool:
         return self.samples <= 1
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, object]:
         return {
             "plan_digest": self.plan_digest,
             "stored_bytes": self.stored_bytes,
@@ -120,27 +119,26 @@ def _median(values: Sequence[float]) -> float:
 def fold(plan_digest: str, runs: Iterable[RunFact]) -> PlanFact:
     """Every run of one plan -> one fact. A field nobody measured stays -1."""
     rows = list(runs)
-    if not rows:
-        return PlanFact(plan_digest)
-    values: dict[str, list[float]] = {}
-    for row in rows:
-        for field in _FOLDED:
-            value = float(getattr(row, field))
-            if value >= 0.0:
-                values.setdefault(field, []).append(value)
-    folded: dict[str, Any] = {}
-    for field in _FOLDED:
-        seen = values.get(field)
-        if not seen:
-            continue
-        median = _median(seen)
-        exact = field in ("step_ms", "reference_deviation_rel_l2")
-        folded[field] = median if exact else int(median)
+    median = {
+        field: _median(seen)
+        for field in _FOLDED
+        if (seen := [value for row in rows if (value := float(getattr(row, field))) >= 0.0])
+    }
+
+    def whole(field: str) -> int:
+        return int(median.get(field, -1))
+
     return PlanFact(
         plan_digest,
+        stored_bytes=whole("stored_bytes"),
+        resident_bytes=whole("resident_bytes"),
+        scratch_bytes=whole("scratch_bytes"),
+        fill_ms=whole("fill_ms"),
+        decode_ms=whole("decode_ms"),
+        step_ms=median.get("step_ms", -1.0),
+        reference_deviation_rel_l2=median.get("reference_deviation_rel_l2", -1.0),
         samples=len(rows),
-        measured=tuple(sorted(values)),
-        **folded,
+        measured=tuple(sorted(median)),
     )
 
 

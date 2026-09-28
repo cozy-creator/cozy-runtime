@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
 
 from cozy_runtime.author._observations import EventRing, Observation, Scalar
 
@@ -212,7 +211,7 @@ class DemandLedger:
             f"{actual - declared} B; {row[1]} miss(es) in {row[0]} serve(s) on this lane",
         )
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, object]:
         return {
             "lanes": {
                 lane: {
@@ -235,15 +234,12 @@ class BootRecord:
     """The worker's own boot narrative, bounded, and readable after the process dies."""
 
     ring: EventRing = field(default_factory=lambda: EventRing(subject="worker"))
-    steps: list[dict[str, Any]] = field(default_factory=list)
+    steps: list[dict[str, Scalar]] = field(default_factory=list)
 
     def step(self, name: str, outcome: str, ms: float, **fields: Scalar) -> None:
         if name not in BOOT_STEPS:
             raise ValueError(f"{name!r} is not one of the typed boot steps {BOOT_STEPS}")
-        row: dict[str, Any] = {"step": name, "outcome": outcome, "ms": round(ms, 2), **fields}
+        row: dict[str, Scalar] = {"step": name, "outcome": outcome, "ms": round(ms, 2), **fields}
         self.steps.append(row)
         del self.steps[:-32]
         self.ring.emit("boot", name, outcome, ms=round(ms, 2), **fields)
-
-    def document(self) -> dict[str, Any]:
-        return {"steps": list(self.steps), "events": self.ring.rows(), "caps": self.ring.caps()}
