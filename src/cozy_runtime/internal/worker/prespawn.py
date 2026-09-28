@@ -163,8 +163,11 @@ class Prespawns:
         unreadable = set(range(len(entries))) - set(readable)
         ordinals = worker.gpu.spare(root, width, exclude=unreadable)
         replica = None if ordinals is None else self._replica(installation, ordinals)
-        if ordinals is None or (replica is not None and replica.supervision.current is not None):
+        current = replica.supervision.current if replica is not None else None
+        if ordinals is None or (current is not None and current.alive()):
             return
+        if current is not None:
+            replica = None  # its dead process is still being reclaimed: a slot of its own
         slot_id = "warm-" + _digest([installation, list(ordinals)])
         with self.lock:
             if (installation, ordinals) in self.slots:
