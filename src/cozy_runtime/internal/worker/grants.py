@@ -66,7 +66,7 @@ import msgspec
 
 from cozy_runtime.author._assets import GrantedInput, file_state
 from cozy_runtime.author._errors import RuntimeFailure
-from cozy_runtime.author._media import SNIFF_BYTES, extension, normalize, sniff
+from cozy_runtime.author._media import SNIFF_BYTES, extension, normalize, reconcile, sniff
 from cozy_runtime.internal import canonical, egress
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -835,22 +835,13 @@ def hydrate_inputs(
                                 "grant_native_unavailable",
                                 f"native input bytes are unavailable: {_cause(exc)}",
                             ) from exc
-                declared = normalize(entry.kind_mime)
                 actual = sniff(receipt.prefix)
-                if declared and actual and declared != actual:
+                media_type = reconcile(entry.kind_mime, actual)
+                if media_type is None:
                     raise GrantRefusal(
                         "input_media_type",
-                        f"input {entry.input_id!r} is declared {declared!r} and its bytes are "
-                        f"{actual!r}. The declaration is a claim by whoever minted the grant; "
-                        "the signature is what the object is, and a mislabelled input refuses "
-                        "rather than reaching a decoder under a type nobody agreed to",
-                    )
-                if declared.startswith(("image/", "video/", "audio/")) and not actual:
-                    raise GrantRefusal(
-                        "input_media_type",
-                        f"input {entry.input_id!r} is declared {declared!r}, but its bytes "
-                        "have no recognised media signature. A typed media declaration is "
-                        "a claim, not a substitute for what the bytes are",
+                        f"input {entry.input_id!r} is declared {normalize(entry.kind_mime)!r} "
+                        f"and its bytes are {actual!r}, another kind of media",
                     )
                 if temporary is not None:
                     temporary.chmod(0o444)
@@ -865,7 +856,7 @@ def hydrate_inputs(
                 input_id=entry.input_id,
                 local=local,
                 file_state=source_state,
-                media_type=actual or declared,
+                media_type=media_type,
                 digest="sha256:" + receipt.sha256.hex(),
                 length=receipt.length,
                 order=int(entry.order),

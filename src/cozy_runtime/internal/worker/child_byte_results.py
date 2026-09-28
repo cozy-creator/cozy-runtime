@@ -8,7 +8,7 @@ from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._call_results import result_at
-from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, admits, normalize, sniff
+from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, admits, normalize, reconcile, sniff
 from cozy_runtime.internal.worker import byte_inputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -91,9 +91,10 @@ def materialize(
         if kind != "tree":
             with (destination / "payload").open("rb") as stream:
                 actual = sniff(stream.read(SNIFF_BYTES))
-            declared = normalize(media_type)
-            if (actual and declared != actual) or (kind != "file" and not actual):
+            reconciled = reconcile(media_type, actual)
+            if reconciled is None:
                 raise WorkspaceRefusal("native child media type differs from its encoded bytes")
+            media_type = reconciled
         if capture:
             if {member.path for member in members} != {"capture.json", "sketches.f32"}:
                 raise WorkspaceRefusal("capture tree does not contain exactly its two files")
