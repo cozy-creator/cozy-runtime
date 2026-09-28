@@ -489,6 +489,7 @@ class ReleaseRoots:
                     parameter,
                     _catalog_choice(given.get(parameter), pins.get(parameter)),
                     fits,
+                    root.owner,
                 )
                 for model, parameter in zip(slots, parameters, strict=True)
                 if parameter not in sourced

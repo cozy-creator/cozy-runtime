@@ -194,9 +194,14 @@ def _code(raw: bytes) -> str:
 
 
 def _ladder(
-    catalog: Catalog, package: str, declaration: Mapping[str, Any], bound: bool = True
+    catalog: Catalog,
+    package: str,
+    declaration: Mapping[str, Any],
+    bound: bool = True,
+    owner: str = "",
 ) -> tuple[str, str, list[dict[str, Any]]] | None:
-    """The owner's binding, else the authored default: (model, release, rungs)."""
+    """The owner's binding, else the authored default: (model, release, rungs). An org-relative
+    default names the package's org, or for unpublished code (local/) its owner's."""
     if bound and package and not package.startswith("local/"):
         row = catalog.binding(package, str(declaration["path"]))
         if row is not None:
@@ -214,7 +219,8 @@ def _ladder(
         raise WorkspaceRefusal(f"{declaration['path']} has an invalid authored default") from exc
     if "/" not in model:
         org = package.partition("/")[0]
-        if not org or org == "local":
+        org = owner if org == "local" else org
+        if not org:
             raise WorkspaceRefusal(f"{declaration['path']} names its owner's model with no owner")
         model = org + "/" + model
     return (
@@ -231,6 +237,7 @@ def slot(
     parameter: str,
     choice: Mapping[str, Any] | None,
     fits: Fits,
+    owner: str = "",
 ) -> dict[str, Any]:
     """One slot's exact checkpoint for this machine, in the captured default row shape."""
     base = {"parameter": parameter, "public_origin": catalog.origin}
@@ -252,7 +259,7 @@ def slot(
             "lane": choice.get("lane", ""),
         }
     # An explicit repository is the caller's choice: the owner's binding is not read for it.
-    ladder = _ladder(catalog, package, declaration, not choice.get("repository"))
+    ladder = _ladder(catalog, package, declaration, not choice.get("repository"), owner)
     if choice.get("repository"):
         rungs = (
             [{"gpu": "*", "gpus": 0, "lane": choice["lane"]}]

@@ -515,6 +515,43 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
         catalog.close()
 
 
+def test_an_unpublished_roots_org_relative_default_names_its_owner() -> None:
+    """Unpublished code (local/) has no org: its org-relative default names the owner the
+    root carries, and without one it refuses rather than guess."""
+    manifest = "sha256:" + "33" * 32
+    catalog = Catalog(manifest, 7, [])
+    try:
+        declaration = {
+            "path": SLOT,
+            "default_ladder": [{"gpu": "*", "lane": f"tenant@{RELEASE}/{LANE}"}],
+        }
+        resolved = machine_model_resolve.slot(
+            machine_model_resolve.Catalog(catalog.origin),
+            "local/tenant",
+            declaration,
+            "model",
+            None,
+            lambda _rung: True,
+            "cozytest",
+        )
+        assert (resolved["repository"], resolved["manifest"]) == (
+            PACKAGE,
+            {"digest": manifest, "length": 7},
+        )
+        assert [urlsplit(path).path for path in catalog.reads] == ["/v1/models/resolve"]
+        with pytest.raises(WorkspaceRefusal, match="with no owner"):
+            machine_model_resolve.slot(
+                machine_model_resolve.Catalog(catalog.origin),
+                "local/tenant",
+                declaration,
+                "model",
+                None,
+                lambda _rung: True,
+            )
+    finally:
+        catalog.close()
+
+
 def test_a_provider_source_choice_is_made_by_the_machine_once(
     published: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
