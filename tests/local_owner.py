@@ -438,10 +438,7 @@ class LocalRecordOwner:
             self.done.set()
             self.host.close()
             return
-        open_window = (
-            report.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
-            and report.available_attempt_slots > 0
-        )
+        open_window = report.admission_state == pb.AdmissionState.ADMISSION_STATE_OPEN
         if self.request.kind == "job":
             ready = open_window and report.job_capacity.jobs_available > 0
         else:

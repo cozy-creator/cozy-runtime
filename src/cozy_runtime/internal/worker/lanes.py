@@ -46,22 +46,6 @@ from cozy_runtime.internal.worker import child
 from cozy_runtime.internal.worker.ledger import DeviceFacts, Ledger
 from cozy_runtime.internal.worker.plan import PlanChooser
 
-#: The seats one serving lane advertises: ONE attempt on the device (#451/law 8) and ONE
-#: staged behind it (proto-061 G). The staged attempt is accepted, hydrated and journaled
-#: while the device runs the one ahead of it, and enters the device the moment that one
-#: releases — so the device never waits on an offer round trip or an input download. It is
-#: on the wire as QUEUED (proto-026): bound to no executor and no plan until device entry.
-#: A job lane stages nothing (one bounded attempt per build) and advertises LANE_RUNNING.
-#:
-#: A seat is held from the offer's hold to DEVICE RELEASE (cr-079 D3) — the executor's
-#: reply — and not through the ack. The post phase (encode, write, outcome, hold to ack) is
-#: bounded structurally instead: while more than LANE_RELEASED released attempts on a lane
-#: are unacknowledged the lane advertises nothing, so an owner that stops acking idles its
-#: own device rather than growing this worker's held set.
-LANE_RUNNING = 1
-LANE_STAGED = 1
-LANE_RELEASED = 1
-
 #: The lane name a job's executor is sealed under: the whole envelope, one seat.
 ENVELOPE_LANE = "envelope"
 #: A weightless machine replica's own lane: sealed to no device, so it never waits for one.

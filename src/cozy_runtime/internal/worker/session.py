@@ -143,9 +143,6 @@ from cozy_runtime.internal.worker.control import (
 )
 from cozy_runtime.internal.worker.gpu_scheduler import GpuBroker, width_for
 from cozy_runtime.internal.worker.lanes import (
-    LANE_RELEASED,
-    LANE_RUNNING,
-    LANE_STAGED,
     DeviceLane,
     LaneRefusal,
     LaneRow,
@@ -185,17 +182,6 @@ REPORT_SECONDS = 2.0
 #: The RUN-ONCE RECYCLE exit (cr-009, v1 rc 75). A job worker that completed its one attempt
 #: and had its terminal acknowledged asks to be RECLAIMED, and that is not a death.
 RECYCLE_EXIT = 75
-
-#: The worker's accepted-attempt WINDOW behind `available_attempt_slots` (#472e/#494f) is
-#: each lane's seats summed over the lanes with a dispatchable placement: one counter per
-#: SERIALIZED RESOURCE, and that resource is the device LANE (cr-066). A serving lane has
-#: `LANE_RUNNING + LANE_STAGED` seats (proto-061 G): one attempt on the device and one
-#: STAGED behind it — accepted, hydrated and journaled while the device runs, visible to the
-#: RecordOwner as QUEUED, entering the device at the running one's release. A seat is held
-#: from the offer's hold to DEVICE RELEASE (cr-079 D3); a released attempt holds none, but
-#: while more than `LANE_RELEASED` released attempts on a lane await `AttemptOutcomeAck` the
-#: lane advertises nothing. An offer over its lane's seats is a JOURNALED REFUSED outcome,
-#: never a silent hold.
 
 
 def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
@@ -1542,7 +1528,7 @@ class Worker:
         """`lanes[]` (proto-024): every device or group lane of the envelope with its seats
         now, sorted by lane_id; `lane_wire.emit_lanes` writes it, the records carry it."""
         return sorted(
-            (lane_wire.lane_document(lane, self._lane_slots(lane)) for lane in self.lanes.lanes),
+            (lane_wire.lane_document(lane) for lane in self.lanes.lanes),
             key=lambda row: str(row["lane_id"]),
         )
 
@@ -1656,25 +1642,6 @@ class Worker:
         if lane is not None:
             lane.row(placement_id).ledger.begin_generation(executor.pid if executor else 0)
 
-    def _lane_phases(self, lane: DeviceLane) -> tuple[int, int]:
-        """(attempts queued for or on the lane's DEVICES, from any lane over them; released
-        attempts awaiting ack on ONE lane)."""
-        sharing = {other.lane_id for other in self.lanes.sharing(lane)}
-        seated = released = 0
-        for held in list(self.engine.history.values()):
-            if held.lane_id in sharing and held.state in self.engine.PRE_RELEASE:
-                seated += 1
-            elif held.lane_id == lane.lane_id and held.state in self.engine.RELEASED:
-                released += 1
-        return seated, released
-
-    def _lane_capacity(self, lane: DeviceLane) -> int:
-        """The seats `lane` has: one running plus one staged on a serving device lane, one
-        on a job lane (the envelope, a CPU slot, orchestration), which stages nothing."""
-        if self.accepted.mode == "serving" and lane in self.lanes.lanes:
-            return LANE_RUNNING + LANE_STAGED
-        return LANE_RUNNING
-
     def _lane_dispatchable(self, lane: DeviceLane) -> bool:
         """Whether THIS lane has a placement that takes offers (job mode: the envelope)."""
         if lane.lane_id.startswith("cpu-") and (slot := self.job_slots.get(lane.lane_id)):
@@ -1685,21 +1652,6 @@ class Worker:
                 slot.ready() if slot is not None else lane is self.lanes.envelope and self.job_ready
             )
         return any(self._placement_dispatchable(placement_id) for placement_id in lane.placements)
-
-    def _lane_slots(self, lane: DeviceLane) -> int:
-        """Free seats on ONE lane, now: its capacity less what is queued for or on its
-        device, NONE while
-        more than `LANE_RELEASED` released attempts await their ack (cr-079 D3), and NONE
-        while the worker's admission is CLOSED — that is one structural fact per worker,
-        and `lanes[]` must never show a seat the worker-level count denies."""
-        if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN:
-            return 0
-        if not self._lane_dispatchable(lane):
-            return 0
-        seated, released = self._lane_phases(lane)
-        if released > LANE_RELEASED:
-            return 0
-        return max(0, self._lane_capacity(lane) - seated)
 
     def _hosted_set_serving(self, placement_id: str, state: pb.ServingState, why: str = "") -> None:
         hosted = self.hosted.get(placement_id)
@@ -3243,9 +3195,8 @@ class Worker:
         self.note("admission", f"epoch {self.admission_epoch}: {why}"[:256])
 
     def dispatchable(self) -> bool:
-        """Can this worker take an offer AT ALL right now? Serving asks the placement's
-        axis; job mode asks whether its one build is ready. Neither answer is a SLOT count —
-        `available_attempt_slots` is the other half, and #486c keeps them apart on purpose."""
+        """Can this worker take an attempt AT ALL right now? Serving asks the placement's
+        axis; job mode asks whether its one build is ready."""
         if any(slot.ready() for name, slot in self.job_slots.items() if name.startswith("cpu-")):
             return True
         if self.accepted.mode == "job":
@@ -3265,20 +3216,6 @@ class Worker:
         """CLOSED: no attempt is offered over the Control stream; work arrives through the
         execution API."""
         return pb.AdmissionState.ADMISSION_STATE_CLOSED
-
-    def available_attempt_slots(self) -> int:
-        """Free seats across this worker's lanes, NOW — the SUM of each lane's free seat.
-
-        BOUNDEDNESS IS STRUCTURAL, NOT A PROMISE (§5): a seat is held from an offer's hold
-        to DEVICE RELEASE, and a lane whose released attempts awaiting `AttemptOutcomeAck`
-        exceed `LANE_RELEASED` advertises none (cr-079 D3), so a RecordOwner that stops
-        acking runs itself out of admission instead of growing this worker's held set. On the
-        one-lane worker this is exactly the old single window; on a multi-lane worker the
-        sum is honest only for an owner that reads which lane an offer draws from
-        (`lanes[]`, proto-024), which is why serving on more than one lane refuses an owner
-        below minor 22. CLOSED admission is zero on every lane, so the sum is zero.
-        """
-        return sum(self._lane_slots(lane) for lane in self.lanes)
 
     def set_phase(self, phase: pb.WorkerPhase, why: str) -> None:
         if phase == self.phase:
@@ -3792,7 +3729,6 @@ class Worker:
             converged_revision=self.converged_revision(),
             admission_epoch=self.admission_epoch,
             admission_state=self.admission_state(),
-            available_attempt_slots=self.available_attempt_slots(),
         )
         if self.placement is not None:
             body.placements.append(self.placement_status())
@@ -3917,15 +3853,7 @@ class Worker:
     def on_outcome_ack(
         self, acked: pb.AttemptOutcomeAck, *, native_finalized: bool = False
     ) -> None:
-        """A closed outcome leaves the lane's RELEASED set — a SLOT COUNT change when the
-        device was waiting on it (cr-079 D3), not a change in admission MEANING, so it does
-        NOT bump `admission_epoch` (§6).
-
-        `admission_epoch` moves when the meaning of an offer changes — executor respawn,
-        window resize, phase change, cutover. Freeing a seat changes neither: bumping here
-        made EVERY steady-state dispatch refuse ADMISSION_EPOCH_STALE.
-        `available_attempt_slots` carries this, recomputed on every tick.
-        """
+        """A closed outcome leaves the lane; it does not bump `admission_epoch` (§6)."""
         if not native_finalized and self.source_calls is not None:
 
             def finished() -> None:
@@ -7398,7 +7326,6 @@ class Worker:
             # ONE serialized device advertise N x the real capacity.
             admission_epoch=self.admission_epoch,
             admission_state=self.admission_state(),
-            available_attempt_slots=self.available_attempt_slots(),
         )
         if self.accepted.mode == "job":
             observed.job_capacity.CopyFrom(self.job_capacity())

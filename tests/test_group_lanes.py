@@ -91,8 +91,6 @@ def test_a_group_lane_overlaps_its_device_lanes_and_shares_their_locks() -> None
         "lane-1",
         "lane-0+1",
     ]
-    # a group is ONE device seat and ONE staged seat regardless of K (per-lane constants)
-    assert (lanes.LANE_RUNNING, lanes.LANE_STAGED) == (1, 1)
     group.placements.add("p")
     lanes_.release("q")
     assert lanes_.by_id["lane-0+1"] is group
@@ -317,7 +315,6 @@ def _lane_rows(target: pb.ObservedWorkerState | pb.WorkerSnapshotBody) -> list[d
         {
             "lane_id": lane.lane_id,
             "device_ordinals": list(lane.device_ordinals),
-            "available_attempt_slots": lane.available_attempt_slots,
             "placement_ids": list(lane.placement_ids),
             "resident_placement_ids": list(lane.resident_placement_ids),
         }

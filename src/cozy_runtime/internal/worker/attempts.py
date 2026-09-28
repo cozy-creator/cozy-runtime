@@ -1648,7 +1648,6 @@ class AttemptEngine:
                 )
         return self.weights.writer_broker.handle(attempt, request)
 
-
     def _run(self, attempt: AttemptRecord) -> pb.AttemptOutcome | Released:
         """ONE attempt: dispatch, freeze point, release.
 
@@ -3253,7 +3252,6 @@ class AttemptEngine:
             held.outcome_digest = attempt.outcome_digest
         return held
 
-
     #: Every state in which this worker still holds an attempt and owes the owner something.
     #: `staged` is accepted into its lane's queue (wire QUEUED); `entering` is claimed off
     #: the queue for device entry or for a cancel.
@@ -3278,8 +3276,6 @@ class AttemptEngine:
         "reclaiming",
         "finalizing",
     )
-    #: Off the device and not yet acknowledged: the post phase and the unacked outcome.
-    RELEASED = ("released", "outcome")
 
     def snapshot_entries(self) -> list[pb.HeldAttempt]:
         """Every attempt this worker still holds — staged, running, or outcome-pending-ack.
@@ -3293,8 +3289,7 @@ class AttemptEngine:
         """The attempts this worker HOLDS, for the ObservedWorkerState tick.
 
         Running attempts, released ones in their post phase, AND outcomes pending ack — the
-        same set the snapshot carries; `available_attempt_slots` reads the same states by
-        phase (cr-079 D3). Reading only `live` under-reported exactly those: `close()`
+        same set the snapshot carries. Reading only `live` under-reported exactly those: `close()`
         drops the attempt from `live`, but an outcome nobody acked is still owed.
 
         An offer not yet accepted into its lane's queue is absent: acceptance is what makes

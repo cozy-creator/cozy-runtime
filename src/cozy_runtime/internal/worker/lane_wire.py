@@ -31,13 +31,12 @@ def read_device_pins(desired_set: pb.DesiredPlacementSet) -> dict[str, tuple[int
     }
 
 
-def lane_document(lane: DeviceLane, available_attempt_slots: int) -> dict[str, Any]:
+def lane_document(lane: DeviceLane) -> dict[str, Any]:
     """ONE `DeviceLane` message's fields as a plain document: what `emit_lanes` writes and
     what the runtime's own records carry."""
     return {
         "lane_id": lane.lane_id,
         "device_ordinals": list(lane.ordinals),
-        "available_attempt_slots": int(available_attempt_slots),
         "placement_ids": sorted(lane.placements),
         "resident_placement_ids": lane.resident_placement_ids(),
     }
@@ -52,7 +51,6 @@ def emit_lanes(
             pb.DeviceLane(
                 lane_id=str(row["lane_id"]),
                 device_ordinals=[int(o) for o in row["device_ordinals"]],
-                available_attempt_slots=int(row["available_attempt_slots"]),
                 placement_ids=[str(p) for p in row["placement_ids"]],
                 resident_placement_ids=[str(p) for p in row["resident_placement_ids"]],
             )
