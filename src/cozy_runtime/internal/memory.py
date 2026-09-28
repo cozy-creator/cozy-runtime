@@ -30,7 +30,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict
 
 from cozy_runtime.author._errors import DEVICE_OOM, RuntimeFailure, is_device_oom
-from cozy_runtime.internal import accel, fill
+from cozy_runtime.internal import accel, fill, proctree
 from cozy_runtime.internal.accel import DeviceMemory
 from cozy_runtime.internal.execution_evidence import gpu_name, gpu_names
 
@@ -615,6 +615,7 @@ class ResidencyDocument(TypedDict):
     refusals: list[str]
     recoveries: list[str]
     cap_bytes: int
+    kept_bytes: int
 
 
 class ConstructionRow(TypedDict):
@@ -667,8 +668,8 @@ CAPACITY_CODES = frozenset({DEVICE_OOM, "device_shortfall"})
 #: device give theirs back; `evict`: this process's idle components leave; `page`: the
 #: component itself pages its blocks; `split`: the leading batch runs in halves.
 FORWARD_RUNGS = ("room", "evict", "page", "split")
-#: A decode or encode additionally tiles, halving the tile until it reaches the latent scale.
-CODEC_RUNGS = ("room", "evict", "page", "slice", "tile")
+#: A decode or encode slices and tiles before paging: its work, not its weights, is large.
+CODEC_RUNGS = ("room", "evict", "slice", "tile", "page")
 
 
 @dataclass(slots=True)
@@ -739,6 +740,8 @@ class ComponentResidency:
     #: the components whose forward is on the stack now: never victims
     running: list[str] = field(default_factory=list)
     windows: list[list[int]] = field(default_factory=list)
+    #: host bytes holding paged units' weights
+    kept_bytes: int = 0
 
     def __post_init__(self) -> None:
         for name, layout in self.backend.layouts.items():
@@ -1155,7 +1158,16 @@ class ComponentResidency:
         elapsed = (time.perf_counter() - started) * 1000
         self.staged_ms += elapsed
         self.attempt_staged_ms += elapsed
+        self._keep(name, unit)
         self._fold()
+
+    def _keep(self, name: str, unit: PageUnit) -> None:
+        """Keep a paged unit in host memory while the host has room for it: the next
+        page-in is a copy, not a store read. Measured each time; no host floor."""
+        if (name, unit.path) in self.backend.mirror:
+            return
+        if proctree.available_host_bytes() > unit.nbytes:
+            self.kept_bytes += self.backend.keep(name, unit)
 
     def _page_leave(
         self, name: str, unit: PageUnit, module: object, args: object, output: object
@@ -1524,6 +1536,7 @@ class ComponentResidency:
             "refusals": list(self.refusals[-8:]),
             "recoveries": list(self.recoveries[-16:]),
             "cap_bytes": self.cap,
+            "kept_bytes": self.kept_bytes,
         }
 
 

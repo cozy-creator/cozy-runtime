@@ -1315,6 +1315,8 @@ class StreamingFillBackend:
         self.paging_specs: dict[str, TensorSpec] = {}
         self.paging_plans: dict[str, ReadPlan] = {}
         self.page_resident: dict[str, memory.PageUnit] = {}
+        #: paged units' weights kept in host memory: (component, unit path) -> key -> tensor
+        self.mirror: dict[tuple[str, str], dict[str, Any]] = {}
         self.stats: FillStats = {"windows": 0, "waits": 0}
         #: Why this generation was poisoned and what the allocator held at that instant.
         #: Empty until a failure lands; the refusal reply carries it as evidence. Nothing
@@ -2150,6 +2152,7 @@ class StreamingFillBackend:
         for hook in self.paging_hooks:
             hook.remove()
         self.paging_hooks.clear()
+        self.mirror.clear()
         self.hold_lease = False
         self.release_lease()
 
@@ -2321,6 +2324,13 @@ class StreamingFillBackend:
                     )
                 _restore_derived(root, self.derived.get(name, {}))
             live = unit.live(name)
+        kept = self.mirror.get((name, unit.path))
+        if kept is not None:
+            # One host-to-device copy per tensor, ordered on the stream the forward runs on.
+            for key, tensor in live.items():
+                tensor.copy_(kept[key], non_blocking=True)
+            self.state = "ready"
+            return
         expected = {f"{name}.{key}" for key in unit.keys}
         if set(live) != expected or not expected <= self.expected.get(name, frozenset()):
             raise _refuse("incomplete_fill", "paging unit destinations changed", [name, unit.path])
@@ -2332,6 +2342,20 @@ class StreamingFillBackend:
         if live:
             self._commit_enqueued()
         self.state = "ready"
+
+    def keep(self, name: str, unit: memory.PageUnit) -> int:
+        """Copy a filled unit's weights to host memory, page-locked where the driver allows,
+        so its next page-in is a copy rather than a store read. Returns the bytes kept."""
+        kept: dict[str, Any] = {}
+        for key, tensor in unit.live(name).items():
+            try:
+                host = self.torch.empty_like(tensor, device="cpu", pin_memory=True)
+            except RuntimeError:
+                host = self.torch.empty_like(tensor, device="cpu")
+            host.copy_(tensor)
+            kept[key] = host
+        self.mirror[(name, unit.path)] = kept
+        return sum(t.numel() * t.element_size() for t in kept.values())
 
     def _place(self, unit: memory.PageUnit, device: object) -> None:
         """Give a unit's parameters and buffers empty storage on `device`; the tensors'
