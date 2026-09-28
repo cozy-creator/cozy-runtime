@@ -64,7 +64,6 @@ SIDE: dict[str, str] = {
     # not what it claims"); UNKNOWN_FORMAT is the one reader-shaped member, and the fill
     # plane collapses it into the same code, so the sentence names the majority remedy.
     "checkpoint_unreadable": DATA,
-    "reader_unavailable": READER,
     "lease_revoked": LEASE,
     # The stored carrier is not the encoding it cites — the header's role set or a role's
     # geometry disagrees with the spec object the tensor names (TensorFS `ROLE_SET_MISMATCH`

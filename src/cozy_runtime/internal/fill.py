@@ -62,10 +62,21 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, Unpack, cast, get_args
 
-from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, canonical_dtype, census
-from cozy_runtime.internal import accel
+import tensorfs
+
+from cozy_runtime.author._loader import (
+    Census,
+    TensorLike,
+    TensorSpec,
+    _members,
+    canonical_dtype,
+    census,
+)
+from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal.derive import placing, torch_module
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
     Capabilities,
@@ -75,17 +86,29 @@ from cozy_runtime.internal.encoding import (
     Provider,
     RolePart,
     Selection,
+    aliases,
     device_line,
     implementation_digest,
     launch_providers,
     measure_device,
+    measure_runtime,
 )
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
 from cozy_runtime.internal.paging import BlockLayout, PageUnit, partition
+from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult, observed_capability_records, qualify
-from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan, TensorResolution
+from cozy_runtime.internal.resolution import (
+    PlanRefusal,
+    ResolvedModelPlan,
+    TensorResolution,
+    script_plan,
+)
+
+# Every `Any` below is a torch module, tensor, event or device: torch is absent from the
+# check venv.
 
 if TYPE_CHECKING:
+    from tensorfs import Batch, ReadPlan, Tensor
     from tensorfs import ReadLease as ReadLease
     from tensorfs import Store as Store
 
@@ -128,7 +151,6 @@ REFUSALS = frozenset(
         # AssertionError abort — the guard catching exactly what it exists to catch.
         "lease_revoked",  # the read lease covering these bytes was revoked mid-fill
         "checkpoint_unreadable",  # the snapshot's header/document bytes do not parse
-        "reader_unavailable",  # the tfs-007 `tensorfs` facade is not installed here
         "store_unusable",  # a caller-prepared Store root that TensorFS refuses to open
         # The stored carrier does not match the encoding spec it CITES: a role set that is
         # not the spec's exact set, or a role whose shape is not what the spec's relation
@@ -236,24 +258,153 @@ class ComponentMemory:
         return max(self.peak, self.settled + headroom)
 
 
+class MoveRow(TypedDict):
+    component: str
+    action: Literal["park", "evict"]
+    bytes: int
+
+
+class LeavesRow(TypedDict):
+    component: str
+    action: Literal["leaves"]
+    count: int
+    bytes: int
+    was: int
+
+
+#: The legs that partition a stage's `ms` (cr-103), plus the destinations it put back.
+type StageLeg = Literal[
+    "reserve_ms",
+    "lease_ms",
+    "enqueue_ms",
+    "commit_ms",
+    "ring_ms",
+    "copy_ms",
+    "fence_ms",
+    "destinations",
+]
+STAGE_LEGS: tuple[StageLeg, ...] = get_args(StageLeg.__value__)
+
+
+class StageRow(TypedDict):
+    component: str
+    action: Literal["stage"]
+    bytes: int
+    ms: int
+    stream_ms: int
+    reserve_ms: int
+    lease_ms: int
+    enqueue_ms: int
+    commit_ms: int
+    copy_ms: int
+    ring_ms: int
+    fence_ms: int
+    objects: int
+    destinations: int
+
+
+type StageEvent = MoveRow | LeavesRow | StageRow
+
+
+class DecodeStats(TypedDict):
+    tensors: int
+    bytes: int
+    flushes: int
+    ms: int
+    #: Destinations that became a MODULE instead of a decoded tensor, and the stored bytes
+    #: those modules now hold RESIDENT: the opposite of `bytes`, which passed through.
+    leaves: int
+    resident_bytes: int
+
+
+class Traversal(TypedDict):
+    component: str
+    order: str
+    tensors: int
+    digest: str
+    first: str
+    last: str
+
+
+class FillStats(TypedDict, total=False):
+    windows: int
+    waits: int
+    lease_bytes: int
+    lease_objects: int
+    lease_acquisitions: int
+    leases: int
+    materialize_ms: int
+    ring_ms: int
+    copy_ms: int
+    fence_ms: int
+    stream_ms: int
+    fill_ms: int
+    decode: DecodeStats
+    traversals: list[Traversal]
+    read_ns: int
+    store: dict[str, object]
+
+
+class PoisonReport(TypedDict, total=False):
+    keys_in_flight: int
+    enqueued: int
+    resident: list[str]
+    parked: list[str]
+    allocator_bytes: int
+
+
+class ComponentEnvelope(TypedDict):
+    destinations: int
+    native_destinations: int
+    native: int
+    native_resident: int
+    native_scratch: int
+    decode_total: int
+    decode_largest: int
+    decode_envelope: int
+    rows: int
+
+
+class DeviceEnvelope(TypedDict):
+    components: dict[str, ComponentEnvelope]
+    destination_bytes: int
+    native_bytes: int
+    decode_peak_bytes: int
+    base_bytes: int
+    fill_overhead_bytes: int
+    required_bytes: int
+    basis: str
+    # Admission's resident view, which the executor adds before refusing a shortfall.
+    resident_destination_bytes: NotRequired[int]
+    local_resident_ceiling_bytes: NotRequired[int]
+    resident_budget_bytes: NotRequired[int]
+    authorized_device_limit_bytes: NotRequired[int]
+
+
+class CompleteEnvelope(DeviceEnvelope):
+    construction_destination_bytes: int
+    derived_destination_bytes: int
+
+
 def price_envelope(
     rows: Sequence[tuple[str, int, int, str, int, int]], decode_scratch_bytes: int
-) -> dict[str, Any]:
+) -> DeviceEnvelope:
     """Price component-boundary fill peaks, retaining logical and settled bytes separately."""
-    per: dict[str, dict[str, int]] = {}
+    per: dict[str, ComponentEnvelope] = {}
     for component, logical, stored, route, native_resident, native_scratch in rows:
         cell = per.setdefault(
             component,
-            {
-                "destinations": 0,
-                "native_destinations": 0,
-                "native": 0,
-                "native_resident": 0,
-                "native_scratch": 0,
-                "decode_total": 0,
-                "decode_largest": 0,
-                "rows": 0,
-            },
+            ComponentEnvelope(
+                destinations=0,
+                native_destinations=0,
+                native=0,
+                native_resident=0,
+                native_scratch=0,
+                decode_total=0,
+                decode_largest=0,
+                decode_envelope=0,
+                rows=0,
+            ),
         )
         cell["rows"] += 1
         cell["destinations"] += logical
@@ -288,7 +439,7 @@ def price_envelope(
     }
 
 
-def _component_memory(cell: Mapping[str, int]) -> ComponentMemory:
+def _component_memory(cell: ComponentEnvelope) -> ComponentMemory:
     return ComponentMemory(
         destinations=cell["destinations"],
         native_destinations=cell["native_destinations"],
@@ -300,39 +451,25 @@ def _component_memory(cell: Mapping[str, int]) -> ComponentMemory:
 
 
 def complete_device_envelope(
-    header: Mapping[str, Any], construction_destination_bytes: int
-) -> dict[str, Any]:
+    header: DeviceEnvelope, construction_destination_bytes: int
+) -> CompleteEnvelope:
     """Include the MCC's derived buffers without charging parked native components."""
-    derived = max(construction_destination_bytes - int(header["destination_bytes"]), 0)
-    base = int(header["base_bytes"]) + derived
+    derived = max(construction_destination_bytes - header["destination_bytes"], 0)
+    base = header["base_bytes"] + derived
     return {
         **header,
         "construction_destination_bytes": construction_destination_bytes,
         "derived_destination_bytes": derived,
         "base_bytes": base,
-        "required_bytes": base + int(header["fill_overhead_bytes"]),
+        "required_bytes": base + header["fill_overhead_bytes"],
     }
 
 
 # ------------------------------------------------------------------- the TensorFS reader
 
 
-def tensorfs_module() -> Any:
-    """The tfs-007 facade, or a typed refusal naming what is missing.
-
-    TensorFS is a compiled extension and the base runtime package stays installable without
-    it, exactly as it stays installable without torch. An absent reader is a REFUSAL that
-    names the install, never an `ImportError` surfacing out of a fill.
-    """
-    try:
-        import tensorfs
-    except ImportError as exc:  # pragma: no cover - environment, not logic
-        raise _refuse(
-            "reader_unavailable",
-            "the TensorFS reader (tfs-007's `tensorfs` facade) is not installed in this "
-            "environment; the fill plane has no other way to read a verified object and "
-            "will not invent one",
-        ) from exc
+def tensorfs_module() -> ModuleType:
+    """TensorFS for `internal/worker` modules, which do not import it themselves (cr-067)."""
     return tensorfs
 
 
@@ -351,7 +488,7 @@ def store(root: str | Path) -> Store:
     with _stores_lock:
         held = _stores.get(key)
         if held is None:
-            held = _stores[key] = tensorfs_module().Store.open(key[1])
+            held = _stores[key] = tensorfs.Store.open(key[1])
         return held
 
 
@@ -359,7 +496,7 @@ def ensure_store(root: str | Path) -> Store:
     """`store(root)`, first creating the Store when its catalog is absent."""
     path = os.path.abspath(root)
     if not os.path.isfile(os.path.join(path, "tensorfs.sqlite")):
-        created: Store = tensorfs_module().Store.ensure(path)
+        created: Store = tensorfs.Store.ensure(path)
         with _stores_lock:
             _stores[(os.getpid(), path)] = created
         return created
@@ -425,7 +562,6 @@ if _undeclared:
 @contextlib.contextmanager
 def store_refusals(what: str) -> Iterator[None]:
     """Speak a TensorFS refusal in this plane's vocabulary, or let it through untranslated."""
-    tensorfs = tensorfs_module()
     try:
         yield
     except tensorfs.errors.Refusal as exc:
@@ -515,11 +651,6 @@ class Checkpoint:
     """
 
     def __init__(self, root: str | Path, manifest_id: str) -> None:
-        tensorfs = tensorfs_module()
-        # Keep the facade's PEP 561 return type; the optional-module helper is deliberately Any.
-        from tensorfs import parse_header
-
-        self.tensorfs = tensorfs
         self.root = str(root)
         self.manifest_id = manifest_id
         with store_refusals(f"opening manifest {manifest_id[:23]}"):
@@ -531,10 +662,8 @@ class Checkpoint:
             # Encoding definitions are nested directly in cozytensors/1. TensorFS parses
             # and validates the header once and exposes each definition with the digest
             # that tensor rows cite; there is no second closure-object lookup.
-            self.header = parse_header(self.header_bytes)
-            self.specs = tuple(str(row["id"]) for row in self.header["encodings"])
-        from cozy_runtime.internal.encoding import aliases
-
+            self.header = tensorfs.parse_header(self.header_bytes)
+            self.specs = tuple(row["id"] for row in self.header["encodings"])
         self._aliases = aliases()
 
     def has(self, component: str) -> bool:
@@ -559,9 +688,9 @@ class Checkpoint:
         out: list[PlanRow] = []
         for key, entry in table.items():
             logical = entry["logical"]
-            shape = tuple(int(n) for n in logical["shape"])
-            dtype = str(logical["logical_dtype"])
-            width = self.tensorfs.DTYPES.get(dtype)
+            shape = tuple(logical["shape"])
+            dtype = logical["logical_dtype"]
+            width = tensorfs.DTYPES.get(dtype)
             if width is None:
                 raise _refuse(
                     "dtype_mismatch",
@@ -602,7 +731,7 @@ class Checkpoint:
             )
         return out
 
-    def _encoded(self, key: str, entry: Mapping[str, Any]) -> Encoded:
+    def _encoded(self, key: str, entry: Tensor) -> Encoded:
         """The tensor's encoding assignment and stored roles, verbatim from the header.
 
         `plain/1` is a real entry here, not an absent form: the selection path has one
@@ -610,9 +739,9 @@ class Checkpoint:
         """
         parts: list[RolePart] = []
         for role, part in entry["parts"].items():
-            shape = tuple(int(n) for n in part["shape"])
-            width = self.tensorfs.DTYPES.get(str(part["dtype"]))
-            if width is None or str(part["dtype"]) not in TORCH_DTYPES:
+            shape, dtype = tuple(part["shape"]), part["dtype"]
+            width = tensorfs.DTYPES.get(dtype)
+            if width is None or dtype not in TORCH_DTYPES:
                 # BOTH directions, for the same reason the logical row checks both: a
                 # carrier dtype TensorFS knows and this runtime has no torch spelling for
                 # would otherwise reach the scratch allocation as a KeyError, which is an
@@ -624,14 +753,14 @@ class Checkpoint:
                 )
                 raise _refuse(
                     "dtype_mismatch",
-                    f"{key}: role {role!r} is stored as {part['dtype']!r}, which {why}",
+                    f"{key}: role {role!r} is stored as {dtype!r}, which {why}",
                     [key],
                 )
             nbytes = width
             for extent in shape:
                 nbytes *= extent
-            parts.append(RolePart(str(role), str(part["dtype"]), shape, nbytes))
-        digest = str(entry["encoding"])
+            parts.append(RolePart(role, dtype, shape, nbytes))
+        digest = entry["encoding"]
         return Encoded(digest, self._aliases.get(digest, "unregistered"), tuple(parts))
 
     def read_plan(
@@ -639,7 +768,7 @@ class Checkpoint:
         traversal: Sequence[tuple[str, str]],
         window_bytes: int,
         components: Sequence[str],
-    ) -> Any:
+    ) -> ReadPlan:
         """The store's own read plan over the traversal THIS PLANE asks for.
 
         cr-005's rule survives the swap and is now the store's to keep: read order is the
@@ -654,35 +783,30 @@ class Checkpoint:
         the 2528 belonging to a sibling transformer its contract forbids it to touch.
         """
         with store_refusals("planning the read"):
-            return self.tensorfs.plan(
+            return tensorfs.plan(
                 self.header_bytes, list(traversal), list(components), window=window_bytes
             )
 
-    def acquire(self) -> Any:
+    def acquire(self) -> ReadLease:
         """A verified read lease over this snapshot's CozyTensors runtime closure."""
         with store_refusals(f"acquiring a lease on {self.manifest_id[:23]}"):
-            return self.store.acquire_cozytensors(self.manifest_id)
+            lease = self.store.acquire_cozytensors(self.manifest_id)
+        return lease
 
     def model_assets(self) -> dict[str, bytes]:
         """Read the header-declared model files through one verified closure lease."""
-
-        names = sorted(str(name) for name in self.header.get("assets", {}))
+        names = sorted(self.header["assets"])
         if not names:
             return {}
         with (
             store_refusals(f"reading model assets from {self.manifest_id[:23]}"),
             self.acquire() as lease,
         ):
-            return {
-                name: bytes(
-                    lease.read_asset(
-                        self.header_bytes,
-                        name,
-                        max_bytes=64 << 20,
-                    )
-                )
+            assets = {
+                name: bytes(lease.read_asset(self.header_bytes, name, max_bytes=64 << 20))
                 for name in names
             }
+        return assets
 
 
 @dataclass(frozen=True, slots=True)
@@ -764,11 +888,6 @@ def servability_for_script(
     Header work only — no tensor bytes move — through the same `resolve()` the executor
     uses, so what a script prints as servable is what a worker would execute.
     """
-    from cozy_runtime.internal.derive import torch_module
-    from cozy_runtime.internal.encoding import measure_runtime
-    from cozy_runtime.internal.planfacts import PlanFacts
-    from cozy_runtime.internal.resolution import script_plan
-
     try:
         answer: ResolvedModelPlan | PlanRefusal = script_plan(
             rows=rows,
@@ -856,17 +975,6 @@ class LeafReplacement:
     freed_bytes: int
     """Device bytes the float destination gave back. The other half of the VRAM claim: a
     replacement that freed nothing bought nothing, whatever the payload cost."""
-
-    def document(self) -> dict[str, Any]:
-        return {
-            "key": self.contract_key,
-            "module": self.module_path,
-            "was": self.was,
-            "now": self.now,
-            "roles": list(self.role_keys),
-            "stored_bytes": self.stored_bytes,
-            "freed_bytes": self.freed_bytes,
-        }
 
 
 class StagingRing:
@@ -1005,7 +1113,7 @@ class ReadLeases:
 
     def __init__(self, checkpoints: Mapping[str, Checkpoint]) -> None:
         self.checkpoints = checkpoints
-        self.held: dict[str, Any] = {}
+        self.held: dict[str, ReadLease] = {}
         #: How many times this generation went to the store. The EFFECT the keying has to
         #: show, reported rather than asserted about the code: one per distinct manifest.
         self.acquisitions = 0
@@ -1015,7 +1123,7 @@ class ReadLeases:
         #: this fill actually spent against FD_HEADROOM.
         self.peak = {"objects": 0, "bytes": 0}
 
-    def acquire(self, component: str) -> Any:
+    def acquire(self, component: str) -> ReadLease:
         """The lease covering this component's manifest, taken once and reused."""
         checkpoint = self.checkpoints.get(component)
         if checkpoint is None:
@@ -1045,7 +1153,7 @@ class ReadLeases:
         """Give every hold back. Idempotent: a poison and a commit may both reach here."""
         held, self.held = self.held, {}
         for lease in held.values():
-            if lease is not None and lease.live:
+            if lease.live:
                 lease.release()
 
     def document(self) -> dict[str, int]:
@@ -1060,6 +1168,20 @@ class ReadLeases:
             "objects": max(self.peak["objects"], self._objects()),
             "bytes": max(self.peak["bytes"], self._bytes()),
         }
+
+
+class StreamOptions(TypedDict, total=False):
+    """The stream and instrumentation knobs a driver script may pass through `for_script`."""
+
+    window_bytes: int
+    slots: int
+    readers: int
+    inflight: int
+    fence: bool
+    on_position: Callable[[int], None] | None
+    decode_scratch_bytes: int
+    forensics_dir: str
+    custody: str
 
 
 class StreamingFillBackend:
@@ -1093,8 +1215,6 @@ class StreamingFillBackend:
         forensics_dir: str = "",
         custody: str = "canonical",
     ) -> None:
-        from cozy_runtime.internal.derive import torch_module
-
         self.torch = torch_module()
         # ONE CHECKPOINT PER COMPONENT (cr-008b). A TensorFS read plan must name every
         # tensor its header carries — tfs-007's completeness rule — so a whole-pipeline
@@ -1155,7 +1275,7 @@ class StreamingFillBackend:
         #: cr-008b: a STAGED plan re-reads the store after construction, so the GC-safe hold
         #: must outlive the first commit. It is released by `close()` with the generation.
         self.hold_lease = False
-        self.stage_log: list[dict[str, Any]] = []
+        self.stage_log: list[StageEvent] = []
         #: DERIVED tensor values per component, captured once at construction. A
         #: non-persistent buffer is a pure function of config that no checkpoint supplies,
         #: so an eviction that dropped it could never get it back — the module's `__init__`
@@ -1172,13 +1292,13 @@ class StreamingFillBackend:
         self.paging: dict[str, BlockLayout] = {}
         self.paging_hooks: list[Any] = []
         self.paging_specs: dict[str, TensorSpec] = {}
-        self.paging_plans: dict[str, Any] = {}
+        self.paging_plans: dict[str, ReadPlan] = {}
         self.page_resident: dict[str, PageUnit] = {}
-        self.stats: dict[str, Any] = {"windows": 0, "waits": 0}
+        self.stats: FillStats = {"windows": 0, "waits": 0}
         #: Why this generation was poisoned and what the allocator held at that instant.
         #: Empty until a failure lands; the refusal reply carries it as evidence. Nothing
         #: is freed by this plane afterwards — the process is replaced (#613).
-        self.poison_report: dict[str, Any] = {}
+        self.poison_report: PoisonReport = {}
         #: THE MEMORY FORENSICS (§3.2's meters, at the boundaries). None unless a capture
         #: directory was configured; every call below is a no-op then, and the serving path
         #: is byte-for-byte the same. See `internal/forensics.py` for why it is permanent.
@@ -1239,18 +1359,7 @@ class StreamingFillBackend:
         #: stream and the decode and never outlive one component's fill.
         self.scratch: dict[str, dict[str, Any]] = {}
         self.decode_scratch_bytes = int(decode_scratch_bytes)
-        self.decoded: dict[str, Any] = {
-            "tensors": 0,
-            "bytes": 0,
-            "flushes": 0,
-            "ms": 0,
-            #: Destinations that became a MODULE instead of a decoded tensor, and the
-            #: stored bytes those modules now hold RESIDENT. Counted apart from `bytes`
-            #: because they are the opposite kind of number: decoded bytes passed through
-            #: and these stayed.
-            "leaves": 0,
-            "resident_bytes": 0,
-        }
+        self.decoded = DecodeStats(tensors=0, bytes=0, flushes=0, ms=0, leaves=0, resident_bytes=0)
         #: The model class's `encoded_leaves=` declaration, handed in by `materialize` and
         #: `"refuse"` until it is. Not a default the runtime picked — the ABSENCE of a
         #: materialize call, which is a state no fill reaches.
@@ -1349,7 +1458,7 @@ class StreamingFillBackend:
         placement: str = "all_resident",
         encoded_leaves: str = "accept",
         device: str = "cuda",
-        **kwargs: Any,
+        **kwargs: Unpack[StreamOptions],
     ) -> StreamingFillBackend:
         """A backend for a DRIVER SCRIPT with no model class: resolve, then construct.
 
@@ -1359,11 +1468,6 @@ class StreamingFillBackend:
         fills through exactly the authority the executor does. A refusal is the resolver's
         `PlanRefusal`, surfaced untranslated: the script asked a plan question.
         """
-        from cozy_runtime.internal.derive import torch_module
-        from cozy_runtime.internal.encoding import measure_runtime
-        from cozy_runtime.internal.planfacts import PlanFacts
-        from cozy_runtime.internal.resolution import script_plan
-
         torch = torch_module()
         index = torch.device(device).index or 0
         facts = measure_device(torch, index)
@@ -1432,7 +1536,7 @@ class StreamingFillBackend:
         self.stats["lease_acquisitions"] = held["acquisitions"]
         self.stats["leases"] = held["leases"]
 
-    def _acquire(self, component: str) -> Any:
+    def _acquire(self, component: str) -> ReadLease:
         """The verified read lease covering this component's manifest (see `ReadLeases`)."""
         return self.leases.acquire(component)
 
@@ -1444,9 +1548,6 @@ class StreamingFillBackend:
         from. The document comes back verbatim; on `ok` the keys `local` custody ignored
         leave the fill's completeness set so the commit does not miss them.
         """
-        from cozy_runtime.internal import canonical
-
-        tensorfs = tensorfs_module()
         by_checkpoint: dict[str, tuple[Checkpoint, list[str]]] = {}
         for component in walked.components:
             checkpoint = self.checkpoints.get(component)
@@ -1526,9 +1627,6 @@ class StreamingFillBackend:
         would mean rolling back gigabytes to deliver an answer that was knowable from the
         header.
         """
-        from cozy_runtime.author._loader import _members
-        from cozy_runtime.internal.derive import placing
-
         self.encoded_leaves = encoded_leaves
         native = sorted(k for k, t in self.resolved.items() if t.route == "encoded_gemm")
         if native and encoded_leaves != "accept":
@@ -1562,18 +1660,10 @@ class StreamingFillBackend:
                 if member is None or not hasattr(member, "to_empty"):
                     continue
                 size = sum(t.numel() * t.element_size() for _, t in _tensors(member))
-                memory = self.component_memory[name] = _component_memory(
-                    header_memory.get(
-                        name,
-                        {
-                            "destinations": 0,
-                            "native_destinations": 0,
-                            "native": 0,
-                            "native_resident": 0,
-                            "native_scratch": 0,
-                            "decode_envelope": 0,
-                        },
-                    )
+                memory = self.component_memory[name] = (
+                    _component_memory(header_memory[name])
+                    if name in header_memory
+                    else ComponentMemory()
                 )
                 memory.destinations = size
                 # Captured BEFORE the park decision: a parked component is staged in later
@@ -1646,7 +1736,7 @@ class StreamingFillBackend:
 
     # -- the forensics view ------------------------------------------------------
 
-    def _forensic_state(self) -> dict[str, Any]:
+    def _forensic_state(self) -> dict[str, object]:
         """What the PLANE believes, in the same row as what the allocator holds.
 
         The two halves of a byte gap have to be read at one instant or the difference is an
@@ -1676,7 +1766,7 @@ class StreamingFillBackend:
             "replaced": len(self.replaced),
         }
 
-    def _mark(self, boundary: str, **fields: Any) -> None:
+    def _mark(self, boundary: str, **fields: object) -> None:
         if self.forensics is None:
             return
         self.forensics.mark(boundary, **{**self._forensic_state(), **fields})
@@ -1692,7 +1782,7 @@ class StreamingFillBackend:
             return self.paging[name].working_bytes + headroom
         return self.component_memory[name].admission(headroom)
 
-    def device_envelope(self) -> dict[str, Any]:
+    def device_envelope(self) -> DeviceEnvelope:
         """Header costs for the selected implementation; the module census adds derived buffers."""
         rows = []
         for row in self.plan.values():
@@ -1914,8 +2004,6 @@ class StreamingFillBackend:
         DestinationSet rather than a second copy of it — there is one code path that moves
         bytes to the device, and this is it.
         """
-        from cozy_runtime.internal.derive import placing
-
         started = time.perf_counter_ns()
         with placing():
             ring = StagingRing(
@@ -1961,7 +2049,7 @@ class StreamingFillBackend:
         # deliberately EXCLUDES the meta construction, which those arms have no analogue
         # for — comparing a number that includes it would flatter neither side honestly.
         self.stats["fill_ms"] = self.stats["stream_ms"] + self.stats.get("materialize_ms", 0)
-        self.stats["decode"] = dict(self.decoded)
+        self.stats["decode"] = self.decoded.copy()
         self._reconcile_leaves()
         # Logical destination addresses are retired after replacement. Keeping them
         # across commits would mistake allocator address reuse for a new tied weight.
@@ -2067,8 +2155,6 @@ class StreamingFillBackend:
         member = self.components.pop(name, None)
         if member is None:
             return 0
-        from cozy_runtime.internal.derive import placing
-
         charged = self.vram_charge.pop(name, 0)
         with placing():
             self._free_storages(t for _, t in _tensors(member))
@@ -2091,8 +2177,10 @@ class StreamingFillBackend:
         del self.stage_log[:-64]
         return charged
 
-    def stage(self, name: str) -> dict[str, Any]:
+    def stage(self, name: str) -> StageRow | None:
         """Re-reserve and RE-FILL one evicted component. The same transaction, scoped.
+
+        A paged component fills only its common unit and reports no stage legs (None).
 
         Every refusal the whole-generation path has fires here too, because it IS that
         path: `fill` validates each destination against the stored row, `_stream` splices
@@ -2115,9 +2203,7 @@ class StreamingFillBackend:
             self._fill_page(name, common)
             self.components[name] = member
             self.vram_charge[name] = common.nbytes
-            return {"component": name, "bytes": common.nbytes, "paging": True}
-        from cozy_runtime.internal.derive import placing
-
+            return None
         started = time.perf_counter_ns()
         memory = self.component_memory[name]
         want = memory.destinations
@@ -2175,12 +2261,12 @@ class StreamingFillBackend:
         # transaction that moves them (`commit_ms`). `ring_ms`/`copy_ms`/`fence_ms` split
         # that last one again; `stream_ms` is unchanged and still the tfs-018-comparable
         # number.
-        row = {
+        row: StageRow = {
             "component": name,
             "action": "stage",
             "bytes": memory.settled,
             "ms": took,
-            "stream_ms": int(self.stats.get("stream_ms", 0)),
+            "stream_ms": self.stats.get("stream_ms", 0),
             "reserve_ms": (reserved - started) // 1_000_000,
             "lease_ms": (leased - reserved) // 1_000_000,
             "enqueue_ms": (enqueued - leased) // 1_000_000,
@@ -2189,9 +2275,9 @@ class StreamingFillBackend:
             # `objects` is the STORED objects the leased snapshot holds; `destinations` is
             # the tensors this component put back. Reported rather than divided here: the
             # ratio is the reader's question and this plane does not decide on it.
-            "copy_ms": int(self.stats.get("copy_ms", 0)),
-            "ring_ms": int(self.stats.get("ring_ms", 0)),
-            "fence_ms": int(self.stats.get("fence_ms", 0)),
+            "copy_ms": self.stats.get("copy_ms", 0),
+            "ring_ms": self.stats.get("ring_ms", 0),
+            "fence_ms": self.stats.get("fence_ms", 0),
             "objects": objects,
             "destinations": len(fresh.destinations),
         }
@@ -2201,8 +2287,6 @@ class StreamingFillBackend:
 
     def _fill_page(self, name: str, unit: PageUnit) -> None:
         """Reserve only this unit, then use the ordinary validated TensorFS fill transaction."""
-        from cozy_runtime.internal.derive import placing
-
         if self.enqueued:
             raise _refuse("incomplete_fill", "another fill is already pending", [name])
         with placing():
@@ -2231,8 +2315,6 @@ class StreamingFillBackend:
         self.state = "ready"
 
     def _park_page(self, unit: PageUnit) -> None:
-        from cozy_runtime.internal.derive import placing
-
         with placing():
             for _, module in unit.owners:
                 self._free_storages(
@@ -2425,8 +2507,6 @@ class StreamingFillBackend:
             stored_bytes=row.stored_nbytes,
             freed_bytes=int(destination.numel() * destination.element_size()),
         )
-        from cozy_runtime.internal.derive import placing
-
         with placing():
             replaced.to_empty(device=self.torch.device("meta"), recurse=True)
         return retired
@@ -2452,8 +2532,6 @@ class StreamingFillBackend:
                 f"{component!r} is not a component this generation holds",
                 [component],
             )
-        from cozy_runtime.internal.derive import placing
-
         before = accel.allocated(self.torch, self.kind, self.device)
         with placing():
             self._free_storages(t for _, t in _tensors(member))
@@ -2546,7 +2624,7 @@ class StreamingFillBackend:
             flat[what] = view
             return view
 
-        def on_batch(batch: Any) -> None:
+        def on_batch(batch: Batch) -> None:
             """Splice one filled slot across the destinations it covers.
 
             A batch item carries `off` — where its bytes sit IN THE SLOT — and the store
@@ -2597,7 +2675,7 @@ class StreamingFillBackend:
                 )
 
         started = time.perf_counter_ns()
-        stats: dict[str, Any] = {}
+        stats: dict[str, object] = {}
         for component, group in by_component.items():
             traversal = [(row.component, row.name) for row in group]
             if component in self.paging:
@@ -2623,7 +2701,7 @@ class StreamingFillBackend:
                 )
             order = _require_construction_order(plan.order, component)
             traversal_digest = _traversal_digest([row.key for row in group])
-            history: list[dict[str, Any]] = self.stats.setdefault("traversals", [])
+            history = self.stats.setdefault("traversals", [])
             history.append(
                 {
                     "component": component,
@@ -2713,8 +2791,11 @@ class StreamingFillBackend:
                     scratch_dropped=dropped,
                     scratch_held=held[0],
                 )
-            for key, value in dict(one).items():
-                stats[key] = stats.get(key, 0) + value if isinstance(value, int) else value
+            for key, value in one.items():
+                prior = stats.get(key, 0)
+                stats[key] = (
+                    prior + value if isinstance(value, int) and isinstance(prior, int) else value
+                )
         self.stats["read_ns"] = time.perf_counter_ns() - started
         self.stats["store"] = stats
         return batches[0]

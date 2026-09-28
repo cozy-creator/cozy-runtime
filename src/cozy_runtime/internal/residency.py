@@ -57,7 +57,13 @@ from dataclasses import dataclass, field
 from typing import Any, NotRequired, Protocol, TypedDict
 
 from cozy_runtime.internal import accel
-from cozy_runtime.internal.fill import FillRefusal, StreamingFillBackend, block_read_bytes
+from cozy_runtime.internal.fill import (
+    STAGE_LEGS,
+    FillRefusal,
+    StageEvent,
+    StreamingFillBackend,
+    block_read_bytes,
+)
 from cozy_runtime.internal.paging import PageUnit
 
 
@@ -130,7 +136,7 @@ class ResidencyDocument(TypedDict):
     active: ActiveScope | None
     fences: dict[str, FenceState]
     poisoned: str
-    log: list[dict[str, object]]
+    log: list[StageEvent]
     refusals: list[str]
 
 
@@ -682,16 +688,7 @@ class ComponentResidency:
         # a 9734 ms restore with nothing said about it, because the swap path had never
         # been instrumented the way `prepare` now is. Each staged component reports the
         # legs that partition its own `ms`, and they are summed here.
-        legs = {
-            "reserve_ms": 0,
-            "lease_ms": 0,
-            "enqueue_ms": 0,
-            "commit_ms": 0,
-            "ring_ms": 0,
-            "copy_ms": 0,
-            "fence_ms": 0,
-            "destinations": 0,
-        }
+        legs: dict[str, int] = dict.fromkeys(STAGE_LEGS, 0)
         # OBJECTS ARE COUNTED PER SNAPSHOT, NOT PER COMPONENT. Four components of one
         # manifest touch one set of stored objects, so summing each component's count
         # would report four times what the store actually holds — the same mistake the
@@ -712,10 +709,11 @@ class ComponentResidency:
                 continue
             try:
                 staged = self.backend.stage(name)
-                fill_ms += int(staged.get("stream_ms", 0))
-                for leg in legs:
-                    legs[leg] += int(staged.get(leg, 0))
-                objects[self.backend.checkpoints[name].manifest_id] = int(staged.get("objects", 0))
+                if staged is not None:
+                    fill_ms += staged["stream_ms"]
+                    for leg in STAGE_LEGS:
+                        legs[leg] += staged[leg]
+                    objects[self.backend.checkpoints[name].manifest_id] = staged["objects"]
             except FillRefusal as exc:
                 raise self._poison(
                     exc.code,
