@@ -827,7 +827,7 @@ class ComponentResidency:
             raise self._spared(
                 method,
                 f"needs {absent} B of weights and {headroom} B of scratch beside what this "
-                f"rank holds; {allocatable} B are allocatable",
+                f"GPU holds; {allocatable} B are allocatable",
             )
 
     def _spared(self, method: str, why: str) -> ResidencyRefusal:

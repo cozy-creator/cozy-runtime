@@ -1,4 +1,4 @@
-"""Spread one component's pure method calls over the ranks of its group."""
+"""Spread one component's pure method calls over the GPUs of its group."""
 
 from collections.abc import Iterable, Iterator
 from typing import Any
@@ -15,13 +15,13 @@ def spread(
 
     The author's statement: the method is a pure function of its tensor and JSON arguments
     and returns one tensor. Inside a sequence-parallel group the runtime offers the calls to
-    the idle ranks, rank 0 included, a round at a time; each result is what rank 0 alone
-    computes on an identical card. A follower without room for the call declines it and the
-    call runs on another rank. Elsewhere they run here, one after another.
+    the idle GPUs, this one included, a round at a time; each result is what one GPU alone
+    computes on an identical card. A GPU without room for the call declines it and the call
+    runs on another. Elsewhere they run here, one after another.
 
-    `spare=True`: no follower may free anything to take a call, because the attempt still
-    needs what the followers hold (a spread before the sharded denoise). A follower homing a
-    `placeable` component always spares.
+    `spare=True`: no other GPU may free anything to take a call, because the attempt still
+    needs what they hold (a spread before the sharded denoise). A GPU homing a `placeable`
+    component always spares.
     """
     runner = getattr(component, "_cozy_spread", None)
     calls = iter(arguments)

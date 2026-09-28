@@ -25,7 +25,7 @@ import msgspec
 
 from cozy_runtime.internal import execution_evidence, liveness, spawn
 from cozy_runtime.internal.config import inherited_environment
-from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDivergence
+from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 from cozy_runtime.internal.seam import Channel, SeamError
 
 #: NCCL reads this once, at communicator creation. NVLink SHARP multicast needs a privilege
@@ -130,6 +130,8 @@ class Follower:
     rank: int
     process: ChildProcess
     channel: Channel
+    #: how people name the GPU this process drives (`execution_evidence.gpu_name`)
+    gpu: str = ""
     #: routed replies; the body stays a mapping because its readers index it by key
     replies: queue.Queue[tuple[Frame, dict[str, Any]] | None] = field(default_factory=queue.Queue)
     #: the seam-closed verdict once the reader saw EOF or a torn frame; "" while live
@@ -189,13 +191,13 @@ def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
 
 
 def _decode[T](
-    frame: Mapping[str, object] | None, kind: type[T], rank: int, field_name: str, what: str
+    frame: Mapping[str, object] | None, kind: type[T], gpu: str, field_name: str, what: str
 ) -> T:
-    """One residence message, or a divergence naming the rank and the field it broke."""
+    """One residence message, or a divergence naming the GPU and the field it broke."""
     try:
         return msgspec.convert(frame, kind)
     except msgspec.ValidationError as exc:
-        raise RankDivergence(rank, field_name, f"{what}: {exc}") from exc
+        raise GpuDivergence(gpu, field_name, f"{what}: {exc}") from exc
 
 
 def receive_residence(
@@ -214,18 +216,19 @@ def receive_residence(
     after that, and accept only a matching, no-larger group ceiling.
     """
     offer = _Offer(rank, model, GroupPlan.read(plan), required)
+    gpu = execution_evidence.gpu_name(offer.plan.devices, rank)
     channel.send(msgspec.to_builtins(offer))
     what = "invalid group parking decision"
-    parking = _decode(channel.recv(timeout=None), _Parking, rank, "parked_constructions", what)
+    parking = _decode(channel.recv(timeout=None), _Parking, gpu, "parked_constructions", what)
     if parking.model != model:
-        raise RankDivergence(rank, "parked_constructions", f"{what} for {parking.model!r}")
+        raise GpuDivergence(gpu, "parked_constructions", f"{what} for {parking.model!r}")
     park(parking.park)
     local = ceiling()
     channel.send(msgspec.to_builtins(_Measured(rank, model, local)))
     what = "invalid group residence ceiling"
-    shared = _decode(channel.recv(timeout=None), _Ceiling, rank, "resident_budget_bytes", what)
+    shared = _decode(channel.recv(timeout=None), _Ceiling, gpu, "resident_budget_bytes", what)
     if shared.model != model or shared.ceiling > local:
-        raise RankDivergence(rank, "resident_budget_bytes", what)
+        raise GpuDivergence(gpu, "resident_budget_bytes", what)
     return shared.ceiling
 
 
@@ -242,6 +245,7 @@ class RankGroup:
         sample_seconds: float = liveness.SAMPLE_SECONDS,
         forward: Callable[[dict[str, object]], None] | None = None,
         launch: Callable[[list[str], int], ChildProcess] | None = None,
+        devices: Iterable[str] = (),
     ) -> None:
         if degree < 2:
             raise ValueError("a rank group is degree >= 2; degree 1 is a plain executor")
@@ -250,6 +254,8 @@ class RankGroup:
         self.python = python
         self.root = root
         self.sample_seconds = float(sample_seconds)
+        #: the seal's `CUDA_VISIBLE_DEVICES` entries: rank r drives entry r
+        self.devices = tuple(devices)
         #: where a follower's progress frame goes: rank 0's own seam, so the worker keeps
         #: reading movement while rank 0 waits on its followers
         self.forward = forward
@@ -278,6 +284,10 @@ class RankGroup:
         self._reserved: Counter[int] = Counter()
         self._leases = threading.Condition()
 
+    def gpu(self, rank: int) -> str:
+        """How people name the GPU process `rank` drives: `GPU 3`, as nvidia-smi numbers it."""
+        return execution_evidence.gpu_name(self.devices, rank)
+
     # ------------------------------------------------------------------ lifecycle
 
     def _spawn_follower(self, module_argv: list[str], rank_fd: int) -> ChildProcess:
@@ -299,7 +309,9 @@ class RankGroup:
                 process = self._launch(argv, theirs.fileno())
             finally:
                 theirs.close()
-            follower = Follower(rank=rank, process=process, channel=Channel(ours))
+            follower = Follower(
+                rank=rank, process=process, channel=Channel(ours), gpu=self.gpu(rank)
+            )
             self.followers.append(follower)
             reader = threading.Thread(
                 target=self._read, args=(follower,), name=f"rank{rank}-reader", daemon=True
@@ -314,27 +326,25 @@ class RankGroup:
             try:
                 frame = follower.channel.recv(timeout=None)
             except SeamError as exc:
-                follower.gone = f"rank {follower.rank} seam: {exc}"
+                follower.gone = f"{follower.gpu} lost its seam: {exc}"
                 break
             if frame is None:
-                follower.gone = f"rank {follower.rank} closed its seam"
+                follower.gone = f"{follower.gpu} closed its seam"
                 break
             try:
                 head = msgspec.convert(frame, Frame)
             except msgspec.ValidationError as exc:
-                follower.gone = f"rank {follower.rank} sent a malformed frame: {exc}"
+                follower.gone = f"{follower.gpu} sent a malformed frame: {exc}"
                 break
             if head.event == "progress":
                 if self.forward is not None:
                     with contextlib.suppress(SeamError):
-                        self.forward({**frame, "name": f"rank{follower.rank}:{head.name}"})
+                        self.forward({**frame, "name": f"{follower.gpu}:{head.name}"})
                 continue
             follower.replies.put((head, frame))
             if head.reply == "run" and not head.ok:
                 self._break(
-                    f"rank {follower.rank} failed its mirrored call: {head.code}: {head.detail}"[
-                        :600
-                    ]
+                    f"{follower.gpu} failed its part of the call: {head.code}: {head.detail}"[:600]
                 )
         follower.replies.put(None)
         self._break(follower.gone)
@@ -375,16 +385,17 @@ class RankGroup:
                 hello = msgspec.convert(reply, _Hello)
             except msgspec.ValidationError as exc:
                 raise GroupRefusal(
-                    f"rank {follower.rank} answered hello malformed: {exc}", code="group_unformed"
+                    f"{follower.gpu} answered hello malformed: {exc}", code="group_unformed"
                 ) from exc
             if (hello.rank, hello.world) != (follower.rank, self.degree):
                 raise GroupRefusal(
-                    f"rank {follower.rank} dialled back as rank {hello.rank} of {hello.world}",
+                    f"{follower.gpu} dialled back as process {hello.rank} of {hello.world}, "
+                    f"not {follower.rank} of {self.degree}",
                     code="group_unformed",
                 )
             if hello.sealed != dict(sealed):
                 raise GroupRefusal(
-                    f"rank {follower.rank} dialled back under a different seal "
+                    f"{follower.gpu} dialled back under a different seal "
                     f"({hello.sealed!r} vs {dict(sealed)!r})",
                     code="group_unformed",
                 )
@@ -407,7 +418,7 @@ class RankGroup:
         for follower, reply in zip(self.followers, self.collect("join"), strict=True):
             if not reply.get("ok"):
                 raise GroupRefusal(
-                    f"rank {follower.rank} could not join: {reply.get('code')}: "
+                    f"{follower.gpu} could not join the group: {reply.get('code')}: "
                     f"{reply.get('detail', '')}"[:400],
                     code="group_unformed",
                 )
@@ -424,7 +435,7 @@ class RankGroup:
                 follower.channel.send(dict(command))
             except SeamError as exc:
                 raise GroupRefusal(
-                    f"rank {follower.rank} cannot be commanded: {exc}", code="group_broken"
+                    f"{follower.gpu} cannot be commanded: {exc}", code="group_broken"
                 ) from exc
 
     def collect(self, name: str) -> list[dict[str, Any]]:
@@ -482,7 +493,7 @@ class RankGroup:
             self.followers[rank - 1].channel.send(dict(command))
         except SeamError as exc:
             raise GroupRefusal(
-                f"rank {rank} cannot be commanded: {exc}", code="group_broken"
+                f"{self.gpu(rank)} cannot be commanded: {exc}", code="group_broken"
             ) from exc
 
     def reply_one(self, rank: int, name: str) -> dict[str, Any]:
@@ -497,9 +508,7 @@ class RankGroup:
             except queue.Empty:
                 pace.observe(liveness.burn(follower.pid))
                 if pace.wedged(floor):
-                    self._break(
-                        f"rank {follower.rank} wedged during {name!r}: {pace.verdict(floor)}"
-                    )
+                    self._break(f"{follower.gpu} wedged during {name!r}: {pace.verdict(floor)}")
                     raise GroupRefusal(self.broken, code="group_broken") from None
                 continue
             if frame is None:
@@ -507,7 +516,7 @@ class RankGroup:
             head, body = frame
             if head.reply != name:
                 refused = f": {head.code}: {head.detail}"[:600] if head.ok is False else ""
-                self._break(f"rank {follower.rank} answered {head.reply!r} to {name!r}{refused}")
+                self._break(f"{follower.gpu} answered {head.reply!r} to {name!r}{refused}")
                 raise GroupRefusal(self.broken, code="group_broken")
             return body
 
@@ -532,9 +541,9 @@ class RankGroup:
         need = int(required)
         mine = GroupPlan.read(plan)
         for follower, reply in zip(self.followers, self.collect("resident_budget"), strict=True):
-            offer = _decode(reply, _Offer, follower.rank, "resident_budget", "invalid rank offer")
+            offer = _decode(reply, _Offer, follower.gpu, "resident_budget", "invalid GPU offer")
             if (offer.rank, offer.model) != (follower.rank, model):
-                raise RankDivergence(follower.rank, "resident_budget", "invalid rank offer")
+                raise GpuDivergence(follower.gpu, "resident_budget", "invalid GPU offer")
             offer.plan.assert_agrees(mine, rank=follower.rank)
             need = max(need, offer.required)
         parked = park(need)
@@ -544,13 +553,13 @@ class RankGroup:
             measured = _decode(
                 reply,
                 _Measured,
-                follower.rank,
+                follower.gpu,
                 "resident_budget_bytes",
-                "invalid rank residence ceiling",
+                "invalid GPU residence ceiling",
             )
             if (measured.rank, measured.model) != (follower.rank, model):
-                raise RankDivergence(
-                    follower.rank, "resident_budget_bytes", "invalid rank residence ceiling"
+                raise GpuDivergence(
+                    follower.gpu, "resident_budget_bytes", "invalid GPU residence ceiling"
                 )
             shared = min(shared, measured.ceiling)
         self.broadcast(msgspec.to_builtins(_Ceiling(model, shared)))
@@ -563,7 +572,7 @@ class RankGroup:
     def verdict(self) -> str:
         """The latched fault, with every exit status known by now beside it."""
         exited = [
-            f"rank {follower.rank} exit status {status}"
+            f"{follower.gpu} exit status {status}"
             for follower in self.followers
             if (status := follower.exit_status()) is not None
         ]
@@ -576,7 +585,7 @@ class RankGroup:
             raise GroupRefusal(self.verdict(), code="group_broken")
         for follower in self.followers:
             if follower.exit_status() is not None:
-                self._break(f"rank {follower.rank} exited")
+                self._break(f"{follower.gpu}'s process exited")
                 raise GroupRefusal(self.verdict(), code="group_broken")
 
     def pids(self) -> tuple[int, ...]:

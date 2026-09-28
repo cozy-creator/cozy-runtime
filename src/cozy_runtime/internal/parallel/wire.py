@@ -187,7 +187,7 @@ def marshal(value: object, spool: TensorSpool, *, path: str = "") -> Json:
             if not isinstance(key, str):
                 raise UncrossableArgument(
                     f"{path or 'argument'}: dict key {key!r} is {type(key).__name__}, and only "
-                    "str keys cross the rank seam"
+                    "str keys cross to the group's other GPUs"
                 )
             if key == _TAG:
                 raise UncrossableArgument(
@@ -197,10 +197,11 @@ def marshal(value: object, spool: TensorSpool, *, path: str = "") -> Json:
             out[key] = marshal(item, spool, path=f"{path}.{key}" if path else key)
         return out
     raise UncrossableArgument(
-        f"{path or 'argument'} is a {type(value).__name__}, which cannot cross the rank seam. "
+        f"{path or 'argument'} is a {type(value).__name__}, which cannot cross to the group's "
+        "other GPUs. "
         "A mirrored model call carries JSON scalars, lists, tuples, str-keyed dicts, torch "
         "tensors (through the attempt spool); a generator, closure, "
-        "callback, a request view or a live handle cannot be broadcast to follower ranks"
+        "callback, a request view or a live handle cannot be sent to another GPU's process"
     )
 
 

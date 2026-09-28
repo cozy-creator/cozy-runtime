@@ -17,7 +17,7 @@ def concurrently(*calls: Callable[[], Any]) -> tuple[Any, ...]:
     The author's statement: no call reads what another writes before this returns, and each
     returns its result rather than publishing it through shared state. A call that is a
     public Model method (bound, or under `functools.partial`) whose declared components the
-    runtime keeps on other ranks of the group holds nothing on this device, so it runs on its
+    runtime keeps on other GPUs of the group holds nothing on this device, so it runs on its
     own thread beside the rest. Every other call runs here, in the order given. Where nothing
     is hosted elsewhere, that is exactly the plain sequence of calls.
 

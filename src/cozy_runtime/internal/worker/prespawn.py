@@ -40,6 +40,7 @@ from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import accel, package_installation, package_interface
 from cozy_runtime.internal.canonical import Json
+from cozy_runtime.internal.execution_evidence import gpu_name, gpu_names
 from cozy_runtime.internal.executor_commands import Start, Warm
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.gpu_scheduler import Ordinals, model_degrees, width_for
@@ -214,6 +215,7 @@ class Prespawns:
         worker = self.worker
         started, began = time.time(), time.perf_counter()
         detail = legs = ""
+        lane = _lane(worker, slot.ordinals)
         try:
             installed = package_installation.open_installation(
                 Path(worker.options.install_root or ""), slot.installation
@@ -227,7 +229,6 @@ class Prespawns:
             )
             package_interface.publish(path, raw)
             slot.supervision.use_environment(str(installed.python), slot.installation)
-            lane = _lane(worker, slot.ordinals)
             executor = slot.executor = slot.supervision.spawn(imposed=worker.imposed(lane))
             # The warm yields every CPU to the download and to running requests; a claim
             # restores the adopted process's priority.
@@ -252,10 +253,10 @@ class Prespawns:
             slot.started.set()
         self._phase("Starting model executor", started, began, not detail, slot, detail or legs)
         if detail:
-            worker.note("warm", f"prespawn on {list(slot.ordinals)} failed: {detail}")
+            worker.note("warm", f"prespawn on {gpu_names(lane.entries)} failed: {detail}")
             self._drop(slot)
             return
-        worker.note("warm", f"prespawned {slot.installation} on {list(slot.ordinals)}: {legs}")
+        worker.note("warm", f"prespawned {slot.installation} on {gpu_names(lane.entries)}: {legs}")
         # Launch checks wait for idle cards; the compiles they start run beside the download.
         while self._busy(slot.ordinals):
             slot.nudge.wait()
@@ -269,7 +270,7 @@ class Prespawns:
             reply = executor.call(Warm(), timeout=None)
             ranks = reply.get("ranks") or []
             detail = "; ".join(
-                f"rank {row.get('rank')}: "
+                f"{gpu_name(lane.entries, int(row.get('rank', -1)))}: "
                 + ", ".join(
                     f"{k['kernel']} {k.get('line') or k['status']}" for k in row.get("kernels", ())
                 )

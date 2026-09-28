@@ -228,12 +228,12 @@ class Residency(Protocol):
 
 
 class Placement(Protocol):
-    """Where a generation's components live across the ranks of its group, installed by the
-    runtime on rank 0 of a group that hosts a `placeable` component elsewhere.
+    """Where a generation's components live across the GPUs of its group, installed by the
+    runtime on the group's first GPU when it hosts a `placeable` component elsewhere.
 
-    A scope whose declared components ALL live on other ranks holds nothing on this device:
-    its module calls run on their home ranks. Such a REMOTE scope is admitted there, not
-    here, and may be open beside this rank's one serial scope (`author.concurrently`).
+    A scope whose declared components ALL live on other GPUs holds nothing on this device:
+    its module calls run on their home GPUs. Such a REMOTE scope is admitted there, not
+    here, and may be open beside this GPU's one serial scope (`author.concurrently`).
     """
 
     def remote(self, components: tuple[str, ...]) -> bool: ...
@@ -244,7 +244,7 @@ class Placement(Protocol):
 
     def carry[T](self, call: Callable[[], T], components: tuple[str, ...]) -> Callable[[], T]:
         """`call`, to run on another thread under this thread's device and autograd modes.
-        Its components' home ranks are reserved from now until it returns."""
+        Its components' home GPUs are reserved from now until it returns."""
         ...
 
 
@@ -321,7 +321,7 @@ def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], typ
 
     The author's statement, and only the author can make it: at each degree K the class's
     attention heads divide by K, its quantization is shard-invariant (rowwise activation
-    scales), and the whole pipeline is built identically on every rank. The runtime reads
+    scales), and the whole pipeline is built identically on every GPU. The runtime reads
     it into the interface slot (`sequence_parallel.degrees`). Every Model slot of one
     callable declares a common degree, or the package is refused. A call runs on the largest
     declared degree the machine's GPUs can form (one GPU only on a machine narrower than
@@ -359,12 +359,13 @@ def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], typ
 
 
 def placeable(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
-    """Declare components the runtime may host on another rank of this Model's group.
+    """Declare components the runtime may host on another GPU of this Model's group.
 
     The author's statement: every use of each named component is a module call (its root or
     a submodule) whose arguments and result are tensors, JSON values or model outputs, with
-    no effect beside that result. When rank 0 cannot hold every component, the runtime may
-    then keep one resident on a follower instead of re-staging it for every request.
+    no effect beside that result. When the group's first GPU cannot hold every component, the
+    runtime may then keep one resident on another GPU instead of re-staging it for every
+    request.
     """
     if not names or any(
         not isinstance(name, str) or not name.replace("_", "").isalnum() for name in names
@@ -456,7 +457,7 @@ class Model[PipelineT]:
     honest default - a class that said nothing is never sharded."""
 
     __placeable__: tuple[str, ...] = ()
-    """`@placeable(...)`: components the runtime may host on another rank of the group."""
+    """`@placeable(...)`: components the runtime may host on another GPU of the group."""
 
     __encoded_leaves__: str = "refuse"
     """The class's `encoded_leaves=` declaration, defaulted to the conservative answer.
@@ -490,7 +491,7 @@ class Model[PipelineT]:
     """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
     _cozy_placement: Placement | None = None
-    """Runtime-installed on rank 0 of a group that hosts a component on a follower."""
+    """Runtime-installed on the first GPU of a group that hosts a component on another."""
 
     def __init_subclass__(cls, /, **keywords: str) -> None:
         """The class-keyword plane is exactly `encoded_leaves` and `fusion` (model-code-fit
@@ -541,7 +542,7 @@ class Model[PipelineT]:
         This hook chooses a name, not a kernel implementation or device operation.
         A name is an explicit choice: validated and never silently replaced. A sequence
         of names is a preference: Runtime takes the first one this site, device,
-        environment and numerical probe admit on each rank, records why each earlier
+        environment and numerical probe admit on each GPU, records why each earlier
         one was skipped, and falls back to its recommendation when none serves.
         Approximate attention remains the model author's quality decision, independent
         of FP8 checkpoint storage. Developer request overrides take precedence.
@@ -780,7 +781,7 @@ class _ComponentScope:
     declares its components together on one method.
 
     The one exception holds nothing here: a REMOTE scope, whose every declared component the
-    runtime keeps on another rank of the group (`Placement.remote`). It admits nothing on
+    runtime keeps on another GPU of the group (`Placement.remote`). It admits nothing on
     this device and marks this context, not the instance, so it may be open beside the one
     local scope (`author.concurrently` overlaps the two)."""
 

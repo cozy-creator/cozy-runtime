@@ -15,7 +15,7 @@ from collections.abc import Mapping
 import msgspec
 
 from cozy_runtime.author._errors import RuntimeFailure
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import canonical, execution_evidence
 
 
 class GroupRefusal(RuntimeFailure):
@@ -25,14 +25,14 @@ class GroupRefusal(RuntimeFailure):
     default_code = "group_broken"
 
 
-class RankDivergence(GroupRefusal):
-    """A rank could not honour the group's plan."""
+class GpuDivergence(GroupRefusal):
+    """One GPU's process could not honour the group's plan. `gpu` names it as people do."""
 
-    default_code = "rank_divergence"
+    default_code = "gpu_divergence"
 
-    def __init__(self, rank: int, field_name: str, detail: str) -> None:
-        super().__init__(f"rank {rank} field {field_name!r}: {detail}", fields=[field_name])
-        self.rank = int(rank)
+    def __init__(self, gpu: str, field_name: str, detail: str) -> None:
+        super().__init__(f"{gpu} disagrees on {field_name!r}: {detail}", fields=[field_name])
+        self.gpu = gpu
         self.field_name = field_name
 
 
@@ -78,9 +78,11 @@ class GroupPlan(msgspec.Struct, frozen=True):
         for key in sorted(self.__struct_fields__):
             mine, theirs = getattr(self, key), getattr(broadcast, key)
             if mine != theirs:
-                raise RankDivergence(
-                    rank,
+                gpu = execution_evidence.gpu_name(broadcast.devices, rank)
+                leader = execution_evidence.gpu_name(broadcast.devices, 0)
+                raise GpuDivergence(
+                    gpu,
                     key,
-                    f"rank 0 broadcast {theirs!r}, this rank derived {mine!r}; the "
-                    "group fails and no rank adapts locally",
+                    f"{leader} decided {theirs!r}, {gpu} derived {mine!r}; the group fails "
+                    "and no GPU adapts locally",
                 )

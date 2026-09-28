@@ -24,7 +24,7 @@ from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.executor_commands import Start
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
-from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDivergence
+from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 from cozy_runtime.internal.worker import lane_wire, lanes
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.gpu_scheduler import width_for
@@ -673,12 +673,13 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
     """THIS process is rank 0. Real follower executor processes are spawned by the real
     launch shape (the executor program, told its rank, world, seam fd and leader), dial
     back over their `socketpair` seam under exactly rank 0's seal, join a TCPStore on a
-    port the kernel chose, pass the formation barrier, and refuse `rank_divergence` on a
-    broadcast plan whose hardware half is not theirs. gloo stands in for NCCL: the
-    rendezvous, the barrier, the plan and the seam are backend-agnostic."""
+    port the kernel chose, pass the formation barrier, and refuse `gpu_divergence` on a
+    broadcast plan whose hardware half is not theirs, naming each GPU as nvidia-smi does:
+    sealed to cards 4-6, rank 1 is GPU 5. gloo stands in for NCCL: the rendezvous, the
+    barrier, the plan and the seam are backend-agnostic."""
     import torch
 
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0,1,2"}
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5,6"}
     sealed = seal_snapshot(env)
     group = RankGroup(
         degree=3,
@@ -687,10 +688,11 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
         root=str(tmp_path),
         sample_seconds=0.2,
         launch=_launcher(env),
+        devices=("4", "5", "6"),
     )
     try:
         group.spawn()
-        assert [f.rank for f in group.followers] == [1, 2]
+        assert [(f.rank, f.gpu) for f in group.followers] == [(1, "GPU 5"), (2, "GPU 6")]
         assert all(f.process.poll() is None for f in group.followers)
         # the followers are DIRECT CHILDREN of rank 0 (they inherit its cgroup and die
         # with it): pdeathsig was armed before exec
@@ -714,7 +716,7 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
         command = {
             "cmd": "load",
             "construction": "fixture",
-            "devices": "0,1,2",
+            "devices": "4,5,6",
             "sequence_parallel_degree": 3,
             "authorized_device_limit_bytes": 1,
             "binding": {
@@ -727,12 +729,13 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
         # the hardware half disagrees: refused BEFORE torch is imported on the follower
         divergent = {"degree": 3, "devices": ["0", "1", "7"]}
         replies = group.call({**command, "group": divergent})
-        assert [r["code"] for r in replies] == ["rank_divergence"] * 2, replies
-        assert "rank 0 broadcast degree 3 over ['0', '1', '7']" in replies[0]["detail"]
+        assert [r["code"] for r in replies] == ["gpu_divergence"] * 2, replies
+        assert replies[0]["detail"].startswith("GPU 5 is sealed to ['4', '5', '6']"), replies
+        assert "GPU 4 broadcast 3 GPUs over ['0', '1', '7']" in replies[1]["detail"], replies
         assert replies[0]["rank"] == 1 and replies[1]["rank"] == 2
         # a follower that refused is poisoned: a second command says so
         replies = group.call({"cmd": "probe"})
-        assert all(r["poisoned"] == "rank divergence" for r in replies), replies
+        assert all(r["poisoned"] == "GPU divergence" for r in replies), replies
         # an out-of-vocabulary command on a follower refuses; rank 0's plane is closed
         replies = group.call({"cmd": "invoke"})
         assert [r["code"] for r in replies] == ["follower_command_unsupported"] * 2
@@ -744,9 +747,9 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
 
 @needs_torch
 def test_the_plan_agrees_field_by_field_or_refuses() -> None:
-    """A follower ASSERTS the broadcast plan; the first field that differs is named and
-    the rank never adapts."""
-    plan = GroupPlan(2, ("0", "1"), "sha256:a", 1024)
+    """A follower ASSERTS the broadcast plan; the first field that differs is named, with
+    the GPU that disagrees, and no GPU ever adapts."""
+    plan = GroupPlan(2, ("2", "3"), "sha256:a", 1024)
     plan.assert_agrees(plan, rank=1)
     for field_name, other in (
         ("plan_digest", msgspec.structs.replace(plan, plan_digest="sha256:b")),
@@ -756,17 +759,18 @@ def test_the_plan_agrees_field_by_field_or_refuses() -> None:
         ),
         ("degree", msgspec.structs.replace(plan, degree=4)),
     ):
-        with pytest.raises(RankDivergence) as refused:
+        with pytest.raises(GpuDivergence) as refused:
             plan.assert_agrees(other, rank=1)
-        assert refused.value.code == "rank_divergence"
-        assert refused.value.field_name == field_name and refused.value.rank == 1
-        assert "never adapts" in refused.value.message or "no rank adapts" in refused.value.message
+        assert refused.value.code == "gpu_divergence"
+        assert refused.value.field_name == field_name and refused.value.gpu == "GPU 3"
+        assert refused.value.message.startswith(f"GPU 3 disagrees on {field_name!r}: GPU 2 decided")
+        assert "no GPU adapts locally" in refused.value.message
 
 
 @needs_torch
 def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
     """A follower killed -9 is observed through its seam the moment it dies; the group
-    latches `group_broken` naming the rank and its exit status, every later command
+    latches `group_broken` naming its GPU and exit status, every later command
     refuses, and teardown reaps what is left. Never a park on a collective."""
     import torch
 
@@ -778,6 +782,7 @@ def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
         root=str(tmp_path),
         sample_seconds=0.2,
         launch=_launcher(env),
+        devices=("0", "1"),
     )
     try:
         group.spawn()
@@ -789,8 +794,8 @@ def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
         with pytest.raises(GroupRefusal) as refused:
             group.call({"cmd": "probe"})
         assert refused.value.code == "group_broken"
-        assert "rank 1" in refused.value.message and "-9" in refused.value.message, refused.value
-        assert group.broken and "rank 1" in group.broken
+        assert "GPU 1" in refused.value.message and "-9" in refused.value.message, refused.value
+        assert group.broken and "GPU 1" in group.broken
         with pytest.raises(GroupRefusal):
             group.check_alive()
     finally:
