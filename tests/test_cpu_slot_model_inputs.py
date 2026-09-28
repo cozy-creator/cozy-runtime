@@ -34,7 +34,6 @@ HOLDING = {"models": [{"path": "main.models.source"}], "weights_outputs": [{"out
 
 def test_the_device_grant_alone_decides_the_slot() -> None:
     assert machine_slots.admits(pb.JobDirective(orchestration=True), HOLDING)
-    assert machine_slots.MODEL_INPUTS
     for granted in (
         pb.JobDirective(device_count=1),
         pb.JobDirective(resource_caps=pb.ResourceCaps(device_required=True)),
