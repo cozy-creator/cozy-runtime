@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,13 +36,19 @@ class Builtins:
     def __init__(self, worker: Worker):
         self.worker = worker
         self.captured: dict[str, Any] | None = None
+        # Concurrent first submissions capture once; the rest take the same result.
+        self.capturing = threading.Lock()
 
     def close(self) -> None:
         pass
 
     def capture(self) -> dict[str, Any]:
-        if self.captured is not None:
+        with self.capturing:
+            if self.captured is None:
+                self.captured = self._capture()
             return self.captured
+
+    def _capture(self) -> dict[str, Any]:
         worker = self.worker
         root = Path(worker.options.install_root or "")
         prepared = builtin_environment.prepare(root)
@@ -72,12 +79,11 @@ class Builtins:
                 canonical_json.encode({"entrypoints": [], "models": []})
             ),
         )
-        self.captured = {
+        return {
             "placement": documents.body(placement),
             "installation_id": installed.installation_id,
             "runtime_version": installed.release,
         }
-        return self.captured
 
     def resolve(self, parent: AttemptRecord, call: Call, intent: dict[str, Any]) -> Target:
         from .machine_child_target import Target

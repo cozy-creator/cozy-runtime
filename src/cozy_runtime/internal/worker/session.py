@@ -1063,6 +1063,10 @@ class Worker:
         # from the superseded stream cannot finish under its successor's epoch.
         self.control_lock = threading.RLock()
         self.preparation_lock = threading.Lock()
+        #: The one preparation executor slot (`placements/prepare`). A package preparation and
+        #: a submission's built-in capture both describe in it; two at once collide on its
+        #: worker-root lease, which refused concurrent first submissions on a fresh pod.
+        self.preparation_slot = threading.Lock()
         self.model_source_operations: set[str] = set()
         self.restart_requested = False
         self.restart_sequence = 0
@@ -1957,6 +1961,16 @@ class Worker:
         application: str = "",
     ) -> bytes:
         """Import package code only inside a dedicated preparation executor."""
+        with self.preparation_slot:
+            return self._describe_in_slot(installed, distribution, application=application)
+
+    def _describe_in_slot(
+        self,
+        installed: package_installation.InstalledEnvironment,
+        distribution: str,
+        *,
+        application: str,
+    ) -> bytes:
         from cozy_runtime.internal.worker import package_prepare
 
         supervision = self._new_preparation_supervision()
