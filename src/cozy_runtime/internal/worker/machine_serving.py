@@ -168,6 +168,8 @@ class Serving:
         self.waiting: set[str] = set()
         # A preparation with no parent execution (a release root) reports here instead.
         self.observers: dict[str, Callable[[dict[str, Any]], None]] = {}
+        #: the tenth of its download each prefetch last narrated, until the download lands
+        self.narrated: dict[str, int] = {}
         # Read leases die with the old process, but durable temporary holds need
         # release through the existing journal after a worker restart.
         workspace = worker.workspace
@@ -196,6 +198,15 @@ class Serving:
             observer(frame)
             return
         if call.call_index == (1 << 32) - 1 and frame.get("kind") == "progress":
+            # A prefetch narrates on its parent's durable log, so once per tenth of its bytes:
+            # every position filled 4,065 of run 1510's 4,096 events and hid its segments.
+            if isinstance(total := frame.get("total"), int) and total > 0:
+                tenth = int(frame.get("position", 0)) * 10 // total
+                if tenth <= self.narrated.get(call.child_request, -1):
+                    return
+                self.narrated[call.child_request] = tenth
+                if tenth >= 10:
+                    self.narrated.pop(call.child_request, None)
             frame = {
                 "kind": "log",
                 "name": "model-prefetch",

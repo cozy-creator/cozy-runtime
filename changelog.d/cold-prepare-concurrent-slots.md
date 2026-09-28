@@ -1,0 +1,1 @@
+A cold preparation pulls all of its model slots at once and reports their summed bytes; H3 turbo's 1.6 GB adapter no longer waits for the 100 GB base (46 s on run 1510's first segment). A prefetch narrates its download on the parent's log once per tenth of its bytes instead of at every position, which filled 4,065 of run 1510's 4,096 events.

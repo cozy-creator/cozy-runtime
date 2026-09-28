@@ -459,6 +459,97 @@ def test_cold_default_native_pull_requires_deployment_object_storage_host(
         thread.join()
 
 
+def test_a_cold_preparation_pulls_its_slots_at_once(tmp_path: Path) -> None:
+    """Run 1510 pulled H3's turbo adapter only after its 100 GB base had landed. Here each
+    slot's closure waits for the other's, which a one-after-another pull never shows."""
+    refs: dict[str, tuple[str, int]] = {}
+    bodies = {hashlib.sha256(body).hexdigest(): body for body in (_HEADER, _ASSET)}
+    objects = [{"length": len(body), "sha256": digest} for digest, body in sorted(bodies.items())]
+    _, base, _, origin = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
+    for name in ("base", "adapter"):
+        # Same bytes under a different path: a second, distinct checkpoint manifest.
+        raw = origin.manifest(base)["manifest"].replace(b"model.cozytensors", name.encode())
+        manifest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        refs[f"proof/{name}@{manifest}"] = (manifest, len(raw))
+        bodies[manifest.removeprefix("sha256:")] = raw
+    asked = {ref: threading.Event() for ref in refs}
+    together: list[bool] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_: Any) -> None:
+            pass
+
+        def answer(self, body: bytes) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path == "/v1/tensorfs/closure":
+                asked[request["ref"]].set()
+                together.append(all(event.wait(10) for event in asked.values()))
+                manifest, length = refs[request["ref"]]
+                response = {
+                    "complete": True,
+                    "lane": "bf16",
+                    "model": request["ref"].partition("@")[0],
+                    "manifest": {"sha256": manifest.removeprefix("sha256:"), "length": length},
+                    "objects": objects,
+                    "presign_max_digests": 10,
+                    "release": "1.0.0",
+                    "scope": "runtime",
+                    "server_time_unix": int(time.time()),
+                }
+            else:
+                response = {
+                    "expires_at_unix": int(time.time()) + 3600,
+                    "server_time_unix": int(time.time()),
+                    "urls": {
+                        digest: f"http://127.0.0.1:{server.server_port}/{digest}"
+                        for digest in request["digests"]
+                    },
+                }
+            self.answer(json.dumps(response, sort_keys=True, separators=(",", ":")).encode())
+
+        def do_GET(self) -> None:
+            self.answer(bodies[self.path.removeprefix("/")])
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root = tmp_path / "destination"
+    store = tensorfs.Store.init(str(root))
+    worker = peer({})
+    worker.workspace = Workspace(root)
+    worker.config = cast(Any, SimpleNamespace(object_storage_hosts=("127.0.0.1",)))
+    rows = [
+        {
+            "parameter": ref.partition("@")[0].removeprefix("proof/"),
+            "public_origin": f"http://localhost:{server.server_port}",
+            "repository": ref.partition("@")[0],
+            "manifest": {"digest": manifest, "length": length},
+        }
+        for ref, (manifest, length) in refs.items()
+    ]
+    reported: list[tuple[int, int]] = []
+    try:
+        with ExitStack() as access:
+            defaults.materialize(
+                worker, rows, access, progress=lambda done, whole: reported.append((done, whole))
+            )
+        for ref, (manifest, length) in refs.items():
+            store.verify_checkpoint_source(ref.partition("@")[0], manifest, length)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert together == [True, True]
+    # One position for the preparation: both slots' bytes, landed.
+    assert reported[-1][0] == reported[-1][1] == max(whole for _, whole in reported)
+
+
 def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hub_only(
     tmp_path: Path,
 ) -> None:

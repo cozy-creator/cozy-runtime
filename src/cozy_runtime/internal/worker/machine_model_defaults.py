@@ -6,7 +6,9 @@ import ipaddress
 import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Annotated, Protocol
 from urllib.parse import urlsplit
 
@@ -302,7 +304,9 @@ def materialize(
     """Verify exact sources; lease bytes only when the preparer will read them.
 
     A reused placement consumes its registered binding document. Its fresh child
-    admission still verifies and retains every checkpoint before submission.
+    admission still verifies and retains every checkpoint before submission. A cold
+    preparation pulls its slots at once and reports their summed bytes: run 1510 pulled
+    H3's 1.6 GB turbo adapter after its 100 GB base, 46 s more before the first segment.
     """
     selected = decode(rows)
     if not selected:
@@ -310,40 +314,57 @@ def materialize(
     assert worker.workspace is not None
     facade = fill.tensorfs_module()
     store = fill.store(worker.workspace.store_root)
-    for row in selected:
+    pulled: dict[str, tuple[int, int]] = {}
+    lock = threading.Lock()
+
+    def report(digest: str, available: int, total: int) -> None:
+        assert progress is not None
+        with lock:
+            pulled[digest] = (available, total)
+            landed = sum(done for done, _ in pulled.values())
+            whole = sum(size for _, size in pulled.values())
+        progress(landed, whole)
+
+    def land(row: Selected) -> None:
+        manifest = row.manifest
         if cancellation is not None and cancellation.cancelled:
             raise WorkspaceRefusal("model preparation canceled")
-        manifest = row.manifest
-        try:
-            # Existing cached custody is sufficient. A cold use fetches this exact
-            # checkpoint; only this machine's own Hub sees its worker capability.
-            with worker.model_transfer_lock:
-                transfer = worker.model_transfers.setdefault(manifest.digest, threading.Lock())
-            with transfer:
-                if cancellation is not None and cancellation.cancelled:
-                    raise WorkspaceRefusal("model preparation canceled")
-                try:
-                    store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
-                except facade.errors.Refusal:
-                    with downloading():
-                        facade.pull(
-                            store,
-                            row.public_origin,
-                            row.repository + "@" + manifest.digest,
-                            credential=credential(worker, row.public_origin),
-                            allowed_hosts=worker.config.object_storage_hosts,
-                            allow_local=local_development(worker),
-                            streams=8,
-                            cancellation=cancellation,
-                            progress=progress,
-                        )
-                    store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
-            if access is not None:
-                access.enter_context(store.acquire_cozytensors(manifest.digest))
-        except facade.errors.Refusal as error:
-            raise WorkspaceRefusal(
-                "captured Model default materialization refused: " + str(error.code)
-            ) from error
+        # Existing cached custody is sufficient. A cold use fetches this exact
+        # checkpoint; only this machine's own Hub sees its worker capability.
+        with worker.model_transfer_lock:
+            transfer = worker.model_transfers.setdefault(manifest.digest, threading.Lock())
+        with transfer:
+            if cancellation is not None and cancellation.cancelled:
+                raise WorkspaceRefusal("model preparation canceled")
+            try:
+                store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
+            except facade.errors.Refusal:
+                with downloading():
+                    facade.pull(
+                        store,
+                        row.public_origin,
+                        row.repository + "@" + manifest.digest,
+                        credential=credential(worker, row.public_origin),
+                        allowed_hosts=worker.config.object_storage_hosts,
+                        allow_local=local_development(worker),
+                        streams=8,
+                        cancellation=cancellation,
+                        progress=None if progress is None else partial(report, manifest.digest),
+                    )
+                store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
+
+    try:
+        with ThreadPoolExecutor(len(selected), thread_name_prefix="model-pull") as pool:
+            landing = [pool.submit(land, row) for row in selected]
+        for future in landing:
+            future.result()
+        if access is not None:
+            for row in selected:
+                access.enter_context(store.acquire_cozytensors(row.manifest.digest))
+    except facade.errors.Refusal as error:
+        raise WorkspaceRefusal(
+            "captured Model default materialization refused: " + str(error.code)
+        ) from error
 
 
 def inputs(

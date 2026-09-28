@@ -118,7 +118,7 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         SimpleNamespace(
             workspace=Workspace(store_root),
             executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
-            options=SimpleNamespace(accelerator_backend="none"),
+            options=SimpleNamespace(accelerator_backend="none", publication_authority=None),
             host_facts=lambda: hostfacts.measure("none"),
             lanes=SimpleNamespace(entries=()),
             config=SimpleNamespace(object_storage_hosts=("127.0.0.1",)),
@@ -188,3 +188,29 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_a_prefetch_narrates_each_tenth_of_its_download_once() -> None:
+    """Run 1510's 100 GB prefetch logged 4,065 positions: 4,065 of the run's 4,096 events.
+    A demanded download's positions stay its live progress, on the lossy lane."""
+    rows: list[dict[str, Any]] = []
+    worker = cast(
+        Worker,
+        SimpleNamespace(workspace=None, emit_progress=lambda _p, _o, frame: rows.append(frame)),
+    )
+    serving = Serving(worker)
+    request = pb.ChildCallRequest(parent_attempt_ordinal=1)
+    stage = "generate / Downloading model weights"
+    try:
+        for index, child in (((1 << 32) - 1, "model-preparation.hint"), (0, "demand")):
+            call = Call("parent", index, 1, 0, b"", b"", child, b"", False, b"", "", "")
+            for landed in range(1001):
+                frame = {"kind": "progress", "stage": stage, "position": landed, "total": 1000}
+                serving._progress(call, request, frame)
+    finally:
+        serving.close()
+    hinted, demanded = rows[:11], rows[11:]
+    assert [row["fields"]["position"] for row in hinted] == list(range(0, 1001, 100))
+    assert {row["name"] for row in hinted} == {"model-prefetch"}
+    assert [row["position"] for row in demanded] == list(range(1001))
+    assert serving.narrated == {}
