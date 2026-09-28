@@ -635,12 +635,12 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream(origin
     from conftest import image_python
     from cozy_runtime.internal import child_env, package_interface, static_interface
     from cozy_runtime.internal.config import Credentials, RuntimeConfig
-    from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
     from cozy_runtime.internal.worker.control import GrpcControlHost
     from cozy_runtime.internal.worker.plan import JobBinding
     from cozy_runtime.internal.worker.session import Worker, WorkerOptions
     from cozy_runtime.protocol import WIRE_MINOR
     from cozy_runtime.protocol import worker_pb2_grpc as rpc
+    from local_owner import LocalRecordOwner, LocalRequest
     from test_end_to_end import _run, _wheel_rows
     from test_job_preparation_isolation import package
     from test_publish_derivation import _download_set, _SimpleIndex

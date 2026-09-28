@@ -75,8 +75,8 @@ rewrites the bindings and the canonical test corpus from that one commit, so the
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
 -> preflight -> hydrate -> invoke -> validate -> finalize. It is pure surface semantics —
 no device, config, environment, protocol or network — so it lives beside the types it
-enforces, and `internal` depends on `author`, never the reverse. Every door (`run`, `job`,
-a served attempt) is a user experience over that one function, and the per-service fakes
+enforces, and `internal` depends on `author`, never the reverse. Every door (an entrypoint
+or a job attempt) is a user experience over that one function, and the per-service fakes
 in `cozy_runtime.author.fakes` are capability adapters over it rather than a parallel
 runtime.
 
@@ -86,11 +86,9 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 `internal/spawn.py` executes the seal (ERASE -> IMPOSE -> SEAL) around it.
 `internal/exits.py` is the one shared exit-code matrix.
 
-## The two processes, and the two RecordOwners
+## The two processes, and the RecordOwner
 
-    a real RecordOwner ──gRPC───┐
-                                ├──▶ worker (no CUDA) ──seam──▶ executor (CUDA)
-    an in-memory RecordOwner ───┘        cozy.worker.v1, either way
+    RecordOwner ──gRPC + signed Claim──▶ worker (no CUDA) ──seam──▶ executor (CUDA)
 
 Product hosts run `cozy-runtime-worker`, a private no-argument entrypoint that constructs
 the worker core directly. On a base worker image it starts as root, consumes the six-value
@@ -334,7 +332,7 @@ by the adapter and the reader over the same parsed tree.
 
 The reader is also what the DEVELOPMENT placement is built from (the worker session's own
 staging): it supervises and does not execute, so it reads the source and takes its model
-slots off the interface document. `cozy-runtime run` still imports — it is about to run the package.
+slots off the interface document.
 
 `internal/discovery.py` is the import path and the static reader's ORACLE: it imports exactly
 the ONE `App` export package.toml names, freezes it, and stops. `cozy-runtime --conformance
@@ -586,11 +584,6 @@ activation capacity. H3's full BF16 text and DiT weight working sets are about 2
 1.42 GB respectively; video-VAE activation tiling and encoded-leaf eviction remain separate
 qualification gaps. No dtype or inference backend is substituted to make a model fit.
 
-Model-bound `cozy-runtime run` uses the same explicit source-checkout lane: package.toml (or its
-`--model` override) selects an exact ref, the local TensorFS Repository resolves its release/lane,
-and the normal worker/attempt kernel applies the host's real GPU checks. It never authors a
-flat binding record or pretends the local selection carries Tensorhub's hardware evidence.
-
 An unpublished package runs from captured source without a Tensorhub package release.
 A local script is the single-file form; editable describes an installation mode.
 On a rental, an editable checkout is not mounted or watched. Creator builds one exact
@@ -609,8 +602,6 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 
 `examples/marco-polo` is the weightless reference package — one entrypoint, one job, no model
 — and it is what the end-to-end suite builds, installs and runs.
-
-`run` and `job` run over the real attempt kernel (cr-016).
 
 **Jobs (cr-009).** A job is an attempt class on the same machinery, not a second runtime:
 `@app.job` over the one invocation kernel, the same worker/executor split, the same

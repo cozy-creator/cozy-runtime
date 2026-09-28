@@ -37,15 +37,10 @@ import pytest
 
 from cozy_runtime.internal import child_env, liveness, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal.development_launch import LOCAL_PLACEMENT
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.local import (
-    LOCAL_PLACEMENT,
-    LocalRecordOwner,
-    LocalRequest,
-    SliceOutcome,
-    run_slice,
-)
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+from local_owner import LocalRecordOwner, LocalRequest, SliceOutcome, run_slice
 from test_end_to_end import NO_EXECUTOR
 
 ROOT = Path(__file__).resolve().parent.parent

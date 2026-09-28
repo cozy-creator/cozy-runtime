@@ -1,0 +1,1 @@
+`cozy-runtime` keeps only `describe`, `new` and `version` (plus Creator's private plumbing verbs); `run`, `job`, `serve`, `bindings`, `doctor`, `capability`, `hostfacts` and the preparation verbs are gone — packages run on a machine through `cozy run`. Every Claim is the RecordOwner's signed ClaimProof.

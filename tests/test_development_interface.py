@@ -7,18 +7,12 @@ every local run of it was refused `development_source_changed`.
 
 from __future__ import annotations
 
-import json
-import os
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
-from test_end_to_end import NO_EXECUTOR
 
 PACKAGE = """\
 import msgspec
@@ -47,41 +41,6 @@ async def twice(ctx: Context, *, value: int) -> Result:
 
 app.job(twice)
 """
-
-
-@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-def test_package_with_a_memoized_job_runs_locally(tmp_path: Path) -> None:
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "package.toml").write_text('[application]\nobject = "memo_app:app"\n')
-    (project / "memo_app.py").write_text(PACKAGE)
-    # The executor's control socket lives under --out, and sun_path holds 108 bytes.
-    with tempfile.TemporaryDirectory(prefix="cz.", dir="/tmp") as out:
-        done = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "cozy_runtime.cli.main",
-                "--json",
-                "--dir",
-                str(project),
-                "run",
-                "serve",
-                "value=3",
-                "--out",
-                out,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd="/",
-            env={**os.environ, "COZY_HOME": str(tmp_path / "home")},
-            timeout=600,
-        )
-    assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-4000:]
-    body = json.loads(done.stdout)
-    assert body["status"] == "OUTCOME_STATUS_SUCCEEDED", body
-    assert body["result"] == {"value": 4}
 
 
 def test_conformance_compares_what_a_source_reading_can_know(tmp_path: Path) -> None:

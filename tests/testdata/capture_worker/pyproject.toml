@@ -1,5 +1,0 @@
-[project]
-name = "capture-worker-fixture"
-version = "0.0.1"
-requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime>=0.8.0,<1", "torch>=2.13,<3"]

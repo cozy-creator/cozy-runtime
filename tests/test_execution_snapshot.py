@@ -7,10 +7,11 @@ import threading
 from collections.abc import Iterator
 from pathlib import Path
 
+import signed_claims
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_machine_execution import ack, complete, offer
 
@@ -20,15 +21,14 @@ def test_reconnect_preserves_machine_collection_and_legacy_recovery(tmp_path: Pa
         RuntimeConfig(
             cozy_home=tmp_path / "home",
             credentials=Credentials(),
+            record_owner_public_key=signed_claims.PUBLIC_KEY,
         ),
-        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
+        WorkerOptions(
+            **signed_claims.IDENTITY, root=tmp_path / "worker", tensorfs_root=tmp_path / "store"
+        ),
         InMemoryControlHost(),
     )
-    claim = pb.Claim(
-        record_owner_id="owner",
-        record_owner_epoch=1,
-        wire_minor=WIRE_MINOR,
-    )
+    claim = signed_claims.claim()
     observed: queue.Queue[pb.WorkerFrame] = queue.Queue()
     try:
         assert worker.accept_claim(claim, observed.put)[0] == 1

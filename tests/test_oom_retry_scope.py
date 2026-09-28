@@ -17,9 +17,9 @@ import shutil
 from pathlib import Path
 
 from cozy_runtime.internal import accel
-from cozy_runtime.internal.local import LocalRequest
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRequest
 from test_shared_lane import (
     DEVICE,
     PACKAGE,

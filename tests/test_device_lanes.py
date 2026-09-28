@@ -34,12 +34,6 @@ from cozy_runtime.internal import accel, child_env, executor_commands, package_i
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor_commands import Start
-from cozy_runtime.internal.local import (
-    LocalRecordOwner,
-    LocalRequest,
-    SliceOutcome,
-    run_slice,
-)
 from cozy_runtime.internal.worker import lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -52,6 +46,7 @@ from cozy_runtime.internal.worker.session import (
     executor_load_command,
 )
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRecordOwner, LocalRequest, SliceOutcome, claimable, run_slice
 from test_end_to_end import NO_EXECUTOR
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -232,7 +227,7 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
     with _workspace() as root:
         config = _config(root / "home")
         options = WorkerOptions(root=root / "worker", devices="0,1")
-        worker = Worker(config, options, InMemoryControlHost())
+        worker = Worker(*claimable(config, options), InMemoryControlHost())
         assert [lane.devices for lane in worker.lanes.lanes] == ["0", "1"]
         assert worker.lanes.envelope.devices == "0,1"
         lane = worker.lanes.lanes[1]
@@ -301,8 +296,7 @@ def test_ceilings_are_measured_and_never_double_booked() -> None:
     # second executor on the card is never handed the bytes the first one holds.
     with _workspace() as root:
         worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0"),
+            *claimable(_config(root / "home"), WorkerOptions(root=root / "worker", devices="0")),
             InMemoryControlHost(),
         )
         try:
@@ -392,8 +386,7 @@ def test_one_lane_worker_seats_and_a_two_lane_worker_sum() -> None:
     with _workspace() as root:
         config = _config(root / "home")
         worker = Worker(
-            config,
-            WorkerOptions(root=root / "worker", devices="0,1"),
+            *claimable(config, WorkerOptions(root=root / "worker", devices="0,1")),
             InMemoryControlHost(),
         )
         try:
@@ -457,8 +450,7 @@ def test_the_ledger_row_survives_a_switch_to_another_placement() -> None:
     with _workspace() as root:
         config = _config(root / "home")
         worker = Worker(
-            config,
-            WorkerOptions(root=root / "worker", devices="0"),
+            *claimable(config, WorkerOptions(root=root / "worker", devices="0")),
             InMemoryControlHost(),
         )
         try:

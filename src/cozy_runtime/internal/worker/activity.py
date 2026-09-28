@@ -148,7 +148,7 @@ def active_work(worker: Worker) -> bool:
 def meter(worker: Worker) -> str | None:
     """One reading of everything this worker is doing, or None when it cannot be read.
 
-    The same composite `local.run_slice`'s readiness watch folds for a boot, widened to the
+    A boot's readiness composite, widened to the
     whole worker: every thread's `progress_burn` except the lanes that wake on a CLOCK
     (`Worker.pollers` — the reporter that writes this file among them, so the writer's own
     cost can never look like work), PLUS every descendant process, PLUS the observation

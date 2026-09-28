@@ -34,8 +34,6 @@ from cozy_runtime.author._observations import (
     EventRing,
     ObservationRefusal,
 )
-from cozy_runtime.cli import run as cli_run
-from cozy_runtime.cli.io import CliError
 from cozy_runtime.internal import (
     attention,
     attention_fp8,
@@ -48,10 +46,10 @@ from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor_commands import Binding
-from cozy_runtime.internal.local import LocalRequest, run_slice
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.plan import DeclaredBinding, ModelBinding
 from cozy_runtime.internal.worker.session import WorkerOptions, executor_load_command
+from local_owner import LocalRequest, run_slice
 from test_end_to_end import NO_EXECUTOR
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
@@ -768,7 +766,6 @@ def test_a_serving_prepare_carries_no_pin_at_all() -> None:
         _binding(), construction="c", devices="0", authorized_device_limit_bytes=7
     )
     assert "attention_pin" not in executor_commands.encode(served)
-    assert WorkerOptions(root=Path("/tmp")).attention_pin == ""
 
 
 def test_a_pinned_prepare_names_one_kernel_for_every_model_of_the_construction() -> None:
@@ -795,37 +792,10 @@ def test_a_pinned_prepare_names_one_kernel_for_every_model_of_the_construction()
     assert "attention_pin" not in {f.name for f in msgspec.structs.fields(Binding)}
 
 
-@pytest.mark.parametrize(
-    "term",
-    [
-        "kernel.gemm=rowwise",  # an axis this runtime does not have
-        "kernel.attention",  # no value
-        "kernel.attention=",  # an empty pin is not a pin
-        "kernel.attention:=sageattention",  # the typed-JSON form of the payload grammar
-    ],
-)
-def test_an_unusable_kernel_term_refuses_instead_of_becoming_a_payload_field(term: str) -> None:
-    """The reserved namespace is claimed BEFORE the payload grammar sees a term, so a
-    mistyped override can never quietly land on a package's own field."""
-    with pytest.raises(CliError) as refused:
-        cli_run.split_flags(["marco", term])
-    assert refused.value.name == "usage"
-    assert "kernel.attention=<name>" in str(refused.value.remedy)
-
-
-def test_the_claimed_pin_leaves_the_payload_terms_untouched() -> None:
-    terms, flags = cli_run.split_flags(
-        ["fl2va", "prompt=a cat", "kernel.attention=sageattention", "--seed", "7"]
-    )
-    assert terms == ["fl2va", "prompt=a cat"]
-    assert flags["kernel.attention"] == ["sageattention"]
-    assert flags["--seed"] == ["7"]
-
-
 @needs_executor
 def test_a_pin_that_cannot_be_honoured_refuses_through_the_whole_real_path() -> None:
-    """THE THREAD, end to end and unmocked: `cozy-runtime run`'s ephemeral worker, the real
-    prepare command, a real executor child process.
+    """THE THREAD, end to end and unmocked: an in-process worker, the real prepare command, a
+    real executor child process.
 
     `examples/marco-polo` declares no model, so it holds no attention site — and a pin with
     nowhere to go is REFUSED rather than ignored. That is the same rule the A/B rests on: a
@@ -852,17 +822,14 @@ def test_a_pin_that_cannot_be_honoured_refuses_through_the_whole_real_path() -> 
                     outputs=(),
                     request_id="pin-weightless",
                     kind="entrypoint",
+                    attention_kernel="sageattention",
                 ),
                 workspace=workspace,
                 package_installation_id="local-" + uuid.uuid4().hex,
                 package_interface_document=body,
                 project=PACKAGE,
                 development_tensorfs_root=config.cozy_home / "tensorfs",
-                options=WorkerOptions(
-                    root=workspace / "worker",
-                    devices="0",
-                    attention_pin="sageattention",
-                ),
+                options=WorkerOptions(root=workspace / "worker", devices="0"),
             )
     # A request-scoped pin refusal terminates the attempt; it does not fault the binding (#678).
     assert outcome.status == "OUTCOME_STATUS_REFUSED", outcome.terminal

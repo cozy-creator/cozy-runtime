@@ -45,7 +45,7 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal.local import LocalRequest
+from local_owner import LocalRequest
 from test_shared_lane import (
     DEVICE,
     Neighbour,

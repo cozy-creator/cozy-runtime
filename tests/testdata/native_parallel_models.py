@@ -29,6 +29,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.derive.microscale import encode_fp8_rowwise
 from cozy_runtime.internal import accel, canonical, package_interface, spawn
+from cozy_runtime.internal.development_launch import stage_development_placement
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE
 from cozy_runtime.internal.executor import Executor, _capture_seal
@@ -40,7 +41,6 @@ from cozy_runtime.internal.executor_commands import (
     PrepareRequest,
     Start,
 )
-from cozy_runtime.internal.local import stage_development_placement
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
 from cozy_runtime.internal.weights_sink import weights_transaction_id

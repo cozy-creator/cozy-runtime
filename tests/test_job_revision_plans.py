@@ -11,9 +11,9 @@ import pytest
 
 from cozy_runtime.internal import job_plan, package_installation, package_interface
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.local import stage_job_plans
 from cozy_runtime.internal.worker.package_prepare import _stage_job_plans
 from cozy_runtime.internal.worker.plan import JobBinding
+from local_owner import stage_job_plans
 
 
 def test_two_installations_with_one_interface_keep_exact_resumable_plans(tmp_path: Path) -> None:

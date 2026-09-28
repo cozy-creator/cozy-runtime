@@ -11,13 +11,14 @@ import pytest
 
 from cozy_runtime.internal import child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal.development_launch import stage_development_placement
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest, stage_development_placement
 from cozy_runtime.internal.worker.attempts import AttemptRefusal, Released
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRecordOwner, LocalRequest, claimable
 from test_end_to_end import NO_EXECUTOR
 
 SOURCE = """
@@ -102,16 +103,18 @@ def test_refused_load_then_success_on_the_same_executor() -> None:
         )
         placement = staged.placement
         worker = Worker(
-            config,
-            WorkerOptions(
-                root=root / "worker",
-                devices="0",
-                tensorfs_root=staged.tensorfs_root,
-                artifact_cache=staged.artifact_cache,
-                development_project=project,
-                development_package=placement.development.package,
-                development_release=placement.development.release,
-                development_installation_id=placement.installation_id,
+            *claimable(
+                config,
+                WorkerOptions(
+                    root=root / "worker",
+                    devices="0",
+                    tensorfs_root=staged.tensorfs_root,
+                    artifact_cache=staged.artifact_cache,
+                    development_project=project,
+                    development_package=placement.development.package,
+                    development_release=placement.development.release,
+                    development_installation_id=placement.installation_id,
+                ),
             ),
             InMemoryControlHost(),
         )

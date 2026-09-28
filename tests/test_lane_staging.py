@@ -25,16 +25,12 @@ import pytest
 
 from conftest import sample_python
 from cozy_runtime.internal import package_interface
+from cozy_runtime.internal.development_launch import LOCAL_PLACEMENT, stage_development_placement
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.local import (
-    LOCAL_PLACEMENT,
-    LocalRecordOwner,
-    LocalRequest,
-    stage_development_placement,
-)
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRecordOwner, LocalRequest, claimable
 from test_device_lanes import _config
 from test_end_to_end import NO_EXECUTOR
 
@@ -190,7 +186,7 @@ def _serve(
         development_release=staged.placement.development.release,
         development_installation_id=staged.placement.development.installation_id,
     )
-    worker = Worker(config, options, owner.host)
+    worker = Worker(*claimable(config, options), owner.host)
     owner.watch(worker)
     if hook is not None:
         hook(owner, worker)

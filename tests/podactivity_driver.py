@@ -29,13 +29,9 @@ from typing import Any
 from cozy_runtime.internal import child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.local import (
-    LocalRecordOwner,
-    LocalRequest,
-    run_slice,
-)
 from cozy_runtime.internal.worker import session
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+from local_owner import LocalRecordOwner, LocalRequest, run_slice
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "examples" / "marco-polo"

@@ -30,17 +30,15 @@ from typing import Any
 import pytest
 
 from cozy_runtime.internal import fill, package_interface
+from cozy_runtime.internal.development_launch import stage_development_placement
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor_commands import Restore
-from cozy_runtime.internal.local import (
-    LocalRequest,
-    stage_development_placement,
-)
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.plan import UNCALIBRATED_ACTIVATION_BYTES
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRequest
 from test_shared_lane import (
     DEVICE,
     NO_TENANT,

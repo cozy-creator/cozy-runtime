@@ -35,13 +35,14 @@ from typing import Any
 import pytest
 
 import podactivity_driver
+import signed_claims
 from cozy_runtime.internal import child_env, liveness
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker import activity
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import HostedPlacement, Placement, Worker, WorkerOptions
-from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import claimable
 from test_end_to_end import NO_EXECUTOR
 from test_machine_execution import offer
 
@@ -112,8 +113,10 @@ def test_the_published_document_is_the_shape_the_supervisor_parses() -> None:
     patience it declares is this runtime's own derivation — not a number chosen in Go."""
     with _short_tmp() as root:
         worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(root=root / "worker", activity_path=root / "activity"),
+            *claimable(
+                _config(root / "home"),
+                WorkerOptions(root=root / "worker", activity_path=root / "activity"),
+            ),
             InMemoryControlHost(),
         )
         try:
@@ -188,8 +191,10 @@ def test_active_work_excludes_connected_owners_and_retained_outcomes() -> None:
 
     with _short_tmp() as root:
         worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(root=root / "worker", activity_path=root / "activity"),
+            *claimable(
+                _config(root / "home"),
+                WorkerOptions(root=root / "worker", activity_path=root / "activity"),
+            ),
             InMemoryControlHost(),
         )
         worker.attached_streams.add(1)
@@ -221,7 +226,8 @@ def test_active_work_excludes_connected_owners_and_retained_outcomes() -> None:
 def test_model_warmup_is_active_but_a_resident_model_is_idle() -> None:
     with _short_tmp() as root:
         worker = Worker(
-            _config(root / "home"), WorkerOptions(root=root / "worker"), InMemoryControlHost()
+            *claimable(_config(root / "home"), WorkerOptions(root=root / "worker")),
+            InMemoryControlHost(),
         )
         placement = Placement(
             placement_id="model",
@@ -267,13 +273,13 @@ def test_an_execution_holds_the_rental_exactly_while_its_unit_lives(
     monkeypatch.setattr(Worker, "dispatch_machine", held)
     with _short_tmp() as root:
         worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+            *claimable(
+                _config(root / "home"),
+                WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+            ),
             InMemoryControlHost(),
         )
-        claim = pb.Claim(
-            record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b""
-        )
+        claim = signed_claims.claim()
         executions = worker.executions
         assert executions is not None
         try:
@@ -322,8 +328,7 @@ def test_an_unreadable_meter_is_absent_and_never_a_zero(monkeypatch: pytest.Monk
     assert liveness.burn(2**22 - 1) is None
     with _short_tmp() as root:
         worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(root=root / "worker"),
+            *claimable(_config(root / "home"), WorkerOptions(root=root / "worker")),
             InMemoryControlHost(),
         )
         try:

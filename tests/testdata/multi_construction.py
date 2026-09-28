@@ -26,9 +26,9 @@ import native_parallel_models as native  # type: ignore[import-not-found]
 
 from cozy_runtime.author import Config
 from cozy_runtime.internal import accel, package_interface
+from cozy_runtime.internal.development_launch import stage_development_placement
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import main as executor_main
-from cozy_runtime.internal.local import stage_development_placement
 from cozy_runtime.internal.parallel import group as group_module
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, listener
 from cozy_runtime.internal.worker.session import executor_load_command

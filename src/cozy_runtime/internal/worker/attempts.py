@@ -103,10 +103,6 @@ def safe(text: str, cap: int = 1024) -> str:
     return ascii_only[:cap]
 
 
-def _attention_pin(spec: Mapping[str, Any], default: str) -> str:
-    return str(spec.get("attention_kernel") or default)
-
-
 def _coded(outcome: Mapping[str, Any]) -> str:
     """`<code>: <message>` — the AUTHOR's typed code in front of its own sentence.
 
@@ -556,7 +552,6 @@ class AttemptEngine:
         owner_scope: Callable[[], str] = lambda: "",
         tensorfs_root: Path | None = None,
         work_fingerprint: Callable[[AttemptRecord], str] | None = None,
-        attention_pin: str = "",
         room: Callable[[AttemptRecord], Exchange] | None = None,
     ) -> None:
         self.records = records
@@ -567,7 +562,6 @@ class AttemptEngine:
         self.spool_root = spool_root
         self.instance_id = instance_id
         #: the dev-mode attention pin of a request that names none (`WorkerOptions`)
-        self.attention_pin = attention_pin
         self.send = send
         self.progress = progress
         #: journals that execution STARTED, immediately before the executor is handed the
@@ -844,7 +838,7 @@ class AttemptEngine:
                     entrypoint=declared.entrypoint,
                     payload=attempt.payload,
                     capture=attempt.spec.get("capture"),
-                    attention_kernel=_attention_pin(attempt.spec, self.attention_pin),
+                    attention_kernel=str(attempt.spec.get("attention_kernel") or ""),
                     input_metadata={
                         name: InputMetadata(
                             input_id=name,
@@ -1929,7 +1923,7 @@ class AttemptEngine:
         return Invoke(
             construction=attempt.declared.construction_key(),
             capture=attempt.spec.get("capture"),
-            attention_kernel=_attention_pin(attempt.spec, self.attention_pin),
+            attention_kernel=str(attempt.spec.get("attention_kernel") or ""),
             request_id=key,
             entrypoint=attempt.declared.entrypoint,
             deadline_s=seconds,

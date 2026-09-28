@@ -35,18 +35,15 @@ from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
 from cozy_runtime.internal import attention, canonical, child_env, package_interface  # noqa: E402
 from cozy_runtime.internal.config import Credentials, RuntimeConfig  # noqa: E402
+from cozy_runtime.internal.development_launch import stage_development_placement  # noqa: E402
 from cozy_runtime.internal.discovery import discover  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN, DeviceFacts  # noqa: E402
-from cozy_runtime.internal.local import (  # noqa: E402
-    LocalRecordOwner,
-    LocalRequest,
-    stage_development_placement,
-)
 from cozy_runtime.internal.weights_sink import weights_transaction_id  # noqa: E402
 from cozy_runtime.internal.worker import triage  # noqa: E402
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions  # noqa: E402
 from cozy_runtime.protocol import documents  # noqa: E402
 from cozy_runtime.protocol import worker_pb2 as pb  # noqa: E402
+from local_owner import LocalRecordOwner, LocalRequest, claimable  # noqa: E402
 from test_end_to_end import NO_EXECUTOR  # noqa: E402
 
 TESTDATA = Path(__file__).parent / "testdata"
@@ -190,7 +187,7 @@ def _serve(root: Path, requests: list[LocalRequest]) -> tuple[Sequence, Worker, 
         development_release=staged.placement.development.release,
         development_installation_id=staged.placement.development.installation_id,
     )
-    worker = Worker(config, options, owner.host)
+    worker = Worker(*claimable(config, options), owner.host)
     notes: list[str] = []
     narrate = worker.note
 

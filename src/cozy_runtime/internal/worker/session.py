@@ -352,17 +352,6 @@ class WorkerOptions:
     """Exact launch facts the development Placement must echo."""
     development_binding_overrides: Mapping[str, str] = field(default_factory=dict)
     """One-shot local resolver inputs; long-lived Creator launches use package.toml."""
-    attention_pin: str = ""
-    """THE EXECUTION-PATH OVERRIDE (cr-125): one attention kernel by name, or empty.
-
-    Empty is the whole product. A serving worker picks the fastest kernel this device and
-    image support by itself (cr-124) and has no knob at all: the guard is the absence of a
-    way to say it rather than a condition somebody could get wrong. Only the ephemeral worker
-    `cozy-runtime run` builds in memory can carry one, which is exactly the dev mode the
-    A/B needs: two runs, two pins, one honest comparison.
-
-    It is the pin of every request that names none: an execution parameter of `invoke`,
-    applied on every rank for that attempt, never a construction of its own (cr-191)."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
@@ -894,8 +883,8 @@ def executor_load_command(
     `parameter_names[i]` is every parameter name the i-th model is bound under across the
     bindings that share this construction (h3a-018); absent, the model binds under this
     binding's own name. `attention_pin` rides the same way when a caller prepares a
-    construction for one kernel (cr-125). The worker never does: a request's pin, and the
-    dev-mode `WorkerOptions.attention_pin` default, are execution parameters of `invoke`.
+    construction for one kernel (cr-125). The worker never does: a request's pin is an
+    execution parameter of `invoke`.
     """
 
     models = []
@@ -979,8 +968,6 @@ class Worker:
 
     def __init__(self, config: RuntimeConfig, options: WorkerOptions, host: ControlHost) -> None:
         if host.persistent and not config.record_owner_public_key:
-            # A listener admits only the RecordOwner's signed Claim; only an in-process
-            # owner, which has no transport, has no key.
             raise ValueError("a worker listener needs the RecordOwner's public key")
         self.config = config
         self.options = options
@@ -1196,7 +1183,6 @@ class Worker:
             jobs={},
             spool_root=self.root / "spool",
             instance_id=options.instance_id,
-            attention_pin=options.attention_pin,
             send=self.send,
             progress=self.emit_progress,
             dispatched=self._dispatched,
@@ -2223,32 +2209,26 @@ class Worker:
                     f"{CAPABILITY_UNAVAILABLE_CODE}: "
                     + _capability_unavailable("workspace calls", claim.wire_minor)
                 )
-            if self.config.record_owner_public_key:
-                if (
-                    claim.worker_boot_id != self.fence.worker_boot_id
-                    or claim.worker_id != self.options.worker_id
-                ):
-                    raise WorkspaceRefusal("workspace proof names another worker lifetime")
-                # The transcript is (epoch, boot, worker, certificate); all but the epoch are
-                # this process's own, so one verified signature stands for the epoch.
-                proven = (claim.record_owner_epoch, bytes(claim.proof))
-                if proven != self._proven_claim:
-                    try:
-                        downloads.verify_claim_proof(
-                            claim,
-                            self.config.record_owner_public_key,
-                            worker_id=self.options.worker_id,
-                            worker_boot_id=self.fence.worker_boot_id,
-                            worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
-                        )
-                    except downloads.DownloadRefusal as exc:
-                        raise WorkspaceRefusal("workspace owner proof was refused") from exc
-                    self._proven_claim = proven
-            elif claim.worker_id not in ("", self.options.worker_id) or (
-                claim.worker_boot_id not in ("", self.fence.worker_boot_id)
+            if (
+                claim.worker_boot_id != self.fence.worker_boot_id
+                or claim.worker_id != self.options.worker_id
             ):
-                # No key: the owner is in this process and has no transport.
-                raise WorkspaceRefusal("workspace call names another worker lifetime")
+                raise WorkspaceRefusal("workspace proof names another worker lifetime")
+            # The transcript is (epoch, boot, worker, certificate); all but the epoch are
+            # this process's own, so one verified signature stands for the epoch.
+            proven = (claim.record_owner_epoch, bytes(claim.proof))
+            if proven != self._proven_claim:
+                try:
+                    downloads.verify_claim_proof(
+                        claim,
+                        self.config.record_owner_public_key,
+                        worker_id=self.options.worker_id,
+                        worker_boot_id=self.fence.worker_boot_id,
+                        worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
+                    )
+                except downloads.DownloadRefusal as exc:
+                    raise WorkspaceRefusal("workspace owner proof was refused") from exc
+                self._proven_claim = proven
             return self.fence.record_owner_id
 
     def _execution_service(self, claim: pb.Claim) -> tuple[workspace_executions.Executions, str]:
@@ -3658,22 +3638,17 @@ class Worker:
             send(pb.WorkerFrame(claim_ack=ack))
             return 0, queue.Queue()
 
-        # THE CREDENTIAL CHECK: a listener verifies the RecordOwner's signed Claim; only an
-        # in-process owner, which has no transport, goes without.
-        if self.config.record_owner_public_key:
-            try:
-                downloads.verify_claim_proof(
-                    claim,
-                    self.config.record_owner_public_key,
-                    worker_id=self.options.worker_id,
-                    worker_boot_id=self.fence.worker_boot_id,
-                    worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
-                )
-            except downloads.DownloadRefusal as exc:
-                return reject(
-                    pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
-                    exc.detail,
-                )
+        # THE CREDENTIAL CHECK: every Claim is the RecordOwner's signed ClaimProof.
+        try:
+            downloads.verify_claim_proof(
+                claim,
+                self.config.record_owner_public_key,
+                worker_id=self.options.worker_id,
+                worker_boot_id=self.fence.worker_boot_id,
+                worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
+            )
+        except downloads.DownloadRefusal as exc:
+            return reject(pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED, exc.detail)
         if claim.worker_id and claim.worker_id != self.options.worker_id:
             return reject(
                 pb.ClaimRejection.CLAIM_REJECTION_WORKER_ID_MISMATCH,
@@ -5261,11 +5236,10 @@ class Worker:
                 )
                 return None
             try:
-                from cozy_runtime.internal import local as development_local
-                from cozy_runtime.internal import static_interface
+                from cozy_runtime.internal import development_launch, static_interface
 
                 # A SOURCE reading (#713): the session supervises, the executor imports.
-                staged = development_local.stage_development_placement(
+                staged = development_launch.stage_development_placement(
                     self.config.cozy_home,
                     static_interface.build(self.options.development_project),
                     package=self.options.development_package,

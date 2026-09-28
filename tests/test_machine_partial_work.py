@@ -29,7 +29,6 @@ import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
-from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -37,6 +36,7 @@ from cozy_runtime.internal.worker.stage_progress import SAMPLE_SECONDS
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
+from local_owner import LocalRecordOwner, LocalRequest
 from test_end_to_end import NO_EXECUTOR
 
 SCRIPT = """import msgspec

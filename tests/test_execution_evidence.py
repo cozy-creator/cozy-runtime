@@ -21,9 +21,9 @@ from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
-from cozy_runtime.internal.local import LocalRequest, run_slice
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.worker.session import WorkerOptions
+from local_owner import LocalRequest, run_slice
 from test_end_to_end import NO_EXECUTOR
 
 MODULE = "execution_evidence_fixture"

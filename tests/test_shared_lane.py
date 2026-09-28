@@ -45,17 +45,14 @@ import pytest
 
 from cozy_runtime.internal import accel, canonical, child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal.development_launch import stage_development_placement
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.local import (
-    LocalRecordOwner,
-    LocalRequest,
-    stage_development_placement,
-)
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.plan import UNCALIBRATED_ACTIVATION_BYTES
 from cozy_runtime.internal.worker.session import HostedPlacement, Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRecordOwner, LocalRequest, claimable
 from test_end_to_end import NO_EXECUTOR
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -546,7 +543,7 @@ def _drive(
         development_release=staged.placement.development.release,
         development_installation_id=staged.placement.development.installation_id,
     )
-    worker = Worker(config, options, owner.host)
+    worker = Worker(*claimable(config, options), owner.host)
     holder.append(worker)
     notes: list[tuple[str, str]] = []
     narrate = worker.note
@@ -830,7 +827,7 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             development_release=staged.placement.development.release,
             development_installation_id=staged.placement.development.installation_id,
         )
-        worker = Worker(config, options, InMemoryControlHost())
+        worker = Worker(*claimable(config, options), InMemoryControlHost())
         seals: list[str] = []
         try:
             worker.accepted.mode = "serving"
@@ -1106,7 +1103,7 @@ def test_a_growing_placement_keeps_its_process_and_its_admission(twin: TwinStore
             development_release=staged.placement.development.release,
             development_installation_id=staged.placement.development.installation_id,
         )
-        worker = Worker(config, options, owner.host)
+        worker = Worker(*claimable(config, options), owner.host)
         holder.append(worker)
         notes: list[tuple[str, str]] = []
         narrate = worker.note

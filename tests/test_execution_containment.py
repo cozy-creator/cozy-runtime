@@ -31,16 +31,16 @@ import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import canonical, child_env, liveness
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
-from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
 from cozy_runtime.internal.worker import activity, execution_unit, machine_byte_results
 from cozy_runtime.internal.worker.control import GrpcControlHost, InMemoryControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_executions import Executions
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
+from local_owner import LocalRecordOwner, LocalRequest
 from test_end_to_end import NO_EXECUTOR
 from test_workspace_custody import produced
 
@@ -571,7 +571,9 @@ def test_a_boot_releases_what_a_terminal_execution_holds(tmp_path: Path) -> None
         for output in outputs:
             output["mime_type"] = "application/vnd.cozy.model-manifest"
     invocation = canonical.write(value)
-    options = WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store")
+    options = WorkerOptions(
+        **signed_claims.IDENTITY, root=tmp_path / "worker", tensorfs_root=tmp_path / "store"
+    )
     executions = Executions(Workspace(tmp_path / "store"))
     executions.submit(
         "owner",
@@ -592,15 +594,16 @@ def test_a_boot_releases_what_a_terminal_execution_holds(tmp_path: Path) -> None
     tensorfs.gc(str(store.root))
     assert store.manifest(manifest)["manifest"]  # held by its failed execution
     worker = Worker(
-        RuntimeConfig(cozy_home=tmp_path / "home", credentials=Credentials()),
+        RuntimeConfig(
+            cozy_home=tmp_path / "home",
+            credentials=Credentials(),
+            record_owner_public_key=signed_claims.PUBLIC_KEY,
+        ),
         options,
         InMemoryControlHost(),
     )
     try:
-        worker.accept_claim(
-            pb.Claim(record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR),
-            lambda frame: None,
-        )
+        worker.accept_claim(signed_claims.claim(), lambda frame: None)
         assert not executions.retention_required("owner")
         assert tensorfs.gc(str(store.root))["reclaimed_bytes"] > 0
         with pytest.raises(tensorfs.errors.ObjectAbsent):

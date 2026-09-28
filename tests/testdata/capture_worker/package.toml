@@ -1,7 +1,0 @@
-[application]
-object = "capture_fixture:app"
-
-[bindings."generate.models.model"]
-model = "proof/ordered"
-release = "1.0.0"
-lane = "bf16"

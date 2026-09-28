@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from cozy_runtime.internal.local import LocalRecordOwner
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRecordOwner
 from test_device_lanes import _slice, _workspace, needs_executor
 
 

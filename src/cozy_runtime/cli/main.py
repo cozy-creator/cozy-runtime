@@ -13,8 +13,6 @@ from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 
 BUILT = (
-    "run",
-    "job",
     "describe",
     "new",
     "version",
@@ -31,26 +29,11 @@ HELP = """cozy-runtime — everything a single package venv can do alone
 usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args]
 
 verbs:
-  run <fn> [<primary>] [k=v …]   one-shot inference: payload in, outputs to disk, exit
-  job <fn> [k=v …]               run one @app.job to completion, same attempt kernel
   describe [<fn>]                the PackageInterface, from source alone (no package code runs)
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
 
-run/job flags:
-  --model [path=]<ref>  override a model binding (repeatable)
-  --tensorfs-root <dir> explicit local Store root for a model-bound source run
-  --input <ref>=<dir>   grant one materialized input tree (job only, repeatable)
-  --org <name>          publishing org; a job's writes land in <org>/_job-<request-id>
-  --out <dir>           output directory (default ./outputs)
-  --seed <n>            deterministic RNG
-  --capture <json>      activation capture: {"components":["unet"],"steps":[0,1]}
-  --in <file>           whole payload as JSON, key=value merged on top
-  key=@/absolute/file   stage a local file only at a declared Asset field
-  kernel.attention=<k>  DEV: pin one attention kernel for this run instead of the fastest
-                        one this device and image support; refuses if it cannot serve
-  --timeout <dur>       attempt deadline (<n>ms|s|m|h)
-  --stream              typed deltas as NDJSON
+Packages run on a machine through `cozy run`; this CLI only reads and scaffolds them.
 
 global flags:
   --json           the full typed result as one JSON document
@@ -78,9 +61,6 @@ _VALUE_FLAGS = (
     "--distribution",
     "--builtin",
 )
-#: Verbs that own their own flag parsing: everything after the verb belongs to them, so a
-#: payload term like `--in` is not eaten by the global pass.
-_OWNS_ARGS = ("run", "job")
 
 
 def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
@@ -98,12 +78,7 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
     rest = list(argv)
     while rest:
         item = rest.pop(0)
-        if verb in _OWNS_ARGS:
-            # The verb owns everything after itself. `run` has flags of its own and a
-            # payload grammar that spells `key=value`; a global pass that tried to
-            # interpret those would have to know the package's schema.
-            args.append(item)
-        elif item in ("-h", "--help"):
+        if item in ("-h", "--help"):
             want_help = True
         elif item == "--json":
             as_json = True
@@ -263,7 +238,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
     # Interpreter plumbing stays portable without importing executor-only modules.
     from cozy_runtime.cli import image_prepare as image_prepare_verb
     from cozy_runtime.cli import new as new_verb
-    from cozy_runtime.cli import run as run_verb
     from cozy_runtime.cli import version as version_verb
 
     if verb == "version":
@@ -277,8 +251,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 Exit.usage,
             )
         return new_verb.run(args[0], opts.dir)
-    if verb in ("run", "job"):
-        return run_verb.run(verb, args, opts, config)
     if verb == "image-prepare":
         return image_prepare_verb.run(args)
     if verb == "image-preparation-profile":

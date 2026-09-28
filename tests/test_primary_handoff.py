@@ -14,12 +14,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from cozy_runtime.internal import package_interface
+from cozy_runtime.internal.development_launch import stage_development_placement
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.local import (
-    LocalRecordOwner,
-    LocalRequest,
-    stage_development_placement,
-)
 from cozy_runtime.internal.worker.attempts import AttemptRecord, Released
 from cozy_runtime.internal.worker.child import Executor, ExecutorSupervision
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -27,6 +23,7 @@ from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRecordOwner, LocalRequest, claimable
 from test_device_lanes import _config, _workspace, needs_executor
 
 
@@ -152,16 +149,18 @@ def test_replacement_waits_for_work_then_retires_before_assignment() -> None:
             )
 
         worker = ObservedWorker(
-            config,
-            WorkerOptions(
-                root=root / "worker",
-                devices="0,1",
-                tensorfs_root=staged.tensorfs_root,
-                artifact_cache=staged.artifact_cache,
-                development_project=project,
-                development_package=staged.placement.development.package,
-                development_release=staged.placement.development.release,
-                development_installation_id=staged.placement.development.installation_id,
+            *claimable(
+                config,
+                WorkerOptions(
+                    root=root / "worker",
+                    devices="0,1",
+                    tensorfs_root=staged.tensorfs_root,
+                    artifact_cache=staged.artifact_cache,
+                    development_project=project,
+                    development_package=staged.placement.development.package,
+                    development_release=staged.placement.development.release,
+                    development_installation_id=staged.placement.development.installation_id,
+                ),
             ),
             InMemoryControlHost(),
         )
@@ -284,16 +283,18 @@ def test_only_the_process_identity_decides_between_in_place_and_replacement() ->
         placement.placement_id = "primary"
         raw, digest = documents.identity(pb.PlacementSet(placements=[placement]))
         worker = Worker(
-            config,
-            WorkerOptions(
-                root=root / "worker",
-                devices="0",
-                tensorfs_root=staged.tensorfs_root,
-                artifact_cache=staged.artifact_cache,
-                development_project=project,
-                development_package=staged.placement.development.package,
-                development_release=staged.placement.development.release,
-                development_installation_id=staged.placement.development.installation_id,
+            *claimable(
+                config,
+                WorkerOptions(
+                    root=root / "worker",
+                    devices="0",
+                    tensorfs_root=staged.tensorfs_root,
+                    artifact_cache=staged.artifact_cache,
+                    development_project=project,
+                    development_package=staged.placement.development.package,
+                    development_release=staged.placement.development.release,
+                    development_installation_id=staged.placement.development.installation_id,
+                ),
             ),
             InMemoryControlHost(),
         )

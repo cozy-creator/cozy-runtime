@@ -26,25 +26,23 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 from cozy_runtime.author import Config
 from cozy_runtime.internal import canonical, child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal.development_launch import LOCAL_PLACEMENT
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import SPEC_PLAIN
-from cozy_runtime.internal.local import (
-    LOCAL_PLACEMENT,
-    LocalRequest,
-    run_slice,
-)
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 from cozy_runtime.internal.worker.session import WorkerOptions
 from cozy_runtime.protocol import documents
 
 PACKAGE = Path(__file__).parent / "h3_group_warm"
-sys.path.insert(0, str(PACKAGE))
+sys.path[:0] = [str(PACKAGE), str(Path(__file__).parents[1])]
 from h3_group_warm import (  # type: ignore[import-not-found]  # noqa: E402
     CONFIG,
     Base,
     BasePipe,
     OverlayPipe,
 )
+
+from local_owner import LocalRequest, run_slice  # noqa: E402
 
 
 def checkpoint(

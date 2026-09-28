@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from cozy_runtime.internal import package_interface
+from cozy_runtime.internal.development_launch import development_placement_documents
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.local import development_placement_documents
 from cozy_runtime.protocol import documents
 
 

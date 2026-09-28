@@ -21,11 +21,11 @@ from packaging.requirements import Requirement
 from conftest import image_python
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
-from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
 from cozy_runtime.internal.worker.job_slots import JobSlot
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRecordOwner, LocalRequest, claimable
 from test_end_to_end import NO_EXECUTOR, _development, _run, _wheel_rows
 
 SOURCE = """from pathlib import Path
@@ -158,15 +158,17 @@ def test_job_only_worker_preparation_preserves_running_job_and_exact_readiness()
         )
         owner = LocalRecordOwner(request, {}, root / "run", package_installation_id="")
         worker = Worker(
-            config,
-            WorkerOptions(
-                root=root / "worker",
-                devices="",
-                accelerator_backend="none",
-                python=str(python),
-                install_root=environment,
-                artifact_cache=root / "artifacts",
-                tensorfs_root=root / "store",
+            *claimable(
+                config,
+                WorkerOptions(
+                    root=root / "worker",
+                    devices="",
+                    accelerator_backend="none",
+                    python=str(python),
+                    install_root=environment,
+                    artifact_cache=root / "artifacts",
+                    tensorfs_root=root / "store",
+                ),
             ),
             owner.host,
         )

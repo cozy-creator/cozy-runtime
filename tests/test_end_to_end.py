@@ -340,9 +340,6 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
     )
 
     _run(*cli, "frobnicate", cwd="/", expect=2)
-    _run(*cli, "run", "nosuchfn", "message=marco", "--out", "/tmp", cwd="/", expect=4)
-    _run(*cli, "run", "marco", "message=nope", "--out", "/tmp", cwd="/", expect=3)
-    _run(*cli, "run", "marco", "bogus=1", "--out", "/tmp", cwd="/", expect=3)
 
 
 def _describe_installed(
@@ -639,108 +636,6 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
         (tmp_path / "prepared-model.json").write_bytes(
             modeled.placement_set.placement_set_canonical_bytes
         )
-
-
-@needs_executor
-def test_installed_cli_serves_a_request(installed_cli: str) -> None:
-    """One served request, all the way through: worker control plus a spawned executor.
-
-    decode -> resolve -> preflight -> hydrate -> invoke -> validate -> finalize, returning
-    the package's own result over the real protocol bytes.
-    """
-    with tempfile.TemporaryDirectory(prefix="cz.", dir="/tmp") as out:
-        served = _run(
-            installed_cli,
-            "--dir",
-            str(PACKAGE),
-            "--json",
-            "run",
-            "marco",
-            "message=marco",
-            "--out",
-            out,
-            cwd="/",
-        )
-    body = json.loads(served.stdout)
-    assert body["result"] == {"message": "polo"}
-    assert body["status"] == "OUTCOME_STATUS_SUCCEEDED"
-
-
-@needs_executor
-def test_installed_cli_runs_a_job_through_the_local_worker(installed_cli: str) -> None:
-    """A JOB, which is a real two-process run: worker control plus a spawned executor.
-
-    Not a second code path — the same acceptance boundary, plan and attempt kernel a served
-    request takes, over a package that declares no model. The short `--out` root is
-    deliberate: the executor's control socket lives under it and `sockaddr_un.sun_path`
-    holds 108 bytes.
-    """
-    with tempfile.TemporaryDirectory(prefix="cz.", dir="/tmp") as out:
-        done = _run(
-            installed_cli,
-            "--dir",
-            str(PACKAGE),
-            "--json",
-            "job",
-            "marco_job",
-            "message=marco",
-            "--out",
-            out,
-            cwd="/",
-        )
-    body = json.loads(done.stdout)
-    assert body["status"] == "OUTCOME_STATUS_SUCCEEDED", body
-    assert body["result"] == {"message": "polo"}
-
-
-def test_a_refusal_terminates_the_process(installed_cli: str) -> None:
-    """CONTAINMENT UNAVAILABLE -> a typed refusal AND AN EXIT, for `run` and for `job`.
-
-    This is the arm cr-061 was missing, and the shape of the assertion is the whole point.
-    The refusal was never broken: on a host whose worker cgroup is not delegated the runtime
-    computed the right diagnosis and printed it. It then sat on a control stream nobody was
-    going to close, until SIGKILL — on any plain container, CI runner or developer box with a
-    different cgroup layout. An arm that asserted only that the refusal was PRINTED is
-    exactly the arm that would have passed against the bug.
-
-    So: a bounded wait, a non-zero status, and the typed error token on stdout. The wait is
-    the assertion.
-    """
-    with _containment_unavailable() as enter_scope:
-        # The second job gets another output workspace and must not conflict
-        # with the first invocation's immutable executable plan.
-        for verb, function in (("run", "marco"), ("job", "marco_job"), ("job", "marco_job")):
-            with tempfile.TemporaryDirectory(prefix="cz.", dir="/tmp") as out:
-                refused = subprocess.run(
-                    (
-                        installed_cli,
-                        "--dir",
-                        str(PACKAGE),
-                        "--json",
-                        verb,
-                        function,
-                        "message=marco",
-                        "--out",
-                        out,
-                    ),
-                    cwd="/",
-                    capture_output=True,
-                    text=True,
-                    timeout=REFUSAL_TIMEOUT,
-                    stdin=subprocess.DEVNULL,
-                    env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
-                    preexec_fn=enter_scope,
-                )
-            assert refused.returncode != 0, (
-                f"`{verb}` exited 0 with no executor: it cannot have run anything\n"
-                f"--- stdout ---\n{refused.stdout[-4000:]}"
-            )
-            error = _trailing_json(refused.stderr)["error"]
-            assert (error["name"], error["code"], refused.returncode) == ("unavailable", 9, 9), (
-                error,
-                refused.returncode,
-            )
-            assert "containment unavailable" in error["message"], error
 
 
 def _write_native_dependency(root: Path, version: str) -> None:

@@ -22,10 +22,10 @@ from typing import Any
 import pytest
 
 from cozy_runtime.internal import liveness
-from cozy_runtime.internal.local import LocalRequest
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.protocol import worker_pb2 as pb
+from local_owner import LocalRequest
 from test_lane_staging import QueueOwner, _request, _serve, _workspace, needs_executor
 
 #: longer than the flat grace this replaces, so the old watchdog would have killed the step
