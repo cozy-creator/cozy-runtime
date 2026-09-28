@@ -241,7 +241,7 @@ class MemoryManager:
         lanes: LaneSet,
         note: Callable[[str, str], None],
         end: Callable[[str, child.Executor, str], bool],
-        vacate: Callable[[child.Executor, tuple[int, ...]], dict[str, object]],
+        vacate: Callable[[child.Executor, tuple[int, ...], bool], dict[str, object]],
         budget: Mapping[str, int] | None = None,
     ) -> None:
         self.lanes = lanes
@@ -312,6 +312,12 @@ class MemoryManager:
         them). True when its measured need fits everywhere, or when it was never measured and
         every idle tenant has gone."""
         lane.touch(slot)
+        if proctree.memory_stalled():
+            # The host stalls on memory: idle tenants give back what they keep there.
+            for other, _, row in self.tenants(set(lane.ordinals)):
+                executor = row.supervision.current if row.supervision is not None else None
+                if other != slot and executor is not None and executor.alive():
+                    self.vacate(executor, (), False)
         need = self.need(lane, slot, shape)
         evicted: list[str] = []
         measured = self.make_room(lane, slot, need, why, evicted)
@@ -442,8 +448,8 @@ class MemoryManager:
         }
         for ordinal in short:
             table = accel.device_processes(lane.entries[lane.ordinals.index(ordinal)])
-            if table is None:
-                continue
+            if table is None or (table and not any(os.path.exists(f"/proc/{p}") for p in table)):
+                continue  # the driver's pids are another namespace's
             held = sum(max(table.get(pid, 0), 0) for pid in pids)
             if measured[ordinal].free_bytes + held < need[ordinal]:
                 return False
@@ -481,7 +487,7 @@ class MemoryManager:
             if lane.group and "vacate_ranks" in executor.hello.get("memory", ())
             else ()
         )
-        reply = self.vacate(executor, ranks)
+        reply = self.vacate(executor, ranks, True)
         if not reply.get("ok"):
             self.note(
                 "residency",
@@ -727,6 +733,7 @@ class _State:
 
     @classmethod
     def take(cls, torch: Any, member: object, leaves: list[object]) -> _State:
+        """`member` is one module tree or a list of them."""
         restores: list[Callable[[], object]] = [
             functools.partial(torch.set_rng_state, torch.get_rng_state())
         ]
@@ -737,10 +744,11 @@ class _State:
             for g in leaves
             if isinstance(g, torch.Generator)
         ]
-        restores += [
-            functools.partial(setattr, module, attribute, value)
-            for (module, attribute), value in _counters(member).items()
-        ]
+        for root in member if isinstance(member, list) else [member]:
+            restores += [
+                functools.partial(setattr, module, attribute, value)
+                for (module, attribute), value in _counters(root).items()
+            ]
         return cls(restores)
 
     def restore(self) -> None:
@@ -799,6 +807,8 @@ class ComponentResidency:
     exhausted: Shortfall | None = None
     #: the work rungs this attempt ran under, as confessions
     applied: set[str] = field(default_factory=set)
+    #: the running call's measured growth, or None while it is unmeasured
+    growth: int | None = None
     #: False in a rank group: a sharded forward cannot run again on one rank alone
     recoverable: bool = True
     #: the allocator bytes this process may hold, or 0 for the whole device
@@ -868,6 +878,8 @@ class ComponentResidency:
         self.recoveries.clear()
         self.applied.clear()
         self.exhausted = None
+        if self.kept_bytes and proctree.memory_stalled():
+            self.relieve_host()
 
     def admit(self, method: str, components: tuple[str, ...]) -> None:
         """Make the declared set resident before the method body runs, paging what does not
@@ -1019,12 +1031,13 @@ class ComponentResidency:
         op.batch = next((int(t.shape[0]) for t in self._tensors(leaves) if t.dim()), 0)
         member = self.backend.components.get(name) or self.backend.parked.get(name)
         plain = op.peaks.get(())
-        rungs = () if plain is not None and self._fits(plain - self._allocated()) else op.rungs
+        rungs = () if plain is not None and self._fits(plain) else op.rungs
         self.running.append(name)
         try:
             while True:
                 self._resident(name)
-                self._clear(name, op.peaks.get(rungs, 0) - self._allocated())
+                self._clear(name, op.peaks.get(rungs, 0))
+                self.growth = op.peaks.get(rungs)
                 versions = self._versions(leaves)
                 state = _State.take(self.torch, member, leaves)
                 codec = _codec(member)
@@ -1040,10 +1053,14 @@ class ComponentResidency:
                 finally:
                     window = self.windows.pop()
                     _restore_codec(member, codec)
-                peak = max(window[0], self._fold())
+                growth = max(window[0], self._fold()) - entered
                 if failure is None:
-                    op.peaks[rungs] = max(op.peaks.get(rungs, 0), peak)
+                    op.peaks[rungs] = max(op.peaks.get(rungs, 0), growth)
                     op.rungs = rungs
+                    if "split" not in rungs:
+                        op.splits = 1
+                    if "tile" not in rungs:
+                        op.tile = {}
                     self.fences.setdefault(name, Fence()).event = accel.completion_event(
                         self.torch, self.kind
                     )
@@ -1057,6 +1074,7 @@ class ComponentResidency:
                     # Not safe to run this forward again; the declared method may be.
                     raise failure
                 state.restore()
+                self.backend.drop_ahead(name)
                 step = self._descend(name, ladder, op, asked, rungs)
                 if step is None:
                     raise self._exhaust(name, op, asked, detail)
@@ -1081,12 +1099,17 @@ class ComponentResidency:
         """A declared method call. An out-of-memory error its forwards could not absorb
         (glue between them, a weight cast, a forward whose hooks hold state) runs the method
         again when idle components, sibling constructions or co-tenants gave at least what
-        it needed, and its inputs are intact."""
+        it needed, its tensor inputs are intact and every other argument is a value the
+        run cannot have changed. The random streams, generators and counters it saw are
+        put back first."""
         if self.running or not self.recoverable:
             return body()
         leaves = self.torch.utils._pytree.tree_leaves((args, kwargs))
+        rerunnable = all(isinstance(leaf, self._values) for leaf in leaves)
+        members = [self.backend.components.get(n) or self.backend.parked.get(n) for n in components]
         while True:
             versions = self._versions(leaves)
+            state = _State.take(self.torch, members, leaves)
             entered = self._allocated()
             try:
                 return body()
@@ -1102,13 +1125,33 @@ class ComponentResidency:
                 for victim in victims:
                     self._evict(victim)
                 self._room_for(asked)
-                if self._versions(leaves) != versions or self._allocatable() <= max(
-                    before, asked - 1
+                if (
+                    not rerunnable
+                    or self._versions(leaves) != versions
+                    or self._allocatable() <= max(before, asked - 1)
                 ):
                     raise
+                state.restore()
                 self.recoveries.append(
                     f"{method}(): out of memory (needed {asked} B) -> room, runs again"
                 )
+
+    @property
+    def _values(self) -> tuple[type, ...]:
+        """Arguments a call cannot have changed, or whose change is tracked (tensors)."""
+        torch = self.torch
+        return (
+            torch.Tensor,
+            torch.Generator,
+            torch.dtype,
+            torch.device,
+            int,
+            float,
+            str,
+            bytes,
+            bool,
+            type(None),
+        )
 
     def _run(
         self,
@@ -1161,10 +1204,10 @@ class ComponentResidency:
         self._touch(name)
         self._stage(name, declared, self.scope_headrooms.get(method, self.headroom), method)
 
-    def _clear(self, name: str, need: int) -> None:
-        """Room for a call whose peak is known, before it runs."""
-        if need > 0 and not self._fits(need):
-            self._make_fit(need, (name, *self.running))
+    def _clear(self, name: str, growth: int) -> None:
+        """Room for a call whose growth is measured, before it runs."""
+        if growth > 0 and not self._fits(growth):
+            self._make_fit(growth, (name, *self.running))
 
     def _descend(
         self, name: str, ladder: tuple[str, ...], op: Op, asked: int, rungs: tuple[str, ...]
@@ -1315,7 +1358,8 @@ class ComponentResidency:
         if following is None or layout is None or self.kind != "cuda":
             return
         block = next((b for b in layout.blocks if b.path == following), None)
-        if block is None or not self._fits(block.nbytes):
+        # Only beside what the running call is measured to grow by: never at its expense.
+        if block is None or self.growth is None or not self._fits(block.nbytes + self.growth):
             return
         if self.copy_stream is None:
             self.copy_stream = self.torch.cuda.Stream()
@@ -1324,10 +1368,16 @@ class ComponentResidency:
     def _keep(self, name: str, unit: PageUnit) -> None:
         """Keep a paged unit in host memory while the host has room for it: the next
         page-in is a copy, not a store read. Measured each time; no host floor."""
-        if (name, unit.path) in self.backend.mirror:
+        if (name, unit.path) in self.backend.mirror or proctree.memory_stalled():
             return
         if proctree.available_host_bytes() > unit.nbytes:
             self.kept_bytes += self.backend.keep(name, unit)
+
+    def relieve_host(self) -> int:
+        """The host stalls on memory: give back the host memory paged blocks were kept in."""
+        freed = self.backend.drop_mirror()
+        self.kept_bytes = 0
+        return freed
 
     def _page_leave(
         self, name: str, unit: PageUnit, module: object, args: object, output: object

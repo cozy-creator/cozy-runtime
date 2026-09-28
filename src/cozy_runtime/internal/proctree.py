@@ -1291,6 +1291,15 @@ def rss_bytes(pid: int) -> int:
     return -1
 
 
+def memory_stalled() -> bool:
+    """Whether the kernel measured every runnable task stalled on memory in its last 10 s."""
+    try:
+        full = Path("/proc/pressure/memory").read_text().splitlines()[1].split()
+        return float(full[1].removeprefix("avg10=")) > 0
+    except (OSError, IndexError, ValueError):
+        return False  # No pressure measurement on this host: nothing says to give back.
+
+
 def available_host_bytes() -> int:
     """The LIVE host budget, from the cgroup when there is one, else MemAvailable.
 

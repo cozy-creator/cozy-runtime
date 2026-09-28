@@ -6178,11 +6178,13 @@ class Worker:
         memory = measured[lane.ordinals[0]]
         return memory.free_bytes if memory.state == "measured" else -1
 
-    def _vacate(self, executor: child.Executor, ranks: tuple[int, ...]) -> dict[str, object]:
+    def _vacate(
+        self, executor: child.Executor, ranks: tuple[int, ...], residents: bool
+    ) -> dict[str, object]:
         """One Vacate round trip; an executor that died answers `executor_gone`."""
         try:
             with executor.watched("vacate"):
-                return executor.call(Vacate(ranks=ranks), timeout=None)
+                return executor.call(Vacate(ranks=ranks, residents=residents), timeout=None)
         except ExecutorGone as exc:
             return {"ok": False, "code": "executor_gone", "detail": str(exc)}
 

@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
+from cozy_runtime.internal import proctree
 from cozy_runtime.internal.worker.child import Executor, ExecutorSupervision
 from cozy_runtime.internal.worker.job_slots import JobSlot
 from cozy_runtime.internal.worker.lanes import DeviceLane
@@ -69,7 +69,7 @@ def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: Jo
     if warm is not None and not (warm.binding == binding and warm.ready()):
         warm.supervision.close()
         warm = None
-    if warm is None and _memory_stalled():
+    if warm is None and proctree.memory_stalled():
         # A new process needs memory the idle ones are holding.
         for idle in list(worker.warm_cpu):
             worker.warm_cpu.pop(idle).supervision.close()
@@ -140,15 +140,6 @@ def release(worker: Worker, request: str, *, ordinal: int | None = None) -> None
         worker.job_slots.pop(slot_key, None)
         worker.lanes.composition.pop(slot_key, None)
         worker.lanes.by_id.pop(slot_key, None)
-
-
-def _memory_stalled() -> bool:
-    """Whether the kernel measured every runnable task stalled on memory in its last 10 s."""
-    try:
-        full = Path("/proc/pressure/memory").read_text().splitlines()[1].split()
-        return float(full[1].removeprefix("avg10=")) > 0
-    except (OSError, IndexError, ValueError):
-        return False  # No pressure measurement on this host: nothing says to vacate.
 
 
 def forget(worker: Worker, installation_id: str) -> None:

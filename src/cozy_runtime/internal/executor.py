@@ -1734,8 +1734,21 @@ class Executor:
         return code == DEVICE_OOM and self.residency is not None and bool(self.residency.exhausted)
 
     def _siblings(self, need: int) -> bool:
-        """Park this process's other constructions until `need` bytes fit."""
-        return bool(self.host._make_room(self.construction, need))
+        """Park this process's other constructions until `need` bytes are allocatable."""
+        host = self.host
+        if host.torch is None:
+            return False
+
+        def fits() -> bool:
+            memory = accel.allocation(host.torch, host.device_kind)
+            slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
+            return memory["driver_free_bytes"] + slack >= need
+
+        host._synchronize()
+        parked = host.arbiter.make_room(self.construction, fits)
+        if parked:
+            accel.release_cached(host.torch, host.device_kind)
+        return bool(parked)
 
     def _cap(self, free_bytes: int) -> None:
         """The worker's budget: what this process may add to what it reserves now (-1: no
@@ -4395,6 +4408,12 @@ class Executor:
             except ResidencyRefusal as exc:
                 return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
             accel.release_cached(self.torch, self.device_kind)
+            if not residents:
+                # The host is short: kept paged blocks go back, the weights stay.
+                for row in self.arbiter.rows.values():
+                    relieve = getattr(row.residency, "relieve_host", None)
+                    if relieve is not None:
+                        relieve()
         vacated = {
             "freed": {k: v for report in reports for k, v in report.get("freed", {}).items()},
             "held": {k: v for report in reports for k, v in report.get("held", {}).items()},

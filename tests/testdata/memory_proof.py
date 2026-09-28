@@ -160,7 +160,7 @@ def main(root: Path) -> None:
     weights_bytes = sum(t.numel() * t.element_size() for s in weights.values() for t in s.values())
     peaks = {name: max(op.peaks.values()) for (name, _), op in residency.ops.items()}
     layout = residency.backend.layouts["unet"]
-    activations = peaks["unet"] - weights_bytes
+    activations = peaks["unet"]  # growth over entry: the forward's own bytes
 
     # A cap the resident run could not live in: the UNet pages, its batch of two only fits
     # as two batches of one, and the full-frame decode only fits in tiles.

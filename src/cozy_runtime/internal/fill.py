@@ -2180,7 +2180,7 @@ class StreamingFillBackend:
                 )
             if name not in self.components:
                 return 0
-            self._drop_ahead(name)
+            self.drop_ahead(name)
             self._park_page(name, self.paging[name].common)
             self.parked[name] = self.components.pop(name)
             return self.vram_charge.pop(name, 0)
@@ -2360,7 +2360,7 @@ class StreamingFillBackend:
         for key, tensor in live.items():
             offsets[key] = total
             total += -(-tensor.numel() * tensor.element_size() // 64) * 64
-        slab = torch.empty(total, dtype=torch.uint8)
+        slab = torch.empty(total, dtype=torch.uint8, device="cpu")
         locked = int(torch.cuda.cudart().cudaHostRegister(slab.data_ptr(), total, 0)) == 0
         kept: dict[str, object] = {}
         for key, tensor in live.items():
@@ -2420,7 +2420,7 @@ class StreamingFillBackend:
             self.prefetched.pop(name)
             self.torch.cuda.current_stream().wait_event(ahead[1])
         else:
-            self._drop_ahead(name)
+            self.drop_ahead(name)
             self._fill_page(name, unit)
             self.vram_charge[name] += unit.nbytes
         self.page_resident[name] = unit
@@ -2452,7 +2452,7 @@ class StreamingFillBackend:
         self.page_resident.pop(name)
         self.vram_charge[name] -= unit.nbytes
 
-    def _drop_ahead(self, name: str) -> None:
+    def drop_ahead(self, name: str) -> None:
         """Free a unit copied ahead, once its copy has landed."""
         ahead = self.prefetched.pop(name, None)
         if ahead is not None:
@@ -2478,7 +2478,7 @@ class StreamingFillBackend:
         self.enqueued.clear()
         self.leaf_sites.clear()
         self.state = "ready"
-        self._drop_ahead(name)
+        self.drop_ahead(name)
         live = self.page_resident.pop(name, None)
         if live is not None:
             self.abandon_page(name, live)
