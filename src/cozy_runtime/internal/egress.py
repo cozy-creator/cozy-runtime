@@ -44,10 +44,12 @@ below nulls anything.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import ipaddress
 import socket
 import ssl
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -137,8 +139,6 @@ def request_control_metadata(
     bytes still move through TensorFS; this function accepts only small metadata.
     It retries nothing: the execution journal must reconcile ambiguous writes.
     """
-    import http.client
-
     if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
         raise EgressRefusal("control_tls_required", "control TLS verification is required")
     if not 0 < limit <= 8 << 20 or (body is not None and len(body) > limit):
@@ -163,18 +163,13 @@ def request_control_metadata(
         connection.close()
 
 
-def request_catalog_metadata(
-    host: str, port: int | None, tls: bool, path: str, *, limit: int
-) -> tuple[int, bytes]:
-    """One bounded anonymous GET of public catalog metadata (bindings, lane resolutions).
-
-    The origin is the controller's configured public catalog, checked by the caller; plain
-    HTTP is for a loopback development catalog only. No credential is sent and nothing is
-    retried: a failed read fails the one selection that needed it.
-    """
-    import http.client
-
-    if not 0 < limit <= 8 << 20 or not path.startswith("/v1/"):
+@contextmanager
+def _catalog_get(
+    host: str, port: int | None, tls: bool, path: str
+) -> Iterator[http.client.HTTPResponse]:
+    """One anonymous GET at the public catalog, which the caller checked. Plain HTTP is for
+    a loopback development catalog only. No credential is sent and nothing is retried."""
+    if not path.startswith("/v1/"):
         raise EgressRefusal("catalog_route_invalid", "catalog route is invalid")
     connection: http.client.HTTPConnection = (
         http.client.HTTPSConnection(
@@ -185,17 +180,41 @@ def request_catalog_metadata(
     )
     try:
         connection.request("GET", path, headers={"Accept": "application/json"})
-        response = connection.getresponse()
-        raw = response.read(limit + 1)
-        if len(raw) > limit:
-            raise EgressRefusal("catalog_response_bound", "catalog response exceeds its bound")
-        return response.status, raw
+        yield connection.getresponse()
     except (OSError, http.client.HTTPException) as exc:
         raise EgressRefusal(
             "catalog_unavailable", f"catalog unreachable: {type(exc).__name__}"
         ) from exc
     finally:
         connection.close()
+
+
+def request_catalog_metadata(
+    host: str, port: int | None, tls: bool, path: str, *, limit: int
+) -> tuple[int, bytes]:
+    """Bounded public catalog metadata (bindings, lane resolutions): status and body."""
+    if not 0 < limit <= 8 << 20:
+        raise EgressRefusal("catalog_route_invalid", "catalog route is invalid")
+    with _catalog_get(host, port, tls, path) as response:
+        raw = response.read(limit + 1)
+        if len(raw) > limit:
+            raise EgressRefusal("catalog_response_bound", "catalog response exceeds its bound")
+        return response.status, raw
+
+
+def measure_catalog_document(
+    host: str, port: int | None, tls: bool, path: str, *, limit: int
+) -> tuple[int, int, bytes]:
+    """A public catalog document streamed, never held: status, length and SHA-256.
+    `limit` is the document kind's own cap."""
+    with _catalog_get(host, port, tls, path) as response:
+        digest, length = hashlib.sha256(), 0
+        while chunk := response.read(CHUNK):
+            length += len(chunk)
+            if length > limit:
+                raise EgressRefusal("catalog_response_bound", "catalog document exceeds its cap")
+            digest.update(chunk)
+        return response.status, length, digest.digest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,8 +411,6 @@ def put_from(
     socket's silence bound is observed per operation and a re-send costs this object's bytes,
     never the attempt. A source that cannot be rewound gets one send.
     """
-    import http.client
-
     if expected_length < 0:
         raise EgressRefusal("stream_invalid_length", f"{what}: negative expected length")
     host, _ = _validate(url, policy)

@@ -56,10 +56,14 @@ class Context:
 
 
 class Catalog:
-    """The owner's binding and one lane resolution, counted."""
+    """The owner's binding and one lane resolution, counted. A resolution without a length
+    serves the checkpoint's manifest bytes, as `served`."""
 
-    def __init__(self, manifest: str, length: int, ladder: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, manifest: str, length: int | None, ladder: list[dict[str, Any]], served: bytes = b""
+    ) -> None:
         self.reads: list[str] = []
+        self.served = served
         catalog = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -83,13 +87,15 @@ class Catalog:
                         "release": RELEASE,
                         "lane": LANE,
                         "manifest_id": manifest,
-                        "manifest_length": length,
+                        **({} if length is None else {"manifest_length": length}),
                     }
+                elif url.path == f"/v1/models/{PACKAGE}/checkpoints/{manifest}":
+                    body = catalog.served
                 else:
                     self.send_response(404)
                     self.end_headers()
                     return
-                raw = json.dumps(body).encode()
+                raw = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
@@ -305,6 +311,47 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
             )
             raise AssertionError(body.get("safe_message"), body.get("cause"))
         assert machine.executions.status(OWNER, "first").state in ("queued", "running"), events
+    finally:
+        catalog.close()
+
+
+def test_an_unstated_manifest_length_is_measured_from_the_bytes_its_digest_names(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release+lane resolution may omit `manifest_length` (th-233): the machine reads the
+    checkpoint's manifest, verifies it by digest and runs; bytes the digest does not name
+    refuse the root."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    raw = tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+    catalog = Catalog(machine.manifest, None, [{"gpu": "H100", "lane": LANE}], raw)
+    try:
+        receipt, _ = submit(
+            machine,
+            submission(machine, "first", catalog.origin, facts(machine, CALLEE), facts(machine)),
+        )
+        assert receipt.request_id == "first"
+        assert [urlsplit(path).path for path in catalog.reads] == [
+            "/v1/packages/cozytest/tenant/bindings",
+            "/v1/models/resolve",
+            f"/v1/models/{PACKAGE}/checkpoints/{machine.manifest}",
+        ]
+        (models,) = [
+            canonical_json.decode(event.body)["models"]
+            for event in machine.executions.events(OWNER, "first").events
+            if event.kind == "resolved"
+        ]
+        assert models[0]["manifest"] == {"digest": machine.manifest, "length": len(raw)}
+        machine.tick()
+        assert machine.executions.status(OWNER, "first").state in ("queued", "running")
+
+        catalog.served = raw + b" "
+        with pytest.raises(Refused, match="manifest bytes do not match"):
+            submit(machine, submission(machine, "forged", catalog.origin))
     finally:
         catalog.close()
 

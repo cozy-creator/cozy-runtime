@@ -1,0 +1,1 @@
+A model resolution that omits `manifest_length` (a release+lane resolve on Tensorhub before v0.15.7) no longer refuses the slot: the machine reads the checkpoint manifest, bounded by TensorFS's document cap, verifies it by digest and uses its measured length.

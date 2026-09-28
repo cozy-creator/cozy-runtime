@@ -13,7 +13,7 @@ from urllib.parse import quote, urlencode, urlsplit
 
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.author._model_defaults import default_ladder, reference
-from cozy_runtime.internal import egress
+from cozy_runtime.internal import egress, fill
 from cozy_runtime.protocol import documents
 
 from .workspace import WorkspaceRefusal
@@ -75,12 +75,32 @@ class Catalog:
         except documents.DocumentError as exc:
             raise WorkspaceRefusal(f"model catalog returned no manifest for {spec}/{lane}") from exc
         if type(length) is not int or length <= 0:
-            raise WorkspaceRefusal(f"model catalog returned no manifest for {spec}/{lane}")
+            length = self.measure(model, str(digest))
         return {
             "manifest": {"digest": digest, "length": length},
             "release": str(value.get("release") or release),
             "lane": str(value.get("lane") or lane),
         }
+
+    def measure(self, model: str, digest: str) -> int:
+        """An unstated manifest length, measured from the exact bytes its digest names."""
+        org, _, name = model.partition("/")
+        path = f"/v1/models/{quote(org)}/{quote(name)}/checkpoints/{digest}"
+        try:
+            status, length, sha256 = egress.measure_catalog_document(
+                self.host,
+                self.port,
+                self.scheme == "https",
+                path,
+                limit=fill.tensorfs_module().manifest_max_bytes(),
+            )
+        except egress.EgressRefusal as exc:
+            raise WorkspaceRefusal(f"model catalog manifest read failed: {exc.code}") from exc
+        if status != 200:
+            raise WorkspaceRefusal(f"model catalog answered {status} for manifest {digest}")
+        if sha256 != documents.raw(digest):
+            raise WorkspaceRefusal(f"model catalog manifest bytes do not match {digest}")
+        return length
 
 
 def _ladder(
