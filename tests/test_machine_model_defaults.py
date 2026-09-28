@@ -22,6 +22,7 @@ from cozy_runtime.internal.worker import grants, machine_checkpoint_inputs
 from cozy_runtime.internal.worker import machine_model_defaults as defaults
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.machine_child_target import Target
+from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
 from cozy_runtime.internal.worker.machine_serving import Serving
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
@@ -442,3 +443,129 @@ def test_cold_default_native_pull_requires_deployment_object_storage_host(
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hub_only(
+    tmp_path: Path,
+) -> None:
+    """The machine's own Hub serves its owner's unpublished checkpoint only to the worker
+    capability; another origin never sees it, and a refused or absent grant is surfaced
+    typed with no anonymous retry."""
+    origin_root = tmp_path / "origin"
+    origin_root.mkdir()
+    _, manifest, length, origin = _snapshot(origin_root, include_asset=True, checkpoint_only=True)
+    bodies = {hashlib.sha256(body).hexdigest(): body for body in (_HEADER, _ASSET)}
+    objects = [{"length": len(body), "sha256": digest} for digest, body in sorted(bodies.items())]
+    bodies[manifest.removeprefix("sha256:")] = origin.manifest(manifest)["manifest"]
+    token = "t" * 43
+    servers: list[ThreadingHTTPServer] = []
+
+    def hub(private: bool) -> tuple[str, list[tuple[str, str, str]]]:
+        seen: list[tuple[str, str, str]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_: Any) -> None:
+                pass
+
+            def answer(self, status: int, body: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                presented = (
+                    self.headers.get("X-Cozy-Worker-ID", ""),
+                    self.headers.get("X-Cozy-Worker-Token", ""),
+                )
+                seen.append((self.path, *presented))
+                if private and presented != ("worker-1", token):
+                    code = "worker.ended" if presented[0] else "tensorfs.closure_denied"
+                    error = {"error": {"code": code, "message": code}}
+                    self.answer(401 if presented[0] else 404, json.dumps(error).encode())
+                    return
+                if self.path == "/v1/tensorfs/closure":
+                    response: dict[str, Any] = {
+                        "complete": True,
+                        "lane": "bf16",
+                        "model": "fidika/private",
+                        "manifest": {"sha256": manifest.removeprefix("sha256:"), "length": length},
+                        "objects": objects,
+                        "presign_max_digests": 10,
+                        "release": "1.0.0",
+                        "scope": "runtime",
+                        "server_time_unix": int(time.time()),
+                    }
+                else:
+                    response = {
+                        "expires_at_unix": int(time.time()) + 3600,
+                        "server_time_unix": int(time.time()),
+                        "urls": {
+                            digest: f"http://127.0.0.1:{server.server_port}/{digest}"
+                            for digest in request["digests"]
+                        },
+                    }
+                self.answer(200, json.dumps(response, sort_keys=True).encode())
+
+            def do_GET(self) -> None:
+                seen.append(
+                    (
+                        "GET",
+                        self.headers.get("X-Cozy-Worker-ID", ""),
+                        self.headers.get("X-Cozy-Worker-Token", ""),
+                    )
+                )
+                self.answer(200, bodies[self.path.removeprefix("/")])
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return f"http://localhost:{server.server_port}", seen
+
+    own, own_seen = hub(private=True)
+    other, other_seen = hub(private=False)
+
+    def materialize(name: str, public_origin: str, authority: PublicationAuthority | None) -> None:
+        root = tmp_path / name
+        tensorfs.Store.init(str(root))
+        worker = peer({})
+        worker.workspace = Workspace(root)
+        worker.options = cast(
+            Any, SimpleNamespace(accelerator_backend="none", publication_authority=authority)
+        )
+        worker.config = cast(
+            Any, SimpleNamespace(bootstrap_credential="local", object_storage_hosts=("127.0.0.1",))
+        )
+        row = {
+            "public_origin": public_origin,
+            "repository": "fidika/private",
+            "manifest": {"digest": manifest, "length": length},
+        }
+        with ExitStack() as access:
+            defaults.materialize(worker, [row], access)
+        tensorfs.Store.open(str(root)).verify_checkpoint_source("fidika/private", manifest, length)
+
+    grant = PublicationAuthority(own, "worker-1", token)
+    try:
+        materialize("own", own, grant)
+        posts = [row for row in own_seen if row[0] != "GET"]
+        assert posts and all(row[1:] == ("worker-1", token) for row in posts)
+        assert all(row[1:] == ("", "") for row in own_seen if row[0] == "GET")
+
+        materialize("other", other, grant)
+        assert other_seen and all(row[1:] == ("", "") for row in other_seen)
+
+        for name, authority, code in (
+            ("ended", PublicationAuthority(own, "worker-1", "e" * 43), "CREDENTIAL_REQUIRED"),
+            ("absent", None, "REF_NOT_FOUND"),
+        ):
+            own_seen.clear()
+            with pytest.raises(WorkspaceRefusal, match="materialization refused: " + code):
+                materialize(name, own, authority)
+            presented = ("", "") if authority is None else ("worker-1", "e" * 43)
+            assert own_seen == [("/v1/tensorfs/closure", *presented)], own_seen
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()

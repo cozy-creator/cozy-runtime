@@ -31,6 +31,24 @@ def local_origin(origin: str) -> bool:
         return False
 
 
+def _same_origin(a: str, b: str) -> bool:
+    try:
+        left, right = urlsplit(a.rstrip("/")), urlsplit(b.rstrip("/"))
+        return (left.scheme, left.hostname, left.port) == (right.scheme, right.hostname, right.port)
+    except ValueError:
+        return False
+
+
+def credential(worker: Worker, origin: str) -> str:
+    """This machine's worker capability, for its own Hub only: there it reads its owner's
+    unpublished checkpoints. Any other origin gets nothing, and a refusal is never retried
+    anonymously."""
+    authority = worker.options.publication_authority
+    if authority is None or not _same_origin(authority.origin, origin):
+        return ""
+    return f"worker {authority.worker_id} {authority.worker_token}"
+
+
 def valid_origin(origin: str, *, local: bool) -> bool:
     try:
         value = urlsplit(origin)
@@ -238,7 +256,7 @@ def materialize(
         manifest = row["manifest"]
         try:
             # Existing cached custody is sufficient. A cold use fetches this exact
-            # public checkpoint; neither a release alias nor a credential is sent.
+            # checkpoint; only this machine's own Hub sees its worker capability.
             with worker.model_transfer_lock:
                 transfer = worker.model_transfers.setdefault(manifest["digest"], threading.Lock())
             with transfer:
@@ -254,6 +272,7 @@ def materialize(
                             store,
                             row["public_origin"],
                             row["repository"] + "@" + manifest["digest"],
+                            credential=credential(worker, row["public_origin"]),
                             allowed_hosts=worker.config.object_storage_hosts,
                             allow_local=bool(worker.config.bootstrap_credential)
                             and local_origin(row["public_origin"]),

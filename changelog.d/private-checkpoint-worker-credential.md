@@ -1,0 +1,1 @@
+A machine pulls its owner's unpublished checkpoints: every TensorFS pull from the machine's own Hub (the origin of its grant) presents the worker capability (`worker <id> <token>`), and no other origin receives it. A refused or absent grant surfaces typed (`CREDENTIAL_REQUIRED`, `REF_NOT_FOUND`) and is never retried anonymously. Requires TensorFS 0.3.74.
