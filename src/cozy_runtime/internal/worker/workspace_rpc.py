@@ -172,16 +172,14 @@ class WorkspaceRPC:
             request.claim, context, lambda s, owner: s.transfers(owner).execute(request.request)
         )
 
-    def WorkspaceForgetPackageBindings(
-        self, request: pb.ForgetPackageBindingsCall, context: ServicerContext
-    ) -> pb.ForgetPackageBindingsResult:
-        return self._workspace_call(
-            request.claim,
-            context,
-            lambda s, _owner: pb.ForgetPackageBindingsResult(
-                forgotten=s.resolutions.forget(request.package)
-            ),
-        )
+    def WorkspaceForgetPackage(
+        self, request: pb.ForgetPackageCall, context: ServicerContext
+    ) -> pb.ForgetPackageResult:
+        def forget(service: Service, _owner: str) -> pb.ForgetPackageResult:
+            service.resolutions.forget(request.package)
+            return pb.ForgetPackageResult()
+
+        return self._workspace_call(request.claim, context, forget)
 
     def WorkspaceReadByteTreeObject(
         self, request: pb.NativeByteReadCall, context: ServicerContext

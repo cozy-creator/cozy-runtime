@@ -579,10 +579,10 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.FromString,
                 _registered_method=True)
-        self.WorkspaceForgetPackageBindings = channel.unary_unary(
-                '/cozy.worker.v1.RuntimePreparation/WorkspaceForgetPackageBindings',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.FromString,
+        self.WorkspaceForgetPackage = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/WorkspaceForgetPackage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageResult.FromString,
                 _registered_method=True)
         self.ImportInputTree = channel.stream_unary(
                 '/cozy.worker.v1.RuntimePreparation/ImportInputTree',
@@ -743,8 +743,8 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def WorkspaceForgetPackageBindings(self, request, context):
-        """The package's owner bindings changed: drop the Model resolutions this machine keeps for it.
+    def WorkspaceForgetPackage(self, request, context):
+        """The package's owner state changed: drop what this machine read of it at its Hub.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -898,10 +898,10 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.SerializeToString,
             ),
-            'WorkspaceForgetPackageBindings': grpc.unary_unary_rpc_method_handler(
-                    servicer.WorkspaceForgetPackageBindings,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.SerializeToString,
+            'WorkspaceForgetPackage': grpc.unary_unary_rpc_method_handler(
+                    servicer.WorkspaceForgetPackage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageResult.SerializeToString,
             ),
             'ImportInputTree': grpc.stream_unary_rpc_method_handler(
                     servicer.ImportInputTree,
@@ -1316,7 +1316,7 @@ class RuntimePreparation(object):
             _registered_method=True)
 
     @staticmethod
-    def WorkspaceForgetPackageBindings(request,
+    def WorkspaceForgetPackage(request,
             target,
             options=(),
             channel_credentials=None,
@@ -1329,9 +1329,9 @@ class RuntimePreparation(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/cozy.worker.v1.RuntimePreparation/WorkspaceForgetPackageBindings',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.FromString,
+            '/cozy.worker.v1.RuntimePreparation/WorkspaceForgetPackage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1962,10 +1962,10 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.FromString,
                 _registered_method=True)
-        self.ForgetPackageBindings = channel.unary_unary(
-                '/cozy.worker.v1.PodHost/ForgetPackageBindings',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.FromString,
+        self.ForgetPackage = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ForgetPackage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageResult.FromString,
                 _registered_method=True)
         self.ImportInputTree = channel.stream_unary(
                 '/cozy.worker.v1.PodHost/ImportInputTree',
@@ -2208,8 +2208,8 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ForgetPackageBindings(self, request, context):
-        """`cozy package bind`/`unbind` moved a slot: the machine re-resolves the package's Models once.
+    def ForgetPackage(self, request, context):
+        """`cozy package bind`, `unbind` or `publish` changed the package: the machine reads it once more.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -2410,10 +2410,10 @@ def add_PodHostServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.SerializeToString,
             ),
-            'ForgetPackageBindings': grpc.unary_unary_rpc_method_handler(
-                    servicer.ForgetPackageBindings,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.SerializeToString,
+            'ForgetPackage': grpc.unary_unary_rpc_method_handler(
+                    servicer.ForgetPackage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageResult.SerializeToString,
             ),
             'ImportInputTree': grpc.stream_unary_rpc_method_handler(
                     servicer.ImportInputTree,
@@ -3182,7 +3182,7 @@ class PodHost(object):
             _registered_method=True)
 
     @staticmethod
-    def ForgetPackageBindings(request,
+    def ForgetPackage(request,
             target,
             options=(),
             channel_credentials=None,
@@ -3195,9 +3195,9 @@ class PodHost(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/cozy.worker.v1.PodHost/ForgetPackageBindings',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.FromString,
+            '/cozy.worker.v1.PodHost/ForgetPackage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageResult.FromString,
             options,
             channel_credentials,
             insecure,

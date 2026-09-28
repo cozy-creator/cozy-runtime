@@ -44,23 +44,24 @@ class Resolved:
 
 
 class Resolutions:
-    """This machine's resolutions, per installation, for its lifetime."""
+    """What this machine read of each package at its Hub, for its lifetime: the newest
+    release, and each installation's resolutions."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.held: dict[str, Resolved] = {}
+        self.newest: dict[str, str] = {}
 
     def of(self, installation: str, package: str) -> Resolved:
         with self.lock:
             return self.held.setdefault(installation, Resolved(package))
 
-    def forget(self, package: str) -> int:
-        """Drop every installation's resolutions of a package; the next run reads it again."""
+    def forget(self, package: str) -> None:
+        """Drop what was read of a package; its next run reads it once more."""
         with self.lock:
-            gone = [key for key, held in self.held.items() if held.package == package]
-            for key in gone:
+            self.newest.pop(package, None)
+            for key in [key for key, held in self.held.items() if held.package == package]:
                 del self.held[key]
-        return len(gone)
 
 
 class Catalog:

@@ -319,18 +319,18 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
         class Forget(WorkspaceRPC):
             workspace_service = machine.worker.workspace_service
 
-        def forget() -> int:
-            call = pb.ForgetPackageBindingsCall(claim=machine.claim, package=PACKAGE)
-            return Forget().WorkspaceForgetPackageBindings(call, Context()).forgotten  # type: ignore[arg-type]
+        def forget() -> None:
+            call = pb.ForgetPackageCall(claim=machine.claim, package=PACKAGE)
+            Forget().WorkspaceForgetPackage(call, Context())  # type: ignore[arg-type]
 
-        assert forget() == 1
+        forget()
         catalog.reads.clear()
         submit(machine, submission(machine, "rebound"))
         assert [urlsplit(path).path for path in catalog.reads] == [
             "/v1/packages/cozytest/tenant/bindings",
             "/v1/models/resolve",
         ]
-        assert forget() == 1
+        forget()
         catalog.reads.clear()
         chosen = submission(machine, "chosen")
         chosen.release_root.models.add(
@@ -659,7 +659,8 @@ def test_a_roots_catalog_slots_resolve_beside_each_other(
 
 def test_the_machine_describes_a_release_from_its_own_hub(published: Machine) -> None:
     """A controller asks the machine, never the Hub, for a release's interface: the newest
-    release when it names none, read once; an installed release answers from its install."""
+    release when it names none, read once until the package is forgotten; an installed
+    release answers from its install."""
     machine = published
     catalog = Catalog(machine.manifest, 1, [], interface=machine.interface)
     catalog.serve(machine)
@@ -683,6 +684,11 @@ def test_the_machine_describes_a_release_from_its_own_hub(published: Machine) ->
             f"{tenant}/releases/{RELEASE}",
             f"{tenant}/releases/{RELEASE}/locked-requirements",
         ]
+        catalog.reads.clear()
+        assert describe() == described and catalog.reads == []
+        machine.worker.resolutions.forget(PACKAGE)
+        assert describe() == described
+        assert [urlsplit(path).path for path in catalog.reads] == [tenant]
         with pytest.raises(Refused, match="not a published release"):
             describe("9.9.9")
         # Without a query, the workspace describes nothing and reads nothing.

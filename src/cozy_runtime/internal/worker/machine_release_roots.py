@@ -301,12 +301,15 @@ class ReleaseRoots:
         return installed, sorted(edges)
 
     def describe(self, selection: pb.PackageSelection) -> pb.DescribedRelease:
-        """A published release as this machine reads it: the newest when none is named."""
+        """A published release as this machine reads it: the newest when none is named, read
+        once until the controller that publishes names the package to `forget`."""
         package, release = selection.package, selection.release
+        newest = self.worker.resolutions.newest
         if not release:
-            release = machine_release_catalog.newest(
+            release = newest.get(package) or machine_release_catalog.newest(
                 machine_model_resolve.own(self.worker), package
             )
+            newest[package] = release
         key = _key(package, release)
         held = self._installed(key)
         raw = held.interface if held is not None else self._facts(key).preparation.package_interface
