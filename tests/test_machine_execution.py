@@ -595,6 +595,55 @@ def test_every_recorded_outcome_is_final_and_only_a_command_runs_again(tmp_path:
     assert e.control("owner", "transient", "user-resume", 1, "resume").attempt_ordinal == 2
 
 
+def test_a_failed_attempt_stays_failed_when_a_pause_reaches_it_first(tmp_path: Path) -> None:
+    """A worker integrity failure fails every held attempt while their parents' stop pauses
+    the children: whichever lands first, a failed outcome ends FAILED, and only the stop a
+    pause itself caused (a canceled outcome) ends paused."""
+    e = Executions(Workspace(tmp_path / "store"))
+    for request, status, state in [
+        ("failed", pb.OUTCOME_STATUS_FAILED, "failed"),
+        ("refused", pb.OUTCOME_STATUS_REFUSED, "failed"),
+        ("stopped", pb.OUTCOME_STATUS_CANCELED, "paused"),
+    ]:
+        e.submit(
+            "owner",
+            request,
+            b"c" * 32,
+            offer(request),
+            expected_execution_workspace_id=e.workspace_id,
+        )
+        e.dispatched("owner", request, 1)
+        # The pause lands first, while the attempt still runs ...
+        assert e.control("owner", request, "pause", 1, "pause").state == "pausing"
+        # ... and the attempt's own outcome arrives after it.
+        pinned = offer(request)
+        body, digest = documents.identity(
+            pb.AttemptOutcomeBody(
+                request_id=request,
+                attempt_ordinal=1,
+                invocation_spec_digest=documents.spell(pinned.invocation_spec_digest),
+                status=status,
+                cause=pb.OutcomeCause(
+                    code=pb.CAUSE_CODE_LOCAL_SAFETY, origin=pb.CAUSE_ORIGIN_WORKER
+                ),
+                safe_message="the worker failed",
+            )
+        )
+        e.workspace.outcome(
+            "owner",
+            pb.AttemptOutcome(
+                request_id=request,
+                attempt_ordinal=1,
+                invocation_spec_digest=pinned.invocation_spec_digest,
+                outcome_id="out-1",
+                outcome_digest=digest,
+                outcome_canonical_bytes=body,
+            ),
+        )
+        e.reconcile("owner", request)
+        assert e.status("owner", request).state == state, request
+
+
 def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path: Path) -> None:
     e = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: 2000)
     e.submit(

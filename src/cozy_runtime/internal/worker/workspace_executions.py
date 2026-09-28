@@ -833,14 +833,17 @@ class Executions:
             if not attempt["outcome"] or row["state"] in TERMINAL:
                 return
             body = documents.parse(attempt["outcome"], pb.AttemptOutcomeBody)
+            ended = body.status in (pb.OUTCOME_STATUS_SUCCEEDED, pb.OUTCOME_STATUS_CANCELED)
             state = (
-                "paused"
+                # A failed attempt is terminal whatever was asked meanwhile: a pause (a
+                # parent's stop reaching its child) applies only to work that did not fail.
+                "failed"
+                if not ended and row["desired"] != "cancel"
+                else "paused"
                 if row["desired"] == "pause"
                 else "canceled"
                 if row["desired"] == "cancel" or body.status == pb.OUTCOME_STATUS_CANCELED
                 else "succeeded"
-                if body.status == pb.OUTCOME_STATUS_SUCCEEDED
-                else "failed"
             )
             if requeue and state == "failed" and _lost_before_dispatch(db, row, body):
                 offer = pb.AttemptOffer.FromString(row["offer"])
