@@ -2185,7 +2185,7 @@ class Executor:
                 "ok": False,
                 "code": exc.code,
                 "detail": str(exc).splitlines()[0][:900],
-                "plan": {"walk": exc.walk, "objective": binding.objective},
+                "plan": {"walk": msgspec.to_builtins(exc.steps), "objective": binding.objective},
             }
         stage("resolve")
         mine = GroupPlan(

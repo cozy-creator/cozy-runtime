@@ -143,15 +143,13 @@ class Step(msgspec.Struct, omit_defaults=True):
 
 
 class PlanRefusal(Exception):
-    """A typed pre-construction refusal on the plan axis. `walk` is the JSON document of
-    `steps`, for the executor's reply."""
+    """A typed pre-construction refusal on the plan axis."""
 
     def __init__(self, code: str, detail: str, steps: Sequence[Step] = ()) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
         self.steps = tuple(steps)
-        self.walk: list[dict[str, object]] = msgspec.to_builtins(self.steps)
 
 
 # ------------------------------------------------------------------------ the variants
