@@ -117,7 +117,6 @@ class ReleaseRoots:
         asked.CopyFrom(request)
         asked.ClearField("claim")
         asked.ClearField("source_credentials")
-        asked.release_root.ClearField("installations")  # remembered by release, below
         raw = asked.SerializeToString(deterministic=True)
         with self.changed:
             job = self.jobs.get(identity)

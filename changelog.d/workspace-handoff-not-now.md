@@ -1,0 +1,1 @@
+A machine execution call that meets a workspace in custody handoff or a foreground transition answers UNAVAILABLE with `cozy-error-code: workspace_not_now` instead of a refusal, so the caller asks again. Release roots submit again after the minor-64 protocol removed `ReleaseRoot.installations`.
