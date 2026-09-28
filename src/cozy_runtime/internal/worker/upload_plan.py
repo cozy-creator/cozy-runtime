@@ -16,23 +16,6 @@ _CIVITAI_MEMBER = re.compile(r"civitai/files/[1-9][0-9]*")
 AS_IS = "as-is/1"
 AS_IS_NOTE = "unrecognized layout; stored as-is; packages may need to normalize it"
 
-# The TensorFS bindings an upload calls, and the first release that carries them all.
-BINDINGS = (
-    "read_source_heads",
-    "prepare_selected_source",
-    "record_model_source_custody",
-    "model_source_objects",
-)
-TENSORFS_FLOOR = "0.3.60"
-
-
-def require_bindings(tensorfs: object, operation: str) -> None:
-    """Refuse before any byte moves when the installed TensorFS predates uploads."""
-    if not all(callable(getattr(tensorfs, name, None)) for name in BINDINGS):
-        raise SourceRefusal(
-            "tensorfs_capability_missing", f"{operation} needs tensorfs >= {TENSORFS_FLOOR}"
-        )
-
 
 def carrier(member: str) -> bool:
     """Members whose header plans the conversion; ordinary files never are."""

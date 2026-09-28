@@ -23,11 +23,11 @@ MAX_BYTES = 2 << 20
 # Refusals a caller can act on; every other code is a native TensorFS code or opaque.
 CODES = frozenset(
     {
-        "tensorfs_capability_missing",
         "model_ingestion_revision",
         "model_source_profiles_invalid",
         "model_source_components_overlap",
         "model_source_configs_overlap",
+        "model_reference_unavailable",
     }
 )
 
@@ -104,6 +104,7 @@ class Convert(Step, frozen=True, tag="convert"):
     adopt: str | None
     writer_epoch: int
     computation_digest: str
+    access: Access  # reaches the converters' pinned reference repositories
 
 
 class View(Step, frozen=True, tag="view"):
@@ -168,6 +169,25 @@ class Plan(msgspec.Struct, frozen=True, kw_only=True):
     writer_epoch: int
     computation_digest: str
     access: Access
+
+    def composition(self) -> "Composition":
+        return Composition(
+            native_owner=self.native_owner,
+            writer_epoch=self.writer_epoch,
+            computation_digest=self.computation_digest,
+            metadata=self.metadata,
+            recipe=self.recipe,
+        )
+
+
+class Composition(msgspec.Struct, frozen=True, kw_only=True):
+    """What composes a converted model: its derived transaction and pinned metadata."""
+
+    native_owner: str
+    writer_epoch: int
+    computation_digest: str
+    metadata: list[Member]
+    recipe: str
 
 
 class Advance(Step, frozen=True, tag="advance"):

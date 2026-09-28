@@ -70,6 +70,7 @@ CALLED: dict[str, str] = {
         "allow_local=False)"
     ),
     "select_source_profile": "(store, heads, *, registry=None)",
+    "source_profile_converters": "(store, profiles, *, registry=None)",
     "prepare_selected_source": (
         "(store, operation_id, source_selection_digest, profiles, members, *, registry=None, "
         "write_budget_bytes=None)"

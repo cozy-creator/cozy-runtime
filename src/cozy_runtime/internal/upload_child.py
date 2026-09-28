@@ -21,11 +21,13 @@ from tensorfs.derived import Config, Derivation, Source, SourceInspection, Targe
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ObjectRef
+from cozy_runtime.author._loader import PATH_KEYS, PATH_SUFFIXES
 from cozy_runtime.internal import fill
 from cozy_runtime.internal.worker.source_steps import (
     Advance,
     Advanced,
     Answer,
+    Composition,
     Facts,
     Heads,
     Launch,
@@ -43,6 +45,7 @@ from cozy_runtime.internal.worker.source_steps import (
     Written,
     serve,
 )
+from cozy_runtime.internal.worker.upload_plan import carrier
 from cozy_runtime.models.qwen_image21.ingestion import preparation
 
 # A predecessor that is absent, complete, live, or already adopted has no prefix to give.
@@ -58,16 +61,13 @@ _NOT_ADOPTABLE = (
 DIFFUSERS_INDEXES = ("model_index.json", "modular_model_index.json")
 
 
-def diffusers_configs(index: bytes) -> dict[str, str]:
-    """Each Diffusers component's construction config file, by component name.
+_ASSET_KINDS = ("Tokenizer", "Processor", "FeatureExtractor")
 
-    A model is built from its folder's ``config.json`` and a scheduler from its
-    ``scheduler_config.json``; tokenizers and processors are assets, not constructors.
-    Classic indexes map a component to ``[library, class]``, modular ones add a spec whose
-    ``subfolder`` and ``type_hint`` name the folder and class.
-    """
+
+def _components(index: bytes) -> dict[str, tuple[str, str]]:
+    """``{component: (class, folder)}`` from a classic or modular Diffusers index."""
     document = json.loads(index)
-    found: dict[str, str] = {}
+    found: dict[str, tuple[str, str]] = {}
     for name, entry in document.items() if isinstance(document, dict) else ():
         if name.startswith("_") or not isinstance(entry, list) or len(entry) < 2:
             continue
@@ -77,13 +77,36 @@ def diffusers_configs(index: bytes) -> dict[str, str]:
         if not isinstance(kind, str) and isinstance(hint, list) and len(hint) == 2:
             kind = hint[1]
         folder = spec.get("subfolder") or name
-        if not isinstance(kind, str) or not isinstance(folder, str):
-            continue
-        if kind.endswith("Scheduler"):
-            found[name] = f"{folder}/scheduler_config.json"
-        elif not any(word in kind for word in ("Tokenizer", "Processor", "FeatureExtractor")):
-            found[name] = f"{folder}/config.json"
+        if isinstance(kind, str) and isinstance(folder, str):
+            found[name] = (kind, folder)
     return found
+
+
+def diffusers_configs(index: bytes) -> dict[str, str]:
+    """Each Diffusers component's construction config file, by component name.
+
+    A model is built from its folder's ``config.json`` and a scheduler from its
+    ``scheduler_config.json``; tokenizers and processors are assets, not constructors.
+    Classic indexes map a component to ``[library, class]``, modular ones add a spec whose
+    ``subfolder`` and ``type_hint`` name the folder and class.
+    """
+    return {
+        name: f"{folder}/scheduler_config.json"
+        if kind.endswith("Scheduler")
+        else f"{folder}/config.json"
+        for name, (kind, folder) in _components(index).items()
+        if not any(word in kind for word in _ASSET_KINDS)
+    }
+
+
+def diffusers_assets(index: bytes) -> list[str]:
+    """The folders of the index's tokenizers, processors and feature extractors: every
+    ordinary file in them is a model asset the pipeline needs to run."""
+    return sorted(
+        f"{folder}/"
+        for kind, folder in _components(index).values()
+        if any(word in kind for word in _ASSET_KINDS)
+    )
 
 
 def _merge[P: Pin](selection: P, metadata: Pin) -> P:
@@ -111,7 +134,8 @@ def _pinned(store: tensorfs.Store, step: Resolve, names: list[str]) -> Pin:
 
 
 def _diffusers_members(store: tensorfs.Store, step: Resolve) -> Pin:
-    """A Diffusers repository's index and each component's config, in the same pin."""
+    """A Diffusers repository's index, each component's config and every tokenizer or
+    processor file, in the same pin."""
     for index in DIFFUSERS_INDEXES:
         pinned = _pinned(store, step, [index])
         if pinned.members:
@@ -119,7 +143,40 @@ def _diffusers_members(store: tensorfs.Store, step: Resolve) -> Pin:
     else:
         return pinned
     ((_, body),) = tensorfs.read_source_heads(step.uri, pinned.members[:1], **step.access)
-    return _pinned(store, step, [index, *sorted(set(diffusers_configs(body).values()))])
+    configs = sorted(set(diffusers_configs(body).values()))
+    return _pinned(store, step, [index, *configs, *diffusers_assets(body)])
+
+
+def reference_members(store: tensorfs.Store, step: Resolve, reference: str) -> Pin:
+    """A converter reference's pipeline files; an unreachable one refuses by name."""
+    try:
+        pinned = _diffusers_members(store, msgspec.structs.replace(step, uri=reference))
+    except Exception as exc:
+        raise SourceRefusal(
+            "model_reference_unavailable", f"converter reference {reference} is unavailable: {exc}"
+        ) from exc
+    if not pinned.members:
+        raise SourceRefusal(
+            "model_reference_unavailable", f"converter reference {reference} has no pipeline index"
+        )
+    return pinned
+
+
+def references(store: tensorfs.Store, step: Resolve, selection: Pin) -> list[str]:
+    """Pinned repositories whose configs and tokenizers the converters' output needs. A
+    source no profile can plan pins none here; the conversion refuses it by its own code."""
+    profiles = step.profiles
+    if not profiles:
+        members = [row for row in selection.members if carrier(row[0])]
+        select_step = Select(
+            uri=step.uri, members=members, registry=step.registry, access=step.access
+        )
+        try:
+            profiles = [select(store, select_step).profile]
+        except tensorfs.errors.Refusal:
+            return []
+    rows = tensorfs.source_profile_converters(store, profiles, registry=step.registry)
+    return sorted({reference for _, reference in rows if reference})
 
 
 def resolve(store: tensorfs.Store, step: Resolve) -> Resolved:
@@ -138,6 +195,11 @@ def resolve(store: tensorfs.Store, step: Resolve) -> Resolved:
     elif step.diffusers:
         # A Diffusers repository's components are constructed from its own configs.
         selection = _merge(selection, _diffusers_members(store, step))
+    if not step.metadata and not any(row[0] in DIFFUSERS_INDEXES for row in selection.members):
+        # A source with no pipeline index (a Civitai single file) takes it, the configs and
+        # tokenizers from its converters' pinned reference, in the same pin.
+        for reference in references(store, step, selection):
+            selection = _merge(selection, reference_members(store, step, reference))
     return Resolved(selection=selection)
 
 
@@ -199,7 +261,8 @@ def advance(store: tensorfs.Store, step: Advance) -> Advanced:
         Facts,
     )
     return Advanced(
-        facts=facts, model=compose(store, plan, facts.sources) if facts.complete else None
+        facts=facts,
+        model=compose(store, plan.composition(), facts.sources) if facts.complete else None,
     )
 
 
@@ -210,8 +273,9 @@ def _header(store: tensorfs.Store, manifest: str) -> tensorfs.Header:
     return tensorfs.parse_header(header)
 
 
-def compose(store: tensorfs.Store, plan: Plan, prepared: list[Prepared]) -> ObjectRef:
-    """The published model: the prepared profiles' union, or the recipe's derivation."""
+def compose(store: tensorfs.Store, plan: Composition, prepared: list[Prepared]) -> ObjectRef:
+    """The model: the prepared profiles' union with its pinned metadata, or the recipe's
+    derivation."""
     transaction = plan.native_owner
     observed = store.derived_lookup(transaction)
     if observed.get("state") != "committed":
@@ -225,36 +289,68 @@ def compose(store: tensorfs.Store, plan: Plan, prepared: list[Prepared]) -> Obje
         receipt = writer.commit()
     else:
         receipt = observed["receipt"]
-    digest, length = "sha256:" + receipt["manifest"]["sha256"], receipt["manifest"]["length"]
-    if not plan.recipe:
-        for row in prepared:
-            names = sorted(_header(store, row.manifest_digest)["assets"])
-            if names:
-                inherited = store.inherit_model_assets(
-                    digest, length, row.manifest_digest, row.manifest_length, names
-                )
-                digest, length = str(inherited["manifest_id"]), int(inherited["manifest_length"])
-    return ObjectRef(digest, length)
+    return ObjectRef("sha256:" + receipt["manifest"]["sha256"], receipt["manifest"]["length"])
 
 
-def _added_configs(store: tensorfs.Store, plan: Plan) -> dict[str, bytes]:
-    """The Diffusers configs landed beside the carriers, named by their component."""
+def _metadata_index(store: tensorfs.Store, metadata: list[Member]) -> tuple[str, bytes] | None:
+    for name, digest, size, _ in metadata:
+        if name in DIFFUSERS_INDEXES:
+            return name, store.document(digest.removeprefix("sha256:"), size)
+    return None
+
+
+def _added_configs(store: tensorfs.Store, metadata: list[Member]) -> dict[str, bytes]:
+    """The pipeline index and each component's Diffusers config landed beside the carriers,
+    named by their component (the index by its own stem)."""
+    found = _metadata_index(store, metadata)
+    if found is None:
+        return {}
+    index_name, index = found
+    paths = diffusers_configs(index)
+    wanted = set(paths.values())
     files = {
         name: store.document(digest.removeprefix("sha256:"), size)
-        for name, digest, size, _ in plan.metadata
+        for name, digest, size, _ in metadata
+        if name in wanted
     }
-    index = next((files[name] for name in DIFFUSERS_INDEXES if name in files), None)
-    if index is None:
-        return {}
-    return {name: files[path] for name, path in diffusers_configs(index).items() if path in files}
+    added = {name: _constructible(files[path]) for name, path in paths.items() if path in files}
+    added[index_name.removesuffix(".json")] = index
+    return added
+
+
+def _constructible(config: bytes) -> bytes:
+    """A saved Diffusers/Transformers config minus its private save-time carrier keys
+    (`_name_or_path`): a construction config never names a source (the Loader refuses one)."""
+    document = json.loads(config)
+    private = {
+        key
+        for key in document
+        if key.startswith("_") and (key.lower() in PATH_KEYS or key.lower().endswith(PATH_SUFFIXES))
+    }
+    if not private:
+        return config
+    return canonical_json.encode({k: v for k, v in document.items() if k not in private})
+
+
+def _asset_files(store: tensorfs.Store, metadata: list[Member]) -> dict[str, tuple[str, int]]:
+    """Every tokenizer/processor file landed beside the carriers: a model asset, named by
+    its verified Store object."""
+    found = _metadata_index(store, metadata)
+    folders = tuple(diffusers_assets(found[1])) if found is not None else ()
+    return {
+        name: (digest, size)
+        for name, digest, size, _ in metadata
+        if folders and name.startswith(folders)
+    }
 
 
 def _union_writer(
-    store: tensorfs.Store, plan: Plan, prepared: list[Prepared]
+    store: tensorfs.Store, plan: Composition, prepared: list[Prepared]
 ) -> tensorfs.DerivedWriter:
     sources: dict[str, tuple[str, int]] = {}
     targets: dict[str, dict[str, object]] = {}
     configs: dict[str, dict[str, str]] = {}
+    bodies: dict[str, bytes] = {}
     order: list[tuple[str, str]] = []
     for row in sorted(prepared, key=lambda row: row.slot):
         sources[row.slot] = (row.manifest_digest, row.manifest_length)
@@ -266,13 +362,15 @@ def _union_writer(
                 )
             targets[name] = {"source": row.slot, "source_component": name, "drop": [], "add": {}}
             order.extend((name, key) for key in tensors)
-        for name in header["configs"]:
-            if name in configs:
+        for name, body in header["configs"].items():
+            if name in configs and bodies[name] != body:
                 raise SourceRefusal(
                     "model_source_configs_overlap", f"profiles both carry config {name}"
                 )
-            configs[name] = {"kind": "copy", "source": row.slot, "source_config": name}
-    added = _added_configs(store, plan)
+            if name not in configs:
+                configs[name] = {"kind": "copy", "source": row.slot, "source_config": name}
+                bodies[name] = body
+    added = _added_configs(store, plan.metadata)
     for name in added:
         if name in configs:
             raise SourceRefusal("model_source_configs_overlap", f"config {name} is carried twice")
@@ -285,6 +383,8 @@ def _union_writer(
         configs,
         order,
         sum(len(body) for body in added.values()),
+        # tensorfs 0.3.71's stub predates object companions, which its binding accepts.
+        _asset_files(store, plan.metadata) or None,  # type: ignore[arg-type]
         work_fingerprint=plan.computation_digest,
     )
     for name, body in sorted(added.items()):
@@ -293,7 +393,7 @@ def _union_writer(
 
 
 def _recipe_writer(
-    store: tensorfs.Store, plan: Plan, prepared: list[Prepared]
+    store: tensorfs.Store, plan: Composition, prepared: list[Prepared]
 ) -> tensorfs.DerivedWriter:
     (row,) = prepared
     components = sorted(_header(store, row.manifest_digest)["components"])
