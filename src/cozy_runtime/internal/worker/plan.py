@@ -870,7 +870,7 @@ class PlanChooser:
         # cr-008c's cross caught exactly that: a plan reporting `all_resident` for a
         # generation with a parked UNet. The ladder may deepen below the floor; it may
         # never claim to be above it.
-        parked = tuple(self.ledger.parked)
+        parked = tuple(name for name in self.ledger.parked if name not in resident)
         for placement, why, status in RUNGS:
             if status != "proven":
                 rows.append(Rung(rung=placement, verdict="unproven", why=why))

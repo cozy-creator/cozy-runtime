@@ -2310,7 +2310,10 @@ class Executor:
                     "evidence_class": "measured",
                 },
             }
-        backend.resident_budget = resident_budget
+        # The ceiling is capped at `destinations`, an estimate that misses derived buffers
+        # when the stored bytes undercut the logical ones (an encoded checkpoint). Capped
+        # there, the card holds the whole construction, so the fill parks nothing (0).
+        backend.resident_budget = resident_budget if resident_budget < destinations else 0
         backend.hold_lease = 0 < resident_budget < destinations
         # ADMISSION prices the RESIDENT set, not every destination: a construction whose
         # total exceeds the card but whose ceiling fits prepares and stages (cr-025 done-when).

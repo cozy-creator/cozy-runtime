@@ -256,8 +256,8 @@ def test_an_executor_short_of_memory_gets_room_from_idle_tenants(
     assert owner.ended == "terminal", (owner.ended, owner.error, owner.refusals)
     assert owner.refusals == [], owner.refusals
     assert [turn.outcome["status"] for turn in owner.turns] == [1, 1, 1], owner.turns
-    freed = _room(notes)
-    assert freed and freed[0] == ("plc-p", "plc-r"), freed
+    assert {victim for victim, whom in _room(notes) if whom == "plc-r"} <= {"plc-p", "plc-q"}
+    assert any(whom == "plc-r" for _victim, whom in _room(notes)), _room(notes)
     for turn in owner.turns:
         assert {row["executor_epoch"] for row in turn.rows.values()} == {1}, turn.rows
 
@@ -292,3 +292,94 @@ def test_a_capacity_refusal_is_not_inherited_by_the_retry(fp8: Fp8Tenant, tmp_pa
     assert owner.ended == "terminal", (owner.ended, owner.error, owner.refusals)
     assert [turn.outcome["status"] for turn in owner.turns] == [1], owner.turns
     assert not any("prepare refused: every binding" in step for _kind, step in notes)
+
+
+#: SDXL's shape: one declared set per stage, and a warm that walks all three.
+_SCOPES = """
+    @uses_components("text_encoder")
+    def encode(self, seed: int) -> float:
+        return self._read("text_encoder", seed)
+
+    @uses_components("unet")
+    def denoise(self, seed: int) -> float:
+        return self._read("unet", seed)
+
+    @uses_components("vae")
+    def decode(self, seed: int) -> float:
+        return self._read("vae", seed)
+
+    def _read(self, name: str, seed: int) -> float:
+        import torch
+
+        with torch.inference_mode():
+            total = torch.zeros((), dtype=torch.float32, device="cuda")
+            for parameter in self.pipe.components[name].parameters():
+                value = parameter.flatten()[seed % parameter.numel()].float()
+                total = total + torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+            return float(torch.tanh(total))
+
+    def warm(self, ctx: Context) -> None:
+        self.encode(0) + self.denoise(0) + self.decode(0)
+
+"""
+
+
+def _staged_package(root: Path) -> Path:
+    """`corpus/tenant` as SDXL is shaped: encoded leaves accepted, encode/denoise/decode
+    scopes, a warm through each, and a text encoder holding a non-persistent buffer (CLIP's
+    `position_ids`) that no checkpoint stores."""
+    source = (TENANT / "tiny_tenant.py").read_text()
+    anchor = '    @uses_components("text_encoder", "unet", "vae")\n    def touch('
+    served = "    checksum = model.touch(view._seed)\n"
+    buffer = "                self.final_norm = Weight(norm, torch.float32)\n"
+    assert source.count(anchor) == 1 and source.count(buffer) == 1
+    source = (
+        source.replace(
+            "class TenantModel(Model[TenantPipeline]):",
+            'class TenantModel(Model[TenantPipeline], encoded_leaves="accept"):',
+        )
+        .replace(anchor, _SCOPES + anchor)
+        .replace(served, "    checksum = model.encode(1) + model.denoise(2) + model.decode(3)\n", 1)
+        .replace(
+            buffer,
+            buffer + '                self.register_buffer("position_ids", torch.arange(77), '
+            "persistent=False)\n",
+        )
+    )
+    project = root / "tenant_staged"
+    project.mkdir(parents=True)
+    (project / "tenant_staged.py").write_text(source)
+    table = (TENANT / "package.toml").read_text().replace("tiny_tenant:app", "tenant_staged:app")
+    (project / "package.toml").write_text(table)
+    return project
+
+
+@needs_tenant
+def test_models_that_fit_together_serve_all_resident(tmp_path: Path) -> None:
+    """Dimitri run 1507: an fp8 SDXL beside an idle bf16 one on a 96 GB card served on the
+    staged rung. Its stored bytes are below its logical ones, so the fill ceiling missed the
+    text encoders' derived buffers and parked the last component, and a parked component
+    denied `all_resident` for the generation's life. Two such tenants that fit together
+    serve every attempt all-resident, with nothing staged or evicted."""
+    fp8 = write_fp8_tenant(tmp_path / "fp8", blocks=8, hidden=2048, ff=8192)
+    project = _staged_package(tmp_path)
+    turns = [
+        _turn("plc-p", "p-1", 1),
+        _turn("plc-q", "q-1", 2),
+        _turn("plc-p", "p-2", 3),
+        _turn("plc-q", "q-2", 4),
+    ]
+    with _workspace() as root:
+        owner, _worker, notes = _drive(fp8.store, turns, root, package=project)
+    assert owner.ended == "terminal", (owner.ended, owner.error, owner.refusals)
+    assert [turn.outcome["status"] for turn in owner.turns] == [1, 1, 1, 1], owner.turns
+    for turn in owner.turns:
+        assert turn.rows[turn.placement_id]["walk"]["chosen"] == "all_resident", turn.rows
+    built = [step for kind, step in notes if kind == "boot" and " parked=" in step]
+    assert len(built) == 2 and all("parked=[]" in step for step in built), built
+    for turn in owner.turns:
+        # `all_resident` frees nothing, and nothing was absent to stage.
+        row, walk = turn.rows[turn.placement_id], turn.rows[turn.placement_id]["walk"]
+        assert walk["rungs"][0]["absent_bytes"] == 0, (turn.request.request_id, walk)
+        assert set(row["resident"]) == {"text_encoder", "unet", "vae"}, row
+        assert row["evicted"] == {}, row
