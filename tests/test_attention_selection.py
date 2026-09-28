@@ -43,7 +43,6 @@ from cozy_runtime.internal import (
     attention_upstream,
     child_env,
     executor_commands,
-    kernel_site,
     package_interface,
 )
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
@@ -74,91 +73,6 @@ def _refusal(run: Any) -> attention.AttentionRefusal:
 
 
 RANKED = ["flash-attn3", "sdpa"]
-
-
-def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
-    """Every kernel declares its arithmetic budget. Sol's full-key control is dense;
-    its production sparse-policy approximation is measured separately (h3a-069).
-    """
-    for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
-        assert candidate.rel_l2_max > 0, candidate.name
-        assert candidate.rel_l2_max < 1, candidate.name
-    # flash-attn4 is EXACT: bf16/fp16 in, no quantisation anywhere in it. Its
-    # `torch2cute_dtype_map` is float16/bfloat16/float32 and its interface has no fp8 or fp4
-    # path at all (h3a-024), so it is held to the same floor as flash-attn3 and is not the
-    # 4-bit story h3a-022's Blackwell case rests on.
-    exact = {"flash-attn3", "flash-attn4", "sdpa", "cudnn"}
-    for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
-        budget = candidate.rel_l2_max
-        if candidate.name == "sol-attn":
-            # This threshold applies to Sol's all-keys native arithmetic
-            # control. Sparse-policy disagreement is reported separately.
-            assert budget == 2e-2
-            assert candidate not in attention.CANDIDATES
-            continue
-        assert (budget <= 2e-2) is (candidate.name in exact), (candidate.name, budget)
-    # One H3 rank's 10 s document: error grows with length (h3a-044), heads do not.
-    assert attention.PROBE == (1, 73_439, 2, 128)
-
-
-def test_the_probe_refuses_a_fault_confined_to_the_partial_tail_tile() -> None:
-    """A kernel wrong only on its last, partial tile passes a sample of rows; the probe checks
-    the first and last rows and every tile edge, each group against the budget on its own."""
-    torch = pytest.importorskip("torch")
-    shape = (1, 4_095, 2, 128)  # the last 128-row tile holds 127 rows
-    seed = torch.Generator().manual_seed(0x5A6E)
-    query, key, value = (torch.randn(shape, generator=seed).to(torch.bfloat16) for _ in range(3))
-    served = torch.nn.functional.scaled_dot_product_attention(
-        *(t.transpose(1, 2).float() for t in (query, key, value))
-    )
-    served = served.transpose(1, 2).to(torch.bfloat16)
-    budget = attention.BY_NAME["flash-attn4"].rel_l2_max
-
-    correct, floor, checked = attention._disagreement(
-        served, query, key, value, torch.Generator().manual_seed(1)
-    )
-    assert set(correct) == {"sampled", "first", "last", "tile_edges"}
-    assert max(correct.values()) < budget and floor < budget
-    assert checked > 2 * shape[1] // attention.PROBE_TILE_GRAIN
-
-    faulty = served.clone()
-    faulty[:, shape[1] // 128 * 128 :] *= 1.03
-    wrong, _, _ = attention._disagreement(
-        faulty, query, key, value, torch.Generator().manual_seed(1)
-    )
-    assert wrong["sampled"] < budget < wrong["last"]
-
-
-def test_probe_inputs_refuse_per_head_fp8_that_gaussian_inputs_admit() -> None:
-    """FA3 FP8 garbled H3 video (run 1250) yet passed its budget on N(0, 1) inputs. The probe's
-    QK-normalised inputs attend sharply, where per-head e4m3 rounding of Q/K/V alone -- the
-    dequantised-input control, a floor under the kernel's own error (h3a-044) -- is past the
-    fp8 budget, while exact BF16 attention keeps the BF16 kernels' budget."""
-    torch = pytest.importorskip("torch")
-    from cozy_runtime.internal.attention_fp8 import quantise_eager
-
-    shape = (1, 4_095, 2, 128)
-    fp8_budget = attention.BY_NAME["flash-attn3-fp8"].rel_l2_max
-    bf16_budget = attention.BY_NAME["flash-attn3"].rel_l2_max
-
-    def served(*tensors: Any) -> Any:
-        out = torch.nn.functional.scaled_dot_product_attention(
-            *(t.transpose(1, 2).float() for t in tensors)
-        )
-        return out.transpose(1, 2).to(torch.bfloat16)
-
-    def fp8_control(*tensors: Any) -> Any:
-        return served(*(q.float() * d[:, None, :, None] for q, d in map(quantise_eager, tensors)))
-
-    def worst(inputs: tuple[Any, Any, Any], output: Any) -> float:
-        by_rows, _, _ = attention._disagreement(output, *inputs, torch.Generator().manual_seed(1))
-        return max(by_rows.values())
-
-    seed = torch.Generator().manual_seed(0x5A6E)
-    sharp = attention.probe_inputs(shape, seed, "cpu", torch.bfloat16)
-    gaussian = tuple(torch.randn(shape, generator=seed).to(torch.bfloat16) for _ in range(3))
-    assert worst(sharp, served(*sharp)) < bf16_budget
-    assert worst(gaussian, fp8_control(*gaussian)) < fp8_budget < worst(sharp, fp8_control(*sharp))
 
 
 def test_fp8_admits_a_strict_subset_of_the_bf16_entrys_sites_so_no_floor_site_moves() -> None:
@@ -249,16 +163,12 @@ def test_a_site_is_admitted_by_its_own_dtype_and_head_dimension(
 
 
 def test_the_device_alone_decides_which_ranked_kernels_are_even_candidates() -> None:
-    """The pure half of the rule: no import, no image, just the card. A device below a
-    kernel's floor never sees it, and every device sees the floor last.
-
-    A BAKED kernel's ceiling is not here, and that is deliberate: it lives in the artifact,
-    which this half is not allowed to read. So sm_100 and sm_120 still list `flash-attn3`
-    here and are refused one step later, at resolution, by the binary's own declaration."""
+    """The pure half of the rule: no import, no compile, just the card. A device outside a
+    kernel's range never sees it, and every device sees the floor last."""
     for device in (_device(0, kind="cpu"), _device(70), _device(89)):
         assert [c.name for c in attention.for_device(device)] == ["sdpa"]
     assert [c.name for c in attention.for_device(_device(90))] == RANKED
-    assert [c.name for c in attention.for_device(_device(100))] == RANKED
+    assert [c.name for c in attention.for_device(_device(100))] == ["sdpa"]
     # Resolution then drops what the image does not ship, in order and without raising.
     for device in (_device(0, kind="cpu"), _device(89), _device(90)):
         offered = [entry.name for entry in attention.available(device)]
@@ -269,83 +179,31 @@ def test_the_device_alone_decides_which_ranked_kernels_are_even_candidates() -> 
 # ----------------------------------------------------------- the range is bounded ABOVE too
 
 
-def test_every_candidate_states_the_architectures_it_serves_and_where_that_came_from() -> None:
-    """h3a-022. The defect was an OPEN-ENDED range: `min_sm=90` and nothing above it, on an
-    entry whose `.so` carries `sm_90a` and dies from C++ anywhere else. So every entry now
-    answers "and up to what?", and the answer comes from one of exactly two places.
-
-    A BAKED entry answers with its artifact and declares no `max_sm` at all — a static copy of
-    a binary's arch list is the thing that drifted. Everything else declares one, and a 0 is a
-    CLAIM about a dispatcher that owns its own fallback, not a field nobody filled in."""
+def test_every_candidate_states_the_architectures_it_serves() -> None:
+    """h3a-022. An OPEN-ENDED range admitted a card the binary had no device code for, and
+    FA3's launcher exits the process from C++ there. Every entry built for a card answers "and
+    up to what?"; the torch backends are unbounded because torch, not this runtime, builds
+    them, and the floor may never be bounded above."""
     for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
-        # A COMPILED snapshot is bounded by its own metadata and may not restate it. A `jit`
-        # kernel is source with no metadata to be bounded by, so it MUST declare the ceiling.
-        assert candidate.jit or not (candidate.snapshot and candidate.max_sm), candidate.name
-        assert not candidate.jit or candidate.max_sm, candidate.name
         assert not candidate.max_sm or candidate.max_sm >= candidate.min_sm, candidate.name
-    # `flash-attn3` is the artifact-bounded one; `sageattention` is bounded here because its
-    # architecture is IN ITS ENTRY POINT and so cannot drift; the torch backends are unbounded
-    # because torch, not this image, builds them.
-    assert attention.BY_NAME["flash-attn3"].snapshot
-    assert not attention.BY_NAME["flash-attn3"].max_sm
-    # h3a-024. FA4 is SOURCE from the kernel site: it declares a ceiling where `flash-attn3`
-    # may not, because it ships device code for no card and compiles for the one it finds.
-    fa4 = attention.BY_NAME["flash-attn4"]
-    assert fa4.jit and not fa4.snapshot and (fa4.min_sm, fa4.max_sm) == (90, 110)
-    assert fa4.distribution == "flash-attn-4" and fa4.import_name == "flash_attn.cute"
-    assert not attention.BY_NAME["flash-attn3"].jit
-    # Sage names one upstream entry per card in its adapter; the site's arches bound the build.
+        assert not candidate.artifact or candidate.max_sm, candidate.name
+    fa3 = attention.BY_NAME["flash-attn3"]
+    assert (fa3.min_sm, fa3.max_sm, fa3.artifact) == (90, 90, "flash-attn3")
     sage = attention.BY_NAME["sageattention"]
     assert (sage.max_sm, sage.sms, sage.local) == (
         120,
         frozenset({89, 90, 120}),
         attention_upstream.SAGE,
     )
-    # The FP16 P/V entry is upstream's SM80 kernel; the image builds it sm_90a only.
+    assert attention.BY_NAME["sol-attn"].sms == frozenset({89, 90, 100, 120})
     fp16pv = attention.BY_NAME["sageattention-fp16pv"]
-    assert (fp16pv.min_sm, fp16pv.max_sm, fp16pv.distribution) == (90, 90, "sageattention")
-    assert fp16pv.local is attention_upstream.SAGE_FP16PV
-    assert fp16pv.rel_l2_max < attention.BY_NAME["sageattention"].rel_l2_max
+    assert (fp16pv.min_sm, fp16pv.max_sm, fp16pv.artifact) == (90, 90, "sageattention")
     assert attention.BY_NAME["cudnn"].max_sm == 0 and attention.BY_NAME["sdpa"].max_sm == 0
-    # The floor may never be bounded above: a card it refused would hold no attention at all.
     assert attention.CANDIDATES[-1].name == "sdpa"
     assert attention.CANDIDATES[-1].min_sm == 0 and attention.CANDIDATES[-1].max_sm == 0
-
-
-@pytest.mark.parametrize(
-    ("declared", "sm", "covers"),
-    [
-        # The baked snapshot's own two entries, against every card the published ladder binds.
-        ("9.0a", 90, True),  # H100/H200 — the only card this image's FA3 has an image for
-        ("9.0a", 100, False),  # B200
-        ("9.0a", 120, False),  # RTX PRO 6000 Blackwell / RTX 5090 — the abort h3a-022 measured
-        ("8.0", 90, False),  # never across a major generation, however close the numbers
-        ("8.0", 120, False),
-        # NVIDIA's binary-compatibility rule: X.y runs on X.z for z >= y, same major only.
-        ("8.0", 80, True),
-        ("8.0", 86, True),
-        ("8.0", 89, True),
-        ("8.6", 80, False),
-        # An ACCELERATED target is architecture-conditional and does not even carry forward to
-        # a higher minor of its own generation; a FAMILY target does.
-        ("12.0a", 121, False),
-        ("12.0f", 121, True),
-        ("12.0", 121, True),
-        ("12.1a", 121, True),
-        # Spellings a kernel-builder artifact and a torch arch list actually use.
-        ("sm_120", 120, True),
-        ("compute_90a", 90, True),
-        # UNREADABLE IS NOT COVERED. A declaration this runtime cannot parse must never admit
-        # a kernel it could not check, because the failure it is checking for is unrecoverable.
-        ("", 90, False),
-        ("hopper", 90, False),
-        ("9.x", 90, False),
-    ],
-)
-def test_device_code_covers_a_card_by_nvidias_rule_and_never_by_optimism(
-    declared: str, sm: int, covers: bool
-) -> None:
-    assert attention._covers(declared, sm) is covers
+    for sm in (100, 120):
+        refused = _refusal(lambda card=sm: attention.pinned("flash-attn3", _device(card)))
+        assert refused.code == "attention_kernel_unsupported" and f"sm{sm}" in str(refused)
 
 
 @pytest.mark.parametrize(
@@ -359,7 +217,7 @@ def test_a_static_ceiling_refuses_the_card_by_name_instead_of_reaching_the_kerne
     name: str, card: int, says: str, below: int
 ) -> None:
     """RED ARM, no plant and no device: a card outside the declared range is refused BY NAME
-    rather than admitted and probed.
+    rather than admitted and reached.
 
     Admitting it is what the old table did, and probing it is what would then have run the
     kernel: h3a-022 measured `cudaErrorNoKernelImageForDevice` out of this extension on an
@@ -377,111 +235,6 @@ def test_a_static_ceiling_refuses_the_card_by_name_instead_of_reaching_the_kerne
     assert under.code == "attention_kernel_unsupported" and f"sm{below}" in str(under)
     # The device gate is applied wherever a candidate is offered, not only at the pin.
     assert name not in attention.image_kernels(_device(card))
-
-
-def test_a_baked_kernels_ceiling_is_read_from_the_artifact_and_refuses_the_card_by_name(
-    tmp_path: Path,
-) -> None:
-    """THE DEFECT, closed against the REAL baked metadata. `backend.archs` below is verbatim
-    from `kernels-community/flash-attn3` at revision `7cb368cf…`, variant
-    `torch-stable-abi29-cu130-x86_64-linux` — the exact snapshot the cu130 worker image bakes
-    at `/opt/cozy/kernels/flash-attn3` and the exact one h3a-022 measured aborting on sm_120.
-
-    The whole point of reading it is that the runtime never had to be told: the table said
-    `min_sm=90` with no ceiling, the binary said `9.0a`, and the two disagreed for as long as
-    nobody compared them. Now the artifact is the authority.
-
-    No `kernels` distribution, no diffusers and no CUDA device are needed to reach this — the
-    gate runs before any of them, because a card the binary has no image for must be refused
-    wherever this code runs, not only where the rest of the stack happens to be installed."""
-    variant = "torch-stable-abi29-cu130-x86_64-linux"
-    build = tmp_path / "flash-attn3" / "build" / variant
-    build.mkdir(parents=True)
-    (build / "metadata.json").write_text(
-        json.dumps(
-            {
-                "name": "flash-attn3",
-                "id": "_flash_attn3_cuda_0f52d9d",
-                "version": 1,
-                "license": "BSD-3-Clause",
-                "backend": {"type": "cuda", "archs": ["8.0", "9.0a"]},
-            }
-        )
-    )
-    real = kernel_site._ACTIVE
-    kernel_site._ACTIVE = kernel_site.KernelSite(str(tmp_path), reason="fixture")
-    try:
-        flash = attention.BY_NAME["flash-attn3"]
-        assert attention._snapshot_archs(flash) == {variant: ["8.0", "9.0a"]}
-
-        # B200 and the 5090 rung of the published `paul/minimax-h3` ladder. Both are refused
-        # by name, and neither reaches the kernel — which is the only outcome that helps,
-        # because the kernel's answer is `exit(1)` and not an exception.
-        for sm in (100, 120):
-            refused = _refusal(lambda card=sm: attention.pinned("flash-attn3", _device(card)))
-            assert refused.code == "attention_kernel_unsupported"
-            assert variant in str(refused) and "'9.0a'" in str(refused)
-            assert f"sm{sm}" in str(refused)
-            assert "exits the process from C++" in str(refused)
-            # AUTO drops it rather than failing the prepare, and never calls it either.
-            assert "flash-attn3" not in [e.name for e in attention.available(_device(sm))]
-            assert "flash-attn3" not in attention.image_kernels(_device(sm))
-
-        # GREEN: the card the artifact DOES declare gets through the arch gate and fails
-        # further in, on what this environment actually lacks. A gate that refused everything
-        # would pass the red arms above while shipping nothing.
-        assert _refusal(lambda: attention.pinned("flash-attn3", _device(90))).code == (
-            "attention_kernel_absent"
-        )
-
-        # SILENCE IS NOT ADMISSION. A baked variant that declares no architecture is refused
-        # on every card, because a check that read nothing must not look like one that passed.
-        (build / "metadata.json").write_text(json.dumps({"name": "flash-attn3", "version": 1}))
-        assert attention._snapshot_archs(flash) == {variant: []}
-        assert _refusal(lambda: attention.pinned("flash-attn3", _device(90))).code == (
-            "attention_kernel_unsupported"
-        )
-    finally:
-        kernel_site._ACTIVE = real
-    # And with no snapshot baked at all the answer is ABSENT, as it always was: an image that
-    # ships no kernel is not an image that ships one for the wrong card.
-    assert _refusal(lambda: attention.pinned("flash-attn3", _device(90))).code == (
-        "attention_kernel_absent"
-    )
-
-
-def test_a_site_kernels_arches_come_from_the_bake_gates_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`sageattention` names an SM120 mode, but the image built it sm_90a only until the
-    per-extension gencode split. The site manifest's arches (proved by `kernel_gate.py`)
-    refuse the card by name before the kernel is reached; a site that declares sm_120a gets
-    past the gate. A package's own copy of the distribution is not described by the site."""
-    site = tmp_path / "site"
-    info = site / "sageattention-2.2.0.dist-info"
-    info.mkdir(parents=True)
-    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: sageattention\nVersion: 2.2.0\n")
-    (info / "RECORD").write_text("")
-    monkeypatch.syspath_prepend(str(site))
-    monkeypatch.setattr(kernel_site, "_ACTIVE", kernel_site.KernelSite(str(tmp_path), str(site)))
-
-    def declare(*arches: str) -> None:
-        manifest = {"kernels": {"sageattention": {"arches": list(arches)}}}
-        (tmp_path / "manifest.json").write_text(json.dumps(manifest))
-
-    declare("sm_90a")
-    sage = attention.BY_NAME["sageattention"]
-    assert attention._baked_archs(sage) == {"kernel site": ["sm_90a"]}
-    refused = _refusal(lambda: attention.pinned("sageattention", _device(120)))
-    assert refused.code == "attention_kernel_unsupported" and "'sm_90a'" in str(refused)
-    declare("sm_89", "sm_90a", "sm_120a")
-    assert _refusal(lambda: attention.pinned("sageattention", _device(120))).code == (
-        "attention_kernel_absent"
-    )
-    # Source kernels carry no device code to declare, and other distributions are not the site's.
-    assert attention._site_archs(attention.BY_NAME["flash-attn4-fp8"]) == {}
-    monkeypatch.setattr(kernel_site, "_ACTIVE", kernel_site.KernelSite(str(tmp_path), str(info)))
-    assert attention._site_archs(sage) == {}
 
 
 def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() -> None:
@@ -531,7 +284,6 @@ def test_the_group_boot_line_renders_from_merged_facts_alone() -> None:
     sentence, namespaced components, offered set unioned in rank order."""
     single = attention.Applied(
         hosts={"dit": {"flash-attn3": 52}},
-        locations={},
         offered=("flash-attn3", "sdpa"),
     )
     assert single.line() == attention.line(single.totals(), single.hosts, list(single.offered), "")
@@ -558,7 +310,7 @@ def test_a_pinned_group_prepare_renders_pinned_from_its_models_own_facts() -> No
     from an unpinned one, which is exactly the A/B h3a-013 cannot afford."""
     pinned = {
         parameter: attention.Applied(
-            hosts={"dit": {"cudnn": 52}}, locations={}, offered=("cudnn",), pin="cudnn"
+            hosts={"dit": {"cudnn": 52}}, offered=("cudnn",), pin="cudnn"
         ).document()
         for parameter in ("fl2va", "ref2va")
     }
@@ -573,11 +325,9 @@ def test_a_pinned_group_prepare_renders_pinned_from_its_models_own_facts() -> No
     auto = attention.merge(
         {
             "fl2va": attention.Applied(
-                hosts={"dit": {"flash-attn3": 52}}, locations={}, offered=("flash-attn3", "sdpa")
+                hosts={"dit": {"flash-attn3": 52}}, offered=("flash-attn3", "sdpa")
             ).document(),
-            "ref2va": attention.Applied(
-                hosts={"vae": {"sdpa": 36}}, locations={}, offered=("sdpa",)
-            ).document(),
+            "ref2va": attention.Applied(hosts={"vae": {"sdpa": 36}}, offered=("sdpa",)).document(),
         }
     )
     assert auto is not None and auto["pin"] == ""
@@ -918,57 +668,25 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     # kernel that cannot serve here is not left guessing (cr-125's discoverability rule).
     assert "This environment runs" in out["too_old"]["detail"]
     # h3a-022, through the real registry: the range is bounded ABOVE as well as below, and the
-    # card above the ceiling is refused by name rather than probed.
+    # card above the ceiling is refused by name rather than reached.
     assert out["too_new"]["code"] == "attention_kernel_unsupported"
     assert "sageattention-fp16pv serves sm90 only" in out["too_new"]["detail"]
 
     # And the pin computes: one real forward through the pinned site.
     assert out["forward"] == {"shape": [1, 64, 1024], "dtype": "torch.bfloat16"}
 
-    # cr-127. Every kernel this card offers agrees with exact attention over a production
-    # length well inside its declared budget, just above its own measured BF16 rounding
-    # floor (h3a-044 measured 0.0016-0.0017 for FA3/FA4/cuDNN at 109k rows on an H100).
-    assert set(out["selfcheck_rel_l2"]) >= {"sdpa"}
-    for name, disagreement in out["selfcheck_rel_l2"].items():
-        floor = out["selfcheck_floor"][name]
-        assert floor < disagreement < out["selfcheck_budgets"][name], (name, disagreement)
-    assert all(budget > 0 for budget in out["selfcheck_budgets"].values())
-
-    # THE PLANTED DEFECT, three shapes, through diffusers' own registry and dispatch. `empty`
-    # is what upstream's meta stub did; `nan` is the h3a-023 hazard, which a bare ratio test
-    # would PASS because NaN compares False; `wrong` is finite, right-shaped and the right
-    # magnitude — the arm no finiteness check and no implausible-rate check can catch.
-    for kind in ("empty", "nan", "wrong"):
-        for name in ("sdpa", "cudnn"):
-            refusal = out[f"dead_{kind}_{name}_pin"]
-            assert refusal["code"] == "attention_kernel_wrong", (kind, name, refusal)
-            assert name in refusal["detail"] and f"sm{out['sm']}" in refusal["detail"]
-        # A PIN refuses; AUTO drops. With the floor itself dead, auto-selection offers
-        # NOTHING rather than silently serving a kernel that returns uninitialized memory —
-        # which is exactly what would have shipped corrupted video.
-        assert out[f"dead_{kind}_auto"] == []
-        assert "sdpa" not in out[f"dead_{kind}_image_kernels"]
-    # The finite arm names the disagreement it measured, so triage reads a number.
-    assert "rel L2 " in out["dead_wrong_sdpa_pin"]["detail"]
-    assert "past its declared budget" in out["dead_wrong_sdpa_pin"]["detail"]
-    # And the green arm holds again once the plants are removed: a passing red arm is not a
-    # registry left broken.
-    assert out["selfcheck_restored"] == out["offered"]
-
-    # cr-136. The fp8 path is NAMEABLE on any box, and what it does depends on what the box
-    # ships: below sm90 the device refuses it; without the snapshot, `absent`; with it, the
-    # production-length probe measures it and, at H3 length, refuses it OUT OF BUDGET by
-    # name (0.31 rel L2 at 109k rows, h3a-044) rather than calling it wrong or serving it.
+    # cr-136. The fp8 path is NAMEABLE on any box, and what it does depends on the card and
+    # what this machine has compiled: below sm90 the device refuses it; on sm90 without its
+    # compiled artifact it is absent; with it, it is pinned and runs.
     fp8 = out["fp8"]
     if fp8["code"]:
         refusals = (
             {"attention_kernel_unsupported"}
-            if out["sm"] < 90
-            else {"attention_kernel_absent", "attention_kernel_out_of_budget"}
+            if out["sm"] != 90
+            else {"attention_kernel_absent", "attention_kernel_compiling"}
         )
         assert fp8["code"] in refusals and "flash-attn3-fp8" in fp8["detail"], fp8
     else:
-        assert 1e-2 < fp8["rel_l2"] < out["selfcheck_budgets"]["flash-attn3-fp8"]
         assert fp8["backend"] == "_cozy_flash_attn3_fp8"
         assert fp8["line"] == "flash-attn3-fp8 x1 (PINNED flash-attn3-fp8) — dit: flash-attn3-fp8"
         assert fp8["forward"] == {"shape": [1, 64, 1024], "dtype": "torch.bfloat16"}

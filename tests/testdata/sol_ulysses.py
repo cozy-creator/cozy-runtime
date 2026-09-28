@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from importlib import import_module
 from pathlib import Path
 from typing import Any, cast
@@ -14,7 +15,7 @@ from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelC
 from torch.multiprocessing.spawn import spawn
 
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
-from cozy_runtime.internal import attention, attention_sol, attention_ulysses
+from cozy_runtime.internal import attention, attention_sol, attention_ulysses, kernel_cache
 from cozy_runtime.internal.parallel.cp import _GroupMesh
 
 
@@ -65,7 +66,9 @@ def sparse_control(tensors: list[Any], output: Any, degree: int, live: int) -> d
     colmean = (q[:, 512:576].float().mean(dim=1) * kc[:, 3].float()).sum(dim=-1)
     colmean *= 128**-0.5 * 1.4426950408889634
     omitted = bool((colmean < threshold[:, 8]).all())
-    all_keys = attention_sol._native(q, k, v, None, live)
+    while (loaded := attention_sol._ready(live, q.device, 0)) is None:
+        time.sleep(0.2)  # the builder process compiles it
+    all_keys = attention_sol._native(q, k, v, None, live, loaded)
     numerator = (output[:, 512:576].float() - all_keys[:, 512:576].float()).norm()
     denominator = all_keys[:, 512:576].float().norm().clamp_min(1e-30)
     return {
@@ -85,7 +88,7 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
     device = torch.device(f"cuda:{rank}" if device_kind == "cuda" else "cpu")
     if device_kind == "cuda":
         torch.cuda.set_device(device)
-        assert torch.cuda.get_device_capability(device) == (9, 0)
+        kernel_cache.configure(kernel_cache.Store(root / "kernels" / "u0"))
     dist.init_process_group(
         "nccl" if device_kind == "cuda" else "cpu:gloo",
         init_method=(root / "rendezvous").as_uri(),

@@ -22,8 +22,7 @@ def test_request_artifact_observation_and_restore_use_actual_diffusers_processor
     entry = attention.Ready(
         attention.BY_NAME["sdpa"],
         attention._member(attention.BY_NAME["sdpa"]),
-        "/installed/snapshot",
-        artifact={"distribution": "fixture", "version": "1", "record_digest": "sha256:abc"},
+        artifact={"artifact": "fixture", "key": "abc", "compile_ms": "1.0"},
     )
     swap = attention.Swap(entry, (("dit", module.processor),), "dit=sdpa")
     value = torch.ones(1, 4, 128)
@@ -34,7 +33,6 @@ def test_request_artifact_observation_and_restore_use_actual_diffusers_processor
             attention.override(defaults, roots, swap, "dit=sdpa") as applied,
         ):
             assert applied.document()["artifacts"]["sdpa"] == entry.artifact
-            assert applied.locations == {"sdpa": "/installed/snapshot"}
             assert torch.equal(module(value), baseline)
             raise RuntimeError("handler failed")
         assert module.processor._attention_backend == before

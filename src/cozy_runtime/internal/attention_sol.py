@@ -4,24 +4,24 @@ No sparse kernel is implemented here. Sparse block selection is approximate;
 protected query rows are recomputed with the selected dense reference. The
 model supplies its live layout, step policy and dense module paths explicitly.
 
-The kernel compiles at most once per key per machine (h3a-087). Upstream's SM90 kernel is
-specialized on the live token count, which only the request knows, so the model's intake
-statement (`expect`), or else the first dense step that sees a count, starts a niced, GPU-less
-builder for it and conditioning and the dense steps cover the compile; the first sparse call
-then loads the object from the machine kernel store, or waits on the builder's lock, never
-switching kernels. Upstream's preprocess autotuning is pinned to
-one configuration, because its candidates differ bitwise and a timing race must not choose
-the output.
+The kernel compiles once per object per machine, out of process (`kernel_compile`): one per
+card, and on SM90 one per 64-token block layout (`variant`), which only the request knows. So
+the first sight of a length (a model's intake statement, or the first dense step) submits its
+compile, and conditioning and the dense steps cover it. A sparse step whose object is not
+compiled yet runs the dense reference instead: nothing waits on a compile. Upstream's
+preprocess autotuning is pinned to one configuration, because its candidates differ bitwise
+and a timing race must not choose the output.
 """
 
 from __future__ import annotations
 
+import ctypes
+import functools
+import hashlib
 import json
 import math
-import os
-import subprocess
 import sys
-import threading
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from functools import wraps
 from importlib import import_module
 from inspect import Parameter, Signature, signature
+from pathlib import Path
 from types import MethodType
 from typing import Any
 
@@ -226,87 +227,214 @@ def _validate_result(output: Any, query: Any) -> None:
         raise ValueError("attention backend returned incompatible output")
 
 
-#: Loaded SM90 kernels by (tokens, kv_splits). One object serves every head count and device:
-#: neither is a compile input (h3a-087).
-_KERNELS: dict[tuple[int, int], kernel_compile.Loaded] = {}
-_KEYS: dict[tuple[int, int], str] = {}
-#: Counts this process already considered for a background build, and the builders it started.
-_CONSIDERED: set[tuple[int, int]] = set()
-_BUILDERS: dict[tuple[int, int], _Builder] = {}
+#: Upstream's CuTe routes. Only SM90's kernel is specialized on the live length, and only
+#: through `make_kernel`'s static route layout: 64-token blocks, grouped 64 at a time, the tail
+#: group's block count, and whether the last block is full. Every operand layout is dynamic,
+#: so its object is a function of (blocks, full), never of the exact count. The other routes'
+#: `make_kernel()` takes nothing: one object per card serves every length.
+ROUTES = {(8, 9): "sm89", (9, 0): "sm90", (10, 0): "sm100", (12, 0): "sm120"}
+_BLOCK = 64
+#: Loaded objects by key digest; one serves every head count, batch and device (h3a-087).
+_KERNELS: dict[str, Loaded] = {}
+#: Keys this process already submitted, so a dense step submits each once.
+_SUBMITTED: set[str] = set()
 _PINNED: list[bool] = []
-#: The builder is `kernel_compile.main` under this process's own import path and bytecode
-#: cache (`-I` drops the PYTHON* variables that carried the latter).
-_BUILDER_BOOT = (
-    "import json, sys; boot = json.loads(sys.argv.pop(1)); sys.path[:] = boot['path']; "
-    "sys.pycache_prefix = boot['pycache_prefix']; "
-    "from cozy_runtime.internal.kernel_compile import main; raise SystemExit(main(sys.argv[1:]))"
-)
+KERNEL = "sol-attn"
+OPTIONS = "--enable-tvm-ffi"
+FUNCTION = "func"
+_DLPACK_CUDA = 2
+_SCALE = 128**-0.5
 
 
-@dataclass(slots=True)
-class _Builder:
-    key: str
-    started: float
-    step: int
-    done: threading.Event
-    exit_status: int | None = None
-    ms: float = 0.0
-    detail: str = ""
-
-    def document(self) -> dict[str, Scalar]:
-        """The observation row's builder fields; `builder_exit` is None while it runs."""
-        return {
-            "builder_step": self.step,
-            "builder_exit": self.exit_status,
-            "builder_ms": self.ms,
-            **({"detail": self.detail} if self.detail else {}),
-        }
+def variant(tokens: int, capability: tuple[int, int]) -> dict[str, Any]:
+    """What of this length the card's kernel is compiled for: nothing, except on SM90."""
+    if type(tokens) is not int or tokens < 1:
+        raise ValueError("a Sol variant needs a positive token count")
+    if capability != (9, 0):
+        return {}
+    return {"blocks": -(-tokens // _BLOCK), "full": tokens % _BLOCK == 0}
 
 
-def _sm90(device: Any) -> bool:
-    return device.type == "cuda" and bool(
-        import_module("torch").cuda.get_device_capability(device) == (9, 0)
+def _capability(device: Any) -> tuple[int, int] | None:
+    if device.type != "cuda":
+        return None
+    found = tuple(import_module("torch").cuda.get_device_capability(device))
+    return (found[0], found[1]) if found in ROUTES else None
+
+
+def target(capability: tuple[int, int]) -> str:
+    """CuTe-DSL's own arch spelling (`env_manager.detect_gpu_arch`) unless its config names one."""
+    named = config.cute_dsl_environment().get("CUTE_DSL_ARCH", "")
+    if named:
+        return named
+    major, minor = capability
+    return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+
+
+@functools.cache
+def sol_library() -> dict[str, Any]:
+    """Every library input to the object: sources, DSL and toolkit, FFI ABI, Python tag."""
+    cutlass = import_module("cutlass")
+    tvm_ffi = import_module("tvm_ffi")
+    toolkit = import_module("cutlass.base_dsl.version_info").CUDA_VERSION
+    root = Path(str(import_module("sol_attn").__file__)).resolve().parent
+    sources = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        data = path.read_bytes()
+        sources.update(path.relative_to(root).as_posix().encode())
+        sources.update(len(data).to_bytes(8, "little"))
+        sources.update(data)
+    return {
+        "sol_attn_sources": sources.hexdigest(),
+        "cutlass_dsl": str(cutlass.__version__),
+        "cuda_toolkit": f"{toolkit.major}.{toolkit.minor}",
+        "tvm_ffi": str(tvm_ffi.__version__),
+        "python": f"cp{sys.version_info.major}{sys.version_info.minor}",
+        "cute_dsl_env": {
+            name: value
+            for name, value in config.cute_dsl_environment().items()
+            if name != "CUTE_DSL_ARCH"
+        },
+    }
+
+
+def job(tokens: int, capability: tuple[int, int]) -> kernel_compile.Job:
+    """The compile of the object serving `tokens` on this card: GPU-less, the DSL's target
+    imposed before it imports."""
+    arch = target(capability)
+    shape = variant(tokens, capability)
+    inputs = {"library": sol_library(), "target": arch, "options": OPTIONS, "variant": shape}
+    return kernel_compile.Job(
+        "sol",
+        kernel_cache.Key.of(KERNEL, inputs),
+        {"route": ROUTES[capability], **shape},
+        {"CUDA_VISIBLE_DEVICES": "", "CUTE_DSL_ARCH": arch},
     )
 
 
-def _key(tokens: int, kv_splits: int, device: Any) -> kernel_cache.Key:
-    capability = tuple(import_module("torch").cuda.get_device_capability(device))
-    return kernel_compile.sol_key(tokens, kv_splits, kernel_compile.target(capability))
+class _Placeholder:
+    """A host tensor that reports CUDA device 0 through DLPack. Tracing reads only dtype, rank,
+    strides and memory space; no pointer is dereferenced, so no GPU is needed."""
+
+    def __init__(self, tensor: Any) -> None:
+        self.tensor = tensor
+        self.ndim = tensor.ndim
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        return (_DLPACK_CUDA, 0)
+
+    def __dlpack__(self, *args: Any, **kwargs: Any) -> Any:
+        capsule = self.tensor.__dlpack__(*args, **kwargs)
+        name_of = ctypes.pythonapi.PyCapsule_GetName
+        name_of.restype, name_of.argtypes = ctypes.c_char_p, [ctypes.py_object]
+        pointer_of = ctypes.pythonapi.PyCapsule_GetPointer
+        pointer_of.restype = ctypes.c_void_p
+        pointer_of.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        name = name_of(capsule)
+        # DLManagedTensorVersioned: version(8) manager_ctx(8) deleter(8) flags(8), then the
+        # DLTensor, whose device follows its data pointer. Unversioned: DLTensor first.
+        offset = 40 if name == b"dltensor_versioned" else 8
+        ctypes.c_int32.from_address(pointer_of(capsule, name) + offset).value = _DLPACK_CUDA
+        return capsule
 
 
-def _prefetch(tokens: int, kv_splits: int, device: Any, step: int) -> None:
-    """At the first dense step that shows this count: load it, or start its builder."""
-    wanted = (tokens, kv_splits)
-    if wanted in _CONSIDERED or wanted in _KERNELS or not _sm90(device):
-        return
-    _CONSIDERED.add(wanted)
+def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
+    """Upstream `_compile_<route>`, traced from placeholders; SM90's at a length that IS this
+    variant. Every route takes q, k, v, output, kc, vc, threshold and lse."""
+    torch = import_module("torch")
+    cute = import_module("cutlass.cute")
+    cuda = import_module("cuda.bindings.driver")
+    to_cute_tensor = import_module("sol_attn.common").to_cute_tensor
+    upstream = import_module(f"sol_attn.{route}")
+    operands = [((2, 2, 2, 128), "bfloat16")] * 6 + [((2, 2, 2), "float32")] * 2
+    arguments = [
+        to_cute_tensor(_Placeholder(torch.empty(shape, dtype=getattr(torch, dtype))))
+        for shape, dtype in operands
+    ]
+    scalars: tuple[int, ...]
+    if route == "sm90":
+        tokens = blocks * _BLOCK if full else blocks * _BLOCK - 1
+        operator, scalars = upstream.make_kernel(tokens, 1), (0,)  # the sink range, packed
+    else:
+        operator = upstream.forward if route == "sm100" else upstream.make_kernel()
+        scalars = (0, 0)  # the sink's first and last block
+    compiled = cute.compile(
+        operator, *arguments, _SCALE, *scalars, stream=cuda.CUstream(0), options=OPTIONS
+    )
+    with tempfile.TemporaryDirectory(prefix="cozy-kernel-") as scratch:
+        path = Path(scratch) / "kernel.o"
+        compiled.export_to_c(object_file_path=str(path), function_name=FUNCTION)
+        return path.read_bytes()
+
+
+def build(spec: dict[str, Any], staging: Path, report: Callable[..., None]) -> dict[str, object]:
+    """The compile manager's builder for one object (`kernel_compile.BUILDERS["sol"]`)."""
+    data = compile_variant(spec["route"], int(spec.get("blocks", 0)), bool(spec.get("full")))
+    (staging / "object").write_bytes(data)
+    return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+
+
+class Loaded:
+    """Upstream's call convention over a loaded object: `stream` is positional in TVM-FFI."""
+
+    __slots__ = ("function",)
+
+    def __init__(self, function: Any) -> None:
+        self.function = function
+
+    def __call__(self, *arguments: Any, stream: Any = None) -> Any:
+        return self.function(*arguments, stream)
+
+
+def load(data: bytes) -> Loaded:
+    """Link verified bytes from a file with no name, private to this process: what was hashed
+    is exactly what runs. `TemporaryFile` is O_TMPFILE, else unlinked at once; it needs no
+    `os.memfd_create`, which python-build-standalone's old glibc build lacks."""
+    cute = import_module("cutlass.cute")
+    for library in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
+        if Path(library).exists():
+            # As flash-attn-4's own disk cache does: a loaded object resolves the DSL
+            # runtime's symbols globally.
+            ctypes.CDLL(library, mode=ctypes.RTLD_GLOBAL)
+    with tempfile.TemporaryFile(prefix="cozy-kernel-") as anonymous:
+        anonymous.write(data)
+        anonymous.flush()
+        path = f"/proc/self/fd/{anonymous.fileno()}"
+        return Loaded(getattr(cute.runtime.load_module(path, enable_tvm_ffi=True), FUNCTION))
+
+
+@functools.cache
+def _job(blocks: int, full: bool, capability: tuple[int, int]) -> kernel_compile.Job:
+    return job(blocks * _BLOCK if full else blocks * _BLOCK - 1, capability)
+
+
+def _job_for(tokens: int, capability: tuple[int, int]) -> kernel_compile.Job:
+    shape = variant(tokens, capability)
+    return _job(shape.get("blocks", 1), shape.get("full", False), capability)
+
+
+def specialize(tokens: int, device: Any, step: int) -> None:
+    """The first sight of a length (a model's intake statement, or a dense step): submit its
+    object's compile to the machine's compile manager, so dense steps cover it."""
+    capability = _capability(device)
     store = kernel_cache.configured()
-    if store is None:
+    if capability is None or store is None:
         return
     started = time.perf_counter()
     try:
-        key = _key(tokens, kv_splits, device)
-        data = store.get(key)
-        if data is not None:
-            _KERNELS[wanted], _KEYS[wanted] = kernel_compile.load(data), key.digest[:16]
-            _kernel_row(_row(wanted, key.digest[:16], "store", started, step=step))
+        found = _job_for(tokens, capability)
+        if found.key.digest in _SUBMITTED or found.key.digest in _KERNELS:
             return
-        lock = store.claim(key)
-        if lock is None:
-            # Another rank or executor on this machine is building it.
-            _kernel_row(_row(wanted, key.digest[:16], "peer_building", started, step=step))
-            return
-        try:
-            _BUILDERS[wanted] = _spawn(store, key, tokens, kv_splits, device, lock, step)
-        finally:
-            os.close(lock)
-        _kernel_row(_row(wanted, key.digest[:16], "background_started", started, step=step))
+        _SUBMITTED.add(found.key.digest)
+        state = kernel_compile.submit(store, found)
+        if variant(tokens, capability):
+            kernel_compile.learn(store, _scope(capability), found)
+        _kernel_row(_row(tokens, found, state.state, started, step=step))
     except Exception as exc:
-        # Nothing needs the kernel yet. The sparse call resolves it again and fails THERE,
-        # precisely; this row keeps the first failure from being invisible.
+        # Nothing needs the kernel yet; the sparse step asks again and falls back THERE.
         _kernel_row(
             {
-                "source": "prefetch_failed",
+                "source": "submit_failed",
                 "tokens": tokens,
                 "step": step,
                 "detail": f"{type(exc).__name__}: {exc}"[:300],
@@ -314,120 +442,70 @@ def _prefetch(tokens: int, kv_splits: int, device: Any, step: int) -> None:
         )
 
 
+def submit_card(index: int) -> None:
+    """At the startup warm, as soon as Sol is ready here: a card whose kernel takes no length
+    compiles its one object; SM90 compiles every length layout this machine has served."""
+    device = import_module("torch").device("cuda", index)
+    capability = _capability(device)
+    store = kernel_cache.configured()
+    if capability is None or store is None:
+        return
+    if capability != (9, 0):
+        specialize(1, device, -2)
+        return
+    for found in kernel_compile.learned(store, _scope(capability)):
+        if found.key.digest not in _SUBMITTED:
+            _SUBMITTED.add(found.key.digest)
+            kernel_compile.submit(store, found)
+
+
+def _scope(capability: tuple[int, int]) -> str:
+    """Learned layouts are this library's on this card: another build learns its own."""
+    digest = hashlib.sha256(json.dumps(sol_library(), sort_keys=True).encode()).hexdigest()
+    return f"{KERNEL}-{target(capability)}-{digest[:16]}"
+
+
 def expect(tokens: int, device: Any) -> None:
-    """A model stated its live length at request intake: start that count's kernel now, a
-    whole text conditioning ahead of the first dense step. Its row carries step -1."""
-    _prefetch(tokens, 1, device, -1)
-
-
-def builder_command(
-    store: kernel_cache.Store, tokens: int, kv_splits: int, arch: str, lock: int
-) -> tuple[list[str], dict[str, str]]:
-    """The builder's argv and environment: this interpreter and import path, this store, no
-    GPU, the key's target imposed before the DSL imports, and the inherited build lock."""
-    argv = [
-        sys.executable,
-        "-I",
-        "-c",
-        _BUILDER_BOOT,
-        json.dumps({"path": sys.path, "pycache_prefix": sys.pycache_prefix}),
-        "--tokens",
-        str(tokens),
-        "--kv-splits",
-        str(kv_splits),
-        "--target",
-        arch,
-        "--lock-fd",
-        str(lock),
-        "--store",
-        str(store.own),
-        *(["--trusted", str(store.trusted)] if store.trusted is not None else []),
-    ]
-    return argv, {
-        **config.inherited_environment(),
-        "CUDA_VISIBLE_DEVICES": "",
-        "CUTE_DSL_ARCH": arch,
-    }
-
-
-def _spawn(
-    store: kernel_cache.Store,
-    key: kernel_cache.Key,
-    tokens: int,
-    kv_splits: int,
-    device: Any,
-    lock: int,
-    step: int,
-) -> _Builder:
-    capability = tuple(import_module("torch").cuda.get_device_capability(device))
-    argv, environment = builder_command(
-        store, tokens, kv_splits, kernel_compile.target(capability), lock
-    )
-    process = subprocess.Popen(
-        argv,
-        env=environment,
-        pass_fds=(lock,),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    builder = _Builder(key.digest[:16], time.perf_counter(), step, threading.Event())
-
-    def reap() -> None:
-        _, err = process.communicate()
-        builder.exit_status = process.returncode
-        builder.ms = round((time.perf_counter() - builder.started) * 1000, 1)
-        if process.returncode:
-            builder.detail = err.decode(errors="replace")[-600:]
-        builder.done.set()
-
-    threading.Thread(target=reap, name=f"sol-builder-{tokens}", daemon=True).start()
-    return builder
+    """A model stated its live length at request intake: a whole conditioning ahead of the
+    first dense step. Its row carries step -1."""
+    specialize(tokens, device, -1)
 
 
 def _row(
-    wanted: tuple[int, int], key: str, source: str, started: float, **extra: Scalar
+    tokens: int, found: kernel_compile.Job, source: str, started: float, **extra: Scalar
 ) -> dict[str, Scalar]:
-    builder = _BUILDERS.get(wanted)
-    # `source` becomes the observation's value; the key digest names the split count too.
+    shape = json.loads(found.key.inputs)["variant"]
     return {
         "source": source,
-        "tokens": wanted[0],
-        "key": key,
+        "tokens": tokens,
+        **{name: value for name, value in shape.items()},
+        "key": found.key.digest[:16],
         "ms": round((time.perf_counter() - started) * 1000, 1),
-        **(builder.document() if builder is not None else {}),
         **extra,
     }
 
 
-def _resolve(tokens: int, kv_splits: int, device: Any) -> kernel_compile.Loaded | None:
-    """The kernel for this count: loaded, waited for, or compiled here and published.
-
-    Every path yields the same bytes, so none of them changes the output. With no store
-    (no rooted worker) upstream compiles in-process exactly as it always has."""
-    wanted = (tokens, kv_splits)
-    loaded = _KERNELS.get(wanted)
-    if loaded is not None:
-        rows = _KERNEL_ROWS.get()
-        if rows is not None and not any(row.get("tokens") == tokens for row in rows):
-            # Resident from an earlier request: say so once, rather than print nothing.
-            rows.append(_row(wanted, _KEYS[wanted], "memory", time.perf_counter()))
-        return loaded
+def _ready(tokens: int, device: Any, step: int) -> Loaded | None:
+    """The object for this length when it is compiled, else None and its compile submitted:
+    the step then runs dense. Nothing here compiles or waits."""
+    capability = _capability(device)
     store = kernel_cache.configured()
-    if store is None:
+    if capability is None or store is None:
         return None
+    found = _job_for(tokens, capability)
+    loaded = _KERNELS.get(found.key.digest)
+    if loaded is not None:
+        return loaded
     started = time.perf_counter()
-    key = _key(tokens, kv_splits, device)
-    data, source = store.get(key), "store"
+    data = store.get(found.key)
     if data is None:
-        with store.building(key):
-            data, source = store.get(key), "waited"
-            if data is None:
-                data, source = kernel_compile.compile_sol(tokens, kv_splits), "compiled"
-                store.put(key, data, kernel_compile.producer(started))
-    loaded = _KERNELS[wanted] = kernel_compile.load(data)
-    _KEYS[wanted] = key.digest[:16]
-    _kernel_row(_row(wanted, _KEYS[wanted], source, started))
+        state = kernel_compile.submit(store, found)
+        _SUBMITTED.add(found.key.digest)
+        _kernel_row(_row(tokens, found, "cold_compile", started, step=step, state=state.line()))
+        return None
+    loaded = _KERNELS[found.key.digest] = load(data)
+    entry = kernel_compile.status(store, found)
+    _kernel_row(_row(tokens, found, "store", started, step=step, compile_ms=entry.ms))
     return loaded
 
 
@@ -446,21 +524,17 @@ def _pin_preprocess() -> None:
     _PINNED.append(True)
 
 
-def _native(query: Any, key: Any, value: Any, scale: float | None, sink_tokens: int) -> Any:
-    """Call the upstream kernel; a full-document sink selects every KV block.
-
-    This does not perform the wrapper's protected-query recomputation. The same
-    public upstream call therefore provides an all-keys arithmetic control.
-    """
-    if query.device.type == "cuda":
-        _pin_preprocess()
-    if _sm90(query.device):
-        batch, tokens, heads, _ = query.shape
-        loaded = _resolve(tokens, 1, query.device)
-        if loaded is not None:
-            import_module("sol_attn.interface")._compiled[
-                (query.device.index, (9, 0), batch, tokens, heads, 1)
-            ] = loaded
+def _native(
+    query: Any, key: Any, value: Any, scale: float | None, sink_tokens: int, loaded: Loaded
+) -> Any:
+    """Call the upstream kernel through the compiled variant; a full-document sink selects
+    every KV block. This does not perform the wrapper's protected-query recomputation."""
+    _pin_preprocess()
+    batch, tokens, heads, _ = query.shape
+    capability = tuple(import_module("torch").cuda.get_device_capability(query.device))
+    import_module("sol_attn.interface")._compiled[
+        (query.device.index, capability, batch, tokens, heads, 1)
+    ] = loaded
     return import_module("sol_attn").sol_attn(
         query.contiguous(),
         key.contiguous(),
@@ -515,15 +589,15 @@ def sol_attention(
         t.dtype != torch.bfloat16 or t.device != query.device or t.requires_grad for t in tensors
     ):
         raise ValueError("Sol requires BF16 inference inputs on one device")
-    if query.device.type != "cuda" or torch.cuda.get_device_capability(query.device) != (9, 0):
-        raise ValueError("This Sol adapter supports the H100 SM90 route only")
+    if _capability(query.device) is None:
+        raise ValueError(f"Sol serves upstream's CuTe routes only: {sorted(ROUTES.values())}")
     if scale is not None and not math.isfinite(scale):
         raise ValueError("attention scale must be finite")
     return _execute(query, key, value, scale, layout, site)
 
 
 def backend(device: Any) -> str:
-    """The route upstream selects on this device: `cute_sm90`, or its silent Triton fallback."""
+    """The route upstream selects on this device: `cute_<sm>`, or its silent Triton fallback."""
     return str(import_module("sol_attn").get_sol_attn_backend(device))
 
 
@@ -545,14 +619,19 @@ def _execute(
     if layout.live_tokens > query.shape[1]:
         raise ValueError("attention layout exceeds Q/K/V sequence length")
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
-    if dense_path or layout.step < layout.dense_until_step:
-        if not dense_path:
-            # The dense steps run on the GPU while this count's kernel compiles on the CPU.
-            _prefetch(layout.live_tokens, 1, query.device, layout.step)
+    loaded = None
+    if not dense_path:
+        # The dense steps run on the GPU while this length's variant compiles on the CPU.
+        specialize(layout.live_tokens, query.device, layout.step)
+        if layout.step >= layout.dense_until_step:
+            loaded = _ready(layout.live_tokens, query.device, layout.step)
+    if loaded is None:
+        # A dense step, a dense path, or a sparse step whose variant is still compiling: the
+        # dense reference serves it, and nothing waits on the compile.
         live_output = _dense(q, k, v, scale)
         _count("dense_path" if dense_path else "dense_step")
     else:
-        live_output = _native(q, k, v, scale, layout.protected_prefix)
+        live_output = _native(q, k, v, scale, layout.protected_prefix, loaded)
         _validate_result(live_output, q)
         if any(
             live_output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()

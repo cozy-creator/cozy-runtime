@@ -156,42 +156,55 @@ def test_the_request_pin_is_what_every_rank_reports_as_requested() -> None:
     assert (held[1]["start_us"], held[1]["end_us"], held[1]["pid"]) == (2, 12, 7)
 
 
-def test_a_kernel_the_probe_refuses_is_evidence_with_its_measurement() -> None:
-    """A kernel 5% off exact attention runs, and the probe refuses it by name: the rank's
-    `skipped` evidence carries the refusal with the numbers behind it."""
-    torch = pytest.importorskip("torch")
+def test_a_kernel_still_compiling_is_evidence_with_its_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auto-selection serves the next ready kernel past one still compiling, and the rank's
+    evidence says which served and how far along the other is."""
     pytest.importorskip("diffusers")
-    from cozy_runtime.internal import attention, attention_ulysses
+    import hashlib
+    import json
+    import zipfile
+
+    from cozy_runtime.internal import attention, attention_upstream, kernel_cache, kernel_sources
     from cozy_runtime.internal.encoding import DeviceFacts
 
-    def off(query: Any, key: Any, value: Any, **_options: Any) -> Any:
-        exact = torch.nn.functional.scaled_dot_product_attention(
-            *(t.transpose(1, 2) for t in (query, key, value))
-        )
-        return (exact * 1.05).transpose(1, 2)
-
-    candidate = attention.Candidate(
-        name="off-by-five",
-        backend="_cozy_off_by_five_test",
-        local=attention_ulysses.Local(off, lambda *_: "scaled"),
+    wheel = tmp_path / "late_kernel-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("late_kernel/__init__.py", "")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    row = {"version": "1.0", "file": wheel.name, "sha256": digest}
+    (tmp_path / "index.json").write_text(json.dumps({"sources": {"late-kernel": row}}))
+    monkeypatch.setattr(kernel_sources, "ROOT", tmp_path)
+    store = kernel_cache.Store(tmp_path / "u0")
+    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [store])
+    job = kernel_sources.job(kernel_sources.PYTHON, 0)
+    lock = store.claim(job.key)
+    assert lock is not None
+    store.set_state(job.key, {"progress": 0.42, "started_unix_ms": 1})
+    late = attention.Candidate(
+        name="late",
+        backend="_cozy_late_test",
+        local=attention_upstream.SDPA,
         min_sm=0,
         dtypes=frozenset(),
         max_head_dim=0,
-        rel_l2_max=1e-2,
+        artifact=kernel_sources.PYTHON,
+        import_name="late_kernel",
     )
+    cpu = DeviceFacts("cpu", "CPU", 0, "", "", 0)
+    monkeypatch.setattr(attention, "CANDIDATES", (late, *attention.CANDIDATES))
     try:
-        with pytest.raises(attention.AttentionRefusal) as refused:
-            attention._resolve(candidate, DeviceFacts("cpu", "CPU", 0, "", "", 0))
-        assert refused.value.code == "attention_kernel_out_of_budget"
-        [row] = [r for r in attention.evidence(()).skipped if r.kernel == "off-by-five"]
-        assert row.status == "attention_kernel_out_of_budget"
-        assert (row.source, row.budget, row.budget_state) == ("prepare", 1e-2, "calibrated")
-        assert row.shape == list(attention.PROBE_SHORT)
-        assert set(row.rel_l2_by_rows) == {"sampled", "first", "last", "tile_edges"}
-        assert min(row.rel_l2_by_rows.values()) == pytest.approx(0.05, abs=5e-3)
-        assert "off-by-five" not in [r.kernel for r in attention.evidence(("off-by-five",)).skipped]
+        skipped: dict[str, str] = {}
+        assert [ready.name for ready in attention.available(cpu, skipped)] == ["sdpa"]
+        assert "compiling (42%)" in skipped["late"]
+        rows = {row["kernel"]: row for row in attention.evidence(("sdpa",))}
+        assert rows["sdpa"] == {"kernel": "sdpa", "state": "ready", "line": "ready", "served": True}
+        assert rows["late"]["state"] == "compiling" and rows["late"]["progress"] == 0.42
+        assert not rows["late"]["served"] and rows["late"]["line"] == "compiling (42%)"
     finally:
-        attention._MEASURED.pop("off-by-five", None)
+        os.close(lock)
+        attention._STATES.pop("late", None)
 
 
 def test_a_long_schedule_keeps_a_bounded_series_and_counts_the_rest() -> None:

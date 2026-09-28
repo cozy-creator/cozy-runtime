@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +10,7 @@ from typing import Any
 import pytest
 
 from cozy_runtime.author import AttentionContext, Model
-from cozy_runtime.internal import attention, attention_ulysses
+from cozy_runtime.internal import attention
 from cozy_runtime.internal.attention_registry import register
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor import Executor
@@ -238,8 +237,6 @@ def test_new_approximate_backends_remain_explicit_and_architecture_exact() -> No
         candidate = attention.BY_NAME[name]
         assert candidate in attention.PINNABLE and candidate not in attention.CANDIDATES
         assert candidate.sms == sms
-        # A Blackwell budget nobody has measured says so in every admission it appears in.
-        assert candidate.uncalibrated & {100, 103, 120, 121} == sms & {100, 103, 120, 121}
     assert not attention._admits(attention.BY_NAME["flashinfer-bf16-fp8"], "bfloat16", 64)
     assert attention._admits(attention.BY_NAME["flashinfer-bf16-fp8"], "bfloat16", 128)
 
@@ -341,31 +338,6 @@ def test_sol_can_be_installed_for_context_parallel_degree() -> None:
     assert applied.totals() == {"sol-attn": 1}
 
 
-def test_probe_refuses_wrong_output_dtype_even_with_perfect_values() -> None:
-    torch = pytest.importorskip("torch")
-    query = torch.ones(1, 2, 1, 8, dtype=torch.bfloat16)
-    exact = query.float()
-    entry = _ready("sdpa")[0]
-    attention._validate_probe_contract(entry, _device(), query, query)
-    with pytest.raises(attention.AttentionRefusal, match="must return"):
-        attention._validate_probe_contract(entry, _device(), exact, query)
-
-
-def test_the_gate_tells_out_of_budget_from_carrying_no_attention() -> None:
-    """Finite output past its budget RUNS and is out of budget, by name; past rel L2 1 the
-    output carries no attention at all (h3a-013's uninitialized buffer)."""
-    pytest.importorskip("diffusers")
-    entry = _ready("flash-attn3-fp8")[0]
-    attention._gate(entry, _device(), 0.05, "fixture")
-    with pytest.raises(attention.AttentionRefusal, match="numerically out of budget") as over:
-        attention._gate(entry, _device(), 0.31, "73439 keys")
-    assert over.value.code == "attention_kernel_out_of_budget"
-    assert "rel L2 0.31" in str(over.value) and "73439 keys" in str(over.value)
-    with pytest.raises(attention.AttentionRefusal) as none:
-        attention._gate(entry, _device(), 1.0, "fixture")
-    assert none.value.code == "attention_kernel_wrong"
-
-
 def test_encoded_projection_output_contract_wins_over_norm_and_storage_dtype() -> None:
     torch = pytest.importorskip("torch")
     from cozy_runtime.internal.encoding import RowwiseNativeLeaf
@@ -397,47 +369,6 @@ def test_active_packed_projection_and_unknown_contract_are_distinguished() -> No
     assert attention._dtype(module) == "float32"
     module.to_q = torch.nn.Identity()
     assert attention._dtype(module) == ""
-
-
-@pytest.mark.skipif(
-    os.environ.get("COZY_TEST_ATTENTION_CUDA") != "1",
-    reason="requires two explicitly owned CUDA devices",
-)
-def test_numerical_probe_runs_on_the_selected_nondefault_device() -> None:
-    torch = pytest.importorskip("torch")
-    if torch.cuda.device_count() < 2:
-        pytest.skip("requires two explicitly owned CUDA devices")
-    indices: list[int] = []
-
-    def reference(query: Any, key: Any, value: Any, **_options: Any) -> Any:
-        indices.append(query.device.index)
-        assert query.device == key.device == value.device == torch.device("cuda", 1)
-        assert torch.cuda.current_device() == 1
-        return torch.nn.functional.scaled_dot_product_attention(
-            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
-        ).transpose(1, 2)
-
-    local = attention_ulysses.Local(reference, lambda *_: "reference")
-    entry = attention.Ready(
-        attention.Candidate(
-            name="index-probe",
-            backend="_cozy_probe_device_test",
-            local=local,
-            min_sm=0,
-            dtypes=frozenset({"bfloat16"}),
-            max_head_dim=128,
-            rel_l2_max=2e-2,
-        ),
-        attention_ulysses.member("_cozy_probe_device_test", local),
-    )
-    major, minor = torch.cuda.get_device_capability(1)
-    selected = DeviceFacts(
-        kind="cuda", name="owned GPU 1", sm=major * 10 + minor, driver="", configuration="", index=1
-    )
-    with torch.cuda.device(0):
-        attention.probe(entry, selected)
-        assert torch.cuda.current_device() == 0
-    assert indices == [1]
 
 
 def test_repeated_group_pin_requires_every_scoped_prepared_site() -> None:
@@ -505,10 +436,10 @@ def test_h3_prefers_sol_then_sage_then_fa3_for_every_dit_and_never_fp8() -> None
             assert model.choose_attention(context) == expected
 
 
-@pytest.mark.parametrize("sm", [90, 100])
-def test_h3_dits_fall_through_to_fa3_when_sol_and_sage_cannot_serve(sm: int) -> None:
-    """sm90 without Sol/Sage in the environment, and a non-SM90 card: both walk to FA3 and
-    say why each earlier preference was skipped. FA3 is installation-only here, as above."""
+@pytest.mark.parametrize(("sm", "served"), [(90, "flash-attn3"), (100, "sdpa")])
+def test_h3_dits_fall_through_when_sol_and_sage_cannot_serve(sm: int, served: str) -> None:
+    """sm90 with Sol and Sage not compiled here walks to FA3; sm100, where FA3's hopper build
+    has no device code, walks to SDPA. Each earlier preference says why it was skipped."""
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
     from cozy_runtime.models.minimax_h3.model import H3Model
@@ -516,16 +447,16 @@ def test_h3_dits_fall_through_to_fa3_when_sol_and_sage_cannot_serve(sm: int) -> 
     roots = _h3_roots("bfloat16")
     skipped: dict[str, str] = {}
     applied = attention.install(
-        _ready("flash-attn3", "sdpa"),
+        _ready(*[c.name for c in attention.for_device(_cuda(sm))]),
         roots,
         device=_cuda(sm),
         choose=object.__new__(H3Model).choose_attention,
         skipped=skipped,
     )
-    assert applied.hosts == {name: {"flash-attn3": 1} for name in roots}
+    assert applied.hosts == {name: {served: 1} for name in roots}
     assert {"sol-attn", "sageattention"} <= set(skipped), skipped
     if sm != 90:
-        assert f"sm{sm}" in skipped["sol-attn"] and f"sm{sm}" in skipped["sageattention"]
+        assert f"sm{sm}" in skipped["sageattention"] and "sm100" not in skipped["sol-attn"]
     assert not {name for name in skipped if "fp8" in name}
 
 

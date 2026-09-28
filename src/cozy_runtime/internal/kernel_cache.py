@@ -1,23 +1,24 @@
-"""Compiled kernel objects that outlive the process, keyed by every input that shapes their bytes.
+"""The machine's compiled artifacts, keyed by every input that shapes their bytes.
 
-A Runtime-served CuTe kernel lowers to a relocatable object that is a pure function of its key:
-the kernel library's exact sources, the CuTe DSL and the CUDA toolkit it was built with, the
-TVM-FFI ABI, the Python tag, the target architecture and the kernel's own static configuration.
-Measured on Sol-Attn's SM90 forward (h3a-087): an object compiled with no GPU visible is
-byte-identical to one compiled beside live tensors, whatever the head count, batch or device.
-The driver is not an input; the object carries SASS for its target.
+An artifact is anything compiled on this machine for this machine: a CuTe object (Sol's per-length
+forward), an extension kernel's importable tree (SageAttention built by its own setup.py for
+the card present), a Triton cache fill. Its key is the complete input document: sources by
+digest, target architecture, torch, CUDA, Python and compiler, plus any specialization.
 
 Entries live in WRITER namespaces, `<machine kernels>/u<uid>`. An executor writes only its own
 uid's namespace and also reads the worker's; it never reads another placement's. A user-run
 machine runs worker and executors as one uid, so that is one machine-wide namespace; under uid
-isolation no placement can plant an object that another placement loads.
+isolation no placement can plant an artifact that another placement loads.
 
-    <namespace>/<kernel>/<digest>/object       the bytes
-    <namespace>/<kernel>/<digest>/entry.json   key document, sha256, size, producer
+    <namespace>/<kernel>/<digest>/entry.json   key document and producer, written last
+    <namespace>/<kernel>/<digest>/object       an object entry's bytes (sha256 in entry.json)
+    <namespace>/<kernel>/<digest>/site/        a tree entry's importable directory
     <namespace>/<kernel>/<digest>.lock         one builder per key, across processes
+    <namespace>/<kernel>/<digest>.state.json   the live builder's progress, or its failure
 
-A lock is `flock`, so a builder that dies releases it: waiting on it is waiting on a live
-compile, never on a clock.
+An entry is built in a private staging directory and renamed into place whole, so a reader
+never sees half of one. A lock is `flock`, so a builder that dies releases it: waiting on it
+is waiting on a live compile, never on a clock.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import os
 import re
 import secrets
 import shutil
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,7 @@ SCHEMA = 1
 _KERNEL = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _OBJECT = "object"
 _ENTRY = "entry.json"
+SITE = "site"
 
 
 class KernelCacheRefusal(Exception):
@@ -49,8 +51,8 @@ class KernelCacheRefusal(Exception):
 
 class _Entry(msgspec.Struct, frozen=True):
     key: object
-    sha256: str
-    size: int
+    sha256: str = ""
+    size: int = -1
 
 
 def _canonical(value: object) -> object:
@@ -100,27 +102,51 @@ class Store:
             found = _read(self.trusted, key, repair=False)
         return found
 
-    def put(self, key: Key, data: bytes, producer: Mapping[str, object]) -> None:
-        """Publish under the key's lock; the first complete entry wins, a later one is dropped.
+    def entry(self, key: Key) -> Path | None:
+        """A published entry's directory, own namespace first, when its key document is this
+        key's; None when absent. An object entry's bytes are verified by `get`, not here."""
+        for namespace in (self.own, self.trusted):
+            if namespace is None:
+                continue
+            entry_dir = namespace / key.kernel / key.digest
+            try:
+                entry = msgspec.json.decode((entry_dir / _ENTRY).read_bytes(), type=_Entry)
+            except (OSError, ValueError):
+                continue
+            if entry.key == key.document():
+                return entry_dir
+        return None
 
-        Every object is a pure function of its key, so a lost race loses nothing."""
+    def put(self, key: Key, data: bytes, producer: Mapping[str, object]) -> None:
+        """Publish an object entry; every object is a pure function of its key."""
+
+        def fill(staging: Path) -> Mapping[str, object]:
+            _write(staging / _OBJECT, data)
+            return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data), **producer}
+
+        self.publish(key, fill)
+
+    def publish(self, key: Key, fill: Callable[[Path], Mapping[str, object]]) -> Path:
+        """Build an entry in a private staging directory, then rename it into place whole.
+
+        `fill` writes the entry's content and returns its producer facts; `sha256` and
+        `size` among them verify an object entry. The first complete entry wins and a later
+        one is dropped: only the lock holder publishes a digest, so any leftover staging
+        directory is a dead writer's."""
         kernel = self._kernel_dir(key)
         final = kernel / key.digest
         if final.exists():
-            return
+            return final
         for stale in kernel.glob(f".tmp-{key.digest}-*"):
-            # Only the lock holder publishes this digest: any temporary is a dead writer's.
             shutil.rmtree(stale, ignore_errors=True)
         staging = kernel / f".tmp-{key.digest}-{secrets.token_hex(8)}"
         staging.mkdir(mode=0o755)
         try:
-            _write(staging / _OBJECT, data)
-            entry = {
-                "key": key.document(),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "size": len(data),
-                "producer": dict(producer),
-            }
+            facts = dict(fill(staging))
+            entry: dict[str, object] = {"key": key.document(), "producer": facts}
+            for name in ("sha256", "size"):
+                if name in facts:
+                    entry[name] = facts.pop(name)
             _write(staging / _ENTRY, json.dumps(entry, sort_keys=True, indent=1).encode())
             _fsync_dir(staging)
             try:
@@ -131,6 +157,31 @@ class Store:
             _fsync_dir(kernel)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+        return final
+
+    def state(self, key: Key) -> dict[str, object] | None:
+        """The builder's last word on this key, own namespace first: progress or failure."""
+        for namespace in (self.own, self.trusted):
+            if namespace is None:
+                continue
+            path = namespace / key.kernel / f"{key.digest}.state.json"
+            try:
+                found = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(found, dict):
+                return found
+        return None
+
+    def set_state(self, key: Key, state: Mapping[str, object] | None) -> None:
+        path = self._kernel_dir(key) / f"{key.digest}.state.json"
+        if state is None:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            return
+        scratch = path.with_name(f".{path.name}.{secrets.token_hex(4)}")
+        scratch.write_text(json.dumps(dict(state), sort_keys=True))
+        os.replace(scratch, path)
 
     @contextlib.contextmanager
     def building(self, key: Key) -> Iterator[None]:
@@ -176,6 +227,7 @@ def _read(namespace: Path, key: Key, *, repair: bool) -> bytes | None:
         entry, data = None, b""
     if (
         entry is not None
+        and entry.size >= 0
         and entry.key == key.document()
         and entry.size == len(data)
         and entry.sha256 == hashlib.sha256(data).hexdigest()

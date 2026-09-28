@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import functools
 import gc
 import hashlib
 import importlib
@@ -49,7 +50,7 @@ import resource
 import socket
 import sys
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -83,7 +84,6 @@ from cozy_runtime.internal import (
     execution_evidence,
     executor_commands,
     kernel_cache,
-    kernel_site,
     model_config,
     native_interfaces,
     package_interface,
@@ -621,6 +621,8 @@ class Executor:
         #: What the runtime pinned on this generation's attention sites (cr-124). One BOOT
         #: line, not a per-attempt record: the choice is a function of device and image.
         self.attention: attention.Applied | None = None
+        #: selects this construction again, when a kernel it skipped while compiling is ready
+        self._reselect: Callable[[], attention.Applied] | None = None
         self.attention_defaults = attention.Snapshot(())
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: Any = None
@@ -692,7 +694,6 @@ class Executor:
             "euid": os.geteuid(),
             "sealed": dict(_SEALED),
             "torch_loaded": "torch" in sys.modules,
-            "kernel_site": kernel_site.current().document(),
             "rss_bytes": _rss(),
             "rank": self.rank,
             "world": self.world,
@@ -1046,7 +1047,7 @@ class Executor:
                 execution_evidence.attention(
                     observed=self._run_attention,
                     impl=attention.implementations(served),
-                    probed=attention.evidence(self._run_served),
+                    kernels=attention.evidence(self._run_served),
                 ),
             ),
         }
@@ -1387,13 +1388,12 @@ class Executor:
         }
 
     def warm(self, command: Warm) -> dict[str, Any]:
-        """The startup warm (h3a-087): a started process with nothing constructed proves, on
-        every rank's own card, what its first construction will otherwise pay for there —
-        the fused glue's loads and the attention probes of the model's preferred chain and
-        the ranked table — so construction and a request's pin check read verdicts.
+        """The startup warm (h3a-087): a started process with nothing constructed starts, on
+        every rank's own card, the compiles its first construction will want (the fused glue
+        and every kernel of the model's preferred chain and the ranked table), so they run
+        beside the weights' download. It returns at once: nothing here waits on a compile.
 
-        An optimization and never a verdict: whatever fails here the construction does again
-        for real and refuses there. The worker sends it only while the cards are idle."""
+        An optimization and never a verdict: the construction selects again for real."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if not self.started or self.torch is None or self.device_kind != "cuda":
@@ -1412,7 +1412,7 @@ class Executor:
         took = (time.perf_counter() - started) * 1000
         if "started_unix_ms" in self.boot:
             # The boot record spans the warm too: `cozy run show` reads one executor boot.
-            for name in ("fusion_load", "attention_probe"):
+            for name in ("fusion_load", "attention_compile"):
                 self.boot["legs_ms"][name] = max(r.get("legs_ms", {}).get(name, 0.0) for r in rows)
             self.boot["ms"] = round(time.time() * 1000 - self.boot["started_unix_ms"], 1)
         return {"ok": True, "ranks": rows, "ms": round(took, 1)}
@@ -1433,10 +1433,10 @@ class Executor:
                 fused = f"{type(exc).__name__}: {exc}"[:200]
             legs["fusion_load"] = round((time.perf_counter() - mark) * 1000, 1)
         mark = time.perf_counter()
-        kernels = attention.warm(device, self._preferred_attention(classes, device))
-        # The probes' scratch goes back to the driver: the card may be another call's.
+        kernels = attention.expect(device, self._preferred_attention(classes, device))
+        # Launch checks' scratch goes back to the driver: the card may be another call's.
         accel.release_cached(self.torch, self.device_kind)
-        legs["attention_probe"] = round((time.perf_counter() - mark) * 1000, 1)
+        legs["attention_compile"] = round((time.perf_counter() - mark) * 1000, 1)
         return {
             "rank": self.rank,
             "legs_ms": legs,
@@ -2434,7 +2434,8 @@ class Executor:
             # not a per-attempt one. The degree rides in because a sharded site admits only
             # a kernel `cp.py` can shard, and the fp8 rank is not one (cr-138).
             roots = {**backend.components, **backend.parked}
-            applied = self._prepare_attention(
+            reselect = functools.partial(
+                self._prepare_attention,
                 binding,
                 roots,
                 pin,
@@ -2444,6 +2445,7 @@ class Executor:
                 else None,
                 optional_scope=optional_attention_scope,
             )
+            applied = reselect()
             self.device_facts = device_facts
             stage("attention_pin")
         except ModelFitRefused as exc:
@@ -2554,7 +2556,7 @@ class Executor:
         # fence are deleted whole (model-code-fit D12) — its only consumer was a fence the
         # planner had already disabled.
         self.plan = plan
-        self.attention = applied
+        self.attention, self._reselect = applied, reselect
         constructed_preimage = canonical.write(
             {
                 "plan_digest": plan.digest(),
@@ -3230,6 +3232,8 @@ class Executor:
             }
         pin = command.attention_kernel
         try:
+            if not pin:
+                self._upgrade_attention()
             swap = self._attention_plan(pin) if pin else None
             self._restore_attention()
         except attention.AttentionRefusal as exc:
@@ -3485,6 +3489,30 @@ class Executor:
         applied = attention.select(device, roots, local, degree=self.world, choose=choose)
         return replace(applied, pin=pin) if local else applied
 
+    def _upgrade_attention(self) -> None:
+        """A kernel this construction skipped while it compiled joins at a request boundary,
+        never inside a request: the construction selects again and the group agrees. A
+        compiled graph holds its kernel, so a construction warmed into one keeps it."""
+        for executor in self.model_executors or [self]:
+            applied, device = executor.attention, executor.device_facts
+            if applied is None or executor._reselect is None or device is None:
+                continue
+            if not attention.pending(applied, device) or executor.backend is None:
+                continue
+            roots = {**executor.backend.components, **executor.backend.parked}
+            if attention._baked_in(roots):
+                continue
+            upgraded = executor._reselect()
+            executor.attention = replace(upgraded, pin=applied.pin)
+            executor.attention_defaults = attention.snapshot(roots)
+            print(f"[attention] upgraded: {upgraded.line()}", file=sys.stderr, flush=True)
+            if self.group is not None and self.rank == 0:
+                refused = executor._agree_attention(upgraded)
+                if refused is not None:
+                    raise attention.AttentionRefusal(
+                        str(refused.get("code")), str(refused.get("detail"))
+                    )
+
     def _attention_snapshot(self) -> attention.Snapshot:
         return attention.Snapshot(
             tuple(
@@ -3529,8 +3557,7 @@ class Executor:
             self._attention_snapshot(), roots, pin
         ):
             return None
-        with attention.measuring("request"):
-            return attention.plan(self._attention_device(pin), roots, pin, self.world)
+        return attention.plan(self._attention_device(pin), roots, pin, self.world)
 
     def _agree_attention(self, applied: attention.Applied) -> dict[str, Any] | None:
         """THE GROUP SERVES RANK 0'S PREPARED SELECTION. Each rank selected beside rank 0
@@ -4589,8 +4616,6 @@ def main(argv: list[str] | None = None) -> int:
 
     _capture_seal()
     kernel_cache.configure(kernel_cache.from_sealed(_SEALED))
-    # Before any kernel import: the image's kernel site, only if its torch build is ours.
-    kernel_site.activate()
     # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
     # AF_UNIX exemption is exercised on every boot rather than asserted. It refuses
     # Python-level egress from package and job code; it is not a kernel bound and

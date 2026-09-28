@@ -236,7 +236,7 @@ class Prespawns:
             self._drop(slot)
             return
         worker.note("warm", f"prespawned {slot.installation} on {list(slot.ordinals)}: {legs}")
-        # Probes wait for idle cards; a request that is ready first proves what it selects.
+        # Launch checks wait for idle cards; the compiles they start run beside the download.
         while self._busy(slot.ordinals):
             slot.nudge.wait()
             slot.nudge.clear()
@@ -250,13 +250,15 @@ class Prespawns:
             ranks = reply.get("ranks") or []
             detail = "; ".join(
                 f"rank {row.get('rank')}: "
-                + ", ".join(f"{k['kernel']} {k['status']}" for k in row.get("kernels", ()))
+                + ", ".join(
+                    f"{k['kernel']} {k.get('line') or k['status']}" for k in row.get("kernels", ())
+                )
                 for row in ranks
             ) or str(reply.get("skipped") or reply.get("detail") or "")
             ok = bool(reply.get("ok"))
         except ExecutorGone as exc:
             detail, ok = f"executor gone: {exc}"[:300], False
-        self._phase("Proving attention kernels", started, began, ok, slot, detail)
+        self._phase("Starting kernel compiles", started, began, ok, slot, detail)
         worker.note("warm", f"prespawned {slot.installation} kernels: {detail}"[:256])
 
     def _phase(

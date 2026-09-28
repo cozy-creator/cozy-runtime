@@ -5,11 +5,6 @@ diffusers 0.40.0 or a CUDA device is missing. Nothing here is faked: the modules
 diffusers' own `WanAttention` at real head dimensions and dtypes, the pin is read back off the
 processors diffusers itself would dispatch through, and one pinned site runs one real forward.
 
-The cr-127 self-check arms plant the h3a-013 defect the only faithful way: by replacing what
-diffusers' OWN backend registry dispatches to, so the runtime reaches a kernel that returns its
-uninitialized output buffer exactly as the shipped `sageattention` sm90 kernel did — right shape,
-right dtype, no exception. Nothing in `cozy_runtime` is stubbed.
-
 Prints one JSON line.
 """
 
@@ -59,78 +54,6 @@ def _refusal(run: Any) -> dict[str, str]:
     return {"code": "", "detail": "no refusal"}
 
 
-def _dead(kind: str) -> Any:
-    """A backend that does what the shipped sm90 kernel did: return without computing.
-
-    `torch.empty_like` IS the defect — upstream's `register_fake` meta implementation allocated
-    the output and returned, so the caller got its uninitialized buffer at the right shape with
-    no error raised anywhere.
-    """
-
-    def backend(
-        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **_: Any
-    ) -> torch.Tensor:
-        if kind == "empty":
-            return torch.empty_like(query)
-        if kind == "nan":
-            return torch.full_like(query, float("nan"))
-        # FINITE AND PLAUSIBLE and still not attention: V straight through. This is the arm
-        # neither a finiteness test nor an implausible-rate test can catch, and it is the
-        # shape h3a-013 actually saw — a right-shaped tensor of the right magnitude that is
-        # simply not the answer.
-        return value.clone()
-
-    return backend
-
-
-def _selfcheck(out: dict[str, Any], device: DeviceFacts) -> None:
-    """Prove the self-check on this card: it passes real kernels and refuses dead ones."""
-    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
-
-    # GREEN. Every kernel this device and image offer agrees with exact fp32 attention inside
-    # its declared budget, measured here rather than asserted.
-    measured: dict[str, float] = {}
-    floors: dict[str, float] = {}
-    for name in ("sdpa", "cudnn"):
-        candidate = attention.BY_NAME[name]
-        if candidate.min_sm and device.sm < candidate.min_sm:
-            continue
-        admission = attention._resolve(candidate, device).admission
-        assert isinstance(admission, attention.Probe)
-        measured[name] = admission.rel_l2_to_exact
-        floors[name] = admission.rounding_floor
-    out["selfcheck_rel_l2"] = measured
-    out["selfcheck_floor"] = floors
-    out["selfcheck_budgets"] = {
-        name: attention.BY_NAME[name].rel_l2_max for name in sorted(attention.BY_NAME)
-    }
-
-    # RED. Same registry, same dispatch, a backend that computes nothing.
-    for kind in ("empty", "nan", "wrong"):
-        for name in ("sdpa", "cudnn"):
-            candidate = attention.BY_NAME[name]
-            if candidate.min_sm and device.sm < candidate.min_sm:
-                continue
-            member = attention._member(candidate)
-            real = _AttentionBackendRegistry._backends[member]
-            _AttentionBackendRegistry._backends[member] = _dead(kind)
-            try:
-                out[f"dead_{kind}_{name}_pin"] = _refusal(
-                    lambda pinned=name: attention.pinned(pinned, device)
-                )
-                if name == "sdpa":
-                    # The FLOOR is dead, so auto-selection must offer NOTHING rather than
-                    # silently serve a kernel that returns uninitialized memory.
-                    out[f"dead_{kind}_auto"] = [r.name for r in attention.available(device)]
-                    out[f"dead_{kind}_image_kernels"] = attention.image_kernels(device)
-            finally:
-                _AttentionBackendRegistry._backends[member] = real
-
-    # And the green arm again AFTER the plants are removed, so a passing red arm cannot be a
-    # registry left broken.
-    out["selfcheck_restored"] = [r.name for r in attention.available(device)]
-
-
 def main() -> None:
     device = _device()
     out: dict[str, Any] = {
@@ -147,7 +70,7 @@ def main() -> None:
     out["head_dims"] = {"dit": attention._head_dim(dit), "vae": attention._head_dim(wide)}
     out["dtypes"] = {"dit": attention._dtype(dit), "vae": attention._dtype(wide)}
 
-    # AUTO. On a box without the baked snapshot this is the floor, and the floor takes both.
+    # AUTO. On a machine that has compiled nothing this is the floor, and it takes both.
     applied = attention.select(device, roots)
     out["auto"] = applied.document()
     out["auto_backends"] = _backends(roots)
@@ -204,28 +127,24 @@ def main() -> None:
         result = dit(hidden)
     out["forward"] = {"shape": list(result.shape), "dtype": str(result.dtype)}
 
-    _selfcheck(out, device)
     out["fp8"] = _fp8(device, dit)
 
     print(json.dumps(out))
 
 
 def _fp8(device: DeviceFacts, dit: WanAttention) -> dict[str, Any]:
-    """cr-136: the fp8 path through the real registry — refused by name where the snapshot is
-    absent or where it is out of budget at production length, otherwise pinned and run."""
+    """cr-136: the fp8 path through the real registry: refused by name where the card cannot
+    run it or this machine has not compiled it, otherwise pinned and run."""
     try:
         ready = attention.pinned("flash-attn3-fp8", device)
     except attention.AttentionRefusal as exc:
         return {"code": exc.code, "detail": str(exc)[:300]}
     applied = attention.install(ready, {"dit": dit}, "flash-attn3-fp8")
-    admission = ready[0].admission
-    assert isinstance(admission, attention.Probe)
     hidden = torch.randn(1, 64, 1024, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
         result = dit(hidden)
     return {
         "code": "",
-        "rel_l2": admission.rel_l2_to_exact,
         "backend": _backends({"dit": dit})["dit"][0],
         "line": applied.line(),
         "forward": {"shape": list(result.shape), "dtype": str(result.dtype)},

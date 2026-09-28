@@ -13,8 +13,7 @@ import numpy as np
 import pytest
 
 from cozy_runtime.author._numeric import within, worst, worst_of
-from cozy_runtime.internal import attention, probe
-from cozy_runtime.internal.encoding import DeviceFacts
+from cozy_runtime.internal import probe
 from cozy_runtime.internal.probe import e4m3_value
 
 POISON = (math.nan, math.inf, -math.inf)
@@ -88,14 +87,3 @@ def test_domain_sweep_refuses_poison_in_every_band(
         got[index] = value
         sweep = probe._domain_sweep(np, dtype, got, [(scale, "s")])
         assert not sweep.passed and sweep.wrong is not None and sweep.wrong[band] == 1, value
-
-
-def test_attention_gate_refuses_poison_as_a_wrong_kernel() -> None:
-    entry = attention.Ready(attention.CANDIDATES[0], member=None)
-    device = DeviceFacts("cpu", "CPU", 0, "", "", 0)
-    budget = entry.candidate.rel_l2_max
-    attention._gate(entry, device, budget / 2, "all rows")
-    for value in POISON:
-        with pytest.raises(attention.AttentionRefusal) as refused:
-            attention._gate(entry, device, value, "all rows")
-        assert refused.value.code == "attention_kernel_wrong", value

@@ -1,211 +1,421 @@
-"""Sol-Attn's SM90 forward: compiled once per key, with no GPU, and loaded everywhere else.
+"""The machine's compile manager: every artifact compiles once per key, on this machine, for the
+card present, in a niced background process, and is published whole to the kernel store.
 
-Upstream (NVlabs/Sana `sol_attn` 0.5.0) keeps compiled kernels in a per-process dict, and
-`cute.compile` forces CuTe-DSL's own file cache off, so every executor process used to pay
-the compile on its first sparse call. Its SM90 kernel specializes on the token count
-(`make_kernel(tokens, kv_splits)`), never on heads, batch or device: every operand layout is
-dynamic. So the object is exactly a function of `sol_key`'s inputs, and tracing it from host
-placeholders that report CUDA device 0 through DLPack yields the same bytes as tracing it
-beside live H100 tensors (measured, h3a-087). That makes the compile a CPU job that can run
-beside a request's dense steps, in a niced child with no GPU visible, and publish into the
-machine kernel store for every rank and every later executor.
+`submit` never blocks and never compiles in the caller. The store holds the artifact (`ready`),
+or a live builder holds its lock (`compiling`, with the progress it reports), or this worker
+boot already failed it (`failed`, retried at the next boot only), or `submit` starts the
+builder and says `compiling`. Nothing waits on a compile: a consumer serves the best READY
+artifact and falls through otherwise.
 
-`python -m cozy_runtime.internal.kernel_compile` is that child. The executor starts it with
-the key's build lock already taken, handed down as `--lock-fd`, so a rank that needs the
-kernel before it is done waits on the lock (on a live compile, never a clock) and then loads.
+The builder is `python -m cozy_runtime.internal.kernel_compile` under the caller's own
+interpreter and import path, so an extension builds against the torch that will import it. It
+inherits the key's lock, takes one of the machine's build slots (flock files, so a dead
+builder frees its slot), runs at nice 19, and is ended only on a PROVEN wedge (`liveness`): its
+whole process tree stopped burning CPU and writing output, against its own observed pace.
+A failure is recorded in the worker boot's scratch scope (`TMPDIR`), which the next boot
+starts without.
 """
 
 from __future__ import annotations
 
 import argparse
-import ctypes
-import functools
-import hashlib
+import contextlib
+import fcntl
 import json
 import os
+import re
+import signal
+import subprocess
 import sys
 import tempfile
+import threading
 import time
-from importlib import import_module, metadata
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import config, kernel_cache
+from cozy_runtime.internal import config, kernel_cache, liveness, proctree
 
-KERNEL = "sol-attn.sm90"
-OPTIONS = "--enable-tvm-ffi"
-FUNCTION = "func"
-_DLPACK_CUDA = 2
-_SCALE = 128**-0.5
-
-
-def target(capability: tuple[int, int]) -> str:
-    """CuTe-DSL's own arch spelling (`env_manager.detect_gpu_arch`) unless its config names one."""
-    named = config.cute_dsl_environment().get("CUTE_DSL_ARCH", "")
-    if named:
-        return named
-    major, minor = capability
-    return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
-
-
-@functools.cache
-def sol_library() -> dict[str, Any]:
-    """Every library input to the object: sources, DSL and toolkit, FFI ABI, Python tag."""
-    cutlass = import_module("cutlass")
-    tvm_ffi = import_module("tvm_ffi")
-    toolkit = import_module("cutlass.base_dsl.version_info").CUDA_VERSION
-    root = Path(str(import_module("sol_attn").__file__)).resolve().parent
-    sources = hashlib.sha256()
-    for path in sorted(root.rglob("*.py")):
-        data = path.read_bytes()
-        sources.update(path.relative_to(root).as_posix().encode())
-        sources.update(len(data).to_bytes(8, "little"))
-        sources.update(data)
-    return {
-        "sol_attn": metadata.version("sol-attn"),
-        "sol_attn_sources": sources.hexdigest(),
-        "cutlass_dsl": str(cutlass.__version__),
-        "cuda_toolkit": f"{toolkit.major}.{toolkit.minor}",
-        "tvm_ffi": str(tvm_ffi.__version__),
-        "python": f"cp{sys.version_info.major}{sys.version_info.minor}",
-        "cute_dsl_env": {
-            name: value
-            for name, value in config.cute_dsl_environment().items()
-            if name != "CUTE_DSL_ARCH"
-        },
-    }
+#: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
+#: function fills `staging` (an `object` file, a `site/` tree, or nothing when the artifact
+#: lives in its compiler's own keyed cache) and returns producer facts.
+BUILDERS = {
+    "setup": "cozy_runtime.internal.kernel_sources:build_setup",
+    "python": "cozy_runtime.internal.kernel_sources:build_python",
+    "sol": "cozy_runtime.internal.attention_sol:build",
+    "fusion": "cozy_runtime.internal.fusion:build",
+}
+#: Compiler jobs one extension build runs, and so the cores one build slot stands for.
+#: Upstream's own `MAX_JOBS`, when the operator sets it, wins.
+JOBS = 4
+_BOOT = (
+    "import json, sys; boot = json.loads(sys.argv.pop(1)); sys.path[:] = boot['path']; "
+    "sys.pycache_prefix = boot['pycache_prefix']; "
+    "from cozy_runtime.internal.kernel_compile import main; raise SystemExit(main(sys.argv[1:]))"
+)
+_PROGRESS = re.compile(rb"^\[(\d+)/(\d+)\]")
 
 
-def sol_key(tokens: int, kv_splits: int, arch: str) -> kernel_cache.Key:
-    if type(tokens) is not int or tokens < 1 or kv_splits not in (1, 2, 4):
-        raise ValueError("Sol kernel key needs a positive token count and 1, 2 or 4 splits")
-    return kernel_cache.Key.of(
-        KERNEL,
+class CompileFailed(Exception):
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class Job:
+    """One artifact: its exact key, the builder kind and the builder's JSON spec."""
+
+    kind: str
+    key: kernel_cache.Key
+    spec: Mapping[str, Any] = field(default_factory=dict)
+    #: variables the builder runs under beyond the caller's own, e.g. a hidden GPU
+    env: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class State:
+    """What a consumer may do with an artifact now."""
+
+    kernel: str
+    state: str  # ready | compiling | pending | failed | absent | unsupported
+    progress: float | None = None
+    ms: float = 0.0
+    detail: str = ""
+    path: str = ""
+
+    def line(self) -> str:
+        if self.state == "compiling" and self.progress is not None:
+            return f"compiling ({self.progress:.0%})"
+        if self.state == "ready" and self.ms:
+            return f"ready (compiled in {self.ms / 1000:.1f} s)"
+        return f"{self.state}: {self.detail}" if self.detail else self.state
+
+    def document(self) -> dict[str, Any]:
+        row: dict[str, Any] = {"kernel": self.kernel, "state": self.state, "line": self.line()}
+        if self.progress is not None:
+            row["progress"] = round(self.progress, 3)
+        if self.ms:
+            row["compile_ms"] = round(self.ms, 1)
+        if self.detail:
+            row["detail"] = self.detail[:300]
+        return row
+
+
+#: This process's builders, by key digest, so their exit is observed without a clock.
+_STARTED: dict[str, subprocess.Popen[bytes]] = {}
+_GUARD = threading.Lock()
+
+
+def status(store: kernel_cache.Store, job: Job) -> State:
+    """The artifact's state, reading only: the store, the boot's failures, the builder's word.
+    `pending` is nobody building it: a builder's word outlives it only until its lock frees."""
+    key = job.key
+    found = store.entry(key)
+    if found is not None:
+        return State(key.kernel, "ready", ms=_compile_ms(found), path=str(found))
+    failed = _failure(key)
+    if failed is not None:
+        return State(key.kernel, "failed", detail=f"{failed['code']}: {failed['detail']}"[:300])
+    live = store.state(key)
+    free = store.claim(key)
+    if free is not None:
+        os.close(free)
+        return State(key.kernel, "pending")
+    live = live or {}
+    progress, started = live.get("progress"), live.get("started_unix_ms")
+    return State(
+        key.kernel,
+        "compiling",
+        progress if isinstance(progress, (int, float)) else None,
+        round(time.time() * 1000 - started, 1) if isinstance(started, (int, float)) else 0.0,
+        str(live.get("phase") or "") if live.get("phase") != "compiling" else "",
+    )
+
+
+def submit(store: kernel_cache.Store, job: Job) -> State:
+    """`status`, after starting the builder when nobody on this machine is building the key."""
+    current = status(store, job)
+    if current.state != "pending":
+        return current
+    with _GUARD:
+        running = _STARTED.get(job.key.digest)
+        lock = store.claim(job.key) if running is None or running.poll() is not None else None
+        if lock is not None:
+            try:
+                if store.entry(job.key) is None and _failure(job.key) is None:
+                    store.set_state(job.key, None)  # a dead builder's last word, if any
+                    _STARTED[job.key.digest] = _spawn(store, job, lock)
+            finally:
+                os.close(lock)
+    current = status(store, job)
+    return current if current.state != "pending" else State(job.key.kernel, "compiling")
+
+
+def learn(store: kernel_cache.Store, scope: str, job: Job) -> None:
+    """Remember, on this machine only, an artifact a request needed, so the next boot compiles
+    it ahead (`learned`). One line per key under the store's own namespace; never shared."""
+    path = store.own / "learned" / f"{scope}.jsonl"
+    row = json.dumps(
         {
-            "library": sol_library(),
-            "target": arch,
-            "options": OPTIONS,
-            "tokens": tokens,
-            "kv_splits": kv_splits,
+            "kind": job.kind,
+            "kernel": job.key.kernel,
+            "inputs": json.loads(job.key.inputs),
+            "spec": dict(job.spec),
+            "env": dict(job.env),
         },
+        sort_keys=True,
     )
+    with contextlib.suppress(OSError):
+        if row not in (path.read_text().splitlines() if path.exists() else ()):
+            path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            with path.open("a") as log:
+                log.write(row + "\n")
 
 
-class _Placeholder:
-    """A host tensor that reports CUDA device 0 through DLPack. Tracing reads only dtype, rank,
-    strides and memory space; no pointer is dereferenced, so no GPU is needed."""
-
-    def __init__(self, tensor: Any) -> None:
-        self.tensor = tensor
-        self.ndim = tensor.ndim
-
-    def __dlpack_device__(self) -> tuple[int, int]:
-        return (_DLPACK_CUDA, 0)
-
-    def __dlpack__(self, *args: Any, **kwargs: Any) -> Any:
-        capsule = self.tensor.__dlpack__(*args, **kwargs)
-        name_of = ctypes.pythonapi.PyCapsule_GetName
-        name_of.restype, name_of.argtypes = ctypes.c_char_p, [ctypes.py_object]
-        pointer_of = ctypes.pythonapi.PyCapsule_GetPointer
-        pointer_of.restype = ctypes.c_void_p
-        pointer_of.argtypes = [ctypes.py_object, ctypes.c_char_p]
-        name = name_of(capsule)
-        # DLManagedTensorVersioned: version(8) manager_ctx(8) deleter(8) flags(8), then the
-        # DLTensor, whose device follows its data pointer. Unversioned: DLTensor first.
-        offset = 40 if name == b"dltensor_versioned" else 8
-        ctypes.c_int32.from_address(pointer_of(capsule, name) + offset).value = _DLPACK_CUDA
-        return capsule
+def learned(store: kernel_cache.Store, scope: str) -> list[Job]:
+    """What `learn` remembered under `scope`, as jobs to submit."""
+    try:
+        lines = (store.own / "learned" / f"{scope}.jsonl").read_text().splitlines()
+    except OSError:
+        return []
+    jobs = []
+    for line in lines:
+        with contextlib.suppress(ValueError, KeyError, TypeError, kernel_cache.KernelCacheRefusal):
+            row = json.loads(line)
+            key = kernel_cache.Key.of(row["kernel"], row["inputs"])
+            jobs.append(Job(row["kind"], key, row["spec"], row["env"]))
+    return jobs
 
 
-def _operands(kv_splits: int) -> list[tuple[tuple[int, ...], str]]:
-    """Upstream `_sol_attn_cute`'s SM90 operand ranks and dtypes, at a size of two per mode."""
-    rows: list[tuple[tuple[int, ...], str]] = [((2, 2, 2, 128), "bfloat16")] * 6
-    rows += [((2, 2, 2), "float32")] * 2
-    if kv_splits > 1:
-        rows += [((2, 2, 2, 128), "bfloat16"), ((2, 2, 2), "float32")]
-    return rows
-
-
-def compile_sol(tokens: int, kv_splits: int) -> bytes:
-    """Upstream `_compile_sm90`, traced from placeholders; the object for `sol_key`."""
-    torch = import_module("torch")
-    cute = import_module("cutlass.cute")
-    cuda = import_module("cuda.bindings.driver")
-    to_cute_tensor = import_module("sol_attn.common").to_cute_tensor
-    make_kernel = import_module("sol_attn.sm90").make_kernel
-    arguments = [
-        to_cute_tensor(_Placeholder(torch.empty(shape, dtype=getattr(torch, dtype))))
-        for shape, dtype in _operands(kv_splits)
+def _spawn(store: kernel_cache.Store, job: Job, lock: int) -> subprocess.Popen[bytes]:
+    argv = [
+        sys.executable,
+        "-I",
+        "-c",
+        _BOOT,
+        json.dumps({"path": sys.path, "pycache_prefix": sys.pycache_prefix}),
+        "--store",
+        str(store.own),
+        *(["--trusted", str(store.trusted)] if store.trusted is not None else []),
+        "--lock-fd",
+        str(lock),
+        "--job",
+        json.dumps(
+            {
+                "kind": job.kind,
+                "kernel": job.key.kernel,
+                "inputs": json.loads(job.key.inputs),
+                "spec": dict(job.spec),
+            }
+        ),
     ]
-    compiled = cute.compile(
-        make_kernel(tokens, kv_splits),
-        *arguments,
-        _SCALE,
-        0,
-        stream=cuda.CUstream(0),
-        options=OPTIONS,
+    process = subprocess.Popen(
+        argv,
+        env={**config.inherited_environment(), **job.env},
+        pass_fds=(lock,),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
-    with tempfile.TemporaryDirectory(prefix="cozy-kernel-") as scratch:
-        path = Path(scratch) / "kernel.o"
-        compiled.export_to_c(object_file_path=str(path), function_name=FUNCTION)
-        return path.read_bytes()
+
+    scope = _failures()
+
+    def reap() -> None:
+        _, err = process.communicate()
+        if process.returncode and _failure(job.key, scope) is None:
+            # Died before it could say why (killed, or an import failed): say it for it.
+            tail = err.decode(errors="replace").strip()[-600:]
+            detail = f"exit {process.returncode}: {tail}"
+            _record_failure(job.key, "compile_crashed", detail, scope)
+
+    threading.Thread(target=reap, name=f"kernel-builder-{job.key.kernel}", daemon=True).start()
+    return process
 
 
-class Loaded:
-    """Upstream's call convention over a loaded object: `stream` is positional in TVM-FFI."""
-
-    __slots__ = ("function",)
-
-    def __init__(self, function: Any) -> None:
-        self.function = function
-
-    def __call__(self, *arguments: Any, stream: Any = None) -> Any:
-        return self.function(*arguments, stream)
+def _compile_ms(entry_dir: Path) -> float:
+    try:
+        facts = json.loads((entry_dir / "entry.json").read_text()).get("producer") or {}
+        return float(facts.get("compile_ms") or 0.0)
+    except (OSError, ValueError, TypeError):
+        return 0.0
 
 
-def load(data: bytes) -> Loaded:
-    """Link verified bytes from a file with no name, private to this process: what was hashed
-    is exactly what runs. `TemporaryFile` is O_TMPFILE, else unlinked at once; it needs no
-    `os.memfd_create`, which python-build-standalone's old glibc build lacks."""
-    cute = import_module("cutlass.cute")
-    for library in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
-        if Path(library).exists():
-            # As flash-attn-4's own disk cache does: a loaded object resolves the DSL
-            # runtime's symbols globally.
-            ctypes.CDLL(library, mode=ctypes.RTLD_GLOBAL)
-    with tempfile.TemporaryFile(prefix="cozy-kernel-") as anonymous:
-        anonymous.write(data)
-        anonymous.flush()
-        path = f"/proc/self/fd/{anonymous.fileno()}"
-        return Loaded(getattr(cute.runtime.load_module(path, enable_tvm_ffi=True), FUNCTION))
+# ------------------------------------------------------------------ boot-scoped failures
 
 
-def producer(started: float) -> dict[str, Any]:
-    return {
-        "host": os.uname().nodename,
-        "pid": os.getpid(),
-        "compile_ms": round((time.perf_counter() - started) * 1000, 1),
-    }
+def _failures() -> Path:
+    return Path(tempfile.gettempdir()) / "cozy-kernel-failures"
+
+
+def _failure(key: kernel_cache.Key, scope: Path | None = None) -> dict[str, Any] | None:
+    try:
+        found = json.loads(((scope or _failures()) / f"{key.kernel}-{key.digest}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def _record_failure(
+    key: kernel_cache.Key, code: str, detail: str, scope: Path | None = None
+) -> None:
+    directory = scope or _failures()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / f"{key.kernel}-{key.digest}.json"
+    scratch = path.with_suffix(f".{os.getpid()}")
+    kept = detail if len(detail) <= 4000 else detail[:2000] + "\n...\n" + detail[-2000:]
+    scratch.write_text(json.dumps({"code": code, "detail": kept}))
+    os.replace(scratch, path)
+
+
+# --------------------------------------------------------------------- the builder process
+
+
+def jobs() -> int:
+    named = config.inherited_environment().get("MAX_JOBS", "")
+    return int(named) if named.isdigit() and int(named) > 0 else JOBS
+
+
+@contextlib.contextmanager
+def _slot(own: Path) -> Iterator[None]:
+    """One of the machine's `cores // jobs` build slots, waiting on a live builder if all are
+    taken. A slot is an flock, so a builder that dies frees it."""
+    directory = own / ".slots"
+    directory.mkdir(mode=0o755, exist_ok=True)
+    count = max(1, (os.cpu_count() or 1) // jobs())
+    fds = [
+        os.open(directory / f"{index}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+        for index in range(count)
+    ]
+    try:
+        for fd in fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            yield
+            return
+        fcntl.flock(fds[os.getpid() % count], fcntl.LOCK_EX)
+        yield
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def run(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    report: Callable[[float], None],
+) -> str:
+    """Run one compiler command to completion; return its output's tail.
+
+    Progress is ninja's `[done/total]`. The command runs in its own session so a proven wedge
+    ends its whole tree: the meter is the tree's CPU and bytes moved plus the output it wrote,
+    judged against its own longest pause (`liveness.Pace`), never against a clock."""
+    process = subprocess.Popen(
+        list(argv),
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    tail: list[bytes] = []
+    errors: list[bytes] = []  # a compiler's first errors, which a traceback tail buries
+    written = [0]
+    # Units of every ninja run so far: a project that builds one extension after another
+    # starts a new `[1/N]` each time, so progress counts over all the units announced.
+    finished, current = [0], [0]
+
+    def drain() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            written[0] += len(line)
+            tail.append(line)
+            del tail[:-40]
+            if b"error" in line.lower() and len(errors) < 12:
+                errors.append(line)
+            found = _PROGRESS.match(line)
+            if found and int(found.group(2)):
+                done, total = int(found.group(1)), int(found.group(2))
+                if done == 1 and current[0]:
+                    finished[0], current[0] = finished[0] + current[0], 0
+                current[0] = total
+                report((finished[0] + done) / (finished[0] + total))
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    pace = liveness.Pace()
+    while True:
+        try:
+            process.wait(timeout=liveness.SAMPLE_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        tree = [process.pid, *proctree.descendants(process.pid)]
+        burns = [liveness.burn(pid) for pid in tree]
+        pace.observe((sum(b for b in burns if b is not None), written[0]))
+        if pace.wedged(liveness.noise_floor()):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise CompileFailed("compile_stalled", pace.verdict(liveness.noise_floor()))
+    reader.join()
+    output = b"".join(tail).decode(errors="replace")
+    if process.returncode:
+        first = b"".join(errors).decode(errors="replace")
+        detail = f"{argv[0]} exited {process.returncode}: {first}...\n{output}"
+        raise CompileFailed("compile_failed", detail)
+    return output
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m cozy_runtime.internal.kernel_compile")
-    parser.add_argument("--tokens", type=int, required=True)
-    parser.add_argument("--kv-splits", type=int, default=1)
-    parser.add_argument("--target", required=True)
-    parser.add_argument("--lock-fd", type=int, default=-1)
     parser.add_argument("--store", type=Path, required=True)
     parser.add_argument("--trusted", type=Path, default=None)
+    parser.add_argument("--lock-fd", type=int, default=-1)
+    parser.add_argument("--job", required=True)
     options = parser.parse_args(argv)
     os.nice(19)
-    if config.cute_dsl_environment().get("CUTE_DSL_ARCH") != options.target:
-        # The DSL reads its target once at import; the parent imposes it with the key.
-        raise SystemExit("CUTE_DSL_ARCH must name the key's target before the DSL imports")
+    raw = json.loads(options.job)
     store = kernel_cache.Store(options.store, options.trusted)
-    started = time.perf_counter()
-    key = sol_key(options.tokens, options.kv_splits, options.target)
-    if store.get(key) is None:
-        store.put(key, compile_sol(options.tokens, options.kv_splits), producer(started))
+    key = kernel_cache.Key.of(raw["kernel"], raw["inputs"])
+    started, started_unix_ms = time.perf_counter(), round(time.time() * 1000)
+    last = [-1.0]
+
+    def report(progress: float, phase: str = "compiling") -> None:
+        if abs(progress - last[0]) >= 0.01 or phase != "compiling":
+            last[0] = progress
+            live = {"pid": os.getpid(), "started_unix_ms": started_unix_ms}
+            store.set_state(key, {**live, "progress": progress, "phase": phase})
+
+    report(0.0, "queued for a build slot")
+    try:
+        with _slot(store.own):
+            report(0.0)
+            module, name = BUILDERS[raw["kind"]].split(":")
+            build = getattr(import_module(module), name)
+
+            def fill(staging: Path) -> Mapping[str, object]:
+                facts = dict(build(raw["spec"], staging, report))
+                elapsed = (time.perf_counter() - started) * 1000
+                return {"host": os.uname().nodename, "compile_ms": round(elapsed, 1), **facts}
+
+            store.publish(key, fill)
+    except CompileFailed as exc:
+        _record_failure(key, exc.code, str(exc))
+        return 1
+    except BaseException as exc:
+        _record_failure(key, "compile_failed", f"{type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        store.set_state(key, None)
     print(json.dumps({"key": key.digest, "ms": round((time.perf_counter() - started) * 1000)}))
     return 0
 

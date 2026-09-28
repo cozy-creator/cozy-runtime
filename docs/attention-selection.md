@@ -1,11 +1,11 @@
 # Attention selection
 
 Runtime owns backend integration and preparation-time selection. Its current
-curated default keeps floating-point attention: FA3 BF16/FP16 when the installed
-artifact and site support it, otherwise PyTorch SDPA. The table in
+curated default keeps floating-point attention: FA3 BF16/FP16 when this machine has
+compiled it for the card and the site supports it, otherwise PyTorch SDPA. The table in
 `internal/attention.py` links retained H3 timing evidence. It is not a universal
-hardware optimum: a numerical probe proves the backend computes attention at a
-production length, not that its videos retain quality. Approximate backends remain explicit choices.
+hardware optimum, and no accuracy check gates a compiled kernel. Approximate backends
+remain explicit choices.
 
 A model may choose a different eligible implementation before warm-up:
 
@@ -27,9 +27,9 @@ output contracts (or ordinary floating Linear inference without external autocas
 never unrelated normalization parameters or encoded storage dtype. Unknown or
 disagreeing projection contracts admit only a dtype-unbounded backend.
 It has no tensors or device methods. FP8
-checkpoint weights do not imply FP8 attention. Eligibility checks site/hardware,
-installed dependency metadata and context-parallel support; selecting an optional
-backend then resolves and checks that implementation. Nothing benchmarks every
+checkpoint weights do not imply FP8 attention. Eligibility checks site/hardware and
+context-parallel support; selecting an optional backend then resolves it: compiled,
+imported and launched once. Nothing benchmarks every
 request or promotes approximate attention automatically.
 
 Returning an unknown or ineligible backend refuses preparation; it does not fall
@@ -64,9 +64,8 @@ choices. See [upstream-attention.md](upstream-attention.md) for their actual lim
 The shared Diffusers registration bridge changes no global active backend and
 refuses collisions with another implementation.
 
-Validation includes actual Diffusers CPU processors and dispatch, metadata-only
-FA3 installation controls, model hook/scoping/rollback tests and architecture
-fences. No GPU performance, model quality, worker deployment or CLI end-to-end
+Validation includes actual Diffusers CPU processors and dispatch, model
+hook/scoping/rollback tests and architecture fences. No GPU performance, model quality, worker deployment or CLI end-to-end
 qualification is established by these tests.
 
 Request observations record selected and restored backend names and per-component
@@ -86,15 +85,26 @@ and `recommended` context explaining this limitation. Explicit matching pins or
 policy choices refuse, including components mixing managed and legacy processors;
 Runtime never creates an unused processor attribute to claim partial coverage.
 
-## Kernel site, Ulysses and probes
+## Kernels compiled on the machine, and Ulysses
 
-Kernels come from the package environment or the worker image's Runtime-owned site,
-never from a package lock written for them. The image bakes `/opt/cozy/kernels/`:
-the importable `site/`, the FA3 `kernels` snapshot `flash-attn3/` and the `manifest.json`
-its kernel gate writes (`site`, `torch`, `cuda`, `python_abi`, per-kernel facts). At process entry the
-executor appends `site/` after the package's own packages (`site.addsitedir`; the package
-wins on conflict) only when its torch release, CUDA build and Python ABI equal the
-manifest's. Otherwise every site kernel is typed-absent with the reason.
+Nothing is compiled on a builder. The worker image carries every kernel as pinned source
+(`python -m cozy_runtime.internal.kernel_sources fetch /opt/cozy/kernel-sources`: sources
+by commit or version and sha256, plus `index.json`) and the CUDA toolkit. At boot the
+prespawned executor's warm submits, for its card, every kernel of the model's preference
+and the ranked table to the compile manager (`internal/kernel_compile.py`): one niced
+background build per exact key (sources, arch, torch, CUDA, Python, compiler) per
+machine, published whole into `<root>/var/lib/cozy/kernels`, reused by every later
+executor and boot. Upstream's own `setup.py` detects the card; no source is patched.
+A build is ended only when its whole process tree stops burning CPU and writing output;
+a failure is recorded for that worker boot and retried at the next.
+
+Selection serves a kernel only once it is compiled, imports and launches. One still
+compiling is skipped with its progress (`sageattention: compiling (42%)`), and the chain
+falls through to the next ready kernel; SDPA is always ready. A request never compiles
+and never waits: at its start, a construction that skipped a kernel now ready selects
+again. Sol compiles one object per card, except on SM90, where upstream specializes on
+the length's 64-token block layout; the first sight of a length (intake or a dense step)
+submits that object, and a sparse step whose object is not ready runs dense.
 
 Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) that
 `attention_ulysses` registers with Diffusers. Without a parallel config it calls the
@@ -103,22 +113,9 @@ the kernel over the full sequence of this rank's heads, and the exchange back. A
 whose reductions stay within a head therefore matches one GPU; FlashInfer's global V
 amax does not, so it is registered without context parallelism. Ring is refused.
 
-Each rank probes the function it serves at `(1, 73439, 2, 128)` — one H3 rank's 10 s
-document, where length-dependent error shows — on QK-normalised inputs whose logits have
-standard deviation 4 (the sharp attention video DiTs serve; N(0, 1) inputs attend almost
-uniformly and let per-head FP8 pass while it garbles H3) — against exact float64 attention
-over four row groups, each gated alone so a localized fault cannot average out: 128 sampled rows
-(even and seeded random), the first and last 256 rows (first tile, partial tail tile) and
-both rows at every multiple of 16 (every tile edge). Non-finite output fails first; then
-the worst group's rel L2 against the kernel's
-declared budget: past 1 it is `attention_kernel_wrong`, otherwise
-`attention_kernel_out_of_budget` (FA3 FP8 at H3 length). Each rank's execution evidence
-carries its probe of every kernel it served and of every kernel its probe refused.
-
-`cozy-runtime attention-qualify --degree 4 --out report.json` spawns one process per
-GPU and, per kernel, runs the registered backend at degree 4 on identical global
-`[1, 73439, 56, 128]` inputs against the same backend at degree 1 (byte equality and
-rel L2 ≤ 2e-3). `--device cpu` runs the same path over gloo.
+Each rank's execution record lists every kernel of its chains: `ready` (served or not),
+`compiling` with progress, `failed`, `absent` or `unsupported`, each with why and its
+compile time.
 
 Select with the existing `kernel.attention=dit=flash-attn3` or
 `--attention-kernel=dit=flash-attn3` Creator argument. Eager requests restore the
@@ -126,10 +123,9 @@ prepared selection after success or failure, so an unpinned A / pinned B / unpin
 A sequence shares its prepared executor. Compiled or context-parallel changes
 require preparing a new model generation whose `choose_attention` policy selects
 that backend before warm-up; the request refuses a frozen change and does not
-silently rebuild it. Changing kernel bytes is a new worker image.
+silently rebuild it.
 
-Preparation facts and request `attention.artifact` observations identify the installed
-distribution/version and SHA256 of its RECORD, or the snapshot variant and metadata
-digest. Each rank's execution record carries `attention.impl`: the implementation that
-actually served, such as the SDPA backend torch dispatched (`cudnn` on H100) or Sol's
-`cute_sm90` route.
+Preparation facts and request `attention.artifact` observations identify the compiled
+artifact by its store key. Each rank's execution record carries `attention.impl`: the
+implementation that actually served, such as the SDPA backend torch dispatched (`cudnn`
+on H100) or Sol's `cute_sm90` route.

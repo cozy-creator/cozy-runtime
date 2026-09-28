@@ -376,12 +376,12 @@ def test_a_slow_download_overlaps_the_executor_start_and_its_probes(
         assert origin.started.wait(60), f"the download never began: {future.exception(0.1)!r}"
         # The weights are still in flight: every object GET is held open.
         phases = _wait(
-            lambda: (p := machine.phases("A")).get("Proving attention kernels") and p,
-            "the prespawned executor proving its kernels",
+            lambda: (p := machine.phases("A")).get("Starting kernel compiles") and p,
+            "the prespawned executor starting its compiles",
         )
         assert not future.done() and origin.landed == 0.0
         started = phases["Starting model executor"]
-        probes = phases["Proving attention kernels"]
+        probes = phases["Starting kernel compiles"]
         assert started["completed"] and probes["completed"], phases
         assert started["ordinals"] == [0] and "torch_import" in started["detail"]
         assert "sdpa ready" in probes["detail"], probes
@@ -493,9 +493,10 @@ def test_a_prespawn_never_sits_on_another_roots_gpu_and_yields_when_one_is_grant
 
 
 @needs_gpu
-def test_the_warm_proves_what_construction_and_a_request_pin_then_read() -> None:
-    """The warm's probes are the ones a construction's selection and a request's pin check
-    would run: after it, neither proves anything again (the check becomes a cache hit)."""
+def test_the_warm_starts_every_chain_kernel_and_selection_reads_what_is_ready() -> None:
+    """The warm returns at once with a row per kernel of the chain and the ranked table: ready,
+    compiling, absent here, or unsupported on this card, each with why. A construction then
+    selects the first ready one."""
     import torch
     from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
 
@@ -504,19 +505,15 @@ def test_the_warm_proves_what_construction_and_a_request_pin_then_read() -> None
 
     device = measure_device(torch, 0)
     preferred = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
-    rows = attention.warm(device, preferred)
-    assert {"kernel": "sdpa", "status": "ready"}.items() <= next(
-        row for row in rows if row["kernel"] == "sdpa"
-    ).items()
-    proven = dict(attention._PROVEN)
+    rows = {row["kernel"]: row for row in attention.expect(device, preferred)}
+    assert set(rows) >= set(preferred)
+    assert rows["sdpa"]["status"] == "ready"
+    assert all(row["status"] == "ready" or row.get("detail") for row in rows.values()), rows
     site = WanAttention(dim=1024, heads=8, dim_head=128, processor=WanAttnProcessor())
     roots = {"dit": site.to("cuda", torch.bfloat16)}
     applied = attention.select(device, roots, choose=lambda context: preferred)
-    assert sum(applied.totals().values()) == 1
-    attention.plan(device, roots, "sdpa").apply()
-    assert proven == attention._PROVEN, "a construction or a request pin proved a kernel again"
-    again = attention.warm(device, preferred)
-    assert all(row.get("held") for row in again if row["status"] == "ready")
+    [served] = applied.totals()
+    assert rows[served]["status"] == "ready"
 
 
 @needs_gpu
@@ -547,7 +544,7 @@ def test_probes_wait_while_a_call_runs_on_the_card_and_follow_when_it_leaves(
     prespawns.reconcile(roots, gpu.view())
     assert slot.finished.wait(120)
     probes = emitted[-1]["fields"]
-    assert probes["phase"] == "Proving attention kernels" and probes["completed"], probes
+    assert probes["phase"] == "Starting kernel compiles" and probes["completed"], probes
     assert probes["started_unix_ms"] >= int(released * 1000)
 
 
@@ -568,7 +565,7 @@ def test_a_host_started_warm_is_adopted_by_the_direct_root_granted_its_card(
     assert slot.finished.wait(300)
     assert [frame["fields"]["phase"] for frame in slot.frames] == [
         "Starting model executor",
-        "Proving attention kernels",
+        "Starting kernel compiles",
     ]
     assert all(frame["fields"]["completed"] for frame in slot.frames), slot.frames
     # A second landing preparation of the same installation starts nothing more.
@@ -586,7 +583,7 @@ def test_a_host_started_warm_is_adopted_by_the_direct_root_granted_its_card(
     assert prespawns.slots == {} and slot.frames == []
     phases = machine.phases("D")
     started = phases["Starting model executor"]
-    probes = phases["Proving attention kernels"]
+    probes = phases["Starting kernel compiles"]
     assert started["completed"] and "sdpa ready" in probes["detail"], phases
     assert started["ordinals"] == probes["ordinals"] == [0]
     assert probes["started_unix_ms"] + probes["elapsed_ms"] < submitted * 1000

@@ -5,10 +5,9 @@ observation and the GPU scheduler's enter/exit events. Fields are added, never c
 
     {"rank": int, "pid": int, "ordinal": int, "uuid": str, "arch": str,
      "start_us": int, "end_us": int,
-     "attention": {"requested": str, "observed": str, "impl": str,
-                   "probes"?: [probe], "skipped"?: [probe]}}
-    probe = {"kernel": str, "status": str, "source": str, "shape": [int],
-             "rel_l2_by_rows": {group: float}, "budget": float, "budget_state": str}
+     "attention": {"requested": str, "observed": str, "impl": str, "kernels"?: [kernel]}}
+    kernel = {"kernel": str, "state": str, "line": str, "served": bool,
+              "progress"?: float, "compile_ms"?: float, "detail"?: str}
 
 `ordinal` is the host CUDA ordinal (-1 without one), `uuid` the NVML `GPU-…` identity and
 `arch` its `sm_XY` ("" off CUDA). `start_us`/`end_us` are wall-clock unix MICROseconds bounding
@@ -16,9 +15,8 @@ the rank's work for the attempt, 0 for a rank that did none: nanoseconds since t
 the ±2^53 integer range canonical JSON (and every JSON reader) admits. `attention.requested` is
 the request's pin ("" = automatic), `observed` what the rank's processors held, in the pin
 grammar, and `impl` the kernel implementation under that backend when one was observed.
-`probes` is the rank's numeric probe of each kernel it served, `skipped` each kernel its probe
-refused (`status` the refusal code); `source` is when it was measured (warm, prepare, request)
-and `budget_state` whether `budget` was calibrated on this architecture.
+`kernels` is every compiled kernel this rank knows of: `state` ready, compiling (with its
+`progress`), failed or absent, whether it `served` this attempt, and how long its compile took.
 """
 
 from __future__ import annotations
@@ -28,41 +26,18 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, NotRequired, TypedDict
 
-import msgspec
-
 
 class Boot(TypedDict):
     """`Applied.document()`, the boot record as it crosses the executor seam (cr-124). A
-    group's `merge` keys `admission` and `artifacts` by model parameter, then kernel."""
+    group's `merge` keys `artifacts` by model parameter, then kernel."""
 
     kernels: dict[str, int]
     hosts: dict[str, dict[str, int]]
     offered: list[str]
-    locations: dict[str, str]
     pin: str
-    admission: NotRequired[dict[str, object]]
     artifacts: NotRequired[dict[str, object]]
     skipped: NotRequired[dict[str, str]]
     line: str
-
-
-class ProbeRow(msgspec.Struct, frozen=True):
-    """One kernel's latest numeric probe in this process (`probe` above)."""
-
-    kernel: str
-    status: str
-    source: str
-    shape: list[int]
-    rel_l2_by_rows: dict[str, float]
-    budget: float
-    budget_state: str
-
-
-class Probed(msgspec.Struct, frozen=True, omit_defaults=True):
-    """A rank's probes of the kernels it served, and of every kernel its probe refused."""
-
-    probes: list[ProbeRow] = []
-    skipped: list[ProbeRow] = []
 
 
 def identity(torch: Any, cuda: bool, local: int, sealed: Sequence[str]) -> dict[str, Any]:
@@ -83,13 +58,13 @@ def attention(
     requested: str = "",
     observed: str = "",
     impl: str = "",
-    probed: Probed | None = None,
+    kernels: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     return {
         "requested": requested,
         "observed": observed,
         "impl": impl,
-        **(msgspec.to_builtins(probed) if probed is not None else {}),
+        **({"kernels": [dict(row) for row in kernels]} if kernels else {}),
     }
 
 
@@ -120,7 +95,7 @@ def record(
     who: Mapping[str, Any],
     start_us: int,
     end_us: int,
-    seen: Mapping[str, str] | None = None,
+    seen: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "rank": rank,

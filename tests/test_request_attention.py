@@ -211,7 +211,7 @@ def _serve(root: Path, requests: list[LocalRequest]) -> tuple[Sequence, Worker, 
 
 
 def _ranks(worker: Worker, outcome: dict[str, Any]) -> dict[int, dict[str, Any]]:
-    """rank -> requested, observed and dispatched attention, probes and arch, from the
+    """rank -> requested, observed and dispatched attention, kernels and arch, from the
     triage bundle."""
     subject = outcome["triage_bundle"]["subject_id"]
     bundle = triage.BundleStore.read(worker.root / "triage", subject, worker.records)
@@ -250,24 +250,23 @@ def test_pins_are_request_scoped_on_one_warm_construction() -> None:
         "ordinary-after": "OUTCOME_STATUS_SUCCEEDED",
     }, {name: outcomes[name].get("safe_message") for name, _ in arms}
     assert "attention_kernel_unsupported" in outcomes["unsupported"]["safe_message"]
-    # Each request dispatched the kernel it asked for, and only that one, and reports that
-    # kernel's probe on this card: cuDNN measured for the first request's pin, SDPA before.
+    # Each request dispatched the kernel it asked for, and only that one, and its evidence
+    # names that kernel as the ready one it served.
     for name, pin in arms:
         if name == "unsupported":
             assert served[name] == {}, served[name]
             continue
         row = served[name][0]
-        [probe] = row["probes"]
-        assert probe["status"] == "ready", row
-        assert 0 < max(probe["rel_l2_by_rows"].values()) <= probe["budget"], row
+        [kernel] = [k for k in row["kernels"] if k["served"]]
+        assert kernel["state"] == "ready", row
         assert row["arch"] == "sm_{}{}".format(*torch.cuda.get_device_capability(0)), row
         if pin:
             assert (row["requested"], row["observed"], row["impl"]) == (pin, "cudnn", "cudnn")
-            assert (probe["kernel"], probe["source"]) == ("cudnn", "request"), row
+            assert kernel["kernel"] == "cudnn", row
         else:
             assert (row["requested"], row["observed"]) == ("", "sdpa"), served[name]
             assert row["impl"] in SDPA, served[name]
-            assert probe["kernel"] == "sdpa" and probe["source"] in ("warm", "prepare"), row
+            assert kernel["kernel"] == "sdpa", row
     # One construction was built, once, and one executor served every request.
     assert sum(" loaded in " in step for step in notes) == 1, notes
     entered = [row.body for row in worker.records.records if row.kind == "entered"]
@@ -304,15 +303,9 @@ def test_every_rank_takes_reports_and_restores_the_request_selection(tmp_path: P
         for row in held.values():
             assert (row["requested"], row["observed"]) == (pin, "sdpa"), held
             assert row["impl"] in SDPA, held  # every rank dispatched it
-            # Each rank's own probe of what it served, measured at its prepare.
-            [probe] = row["probes"]
-            assert (probe["kernel"], probe["status"], probe["source"]) == (
-                "sdpa",
-                "ready",
-                "prepare",
-            ), probe
-            assert probe["shape"] == list(attention.PROBE_SHORT), probe
-            assert 0 < max(probe["rel_l2_by_rows"].values()) <= probe["budget"], probe
-            assert probe["budget_state"] == "calibrated" and "skipped" not in row, row
+            # Each rank's own evidence of what it served.
+            assert [(k["kernel"], k["state"]) for k in row["kernels"] if k["served"]] == [
+                ("sdpa", "ready")
+            ], row
             assert row["arch"] == "", row  # no CUDA arch on a CPU rank
     assert len({tuple(pids) for pids in facts["pids"]}) == 1, facts["pids"]

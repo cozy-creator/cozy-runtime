@@ -25,7 +25,7 @@ DEVICES = "cpu0,cpu1"
 
 
 def ranks(execution: dict[str, Any]) -> dict[int, dict[str, Any]]:
-    """rank -> requested, observed and dispatched attention with its probes, and the rank's
+    """rank -> requested, observed and dispatched attention with its kernels, and the rank's
     device arch, from the execution record."""
     return {row["rank"]: {**row["attention"], "arch": row["arch"]} for row in execution["ranks"]}
 
