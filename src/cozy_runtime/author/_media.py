@@ -6,18 +6,15 @@ all unless something reads the first bytes, so this module reads them.
 
 Three rules:
 
-**The sniff is a REFUSAL, not a correction.** When the bytes disagree with the declaration
-the input refuses typed and pre-entrypoint. Rewriting the declared type to match the bytes
-would make a caller's mislabelled upload succeed under a type the package never agreed to,
-and the package's typed field is the whole contract.
+**The bytes win within a family.** A `.jpg` that is really WebP, or `audio/x-wav` for a WAV,
+is the image or audio the field asked for: `reconcile` takes the sniffed type and the field's
+own check (`admits`) still decides. Only an image declared and video delivered (another
+family) refuses. Bytes no signature names keep their declaration; the decoder is the judge.
 
 **A kind is a set of media types, declared here and nowhere else.** `ImageAsset` means
 exactly `KIND_MEDIA["image"]`. A package narrows that with `AssetBound(media_types=…)`;
 it never widens it, because a decoder the runtime does not have is not a capability.
 
-**An unrecognised container is UNKNOWN, never "probably fine".** `sniff` returns `""` when
-no signature matches, and the caller decides — which for a typed image field is a refusal,
-and for a `FileAsset` (the kind that promises nothing about its contents) is not.
 
 It lives under `author/` because the KIND table is a fact about the author surface's own
 types, and both sides need one copy: the worker sniffs the fetched bytes before
@@ -47,6 +44,7 @@ SIGNATURES: tuple[tuple[int, bytes, str], ...] = (
     (4, b"ftypmp42", "video/mp4"),
     (4, b"ftypM4V ", "video/mp4"),
     (4, b"ftypqt  ", "video/quicktime"),
+    (4, b"ftyp", "video/mp4"),  # every other ISO-BMFF brand: mp41, avc1, iso4, dash, 3gp...
     (0, b"\x1a\x45\xdf\xa3", "video/webm"),
     (8, b"WAVE", "audio/wav"),
     (0, b"OggS", "audio/ogg"),
@@ -54,6 +52,8 @@ SIGNATURES: tuple[tuple[int, bytes, str], ...] = (
     (0, b"ID3", "audio/mpeg"),
     (0, b"\xff\xfb", "audio/mpeg"),
     (0, b"\xff\xf3", "audio/mpeg"),
+    (0, b"\xff\xfa", "audio/mpeg"),
+    (0, b"\xff\xf2", "audio/mpeg"),
     (0, b"%PDF-", "application/pdf"),
 )
 
@@ -108,11 +108,36 @@ def admits(kind: str, media_type: str) -> bool:
     return not allowed or media_type in allowed
 
 
+#: Spellings people and tools use for the types above.
+ALIASES: dict[str, str] = {
+    "image/jpg": "image/jpeg",
+    "image/pjpeg": "image/jpeg",
+    "image/x-png": "image/png",
+    "image/x-ms-bmp": "image/bmp",
+    "video/x-m4v": "video/mp4",
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/vnd.wave": "audio/wav",
+    "audio/mp3": "audio/mpeg",
+    "audio/x-mpeg": "audio/mpeg",
+    "audio/x-flac": "audio/flac",
+}
+
+
 def normalize(declared: str) -> str:
-    """The media type without its parameters, lowercased. `image/png; charset=x` is a
-    media type with a parameter, not a different type, and a comparison that says
-    otherwise refuses a well-formed declaration."""
-    return declared.split(";")[0].strip().lower()
+    """The media type without its parameters, lowercased and unaliased: `image/jpg` and
+    `image/jpeg; q=1` are `image/jpeg`."""
+    media_type = declared.split(";")[0].strip().lower()
+    return ALIASES.get(media_type, media_type)
+
+
+def reconcile(declared: str, actual: str) -> str | None:
+    """The type bytes sniffed `actual` are used as under a `declared` claim: the bytes within
+    one family, the claim when no signature matched, None across families."""
+    declared = normalize(declared)
+    if not actual or not declared or declared == "application/octet-stream":
+        return actual or declared
+    return actual if actual.partition("/")[0] == declared.partition("/")[0] else None
 
 
 def extension(media_type: str) -> str:
