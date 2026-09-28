@@ -55,6 +55,8 @@ class CallTrack(msgspec.Struct, frozen=True, kw_only=True):
     ended_unix_ms: int = 0
     series: tuple[tuple[int, float], ...] = ()
     series_dropped: int = 0
+    #: bytes the span moved: an effect's upload stage
+    bytes: int = 0
 
 
 class _Attribution(msgspec.Struct, frozen=True):

@@ -15,6 +15,7 @@ from cozy_runtime.internal import effect_interfaces, fill
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker import machine_assessment, machine_models
 from cozy_runtime.internal.worker.machine_artifacts import model_retention
+from cozy_runtime.internal.worker.machine_calls import CallRecord, CallTrack
 from cozy_runtime.internal.worker.machine_models import ModelHold
 from cozy_runtime.internal.worker.machine_publication import (
     PublicationAuthority,
@@ -150,6 +151,8 @@ class Effects:
         self.stalls: dict[tuple[str, str], int] = {}
         # The stage each effect is in; it outlives retries, so its timing covers them.
         self.stages: dict[tuple[str, str], StageProgress] = {}
+        # Each effect's ended stages, for the `call` record its root keeps.
+        self.tracks: dict[tuple[str, str], dict[str, CallTrack]] = {}
         # Sent publications whose awaiting-owner notice this process already recorded.
         self.noticed: set[tuple[str, str]] = set()
         self.stopped = False
@@ -215,6 +218,7 @@ class Effects:
             return current
         if current is not None:
             current.finish(True)
+            self._track(key, current)
 
         def emit(frame: dict[str, object]) -> None:
             if self.report is not None:
@@ -327,7 +331,7 @@ class Effects:
                 self._notice_settled(owner, latest, True)
             else:
                 self.journal.observe_result(owner, call, raw)
-            self._settled(key, True)
+            self._settled(owner, call, True)
         except Exception as caught:
             exc = _refusal(caught)
             pending = isinstance(exc, PublicationRefusal) and (
@@ -358,13 +362,13 @@ class Effects:
                     if transient
                     else "publication was refused before its commit",
                 )
-                self._settled(key, False)
+                self._settled(owner, latest, False)
                 return
             if latest.sent and isinstance(exc, PublicationUncommitted):
                 # Hub durably reports the commit did not land: settle like a refusal.
                 self.journal.uncommitted(owner, latest, exc.code, "publication commit did not land")
                 self._notice_settled(owner, latest, False)
-                self._settled(key, False)
+                self._settled(owner, latest, False)
                 return
             target = _publication(latest)
             if (
@@ -500,7 +504,7 @@ class Effects:
                 return  # settled concurrently
             raise
         self._notice_settled(owner, call, committed)
-        self._settled((owner, call.child_request), committed)
+        self._settled(owner, call, committed)
 
     def _closure(
         self, call: Call, upload: effect_interfaces.Upload
@@ -519,13 +523,81 @@ class Effects:
         )
         return checkpoint, objects
 
-    def _settled(self, key: tuple[str, str], completed: bool) -> None:
+    def _settled(self, owner: str, call: Call, completed: bool) -> None:
+        """The effect settled: its last stage ends, and its root records the call."""
+        key = owner, call.child_request
         with self.lock:
             self.landed.pop(key, None)
             self.stalls.pop(key, None)
             stage = self.stages.pop(key, None)
         if stage is not None:
             stage.finish(completed)
+            self._track(key, stage)
+        self._record(owner, self.journal.get(owner, call.parent_request, call.call_index))
+
+    def _track(self, key: tuple[str, str], stage: StageProgress) -> None:
+        """An ended stage, as the effect's `call` record spells its span."""
+        elapsed = round((stage.clock() - stage.started) * 1000, 3)
+        span = CallTrack(
+            count=1,
+            total_ms=elapsed,
+            first_ms=elapsed,
+            min_ms=elapsed,
+            max_ms=elapsed,
+            started_unix_ms=stage.started_ms,
+            ended_unix_ms=stage.started_ms + round(elapsed),
+            bytes=stage.position,
+        )
+        with self.lock:
+            spans = self.tracks.setdefault(key, {})
+            prior = spans.get(stage.stage)
+            if prior is not None:
+                # A stage entered again (a retried finalization) adds to its one span.
+                span = CallTrack(
+                    count=prior.count + 1,
+                    total_ms=round(prior.total_ms + elapsed, 3),
+                    first_ms=prior.first_ms,
+                    min_ms=min(prior.min_ms, elapsed),
+                    max_ms=max(prior.max_ms, elapsed),
+                    started_unix_ms=prior.started_unix_ms,
+                    ended_unix_ms=span.ended_unix_ms,
+                    bytes=max(prior.bytes, span.bytes),
+                )
+            spans[stage.stage] = span
+
+    def _record(self, owner: str, call: Call) -> None:
+        """A settled effect is a call of its run, like a child call: its root keeps the record
+        (kind `call`) with each stage's time and bytes. Left for its owner to reconcile, it has
+        not settled yet."""
+        with self.lock:
+            stages = self.tracks.pop((owner, call.child_request), {})
+        if not call.result and not call.safe_code:
+            return
+        intent = canonical_json.decode_as(call.intent, _Effect)
+        upload = intent.upload()
+        label = {
+            "upload_checkpoint": "Upload checkpoint",
+            "publish_release": "Publish release",
+            "attach_assessment": "Attach assessment",
+        }.get(intent.export, intent.export)
+        if upload is not None:
+            label += f" to {upload.destination}"
+        record = CallRecord(
+            request=call.child_request,
+            parent=call.parent_request,
+            index=call.call_index,
+            attempt=1,
+            module=intent.module,
+            export=intent.export,
+            label=label[:200],
+            status="succeeded" if call.result else "failed",
+            error="" if call.result else (call.safe_detail or call.safe_code),
+            called_unix_ms=call.created_ms,
+            stages=stages,
+            steps={},
+        )
+        root, _ = self.executions.scheduling_root(owner, call.parent_request)
+        self.executions.record(owner, root, "call", msgspec.to_builtins(record.bounded()))
 
     def _upload(
         self, owner: str, call: Call, request: effect_interfaces.Upload, client: PublicationClient
