@@ -29,16 +29,18 @@ ROOT = Path(__file__).resolve().parents[1]
 #: H3 1.19.0's lock; the older executor is the Runtime H3 1.19.0 and qwen-image-2 0.2.3 lock.
 PACKAGES = ("diffusers==0.40.0", "transformers==5.17.0")
 OLD = "0.18.67"
-SITE = "/opt/cozy/python/lib/python3.12/site-packages"
 CPUS = 2
 EXECUTOR = "setpriv --reuid=64001 --regid=64001 --clear-groups env HOME=/tmp TMPDIR=/tmp"
 #: The older executor imports its own release, never this checkout.
 OLD_EXECUTOR = EXECUTOR.replace("env ", "env -u PYTHONPATH ")
 PROOF = "/work/venv/bin/python /proof/kernel_boot_proof.py"
+#: A package venv over the image's own interpreter and packages, wherever the image keeps them.
 VENV = (
-    "uv venv -q --python /opt/cozy/python/bin/python {0} && "
-    "echo {1} > {0}/lib/python3.12/site-packages/image.pth && "
-    "uv pip install -q --python {0}/bin/python {2}"
+    "base=$(python3 -c 'import sys; print(sys.executable)') && "
+    "uv venv -q --python $base {0} && "
+    "$base -c 'import sysconfig; print(sysconfig.get_path(\"purelib\"))' "
+    "> {0}/lib/python3.12/site-packages/image.pth && "
+    "uv pip install -q --python {0}/bin/python {1}"
 )
 
 
@@ -83,8 +85,8 @@ def test_the_machine_compiles_h3s_kernels_at_boot_and_every_executor_serves_them
         capture_output=True,
     )
     try:
-        _exec(name, VENV.format("/work/venv", SITE, " ".join(PACKAGES)))
-        _exec(name, VENV.format("/work/old", SITE, " ".join(PACKAGES)))
+        _exec(name, VENV.format("/work/venv", " ".join(PACKAGES)))
+        _exec(name, VENV.format("/work/old", " ".join(PACKAGES)))
         _exec(
             name, f"uv pip install -q --no-deps --python /work/old/bin/python cozy-runtime=={OLD}"
         )
@@ -133,7 +135,9 @@ def test_the_machine_compiles_h3s_kernels_at_boot_and_every_executor_serves_them
     rows = {row["kernel"]: row for row in warm["warm"]}
     assert rows["sageattention"]["state"] == "compiling", rows
     assert rows["flash-attn3"]["status"] == "unsupported" and rows["sdpa"]["status"] == "ready"
-    assert warm["construction"]["hosts"] == {"ref2va_dit": {"sdpa": 1}}
+    # It serves the best kernel ready then: Sol once its sources are unpacked (seconds), else SDPA.
+    served = warm["construction"]["hosts"]["ref2va_dit"]
+    assert served in ({"sol-attn": 1}, {"sdpa": 1}), served
     assert warm["pin_while_compiling"]["code"] == "attention_kernel_compiling"
     assert set(warm["own_builders"]) <= {"sol-attn"}, warm  # Sol's card object is its own
 

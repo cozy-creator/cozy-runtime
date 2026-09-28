@@ -91,10 +91,13 @@ def machine(out: dict[str, Any], root: Path) -> None:
     out["order"] = [job.key.kernel for _, job in booted.jobs]
     (root.parent / "machine.started").write_text(booted.line())
     ready: dict[str, float] = {}
-    while booted.thread.is_alive():
+    while True:
+        alive = booted.thread.is_alive()
         for _, job in booted.jobs:
             if kernel_compile.status(booted.store, job).state == "ready":
                 ready.setdefault(job.key.kernel, round(time.monotonic() - started, 1))
+        if not alive:
+            break
         time.sleep(1)
     out["compiles"] = {
         job.key.kernel: {
