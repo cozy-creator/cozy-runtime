@@ -1584,7 +1584,24 @@ class Executor:
         parked = self.arbiter.make_room(exclude, fits)
         if parked:
             accel.release_cached(torch, kind)
+        if self.world > 1 or not fits():
+            # A group asks for every rank: a follower's card may be short where this one
+            # is not, and the worker frees each device of the lane until its tightest fits.
+            self._room(need)
         return parked
+
+    def _room(self, need: int) -> None:
+        """Ask the worker for `need` allocatable bytes this process cannot free itself:
+        idle co-tenants of its devices give theirs back. Rank 0 only; followers answer to
+        rank 0."""
+        host = self.host
+        if host.rank != 0 or host.torch is None or host.device_kind != "cuda":
+            return
+        memory = accel.allocation(host.torch, host.device_kind)
+        slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
+        answer = host._durable("device_room", {"free_bytes": int(need) - slack})
+        if answer.get("ok") and "authorized_device_limit_bytes" in answer:
+            host.authorized = int(answer["authorized_device_limit_bytes"])
 
     def _synchronize(self) -> None:
         if self.torch is not None:
@@ -2161,7 +2178,9 @@ class Executor:
             measured["allocatable"] = memory["driver_free_bytes"] + max(
                 memory["reserved_bytes"] - memory["allocated_bytes"], 0
             )
-            measured["authorized"] = authorized - memory["allocated_bytes"]
+            # Rank 0's ceiling moves when the worker vacated co-tenants for it (`_room`).
+            ceiling = host.authorized if self.rank == 0 else authorized
+            measured["authorized"] = ceiling - memory["allocated_bytes"]
             # THE RESIDENCE CEILING (cl-027 / cr-025 / cr-066): the worker's ASSIGNED
             # limit less what this process already holds, verified against measured
             # capacity, capped at the artifact's complete destination bytes; the APPLIED
@@ -2458,7 +2477,9 @@ class Executor:
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY, installed on the constructed
         # generation. From here on, entering a declared scope admits and materializes its
         # set before the body runs; the package cannot observe that it happened.
-        self.residency = ComponentResidency(backend=backend, torch=torch, placement="all_resident")
+        self.residency = ComponentResidency(
+            backend=backend, torch=torch, placement="all_resident", room=self._room
+        )
         object.__setattr__(model, "_cozy_residency", self.residency)
         record = registry.generations()[0].record
         # THE CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
@@ -2555,12 +2576,18 @@ class Executor:
             except WarmFailed as exc:
                 # A CONSTRUCTION FAILURE, typed on the author's exception: the executor is
                 # poisoned and replaced like every other prepare refusal, and the binding
-                # faults instead of serving a generation whose warm did not complete.
+                # faults instead of serving a generation whose warm did not complete. The
+                # device running short is a capacity fact and is typed as one, so the
+                # refusal stays this attempt's and is never held against the binding.
                 backend.poison(())
                 self.poisoned = f"warm failed: {exc}"[:200]
+                cause = exc.__cause__
+                short = cause if isinstance(cause, ResidencyRefusal) else None
+                oom = cause is not None and accel.is_oom(torch, cause)
                 return {
                     "ok": False,
-                    "code": exc.code,
+                    "code": short.code if short else "device_out_of_memory" if oom else exc.code,
+                    "shortfall": short.shortfall if short else None,
                     "detail": str(exc)[:900],
                     "traceback": prepare_diagnostics.exception_trace(exc),
                     "state": backend.state,
@@ -4185,31 +4212,33 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
-    def vacate(self) -> dict[str, Any]:
+    def vacate(self, residents: bool = True) -> dict[str, Any]:
         """FREE this process's device bytes for another tenant of the lane (cr-022).
 
         The worker calls this BETWEEN attempts — the lane seat guarantees none is in
         flight here — when a co-tenant's attempt or prepare does not fit beside what this
         process holds. Every resident construction is parked; the process stays (its epoch
         does not move; only residency does), `restore` brings the active construction back
-        and an attempt's own admissions stage whatever is still missing. The reply is the
-        probe's after-state plus what moved.
+        and an attempt's own admissions stage whatever is still missing. Without
+        `residents` only the allocator's cache goes back and every construction stays.
+        The reply is the probe's after-state plus what moved.
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         empty = {"freed": {}, "held": {}, "freed_bytes": 0}
-        if self.torch is None or not self.constructions:
+        if self.torch is None:
             return {**self.probe(), "vacated": empty}
         if self.group is not None:
             # EVERY RANK VACATES (cr-068): each replica frees its own card. The reply is
             # rank 0's; the worker reads the K devices itself, through NVML.
             try:
-                self.group.broadcast({"cmd": "vacate"})
+                self.group.broadcast({"cmd": "vacate", "residents": residents})
             except GroupRefusal as exc:
                 return self._group_refusal(exc, closing=False)
         self._synchronize()
         try:
-            reports = [self.arbiter.park(key) for key in self.arbiter.victims(exclude="")]
+            victims = self.arbiter.victims(exclude="") if residents else []
+            reports = [self.arbiter.park(key) for key in victims]
         except ResidencyRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
         accel.release_cached(self.torch, self.device_kind)
@@ -4656,7 +4685,7 @@ def main(argv: list[str] | None = None) -> int:
             elif name == "probe":
                 reply = executor.probe()
             elif name == "vacate":
-                reply = executor.vacate()
+                reply = executor.vacate(residents=bool(command.get("residents", True)))
             elif name == "restore":
                 reply = executor.restore(names=tuple(str(n) for n in (command.get("names") or ())))
             elif name == "shutdown":

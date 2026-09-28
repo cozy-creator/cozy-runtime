@@ -153,6 +153,9 @@ class ComponentResidency:
     page_autocast_cache: bool | None = None
     page_bytes: int = 0
     attempt_page_bytes: int = 0
+    #: Asks the worker for allocatable bytes this process cannot free: idle co-tenants of
+    #: its devices give theirs back. A shortfall refuses only once that has been asked.
+    room: Callable[[int], None] | None = None
 
     def __post_init__(self) -> None:
         for name, layout in self.backend.paging.items():
@@ -397,7 +400,10 @@ class ComponentResidency:
             # headroom, the answer is a typed shortfall with nothing to undo — the executor
             # stays Ready and the ladder chooses a deeper rung. Past this line, a failure is
             # a surprise the arithmetic did not predict, and surprises poison.
-            if not self._fits(self.backend.stage_bytes(name, headroom)):
+            need = self.backend.stage_bytes(name, headroom)
+            if not self._fits(need) and self.room is not None:
+                self.room(need)
+            if not self._fits(need):
                 refusal = self._shortfall(
                     method,
                     name,

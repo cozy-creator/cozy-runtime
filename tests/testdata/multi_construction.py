@@ -119,6 +119,10 @@ class Driver:
             assert frame is not None, f"the executor died during {command['cmd']!r}"
             if frame.get("event") == "progress":
                 continue
+            if frame.get("event") == "request":
+                # No co-tenant to vacate: answered as a worker with no handler answers.
+                self.channel.send({"event": "answer", "seq": frame["seq"], "ok": False})
+                continue
             assert frame.get("reply") == command["cmd"], frame
             return frame
 
