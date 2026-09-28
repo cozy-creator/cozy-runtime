@@ -655,7 +655,14 @@ def test_canceled_parent_settles_a_finalize_that_never_reached_the_hub(
 ) -> None:
     staged, hub, effects = stage
     hub.lose_finalize = True
-    drive(effects, lambda: staged.call().sent and bool(staged.progress()))
+    # Earlier phases' rows land first; the lost finalize is settled once it reconciles.
+    drive(
+        effects,
+        lambda: (
+            staged.call().sent
+            and any(row.get("phase") == "reconciling" for row in staged.progress())
+        ),
+    )
     assert staged.progress()[-1] == {
         "stage": "Publishing checkpoint / reconciling",
         "operation": "publication",
