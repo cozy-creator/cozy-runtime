@@ -7,12 +7,16 @@ newer executor adds is ignored.
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 import msgspec
 
 from cozy_runtime.author._observations import Scalar
+from cozy_runtime.internal import tolerant
 from cozy_runtime.internal.canonical import Json
+
+_LOG = logging.getLogger(__name__)
 
 
 class Outcome(msgspec.Struct, frozen=True, kw_only=True):
@@ -157,9 +161,44 @@ def budget_claim(reply: AttemptReply) -> dict[str, int]:
     return {} if reply.max_output_bytes is None else {"max_output_bytes": reply.max_output_bytes}
 
 
+#: Telemetry and narration: a member here that does not read takes its default. The verdict,
+#: result, outputs, digests and `poisoned` stay exact.
+_ADVISORY: dict[type, frozenset[str]] = {
+    AttemptReply: frozenset(
+        {
+            "origin",
+            "shortfall",
+            "quiescent",
+            "env_changed",
+            "residency",
+            "observations",
+            "observation_caps",
+            "attribution",
+            "position",
+            "execution_observation",
+            "execution",
+            "attention_applied",
+            "adjustments",
+            "oversize_result_bytes",
+            "metrics",
+        }
+    ),
+    PreparedReply: frozenset({"origin", "detail", "adjustments"}),
+}
+
+
 def decode[R: (AttemptReply, PreparedReply)](frame: object, into: type[R]) -> R:
-    """The reply a frame states; a malformed one is the executor's refusal, named."""
+    """The reply a frame states. An unreadable advisory member costs itself, with one warning;
+    a malformed load-bearing one is the executor's refusal, named."""
     try:
-        return msgspec.convert(frame, into)
+        reply, dropped = tolerant.read(frame, into, _ADVISORY[into])
     except msgspec.ValidationError as exc:
         return into(ok=False, code="executor_reply_malformed", detail=str(exc)[:1024])
+    if dropped:
+        _LOG.warning(
+            "executor %s: dropped %d unreadable member(s); first %s",
+            into.__name__,
+            len(dropped),
+            dropped[0][:512],
+        )
+    return reply
