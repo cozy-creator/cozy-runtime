@@ -336,6 +336,8 @@ def test_projection_terminal_replays_after_retained_collection(
     assert tree_members.project(calls, parent, frame)["ok"]
     terminal_bundle(workspace, parent, hold)
     executions = Executions(workspace)
+    # The execution unit projects a recorded outcome onto its execution (`reconcile`).
+    executions.reconcile("owner", "producer")
     terminal = executions.collect("owner", "producer")
     workspace.outcome("owner", terminal)
     ack = pb.AttemptOutcomeAck(
