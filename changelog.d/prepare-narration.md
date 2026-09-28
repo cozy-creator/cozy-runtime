@@ -1,0 +1,1 @@
+A prepare reply whose attention boot fact or delivery narration another Runtime version shaped differently no longer fails the attempt with `construction_reply_incomplete` after the weights are filled. Those members take their defaults; the construction digest and delivery plan stay exact.

@@ -2,8 +2,9 @@
 
 One member that does not decode costs itself, never the document: `read` drops the deepest
 node a validation error names and decodes again. A null takes its member's default anywhere;
-any other unreadable node is dropped only inside an advisory member (telemetry, narration).
-A load-bearing member (a verdict, a result, a digest) is never guessed, so its error raises.
+any other unreadable node is dropped only inside an advisory member (telemetry, narration),
+named by its dotted path (`metrics`, `facts.attention`). A load-bearing member (a verdict, a
+result, a digest) is never guessed, so its error raises.
 """
 
 from __future__ import annotations
@@ -38,11 +39,12 @@ def read[T](doc: object, into: type[T], advisory: Collection[str] = ()) -> tuple
             parent, node = node, _child(node, step)
             if node is _MISSING:
                 raise error
+        dotted = ".".join(map(str, path))
         absent = node is None and isinstance(path[-1], str) if path else False
-        if not path or not (absent or path[0] in advisory):
+        if not path or not (absent or any(_within(dotted, member) for member in advisory)):
             raise error
         del parent[path[-1]]
-        dropped.append(f"{'.'.join(map(str, path))}: {message or error}")
+        dropped.append(f"{dotted}: {message or error}")
         try:
             return msgspec.convert(work, into), dropped
         except msgspec.ValidationError as exc:
@@ -50,6 +52,10 @@ def read[T](doc: object, into: type[T], advisory: Collection[str] = ()) -> tuple
 
 
 _MISSING = object()
+
+
+def _within(dotted: str, member: str) -> bool:
+    return dotted == member or dotted.startswith(member + ".")
 
 
 def _child(node: Any, step: str | int) -> Any:
