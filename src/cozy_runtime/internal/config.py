@@ -463,10 +463,10 @@ def read_worker_host_config(
             "worker_host_config", "worker and media ports are equal", "fix host launch"
         )
     try:
-        layout = host_paths.layout(env.get("COZY_MACHINE_ROOT"))
+        layout = host_paths.layout(env.get("COZY_MACHINE_ROOT"), env.get("COZY_TENSORFS_ROOT"))
     except ValueError as exc:
         raise ConfigError(
-            "worker_host_config", f"COZY_MACHINE_ROOT is invalid: {exc}", "fix host launch"
+            "worker_host_config", f"machine layout is invalid: {exc}", "fix host launch"
         ) from exc
     storage_fd = env.get("COZY_STORAGE_ADMISSION_FD")
     if storage_fd not in (None, "4"):

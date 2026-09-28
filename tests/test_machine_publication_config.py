@@ -50,7 +50,8 @@ except ConfigError as exc:
     raise SystemExit(2)
 print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env),
                   "hosts":runtime_config_from_host(cfg).object_storage_hosts,
-                  "dependency_cache":str(runtime_config_from_host(cfg).dependency_cache)}))
+                  "dependency_cache":str(runtime_config_from_host(cfg).dependency_cache),
+                  "tensorfs":str(cfg.layout.tensorfs_root)}))
 """
     result = subprocess.run(
         [sys.executable, "-c", program],
@@ -64,7 +65,20 @@ print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env)
         "child": {"PATH": "/usr/bin:/bin"},
         "hosts": [".objects.example", "storage.example"],
         "dependency_cache": "/var/lib/cozy/dependencies",
+        "tensorfs": "/var/lib/tensorfs",
     }
+    # The Host names the box's one Store; the rest of the layout stays under the root.
+    named = subprocess.run(
+        [sys.executable, "-c", program],
+        input=json.dumps(
+            {"env": handoff | {"COZY_TENSORFS_ROOT": "/home/o/.tensorfs"}, "path": str(path)}
+        ),
+        text=True,
+        capture_output=True,
+    )
+    assert named.returncode == 0, named.stderr
+    assert json.loads(named.stdout)["tensorfs"] == "/home/o/.tensorfs"
+    assert json.loads(named.stdout)["dependency_cache"] == "/var/lib/cozy/dependencies"
     # Settings from newer hosts (including credentials irrelevant to this
     # worker) neither abort boot nor enter the child environment.
     extended_auth = json.loads(handoff["COZY_RECORD_OWNER_AUTH_JSON"])
@@ -90,6 +104,8 @@ print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env)
     assert json.loads(evolved.stdout) == json.loads(result.stdout)
     for env_change, change in (
         ({"PYTHONPATH": "/untrusted/source"}, {}),
+        ({"COZY_TENSORFS_ROOT": "relative/.tensorfs"}, {}),
+        ({"COZY_TENSORFS_ROOT": "/home/o/../.tensorfs"}, {}),
         ({"COZY_RECORD_OWNER_AUTH_JSON": json.dumps({"future_advisory": True})}, {}),
         (
             {

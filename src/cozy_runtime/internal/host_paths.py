@@ -1,7 +1,8 @@
 """The machine filesystem layout, rooted where the Host says.
 
 A pod roots it at `/`; a laptop's Host roots it at a directory it owns. The layout under the
-root is identical, so the Host and Runtime share one relative table and nothing else.
+root is identical, so the Host and Runtime share one relative table and nothing else. The one
+TensorFS Store may live elsewhere (a laptop's `~/.tensorfs`); the Host names it.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ POD_ROOT: Final = Path("/")
 @dataclass(frozen=True, slots=True)
 class Layout:
     root: Path = POD_ROOT
+    #: The box's TensorFS Store when the Host names one; else under the root.
+    tensorfs: Path | None = None
 
     def _at(self, relative: str) -> Path:
         return self.root / relative
@@ -31,7 +34,7 @@ class Layout:
 
     @property
     def tensorfs_root(self) -> Path:
-        return self._at("var/lib/tensorfs")
+        return self.tensorfs or self._at("var/lib/tensorfs")
 
     @property
     def boot_data(self) -> Path:
@@ -114,14 +117,19 @@ class Layout:
         return self.media_root / "triage"
 
 
-def layout(raw: str | None) -> Layout:
-    """The Host's `COZY_MACHINE_ROOT`: absolute and normalized; absent means `/`."""
-    if raw is None or raw == "":
-        return Layout()
-    root = Path(raw)
-    if not root.is_absolute() or os.path.normpath(raw) != raw:
-        raise ValueError("machine root must be an absolute normalized path")
-    return Layout(root)
+def _absolute(raw: str, name: str) -> Path:
+    if not os.path.isabs(raw) or os.path.normpath(raw) != raw:
+        raise ValueError(f"{name} must be an absolute normalized path")
+    return Path(raw)
+
+
+def layout(raw: str | None, tensorfs: str | None = None) -> Layout:
+    """The Host's `COZY_MACHINE_ROOT` and `COZY_TENSORFS_ROOT`: each absolute and normalized.
+    An absent machine root is `/`; an absent Store is `var/lib/tensorfs` under it."""
+    return Layout(
+        _absolute(raw, "machine root") if raw else POD_ROOT,
+        _absolute(tensorfs, "TensorFS root") if tensorfs else None,
+    )
 
 
 def input_media_root() -> Path:
