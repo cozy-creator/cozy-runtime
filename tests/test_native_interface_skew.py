@@ -82,6 +82,5 @@ def test_an_operation_this_worker_lacks_is_refused_alone() -> None:
     operations["download_dataset"] = operations["download_huggingface"]
     rows = native_interfaces.rows(hello)
     (refused,) = [row for row in rows if "unavailable" in row]
-    assert (
-        refused["export"] == "download_dataset" and "cozy rental update" in refused["unavailable"]
-    )
+    assert refused["export"] == "download_dataset"
+    assert "cozy rental update" in str(refused["unavailable"])
