@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO
 import tensorfs
 
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.internal import storage_admission
+from cozy_runtime.internal import storage_admission, weights_sink
 from cozy_runtime.internal.seam import DescriptorReply
 from cozy_runtime.protocol import weights_limits
 
@@ -412,7 +412,9 @@ class WriterBroker:
         ) as source:
             facts = canonical_json.decode(source.read())
         native = self.store().derived_lookup(transaction)
-        if native.get("state") != "committed" or native.get("receipt") != facts:
+        if native.get("state") != "committed" or not weights_sink.same_receipt(
+            native["receipt"], facts
+        ):
             raise CapabilityError(
                 "receipt differs from native custody", code="weights_receipt_mismatch"
             )
@@ -420,6 +422,8 @@ class WriterBroker:
             raise CapabilityError(
                 "receipt has no execution recorder", code="weights_host_unavailable"
             )
+        # Whichever form the executor relayed, the worker records its own custody's receipt.
+        facts = native["receipt"]
         self.record_receipt(attempt, transaction, binding, facts)
         self._current(attempt, transaction, binding)
         return {
@@ -439,8 +443,6 @@ class WriterBroker:
         fingerprint: str,
     ) -> DescriptorReply:
         from tensorfs.derived import serve_derived, serve_derived_replay
-
-        from cozy_runtime import canonical_json
 
         key = self.key(attempt, transaction)
         self._current(attempt, transaction, binding)
@@ -471,8 +473,7 @@ class WriterBroker:
                 )
             if (
                 replay.get("transaction_id") != transaction
-                or hashlib.sha256(canonical_json.encode(replay.get("declaration"))).digest()
-                != binding.declaration_digest
+                or weights_sink.declaration_digest(replay) != binding.declaration_digest
             ):
                 raise CapabilityError(
                     "native receipt differs from intent", code="weights_receipt_mismatch"

@@ -71,7 +71,7 @@ def test_graft_is_native_declared_granted_and_retained(tmp_path: Path) -> None:
     store.derived_dispose(bank_id)
     receipt = writer.commit()
     facts = receipt
-    assert facts["declaration"]["components"]["model"]["add"]["table"]["parts"]["value"][
+    assert host.declaration(facts)["components"]["model"]["add"]["table"]["parts"]["value"][
         "source"
     ] == {"source": "bank", "component": "model", "tensor": "weight", "role": "value"}
     assert facts["added_objects"] == []

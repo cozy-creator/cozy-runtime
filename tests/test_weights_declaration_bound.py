@@ -18,6 +18,7 @@ from tensorfs.derived import Derivation, Part, PartSource, Source, Target, Tenso
 
 from cozy_runtime.author import ModelArtifact, ObjectRef
 from cozy_runtime.internal.encoding import SPEC_PLAIN
+from cozy_runtime.protocol import documents
 from native_weights import NativeExecution
 
 
@@ -86,3 +87,35 @@ def test_a_large_declaration_is_journaled_and_opens_its_writer(
         assert not intent.tensorfs_declaration_canonical_bytes
         assert intent.tensorfs_declaration_length == len(declaration)
         assert intent.tensorfs_declaration_digest == hashlib.sha256(declaration).digest()
+
+
+def test_a_whole_model_declaration_commits_with_a_constant_size_receipt(tmp_path: Path) -> None:
+    # SDXL `assemble_normalized`: every tensor inherited from its source, all in order.
+    store = tensorfs.Store.init(tmp_path / "store")
+    source = _source(store)
+    keys = _keys(2800, 60)
+    graft = Part("f16", (4,), source=PartSource("source", "unet", "base", "value"))
+    definition = Derivation(
+        {"source": Source(source.manifest.digest, source.manifest.length)},
+        {
+            "unet": Target(
+                add={key: Tensor("f16", (4,), SPEC_PLAIN, {"value": graft}) for key in keys}
+            )
+        },
+        {},
+        tuple(("unet", key) for key in keys),
+    )
+    with NativeExecution(store, tmp_path, "assemble", {"source": source}, {"model": 0}) as owner:
+        with owner.client.open_output("model", definition) as writer:
+            receipt = writer.commit()
+        artifact = owner.client.adopt_model(receipt)
+    (intent,) = [f.weights_intent for f in owner.frames if f.HasField("weights_intent")]
+    recorded = [f.weights_receipt for f in owner.frames if f.HasField("weights_receipt")]
+    assert recorded and intent.tensorfs_declaration_length > 1 << 20
+    # The receipt names the declaration by digest, so it stays small however large the model.
+    assert all(
+        len(frame.weights_receipt.weights_receipt_canonical_bytes) < 16 << 10 for frame in recorded
+    )
+    assert receipt["declaration_digest"] == documents.spell(intent.tensorfs_declaration_digest)
+    header = tensorfs.parse_header(bytes(store.manifest(artifact.manifest.digest)["header"]))
+    assert list(header["components"]["unet"]) == keys

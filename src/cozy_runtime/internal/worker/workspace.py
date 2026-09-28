@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import fill, weights_writer
+from cozy_runtime.internal import fill, weights_sink, weights_writer
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 from cozy_runtime.internal.worker import derived_retention
 from cozy_runtime.protocol import documents
@@ -1057,7 +1057,7 @@ class Workspace:
             if (
                 observed.get("state") != "committed"
                 or observed.get("disposition", {}).get("kind") == "released"
-                or canonical_json.encode(observed.get("receipt")) != native
+                or not weights_sink.same_receipt(observed["receipt"], canonical_json.decode(native))
             ):
                 raise WorkspaceRefusal("receipt has no exact live native result")
             manifest = observed["receipt"]["manifest"]

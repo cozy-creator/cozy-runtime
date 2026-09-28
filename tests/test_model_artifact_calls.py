@@ -35,6 +35,7 @@ from cozy_runtime.cli import describe as describe_cli
 from cozy_runtime.cli.io import Options
 from cozy_runtime.internal import interface_wheel, package_interface
 from cozy_runtime.internal.discovery import Discovered
+from cozy_runtime.internal.weights_sink import same_receipt
 from cozy_runtime.internal.worker import derived_retention
 from cozy_runtime.internal.worker.control import _PreparationServicer
 from cozy_runtime.protocol import documents
@@ -245,7 +246,9 @@ def test_native_artifact_receipt_and_independent_loopback_retention_survive_orig
             for _ in range(2):
                 released_original = client.ReleaseDerivedResult(original_release, timeout=5)
                 assert released_original.released
-            assert store.derived_lookup(receipt.weights_transaction_id)["receipt"] == native
+            assert same_receipt(
+                store.derived_lookup(receipt.weights_transaction_id)["receipt"], native
+            )
             tensorfs.gc(str(root))
             assert client.RetainDerivedResult(request, timeout=5) == held
             assert store.manifest(artifact.manifest.digest)

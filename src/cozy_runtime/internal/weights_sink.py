@@ -27,6 +27,28 @@ _OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 _EXCHANGE_KINDS = frozenset({"declaration", "receipt", "derivation", "native-receipt"})
 
 
+def declaration_digest(facts: Mapping[str, Any]) -> bytes:
+    """The declaration a native receipt names: by digest, or inline as older receipts do."""
+    named = facts.get("declaration_digest")
+    if isinstance(named, str):
+        return documents.raw(named)
+    return hashlib.sha256(canonical_json.encode(facts.get("declaration"))).digest()
+
+
+def same_receipt(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Whether two native receipts state the same facts, whichever form names the declaration."""
+
+    def named(facts: Mapping[str, Any]) -> dict[str, Any]:
+        facts = dict(facts)
+        if "declaration" in facts:
+            raw = canonical_json.encode(facts.pop("declaration"))
+            facts["declaration_digest"] = "sha256:" + hashlib.sha256(raw).hexdigest()
+            facts["declaration_length"] = len(raw)
+        return facts
+
+    return named(left) == named(right)
+
+
 def work_fingerprint(
     spec: Mapping[str, Any],
     numerical: bytes,
