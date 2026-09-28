@@ -12,13 +12,13 @@ from __future__ import annotations
 import hashlib
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, TypedDict
 
 import msgspec
 
@@ -37,8 +37,12 @@ from cozy_runtime.internal.worker.plan import (
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+if TYPE_CHECKING:
+    from .session import Placement
+
 type FaultKind = pb.FaultKind
 type LegName = Literal["package", "model"]
+type ObservationCallback = Callable[[pb.PlacementAcquisitionObservation], object]
 
 
 class _SequenceParallel(TypedDict):
@@ -67,6 +71,22 @@ class _ArtifactReference(msgspec.Struct):
     length: int
 
 
+class _Blob(msgspec.Struct, frozen=True):
+    sha256: Annotated[str, msgspec.Meta(pattern="^[0-9a-f]{64}$")]
+    length: Annotated[int, msgspec.Meta(gt=0)]
+
+
+class _Entry(msgspec.Struct, frozen=True):
+    kind: str
+    blob: _Blob | None = None
+
+
+class _Manifest(msgspec.Struct, frozen=True):
+    """The TensorFS Manifest entries Runtime reads: the sole CozyTensors header's blob."""
+
+    entries: tuple[_Entry, ...] = ()
+
+
 class AcquisitionRefusal(Exception):
     """A typed, fail-closed acquisition verdict carrying the fault kind it reports as."""
 
@@ -93,7 +113,7 @@ class AcquisitionObservation:
     useful meaning for another machine reading this placement's progress.
     """
 
-    def __init__(self, callback: Any = None) -> None:
+    def __init__(self, callback: ObservationCallback | None = None) -> None:
         self._lock = Lock()
         self._origin_ns = time.monotonic_ns()
         self._legs = {"package": _Leg(), "model": _Leg()}
@@ -193,7 +213,7 @@ class HeldManifests:
         with self._lock:
             return sorted(self._held)
 
-    def hold(self, store: Any, digest: str) -> tuple[tuple[str, int], ...]:
+    def hold(self, store: fill.Store, digest: str) -> tuple[tuple[str, int], ...]:
         """One verified walk of `digest`'s runtime closure: record the answer and return the
         closure's objects, or re-raise the store's refusal after recording the absence."""
         try:
@@ -202,7 +222,7 @@ class HeldManifests:
             self._record(digest, False)
             raise
         try:
-            objects = tuple((str(ref), int(length)) for ref, length in lease.objects)
+            objects = tuple(lease.objects)
         finally:
             lease.release()
         self._record(digest, True)
@@ -215,7 +235,7 @@ class HeldManifests:
         if held != before and self._on_change is not None:
             self._on_change()
 
-    def rebuild(self, store: Any) -> int:
+    def rebuild(self, store: fill.Store) -> int:
         """Replace the index from TensorFS's verified complete-CozyTensors census."""
 
         held = set(store.complete_cozytensors_manifests())
@@ -376,7 +396,7 @@ class Acquirer:
         installed_environment: package_installation.InstalledEnvironment | None = None,
         verified_cache: VerifiedArtifactCache | None = None,
         held_manifests: HeldManifests | None = None,
-        on_observation: Any = None,
+        on_observation: ObservationCallback | None = None,
     ) -> None:
         self.cache_root = cache_root
         self.install_root = install_root
@@ -453,7 +473,7 @@ class Acquirer:
                     )
         return path
 
-    def acquire(self, placement: Any) -> AcquiredPlacement:
+    def acquire(self, placement: Placement) -> AcquiredPlacement:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cozy-acquire") as pool:
             model_future = pool.submit(self._run_model, placement)
             package_future = pool.submit(self._run_package, placement, model_future)
@@ -471,7 +491,7 @@ class Acquirer:
         )
 
     def _run_package(
-        self, placement: Any, models: Future[int]
+        self, placement: Placement, models: Future[int]
     ) -> tuple[package_installation.InstalledEnvironment, Mapping[str, DeclaredBinding], int]:
         self._thread.leg = "package"
         self.observation.start("package")
@@ -485,7 +505,7 @@ class Acquirer:
         finally:
             self.observation.finish("package")
 
-    def _run_model(self, placement: Any) -> int:
+    def _run_model(self, placement: Placement) -> int:
         self._thread.leg = "model"
         self.observation.start("model")
         try:
@@ -493,7 +513,7 @@ class Acquirer:
         finally:
             self.observation.finish("model")
 
-    def _environment(self, placement: Any) -> package_installation.InstalledEnvironment:
+    def _environment(self, placement: Placement) -> package_installation.InstalledEnvironment:
         """Reopen the generation this placement's prepare published; move no wheel bytes.
 
         Wire 30 deletes wheel members and grants from the download path outright: a
@@ -517,7 +537,7 @@ class Acquirer:
                 getattr(exc, "detail", str(exc)),
             ) from exc
 
-    def _models(self, placement: Any) -> int:
+    def _models(self, placement: Placement) -> int:
         """Hold every distinct selected manifest with ONE verified walk each; returns the
         number of manifests held. The walk's object list prices the bindings."""
         if not placement.models:
@@ -566,19 +586,12 @@ class Acquirer:
             )
         return self._manifest_bytes[digest]
 
-    def _bindings(self, placement: Any) -> tuple[Mapping[str, DeclaredBinding], int]:
+    def _bindings(self, placement: Placement) -> tuple[Mapping[str, DeclaredBinding], int]:
         development = placement.development
         interface_path = self.selection_root / placement.installation_id / "package-interface.json"
         package_interface.publish(interface_path, placement.package_interface)
-        try:
-            interface = package_interface.read_bytes(
-                placement.package_interface, str(interface_path)
-            )
-        except package_interface.StalePackageInterface as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
-            ) from exc
-        visible = _visible_entrypoints(interface)
+        interface = _interface(placement.package_interface, str(interface_path))
+        visible = _entrypoints_by_name(interface)
         models = {str(row["id"]): row for row in placement.models}
         package_code_digest = placement.installation_id
         bindings: dict[str, DeclaredBinding] = {}
@@ -594,12 +607,11 @@ class Acquirer:
                     f"interface has no entrypoint {name!r}",
                 )
             slots = entrypoint.get("slots", [])
-            described_models = described.get("models", [])
-            if len(slots) != len(described_models):
+            if len(slots) != len(described.models):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "binding_slot_set_mismatch", name
                 )
-            application = str(interface.get("application", ""))
+            application = interface.application
             if not slots:
                 bindings[binding_digest] = DeclaredBinding(
                     entrypoint_binding_digest=binding_digest,
@@ -611,11 +623,11 @@ class Acquirer:
                     model_parameter_name="",
                     application=application,
                     interface_path=str(interface_path),
-                    internal=bool(described.get("internal", False)),
+                    internal=described.internal,
                 )
                 continue
-            described_by_path = {row["path"]: row for row in described_models}
-            if len(described_by_path) != len(described_models):
+            described_by_path = {row.path: row for row in described.models}
+            if len(described_by_path) != len(described.models):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                     "binding_package_interface_invalid",
@@ -651,7 +663,7 @@ class Acquirer:
                         _model_group_weight_bytes(
                             self.tensorfs_root,
                             snapshots,
-                            declared.get("component_use", {}),
+                            declared.component_use,
                             model_weight_bytes,
                         )
                     )
@@ -661,13 +673,14 @@ class Acquirer:
                         "selected_model_manifest_unavailable",
                         f"{type(exc).__name__}: {exc}",
                     ) from exc
-                sequence_parallel = declared.get("sequence_parallel")
                 degrees = (
-                    tuple(sequence_parallel["degrees"]) if sequence_parallel is not None else ()
+                    ()
+                    if declared.sequence_parallel is msgspec.UNSET
+                    else declared.sequence_parallel.degrees
                 )
                 members.append(
                     ModelBinding(
-                        model_class=str(declared.get("class", "")),
+                        model_class=declared.class_name,
                         model_binding_path=path,
                         model_parameter_name=str(slot["slot"]),
                         store=str(self.tensorfs_root),
@@ -707,7 +720,7 @@ class Acquirer:
                 model_parameter_name=first.model_parameter_name,
                 application=application,
                 interface_path=str(interface_path),
-                internal=bool(described.get("internal", False)),
+                internal=described.internal,
                 store=first.store,
                 variant=first.variant,
                 reference_snapshot=first.reference_snapshot,
@@ -729,7 +742,7 @@ class Acquirer:
         # This intermediate state has no executable bindings; a weightless
         # entrypoint must still be selected and selected models cannot disappear.
         code_only_preparation = not models and all(
-            entrypoint.get("models") for entrypoint in visible.values()
+            entrypoint.models for entrypoint in visible.values()
         )
         if not selected_entrypoints and (development or visible) and not code_only_preparation:
             raise AcquisitionRefusal(
@@ -741,7 +754,10 @@ class Acquirer:
 
 
 def _model_group_weight_bytes(
-    root: Path, snapshots: Mapping[str, str], scopes: Mapping[str, list[str]], artifact_bytes: int
+    root: Path,
+    snapshots: Mapping[str, str],
+    scopes: Mapping[str, Sequence[str]],
+    artifact_bytes: int,
 ) -> int:
     """Price complete staging declarations; otherwise retain full artifact accounting."""
     covered = {name for names in scopes.values() for name in names}
@@ -821,30 +837,48 @@ def _ref(value: object, name: str) -> tuple[str, int]:
     return reference.digest, reference.length
 
 
-def cozytensors_ref(tensorfs: Any, raw: bytes) -> tuple[str, int]:
+def cozytensors_ref(raw: bytes) -> tuple[str, int]:
     """Select the sole typed CozyTensors header through TensorFS's Manifest parser."""
 
     try:
-        manifest = tensorfs.parse_manifest(raw)
-        rows = manifest["entries"]
-        selected = [row for row in rows if row.get("kind") == "cozytensors"]
-        if len(selected) != 1:
-            raise ValueError("expected exactly one cozytensors entry")
-        blob = selected[0]["blob"]
-        ref = "sha256:" + str(blob["sha256"]), int(blob["length"])
+        manifest = msgspec.convert(fill.tensorfs_module().parse_manifest(raw), _Manifest)
     except Exception as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "model_manifest_invalid",
             f"TensorFS refused Manifest bytes: {type(exc).__name__}: {exc}",
         ) from exc
-    if not rows or not ref[0].startswith("sha256:") or len(ref[0]) != 71 or ref[1] <= 0:
+    blobs = [entry.blob for entry in manifest.entries if entry.kind == "cozytensors"]
+    if len(blobs) != 1 or blobs[0] is None:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "model_manifest_invalid",
             "TensorFS Manifest has no positive CozyTensors header reference",
         )
-    return ref
+    return "sha256:" + blobs[0].sha256, blobs[0].length
+
+
+def _interface(raw: bytes, source: str) -> package_interface.PackageInterface:
+    try:
+        return package_interface.parse(raw, source)
+    except package_interface.StalePackageInterface as exc:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
+        ) from exc
+
+
+def _entrypoints_by_name(
+    interface: package_interface.PackageInterface,
+) -> dict[str, package_interface.CallableDoc]:
+    rows = interface.entrypoints
+    visible = {row.name: row for row in rows}
+    if len(visible) != len(rows):
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+            "package_interface_invalid",
+            "entrypoint names are not unique",
+        )
+    return visible
 
 
 def _visible_entrypoints(interface: Mapping[str, object]) -> dict[str, _EntrypointDeclaration]:

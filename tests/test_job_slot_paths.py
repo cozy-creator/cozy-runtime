@@ -45,6 +45,7 @@ from cozy_runtime.internal.worker.package_prepare import (
     _entrypoints,
     _prepare_published,
     _slot_paths,
+    selections,
 )
 from cozy_runtime.internal.worker.session import Placement, read_placement_set
 from cozy_runtime.protocol import documents
@@ -180,13 +181,14 @@ def test_the_release_declares_both_collections_slots(interface: dict[str, Any]) 
     """The set the hub must send. Reading `entrypoints` alone loses the job's slot
     entirely -- and for a release with no entrypoint at all, loses everything."""
 
-    assert _slot_paths(interface, "entrypoints", "jobs") == {
+    typed = package_interface.parse(package_interface.canonical_bytes(interface))
+    assert _slot_paths((*typed.entrypoints, *typed.jobs)) == {
         ENTRYPOINT_SLOT,
         RETOUCH_SLOT,
         JOB_SLOT,
     }
-    assert _slot_paths(interface, "entrypoints") == {ENTRYPOINT_SLOT, RETOUCH_SLOT}
-    assert _slot_paths(interface, "jobs") == {JOB_SLOT}
+    assert _slot_paths(typed.entrypoints) == {ENTRYPOINT_SLOT, RETOUCH_SLOT}
+    assert _slot_paths(typed.jobs) == {JOB_SLOT}
 
 
 @pytest.mark.parametrize("checkpoint_only", [False, True])
@@ -212,7 +214,7 @@ def test_a_job_shaped_selection_prepares(
         locked=package_environment.read_locked_requirements(
             b"--index-url https://pypi.org/simple\ntenant==1.0.0 --hash=sha256:" + b"a" * 64 + b"\n"
         ),
-        models=[selection],
+        models=selections([selection]),
         artifact_cache=tmp_path / "artifacts",
         tensorfs_root=store_root,
         install_root=tmp_path / "install",
@@ -262,9 +264,9 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
         selection.pop("release")
         selection.pop("lane")
     models, entrypoints = _entrypoints(
-        package_interface.read_bytes(raw),
+        package_interface.parse(raw),
         package_name=PACKAGE,
-        selections=[selection],
+        selections=selections([selection]),
         tensorfs_root=store_root,
         verified=lambda _digest, _length, _path: None,
         census=census,
@@ -318,9 +320,9 @@ def test_a_job_slot_is_never_constructed_at_preparation(
         return {}
 
     models, entrypoints = _entrypoints(
-        package_interface.read_bytes(package_interface.canonical_bytes(interface)),
+        package_interface.parse(package_interface.canonical_bytes(interface)),
         package_name=PACKAGE,
-        selections=[_selection(JOB_SLOT, manifest)],
+        selections=selections([_selection(JOB_SLOT, manifest)]),
         tensorfs_root=store_root,
         verified=lambda _digest, _length, _path: None,
         census=census,
@@ -339,9 +341,9 @@ def test_a_selection_no_callable_declares_still_refuses(
     store_root, manifest, _length = released
     with pytest.raises(PreparationRefusal) as refusal:
         _entrypoints(
-            package_interface.read_bytes(package_interface.canonical_bytes(interface)),
+            package_interface.parse(package_interface.canonical_bytes(interface)),
             package_name=PACKAGE,
-            selections=[_selection("no_such.models.source", manifest)],
+            selections=selections([_selection("no_such.models.source", manifest)]),
             tensorfs_root=store_root,
             verified=lambda _digest, _length, _path: None,
             census=lambda _wanted: {},

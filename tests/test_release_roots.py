@@ -425,6 +425,7 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
                     capture_root=lambda *_: "root",
                     capture=lambda *_: {"model_defaults": []},
                 ),
+                lanes=SimpleNamespace(entries=()),
             ),
         )
         call = cast(Call, SimpleNamespace(parent_request="root"))

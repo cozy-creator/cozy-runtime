@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import (
@@ -15,9 +18,10 @@ from cozy_runtime.internal import (
     package_installation,
     package_interface,
 )
-from cozy_runtime.internal.worker import package_prepare
+from cozy_runtime.internal.worker import machine_capture, package_prepare
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace_calls import CallIntent
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -35,20 +39,20 @@ class Preparing(Exception):
 class Builtins:
     def __init__(self, worker: Worker):
         self.worker = worker
-        self.captured: dict[str, Any] | None = None
+        self.captured: machine_capture.Builtin | None = None
         # Concurrent first submissions capture once; the rest take the same result.
         self.capturing = threading.Lock()
 
     def close(self) -> None:
         pass
 
-    def capture(self) -> dict[str, Any]:
+    def capture(self) -> machine_capture.Builtin:
         with self.capturing:
             if self.captured is None:
                 self.captured = self._capture()
             return self.captured
 
-    def _capture(self) -> dict[str, Any]:
+    def _capture(self) -> machine_capture.Builtin:
         worker = self.worker
         root = Path(worker.options.install_root or "")
         prepared = builtin_environment.prepare(root)
@@ -58,13 +62,13 @@ class Builtins:
             "cozy-runtime",
             application=builtin_operations.APPLICATION,
         )
-        interface = package_interface.read_bytes(interface_raw)
+        package_interface.parse(interface_raw)
         interface_path = (
             root / "installations" / installed.installation_id / "package-interface.json"
         )
         package_interface.publish(interface_path, interface_raw)
         package_prepare._stage_job_plans(
-            interface,
+            interface_raw,
             root=worker.config.cozy_home / "job-plans",
             installation_id=installed.installation_id,
             interface_path=interface_path,
@@ -79,38 +83,45 @@ class Builtins:
                 canonical_json.encode({"entrypoints": [], "models": []})
             ),
         )
-        return {
-            "placement": documents.body(placement),
-            "installation_id": installed.installation_id,
-            "runtime_version": installed.release,
-        }
+        return machine_capture.Builtin(
+            placement=documents.body(placement),
+            installation_id=installed.installation_id,
+            runtime_version=installed.release,
+        )
 
-    def resolve(self, parent: AttemptRecord, call: Call, intent: dict[str, Any]) -> Target:
+    def resolve(self, parent: AttemptRecord, call: Call, intent: Mapping[str, object]) -> Target:
+        # machine_child_target -> machine_deferred -> this module's Preparing: a cycle.
         from .machine_child_target import Target
 
         worker = self.worker
+        try:
+            named = msgspec.convert(intent, CallIntent)
+        except msgspec.ValidationError as exc:
+            raise WorkspaceRefusal(f"Runtime operation intent is malformed: {exc}") from exc
         if (
-            intent["module"] != builtin_operations.MODULE
-            or intent["export"] not in builtin_operations.EXPORTS
+            named.module != builtin_operations.MODULE
+            or named.export not in builtin_operations.EXPORTS
         ):
             raise WorkspaceRefusal("unknown Runtime operation")
         assert worker.executions is not None
         owner = worker.fence.record_owner_id
         root = worker.executions.capture_root(owner, parent.request_id)
-        captured = worker.executions.preparation(owner, root).get("runtime_builtin")
-        if not isinstance(captured, dict):
+        captured = machine_capture.preparation(
+            worker.executions.preparation(owner, root)
+        ).runtime_builtin
+        if captured is None:
             raise WorkspaceRefusal("Runtime operation installation was not retained")
         installed = package_installation.open_installation(
-            Path(worker.options.install_root or ""),
-            captured["installation_id"],
+            Path(worker.options.install_root or ""), captured.installation_id
         )
-        placement = worker._placement_from_entry(captured["placement"], b"")
+        placement = worker._placement_from_entry(captured.placement, b"")
         placement.installed = installed
         worker.prepared_installations[placement.prepared_key] = placement
-        interface = package_interface.read_bytes(placement.package_interface)
-        export = intent["export"]
-        declared = next(row for row in interface["jobs"] if row["name"] == export)
-        descriptor = package_interface.job_descriptor_id(interface, export)
+        body = package_interface.read_bytes(placement.package_interface)
+        export = named.export
+        declared = next(row for row in body["jobs"] if row["name"] == export)
+        typed = msgspec.convert(declared, package_interface.CallableDoc)
+        descriptor = package_interface.job_descriptor_id(body, export)
         binding = JobBinding.read(
             json.loads(
                 job_plan.path(
@@ -120,8 +131,12 @@ class Builtins:
                 ).read_bytes()
             )
         )
-        operation_identity = str(declared.get("invocable", {}).get("operation_identity", ""))
-        if declared.get("invocable", {}).get("memoize") and not operation_identity:
+        operation_identity = machine_capture.operation_identity(typed)
+        if (
+            typed.invocable is not msgspec.UNSET
+            and typed.invocable.memoize
+            and not operation_identity
+        ):
             worker.note(
                 "memoization", f"Runtime {export} runs uncached: operation identity unavailable"
             )
@@ -132,7 +147,7 @@ class Builtins:
             {
                 "placement": placement.document,
                 "installation_id": installed.installation_id,
-                "runtime_builtin": captured,
+                "runtime_builtin": msgspec.to_builtins(captured),
             },
             binding,
             operation_identity,

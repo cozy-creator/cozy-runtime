@@ -78,7 +78,15 @@ def test_default_ladder_picks_the_widest_rung_so_h3_is_one_four_gpu_group(
 
     from cozy_runtime.internal import hostfacts
 
-    ladder = [{"gpu": "H100", "gpus": 2}, {"gpu": "H100", "gpus": 4}, {"gpu": "H200", "gpus": 1}]
+    checkpoint = {
+        "repository": "proof/h3",
+        "manifest": {"digest": "sha256:" + "a" * 64, "length": 1},
+    }
+    ladder = [
+        {"gpu": "H100", "gpus": 2, **checkpoint},
+        {"gpu": "H100", "gpus": 4, **checkpoint},
+        {"gpu": "H200", "gpus": 1, **checkpoint},
+    ]
     rows = [
         {
             "callee_installation_id": "h3",

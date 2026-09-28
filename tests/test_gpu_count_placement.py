@@ -1,18 +1,50 @@
-import copy
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from cozy_runtime.internal import hostfacts
+from cozy_runtime.internal import hostfacts, package_interface
 from cozy_runtime.internal.worker import machine_model_defaults
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def test_counted_capture_verifies() -> None:
-    rung: dict[str, Any] = {
+    slot = package_interface.ModelSlot(path="run.models.model", class_name="M", component_use={})
+    run = package_interface.CallableDoc(name="run", request={}, result={}, models=(slot,))
+    interfaces = {
+        "installed": package_interface.PackageInterface(
+            format=package_interface.SCHEMA, application="app", entrypoints=(run,), jobs=()
+        )
+    }
+    rung = pb.MachineModelDefaultRung(
+        gpu="H100", repository="proof/h3", manifest=pb.Ref(digest=b"\xaa" * 32, length=1)
+    )
+    capture = pb.MachineExecutionCapture(
+        bindings=[pb.MachineCallableBinding(callee_installation_id="installed", entrypoint="run")],
+        model_defaults=[
+            pb.MachineModelDefault(
+                callee_installation_id="installed",
+                entrypoint="run",
+                parameter="model",
+                public_origin="https://hub.example",
+                rungs=[rung],
+            )
+        ],
+    )
+    worker = cast(Any, SimpleNamespace(options=SimpleNamespace(publication_authority=None)))
+    machine_model_defaults.verify(worker, capture, interfaces)
+    rungs = capture.model_defaults[0].rungs
+    rungs[0].gpus = 2
+    rungs.add().CopyFrom(rungs[0])
+    rungs[1].gpus = 4
+    machine_model_defaults.verify(worker, capture, interfaces)
+
+
+def test_selection_counts_the_granted_pool_and_uncounted_rows_need_no_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rung = {
         "gpu": "H100",
         "repository": "proof/h3",
         "manifest": {"digest": "sha256:" + "a" * 64, "length": 1},
@@ -24,39 +56,13 @@ def test_counted_capture_verifies() -> None:
         "public_origin": "https://hub.example",
         "rungs": [rung],
     }
-    capture = {
-        "bindings": [{"callee_installation_id": "installed", "entrypoint": "run"}],
-        "model_defaults": [row],
-    }
-    interfaces = {
-        "installed": {"entrypoints": [{"name": "run", "models": [{"path": "run.models.model"}]}]}
-    }
-    worker = cast(Any, SimpleNamespace(options=SimpleNamespace(publication_authority=None)))
-    request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=WIRE_MINOR))
-    machine_model_defaults.verify(worker, request, capture, interfaces)
-    rung["gpus"] = 2
-    second = copy.deepcopy(rung)
-    second["gpus"] = 4
-    row["rungs"].append(second)
-    machine_model_defaults.verify(worker, request, capture, interfaces)
-
-
-def test_selection_uses_granted_pool_and_old_rows_do_not_need_count_probe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    row: dict[str, Any] = {
-        "callee_installation_id": "installed",
-        "entrypoint": "run",
-        "parameter": "model",
-        "public_origin": "https://hub.example",
-        "rungs": [{"gpu": "H100"}],
-    }
     worker = SimpleNamespace(
         options=SimpleNamespace(accelerator_backend="cuda"),
         host_facts=lambda: hostfacts.measure("cuda"),
         executions=SimpleNamespace(
             capture_root=lambda *_: "root", capture=lambda *_: {"model_defaults": [row]}
         ),
+        lanes=SimpleNamespace(entries=()),
     )
     target = cast(
         Any,
@@ -78,8 +84,8 @@ def test_selection_uses_granted_pool_and_old_rows_do_not_need_count_probe(
     )
     select = machine_model_defaults.select
     assert "gpus" not in select(cast(Any, worker), "owner", call, target, {})[0]
-    row["rungs"] = [{"gpu": "H100", "gpus": 4}, {"gpu": "H100", "gpus": 2}]
-    with pytest.raises(WorkspaceRefusal, match="readable granted GPU count"):
+    row["rungs"] = [{**rung, "gpus": 4}, {**rung, "gpus": 2}]
+    with pytest.raises(WorkspaceRefusal, match="no rung for this accelerator"):
         select(cast(Any, worker), "owner", call, target, {})
     worker.lanes = SimpleNamespace(entries=[0, 1])
     assert select(cast(Any, worker), "owner", call, target, {})[0]["gpus"] == 2

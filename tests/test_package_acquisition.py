@@ -341,7 +341,7 @@ def _prepare_modeled(release: ModeledRelease, root: Path, slots: tuple[str, ...]
             + b"a" * 64
             + b"\n"
         ),
-        models=[
+        models=package_prepare.selections(
             {
                 "package": MODELED,
                 "slot": slot,
@@ -349,7 +349,7 @@ def _prepare_modeled(release: ModeledRelease, root: Path, slots: tuple[str, ...]
                 "manifest": release.manifest,
             }
             for slot in slots
-        ],
+        ),
         artifact_cache=root / "artifacts",
         tensorfs_root=release.store,
         install_root=root / "install",

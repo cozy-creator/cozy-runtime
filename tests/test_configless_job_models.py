@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -9,13 +10,16 @@ import pytest
 import tensorfs
 from tensorfs.derived import Config, Derivation, Part, Target, Tensor
 
-from cozy_runtime.internal import base_observation, census_cache
+from cozy_runtime.internal import base_observation, census_cache, package_interface
 from cozy_runtime.internal.encoding import SPEC_PLAIN
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
+    Selected,
+    Selection,
     _entrypoints,
     _selected_models,
+    selections,
 )
 from cozy_runtime.protocol import documents
 
@@ -63,21 +67,22 @@ def checkpoint(tmp_path: Path, *, config: bool = False) -> tuple[Path, str, int,
     )
 
 
-def selection(manifest: str, slot: str, **extra: Any) -> dict[str, Any]:
-    return {
-        "package": "example/convert",
-        "model": "example/adapter",
-        "slot": slot,
-        "manifest": manifest,
-        **extra,
-    }
+def selection(manifest: str, slot: str, **extra: Any) -> Selection:
+    row = {"package": "example/convert", "model": "example/adapter", "slot": slot}
+    return selections([{**row, "manifest": manifest, **extra}])[0]
 
 
-def interface() -> dict[str, Any]:
-    return {
-        "entrypoints": [{"name": "generate", "models": [{"path": "generate.models.model"}]}],
-        "jobs": [{"name": "main", "models": [{"path": "main.models.source"}]}],
-    }
+def interface() -> package_interface.PackageInterface:
+    def modeled(name: str, path: str) -> package_interface.CallableDoc:
+        slot = package_interface.ModelSlot(path=path, class_name="Adapter", component_use={})
+        return package_interface.CallableDoc(name=name, request={}, result={}, models=(slot,))
+
+    return package_interface.PackageInterface(
+        format=package_interface.SCHEMA,
+        application="convert",
+        entrypoints=(modeled("generate", "generate.models.model"),),
+        jobs=(modeled("main", "main.models.source"),),
+    )
 
 
 def test_configless_job_source_prepares_without_a_constructor_or_fabricated_config(
@@ -102,7 +107,7 @@ def test_configless_job_source_prepares_without_a_constructor_or_fabricated_conf
         lambda *_args: None,
         construction_slots=set(),
     )
-    assert set(selected["main.models.source"]) == {"selection", "manifest_length"}
+    assert selected["main.models.source"].construction is None
     header = tensorfs.Store.open(str(root)).manifest(manifest)["header"]
     assert header is not None
     assert not tensorfs.parse_header(bytes(header)).get("configs")
@@ -131,11 +136,13 @@ def test_shared_configured_manifest_derives_only_its_serving_slot(tmp_path: Path
     root, manifest, _length, _payload = checkpoint(tmp_path, config=True)
     observed = []
 
-    def census(wanted: Any) -> dict[str, census_cache.Census]:
+    def census(
+        wanted: Mapping[str, tuple[Selected, package_interface.ModelSlot]],
+    ) -> dict[str, census_cache.Census]:
         for path, (model, _declared) in wanted.items():
-            observed.append(
-                (path, model["config_bytes"], model["assets"](), model["tensor_dtypes"])
-            )
+            built = model.construction
+            assert built is not None
+            observed.append((path, built.config_bytes, built.assets(), built.tensor_dtypes))
         return {path: census_cache.Census(("adapter",), (), True, "") for path in wanted}
 
     selected = [

@@ -21,7 +21,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author._loader import Config
 from cozy_runtime.internal import source_interfaces, storage_admission
 from cozy_runtime.internal.worker import workspace_sources
-from cozy_runtime.internal.worker.package_prepare import _selected_models
+from cozy_runtime.internal.worker.package_prepare import _selected_models, selections
 from cozy_runtime.internal.worker.source_calls import SourceCalls
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
@@ -193,19 +193,23 @@ def test_a_diffusers_upload_carries_each_components_config_and_prepares(
     # The package's preparation reads the checkpoint as a rented machine's would.
     models = _selected_models(
         "example/pipeline",
-        [
-            {
-                "package": "example/pipeline",
-                "slot": SLOT,
-                "model": "example/diffusers-model",
-                "manifest": manifest["digest"],
-            }
-        ],
+        selections(
+            [
+                {
+                    "package": "example/pipeline",
+                    "slot": SLOT,
+                    "model": "example/diffusers-model",
+                    "manifest": manifest["digest"],
+                }
+            ]
+        ),
         root,
         lambda *_: None,
         construction_slots={SLOT},
     )
-    constructor = json.loads(models[SLOT]["config_bytes"])
+    built = models[SLOT].construction
+    assert built is not None
+    constructor = json.loads(built.config_bytes)
     index = next(name for name in files if name.endswith("model_index.json"))
     assert constructor == {**CONFIGS, index.removesuffix(".json"): json.loads(files[index])}
     raw = tensorfs.Store.open(str(workspace.store_root)).manifest(manifest["digest"])["header"]

@@ -5,13 +5,15 @@ from __future__ import annotations
 import ipaddress
 import re
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager, ExitStack, nullcontext
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Protocol
 from urllib.parse import urlsplit
 
-from cozy_runtime.internal import fill
-from cozy_runtime.protocol import documents
+import msgspec
+
+from cozy_runtime.internal import fill, package_interface
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import grants, machine_model_resolve
@@ -21,6 +23,62 @@ if TYPE_CHECKING:
     from .machine_child_target import Target
     from .session import Worker
     from .workspace_calls import Call
+
+
+class Cancellation(Protocol):
+    """TensorFS's pull cancellation token, as a preparation checks it between checkpoints."""
+
+    @property
+    def cancelled(self) -> bool: ...
+
+
+class Manifest(msgspec.Struct, frozen=True):
+    digest: Annotated[str, msgspec.Meta(pattern=r"^sha256:[0-9a-f]{64}$")]
+    length: Annotated[int, msgspec.Meta(gt=0)]
+
+
+class Selector(msgspec.Struct, frozen=True):
+    """A ladder rung's accelerator selector: GPU name tokens and the count it needs."""
+
+    gpu: str = ""
+    gpus: int = 0
+
+
+class Rung(Selector, frozen=True, kw_only=True, omit_defaults=True):
+    repository: str = ""
+    manifest: Manifest
+
+
+class Captured(msgspec.Struct, frozen=True):
+    """One `MachineModelDefault` as the accepted capture document spells it."""
+
+    entrypoint: str = ""
+    parameter: str = ""
+    public_origin: str = ""
+    rungs: tuple[Rung, ...] = ()
+    unavailable_code: str = ""
+    callee_installation_id: str = ""
+    callee_deferred_key: str = ""
+
+
+class _Capture(msgspec.Struct, frozen=True):
+    model_defaults: tuple[Captured, ...] = ()
+
+
+class Selected(msgspec.Struct, frozen=True, kw_only=True):
+    """One slot's exact checkpoint for this machine, as a preparation lands and binds it."""
+
+    parameter: str
+    repository: str
+    manifest: Manifest
+    public_origin: str = ""
+    gpus: int = 0
+
+
+UNAVAILABLE = frozenset(
+    {"model_default_unavailable", "model_default_unbound", "model_default_origin_unsupported"}
+)
+_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def local_origin(origin: str) -> bool:
@@ -83,76 +141,51 @@ def valid_origin(origin: str, *, local: bool) -> bool:
 
 def verify(
     worker: Worker,
-    request: pb.MachineExecutionSubmit,
-    capture: dict[str, Any],
-    interfaces: dict[str, dict[str, Any]],
+    capture: pb.MachineExecutionCapture,
+    interfaces: Mapping[str, package_interface.PackageInterface],
 ) -> None:
-    rows = capture.get("model_defaults", [])
-    if not rows:
+    if not capture.model_defaults:
         return
-    expected: set[tuple[str, str, str]] = set()
-    for binding in capture["bindings"]:
-        revision, entrypoint = callee(binding), binding["entrypoint"]
-        for entry in interfaces[revision]["entrypoints"]:
-            if entry["name"] == entrypoint:
-                expected.update(
-                    (revision, entrypoint, model["path"].rpartition(".")[2])
-                    for model in entry.get("models", [])
-                )
+    expected = {
+        (callee(binding), entry.name, model.parameter)
+        for binding in capture.bindings
+        for entry in interfaces[callee(binding)].entrypoints
+        if entry.name == binding.entrypoint
+        for model in entry.models
+    }
     keys = []
-    for row in rows:
-        if not callee(row) or not {"entrypoint", "parameter"} <= row.keys():
+    for row in capture.model_defaults:
+        if not callee(row) or not row.entrypoint or not row.parameter:
             raise WorkspaceRefusal("captured Model default has no exact slot identity")
-        key = callee(row), row["entrypoint"], row["parameter"]
-        keys.append(key)
-        rungs, unavailable = row.get("rungs", []), row.get("unavailable_code", "")
-        if unavailable:
-            if (
-                unavailable
-                not in {
-                    "model_default_unavailable",
-                    "model_default_unbound",
-                    "model_default_origin_unsupported",
-                }
-                or rungs
-                or row.get("public_origin")
-            ):
+        keys.append((callee(row), row.entrypoint, row.parameter))
+        if row.unavailable_code:
+            if row.unavailable_code not in UNAVAILABLE or row.rungs or row.public_origin:
                 raise WorkspaceRefusal("captured Model default has conflicting availability")
             continue
-        if not 1 <= len(rungs) <= 32 or not valid_origin(
-            row.get("public_origin", ""), local=local_development(worker)
+        if not 1 <= len(row.rungs) <= 32 or not valid_origin(
+            row.public_origin, local=local_development(worker)
         ):
             raise WorkspaceRefusal("captured Model default has no exact public origin or ladder")
-        selectors = []
-        for rung in rungs:
-            if not {"gpu", "repository", "manifest"} <= rung.keys():
-                raise WorkspaceRefusal("captured Model default has incomplete rung facts")
-            gpu, repository, manifest = rung["gpu"], rung["repository"], rung["manifest"]
+        for rung in row.rungs:
             if (
-                not 0 < len(gpu) <= 128
-                or any(ord(c) < 32 for c in gpu)
-                or re.fullmatch(
-                    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}", repository
-                )
-                is None
-                or repository.startswith("local/")
-                or manifest["length"] <= 0
+                not 0 < len(rung.gpu) <= 128
+                or any(ord(c) < 32 for c in rung.gpu)
+                or _REPOSITORY.fullmatch(rung.repository) is None
+                or rung.repository.startswith("local/")
+                or len(rung.manifest.digest) != 32
+                or rung.manifest.length <= 0
             ):
                 raise WorkspaceRefusal("captured Model default has invalid exact rung facts")
-            documents.raw(manifest["digest"])
-            gpus = rung.get("gpus", 0)
-            if type(gpus) is not int or gpus < 0:
-                raise WorkspaceRefusal("captured Model default has invalid GPU count")
-            selectors.append((gpu.lower(), gpus))
+        selectors = [(rung.gpu.lower(), rung.gpus) for rung in row.rungs]
         if len(set(selectors)) != len(selectors):
             raise WorkspaceRefusal("captured Model default repeats a GPU and count selector")
     if len(keys) > 4096 or keys != sorted(set(keys)) or set(keys) != expected:
         raise WorkspaceRefusal("captured Model default inventory is incomplete or ambiguous")
 
 
-def callee(row: dict[str, Any]) -> str:
+def callee(row: pb.MachineCallableBinding | pb.MachineModelDefault | Captured) -> str:
     """A binding or default row's callee: its installation, or a deferred release key."""
-    return str(row.get("callee_installation_id") or row.get("callee_deferred_key") or "")
+    return row.callee_installation_id or row.callee_deferred_key
 
 
 def matches(selector: str, observed: str) -> bool:
@@ -164,89 +197,106 @@ def matches(selector: str, observed: str) -> bool:
     return bool(wanted) and all(any(token == candidate for candidate in actual) for token in wanted)
 
 
-def fitter(worker: Worker) -> Callable[[Mapping[str, Any]], bool]:
-    """Whether a rung's GPU selector and count fit this machine's devices."""
+def fitter(worker: Worker) -> Callable[[Selector], bool]:
+    """Whether a rung's GPU selector and count fit this machine's granted devices."""
     facts = worker.host_facts()
     if "gpu_name" in facts.unreadable:
         raise WorkspaceRefusal("captured Model default cannot select an unreadable accelerator")
-    entries = getattr(getattr(worker, "lanes", None), "entries", None)
+    granted = len(worker.lanes.entries)
 
-    def fits(candidate: Mapping[str, Any]) -> bool:
-        if not matches(str(candidate.get("gpu", "")), facts.gpu_name):
-            return False
-        count = candidate.get("gpus", 0)
-        if count and entries is None and "gpu_count" in facts.unreadable:
-            raise WorkspaceRefusal("counted Model default requires a readable granted GPU count")
-        return not count or count <= (len(entries) if entries is not None else facts.gpu_count)
+    def fits(rung: Selector) -> bool:
+        return matches(rung.gpu, facts.gpu_name) and (not rung.gpus or rung.gpus <= granted)
 
     return fits
 
 
+def catalog_fits(fits: Callable[[Selector], bool]) -> Callable[[Mapping[str, object]], bool]:
+    """`fits` over a catalog ladder's JSON rungs."""
+
+    def check(rung: Mapping[str, object]) -> bool:
+        try:
+            selector = msgspec.convert(rung, Selector)
+        except msgspec.ValidationError as exc:
+            raise WorkspaceRefusal(f"catalog ladder rung is malformed: {exc}") from exc
+        return fits(selector)
+
+    return check
+
+
 def select(
-    worker: Worker, owner: str, call: Call, target: Target, arguments: dict[str, Any]
-) -> list[dict[str, Any]]:
-    missing = {
-        model["path"].rpartition(".")[2]
-        for model in target.declaration.get("models", [])
-        if arguments.get(model["path"].rpartition(".")[2]) is None
+    worker: Worker, owner: str, call: Call, target: Target, arguments: Mapping[str, object]
+) -> list[dict[str, Json]]:
+    """Each omitted Model argument's checkpoint here: its captured default's widest fitting
+    rung, or this machine's own Hub's answer for a slot the capture left open."""
+    declared = {
+        model["path"].rpartition(".")[2]: model for model in target.declaration.get("models", [])
     }
+    missing = sorted(parameter for parameter in declared if arguments.get(parameter) is None)
     if not missing:
         return []
     assert worker.executions is not None
     root = worker.executions.capture_root(owner, call.parent_request)
-    capture = worker.executions.capture(owner, root)
-    rows = capture.get("model_defaults", [])
+    try:
+        captured = msgspec.convert(worker.executions.capture(owner, root), _Capture)
+    except msgspec.ValidationError as exc:
+        raise WorkspaceRefusal(f"accepted capture has malformed Model defaults: {exc}") from exc
+    slot = (target.callee or target.installation_id, target.entrypoint)
     defaults = {
-        row["parameter"]: row
-        for row in rows
-        if (callee(row), row["entrypoint"])
-        == (target.callee or target.installation_id, target.entrypoint)
+        row.parameter: row
+        for row in captured.model_defaults
+        if (callee(row), row.entrypoint) == slot
     }
-    # A slot the capture left open is resolved here, at this machine's own Hub.
-    for parameter in sorted(missing):
-        row = defaults.get(parameter)
-        if row is not None and row.get("unavailable_code"):
+    for parameter in missing:
+        default = defaults.get(parameter)
+        if default is not None and default.unavailable_code:
             raise WorkspaceRefusal("captured Model default is unavailable for " + parameter)
+    # A slot the capture left open is resolved here, at this machine's own Hub.
     open_slots = any(parameter not in defaults for parameter in missing)
     catalog = machine_model_resolve.own(worker) if open_slots else None
     fits = fitter(worker)
+    placement = target.prepared_installation.get("placement", {})
     package = str(
-        (
-            target.prepared_installation.get("placement", {}).get("package")
-            or target.prepared_installation.get("placement", {}).get("development")
-            or {}
-        ).get("package", "")
+        (placement.get("package") or placement.get("development") or {}).get("package", "")
     )
-    declared = {
-        model["path"].rpartition(".")[2]: model for model in target.declaration.get("models", [])
-    }
-    selected = []
-    for parameter in sorted(missing):
-        row = defaults.get(parameter)
-        if row is None:
+    selected: list[dict[str, Json]] = []
+    for parameter in missing:
+        default = defaults.get(parameter)
+        if default is None:
             assert catalog is not None
             selected.append(
                 machine_model_resolve.slot(
-                    catalog, package, declared[parameter], parameter, None, fits
+                    catalog, package, declared[parameter], parameter, None, catalog_fits(fits)
                 )
             )
             continue
-        fitting = [candidate for candidate in row["rungs"] if fits(candidate)]
         # The widest rung this machine holds: the width itself is the declared degree.
-        rung = max(fitting, key=lambda candidate: candidate.get("gpus", 0), default=None)
+        rung = max(
+            (rung for rung in default.rungs if fits(rung)), key=lambda rung: rung.gpus, default=None
+        )
         if rung is None:
             raise WorkspaceRefusal("captured Model default has no rung for this accelerator")
-        selected.append({"parameter": parameter, "public_origin": row["public_origin"], **rung})
+        selected.append(
+            {"parameter": parameter, "public_origin": default.public_origin}
+            | msgspec.to_builtins(rung)
+        )
     return selected
+
+
+def decode(rows: Iterable[Mapping[str, object]]) -> list[Selected]:
+    """Selected rows a serving preparation carries as JSON, decoded once where read."""
+    try:
+        return [msgspec.convert(row, Selected) for row in rows]
+    except msgspec.ValidationError as exc:
+        raise WorkspaceRefusal(f"selected Model row is malformed: {exc}") from exc
 
 
 def materialize(
     worker: Worker,
-    rows: list[dict[str, Any]],
+    rows: Iterable[Mapping[str, object]],
     access: ExitStack | None,
     *,
     downloading: Callable[[], AbstractContextManager[None]] = nullcontext,
-    cancellation: Any = None,
+    cancellation: Cancellation | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> None:
     """Verify exact sources; lease bytes only when the preparer will read them.
@@ -254,68 +304,67 @@ def materialize(
     A reused placement consumes its registered binding document. Its fresh child
     admission still verifies and retains every checkpoint before submission.
     """
-    if not rows:
+    selected = decode(rows)
+    if not selected:
         return
     assert worker.workspace is not None
-    tensorfs = fill.tensorfs_module()
+    facade = fill.tensorfs_module()
     store = fill.store(worker.workspace.store_root)
-    for row in rows:
+    for row in selected:
         if cancellation is not None and cancellation.cancelled:
             raise WorkspaceRefusal("model preparation canceled")
-        manifest = row["manifest"]
+        manifest = row.manifest
         try:
             # Existing cached custody is sufficient. A cold use fetches this exact
             # checkpoint; only this machine's own Hub sees its worker capability.
             with worker.model_transfer_lock:
-                transfer = worker.model_transfers.setdefault(manifest["digest"], threading.Lock())
+                transfer = worker.model_transfers.setdefault(manifest.digest, threading.Lock())
             with transfer:
                 if cancellation is not None and cancellation.cancelled:
                     raise WorkspaceRefusal("model preparation canceled")
                 try:
-                    store.verify_checkpoint_source(
-                        row["repository"], manifest["digest"], manifest["length"]
-                    )
-                except tensorfs.errors.Refusal:
+                    store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
+                except facade.errors.Refusal:
                     with downloading():
-                        tensorfs.pull(
+                        facade.pull(
                             store,
-                            row["public_origin"],
-                            row["repository"] + "@" + manifest["digest"],
-                            credential=credential(worker, row["public_origin"]),
+                            row.public_origin,
+                            row.repository + "@" + manifest.digest,
+                            credential=credential(worker, row.public_origin),
                             allowed_hosts=worker.config.object_storage_hosts,
                             allow_local=local_development(worker),
                             streams=8,
                             cancellation=cancellation,
                             progress=progress,
                         )
-                    store.verify_checkpoint_source(
-                        row["repository"], manifest["digest"], manifest["length"]
-                    )
+                    store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
             if access is not None:
-                access.enter_context(store.acquire_cozytensors(manifest["digest"]))
-        except tensorfs.errors.Refusal as error:
+                access.enter_context(store.acquire_cozytensors(manifest.digest))
+        except facade.errors.Refusal as error:
             raise WorkspaceRefusal(
                 "captured Model default materialization refused: " + str(error.code)
             ) from error
 
 
-def inputs(rows: list[dict[str, Any]]) -> tuple[list[pb.InputBinding], list[pb.InputAccess]]:
+def inputs(
+    rows: Iterable[Mapping[str, object]],
+) -> tuple[list[pb.InputBinding], list[pb.InputAccess]]:
     bindings, accesses = [], []
-    for row in rows:
-        manifest, input_id = row["manifest"], grants.MODEL_PREFIX + row["parameter"]
+    for row in decode(rows):
+        input_id = grants.MODEL_PREFIX + row.parameter
         bindings.append(
             pb.InputBinding(
                 input_id=input_id,
-                digest=manifest["digest"],
-                length=manifest["length"],
+                digest=row.manifest.digest,
+                length=row.manifest.length,
                 kind_mime=grants.MODEL_MIME,
             )
         )
         accesses.append(
             pb.InputAccess(
                 input_id=input_id,
-                url="model://" + manifest["digest"],
-                catalog_model=pb.CatalogModelSource(repository=row["repository"]),
+                url="model://" + row.manifest.digest,
+                catalog_model=pb.CatalogModelSource(repository=row.repository),
             )
         )
     return bindings, accesses

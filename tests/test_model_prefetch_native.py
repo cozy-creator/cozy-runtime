@@ -120,6 +120,7 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
             options=SimpleNamespace(accelerator_backend="none"),
             host_facts=lambda: hostfacts.measure("none"),
+            lanes=SimpleNamespace(entries=()),
             config=SimpleNamespace(object_storage_hosts=("127.0.0.1",)),
             control_lock=threading.RLock(),
             model_transfer_lock=threading.Lock(),

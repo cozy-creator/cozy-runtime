@@ -14,7 +14,11 @@ from tensorfs.derived import Derivation, Source, Target
 
 from cozy_runtime.author import Config, ConformanceError
 from cozy_runtime.internal import canonical, model_config
-from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, _selected_models
+from cozy_runtime.internal.worker.package_prepare import (
+    PreparationRefusal,
+    _selected_models,
+    selections,
+)
 from test_derived_config_runtime import _released_source
 from test_model_runtime_closure import _CONFIG
 
@@ -166,12 +170,14 @@ def _prepared_config(store: Any, manifest: str) -> bytes:
     }
     selected = _selected_models(
         "example/package",
-        [selection],
+        selections([selection]),
         Path(store.root),
         lambda *_args: None,
         construction_slots={"generate.models.model"},
     )
-    return bytes(selected["generate.models.model"]["config_bytes"])
+    built = selected["generate.models.model"].construction
+    assert built is not None
+    return built.config_bytes
 
 
 def test_the_retired_contracts_leave_the_constructor_document_untouched() -> None:
@@ -236,18 +242,18 @@ def test_a_selection_serves_its_manifest_after_its_lane_moves(tmp_path: Path) ->
     }
     selected = _selected_models(
         "example/package",
-        [selection, dict(selection)],
+        selections([selection, dict(selection)]),
         Path(store.root),
         lambda *_args: None,
         construction_slots={"generate.models.model"},
     )
-    assert selected["generate.models.model"]["manifest_length"] == len(
+    assert selected["generate.models.model"].manifest_length == len(
         bytes(store.manifest(checkpoint)["manifest"])
     )
     with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
         _selected_models(
             "example/package",
-            [selection, {**selection, "manifest": current}],
+            selections([selection, {**selection, "manifest": current}]),
             Path(store.root),
             lambda *_args: None,
             construction_slots={"generate.models.model"},

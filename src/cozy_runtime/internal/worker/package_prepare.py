@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import copy
 import hashlib
@@ -11,10 +10,11 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
+import msgspec
 from packaging.requirements import Requirement
 
 from cozy_runtime.internal import (
@@ -22,12 +22,15 @@ from cozy_runtime.internal import (
     canonical,
     census_cache,
     fill,
+    installed_interfaces,
+    job_plan,
     model_config,
     package_environment,
     package_installation,
     package_interface,
     python_interpreters,
 )
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker import acquire
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -42,6 +45,58 @@ class PreparationRefusal(Exception):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+
+
+class Selection(msgspec.Struct, frozen=True, kw_only=True):
+    """One model slot's exact checkpoint: its manifest digest is the identity, release and
+    lane are the labels it was chosen by."""
+
+    package: str = ""
+    slot: str = ""
+    model: str = ""
+    manifest: str = ""
+    release: str = ""
+    lane: str = ""
+
+
+def selections(rows: Iterable[Mapping[str, object] | pb.DownloadModelRef]) -> list[Selection]:
+    """Selection rows a caller states as JSON or a download set signs, decoded once here."""
+    try:
+        return [msgspec.convert(row, Selection, from_attributes=True) for row in rows]
+    except msgspec.ValidationError as exc:
+        raise PreparationRefusal("package_prepare_model_selection_mismatch", str(exc)) from exc
+
+
+class _Segment(msgspec.Struct, frozen=True):
+    sha256: str
+    length: int
+
+
+class _Asset(msgspec.Struct, frozen=True):
+    """A header-declared asset's stored segments, as TensorFS's header projection states them."""
+
+    segments: tuple[_Segment, ...] = ()
+
+
+@dataclass(frozen=True)
+class Construction:
+    """What constructing a served slot reads of its checkpoint's header."""
+
+    unnormalized: str
+    config_bytes: bytes
+    header: bytes
+    assets: Callable[[], dict[str, bytes]]
+    tensor_dtypes: dict[str, str]
+
+
+@dataclass(frozen=True)
+class Selected:
+    """A selection admitted from the local store: its held manifest length and, for a served
+    slot, its construction facts."""
+
+    selection: Selection
+    manifest_length: int
+    construction: Construction | None = None
 
 
 def _select_python(
@@ -111,21 +166,13 @@ def prepare_package_set(
     ):
         raise PreparationRefusal("package_prepare_install_root_invalid", request.install_root)
     try:
-        download_set = documents.read(request.download_delegation, pb.DownloadDelegation)
+        download_set = documents.parse(request.download_delegation, pb.DownloadDelegation)
     except documents.DocumentError as exc:
         raise PreparationRefusal("package_prepare_download_set_invalid", exc.detail) from exc
-    packages = download_set.get("packages")
-    models = download_set.get("models")
-    if not isinstance(packages, list) or len(packages) != 1 or not isinstance(models, list):
-        raise PreparationRefusal(
-            "package_prepare_selection_invalid",
-            "exactly one package and a model array are required",
-        )
-    selected = packages[0]
-    if not isinstance(selected, dict):
-        raise PreparationRefusal("package_prepare_download_set_invalid", "package row")
-    package_name = str(selected.get("package", ""))
-    release = str(selected.get("release", ""))
+    if len(download_set.packages) != 1:
+        raise PreparationRefusal("package_prepare_selection_invalid", "exactly one package")
+    package_name = download_set.packages[0].package
+    release = download_set.packages[0].release
     try:
         locked = package_environment.read_locked_requirements(bytes(request.locked_requirements))
     except package_environment.EnvironmentRefusal as exc:
@@ -143,7 +190,7 @@ def prepare_package_set(
         package_name=package_name,
         release=release,
         locked=locked,
-        models=[] if request.models_landing else models,
+        models=[] if request.models_landing else selections(download_set.models),
         artifact_cache=artifact_cache,
         tensorfs_root=tensorfs_root,
         install_root=install_root,
@@ -159,22 +206,21 @@ def prepare_package_set(
     )
 
 
-def landing_models(request: pb.PreparePackageSetRequest, interface: bytes) -> list[Any]:
+def landing_models(request: pb.PreparePackageSetRequest, interface: bytes) -> list[Json]:
     """The model slots of every serving entrypoint the download set selects whole: what a
     root of this preparation constructs, and so the cards its executor starts on."""
     try:
-        download_set = documents.read(request.download_delegation, pb.DownloadDelegation)
+        download_set = documents.parse(request.download_delegation, pb.DownloadDelegation)
     except documents.DocumentError as exc:
         raise PreparationRefusal("package_prepare_download_set_invalid", exc.detail) from exc
-    rows = download_set.get("models")
-    selected = {str(row.get("slot", "")) for row in rows or () if isinstance(row, dict)}
-    body = package_interface.read_bytes(interface, "landing package interface")
+    selected = {row.slot for row in download_set.models}
+    typed = package_interface.parse(interface, "landing package interface")
+    body = canonical.parse(interface)
     return [
         slot
-        for entry in body["entrypoints"]
-        if (declared := entry.get("models"))
-        and {str(model.get("path", "")) for model in declared} <= selected
-        for slot in declared
+        for entry, document in zip(typed.entrypoints, body["entrypoints"], strict=True)
+        if entry.models and {model.path for model in entry.models} <= selected
+        for slot in document["models"]
     ]
 
 
@@ -214,21 +260,21 @@ def _installed_interface(
             f"{distribution!r} has no installed interface and no sandbox describe is available",
         )
     try:
-        body = package_interface.read_bytes(raw, "installed package interface")
+        interface = package_interface.parse(raw, "installed package interface")
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
     if (
         metadata
         and describe is not None
         and any(
-            entry.get("invocable", {}).get("memoize")
-            for entry in [*body["jobs"], *body["entrypoints"]]
+            entry.invocable is not msgspec.UNSET and entry.invocable.memoize
+            for _, entry in interface.callables()
         )
     ):
         # Installed callee/helper definitions own memo invalidation. The wheel's
         # static schema is never a second code reading to compare or admit against.
         raw = describe(installed, distribution)
-        package_interface.read_bytes(raw, "installed operation interface")
+        package_interface.parse(raw, "installed operation interface")
     return raw
 
 
@@ -267,7 +313,7 @@ def prepare_published_local(
     package_name: str,
     release: str,
     locked: package_environment.LockedRequirements,
-    models: Sequence[Any],
+    models: Sequence[Mapping[str, object]],
     artifact_cache: Path,
     tensorfs_root: Path,
     install_root: Path,
@@ -282,7 +328,7 @@ def prepare_published_local(
         package_name=package_name,
         release=release,
         locked=locked,
-        models=models,
+        models=selections(models),
         artifact_cache=artifact_cache,
         tensorfs_root=tensorfs_root,
         install_root=install_root,
@@ -318,7 +364,7 @@ def _prepare_published(
     package_name: str,
     release: str,
     locked: package_environment.LockedRequirements,
-    models: Sequence[Any],
+    models: Sequence[Selection],
     artifact_cache: Path,
     tensorfs_root: Path | None,
     install_root: Path,
@@ -370,13 +416,12 @@ def _prepare_published(
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     interface_raw = interface(installed, expected_distribution)
     try:
-        interface_body = package_interface.read_bytes(interface_raw, "release package interface")
+        interface_body = package_interface.parse(interface_raw, "release package interface")
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
-    application = str(interface_body["application"])
     interface_ref = _stage(artifact_cache, interface_raw)
     jobs = _stage_job_plans(
-        interface_body,
+        interface_raw,
         root=job_plan_root,
         installation_id=installed.installation_id,
         interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
@@ -388,15 +433,15 @@ def _prepare_published(
         selections=models,
         tensorfs_root=tensorfs_root,
         verified=verified,
-        census=_census(installed, application, artifact_cache),
+        census=_census(installed, interface_body.application, artifact_cache),
     )
     # A captured serving dependency needs its exact code/interface before its
     # caller chooses models. Retain that sealed revision without advertising an
     # executable binding, just as unpublished preparation does.
     code_only = (
         not models
-        and bool(interface_body["entrypoints"])
-        and all(row.get("models") for row in interface_body["entrypoints"])
+        and bool(interface_body.entrypoints)
+        and all(row.models for row in interface_body.entrypoints)
     )
     if not entrypoints and not jobs and not code_only:
         raise PreparationRefusal(
@@ -551,7 +596,7 @@ def prepare_local_package(
 def prepare_unpublished_placement(
     request: pb.PreparePrivatePlacementRequest,
     *,
-    prepared: Mapping[str, Any],
+    prepared: Mapping[str, object],
     installed: package_installation.InstalledEnvironment | None,
     artifact_cache: Path,
     tensorfs_root: Path | None,
@@ -571,18 +616,18 @@ def prepare_unpublished_placement(
         or prepared.get("installation_id") != installed.installation_id
     ):
         raise PreparationRefusal("private_placement_identity_invalid", request.operation_id)
-    models: list[Any] = []
+    models: Sequence[pb.DownloadModelRef] = ()
     if request.download_delegation:
         try:
-            download_set = documents.read(request.download_delegation, pb.DownloadDelegation)
+            download_set = documents.parse(request.download_delegation, pb.DownloadDelegation)
         except documents.DocumentError as exc:
             raise PreparationRefusal("private_placement_download_set_invalid", exc.detail) from exc
-        models = download_set.get("models", [])
-        if download_set.get("packages", []) != [] or not isinstance(models, list):
+        if download_set.packages:
             raise PreparationRefusal(
                 "private_placement_download_set_invalid",
                 "an unpublished model download set carries no package refs",
             )
+        models = download_set.models
     elif request.download_delegation_signature:
         raise PreparationRefusal(
             "private_placement_download_set_invalid", "download signature has no model set"
@@ -598,51 +643,69 @@ def prepare_unpublished_placement(
     )
 
 
+class _Package(msgspec.Struct, frozen=True):
+    package: str = ""
+
+
+class _PlacementHead(msgspec.Struct, frozen=True):
+    """The facts a Model binding reads of the placement document it extends."""
+
+    package_interface: bytes = b""
+    package: _Package | None = None
+    development: _Package | None = None
+
+
 def prepare_model_placement(
     *,
-    prepared: Mapping[str, Any],
+    prepared: Mapping[str, object],
     installed: package_installation.InstalledEnvironment,
     native_models: Sequence[pb.NativeModelBinding],
     artifact_cache: Path,
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
-    models: Sequence[Any] = (),
+    models: Sequence[Mapping[str, object] | pb.DownloadModelRef] = (),
 ) -> pb.PreparePackageSetResult:
     """Derive new Model bindings from either origin's exact immutable preparation."""
-    package = prepared.get("package") or prepared.get("development") or {}
-    interface_raw = base64.b64decode(prepared["package_interface"], validate=True)
-    models = list(models)
+    try:
+        head = msgspec.convert(prepared, _PlacementHead)
+    except msgspec.ValidationError as exc:
+        raise PreparationRefusal("prepared_placement_interface_invalid", str(exc)) from exc
+    package = (head.package or head.development or _Package()).package
     slots = [row.slot for row in native_models]
     if slots != sorted(set(slots)) or not all(slots):
         raise PreparationRefusal(
             "prepared_placement_native_models_invalid",
             "native model slots must be unique and sorted",
         )
-    models.extend(
-        {
-            "package": str(package["package"]),
-            "slot": row.slot,
-            "model": row.model,
-            "manifest": documents.spell(row.manifest.digest),
-            "manifest_length": row.manifest.length,
-        }
-        for row in native_models
-    )
-    if not 0 < len(models) <= 32:
+    chosen = [
+        *selections(models),
+        *(
+            Selection(
+                package=package,
+                slot=row.slot,
+                model=row.model,
+                manifest=documents.spell(row.manifest.digest),
+            )
+            for row in native_models
+        ),
+    ]
+    if not 0 < len(chosen) <= 32:
         raise PreparationRefusal(
             "prepared_placement_models_invalid", "a placement requires between 1 and 32 model slots"
         )
     try:
-        interface_body = package_interface.read_bytes(interface_raw, "prepared package interface")
+        interface_body = package_interface.parse(
+            head.package_interface, "prepared package interface"
+        )
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("prepared_placement_interface_invalid", str(exc)) from exc
     selected_models, entrypoints = _entrypoints(
         interface_body,
-        package_name=str(package.get("package", "")),
-        selections=models,
+        package_name=package,
+        selections=chosen,
         tensorfs_root=tensorfs_root,
         verified=verified,
-        census=_census(installed, str(interface_body.get("application", "")), artifact_cache),
+        census=_census(installed, interface_body.application, artifact_cache),
     )
     entrypoint_bodies = [documents.body(row) for row in entrypoints]
     model_bodies = [documents.body(row) for row in selected_models]
@@ -737,11 +800,11 @@ def prepare_package(
         materialized(installed)
     distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     interface_raw = describe(installed, distribution)
-    interface_body = package_interface.read_bytes(interface_raw, "installed package interface")
+    interface_body = package_interface.parse(interface_raw, "installed package interface")
     interface_path = install_root / "installations" / installation_id / "package-interface.json"
     package_interface.publish(interface_path, interface_raw)
     _stage_job_plans(
-        interface_body,
+        interface_raw,
         root=job_plan_root,
         installation_id=installation_id,
         interface_path=interface_path,
@@ -879,9 +942,9 @@ def _install_private_files(
     return installed
 
 
-#: `{slot path: (selected model, interface slot row)} -> {slot path: census}`.
+#: `{slot path: (selected model, interface slot)} -> {slot path: census}`.
 CensusLookup = Callable[
-    [Mapping[str, tuple[Mapping[str, Any], Mapping[str, Any]]]], Mapping[str, census_cache.Census]
+    [Mapping[str, tuple[Selected, package_interface.ModelSlot]]], Mapping[str, census_cache.Census]
 ]
 
 
@@ -893,10 +956,11 @@ def _census(
     through the `derive_child` seam (cr-067's guard, kept by construction)."""
 
     def lookup(
-        wanted: Mapping[str, tuple[Mapping[str, Any], Mapping[str, Any]]],
+        wanted: Mapping[str, tuple[Selected, package_interface.ModelSlot]],
     ) -> Mapping[str, census_cache.Census]:
         if not wanted:
             return {}
+        built = {path: (_constructed(model), slot) for path, (model, slot) in wanted.items()}
         try:
             return census_cache.ensure(
                 artifact_cache / "census",
@@ -906,20 +970,18 @@ def _census(
                 slots=[
                     census_cache.SlotInput(
                         slot=path,
-                        config=model["config_bytes"],
-                        tensor_dtypes=model["tensor_dtypes"],
-                        header=model["header"],
-                        encoded_leaves=declared.get("encoded_leaves") == "accept",
-                        assets=model["assets"],
+                        config=construction.config_bytes,
+                        tensor_dtypes=construction.tensor_dtypes,
+                        header=construction.header,
+                        encoded_leaves=slot.encoded_leaves == "accept",
+                        assets=construction.assets,
                     )
-                    for path, (model, declared) in sorted(wanted.items())
+                    for path, (construction, slot) in sorted(built.items())
                 ],
             )
         except census_cache.CensusRefusal as exc:
             # A construction that cannot read a checkpoint stored as-is says so, and why.
-            remedy = next(
-                (m["unnormalized"] for m, _ in wanted.values() if m.get("unnormalized")), ""
-            )
+            remedy = next((c.unnormalized for c, _ in built.values() if c.unnormalized), "")
             if remedy:
                 raise PreparationRefusal(
                     model_config.UNNORMALIZED, f"{remedy}; {exc.code}: {exc.detail}"
@@ -929,42 +991,32 @@ def _census(
     return lookup
 
 
-def _slot_paths(body: Mapping[str, Any], *collections: str) -> set[str]:
-    """Every model-slot path the interface declares in the named callable collections.
+def _constructed(model: Selected) -> Construction:
+    # Every entrypoint slot is a construction slot, so its selection read the header.
+    assert model.construction is not None
+    return model.construction
+
+
+def _slot_paths(callables: Iterable[package_interface.CallableDoc]) -> set[str]:
+    """Every model-slot path the callables declare.
 
     cozy.package.interface/1 declares `models[].path` in BOTH `entrypoints` and `jobs`.
     Reading only the first is how a release whose callables are all jobs came to describe
     no model slot at all, and how the one slot a job bound became undeclarable.
     """
-
-    paths: set[str] = set()
-    for collection in collections:
-        rows = body.get(collection, [])
-        if not isinstance(rows, list):
-            raise PreparationRefusal("package_prepare_interface_invalid", collection)
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            models = row.get("models", [])
-            if not isinstance(models, list):
-                raise PreparationRefusal("package_prepare_interface_invalid", "model slots")
-            paths.update(str(model.get("path", "")) for model in models if isinstance(model, dict))
-    return paths
+    return {model.path for entry in callables for model in entry.models}
 
 
 def _entrypoints(
-    body: Mapping[str, Any],
+    interface: package_interface.PackageInterface,
     *,
     package_name: str,
-    selections: Sequence[Any],
+    selections: Sequence[Selection],
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
     census: CensusLookup | None,
 ) -> tuple[list[pb.Model], list[pb.Entrypoint]]:
-    rows = body.get("entrypoints")
-    if not isinstance(rows, list):
-        raise PreparationRefusal("package_prepare_interface_invalid", "entrypoints")
-    construction_slots = _slot_paths(body, "entrypoints")
+    construction_slots = _slot_paths(interface.entrypoints)
     selected = _selected_models(
         package_name, selections, tensorfs_root, verified, construction_slots=construction_slots
     )
@@ -976,64 +1028,49 @@ def _entrypoints(
     models = [
         pb.Model(
             id=model_ids[slot],
-            repo=str(value["selection"]["model"]),
-            version=str(value["selection"].get("release", "")),
-            lane=str(value["selection"].get("lane", "")),
+            repo=value.selection.model,
+            version=value.selection.release,
+            lane=value.selection.lane,
             manifest=pb.Ref(
-                digest=documents.raw(str(value["selection"]["manifest"])),
-                length=int(value["manifest_length"]),
+                digest=documents.raw(value.selection.manifest), length=value.manifest_length
             ),
         )
         for slot, value in sorted(selected.items(), key=lambda item: model_ids[item[0]])
     ]
-    bound: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
-    for value in rows:
-        if not isinstance(value, dict) or not isinstance(value.get("name"), str):
-            raise PreparationRefusal("package_prepare_interface_invalid", "entrypoint")
-        described = value.get("models", [])
-        if not isinstance(described, list):
-            raise PreparationRefusal("package_prepare_interface_invalid", "model slots")
-        described_paths: set[str] = set()
-        for row in described:
-            if not isinstance(row, dict) or not isinstance(row.get("path"), str):
-                raise PreparationRefusal("package_prepare_interface_invalid", "model slot")
-            described_paths.add(str(row["path"]))
-        if len(described_paths) != len(described):
+    bound: list[package_interface.CallableDoc] = []
+    for entry in interface.entrypoints:
+        paths = {model.path for model in entry.models}
+        if len(paths) != len(entry.models):
             raise PreparationRefusal(
-                "package_prepare_model_selection_mismatch", f"{value['name']}: duplicate slot"
+                "package_prepare_model_selection_mismatch", f"{entry.name}: duplicate slot"
             )
-        if described_paths and not described_paths.issubset(selected):
+        if paths and not paths.issubset(selected):
             # One desired package set names the entrypoints it can actually bind. A
             # different invocation may select another model later; it should not force
             # this worker to download unrelated weights now.
             continue
-        for row in described:
-            path = str(row["path"])
-            if not path.startswith(f"{value['name']}.models.") or path not in selected:
+        for path in paths:
+            if not path.startswith(f"{entry.name}.models."):
                 raise PreparationRefusal("package_prepare_model_selection_mismatch", path)
-        bound.append((value, described))
+        bound.append(entry)
     wanted = {
-        str(row["path"]): (selected[str(row["path"])], row)
-        for _value, described in bound
-        for row in described
+        model.path: (selected[model.path], model) for entry in bound for model in entry.models
     }
     censuses = census(wanted) if census is not None else {}
     out: list[pb.Entrypoint] = []
-    described_slots: set[str] = set(wanted)
-    for value, described in bound:
-        prefix = f"{value['name']}.models."
+    for entry in bound:
+        prefix = f"{entry.name}.models."
         slots: list[pb.Slot] = []
-        for row in described:
-            path = str(row["path"])
-            model = selected[path]
+        for row in entry.models:
+            path = row.path
+            chosen = selected[path].selection
             found = censuses[path]
             if not found.fit_ok:
                 raise PreparationRefusal(
                     "checkpoint_incompatible",
                     _printable(
-                        f"{path} does not fit {model['selection'].get('model')}"
-                        f"@{model['selection'].get('release', '')}"
-                        f"/{model['selection'].get('lane', '')}: {found.fit_detail}"
+                        f"{path} does not fit {chosen.model}@{chosen.release}/{chosen.lane}: "
+                        f"{found.fit_detail}"
                     ),
                 )
             slots.append(
@@ -1049,7 +1086,7 @@ def _entrypoints(
                 )
             )
         slots.sort(key=lambda row: row.slot)
-        entrypoint = pb.Entrypoint(name=value["name"], slots=slots)
+        entrypoint = pb.Entrypoint(name=entry.name, slots=slots)
         entrypoint.entrypoint_binding_digest = documents.digest_of(
             canonical.write(
                 {"name": entrypoint.name, "slots": [documents.body(slot) for slot in slots]}
@@ -1059,14 +1096,14 @@ def _entrypoints(
     out.sort(key=lambda row: row.name)
     if len({row.name for row in out}) != len(out):
         raise PreparationRefusal("package_prepare_interface_invalid", "duplicate entrypoint")
-    unbound = sorted(set(selected) - described_slots)
+    unbound = sorted(set(selected) - set(wanted))
     if unbound:
         # A JOB's model slot is legitimately unbound here. A job has no placement and no
         # residency: its Model parameter is an attempt-held, derive-only view of one
         # TensorFS Manifest, so the selection exists to admit those bytes to this pod,
         # not to construct an Entrypoint binding. Only a selection NO callable declares
         # -- or one that would leave an entrypoint half-bound -- is a mismatch.
-        stranded = [path for path in unbound if path not in _slot_paths(body, "jobs")]
+        stranded = [path for path in unbound if path not in _slot_paths(interface.jobs)]
         if stranded:
             raise PreparationRefusal(
                 "package_prepare_model_selection_mismatch",
@@ -1077,38 +1114,32 @@ def _entrypoints(
 
 
 def _stage_job_plans(
-    body: Mapping[str, Any],
+    interface_raw: bytes,
     *,
     root: Path | None,
     installation_id: str,
     interface_path: Path,
     installed: package_installation.InstalledEnvironment,
 ) -> set[str]:
-    rows = body.get("jobs")
-    if not isinstance(rows, list):
-        raise PreparationRefusal("package_prepare_interface_invalid", "jobs")
-    selected = [row for row in rows if isinstance(row, dict)]
-    if not selected or root is None:
+    interface = package_interface.parse(interface_raw, "staged package interface")
+    if not interface.jobs or root is None:
         return set()
     root.mkdir(parents=True, exist_ok=True, mode=0o755)
     if root.is_symlink() or not root.is_dir():
         raise PreparationRefusal("package_prepare_job_plan_root_invalid", str(root))
-    application = str(body.get("application", ""))
-    from cozy_runtime.internal import installed_interfaces
-
+    body = canonical.parse(interface_raw)
     call_interfaces = installed_interfaces.read(installed)
     staged: set[str] = set()
-    for row in selected:
-        name = str(row.get("name", ""))
-        descriptor_id = package_interface.job_descriptor_id(body, name)
-        record = {
+    for job in interface.jobs:
+        descriptor_id = package_interface.job_descriptor_id(body, job.name)
+        record: dict[str, Json] = {
             "job_descriptor_id": descriptor_id,
             "installation_id": installation_id,
-            "application": application,
+            "application": interface.application,
             "package_interface": str(interface_path),
             "python": str(installed.python),
-            "job": name,
-            "publishes": bool(row.get("publishes", False)),
+            "job": job.name,
+            "publishes": job.publishes is True,
             "emits_media": False,
             "gpu_rate_micro_usd_per_hour": 0,
             "cap_micro_usd": 0,
@@ -1116,8 +1147,6 @@ def _stage_job_plans(
         }
         if call_interfaces:
             record["call_interfaces"] = call_interfaces
-        from cozy_runtime.internal import job_plan
-
         try:
             job_plan.write(root, record)
         except ValueError as exc:
@@ -1128,12 +1157,12 @@ def _stage_job_plans(
 
 def _selected_models(
     package_name: str,
-    selections: Sequence[Any],
+    selections: Sequence[Selection],
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
     *,
     construction_slots: set[str],
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, Selected]:
     """Resolve each selected model from the local TensorFS Store.
 
     The privileged host and TensorFS admitted every model byte before preparation ran; this
@@ -1144,24 +1173,22 @@ def _selected_models(
     are source-only capabilities. Nothing here writes to the store.
     """
 
-    selected: dict[str, dict[str, Any]] = {}
+    chosen: dict[str, Selection] = {}
     for row in selections:
-        if not isinstance(row, dict) or row.get("package") != package_name:
+        if row.package != package_name:
             raise PreparationRefusal("package_prepare_model_selection_mismatch", "package")
-        slot = str(row.get("slot", ""))
-        if not slot:
+        if not row.slot:
             raise PreparationRefusal("package_prepare_model_selection_mismatch", "slot")
-        if slot in selected and selected[slot]["selection"] != row:
-            first = selected[slot]["selection"]
+        first = chosen.setdefault(row.slot, row)
+        if first != row:
             raise PreparationRefusal(
                 "package_prepare_model_selection_mismatch",
-                f"{package_name} slot {slot} is selected twice with different models "
-                f"({first.get('model')} {first.get('manifest')} and "
-                f"{row.get('model')} {row.get('manifest')}); select one model for this slot",
+                f"{package_name} slot {row.slot} is selected twice with different models "
+                f"({first.model} {first.manifest} and {row.model} {row.manifest}); "
+                "select one model for this slot",
             )
-        selected[slot] = {"selection": row}
-    if not selected:
-        return selected
+    if not chosen:
+        return {}
 
     if tensorfs_root is None:
         raise PreparationRefusal(
@@ -1169,27 +1196,30 @@ def _selected_models(
         )
 
     try:
-        tensorfs = fill.tensorfs_module()
+        facade = fill.tensorfs_module()
         store = fill.open_store(tensorfs_root)
         manifests: dict[str, tuple[int, bytes, bytes]] = {}
-        for value in selected.values():
-            selection = value["selection"]
+        for selection in chosen.values():
             # The selected manifest digest is the model's identity; release and lane are
             # labels. Where a mutable lane points now does not change what was selected.
-            digest = str(selection["manifest"])
-            model = str(selection.get("model", ""))
-            release = str(selection.get("release", ""))
-            lane = str(selection.get("lane", ""))
-            parts = model.split("/")
-            if len(parts) != 2 or not all(parts) or bool(release) != bool(lane):
-                raise PreparationRefusal("package_prepare_model_selection_mismatch", model)
+            digest = selection.manifest
+            parts = selection.model.split("/")
+            if len(parts) != 2 or not all(parts) or bool(selection.release) != bool(selection.lane):
+                raise PreparationRefusal(
+                    "package_prepare_model_selection_mismatch", selection.model
+                )
             held = store.manifest(digest)
-            raw, header = held["manifest"], held["header"]
-            if not raw or header is None or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
+            raw, held_header = held["manifest"], held["header"]
+            if (
+                not raw
+                or held_header is None
+                or "sha256:" + hashlib.sha256(raw).hexdigest() != digest
+            ):
                 raise PreparationRefusal("package_prepare_model_manifest_mismatch", digest)
-            manifests[digest] = (len(raw), raw, header)
-        for digest, (length, raw, header_raw) in sorted(manifests.items()):
-            header_digest, header_length = acquire.cozytensors_ref(tensorfs, raw)
+            manifests[digest] = (len(raw), raw, held_header)
+        constructions: dict[str, Construction] = {}
+        for digest, (_length, raw, header_raw) in sorted(manifests.items()):
+            header_digest, header_length = acquire.cozytensors_ref(raw)
             if (
                 len(header_raw) != header_length
                 or "sha256:" + hashlib.sha256(header_raw).hexdigest() != header_digest
@@ -1198,36 +1228,35 @@ def _selected_models(
                     "package_prepare_model_header_unavailable",
                     f"{digest}: held header does not match {header_digest}",
                 )
-            header = tensorfs.parse_header(header_raw)
-            if not header.get("components"):
+            header = facade.parse_header(header_raw)
+            if not header["components"]:
                 raise PreparationRefusal(
                     "package_prepare_model_header_unsupported",
                     f"{digest}: expected tensor components",
                 )
-            construction: dict[str, Any] = {}
-            if any(
-                slot in construction_slots and value["selection"]["manifest"] == digest
-                for slot, value in selected.items()
+            if not any(
+                slot in construction_slots and selection.manifest == digest
+                for slot, selection in chosen.items()
             ):
-                try:
-                    construction = {
-                        "unnormalized": model_config.unnormalized(header.get("configs")),
-                        "config_bytes": model_config.construction_config(header.get("configs")),
-                        "header": header_raw,
-                        "assets": _asset_reader(
-                            store, digest, (header_digest, header_length), header_raw, header
-                        ),
-                        "tensor_dtypes": model_config.tensor_dtypes(header),
-                    }
-                except model_config.ModelConfigRefusal as exc:
-                    raise PreparationRefusal(
-                        exc.code or "package_prepare_model_config_mismatch", f"{digest}: {exc}"
-                    ) from exc
-            for slot, value in selected.items():
-                if value["selection"]["manifest"] == digest:
-                    value["manifest_length"] = length
-                    if slot in construction_slots:
-                        value.update(construction)
+                continue
+            try:
+                constructions[digest] = Construction(
+                    unnormalized=model_config.unnormalized(header["configs"]),
+                    config_bytes=model_config.construction_config(header["configs"]),
+                    header=header_raw,
+                    assets=_asset_reader(
+                        store,
+                        digest,
+                        (header_digest, header_length),
+                        header_raw,
+                        msgspec.convert(header["assets"], dict[str, _Asset]),
+                    ),
+                    tensor_dtypes=model_config.tensor_dtypes(header),
+                )
+            except model_config.ModelConfigRefusal as exc:
+                raise PreparationRefusal(
+                    exc.code or "package_prepare_model_config_mismatch", f"{digest}: {exc}"
+                ) from exc
     except PreparationRefusal:
         raise
     except (acquire.AcquisitionRefusal, fill.FillRefusal) as exc:
@@ -1238,26 +1267,32 @@ def _selected_models(
         raise PreparationRefusal(
             "package_prepare_model_refused", f"{type(exc).__name__}: {exc}"
         ) from exc
-    return selected
+    return {
+        slot: Selected(
+            selection,
+            manifests[selection.manifest][0],
+            constructions[selection.manifest] if slot in construction_slots else None,
+        )
+        for slot, selection in chosen.items()
+    }
 
 
 def _asset_reader(
-    store: Any,
+    store: fill.Store,
     manifest: str,
     header_ref: tuple[str, int],
     header_raw: bytes,
-    header: Mapping[str, Any],
+    assets: Mapping[str, _Asset],
 ) -> Callable[[], dict[str, bytes]]:
     """Read header-declared assets through a lease on the header and asset segments only."""
 
     def read() -> dict[str, bytes]:
-        names = sorted(str(name) for name in header.get("assets", {}))
+        names = sorted(assets)
         if not names:
             return {}
         segments = {header_ref}
         for name in names:
-            for segment in header["assets"][name].get("segments", []):
-                segments.add(("sha256:" + str(segment["sha256"]), int(segment["length"])))
+            segments.update(("sha256:" + row.sha256, row.length) for row in assets[name].segments)
         try:
             lease = store.acquire(manifest, sorted(segments))
             try:

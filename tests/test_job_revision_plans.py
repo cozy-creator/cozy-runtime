@@ -52,7 +52,7 @@ def compute(payload:Input)->Output:
     root = tmp_path / "remote-plans"
     for identifier in (first, second):
         _stage_job_plans(
-            interface,
+            exact,
             root=root,
             installation_id=identifier,
             interface_path=interface_path,
@@ -78,7 +78,7 @@ def compute(payload:Input)->Output:
     assert job_plan.path(local / "job-plans", first, descriptor).exists()
     assert job_plan.path(local / "job-plans", second, descriptor).exists()
     _stage_job_plans(
-        interface,
+        exact,
         root=root,
         installation_id=first,
         interface_path=interface_path,

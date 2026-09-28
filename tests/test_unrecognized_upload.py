@@ -25,7 +25,12 @@ from cozy_runtime.author import Artifact, CheckpointUnnormalized, Config, Loader
 from cozy_runtime.author._loader import Backend, Census, Fit
 from cozy_runtime.internal import fill, model_config, source_interfaces, storage_admission
 from cozy_runtime.internal.worker import upload_plan, workspace_sources
-from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, _selected_models
+from cozy_runtime.internal.worker.package_prepare import (
+    PreparationRefusal,
+    Selected,
+    _selected_models,
+    selections,
+)
 from cozy_runtime.internal.worker.source_calls import SourceCalls
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
@@ -146,10 +151,10 @@ def _checkpoint(root: Path, finished: pb.NativeSourceStatus) -> tuple[str, dict[
     return digest, dict(header)
 
 
-def _prepare(root: Path, model: str, digest: str) -> dict[str, Any]:
+def _prepare(root: Path, model: str, digest: str) -> dict[str, Selected]:
     rows = [{"package": "example/pipeline", "slot": SLOT, "model": model, "manifest": digest}]
     return _selected_models(
-        "example/pipeline", rows, root, lambda *_: None, construction_slots={SLOT}
+        "example/pipeline", selections(rows), root, lambda *_: None, construction_slots={SLOT}
     )
 
 
@@ -238,7 +243,9 @@ def test_an_unrecognized_repository_uploads_one_default_file_per_folder_as_is(
     assert sorted(header["components"]) == ["decoder", "encoder"]
     assert json.loads(header["configs"]["normalization"]) == RAW
     # The record is TensorFS metadata, never construction input.
-    constructor = json.loads(_prepare(root, "example/unknown-model", digest)[SLOT]["config_bytes"])
+    built = _prepare(root, "example/unknown-model", digest)[SLOT].construction
+    assert built is not None
+    constructor = json.loads(built.config_bytes)
     assert constructor == {**CONFIGS, "model_index": json.loads(files["model_index.json"])}
 
 

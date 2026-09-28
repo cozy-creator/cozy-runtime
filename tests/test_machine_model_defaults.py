@@ -17,7 +17,7 @@ import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import fill, hostfacts
+from cozy_runtime.internal import fill, hostfacts, package_interface
 from cozy_runtime.internal.worker import grants, machine_checkpoint_inputs
 from cozy_runtime.internal.worker import machine_model_defaults as defaults
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -28,7 +28,7 @@ from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_executions import Executions
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config
 from test_group_lanes import _placement
@@ -74,8 +74,27 @@ def peer(capture: dict[str, Any]) -> Worker:
             model_transfer_lock=threading.Lock(),
             model_transfers={},
             executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
+            lanes=SimpleNamespace(entries=()),
         ),
     )
+
+
+def parsed(capture: dict[str, Any]) -> pb.MachineExecutionCapture:
+    tag = documents.doc_format(pb.MachineExecutionCapture.DESCRIPTOR.full_name)
+    raw = canonical_json.encode({"format": tag, **capture})
+    return documents.parse(raw, pb.MachineExecutionCapture)
+
+
+def interfaces() -> dict[str, package_interface.PackageInterface]:
+    models = tuple(
+        package_interface.ModelSlot(path=model["path"], class_name="M", component_use={})
+        for model in target().declaration["models"]
+    )
+    generate = package_interface.CallableDoc(name="generate", request={}, result={}, models=models)
+    interface = package_interface.PackageInterface(
+        format=package_interface.SCHEMA, application="app", entrypoints=(generate,), jobs=()
+    )
+    return {INSTALLATION: interface}
 
 
 def target() -> Target:
@@ -93,9 +112,7 @@ def target() -> Target:
 
 def test_default_capture_requires_complete_exact_inventory() -> None:
     body = captured()
-    interfaces = {INSTALLATION: {"entrypoints": [{"name": "generate", **target().declaration}]}}
-    request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=WIRE_MINOR))
-    defaults.verify(peer(body), request, body, interfaces)
+    defaults.verify(peer(body), parsed(body), interfaces())
     mutations: list[Callable[[dict[str, Any]], Any]] = [
         lambda value: value["model_defaults"].pop(),
         lambda value: value["model_defaults"].reverse(),
@@ -116,7 +133,7 @@ def test_default_capture_requires_complete_exact_inventory() -> None:
         changed = copy.deepcopy(body)
         mutate(changed)
         with pytest.raises(WorkspaceRefusal):
-            defaults.verify(peer(changed), request, changed, interfaces)
+            defaults.verify(peer(changed), parsed(changed), interfaces())
     assert defaults.valid_origin("http://127.0.0.1:8819", local=True)
     assert not defaults.valid_origin("http://127.0.0.1:8819", local=False)
     assert not defaults.valid_origin("http://169.254.169.254", local=True)
@@ -421,6 +438,7 @@ def test_cold_default_native_pull_requires_deployment_object_storage_host(
     worker = peer({})
     worker.workspace = Workspace(root)
     row = {
+        "parameter": "adapter",
         "public_origin": f"http://localhost:{server.server_port}",
         "repository": "proof/adapter",
         "manifest": {"digest": manifest, "length": length},
@@ -532,6 +550,7 @@ def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hu
         )
         worker.config = cast(Any, SimpleNamespace(object_storage_hosts=("127.0.0.1",)))
         row = {
+            "parameter": "model",
             "public_origin": public_origin,
             "repository": "fidika/private",
             "manifest": {"digest": manifest, "length": length},

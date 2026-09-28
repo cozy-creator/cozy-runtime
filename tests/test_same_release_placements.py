@@ -125,7 +125,7 @@ class Machine:
                 package_name=PACKAGE,
                 release=RELEASE,
                 locked=package_environment.read_locked_requirements(LOCKED),
-                models=models,
+                models=package_prepare.selections(models),
                 artifact_cache=seams["artifact_cache"],
                 tensorfs_root=seams["tensorfs_root"],
                 install_root=seams["install_root"],

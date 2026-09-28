@@ -73,13 +73,11 @@ try:
     builtins = worker.machine_calls.builtins
     captured = builtins.capture()
     assert builtins.capture() is captured
-    installed = package_installation.open_installation(
-        root / "installs", captured["installation_id"]
-    )
+    installed = package_installation.open_installation(root / "installs", captured.installation_id)
     assert installed.python == Path(sys.executable)
-    assert installed.release == captured["runtime_version"]
-    placement = captured["placement"]
-    assert placement["installation_id"] == captured["installation_id"]
+    assert installed.release == captured.runtime_version
+    placement = captured.placement
+    assert placement["installation_id"] == captured.installation_id
     interface = package_interface.read_bytes(base64.b64decode(placement["package_interface"]))
     assert set(builtin_operations.EXPORTS) <= {row["name"] for row in interface["jobs"]}
     actual = subprocess.check_output(
@@ -92,8 +90,8 @@ try:
         ],
         text=True,
     )
-    assert json.loads(actual) == {"runtime_version": captured["runtime_version"]}
-    print("RENTED BUILTIN PASS", captured["runtime_version"], "leases", len(leases))
+    assert json.loads(actual) == {"runtime_version": captured.runtime_version}
+    print("RENTED BUILTIN PASS", captured.runtime_version, "leases", len(leases))
 finally:
     worker.shutdown()
     assert storage._channel is not None

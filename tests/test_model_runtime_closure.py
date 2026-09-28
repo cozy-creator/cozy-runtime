@@ -9,7 +9,7 @@ import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 import pytest
 import tensorfs
@@ -24,9 +24,12 @@ from cozy_runtime.internal.worker import grants
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal, HeldManifests
 from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRefusal
 from cozy_runtime.internal.worker.package_prepare import (
+    Construction,
     PreparationRefusal,
     _selected_models,
+    selections,
 )
+from cozy_runtime.internal.worker.session import Placement
 from cozy_runtime.protocol import worker_pb2 as pb
 
 # Canonical CozyTensors header produced by TensorFS itself. It contains one inline JCS config, one
@@ -104,8 +107,9 @@ def _acquirer(tmp_path: Path, store_root: Path) -> Acquirer:
 
 def test_model_prep_ignores_absent_snapshot_siblings(tmp_path: Path) -> None:
     store_root, manifest_id, manifest_length, store = _snapshot(tmp_path, include_asset=True)
-    placement = SimpleNamespace(
-        models=({"manifest": {"digest": manifest_id, "length": manifest_length}},)
+    placement = cast(
+        Placement,
+        SimpleNamespace(models=({"manifest": {"digest": manifest_id, "length": manifest_length}},)),
     )
 
     count = _acquirer(tmp_path, store_root)._models(placement)
@@ -129,8 +133,9 @@ def test_held_manifest_census_comes_from_tensorfs(tmp_path: Path) -> None:
 
 def test_model_prep_still_requires_header_assets(tmp_path: Path) -> None:
     store_root, manifest_id, manifest_length, _store = _snapshot(tmp_path, include_asset=False)
-    placement = SimpleNamespace(
-        models=({"manifest": {"digest": manifest_id, "length": manifest_length}},)
+    placement = cast(
+        Placement,
+        SimpleNamespace(models=({"manifest": {"digest": manifest_id, "length": manifest_length}},)),
     )
 
     with pytest.raises(AcquisitionRefusal) as refused:
@@ -188,14 +193,16 @@ def test_worker_prepare_reads_tensorfs_03_logical_dtype(tmp_path: Path) -> None:
     assert SPEC_PLAIN in launch_providers()
 
 
-def _prepared(root: Path, selection: dict[str, Any]) -> dict[str, Any]:
-    return _selected_models(
+def _prepared(root: Path, selection: dict[str, Any]) -> Construction:
+    built = _selected_models(
         "example/package",
-        [dict(selection, package="example/package")],
+        selections([dict(selection, package="example/package")]),
         root,
         lambda *_args: None,
         construction_slots={selection["slot"]},
-    )[selection["slot"]]
+    )[selection["slot"]].construction
+    assert built is not None
+    return built
 
 
 def test_prepare_reads_header_and_assets_without_a_closure_lease(tmp_path: Path) -> None:
@@ -212,13 +219,13 @@ def test_prepare_reads_header_and_assets_without_a_closure_lease(tmp_path: Path)
         "lane": "",
     }
     candidate = _prepared(store_root, selected)
-    assert candidate["config_bytes"] == _CONFIG
-    assert candidate["assets"]() == {"tokenizer/vocab.txt": _ASSET}
-    assert candidate["tensor_dtypes"] == {"unet.weight": "f32"}
+    assert candidate.config_bytes == _CONFIG
+    assert candidate.assets() == {"tokenizer/vocab.txt": _ASSET}
+    assert candidate.tensor_dtypes == {"unet.weight": "f32"}
 
     mismatch = tensorfs.fit(
         [tensorfs.TensorRequirement("unet", "weight", [2], "f32")],
-        candidate["header"],
+        candidate.header,
         custody="canonical",
         encoded_leaves=False,
     )
@@ -230,7 +237,7 @@ def test_prepare_reads_header_and_assets_without_a_closure_lease(tmp_path: Path)
     )
     cold = _prepared(cold_root, dict(selected, manifest=cold_manifest))
     with pytest.raises(CensusRefusal, match="model_asset_unavailable"):
-        cold["assets"]()
+        cold.assets()
 
 
 def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -> None:
@@ -265,23 +272,26 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         "sha256:"
         + hashlib.sha256(canonical.write({"name": "generate", "slots": [slot]})).hexdigest()
     )
-    placement = SimpleNamespace(
-        package_interface=interface_bytes,
-        models=(
-            {
-                "id": "model-0000",
-                "repo": "example/model",
-                "version": "1",
-                "lane": "main",
-                "manifest": {"digest": manifest_id, "length": manifest_length},
-            },
+    placement = cast(
+        Placement,
+        SimpleNamespace(
+            package_interface=interface_bytes,
+            models=(
+                {
+                    "id": "model-0000",
+                    "repo": "example/model",
+                    "version": "1",
+                    "lane": "main",
+                    "manifest": {"digest": manifest_id, "length": manifest_length},
+                },
+            ),
+            entrypoints=(
+                {"name": "generate", "entrypoint_binding_digest": binding_digest, "slots": [slot]},
+            ),
+            package={"package": "example/package", "release": "1"},
+            development={},
+            installation_id="local-" + "33" * 16,
         ),
-        entrypoints=(
-            {"name": "generate", "entrypoint_binding_digest": binding_digest, "slots": [slot]},
-        ),
-        package={"package": "example/package", "release": "1"},
-        development={},
-        installation_id="local-" + "33" * 16,
     )
 
     assert acquirer._models(placement) == 1
@@ -319,15 +329,17 @@ def test_exact_checkpoint_prepares_and_streams_without_any_release(
             store.resolve_release("example", "model", "1", "main")
         prepared = _selected_models(
             "example/package",
-            [selection],
+            selections([selection]),
             root,
             lambda *_args: None,
             construction_slots={selection["slot"]},
         )
-        assert prepared[selection["slot"]]["manifest_length"] == length
-        assert prepared[selection["slot"]]["config_bytes"] == _CONFIG
-        assert prepared[selection["slot"]]["assets"]() == {"tokenizer/vocab.txt": _ASSET}
-        assert prepared[selection["slot"]]["tensor_dtypes"] == {"unet.weight": "f32"}
+        chosen = prepared[selection["slot"]]
+        assert chosen.manifest_length == length
+        assert chosen.construction is not None
+        assert chosen.construction.config_bytes == _CONFIG
+        assert chosen.construction.assets() == {"tokenizer/vocab.txt": _ASSET}
+        assert chosen.construction.tensor_dtypes == {"unet.weight": "f32"}
         checkpoint = fill.Checkpoint(root, manifest)
         plan = checkpoint.read_plan([("unet", "weight")], 64, ["unet"])
         slot = bytearray(b"\xa5" * 64)
@@ -363,7 +375,7 @@ def test_checkpoint_selection_refuses_partial_release_or_incomplete_model(
     with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
         _selected_models(
             "example/package",
-            [selection],
+            selections([selection]),
             root,
             lambda *_args: None,
             construction_slots={selection["slot"]},
@@ -377,16 +389,16 @@ def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path)
     for declared_length in (-1, length + 1):
         prepared = _selected_models(
             "example/package",
-            [dict(selection, manifest_length=declared_length)],
+            selections([dict(selection, manifest_length=declared_length)]),
             root,
             lambda *_args: None,
             construction_slots={selection["slot"]},
         )
-        assert prepared[selection["slot"]]["manifest_length"] == length
+        assert prepared[selection["slot"]].manifest_length == length
     with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
         _selected_models(
             "other/package",
-            [selection],
+            selections([selection]),
             root,
             lambda *_args: None,
             construction_slots={selection["slot"]},
@@ -395,7 +407,7 @@ def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path)
     with pytest.raises(PreparationRefusal):
         _selected_models(
             "example/package",
-            [missing],
+            selections([missing]),
             root,
             lambda *_args: None,
             construction_slots={selection["slot"]},
@@ -403,7 +415,7 @@ def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path)
     candidate = _prepared(root, selection)
     mismatch = tensorfs.fit(
         [tensorfs.TensorRequirement("unet", "weight", [2], "f32")],
-        candidate["header"],
+        candidate.header,
         custody="canonical",
         encoded_leaves=False,
     )
@@ -420,7 +432,7 @@ def test_checkpoint_selection_refuses_corrupt_header(tmp_path: Path) -> None:
     with pytest.raises(PreparationRefusal):
         _selected_models(
             "example/package",
-            [selection],
+            selections([selection]),
             root,
             lambda *_args: None,
             construction_slots={selection["slot"]},
@@ -429,7 +441,9 @@ def test_checkpoint_selection_refuses_corrupt_header(tmp_path: Path) -> None:
 
 def test_evicted_preparation_rechecks_native_bytes(tmp_path: Path) -> None:
     root, manifest, length, _native = _snapshot(tmp_path, include_asset=True)
-    placement = SimpleNamespace(models=({"manifest": {"digest": manifest, "length": length}},))
+    placement = cast(
+        Placement, SimpleNamespace(models=({"manifest": {"digest": manifest, "length": length}},))
+    )
     acquirer = _acquirer(tmp_path, root)
     assert acquirer._models(placement) == 1
     # These are unowned cached bytes. An earlier preparation is not a root.

@@ -17,25 +17,28 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from google.protobuf import json_format
+import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, job_plan, package_installation, package_interface
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import (
     machine_byte_results,
-    machine_deferred,
+    machine_capture,
     machine_model_defaults,
     machine_model_resolve,
     machine_release_catalog,
     machine_source_models,
 )
+from .machine_capture import Installation
 from .machine_child_target import Target
 from .plan import JobBinding
+from .servicer_context import ServicerContext
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
 from .workspace_executions import ExecutionWorkspaceRefusal, Receipt
@@ -52,12 +55,22 @@ MAX_FACTS = 128
 #: A root's published callee closure.
 MAX_CLOSURE = 128
 
-#: An installation this machine holds: its placement document and installation id.
-type _Held = dict[str, Any]
 #: A device job's resident-memory ceiling, as the controller's root jobs are given it.
 JOB_RSS_CAP = 8 << 30
 #: The accelerator half of the base-owned Python stack: requiring one needs a device.
 ACCELERATOR_DISTRIBUTIONS = frozenset({"torch", "torchaudio", "torchvision", "triton"})
+#: What the resolved record journals of each slot's selection.
+RECORDED = (
+    "parameter",
+    "repository",
+    "release",
+    "lane",
+    "gpus",
+    "manifest",
+    "source",
+    "resolved",
+    "profiles",
+)
 
 
 def _requirement(line: str) -> str:
@@ -79,10 +92,12 @@ class Preparing(Exception):
 class _Prepared:
     key: str  # package@release of the root's code
     target: Target
-    placement: dict[str, Any]
-    models: list[dict[str, Any]]
-    installed: dict[str, _Held]
+    declared: package_interface.CallableDoc
+    placement: dict[str, Json]
+    models: list[dict[str, Json]]
+    installed: dict[str, Installation]
     edges: list[tuple[str, str]]
+    placement_set: bytes = b""  # a served root's prepared placement, as its set's exact bytes
 
 
 @dataclass
@@ -111,7 +126,7 @@ class ReleaseRoots:
         self.facts: dict[str, pb.DeferredInstallation] = {}
 
     def submit(
-        self, owner: str, request: pb.MachineExecutionSubmit, context: Any
+        self, owner: str, request: pb.MachineExecutionSubmit, context: ServicerContext
     ) -> pb.MachineExecutionReceipt:
         executions = self.worker.executions
         assert executions is not None
@@ -153,7 +168,7 @@ class ReleaseRoots:
         assert job.result is not None
         return self._accept(owner, request, job.result)
 
-    def _wait(self, job: _Job, context: Any) -> None:
+    def _wait(self, job: _Job, context: ServicerContext) -> None:
         """Until the job finishes or reports news, or the caller goes away."""
         gone = threading.Event()
 
@@ -162,8 +177,8 @@ class ReleaseRoots:
                 gone.set()
                 self.changed.notify_all()
 
-        if hasattr(context, "add_callback"):
-            context.add_callback(leave)
+        if not context.add_callback(leave):
+            leave()  # the RPC already ended: its callback will never run
         seen = job.version
         while not job.done and job.version == seen and not gone.is_set():
             self.changed.wait()
@@ -180,7 +195,7 @@ class ReleaseRoots:
             job.version += 1
             self.changed.notify_all()
 
-    def _installed(self, key: str) -> _Held | None:
+    def _installed(self, key: str) -> Installation | None:
         """The placement this machine holds for a release with the fewest bound Models."""
         package, _, release = key.partition("@")
         with self.worker.control_lock:
@@ -194,7 +209,7 @@ class ReleaseRoots:
         if not held:
             return None
         selected = min(held, key=lambda placement: len(placement.models))
-        return {"placement": dict(selected.document), "installation_id": selected.installation_id}
+        return Installation(dict(selected.document), selected.installation_id)
 
     def _plan(self, root: pb.ReleaseRoot) -> None:
         if (
@@ -206,7 +221,7 @@ class ReleaseRoots:
                 "release root names no package, entrypoint and one release or installation"
             )
 
-    def _root(self, root: pb.ReleaseRoot) -> tuple[str, _Held | None]:
+    def _root(self, root: pb.ReleaseRoot) -> tuple[str, Installation | None]:
         """The root's package@release, and the unpublished installation it names, which this
         machine must already hold: the controller prepares it and asks again."""
         if not root.installation_id:
@@ -226,10 +241,9 @@ class ReleaseRoots:
                 "release_root_installation_absent",
                 f"this machine holds no installation {root.installation_id} of {root.package}",
             )
-        return _key(root.package, str(held.development["release"])), {
-            "placement": dict(held.document),
-            "installation_id": held.installation_id,
-        }
+        return _key(root.package, str(held.development["release"])), Installation(
+            dict(held.document), held.installation_id
+        )
 
     def _facts(self, key: str) -> pb.DeferredInstallation:
         """A release's install facts, read at this machine's catalog once."""
@@ -246,14 +260,14 @@ class ReleaseRoots:
                     del self.facts[old]
         return held
 
-    def _locked(self, key: str, held: _Held | None, captured: bool = False) -> bytes:
+    def _locked(self, key: str, held: Installation | None, captured: bool = False) -> bytes:
         """A release's lock: its installation's here, else its install facts'. A captured
         installation has no release at the Hub: only its own lock, if it has one."""
         if held is not None:
             path = (
                 Path(self.worker.options.install_root or "")
                 / "installations"
-                / str(held["installation_id"])
+                / held.installation_id
                 / "requirements.txt"
             )
             if path.is_file():
@@ -261,11 +275,11 @@ class ReleaseRoots:
         return b"" if captured else self._facts(key).preparation.locked_requirements
 
     def _closure(
-        self, root: str, captured: _Held | None
-    ) -> tuple[dict[str, _Held], list[tuple[str, str]]]:
+        self, root: str, captured: Installation | None
+    ) -> tuple[dict[str, Installation], list[tuple[str, str]]]:
         """The releases of the root's closure this machine holds, and the closure's edges,
         each release's callees read from its own lock (a captured root's from its own)."""
-        installed: dict[str, _Held] = {}
+        installed: dict[str, Installation] = {}
         edges: set[tuple[str, str]] = set()
         pending, seen = [root], set[str]()
         while pending:
@@ -295,11 +309,7 @@ class ReleaseRoots:
             )
         key = _key(package, release)
         held = self._installed(key)
-        raw = (
-            base64.b64decode(held["placement"]["package_interface"], validate=True)
-            if held is not None
-            else self._facts(key).preparation.package_interface
-        )
+        raw = held.interface if held is not None else self._facts(key).preparation.package_interface
         return pb.DescribedRelease(package=package, release=release, package_interface=raw)
 
     def _run(self, owner: str, request: pb.MachineExecutionSubmit, job: _Job) -> None:
@@ -317,7 +327,7 @@ class ReleaseRoots:
                 job.version += 1
                 self.changed.notify_all()
 
-    def _install(self, row: pb.DeferredInstallation) -> _Held:
+    def _install(self, row: pb.DeferredInstallation) -> Installation:
         from .session import read_placement_set  # session imports this module's RPC
 
         prepared = pb.PreparePackageSetRequest()
@@ -326,7 +336,7 @@ class ReleaseRoots:
         entries = read_placement_set(self.worker.prepare_package_set(prepared).placement_set)
         if len(entries) != 1 or entries[0].get("package", {}).get("package") != row.package:
             raise WorkspaceRefusal("release root preparation returned another installation")
-        return {"placement": entries[0], "installation_id": entries[0]["installation_id"]}
+        return Installation(entries[0], entries[0]["installation_id"])
 
     def _prepare(self, owner: str, request: pb.MachineExecutionSubmit, job: _Job) -> _Prepared:
         root, worker = request.release_root, self.worker
@@ -337,34 +347,32 @@ class ReleaseRoots:
             self._note(job, f"installing {key}")
             installed[key] = self._install(self._facts(key))
         prepared = installed[key]
-        interface = package_interface.read_bytes(
-            base64.b64decode(prepared["placement"]["package_interface"], validate=True),
-            "release root",
-        )
+        body = package_interface.read_bytes(prepared.interface, "release root")
         section, kind = ("jobs", "job") if root.job else ("entrypoints", "inference entrypoint")
         declaration = next(
-            (entry for entry in interface[section] if entry["name"] == root.entrypoint), None
+            (entry for entry in body[section] if entry["name"] == root.entrypoint), None
         )
         if declaration is None:
             raise WorkspaceRefusal(f"{key} serves no {kind} {root.entrypoint}")
-        if declaration.get("internal", False):
+        declared = msgspec.convert(declaration, package_interface.CallableDoc)
+        if declared.internal:
             raise WorkspaceRefusal("internal_callable: an internal callable cannot be a root")
         binding = None
         if root.job:
-            descriptor = package_interface.job_descriptor_id(interface, root.entrypoint)
+            descriptor = package_interface.job_descriptor_id(body, root.entrypoint)
             plan = job_plan.path(
-                worker.config.cozy_home / "job-plans", prepared["installation_id"], descriptor
+                worker.config.cozy_home / "job-plans", prepared.installation_id, descriptor
             )
             binding = JobBinding.read(json.loads(plan.read_bytes()))
         target = Target(
-            prepared["installation_id"],
+            prepared.installation_id,
             root.entrypoint,
             declaration,
-            prepared,
+            msgspec.to_builtins(prepared),
             binding,
-            str(declaration.get("invocable", {}).get("operation_identity", "")),
+            machine_capture.operation_identity(declared),
             False,
-            prepared["installation_id"],
+            prepared.installation_id,
         )
         models = self._resolve(
             root,
@@ -382,7 +390,9 @@ class ReleaseRoots:
                     job, "downloading model weights", done, total
                 ),
             )
-            return _Prepared(key, target, dict(prepared["placement"]), models, installed, edges)
+            return _Prepared(
+                key, target, declared, dict(prepared.placement), models, installed, edges
+            )
         serving = worker.machine_calls.serving
         call = Call(
             request.offer.request_id,
@@ -413,39 +423,40 @@ class ReleaseRoots:
         finally:
             serving.observers.pop(call.child_request, None)
             serving._release_preparation(owner, call.child_request)
-        self._register(target, ready.placement)
-        return _Prepared(key, target, ready.placement, models, installed, edges)
+        placement_set = canonical_json.encode(
+            {"format": "cozy.worker.v1.PlacementSet/1", "placements": [ready.placement]}
+        )
+        self._register(target, ready.placement, placement_set)
+        return _Prepared(
+            key, target, declared, ready.placement, models, installed, edges, placement_set
+        )
 
     def _resolve(
         self,
         root: pb.ReleaseRoot,
-        declaration: Mapping[str, Any],
+        declaration: Mapping[str, Json],
         credentials: Mapping[str, str],
         note: machine_source_models.Note,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Json]]:
         """Each slot for this machine. A manifest it already holds needs no catalog read; the
         package's bindings are read once and its catalog slots then resolve beside each other."""
         slots = declaration.get("models", [])
         if not slots:
             return []
-        choices = {
-            choice.parameter: json_format.MessageToDict(choice, preserving_proto_field_name=True)
-            for choice in root.models
+        given = {choice.parameter: choice for choice in root.models}
+        pins = {
+            parameter: self._pin(choice)
+            for parameter, choice in given.items()
+            if choice.HasField("manifest")
         }
-        for choice in choices.values():
-            if "manifest" in choice:
-                digest = documents.spell(base64.b64decode(choice["manifest"]["digest"]))
-                length = int(choice["manifest"].get("length", 0)) or self._held_length(digest)
-                choice["manifest"] = {"digest": digest, "length": length}
-        parameters = [model["path"].rpartition(".")[2] for model in slots]
+        parameters = [str(model["path"]).rpartition(".")[2] for model in slots]
         sourced = {
-            parameter for parameter in parameters if choices.get(parameter, {}).get("source")
+            parameter for parameter in parameters if parameter in given and given[parameter].source
         }
         open_slots = [
-            model
+            (model, parameter)
             for model, parameter in zip(slots, parameters, strict=True)
-            if not choices.get(parameter, {}).get("source")
-            and not choices.get(parameter, {}).get("manifest", {}).get("length")
+            if parameter not in sourced and not (parameter in pins and pins[parameter]["length"])
         ]
         # Pinned and sourced slots read nothing; an open one reads this machine's own Hub.
         catalog = (
@@ -453,12 +464,8 @@ class ReleaseRoots:
             if open_slots
             else machine_model_resolve.Catalog("")
         )
-        fits = machine_model_defaults.fitter(self.worker)
-        laddered = [
-            model
-            for model in open_slots
-            if "manifest" not in choices.get(model["path"].rpartition(".")[2], {})
-        ]
+        fits = machine_model_defaults.catalog_fits(machine_model_defaults.fitter(self.worker))
+        laddered = [model for model, parameter in open_slots if parameter not in pins]
         if laddered and not root.package.startswith("local/"):
             catalog.binding(root.package, str(laddered[0]["path"]))
         with ThreadPoolExecutor(max_workers=len(slots)) as pool:
@@ -469,7 +476,7 @@ class ReleaseRoots:
                     root.package,
                     model,
                     parameter,
-                    choices.get(parameter),
+                    _catalog_choice(given.get(parameter), pins.get(parameter)),
                     fits,
                 )
                 for model, parameter in zip(slots, parameters, strict=True)
@@ -477,13 +484,19 @@ class ReleaseRoots:
             }
             resolved = {parameter: row.result() for parameter, row in resolving.items()}
         # A provider source is made here, in order: headers first, only its profile's members.
-        given = {choice.parameter: choice for choice in root.models}
         return [
             machine_source_models.slot(self.worker, given[parameter], credentials, note)
             if parameter in sourced
             else resolved[parameter]
             for parameter in parameters
         ]
+
+    def _pin(self, choice: pb.ModelChoice) -> dict[str, Json]:
+        """A pinned manifest, its length read from this machine's store when unstated."""
+        if len(choice.manifest.digest) != 32:
+            raise WorkspaceRefusal(f"{choice.parameter} pins a manifest with no exact digest")
+        digest = documents.spell(choice.manifest.digest)
+        return {"digest": digest, "length": choice.manifest.length or self._held_length(digest)}
 
     def _held_length(self, digest: str) -> int:
         """The length of a manifest this machine's store holds, else 0 (the catalog says)."""
@@ -494,33 +507,32 @@ class ReleaseRoots:
             return 0
         return len(raw) if raw and documents.spell(hashlib.sha256(raw).digest()) == digest else 0
 
-    def _progress(self, job: _Job, frame: Mapping[str, Any]) -> None:
-        position, total = frame.get("position"), frame.get("total")
+    def _progress(self, job: _Job, frame: Mapping[str, object]) -> None:
+        position, total, stage = frame.get("position"), frame.get("total"), frame.get("stage")
         if isinstance(position, int) and isinstance(total, int) and total > 0:
             self._note(job, "downloading model weights", position, total)
-        elif frame.get("kind") == "progress" and frame.get("stage"):
-            stage = str(frame["stage"])
-            if "Downloading" in stage or "compatibility" in stage:
-                self._note(job, stage)
+        elif (
+            frame.get("kind") == "progress"
+            and isinstance(stage, str)
+            and ("Downloading" in stage or "compatibility" in stage)
+        ):
+            self._note(job, stage)
 
-    def _register(self, target: Target, placement: dict[str, Any]) -> None:
+    def _register(self, target: Target, placement: dict[str, Json], placement_set: bytes) -> None:
         """Keep the prepared placement, so the next identical root matches it at once."""
         worker = self.worker
-        raw = canonical_json.encode(
-            {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
-        )
-        stored = worker._placement_from_entry(placement, hashlib.sha256(raw).digest())
+        stored = worker._placement_from_entry(placement, hashlib.sha256(placement_set).digest())
         stored.installed = package_installation.open_installation(
             Path(worker.options.install_root or ""), target.installation_id
         )
         with worker.control_lock:
             worker.prepared_installations[stored.prepared_key] = stored
 
-    def _capture(self, prepared: _Prepared) -> tuple[bytes, bytes, dict[str, Any]]:
+    def _capture(self, prepared: _Prepared) -> tuple[bytes, bytes, dict[str, Installation]]:
         """The callable inventory this machine would have been sent: installed and deferred."""
         installed = prepared.installed
         names: dict[str, tuple[str, str]] = {}  # key -> (field prefix, capture name)
-        interfaces: dict[str, dict[str, Any]] = {}
+        interfaces: dict[str, package_interface.PackageInterface] = {}
         packages: list[pb.InstalledPackage] = []
         rows: list[pb.DeferredInstallation] = []
         keys = {prepared.key}
@@ -528,35 +540,35 @@ class ReleaseRoots:
         for key in sorted(keys):
             held = installed.get(key)
             if held is not None:
-                raw = base64.b64decode(held["placement"]["package_interface"], validate=True)
+                raw = held.interface
                 package, _, release = key.partition("@")
                 packages.append(
                     pb.InstalledPackage(
-                        installation_id=held["installation_id"],
+                        installation_id=held.installation_id,
                         package=package,
                         release=release,
                         package_interface=raw,
                     )
                 )
-                names[key] = ("installation_id", held["installation_id"])
-                interfaces[key] = package_interface.read_bytes(raw, "installed release")
+                names[key] = ("installation_id", held.installation_id)
+                interfaces[key] = package_interface.parse(raw, "installed release")
             else:
                 row = self._facts(key)
                 rows.append(row)
                 names[key] = ("deferred_key", key)
-                interfaces[key] = machine_deferred.interface(
-                    json_format.MessageToDict(row, preserving_proto_field_name=True)
+                interfaces[key] = package_interface.parse(
+                    row.preparation.package_interface, "deferred release"
                 )
         bindings: list[pb.MachineCallableBinding] = []
 
         def bind(caller: str, callee: str, own: bool) -> None:
             body = interfaces[callee]
-            for entry in [*body.get("jobs", []), *body.get("entrypoints", [])]:
-                invocable = entry.get("invocable")
-                if not invocable or (entry.get("internal", False) and not own):
+            for entry in (*body.jobs, *body.entrypoints):
+                invocable = entry.invocable
+                if invocable is msgspec.UNSET or (entry.internal and not own):
                     continue
                 binding = pb.MachineCallableBinding(
-                    module=invocable["module"], export=invocable["export"], entrypoint=entry["name"]
+                    module=invocable.module, export=invocable.export, entrypoint=entry.name
                 )
                 setattr(binding, "caller_" + names[caller][0], names[caller][1])
                 setattr(binding, "callee_" + names[callee][0], names[callee][1])
@@ -593,7 +605,7 @@ class ReleaseRoots:
         digest = documents.spell(hashlib.sha256(payload).digest())
         bindings, access = machine_model_defaults.inputs(prepared.models)
         spec = pb.InvocationSpec(
-            installation_id=placement["installation_id"],
+            installation_id=prepared.target.installation_id,
             payload_digest=digest,
             inputs=[
                 pb.InputBinding(
@@ -615,15 +627,16 @@ class ReleaseRoots:
             attention_kernel=root.attention_kernel,
         )
         if root.job:
-            desired = self._job(root, prepared, spec)
+            desired, placement_id = self._job(root, prepared, spec), ""
         else:
-            desired = self._serving(root, prepared, spec)
+            served = documents.parse(prepared.placement_set, pb.PlacementSet).placements[0]
+            desired, placement_id = self._serving(root, prepared, served, spec), served.placement_id
         spec.inputs.sort(key=lambda entry: entry.input_id)
         raw, identity = documents.identity(spec)
         offer = pb.AttemptOffer(
             request_id=request.offer.request_id,
             attempt_ordinal=1,
-            placement_id="" if root.job else placement["placement_id"],
+            placement_id=placement_id,
             invocation_spec_canonical_bytes=raw,
             invocation_spec_digest=identity,
             grant=pb.DeliveryGrant(
@@ -639,9 +652,7 @@ class ReleaseRoots:
                 outputs=[pb.OutputAccess(output_id=output.output_id) for output in spec.outputs],
             ),
         )
-        weights = {
-            row["output_id"] for row in prepared.target.declaration.get("weights_outputs", [])
-        }
+        weights = {row.output_id for row in _weights_outputs(prepared.declared)}
         for output in offer.grant.outputs:
             if root.weights_destination and output.output_id in weights:
                 # `--upload-to`: Runtime sends this weights output to the named repository.
@@ -649,21 +660,20 @@ class ReleaseRoots:
         offer.grant.inputs.sort(key=lambda entry: entry.input_id)
         capture, capture_digest, installed = self._capture(prepared)
         installations = {
-            held["installation_id"]: {
-                "placement": placement
-                if held["installation_id"] == prepared.target.installation_id
-                else held["placement"],
-                "installation_id": held["installation_id"],
-            }
+            held.installation_id: Installation(
+                placement
+                if held.installation_id == prepared.target.installation_id
+                else held.placement,
+                held.installation_id,
+            )
             for held in installed.values()
         }
-        preparation: dict[str, Any] = {
-            "installations": installations,
-            "state": base64.b64encode(desired.SerializeToString(deterministic=True)).decode(),
-        }
         assert worker.machine_calls is not None
-        if sdk := worker.machine_calls.builtins.capture():
-            preparation["runtime_builtin"] = sdk
+        preparation = machine_capture.Preparation(
+            installations=installations,
+            state=base64.b64encode(desired.SerializeToString(deterministic=True)).decode(),
+            runtime_builtin=worker.machine_calls.builtins.capture(),
+        )
         worker.machine_sources.hold(owner, offer.request_id, request.source_credentials)
         receipt = worker.submit_execution(
             request.claim,
@@ -672,7 +682,7 @@ class ReleaseRoots:
             offer,
             expected_execution_workspace_id=request.expected_execution_workspace_id,
             capture_document=capture,
-            preparation=canonical_json.encode(preparation),
+            preparation=preparation.encode(),
             publication_authorization_id=request.publication_authorization_id,
             arguments=canonical_json.decode(payload) if root.job else None,
             owner_memo=request.owner_memo,
@@ -687,57 +697,41 @@ class ReleaseRoots:
                 "release": prepared.key.partition("@")[2],
                 "installation_id": prepared.target.installation_id,
                 "models": [
-                    {
-                        name: row[name]
-                        for name in (
-                            "parameter",
-                            "repository",
-                            "release",
-                            "lane",
-                            "gpus",
-                            "manifest",
-                            "source",
-                            "resolved",
-                            "profiles",
-                        )
-                        if name in row
-                    }
-                    for row in prepared.models
+                    {name: row[name] for name in RECORDED if name in row} for row in prepared.models
                 ],
             },
         )
         return self._receipt(receipt)
 
     def _serving(
-        self, root: pb.ReleaseRoot, prepared: _Prepared, spec: pb.InvocationSpec
+        self,
+        root: pb.ReleaseRoot,
+        prepared: _Prepared,
+        served: pb.Placement,
+        spec: pb.InvocationSpec,
     ) -> pb.DesiredWorkerState:
         """The serving invocation of the prepared placement, and that placement as state."""
-        placement = prepared.placement
-        selected = next(
-            (row for row in placement["entrypoints"] if row["name"] == root.entrypoint), None
-        )
+        selected = next((row for row in served.entrypoints if row.name == root.entrypoint), None)
         if selected is None:
             raise WorkspaceRefusal("release root has no complete prepared Model binding")
+        binding = documents.spell(selected.entrypoint_binding_digest)
         spec.serving.CopyFrom(
             pb.ServingInvocationSpec(
-                entrypoint_binding_digest=selected["entrypoint_binding_digest"],
-                attempt_binding_id=selected["entrypoint_binding_digest"],
-                bindings_digest=placement["bindings_digest"],
+                entrypoint_binding_digest=binding,
+                attempt_binding_id=binding,
+                bindings_digest=documents.spell(served.bindings_digest),
             )
         )
         if root.HasField("capture"):
             spec.capture.CopyFrom(root.capture)
             spec.outputs.append(pb.OutputBinding(output_id="runtime.capture", max_bytes=64 << 20))
-        placement_bytes = canonical_json.encode(
-            {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
-        )
-        width = max((int(row.get("gpus", 0)) for row in prepared.models), default=0)
+        width = max((row.gpus for row in machine_model_defaults.decode(prepared.models)), default=0)
         return pb.DesiredWorkerState(
             wire_minor=self.worker.fence.wire_minor,
             posture=pb.POSTURE_ACCEPTING,
             placement_set=pb.DesiredPlacementSet(
-                placement_set_digest=hashlib.sha256(placement_bytes).digest(),
-                placement_set_canonical_bytes=placement_bytes,
+                placement_set_digest=hashlib.sha256(prepared.placement_set).digest(),
+                placement_set_canonical_bytes=prepared.placement_set,
                 execution_gpus=width,
             ),
         )
@@ -746,10 +740,13 @@ class ReleaseRoots:
         self, root: pb.ReleaseRoot, prepared: _Prepared, spec: pb.InvocationSpec
     ) -> pb.DesiredWorkerState:
         """The job invocation and its directive, by the rules a controller used to apply."""
-        target, declaration = prepared.target, prepared.target.declaration
+        target = prepared.target
         assert target.binding is not None
         spec.outputs.extend(
-            pb.OutputBinding(**row) for row in declaration.get("weights_outputs", [])
+            pb.OutputBinding(
+                output_id=row.output_id, mime_type=row.mime_type, max_bytes=row.max_bytes
+            )
+            for row in _weights_outputs(prepared.declared)
         )
         spec.job.CopyFrom(
             pb.JobInvocationSpec(
@@ -780,10 +777,9 @@ class ReleaseRoots:
     def _needs_device(self, root: pb.ReleaseRoot, prepared: _Prepared) -> bool:
         """A job's own `accelerator` decides; an undeclared one follows its locked closure,
         except a composer that holds no Model or weights and only calls published callees."""
-        target = prepared.target
-        declaration = target.declaration
-        if declaration.get("accelerator") is not None:
-            return bool(declaration["accelerator"])
+        target, declared = prepared.target, prepared.declared
+        if declared.accelerator is not msgspec.UNSET:
+            return declared.accelerator
         locked = (
             Path(self.worker.options.install_root or "")
             / "installations"
@@ -797,10 +793,30 @@ class ReleaseRoots:
         if not names & ACCELERATOR_DISTRIBUTIONS:
             return False
         composes = any(caller == _key(root.package, root.release) for caller, _ in prepared.edges)
-        return not (
-            composes and not declaration.get("models") and not declaration.get("weights_outputs")
-        )
+        return not (composes and not declared.models and not _weights_outputs(declared))
 
     @staticmethod
     def _receipt(receipt: Receipt) -> pb.MachineExecutionReceipt:
         return pb.MachineExecutionReceipt(**asdict(receipt))
+
+
+def _weights_outputs(
+    declared: package_interface.CallableDoc,
+) -> tuple[package_interface.WeightsOutputDeclaration, ...]:
+    return () if declared.weights_outputs is msgspec.UNSET else declared.weights_outputs
+
+
+def _catalog_choice(
+    choice: pb.ModelChoice | None, pin: dict[str, Json] | None
+) -> dict[str, Json] | None:
+    """A catalog choice as the resolver reads it: its checkpoint names and any pinned manifest."""
+    if choice is None:
+        return None
+    row: dict[str, Json] = {
+        "repository": choice.repository,
+        "release": choice.release,
+        "lane": choice.lane,
+    }
+    if pin is not None:
+        row["manifest"] = pin
+    return row
