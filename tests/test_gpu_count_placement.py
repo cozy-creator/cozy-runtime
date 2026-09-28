@@ -32,7 +32,9 @@ def test_counted_capture_verifies() -> None:
             )
         ],
     )
-    worker = cast(Any, SimpleNamespace(options=SimpleNamespace(publication_authority=None)))
+    worker = cast(
+        Any, SimpleNamespace(options=SimpleNamespace(publication_authority=None, hubs=()))
+    )
     machine_model_defaults.verify(worker, capture, interfaces)
     rungs = capture.model_defaults[0].rungs
     rungs[0].gpus = 2

@@ -35,6 +35,7 @@ from cozy_runtime.internal.config import (
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.placement_materialization import prepare_boot
 from cozy_runtime.internal.refusal import LaunchRefusal
+from cozy_runtime.internal.worker import machine_publication
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.downloads import tls_certificate_digest
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
@@ -220,6 +221,9 @@ def _worker_options(
     """Construct the worker core directly; no public ``serve`` parser participates."""
 
     layout = config.layout
+    hubs, skipped = machine_publication.registrations(layout.machine_hubs)
+    for line in skipped:
+        print(f"[worker] {line}", file=sys.stderr, flush=True)
     return WorkerOptions(
         root=layout.worker_state,
         worker_id=config.worker_id,
@@ -239,9 +243,11 @@ def _worker_options(
             config.worker_id,
             config.tensorhub_worker_token,
             layout.tensorhub_ca if layout.tensorhub_ca.is_file() else None,
+            config.object_storage_hosts,
         )
         if config.tensorhub_origin
         else None,
+        hubs=hubs,
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
         claim_ready=False,
         executor_uid=identity.executor_uid,

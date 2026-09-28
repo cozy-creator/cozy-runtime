@@ -52,6 +52,7 @@ class Preparation(msgspec.Struct, frozen=True, omit_defaults=True):
     state: str = ""
     wire_minor: int | msgspec.UnsetType = msgspec.UNSET
     runtime_builtin: Builtin | None = None
+    hub: str = ""  # the Hub its run came from, as `hub_key` spells it; "": the default
 
     def encode(self) -> bytes:
         return canonical.write(msgspec.to_builtins(self))

@@ -28,7 +28,11 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ObjectRef
 from cozy_runtime.author.publication import AssessmentRef, CheckpointRef, ReleaseReceipt
 from cozy_runtime.internal import egress
-from cozy_runtime.internal.config import parse_tensorhub_origin
+from cozy_runtime.internal.config import (
+    ConfigError,
+    parse_object_storage_hosts,
+    parse_tensorhub_origin,
+)
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
@@ -67,6 +71,7 @@ class PublicationAuthority:
     worker_id: str
     worker_token: str = field(repr=False)
     ca: Path | None = None  # the grant's private Hub CA, when its Hub uses one
+    object_storage_hosts: tuple[str, ...] = ()  # where that Hub's presigned bytes live
 
     def context(self) -> ssl.SSLContext:
         return ssl.create_default_context(cafile=str(self.ca) if self.ca else None)
@@ -79,6 +84,68 @@ class PublicationAuthority:
             worker_id=self.worker_id,
             worker_token=self.worker_token,
         )
+
+
+class _Hub(msgspec.Struct, frozen=True):
+    origin: str
+    worker_id: str
+    worker_token: str
+    ca: str = ""  # a file name beside the document
+    object_storage_hosts: tuple[str, ...] = ()
+
+
+class _Hubs(msgspec.Struct, frozen=True):
+    version: int
+    hubs: tuple[msgspec.Raw, ...] = ()
+
+
+def registrations(path: Path) -> tuple[tuple[PublicationAuthority, ...], list[str]]:
+    """Every other Hub this machine is registered at (wire 67), as the Host writes them
+    beside the closed default-Hub grant, and what was not read. A newer, unreadable or
+    partly unreadable document confers what it can and never stops the machine."""
+    try:
+        with path.open("rb") as source:
+            raw = source.read((256 << 10) + 1)
+    except FileNotFoundError:
+        return (), []
+    try:
+        if len(raw) > 256 << 10:
+            raise ValueError("exceeds its bound")
+        document = msgspec.json.decode(raw, type=_Hubs)
+    except (ValueError, msgspec.ValidationError) as exc:
+        return (), [f"{path.name} is unreadable: {exc}"[:512]]
+    if document.version != 1:
+        return (), [f"{path.name} version {document.version} is not one this Runtime reads"]
+    held: list[PublicationAuthority] = []
+    skipped: list[str] = []
+    for entry in document.hubs[:64]:
+        try:
+            hub = msgspec.json.decode(entry, type=_Hub)
+            parse_tensorhub_origin(hub.origin)
+            token = base64.urlsafe_b64decode(hub.worker_token + "=" * (-len(hub.worker_token) % 4))
+            if (
+                not 0 < len(hub.worker_id) <= 128
+                or not hub.worker_id.isprintable()
+                or len(token) != 32
+                or base64.urlsafe_b64encode(token).decode().rstrip("=") != hub.worker_token
+                or (hub.ca and (Path(hub.ca).name != hub.ca or hub.ca in {".", ".."}))
+                or (hub.ca and not (path.parent / hub.ca).is_file())
+            ):
+                raise ValueError("invalid registration")
+            hosts = parse_object_storage_hosts(",".join(sorted(set(hub.object_storage_hosts))))
+        except (ValueError, msgspec.ValidationError, ConfigError) as exc:
+            skipped.append(f"{path.name} entry skipped: {exc}"[:512])
+            continue
+        held.append(
+            PublicationAuthority(
+                hub.origin,
+                hub.worker_id,
+                hub.worker_token,
+                path.parent / hub.ca if hub.ca else None,
+                hosts,
+            )
+        )
+    return tuple(held), skipped
 
 
 class _Token(msgspec.Struct, frozen=True):
