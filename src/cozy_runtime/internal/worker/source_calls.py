@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import IO, Any, get_args, get_type_hints
 
 import msgspec
-import tensorfs
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._errors import AuthorError
@@ -168,7 +167,7 @@ def _native_selection(value: pb.NativeSourceSelection) -> dict[str, Any]:
 
 
 # The CozyTensors format this TensorFS writes, as its typed header declares it.
-OUTPUT_FORMAT: str = get_args(get_type_hints(tensorfs.Header)["format"])[0]
+OUTPUT_FORMAT: str = get_args(get_type_hints(fill.tensorfs_module().Header)["format"])[0]
 
 
 def computation_key(
