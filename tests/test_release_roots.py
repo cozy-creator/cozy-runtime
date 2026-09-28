@@ -438,3 +438,39 @@ def test_a_provider_source_choice_is_made_by_the_machine_once(
             if event.kind == "resolved"
         ]
         assert again == resolved
+
+
+def test_a_published_job_is_a_release_root_the_machine_mints(published: Machine) -> None:
+    """A job by its release: the machine takes its declaration, mints the job invocation and
+    its directive, and names the owner's publication grant; nothing is prepared per call."""
+    machine = published
+    root = pb.ReleaseRoot(
+        package=PACKAGE,
+        release=RELEASE,
+        entrypoint="workflow",
+        job=True,
+        publication_grant="cozytest/_job-jobbed",
+        installations=[facts(machine)],
+    )
+    request = pb.MachineExecutionSubmit(
+        claim=machine.claim,
+        submission_id="jobbed",
+        offer=pb.AttemptOffer(request_id="jobbed"),
+        payload_canonical_bytes=canonical_json.encode({"shots": 2}),
+        expected_execution_workspace_id=machine.executions.workspace_id,
+        release_root=root,
+    )
+    receipt, _ = submit(machine, request)
+    assert receipt.request_id == "jobbed"
+    assert machine.executions.status(OWNER, "jobbed").state == "queued"
+    offer = machine.executions.offer(OWNER, "jobbed")
+    spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+    assert spec["job"]["job_descriptor_id"].startswith("sha256:")
+    assert spec["job"]["publication_contract"]["grant_id"] == "cozytest/_job-jobbed"
+    assert "serving" not in spec and not offer.placement_id
+    desired = pb.DesiredWorkerState.FromString(
+        base64.b64decode(machine.executions.preparation(OWNER, "jobbed")["state"])
+    )
+    # No declared accelerator and no torch in its lock: a CPU orchestration job.
+    assert desired.job.orchestration and not desired.job.device_count
+    assert desired.job.job_descriptor_id == spec["job"]["job_descriptor_id"]

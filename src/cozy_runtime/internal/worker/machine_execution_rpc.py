@@ -132,6 +132,7 @@ class MachineExecutionRPC:
                 resolves_model_defaults=True,
                 release_roots=self.worker.machine_calls is not None,
                 release_root_sources=self.worker.machine_calls is not None,
+                release_root_jobs=self.worker.machine_calls is not None,
                 input_object_reuse=True,
                 event_wait=True,
                 memo_lookup=self.worker.owner_memo is not None,
