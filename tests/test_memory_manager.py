@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Iterator
@@ -17,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import accel
+from cozy_runtime.internal import accel, proctree
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
 from cozy_runtime.internal.worker.memory import Watch
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -271,3 +273,34 @@ def test_a_group_that_can_name_its_ranks_gives_back_only_the_cards_a_call_needs(
     assert len(steps) == 1 and f"{h3!r}" in steps[0] and "vacated ranks [3] " in steps[0], steps
     assert group.row(h3).held == dict.fromkeys(range(3), 20 * GiB)
     assert group.row(h3).emptied == {3}
+
+
+_EXITS_IN_SCOPE = """
+import sys
+from cozy_runtime.internal import proctree
+proctree.join_executor_cgroup(proctree.CgroupScope(sys.argv[1], int(sys.argv[2])))
+"""
+
+
+@needs_executor
+def test_a_follower_that_exited_first_is_reaped_with_its_group(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a cgroup-scoped host, a rank that exited before its leader was killed is a zombie
+    `cgroup.procs` does not list; the reclaim reaps it from its cgroup, not just the listed."""
+    h3, _qwen = long_form(machine, monkeypatch)
+    hosted = machine.worker.hosted[h3]
+    executor = hosted.supervision.current
+    assert executor is not None
+    scope = executor.scope
+    if not isinstance(scope, proctree.CgroupScope):
+        pytest.skip("this host scopes executors by uid, whose census already sees zombies")
+    rank = subprocess.Popen(
+        [sys.executable, "-c", _EXITS_IN_SCOPE, scope.relative_path, str(scope.inode)]
+    )
+    bound = time.monotonic() + 60  # a hang bound on a loaded box, not a budget
+    while proctree.process_state(proctree.process_identity(rank.pid)) != "Z":
+        assert time.monotonic() < bound
+        time.sleep(0.01)
+    hosted.supervision.retire_current(executor, "the group broke")
+    assert not os.path.exists(f"/proc/{rank.pid}"), "the exited rank was reaped"

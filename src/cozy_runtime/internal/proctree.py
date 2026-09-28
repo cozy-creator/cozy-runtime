@@ -734,6 +734,27 @@ def _cgroup_processes(path: Path) -> set[ProcessIdentity]:
     return found
 
 
+def adopted_zombies(scope: CgroupScope) -> set[ProcessIdentity]:
+    """This process's zombie children that died inside `scope`. cgroup v2 lists no zombie in
+    `cgroup.procs`, so a follower that exited before its leader was killed, and was then
+    adopted by this subreaper, is found only here, by its `/proc/<pid>/cgroup`."""
+    _linux_only("adopted_zombies")
+    me, found = os.getpid(), set()
+    inside = scope.relative_path.rstrip("/")
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        with contextlib.suppress(OSError, ValueError, IndexError, ProcessLookupError):
+            fields = _linux_stat(pid)
+            if fields[0] != "Z" or int(fields[1]) != me:
+                continue
+            path = Path(f"/proc/{pid}/cgroup").read_text().split("::", 1)[1].strip()
+            if path == inside or path.startswith(inside + "/"):
+                found.add(process_identity(pid))
+    return found
+
+
 def cgroup_contains(scope: CgroupScope, process: ProcessIdentity) -> bool:
     """Whether one exact process birth is currently inside this exact cgroup subtree."""
     return process in _cgroup_processes(_scope_path(scope))

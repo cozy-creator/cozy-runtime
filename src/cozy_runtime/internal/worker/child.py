@@ -1284,6 +1284,8 @@ class ExecutorSupervision:
 
     def _reclaim_owner(self, owner: OwnerRecord, why: str) -> ReclaimEvidence:
         owner, known, device = self._stop_and_observe_reclaim(owner, why)
+        if isinstance(owner.scope, proctree.CgroupScope):
+            known |= proctree.adopted_zombies(owner.scope)
         devices = self._device_evidence(known)
         status = self._reap_and_prove_absent(known, owner.process)
         self._remove_scope_and_owner(owner)
