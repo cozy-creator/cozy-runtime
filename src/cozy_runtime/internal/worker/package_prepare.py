@@ -490,10 +490,12 @@ def installation_key(
     locked: package_environment.LockedRequirements,
     python: Path,
 ) -> str:
-    """A published environment's identity: its release, locked closure and interpreter ABI.
+    """A published environment's identity: its release, locked closure, interpreter ABI and
+    the machine SDK its Runtime was chosen against.
 
     Index URLs and wheel locations are where bytes came from, not what was installed, so
-    a mirror change reuses the environment; a different lock or ABI makes a new one.
+    a mirror change reuses the environment; a different lock, ABI or machine Runtime makes a
+    new one, and the superseded one is collected.
     """
     try:
         abi = python_interpreters.probe(python).abi
@@ -504,7 +506,13 @@ def installation_key(
         + ",".join(sorted(row.hashes))
         for row in locked.rows
     )
-    document = {"package": package_name, "release": release, "abi": abi, "rows": rows}
+    document = {
+        "package": package_name,
+        "release": release,
+        "abi": abi,
+        "rows": rows,
+        "sdk": package_installation.machine_sdk(),
+    }
     digest = hashlib.sha256(canonical.write(document)).hexdigest()[:32]
     return package_installation.PUBLISHED_PREFIX + digest
 
@@ -759,6 +767,12 @@ def prepare_package(
                 "package_installation_conflict",
                 "installation ID belongs to another package release",
             )
+        try:
+            installed = package_installation.refresh(
+                install_root, installation_id, cache=dependency_cache
+            )
+        except package_environment.EnvironmentRefusal as exc:
+            raise PreparationRefusal(exc.code, exc.detail) from exc
     elif any(not row.path for row in files):
         # Host removes operation carriers after recording successful installation.
         # Its inventory probe/replay intentionally has names but no transfer paths.

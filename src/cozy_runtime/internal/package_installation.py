@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -10,14 +13,18 @@ import ssl
 import subprocess
 import sys
 import tarfile
+import tomllib
 import uuid
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict
 
 import msgspec
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
 
 from cozy_runtime.internal.config import package_install_environment
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
@@ -30,6 +37,11 @@ IMAGE_UV_CACHE = Path("/opt/cozy/dependency-seed/uv-cache")
 PUBLISHED_PREFIX = "release-"
 #: An account-index URL: its origin, then the path that names it (account, then page or file).
 _ACCOUNT_INDEX = re.compile(rb"https?://[^/\s'\"]+(/v1/index/[A-Za-z0-9._-]+/(?:simple|files)/)")
+#: Cozy's SDK. A lock freezes a package's dependencies, not the Runtime its executor runs:
+#: the package's declared bounds choose that, and everything else installs as locked.
+RUNTIME = "cozy-runtime"
+SDK = (RUNTIME, "tensorfs")
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 class InstallationRecord(TypedDict):
@@ -38,6 +50,19 @@ class InstallationRecord(TypedDict):
     python: NotRequired[str]
     generation: NotRequired[str]
     site_packages: NotRequired[str]
+    #: The base interpreter, the machine SDK the SDK was chosen against, and the SDK installed.
+    interpreter: NotRequired[str]
+    machine: NotRequired[dict[str, str]]
+    sdk: NotRequired[dict[str, str]]
+
+
+def machine_sdk() -> dict[str, str]:
+    """The SDK this machine's Runtime runs, which an installation's SDK is chosen against."""
+    found = {}
+    for name in SDK:
+        with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+            found[name] = importlib.metadata.version(name)
+    return found
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,13 +90,16 @@ def _directory(root: Path, installation_id: str) -> Path:
     return root / "installations" / installation_id
 
 
+def _read_record(directory: Path) -> InstallationRecord:
+    return msgspec.json.decode(
+        (directory / "installation.json").read_bytes(), type=InstallationRecord
+    )
+
+
 def open_installation(root: Path, installation_id: str) -> InstalledEnvironment:
     directory = _directory(root, installation_id)
     try:
-        record = msgspec.json.decode(
-            (directory / "installation.json").read_bytes(),
-            type=InstallationRecord,
-        )
+        record = _read_record(directory)
         python = Path(record.get("python", directory / "venv" / "bin" / "python"))
         generation = Path(record.get("generation", python.parent.parent))
         sites = (
@@ -157,7 +185,7 @@ def _extract(archive: Path, destination: Path) -> None:
         )
 
 
-def _bind_account_index(source: Path, hub: HubIndex | None, environment: dict[str, str]) -> None:
+def _bind_account_index(source: Path, hub: HubIndex | None) -> None:
     """Point a synced project's account-index URLs at this machine's own Hub. A lock names
     that index by its path (account, page, file digest), never by the Hub its author used."""
     for name in ("pyproject.toml", "uv.lock"):
@@ -172,13 +200,195 @@ def _bind_account_index(source: Path, hub: HubIndex | None, environment: dict[st
             )
         path.write_bytes(_ACCOUNT_INDEX.sub(hub.origin.rstrip("/").encode() + rb"\1", raw))
         if hub.ca is not None:
-            # uv trusts one certificate set: the platform's, plus the grant's private Hub CA.
             trusted = source.parent / "hub-ca"
             trusted.mkdir(exist_ok=True)
             shutil.copyfile(hub.ca, trusted / "tensorhub-ca.pem")
-            environment["SSL_CERT_DIR"] = (
-                f"{ssl.get_default_verify_paths().openssl_capath}:{trusted}"
+
+
+def _environment(directory: Path, cache: Path | None) -> dict[str, str]:
+    environment = package_install_environment()
+    if IMAGE_UV_CACHE.is_dir():
+        # The image already contains uv's expanded wheels and index records.
+        # Continue using that normal machine cache for matching and new packages.
+        # Symlinks avoid overlayfs copying the baked Torch payload into each venv;
+        # uv owns resolution, integrity and cache locking, with no Cozy inventory.
+        environment["UV_CACHE_DIR"] = str(IMAGE_UV_CACHE)
+        environment["UV_LINK_MODE"] = "symlink"
+    elif cache is not None:
+        environment["UV_CACHE_DIR"] = str(cache / "uv-cache")
+    if (directory / "hub-ca").is_dir():
+        # uv trusts one certificate set: the platform's, plus the grant's private Hub CA.
+        environment["SSL_CERT_DIR"] = (
+            f"{ssl.get_default_verify_paths().openssl_capath}:{directory / 'hub-ca'}"
+        )
+    return environment
+
+
+def _site(generation: Path) -> Path:
+    sites = list((generation / "lib").glob("python*/site-packages"))
+    if len(sites) != 1:
+        raise EnvironmentRefusal("package_installation_invalid", "venv is incomplete")
+    return sites[0]
+
+
+def _split_runtime(requirements: bytes) -> tuple[bytes, bytes]:
+    """A lock without its Runtime rows, and those rows alone; both keep the index lines."""
+    exact, runtime = [], []
+    for line in requirements.decode().replace("\\\n", " ").splitlines():
+        name = _NAME.match(line.strip())
+        if name is not None and canonicalize_name(name.group()) == RUNTIME:
+            runtime.append(line)
+            continue
+        exact.append(line)
+        if line.strip().startswith("--"):
+            runtime.append(line)
+    rows = "\n".join(runtime) + "\n" if any(_NAME.match(row.strip()) for row in runtime) else ""
+    return ("\n".join(exact) + "\n").encode(), rows.encode()
+
+
+def _select_sdk(
+    site: Path,
+    declared: list[str],
+    constraints: Path,
+    install: Callable[[list[str]], None],
+    as_locked: Callable[[], None],
+) -> None:
+    """Install the SDK the requirements admit (the installed distributions' and `declared`):
+    this machine's own Runtime and TensorFS, else the newest published Runtime they admit
+    (TensorFS as installed, where that Runtime accepts it), else the lock's own. Every other
+    distribution stays as installed."""
+    bounds = {name: (SpecifierSet(), frozenset[str]()) for name in SDK}
+    pinned: dict[str, str] = {}
+    requirements = list(declared)
+    for distribution in importlib.metadata.distributions(path=[str(site)]):
+        name = canonicalize_name(distribution.metadata["Name"] or "")
+        if name not in bounds:
+            pinned[name] = distribution.version
+            requirements += distribution.requires or ()
+    for raw in requirements:
+        requirement = Requirement(raw)
+        wanted = canonicalize_name(requirement.name)
+        if wanted in bounds and (
+            requirement.marker is None or requirement.marker.evaluate({"extra": ""})
+        ):
+            specifier, extras = bounds[wanted]
+            bounds[wanted] = (specifier & requirement.specifier, extras | requirement.extras)
+    constraints.write_text("".join(f"{name}=={version}\n" for name, version in pinned.items()))
+    mine = machine_sdk()
+    named = {
+        name: name + (f"[{','.join(sorted(extras))}]" if extras else "")
+        for name, (_, extras) in bounds.items()
+    }
+    ranged = [named[name] + str(specifier) for name, (specifier, _) in bounds.items()]
+    preferred = [
+        f"{named[name]}=={mine[name]}"
+        if name in mine and specifier.contains(mine[name], prereleases=True)
+        else named[name] + str(specifier)
+        for name, (specifier, _) in bounds.items()
+    ]
+    for rows in dict.fromkeys((tuple(preferred), tuple(ranged))):
+        with contextlib.suppress(EnvironmentRefusal):
+            install(list(rows))
+            return
+    as_locked()
+
+
+def _build(
+    directory: Path,
+    generation: Path,
+    python: Path,
+    *,
+    package: str,
+    release: str,
+    environment: dict[str, str],
+    lock_fd: int,
+) -> dict[str, str]:
+    """Install an installation's retained inputs into `generation`: the lock exactly, except
+    the Runtime, which the package's bounds choose (`_select_sdk`). Returns the SDK installed."""
+    uv = shutil.which("uv")
+    if uv is None:
+        raise EnvironmentRefusal("package_installation_uv_absent", "uv is required")
+    environment = {**environment, "UV_PROJECT_ENVIRONMENT": str(generation)}
+
+    def run(*argv: str, cwd: Path = directory) -> None:
+        _run([uv, *argv], directory=cwd, environment=environment, lock_fd=lock_fd)
+
+    source = directory / "source"
+    declared: list[str] = []
+    pip = ("pip", "install", "--no-config", "--python", str(generation / "bin" / "python"))
+    if source.is_dir():
+        lock = tomllib.loads((source / "uv.lock").read_text())
+        declared = (
+            tomllib.loads((source / "pyproject.toml").read_text())
+            .get("project", {})
+            .get("dependencies", [])
+        )
+        floating = any(canonicalize_name(row["name"]) == RUNTIME for row in lock.get("package", ()))
+        sync = ("sync", "--frozen", "--no-dev", "--no-python-downloads", "--project", str(source))
+        run(
+            *sync,
+            "--python",
+            str(python),
+            *("--no-install-package", RUNTIME) * floating,
+            cwd=source,
+        )
+
+        def as_locked() -> None:
+            run(*sync, "--python", str(python), "--inexact", cwd=source)
+
+    else:
+        if not (generation / "bin" / "python").is_file():
+            shutil.rmtree(generation, ignore_errors=True)
+            run(
+                *("venv", "--no-project", "--no-config", "--no-python-downloads"),
+                *("--python", str(python), str(generation)),
             )
+        requirements = directory / "requirements.txt"
+        exact, runtime = _split_runtime(
+            requirements.read_bytes() if requirements.is_file() else b""
+        )
+        floating = bool(runtime)
+
+        def hashed(name: str, rows: bytes) -> None:
+            (directory / name).write_bytes(rows)
+            run(*pip, "--require-hashes", "--no-deps", "--requirements", str(directory / name))
+
+        wheels = sorted(str(path) for path in (directory / "wheels").glob("*.whl"))
+        if requirements.is_file():
+            hashed(".exact-requirements.txt", exact)
+        if wheels:
+            run(*pip, "--no-deps", *wheels)
+        elif not requirements.is_file():
+            run(*pip, f"{package.rsplit('/', 1)[-1]}=={release}")
+
+        def as_locked() -> None:
+            hashed(".runtime-requirements.txt", runtime)
+
+    site = _site(generation)
+    if floating:
+        constraints = directory / ".sdk-constraints.txt"
+        _select_sdk(
+            site,
+            declared,
+            constraints,
+            lambda rows: run(*pip, "--constraints", str(constraints), *rows),
+            as_locked,
+        )
+    return {
+        name: distribution.version
+        for distribution in importlib.metadata.distributions(path=[str(site)])
+        if (name := canonicalize_name(distribution.metadata["Name"] or "")) in SDK
+    }
+
+
+def _write_record(directory: Path, generation: Path, record: InstallationRecord) -> None:
+    """Publish the record naming `generation` as the installation's environment."""
+    record["python"] = str(generation / "bin" / "python")
+    record["generation"] = str(generation)
+    record["site_packages"] = str(_site(generation))
+    temporary = directory / ".installation.json"
+    temporary.write_text(json.dumps(record, sort_keys=True) + "\n")
+    os.replace(temporary, directory / "installation.json")
 
 
 def _install(
@@ -195,7 +405,8 @@ def _install(
     hub: HubIndex | None = None,
     lock_fd: int = -1,
 ) -> InstalledEnvironment:
-    """Create a venv without package fingerprints; existing IDs are operation replays only."""
+    """Create a venv without package fingerprints; existing IDs are operation replays only.
+    Its inputs stay in the installation, so a later machine Runtime rebuilds it (`refresh`)."""
     identifier = installation_id or "install-" + uuid.uuid4().hex
     directory = _directory(root, identifier)
     if (directory / "installation.json").is_file():
@@ -208,105 +419,52 @@ def _install(
         return installed
     directory.parent.mkdir(parents=True, exist_ok=True, mode=0o711)
     directory.mkdir(exist_ok=True, mode=0o711)
-    uv = shutil.which("uv")
-    if uv is None:
-        raise EnvironmentRefusal("package_installation_uv_absent", "uv is required")
-    environment = package_install_environment()
-    environment["UV_PROJECT_ENVIRONMENT"] = str(directory / "venv")
-    if IMAGE_UV_CACHE.is_dir():
-        # The image already contains uv's expanded wheels and index records.
-        # Continue using that normal machine cache for matching and new packages.
-        # Symlinks avoid overlayfs copying the baked Torch payload into each venv;
-        # uv owns resolution, integrity and cache locking, with no Cozy inventory.
-        environment["UV_CACHE_DIR"] = str(IMAGE_UV_CACHE)
-        environment["UV_LINK_MODE"] = "symlink"
-    elif cache is not None:
-        environment["UV_CACHE_DIR"] = str(cache / "uv-cache")
-    try:
-        if source_archive is not None:
-            source = directory / "source"
-            if not source.exists():
-                staged_source = directory / ".source-staging"
-                if staged_source.exists():
-                    shutil.rmtree(staged_source)
-                _extract(source_archive, staged_source)
-                os.replace(staged_source, source)
-            _bind_account_index(source, hub, environment)
-            _run(
-                [
-                    uv,
-                    "sync",
-                    "--frozen",
-                    "--no-dev",
-                    "--no-python-downloads",
-                    "--project",
-                    str(source),
-                    "--python",
-                    str(python),
-                ],
-                directory=source,
-                environment=environment,
-                lock_fd=lock_fd,
-            )
-        else:
-            if not (directory / "venv" / "bin" / "python").is_file():
-                if (directory / "venv").exists():
-                    shutil.rmtree(directory / "venv")
-                _run(
-                    [
-                        uv,
-                        "venv",
-                        "--no-project",
-                        "--no-config",
-                        "--no-python-downloads",
-                        "--python",
-                        str(python),
-                        str(directory / "venv"),
-                    ],
-                    directory=directory,
-                    environment=environment,
-                    lock_fd=lock_fd,
-                )
-            command = [
-                uv,
-                "pip",
-                "install",
-                "--no-config",
-                "--python",
-                str(directory / "venv" / "bin" / "python"),
-            ]
-            if requirements:
-                locked = directory / "requirements.txt"
-                locked.write_bytes(requirements)
-                _run(
-                    [*command, "--require-hashes", "--no-deps", "--requirements", str(locked)],
-                    directory=directory,
-                    environment=environment,
-                    lock_fd=lock_fd,
-                )
-            if wheels:
-                _run(
-                    [*command, "--no-deps", *[str(wheel) for wheel in wheels]],
-                    directory=directory,
-                    environment=environment,
-                    lock_fd=lock_fd,
-                )
-            elif not requirements:
-                distribution = package.rsplit("/", 1)[-1]
-                _run(
-                    [*command, f"{distribution}=={release}"],
-                    directory=directory,
-                    environment=environment,
-                    lock_fd=lock_fd,
-                )
-        record = directory / "installation.json"
-        temporary = directory / ".installation.json"
-        temporary.write_text(json.dumps({"package": package, "release": release}) + "\n")
-        os.replace(temporary, record)
-    except Exception:
-        # Retain unpublished uv state for the next operation replay. The process
-        # lock also rides the uv child, so a surviving installer cannot be raced.
-        raise
+    # A failure retains unpublished uv state for the next operation replay. The process
+    # lock also rides the uv child, so a surviving installer cannot be raced.
+    if source_archive is not None:
+        source = directory / "source"
+        if not source.exists():
+            staged_source = directory / ".source-staging"
+            if staged_source.exists():
+                shutil.rmtree(staged_source)
+            _extract(source_archive, staged_source)
+            os.replace(staged_source, source)
+        _bind_account_index(source, hub)
+    else:
+        if requirements:
+            (directory / "requirements.txt").write_bytes(requirements)
+        if wheels:
+            staged = directory / ".wheels-staging"
+            shutil.rmtree(staged, ignore_errors=True)
+            shutil.rmtree(directory / "wheels", ignore_errors=True)
+            staged.mkdir()
+            for wheel in wheels:
+                try:
+                    os.link(wheel, staged / wheel.name)
+                except OSError:
+                    shutil.copyfile(wheel, staged / wheel.name)
+            os.replace(staged, directory / "wheels")
+    generation = directory / "venv"
+    sdk = _build(
+        directory,
+        generation,
+        python,
+        package=package,
+        release=release,
+        environment=_environment(directory, cache),
+        lock_fd=lock_fd,
+    )
+    _write_record(
+        directory,
+        generation,
+        {
+            "package": package,
+            "release": release,
+            "interpreter": str(python),
+            "machine": machine_sdk(),
+            "sdk": sdk,
+        },
+    )
     installed = open_installation(root, identifier)
     return InstalledEnvironment(
         installed.installation_id,
@@ -316,6 +474,38 @@ def _install(
         installed.package,
         installed.release,
     )
+
+
+def refresh(root: Path, installation_id: str, *, cache: Path | None = None) -> InstalledEnvironment:
+    """The installation, rebuilt from its retained inputs as a new generation when its SDK
+    was chosen against another machine Runtime (a Runtime update): its ID names a package
+    revision, not an executor. Executors of the old generation keep its files."""
+    directory = _directory(root, installation_id)
+    with _installation_lock(root, installation_id) as lock_fd:
+        installed = open_installation(root, installation_id)
+        record = _read_record(directory)
+        machine = machine_sdk()
+        retained = (directory / "source").is_dir() or (directory / "wheels").is_dir()
+        if record.get("machine") == machine or not retained:
+            return installed
+        key = hashlib.sha256(json.dumps(machine, sort_keys=True).encode()).hexdigest()[:16]
+        generation = directory / f"venv-{key}"
+        shutil.rmtree(generation, ignore_errors=True)
+        sdk = _build(
+            directory,
+            generation,
+            Path(record.get("interpreter", installed.python)),
+            package=installed.package,
+            release=installed.release,
+            environment=_environment(directory, cache),
+            lock_fd=lock_fd,
+        )
+        record["machine"], record["sdk"] = machine, sdk
+        _write_record(directory, generation, record)
+        for stale in directory.glob("venv*"):
+            if stale not in (generation, installed.generation):
+                shutil.rmtree(stale, ignore_errors=True)
+        return open_installation(root, installation_id)
 
 
 def open_existing_environment(
