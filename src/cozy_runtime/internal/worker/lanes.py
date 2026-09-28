@@ -91,6 +91,8 @@ class LaneRow:
     held: dict[int, int] = field(default_factory=dict)
     #: (entrypoint, shape cell) -> ordinal -> the most it held there during a successful call
     peak: dict[tuple[str, str], dict[int, int]] = field(default_factory=dict)
+    #: ordinals an eviction emptied since the tenant last restored or ran: what it restores
+    emptied: set[int] = field(default_factory=set)
 
     def resident_bytes(self) -> int:
         return sum(self.ledger.resident.values())

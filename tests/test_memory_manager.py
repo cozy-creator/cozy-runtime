@@ -250,3 +250,24 @@ def test_an_executor_that_exits_after_its_withdrawal_is_reaped(
     while hosted.supervision.current is not None or os.path.exists(f"/proc/{executor.pid}"):
         assert time.monotonic() < bound, [e.step for e in worker.activity][-5:]
         time.sleep(0.05)
+
+
+@needs_executor
+def test_a_group_that_can_name_its_ranks_gives_back_only_the_cards_a_call_needs(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reference on card 3 needs H3's bytes there, not on cards 0-2: an executor that
+    says it can vacate ranks gives back rank 3 alone, and restores it before it next runs."""
+    h3, qwen = long_form(machine, monkeypatch)
+    worker = machine.worker
+    group = worker._lane_of(h3)
+    executor = worker.hosted[h3].supervision.current
+    assert executor is not None
+    executor.hello["memory"] = ["vacate_ranks"]
+    lane = worker._lane_of(qwen[3])
+    lane.row(qwen[3]).peak[SHAPE] = {3: 70 * GiB}
+    assert worker.memory.admit(lane, qwen[3], SHAPE, "a reference")
+    steps = [e.step for e in worker.activity if " vacated " in e.step]
+    assert len(steps) == 1 and f"{h3!r}" in steps[0] and "vacated ranks [3] " in steps[0], steps
+    assert group.row(h3).held == dict.fromkeys(range(3), 20 * GiB)
+    assert group.row(h3).emptied == {3}

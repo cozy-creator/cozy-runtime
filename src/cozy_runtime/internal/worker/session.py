@@ -6126,7 +6126,7 @@ class Worker:
         does not fit stays absent and the attempt stages it."""
         missing = row.ledger.missing_resident()
         executor = row.executor()
-        if not missing or executor is None:
+        if not (missing or row.emptied) or executor is None:
             return
         kind = accel.host_backend_family()
         memory = lane.memory(kind)
@@ -6150,6 +6150,8 @@ class Worker:
         row.ledger.device_process = self.read_device_process(executor.pid)
         restored = (reply.get("restored") or {}).get("restored") or {}
         held = (reply.get("restored") or {}).get("held") or {}
+        if not held:
+            row.emptied.clear()
         if gained or restored:
             after = lane.memory(kind)
             # THE OTHER HALF OF A SWAP, MEASURED RATHER THAN INFERRED (cr-100). `restore_ms`

@@ -186,7 +186,7 @@ class MemoryManager:
                 if self.end(other, executor, f"reclaimed for {slot!r} on {why}: {why_dead}"):
                     row.held.clear()
                 continue
-            self._evict(other, other_lane, row, executor, slot, why, measured)
+            self._evict(other, other_lane, row, executor, slot, why, measured, short)
 
     def _victim(
         self, slot: str, short: set[int], tried: set[str]
@@ -201,7 +201,7 @@ class MemoryManager:
                 continue
             if executor.poisoned or not executor.alive():
                 dead.append((other, lane, row, executor))
-            elif row.resident_bytes() or any(row.held.get(o, 0) for o in short):
+            elif any(row.held.get(o, 0) for o in short) or (not row.held and row.resident_bytes()):
                 idle.append((other, lane, row, executor))
         for tier in (dead, idle):
             if tier:
@@ -217,12 +217,20 @@ class MemoryManager:
         slot: str,
         why: str,
         before: Mapping[int, DeviceMemory],
+        short: set[int],
     ) -> None:
-        """Vacate one idle tenant: the process stays warm and its weights leave the device.
-        An executor that refuses or dies is killed and reaped instead: death frees all."""
+        """Vacate one idle tenant: the process stays warm and its weights leave the device,
+        only on `short` cards when it is a group that can say which ranks. An executor that
+        refuses or dies is killed and reaped instead: death frees all."""
+        on = [o for o in lane.ordinals if o in short]
+        ranks = (
+            tuple(lane.ordinals.index(o) for o in on)
+            if lane.group and "vacate_ranks" in executor.hello.get("memory", ())
+            else ()
+        )
         try:
             with executor.watched("vacate"):
-                reply = executor.call(Vacate(), timeout=None)
+                reply = executor.call(Vacate(ranks=ranks), timeout=None)
         except ExecutorGone as exc:
             reply = {"ok": False, "code": "executor_gone", "detail": str(exc)}
         if not reply.get("ok"):
@@ -234,14 +242,19 @@ class MemoryManager:
             if self.end(victim, executor, f"evicted for {slot!r} on {why}"):
                 row.held.clear()
             return
-        if row.supervision is not None and row.supervision.current is executor:
+        current = row.supervision is not None and row.supervision.current is executor
+        if current and (not ranks or 0 in ranks):
             row.ledger.observe_vacate(reply, why)
-        row.held.clear()
+        emptied = on if ranks else list(lane.ordinals)
+        for o in emptied:
+            row.held.pop(o, None)
+        row.emptied.update(emptied)
         after = lane.measure(self.kind)
         self.note(
             "residency",
             f"{lane.lane_id}: {victim!r} (epoch {executor.epoch} pid {executor.pid}) vacated "
-            f"for {slot!r} on {why}: "
+            + (f"ranks {list(ranks)} " if ranks else "")
+            + f"for {slot!r} on {why}: "
             + ", ".join(
                 f"device {o} {before[o].free_bytes} -> {after[o].free_bytes} B free"
                 for o in lane.ordinals
@@ -302,4 +315,6 @@ class MemoryManager:
                 peak[o] = max(peak.get(o, 0), row.held.get(o, 0) + free - seen.low.get(o, free))
         elif forget:
             row.peak.pop(shape, None)
+        if ok:
+            row.emptied.clear()
         self.moved(lane, slot, seen)

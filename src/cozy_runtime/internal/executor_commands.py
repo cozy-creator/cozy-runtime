@@ -60,6 +60,8 @@ class DescribeInstalled(Command, frozen=True, kw_only=True, tag="describe_instal
 
 class Vacate(Command, frozen=True, kw_only=True, tag="vacate"):
     residents: bool = True
+    #: the group ranks that give their weights back; empty is every rank
+    ranks: tuple[int, ...] = ()
 
 
 class Restore(Command, frozen=True, kw_only=True, tag="restore"):

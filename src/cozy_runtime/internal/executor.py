@@ -681,7 +681,7 @@ class Executor:
             case Probe():
                 return self.probe()
             case Vacate():
-                return self.vacate(residents=command.residents)
+                return self.vacate(residents=command.residents, ranks=command.ranks)
             case Restore():
                 return self.restore(names=command.names)
             case Shutdown():
@@ -698,6 +698,8 @@ class Executor:
             "runtime_version": RUNTIME_VERSION,
             "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
             "native_interfaces": native_interfaces.stated(),
+            #: what the worker's memory manager may ask beyond the floor's commands
+            "memory": ["vacate_ranks"],
             "pgid": os.getpgrp(),
             "no_new_privs": _proc_status("NoNewPrivs"),
             "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
@@ -4263,15 +4265,14 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
-    def vacate(self, residents: bool = True) -> dict[str, Any]:
-        """FREE this process's device bytes for another tenant of the lane (cr-022).
+    def vacate(self, residents: bool = True, ranks: tuple[int, ...] = ()) -> dict[str, Any]:
+        """FREE this process's device bytes for another tenant (cr-022), on `ranks` of a
+        group (every rank when empty): only the cards the worker needs are given back.
 
-        The worker calls this BETWEEN attempts — the lane seat guarantees none is in
-        flight here — when a co-tenant's attempt or prepare does not fit beside what this
-        process holds. Every resident construction is parked; the process stays (its epoch
-        does not move; only residency does), `restore` brings the active construction back
-        and an attempt's own admissions stage whatever is still missing. Without
-        `residents` only the allocator's cache goes back and every construction stays.
+        The worker calls this between attempts, when a co-tenant's attempt or load does not
+        fit beside what this process holds. Every resident construction is parked; the
+        process stays, `restore` brings them back and an attempt's own admissions stage
+        whatever is still missing. Without `residents` only the allocator's cache goes back.
         The reply is the probe's after-state plus what moved.
         """
         if self.poisoned:
@@ -4279,20 +4280,24 @@ class Executor:
         empty = {"freed": {}, "held": {}, "freed_bytes": 0}
         if self.torch is None:
             return {**self.probe(), "vacated": empty}
+        chosen = set(ranks) if ranks else set(range(self.world))
+        followers = sorted(rank for rank in chosen if 0 < rank < self.world)
+        command = executor_commands.encode(Vacate(residents=residents))
         if self.group is not None:
-            # EVERY RANK VACATES (cr-068): each replica frees its own card. The reply is
-            # rank 0's; the worker reads the K devices itself, through NVML.
             try:
-                self.group.broadcast(executor_commands.encode(Vacate(residents=residents)))
+                for rank in followers:
+                    self.group.send_one(rank, command)
             except GroupRefusal as exc:
                 return self._group_refusal(exc, closing=False)
-        self._synchronize()
-        try:
-            victims = self.arbiter.victims(exclude="") if residents else []
-            reports = [self.arbiter.park(key) for key in victims]
-        except ResidencyRefusal as exc:
-            return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
-        accel.release_cached(self.torch, self.device_kind)
+        reports: list[Any] = []
+        if 0 in chosen:
+            self._synchronize()
+            try:
+                victims = self.arbiter.victims(exclude="") if residents else []
+                reports = [self.arbiter.park(key) for key in victims]
+            except ResidencyRefusal as exc:
+                return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
+            accel.release_cached(self.torch, self.device_kind)
         vacated = {
             "freed": {k: v for report in reports for k, v in report.get("freed", {}).items()},
             "held": {k: v for report in reports for k, v in report.get("held", {}).items()},
@@ -4304,10 +4309,11 @@ class Executor:
         }
         if self.group is not None:
             try:
-                for reply in self.group.collect("vacate"):
+                for rank in followers:
+                    reply = self.group.reply_one(rank, "vacate")
                     if not reply.get("ok"):
                         raise GroupRefusal(
-                            f"a follower refused to vacate: {reply.get('code')}: "
+                            f"rank {rank} refused to vacate: {reply.get('code')}: "
                             f"{reply.get('detail', '')}"[:600],
                             code="group_broken",
                         )
