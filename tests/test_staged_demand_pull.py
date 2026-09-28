@@ -226,3 +226,31 @@ def test_a_hosted_text_encoder_leaves_rank_0_nothing_to_move(device: Device) -> 
     document = residency.document()
     assert document["hosted"] == ["text_encoder"]
     assert "text_encoder" not in document["evicted"]
+
+
+#: GPU 1 of run 1560 (4xH100, H3 hosting its text encoder): 85_017_493_504 B less the vacated
+#: Qwen executor's context (842 MiB) and this process's bytes outside the allocator (78.28 GiB
+#: in use, 75.35 GiB reserved), so 7.57 GB stay allocatable beside the encoder and the DiT.
+GPU1 = 80_981_451_079
+#: What segment 2 (345 frames + a 56-frame context, ~134k rows) had allocated beyond those
+#: weights when it asked for 452 MiB more and the card had 58.5 MiB left.
+SEGMENT_2_AT_FAILURE = 7_648_016_643
+
+
+def test_run_1560_gpu_1_gives_up_the_text_encoder_only_when_the_segment_is_measured_elsewhere(
+    device: Device,
+) -> None:
+    device.capacity = GPU1
+    residency, backend = plane(device, ("text_encoder", "ref2va_dit"))
+    # The follower homing the encoder runs staged. Segment 2 shared segment 1's cell, so the
+    # 6 s peak counted as measured and the encoder stayed beside a 12 s denoise.
+    residency.open_attempt("component_staged", ENVELOPE, dict(SCOPES), tuple(SCOPES))
+    residency.admit("sample_ref2va_turbo", ("ref2va_dit",))
+    residency.release("sample_ref2va_turbo", ("ref2va_dit",))
+    assert "text_encoder" in backend.components
+    assert device.capacity - device.allocated < SEGMENT_2_AT_FAILURE
+    # At its own, unmeasured cell the denoise frees everything else first.
+    residency.open_attempt("component_staged", ENVELOPE, dict(SCOPES))
+    residency.admit("sample_ref2va_turbo", ("ref2va_dit",))
+    assert sorted(backend.components) == ["ref2va_dit"]
+    assert device.capacity - device.allocated > 7 * SEGMENT_2_AT_FAILURE

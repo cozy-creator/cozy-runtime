@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 
 import msgspec
 
@@ -25,7 +25,7 @@ from cozy_runtime.author._assets import Asset
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import AXES, Shape
 from cozy_runtime.author._signature import AssetInputValue
-from cozy_runtime.author._walker import Node, field_values, value_domain, walk
+from cozy_runtime.author._walker import Node, field_values, is_struct, value_domain, walk
 
 #: Axis-named request fields normalize with zero author involvement. A field named for an
 #: axis IS the declaration; a `Shape` annotation exists only for author-only knowledge.
@@ -52,14 +52,24 @@ class FeatureSpec:
 def feature_specs(payload_type: object) -> tuple[FeatureSpec, ...]:
     """Derive the axes this payload yields. REFUSES an underivable axis at BUILD (§1.2)."""
     specs: list[FeatureSpec] = []
-    for node in _top_level(payload_type):
+    for parent, node in _declaring(payload_type):
+        name = f"{parent}.{node.name}" if parent else node.name
         if (axis := AXIS_FIELDS.get(node.name)) is not None:
-            specs.append(FeatureSpec(axis, node.name, "field"))
+            specs.append(FeatureSpec(axis, name, "field"))
         shape = node.marker(Shape)
         if shape is None:
             continue
         _check_coverage(node, shape)
-        specs += [FeatureSpec(axis, node.name, "shape") for axis in shape.axes()]
+        specs += [FeatureSpec(axis, name, "shape") for axis in shape.axes()]
+    for axis in AXES:
+        fields = [s.field for s in specs if s.axis == axis]
+        if len(fields) > 1:
+            raise ConformanceError(
+                f"axis {axis!r} is declared by {', '.join(fields)}: a request has one value "
+                "per axis, so declare it once",
+                code="duplicate_axis",
+                fields=fields,
+            )
     if any(s.axis in ("width", "height") for s in specs) and not any(
         s.axis == "pixels" for s in specs
     ):
@@ -77,6 +87,21 @@ def feature_specs(payload_type: object) -> tuple[FeatureSpec, ...]:
 
 def _top_level(payload_type: object) -> list[Node]:
     return [node for node in walk(payload_type) if "." not in node.path]
+
+
+def _declaring(payload_type: object) -> list[tuple[str, Node]]:
+    """The fields an axis may be declared on, each with its parent ("" for the request's own):
+    the request's fields and those of each struct-typed field. An invocable's request is its
+    keyword parameters, so its `payload: T` holds the shape one level down (run 1560: every
+    H3 segment shared one cell and a 345-frame call ran on a 158-frame peak)."""
+    own = _top_level(payload_type)
+    return [("", node) for node in own] + [
+        (node.name, child)
+        for node in own
+        if isinstance(node.annotation, type)
+        and (is_struct(node.annotation) or is_dataclass(node.annotation))
+        for child in _top_level(node.annotation)
+    ]
 
 
 #: The widest bounded-int field a preset table may cover; wider is not a preset.
@@ -139,9 +164,9 @@ class RequestFeatures:
 def normalize(payload: object) -> RequestFeatures:
     """Request-time normalization. Same rules as `feature_specs`, applied to VALUES."""
     values: dict[str, int] = {}
-    fields = field_values(payload)
-    for node in _top_level(type(payload)):
-        value = fields.get(node.name)
+    own = field_values(payload)
+    for parent, node in _declaring(type(payload)):
+        value = (field_values(own.get(parent)) if parent else own).get(node.name)
         if (axis := AXIS_FIELDS.get(node.name)) is not None and isinstance(value, int):
             values[axis] = value
         shape = node.marker(Shape)

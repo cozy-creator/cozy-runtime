@@ -1,0 +1,1 @@
+A request's shape cell includes the axes of its typed payload struct, so an invocable's `payload: T` sizes its memory. H3's `long_form` segments had been one cell, and a 12 s segment was admitted on the 6 s segment's peak and ran out of memory on GPU 1 (run 1560). An axis declared twice is refused at build (`duplicate_axis`).

@@ -23,10 +23,12 @@ from cozy_runtime.author import (
     AssetLimits,
     Assets,
     ConformanceError,
+    Context,
     Mixed,
     Preflight,
     Shape,
     describe,
+    invocable,
     prepare,
 )
 from cozy_runtime.author._assets import GrantedInput
@@ -68,7 +70,31 @@ def ref2va_turbo(payload: TurboInput, assets: References, facts: Preflight[Facts
     raise AssertionError("prepare only")
 
 
-def _cell(tmp_path: Path, *, seconds: int, references: int, prompt: str = "a garden") -> str:
+class MotionInput(msgspec.Struct, forbid_unknown_fields=True):
+    """`long_form`'s segment request: an invocable's `payload`, one level below its request."""
+
+    prompt: str
+    seed: int
+    duration_s: DurationSeconds
+    steps: int = 8
+
+
+@invocable
+async def motion_segment_turbo(ctx: Context, *, payload: MotionInput, assets: References) -> Output:
+    raise AssertionError("prepare only")
+
+
+app.entrypoint(internal=True)(motion_segment_turbo)
+
+
+def _cell(
+    tmp_path: Path,
+    *,
+    seconds: int,
+    references: int,
+    prompt: str = "a garden",
+    entrypoint: str = "ref2va_turbo",
+) -> str:
     image = io.BytesIO()
     Image.new("RGB", (4, 4), (0, 90, 0)).save(image, format="PNG")
     raw = image.getvalue()
@@ -86,13 +112,14 @@ def _cell(tmp_path: Path, *, seconds: int, references: int, prompt: str = "a gar
         )
         for index in range(references)
     }
-    wire: dict[str, Any] = {
-        "prompt": prompt,
-        "seed": 41827,
-        "duration_s": seconds,
-        "assets": [{"asset": digest} for _ in range(references)],
-    }
-    return shape_cell(prepare(app.get("ref2va_turbo"), wire, input_metadata=rows).features.values)
+    request: dict[str, Any] = {"prompt": prompt, "seed": 41827, "duration_s": seconds}
+    assets = [{"asset": digest} for _ in range(references)]
+    wire: dict[str, Any] = (
+        {"payload": request, "assets": assets}
+        if entrypoint == "motion_segment_turbo"
+        else {**request, "assets": assets}
+    )
+    return shape_cell(prepare(app.get(entrypoint), wire, input_metadata=rows).features.values)
 
 
 def test_length_and_reference_count_are_the_cell(tmp_path: Path) -> None:
@@ -119,6 +146,42 @@ def test_a_longer_first_request_is_unmeasured_so_staging_frees_the_card(tmp_path
     assert ledger.measured_scopes(ten) == frozenset(peaks)
     assert ledger.measured_scopes(fifteen) == frozenset()
     assert ledger.measured_scopes(_cell(tmp_path, seconds=10, references=5)) == frozenset()
+
+
+def test_an_invocable_payload_carries_its_segment_length_into_the_cell(tmp_path: Path) -> None:
+    """Run 1560: `long_form` calls `motion_segment_turbo(payload=..., assets=...)`, so the
+    length sits one level below the request. Its 6 s and 12 s segments were one cell, and the
+    12 s one kept the text encoder beside a DiT on the 6 s peak and ran out on GPU 1."""
+    describe(app)
+    six = _cell(tmp_path, seconds=6, references=5, entrypoint="motion_segment_turbo")
+    twelve = _cell(tmp_path, seconds=12, references=5, entrypoint="motion_segment_turbo")
+    assert six == f"assets=5,frames={FRAMES[6]},steps=8"
+    assert twelve == f"assets=5,frames={FRAMES[12]},steps=8"
+    ledger = Ledger(worker_pid=1)
+    ledger.begin_generation(1)
+    ledger.device_free = 7 << 30
+    ledger.observe_attempt(
+        msgspec.convert({"activation_peaks": {"sample_ref2va_turbo": 3 << 30}}, Metrics),
+        cell=six,
+        succeeded=True,
+    )
+    assert ledger.measured_scopes(twelve) == frozenset()
+
+
+class Twice(msgspec.Struct):
+    duration_s: DurationSeconds = 5
+
+
+@invocable
+async def twice(ctx: Context, *, payload: Twice, frames: int) -> Output:
+    raise AssertionError("describe only")
+
+
+def test_an_axis_declared_twice_is_refused_at_build() -> None:
+    local = App()
+    local.entrypoint(twice)
+    with pytest.raises(ConformanceError, match=r"frames, payload\.duration_s"):
+        describe(local)
 
 
 class Open(msgspec.Struct):
