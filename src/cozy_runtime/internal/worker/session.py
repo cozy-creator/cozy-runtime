@@ -7042,7 +7042,35 @@ class Worker:
                 f"post_phase_faulted: {type(exc).__name__}: {exc}",
             )
             return
+        self._attention_record(attempt)
         self.send(pb.WorkerFrame(attempt_outcome=outcome))
+
+    def _attention_record(self, attempt: AttemptRecord) -> None:
+        """A request's pin is the run's: whichever of its calls hold attention sites apply
+        it. The run's root records the first call that did, or warns that none did."""
+        pin = str(attempt.spec.get("attention_kernel") or "")
+        owner = self.fence.record_owner_id
+        executions = self.executions
+        if not pin or executions is None or not executions.owns(owner, attempt.request_id):
+            return
+        with contextlib.suppress(WorkspaceRefusal):
+            root = executions.scheduling_root(owner, attempt.request_id)[0]
+            if executions.noticed(owner, root, "attention.applied"):
+                return
+            if attempt.attention_applied:
+                executions.notice(
+                    owner, root, "attention.applied", {"pin": pin, "request": attempt.request_id}
+                )
+            elif root == attempt.request_id:
+                executions.notice(
+                    owner,
+                    root,
+                    "warning",
+                    {
+                        "code": "attention_pin_unapplied",
+                        "message": f"attention pin {pin} was never applied",
+                    },
+                )
 
     def terminate(
         self, attempt: AttemptRecord, build: Callable[..., pb.AttemptOutcome], *args: Any

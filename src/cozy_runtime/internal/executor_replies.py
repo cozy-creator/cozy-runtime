@@ -122,6 +122,8 @@ class AttemptReply(msgspec.Struct, frozen=True, kw_only=True):
     position: int = 0
     execution_observation: dict[str, Json] = {}
     execution: dict[str, Json] = {}
+    #: A request pin some attention site of this call applied.
+    attention_applied: bool = False
     capture: CaptureWritten | None = None
     outputs: tuple[OutputRow, ...] = ()
     frames: tuple[FrameRow, ...] = ()

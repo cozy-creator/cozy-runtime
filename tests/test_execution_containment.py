@@ -106,7 +106,12 @@ class Machine:
     deadline: float
 
     def submit(
-        self, request_id: str, job: str = "nested", timeout_ms: int = 240_000, **payload: Any
+        self,
+        request_id: str,
+        job: str = "nested",
+        timeout_ms: int = 240_000,
+        attention_kernel: str = "",
+        **payload: Any,
     ) -> None:
         submit(
             self.client,
@@ -118,6 +123,7 @@ class Machine:
             job,
             timeout_ms,
             payload,
+            attention_kernel,
         )
 
     def wait(self, ready: Callable[[], bool]) -> None:
@@ -163,6 +169,7 @@ def submit(
     job: str,
     timeout_ms: int,
     payload: dict[str, Any],
+    attention_kernel: str = "",
 ) -> None:
     owner = LocalRecordOwner(
         LocalRequest(
@@ -173,6 +180,7 @@ def submit(
             request_id=request_id,
             job_descriptor_id=binding.job_descriptor_id,
             timeout_ms=timeout_ms,
+            attention_kernel=attention_kernel,
         ),
         {},
         root / f"grants-{request_id}",
@@ -311,6 +319,44 @@ def test_last_segment_empty_context_completes(monkeypatch: pytest.MonkeyPatch) -
         assert (state, ordinal, body.status) == ("succeeded", 1, pb.OUTCOME_STATUS_SUCCEEDED), body
         assert canonical_json.decode(body.result.inline_result) == {"sizes": [9, 9, 0]}
         assert m.worker.phase != pb.WorkerPhase.WORKER_PHASE_FAILED
+        m.idle()
+
+
+@pytest.mark.parametrize("call", ["job", "serving"])
+def test_a_runs_attention_pin_reaches_every_call_and_says_when_none_applied(
+    monkeypatch: pytest.MonkeyPatch, call: str
+) -> None:
+    """long_form's shape: the owner pins the job, whose segments hold the attention sites.
+    Every call carries the pin; a call with no site runs rather than refusing, and a run
+    none of whose calls applied the pin succeeds with a warning on its root."""
+    if call == "serving":
+        monkeypatch.setattr(
+            sys.modules[__name__], "SOURCE", SOURCE.replace("app.job(leaf)", "app.entrypoint(leaf)")
+        )
+    with machine(monkeypatch) as m:
+        m.submit("pinned", attention_kernel="sageattention", segments=2)
+        state, _, body = m.settle("pinned")
+        assert state == "succeeded", body
+        children = m.children("pinned")
+        assert len(children) == 2
+        assert m.worker.workspace is not None and m.worker.executions is not None
+        with m.worker.workspace.locked() as db:
+            specs = [
+                documents.parse(row[0], pb.InvocationSpec)
+                for row in db.execute(
+                    "SELECT invocation FROM attempts WHERE request IN (?,?)", children
+                )
+            ]
+        assert [spec.attention_kernel for spec in specs] == ["sageattention"] * 2
+        events = m.worker.executions.events(m.worker.fence.record_owner_id, "pinned").events
+        warnings = [canonical_json.decode(e.body) for e in events if e.kind == "warning"]
+        assert warnings == [
+            {
+                "code": "attention_pin_unapplied",
+                "message": "attention pin sageattention was never applied",
+            }
+        ]
+        assert not [e for e in events if e.kind == "attention.applied"]
         m.idle()
 
 

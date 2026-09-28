@@ -3178,7 +3178,7 @@ class Executor:
             }
         registration = self.discovered.app.get(command.entrypoint)
         pin = command.attention_kernel
-        if pin:
+        if pin and self._attention_reaches(pin):
             try:
                 self._attention_plan(pin)
             except attention.AttentionRefusal as exc:
@@ -3243,7 +3243,10 @@ class Executor:
                 "runs the record its plan was priced against, and this executor holds none "
                 "(a fresh epoch holds nothing at all)",
             }
-        pin = command.attention_kernel
+        requested = command.attention_kernel
+        # A pin is the run's: a call holding no site in its scope runs its own selection,
+        # and the worker reports a run none of whose calls applied it.
+        pin = requested if requested and self._attention_reaches(requested) else ""
         try:
             if not pin:
                 self._upgrade_attention()
@@ -3428,8 +3431,9 @@ class Executor:
             "position": record.position,
             "outcome": terminal,
             "execution_observation": self._execution_observation(served_attention),
+            "attention_applied": bool(pin),
             "execution": self._execution(
-                pin,
+                requested,
                 served_attention,
                 started_us,
                 released_us,
@@ -3550,6 +3554,12 @@ class Executor:
             for name, root in {**executor.backend.components, **executor.backend.parked}.items():
                 roots[prefix + name] = root
         return roots
+
+    def _attention_reaches(self, pin: str) -> bool:
+        try:
+            return attention.reaches(self._attention_roots(), pin)
+        except attention.AttentionRefusal:
+            return True  # a malformed pin refuses where it is planned
 
     def _attention_device(self, pin: str) -> Any:
         device = next(

@@ -1,0 +1,1 @@
+A request's attention pin is the run's: every child call carries it, a call holding no attention site in its scope runs its own selection instead of refusing, and a run none of whose calls applied it ends with a `warning` execution event (`attention_pin_unapplied`, "attention pin <pin> was never applied") on its root.

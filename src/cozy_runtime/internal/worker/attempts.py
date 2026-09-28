@@ -411,6 +411,7 @@ class AttemptRecord:
     execution_observation: dict[str, Any] = dataclasses_field(default_factory=dict)
     #: the executor's `execution` record: degree, per-rank rows, executor and construction
     execution: dict[str, Any] = dataclasses_field(default_factory=dict)
+    attention_applied: bool = False
     capture_result: CaptureWritten | None = None
 
     #: the record the plan was PRICED against, resolved once by the executor's kernel
@@ -557,7 +558,6 @@ class AttemptEngine:
         self.job_device_count = 0
         self.spool_root = spool_root
         self.instance_id = instance_id
-        #: the dev-mode attention pin of a request that names none (`WorkerOptions`)
         self.send = send
         self.progress = progress
         #: journals that execution STARTED, immediately before the executor is handed the
@@ -1876,6 +1876,7 @@ class AttemptEngine:
         self.monitor.end(key, "returned")
         attempt.execution_observation = dict(reply.execution_observation)
         attempt.execution = dict(reply.execution)
+        attempt.attention_applied = reply.attention_applied
         attempt.capture_result = reply.capture
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
         # whatever came back, success or fault: a failed attempt's activation peak is

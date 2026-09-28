@@ -486,6 +486,7 @@ class Serving:
                     for path, bound in machine_byte_results.paths(target.declaration["result"])
                 ],
                 deadline_unix_ms=parent.deadline_unix_ms,
+                attention_kernel=parent.attention_kernel,
                 serving=pb.ServingInvocationSpec(
                     entrypoint_binding_digest=binding,
                     attempt_binding_id=binding,

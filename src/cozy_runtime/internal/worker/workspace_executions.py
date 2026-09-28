@@ -943,6 +943,16 @@ class Executions:
         with self.workspace.locked() as db, transaction(db):
             return self._event(db, self._row(db, owner, request), kind, raw)
 
+    def noticed(self, owner: str, request: str, kind: str) -> bool:
+        with self.workspace.locked() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM execution_events WHERE owner=? AND request=? AND kind=? LIMIT 1",
+                    (owner, request, kind),
+                ).fetchone()
+                is not None
+            )
+
     def owner_memo(self, owner: str, request: str) -> bool:
         with self.workspace.locked() as db:
             return bool(self._row(db, owner, request)["owner_memo"])

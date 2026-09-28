@@ -272,6 +272,7 @@ class Calls:
                 for output in target.declaration.get("weights_outputs", [])
             ],
             deadline_unix_ms=parent.deadline_ms,
+            attention_kernel=str(parent.spec.get("attention_kernel") or ""),
             job=pb.JobInvocationSpec(
                 installation_id=target.installation_id,
                 job_descriptor_id=target.binding.job_descriptor_id,

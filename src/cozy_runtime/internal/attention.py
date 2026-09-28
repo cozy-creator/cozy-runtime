@@ -852,6 +852,12 @@ def _pin_parts(pin: str) -> tuple[str, str]:
     return component, name
 
 
+def reaches(roots: Mapping[str, object], pin: str) -> bool:
+    """Whether any attention site here falls in the pin's scope."""
+    scope, _ = _pin_parts(pin)
+    return any(_matches(component, scope) for component, _, _, _ in _attention_records(roots))
+
+
 def for_model(pin: str, parameters: Sequence[str]) -> str:
     """Translate an aggregate model/component pin to one construction's local scope."""
     scope, backend = _pin_parts(pin)
