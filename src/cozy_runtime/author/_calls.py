@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import logging
 import math
 import re
 import socket
@@ -38,6 +39,8 @@ from cozy_runtime.author._memo import MemoDependency
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
+
+_LOG = logging.getLogger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -545,9 +548,8 @@ class _Broker:
                 strict=True,
             )
         except (ValueError, TypeError, msgspec.ValidationError) as exc:
-            raise ChildCallError(
-                "child_observation_invalid", "child observation is invalid", call.index
-            ) from exc
+            # An observation is evidence about the child, never its result.
+            _LOG.warning("child call %d: unreadable execution observation: %s", call.index, exc)
 
     @staticmethod
     def _intent(call: PendingCall[Any]) -> ChildCall:

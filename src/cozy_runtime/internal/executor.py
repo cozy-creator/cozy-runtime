@@ -111,6 +111,7 @@ from cozy_runtime.internal import (
     prepare_diagnostics,
     proctree,
     sandbox,
+    tolerant,
 )
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
@@ -4296,7 +4297,7 @@ class Executor:
             elif handoff and frame.get("ok") is True:
                 raise SeamError("seam_descriptor", "successful reply omitted its capability")
         try:
-            return msgspec.convert(frame, into)
+            return tolerant.read(frame, into, ("progress", "observation"))[0]
         except msgspec.ValidationError as exc:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
 
@@ -4512,6 +4513,9 @@ class Executor:
         }
 
 
+#: Telemetry a reply can lose to fit one frame; the worker reads each as optional.
+_SHEDDABLE = ("execution", "attribution")
+
 #: The keys the minimal reply below actually carries. A reply whose own keys are a subset
 #: of these loses nothing by being reduced; anything else would be silently mutilated.
 _MINIMAL_KEYS = frozenset(
@@ -4572,19 +4576,26 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
     """
     held = len(reply.get("observations") or ())
     rows = list(reply.get("observations") or ())
+    # Telemetry the worker reads as optional goes next, before any result is refused.
+    shed = [key for key in _SHEDDABLE if key in reply]
     while True:
         try:
             channel.send(reply)
             return
         except SeamError as exc:
-            if exc.code != "frame_too_large" or not rows:
+            # A telemetry key the seam reads as a credential sheds the same way.
+            if exc.code not in ("frame_too_large", "credential_at_seam") or not (rows or shed):
                 break
-            rows = rows[len(rows) // 2 :]
-            reply["observations"] = rows
-            reply["observation_caps"] = {
-                **(reply.get("observation_caps") or {}),
-                "dropped_for_frame": held - len(rows),
-            }
+            caps = dict(reply.get("observation_caps") or {})
+            if rows:
+                rows = rows[(len(rows) + 1) // 2 :]
+                reply["observations"] = rows
+                caps["dropped_for_frame"] = held - len(rows)
+            else:
+                key = shed.pop()
+                del reply[key]
+                caps[f"dropped_{key}_for_frame"] = 1
+            reply["observation_caps"] = caps
     reduced = not reply.get("ok") or set(reply) <= _MINIMAL_KEYS
     channel.send(
         {
@@ -4619,7 +4630,7 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
             "residency": reply.get("residency") or {},
             "adjustments": reply.get("adjustments") or [],
             "observations": [],
-            "observation_caps": {"dropped_for_frame": held, "minimal_reply": True},
+            "observation_caps": {"dropped_for_frame": held, "minimal_reply": 1},
         }
     )
 

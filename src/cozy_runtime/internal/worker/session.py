@@ -78,6 +78,7 @@ from cozy_runtime.internal import (
     prepare_diagnostics,
     proctree,
     readiness,
+    tolerant,
     weights_sink,
 )
 from cozy_runtime.internal.config import RuntimeConfig
@@ -211,7 +212,7 @@ def _progress_document(frame: Mapping[str, canonical.Json]) -> dict[str, canonic
     if kind != "progress":
         routing = {"event", "request_id", "kind"}
         return {"type": kind, "payload": {k: v for k, v in frame.items() if k not in routing}}
-    progress = msgspec.convert(frame, _Progress)
+    progress, _ = tolerant.read(frame, _Progress, _Progress.__struct_fields__)
     payload = {k: v for k, v in msgspec.structs.asdict(progress).items() if v is not None}
     payload["stage"] = progress.stage[:120]
     return {"type": kind, "payload": payload}

@@ -33,8 +33,10 @@ be able to fail the attempt that produced it. It did — a contract attestation 
 1,744-character line, the refusal escaped device release, and the worker abandoned the
 attempt `EXECUTOR_INVALIDATED`, rebuilt and retried the same 30-step generation forever. So
 values and field values clip to `TEXT_CAP` with a marker and bump `truncated`; a lost tail
-is a fact on `caps()`, exactly like a shed row. NAMES and field KEYS still refuse typed: a
-name is a record's identity, and a clipped identity silently aliases two different records.
+is a fact on `caps()`, exactly like a shed row. An over-cap NAME or KEY keeps a digest of its
+tail, so two records never alias; fields past `FIELDS_CAP` go; a numpy or torch scalar
+unwraps; a number JSON cannot carry exactly (NaN, beyond 2^53) and any other object become
+text. Each is counted, and none raises.
 
 This module is in the AUTHOR package on purpose — the caps must bite where the author code
 emits, and the worker imports the same implementation rather than a second one.
@@ -42,6 +44,7 @@ emits, and the worker imports the same implementation rather than a second one.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import time
@@ -88,16 +91,8 @@ class ObservationRefusal(CapabilityError):
     """A record the emit boundary will not admit. Typed, and never a silent drop."""
 
 
-def _identifier(value: str, cap: int, what: str) -> str:
-    """An observation's NAME or field KEY. Over-cap refuses: clipping would alias records."""
-    if len(value) > cap:
-        raise ObservationRefusal(
-            f"{what} is {len(value)} characters, over the {cap}-character cap: an "
-            "observation is a bounded record, and a record that can grow without limit is "
-            "not one",
-            code="observation_too_large",
-        )
-    return value
+#: The widest integer every JSON reader holds exactly (I-JSON).
+_EXACT_INT = (1 << 53) - 1
 
 
 REDACTED = "<redacted>"
@@ -199,26 +194,43 @@ class EventRing:
                 "a schema change, never a new string",
                 code="observation_kind",
             )
-        _identifier(name, NAME_CAP, f"observation name {name[:40]!r}")
-        if isinstance(value, str):
-            value = self._clip(self._redact(value))
-        elif isinstance(value, float) and not math.isfinite(value):
-            raise ObservationRefusal(
-                f"observation {name!r} carries {value!r}, which has no canonical spelling",
-                code="observation_value",
-            )
-        if len(fields) > FIELDS_CAP:
-            raise ObservationRefusal(
-                f"observation {name!r} carries {len(fields)} fields, over the {FIELDS_CAP} cap",
-                code="observation_too_large",
-            )
-        clean: dict[str, Scalar] = {}
-        for key, item in fields.items():
-            _identifier(key, KEY_CAP, f"observation field name {key[:40]!r}")
-            if isinstance(item, str):
-                item = self._clip(self._redact(item))
-            clean[key] = item
-        return Observation(kind, name, value, clean, int(time.time() * 1000), 0)
+        items = list(fields.items())
+        if len(items) > FIELDS_CAP:
+            self.truncated += 1
+            items = items[:FIELDS_CAP]
+        clean = {self._identifier(key, KEY_CAP): self._scalar(item) for key, item in items}
+        return Observation(
+            kind,
+            self._identifier(name, NAME_CAP),
+            self._scalar(value),
+            clean,
+            int(time.time() * 1000),
+            0,
+        )
+
+    def _identifier(self, value: object, cap: int) -> str:
+        """A NAME or KEY; over its cap it keeps a digest of the whole, so none alias."""
+        text = str(value)
+        if len(text) <= cap:
+            return text
+        self.truncated += 1
+        return text[: cap - 9] + "~" + hashlib.sha256(text.encode()).hexdigest()[:8]
+
+    def _scalar(self, value: object) -> Scalar:
+        """Any value as a scalar JSON carries exactly; everything else becomes bounded text."""
+        unwrap = getattr(value, "item", None)  # a numpy or torch scalar
+        if callable(unwrap) and not isinstance(value, (str, bytes)):
+            try:
+                value = unwrap()
+            except (TypeError, ValueError, RuntimeError):
+                value = str(value)
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int) and abs(value) <= _EXACT_INT:
+            return value
+        if isinstance(value, float) and math.isfinite(value):
+            return value
+        return self._clip(self._redact(value if isinstance(value, str) else str(value)))
 
     def _clip(self, text: str) -> str:
         """Bound one VALUE and count it. Never raises — see the module docstring."""

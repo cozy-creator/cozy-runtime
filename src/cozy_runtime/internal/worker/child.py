@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import queue
 import re
@@ -55,6 +56,8 @@ from cozy_runtime.internal.seam import (
     listener,
 )
 from cozy_runtime.internal.worker.plan import PreparedModel
+
+_LOG = logging.getLogger(__name__)
 
 #: How often the worker LOOKS while a spawned executor is dialling back. A sampling
 #: cadence, not a bound: `spawn` waits while the child is alive, and this only says how
@@ -249,7 +252,10 @@ class Executor:
                     )
                 if frame.get("event") == "progress":
                     if on_progress is not None:
-                        on_progress(frame)
+                        try:
+                            on_progress(frame)
+                        except Exception as exc:  # the lossy lane sheds; the call goes on
+                            _LOG.warning("dropped an executor progress frame: %r", exc)
                     continue
                 if frame.get("event") == "request":
                     answer, handoff = respond(frame, on_request)

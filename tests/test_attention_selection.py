@@ -28,7 +28,6 @@ from cozy_runtime.author._observations import (
     NAME_CAP,
     TEXT_CAP,
     EventRing,
-    ObservationRefusal,
 )
 from cozy_runtime.internal import (
     attention,
@@ -700,11 +699,10 @@ def test_an_over_cap_observation_truncates_and_never_faults_the_attempt() -> Non
     ring.emit("log", "note", "short", detail="y" * 8192)
     assert len(str(ring.events[-1].fields["detail"])) == TEXT_CAP
     assert ring.caps()["truncated"] == 2 and ring.caps()["refused"] == 0
-    # A NAME still refuses: it is the record's identity, and clipping one would make two
-    # different records the same record.
-    with pytest.raises(ObservationRefusal) as refused:
-        ring.emit("log", "n" * (NAME_CAP + 1))
-    assert refused.value.code == "observation_too_large"
+    # A NAME over its cap keeps a digest of the whole, so two long names never alias.
+    first, second = ring.emit("log", "n" * (NAME_CAP + 1)), ring.emit("log", "n" * (NAME_CAP + 2))
+    assert len(first.name) == NAME_CAP and first.name != second.name
+    assert ring.caps()["refused"] == 0
 
 
 def test_the_attempt_confession_of_a_huge_value_is_admitted() -> None:
