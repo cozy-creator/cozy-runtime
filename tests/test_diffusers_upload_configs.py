@@ -208,8 +208,9 @@ def test_a_diffusers_upload_carries_each_components_config_and_prepares(
     constructor = json.loads(models[SLOT]["config_bytes"])
     index = next(name for name in files if name.endswith("model_index.json"))
     assert constructor == {**CONFIGS, index.removesuffix(".json"): json.loads(files[index])}
-    store = tensorfs.Store.open(str(workspace.store_root))
-    header = tensorfs.parse_header(store.manifest(manifest["digest"])["header"])
+    raw = tensorfs.Store.open(str(workspace.store_root)).manifest(manifest["digest"])["header"]
+    assert raw is not None
+    header = tensorfs.parse_header(raw)
     assets = {name: row["logical_sha256"] for name, row in header["assets"].items()}
     assert assets == {
         name: hashlib.sha256(files[name]).hexdigest()
