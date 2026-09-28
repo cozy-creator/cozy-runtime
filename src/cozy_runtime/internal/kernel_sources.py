@@ -22,6 +22,8 @@ compiler, so another image or card builds its own entry and never loads this one
 
 from __future__ import annotations
 
+import base64
+import email.parser
 import functools
 import hashlib
 import json
@@ -45,6 +47,8 @@ ROOT = Path("/opt/cozy/kernel-sources")
 INDEX = "index.json"
 #: The artifact every Python source unpacks into.
 PYTHON = "kernel-python"
+#: Recipe fields that set only how many compiler processes a build runs.
+_WIDTH_ONLY = ("extensions", "unit_bytes")
 #: What `setup.py` itself imports, from the registry when the environment lacks it; build-only.
 _BUILD_DEPS = ("setuptools", "wheel", "packaging")
 
@@ -221,6 +225,11 @@ class Recipe:
     env: Mapping[str, str] = field(default_factory=dict)
     #: (file, old, new): a text fix applied to the extracted tree before building
     replace: tuple[tuple[str, str, str], ...] = ()
+    #: the extension modules upstream builds, as many at once as the build is wide
+    extensions: int = 1
+    #: the peak memory of one of its compiler processes, which bounds how wide it runs:
+    #: SageAttention2's largest measured 3.2 GB (cicc on its sm89 kernels)
+    unit_bytes: int = 4 << 30
 
 
 #: Torch 2.14's headers need C++20; every recipe below says so in upstream's own terms.
@@ -231,12 +240,10 @@ RECIPES: dict[str, Recipe] = {
             "sageattention",
             "setup",
             ("sageattention",),
-            # Upstream appends these after its C++17 defaults; one extension at a time.
-            env={
-                "CXX_APPEND_FLAGS": "-std=c++20",
-                "NVCC_APPEND_FLAGS": "-std=c++20 --threads=1",
-                "EXT_PARALLEL": "1",
-            },
+            # Upstream appends these after its C++17 defaults.
+            env={"CXX_APPEND_FLAGS": "-std=c++20", "NVCC_APPEND_FLAGS": "-std=c++20 --threads=1"},
+            # _qattn_sm80, _qattn_sm89, _qattn_sm90 (SM90 only) and _fused.
+            extensions=4,
         ),
         Recipe(
             "sageattn3",
@@ -260,6 +267,8 @@ RECIPES: dict[str, Recipe] = {
                 f"FLASH_ATTENTION_DISABLE_{part}": "TRUE"
                 for part in ("BACKWARD", "SM80", "PAGEDKV", "APPENDKV", "SOFTCAP", "LOCAL")
             },
+            # Upstream's own guidance: its hopper instantiations need several GB per job.
+            unit_bytes=6 << 30,
             # Upstream updates the submodule with git, and off CUDA 12.8 downloads NVIDIA's
             # 12.6/12.8 compilers over this machine's toolkit; build with the toolkit present.
             replace=(
@@ -361,9 +370,14 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
             "cuda": cuda,
             "python": _python(),
             "compiler": compiler(),
-            "recipe": json.loads(json.dumps(asdict(recipe))),
+            # How wide it builds shapes no byte of it.
+            "recipe": json.loads(
+                json.dumps({k: v for k, v in asdict(recipe).items() if k not in _WIDTH_ONLY})
+            ),
         }
     inputs["sources"] = {n: s.sha256 for n, s in sorted(wanted.items())}
+    # 2: every tree carries an installed distribution's dist-info (`kernel_site`).
+    inputs["layout"] = 2
     spec = {
         "recipe": name,
         "sources": {n: asdict(s) for n, s in wanted.items()},
@@ -436,7 +450,9 @@ def build_python(
         for done, row in enumerate(rows, 1):
             if row.get("package"):
                 tree = _extract(row, Path(scratch) / row["name"])
-                shutil.copytree(tree / row["package"], site / Path(row["package"]).name)
+                package = site / Path(row["package"]).name
+                shutil.copytree(tree / row["package"], package)
+                _dist_info(site, row["name"], f"0+{row['version'][:12]}", [package])
             else:
                 _unpack(row, site)
             report(done / len(rows))
@@ -476,14 +492,19 @@ def build_setup(
             for key, value in config.inherited_environment().items()
             if key != "TORCH_CUDA_ARCH_LIST"
         }
+        width = kernel_compile.width(recipe.unit_bytes)
+        parallel = min(recipe.extensions, width)
         environment.update(
             {
-                "MAX_JOBS": str(kernel_compile.jobs()),
+                # Upstream's own knobs: extensions at once, and ninja jobs within each.
+                "EXT_PARALLEL": str(parallel),
+                "MAX_JOBS": str(max(1, width // parallel)),
                 "PYTHONPATH": os.pathsep.join([str(deps), *sys.path]),
                 "PYTHONNOUSERSITE": "1",
                 **recipe.env,
             }
         )
+        site = staging / kernel_cache.SITE
         output = kernel_compile.run(
             [
                 sys.executable,
@@ -492,16 +513,59 @@ def build_setup(
                 "--build-base",
                 str(work / "build"),
                 "--build-lib",
-                str(staging / kernel_cache.SITE),
+                str(site),
+                "egg_info",
+                "--egg-base",
+                str(work),
             ],
             cwd=tree / recipe.subdir,
             env=environment,
             report=report,
         )
+        [info] = work.glob("*.egg-info/PKG-INFO")
+        found = email.parser.Parser().parsestr(info.read_text())
+        _dist_info(site, found["Name"], found["Version"], list(site.iterdir()))
+        units = _units(work / "build")
     return {
         "sources": {name: row["version"] for name, row in sources.items()},
+        "width": width,
+        "extensions_at_once": parallel,
+        "units_ms": dict(sorted(units.items(), key=lambda unit: -unit[1])[:12]),
         "log_tail": output[-400:],
     }
+
+
+def _units(build: Path) -> dict[str, int]:
+    """Each compiled unit's own wall time, from ninja's log: what bounds a wider build."""
+    units: dict[str, int] = {}
+    for log in build.rglob(".ninja_log"):
+        for line in log.read_text().splitlines()[1:]:
+            fields = line.split("\t")
+            if len(fields) == 5 and fields[0].isdigit() and fields[1].isdigit():
+                units[Path(fields[3]).name] = int(fields[1]) - int(fields[0])
+    return units
+
+
+def _dist_info(site: Path, name: str, version: str, installed: list[Path]) -> None:
+    """The installed distribution's record a tree needs to be one: an executor reads a
+    kernel's version and RECORD from it (`kernel_site`)."""
+    info = site / f"{re.sub(r'[-_.]+', '_', name)}-{version}.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+    (info / "INSTALLER").write_text("cozy-runtime\n")
+    files = sorted(
+        path
+        for top in [*installed, info]
+        for path in ([top] if top.is_file() else top.rglob("*"))
+        if path.is_file() and "__pycache__" not in path.parts
+    )
+    rows = []
+    for path in files:
+        data = path.read_bytes()
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        rows.append(f"{path.relative_to(site).as_posix()},sha256={digest},{len(data)}")
+    rows.append(f"{(info / 'RECORD').relative_to(site).as_posix()},,")
+    (info / "RECORD").write_text("\n".join(rows) + "\n")
 
 
 def fetch(root: Path) -> dict[str, Any]:

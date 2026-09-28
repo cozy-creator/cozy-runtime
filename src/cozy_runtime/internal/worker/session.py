@@ -71,6 +71,7 @@ from cozy_runtime.internal import (
     hostfacts,
     job_plan,
     liveness,
+    machine_kernels,
     package_environment,
     package_installation,
     prepare_diagnostics,
@@ -932,6 +933,10 @@ class Worker:
         #: every device byte of this machine, across every executor, package and rank
         self.memory = MemoryManager(self.lanes, self.note, self._end_tenant)
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
+        # Before any executor starts: an older executor reads the image kernel site once.
+        self.machine_kernels = machine_kernels.boot(
+            config.kernel_cache, options.devices, dict(config.child_base_env)
+        )
         self.supervision = ExecutorSupervision(
             root=self.root,
             python=options.python or sys.executable,

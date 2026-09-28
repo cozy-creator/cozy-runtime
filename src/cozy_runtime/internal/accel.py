@@ -310,6 +310,20 @@ def _nvml_device_memory(device: str) -> DeviceMemory | None:
     return _device_memory_of(int(memory.free), int(memory.total))
 
 
+def device_capability(device: str) -> int:
+    """One envelope entry's CUDA capability as `major * 10 + minor` (sm_120 is 120), from
+    the driver, torch-free; zero where NVML is absent or does not know the entry."""
+    library = _nvml_library()
+    handle = _nvml_handle(library, device) if library is not None else None
+    if library is None or handle is None:
+        return 0
+    major, minor = ctypes.c_int(), ctypes.c_int()
+    answer = library.nvmlDeviceGetCudaComputeCapability(
+        handle, ctypes.byref(major), ctypes.byref(minor)
+    )
+    return major.value * 10 + minor.value if answer == _NVML_SUCCESS else 0
+
+
 def _device_memory_of(free: int, total: int) -> DeviceMemory:
     if total <= 0 or free < 0 or free > total:
         return DeviceMemory("unreadable")

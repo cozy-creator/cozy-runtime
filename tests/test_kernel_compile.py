@@ -137,11 +137,12 @@ def test_progress_is_ninjas_and_a_silent_idle_compiler_is_ended(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen: list[float] = []
-    lines = "; ".join(f"print('[{d}/{t}] x')" for d, t in ((1, 2), (2, 2), (1, 4), (4, 4)))
+    units = ((1, 2), (1, 4), (2, 2), (2, 4), (3, 4), (4, 4))  # two extensions at once
+    lines = "; ".join(f"print('[{d}/{t}] x')" for d, t in units)
     output = kernel_compile.run(
         [sys.executable, "-c", lines], cwd=tmp_path, env=os.environ, report=seen.append
     )
-    assert seen == [0.5, 1.0, 0.5, 1.0] and "[4/4] x" in output  # two extensions, 6 units
+    assert seen == [0.5, 1 / 3, 0.5, 2 / 3, 5 / 6, 1.0] and "[4/4] x" in output
     with pytest.raises(kernel_compile.CompileFailed) as failed:
         kernel_compile.run(
             [sys.executable, "-c", "raise SystemExit(3)"],
@@ -184,3 +185,55 @@ def test_learned_artifacts_are_this_machines_and_replay_as_the_same_jobs(tmp_pat
     assert kernel_compile.learned(store, "another-card") == []
     kernel_compile.submit(store, again)
     assert _wait(store, job).state == "ready"
+
+
+def test_the_machines_ordered_builds_are_every_executors(tmp_path: Path) -> None:
+    """The worker claims its boot builds at once and runs them in its order; an executor in
+    its own namespace sees each as compiling while it waits its turn, starts none of its own,
+    and reads it from the worker's namespace once built."""
+    root = _registry(tmp_path / "sources")
+    worker = kernel_cache.Store(tmp_path / "u0")
+    executor = kernel_cache.Store(tmp_path / "u64001", tmp_path / "u0")
+    job = kernel_sources.job(kernel_sources.PYTHON, 89, root)
+    finished: list[tuple[str, str]] = []
+    gate = worker.claim(job.key)  # a build ahead of it in the machine's order
+    assert gate is not None
+    os.close(gate)
+    thread = kernel_compile.in_order(
+        worker,
+        [job],
+        dict(os.environ),
+        lambda done, state: finished.append((done.key.kernel, state.state)),
+    )
+    thread.join()
+    assert finished == [("kernel-python", "ready")]
+    assert kernel_compile.submit(executor, job).state == "ready"
+    assert (
+        executor.entry(job.key)
+        == worker.entry(job.key)
+        == tmp_path / "u0" / job.key.kernel / job.key.digest
+    )
+
+
+def test_an_executor_waits_on_the_machines_claim_and_builds_nothing(tmp_path: Path) -> None:
+    root = _registry(tmp_path / "sources")
+    worker = kernel_cache.Store(tmp_path / "u0")
+    executor = kernel_cache.Store(tmp_path / "u64001", tmp_path / "u0")
+    job = kernel_sources.job(kernel_sources.PYTHON, 89, root)
+    held = worker.claim(job.key)  # the machine's queue holds it, its turn not yet come
+    assert held is not None
+    try:
+        worker.set_state(job.key, {"pid": os.getpid(), "progress": 0.0, "phase": "queued"})
+        started = dict(kernel_compile._STARTED)
+        state = kernel_compile.submit(executor, job)
+        assert state.state == "compiling" and state.detail == "queued", state
+        assert kernel_compile._STARTED == started  # no builder of its own
+    finally:
+        os.close(held)
+    assert kernel_compile.status(executor, job).state == "pending"  # the machine's claim ended
+
+
+def test_a_wide_build_is_as_wide_as_the_cpus_and_memory_this_process_may_use() -> None:
+    cpus = len(os.sched_getaffinity(0))
+    assert 1 <= kernel_compile.width(1) <= cpus
+    assert kernel_compile.width(1 << 60) == 1  # no memory for even one more: still builds
