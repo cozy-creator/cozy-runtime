@@ -133,11 +133,14 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"version={v}\nsha256sums<<SUMS\n{sums}\nSUMS\n")
           PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-dist
-          path: source/dist/
-          if-no-files-found: error
+      # Both jobs run on the one cozy-local runner, and the org's artifact storage quota is
+      # exhausted, so the files pass through a runner-local directory keyed by this run.
+      - name: Hand the release set to publish
+        run: |
+          out="$HOME/actions-runner/_release/cozy-runtime/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          rm -rf "$out" && mkdir -p "$out"
+          cp source/dist/cozy_runtime-* "$out"/
+          ls -l "$out"
 
   publish:
     needs: build
@@ -148,10 +151,10 @@ jobs:
     permissions:
       id-token: write  # PyPI trusted publishing (OIDC)
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-dist
-          path: dist
+      - name: Take the release set build handed over
+        run: |
+          src="$HOME/actions-runner/_release/cozy-runtime/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          rm -rf dist && mkdir dist && cp "$src"/* dist/ && ls -l dist
       - name: Upload set is exactly what build hashed
         env:
           SUMS: ${{ needs.build.outputs.sha256sums }}
