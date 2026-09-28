@@ -26,6 +26,7 @@ from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._calls import _Broker, _CallType
 from cozy_runtime.internal import call_types, static_interface
 from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.executor_commands import CallInterface
 
 SOURCE = """from __future__ import annotations
 import msgspec
@@ -46,7 +47,7 @@ app.job(select)
 
 def installed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[ModuleType, dict[str, Any], Executor]:
+) -> tuple[ModuleType, tuple[CallInterface, ...], Executor]:
     module = "installed_selection"
     monkeypatch.delitem(sys.modules, module, raising=False)
     monkeypatch.delitem(sys.modules, module + "._cozy_runtime_callers", raising=False)
@@ -57,27 +58,22 @@ def installed(
     importlib.invalidate_caches()
     document = static_interface.build(tmp_path)
     imported = importlib.import_module(module)
-    command = {
-        "request_id": "parent",
-        "call_interfaces": [
-            {"module": module, "export": "select", "kind": "job", "interface_document": document}
-        ],
-    }
+    rows = (CallInterface(module=module, export="select", interface_document=document),)
     engine = Executor(cast(Any, None), tmp_path)
-    engine._install_call_proxies(command)
-    return imported, command, engine
+    engine._install_call_proxies(rows)
+    return imported, rows, engine
 
 
 def test_plain_script_returns_installed_public_struct_after_managed_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    imported, command, engine = installed(tmp_path, monkeypatch)
+    imported, rows, engine = installed(tmp_path, monkeypatch)
     binding = imported.__cozy_bindings__["select"]
     assert binding.result is not imported.Selection
     assert binding.python_result is imported.Selection
     # A second installation keeps the actual public type even though the export
     # is already a generated proxy with an Awaitable annotation.
-    engine._install_call_proxies(command)
+    engine._install_call_proxies(rows)
     binding = imported.__cozy_bindings__["select"]
     assert binding.python_result is imported.Selection
     (tmp_path / "selection_client.py").write_text(

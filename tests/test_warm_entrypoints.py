@@ -31,6 +31,7 @@ import pytest
 
 from cozy_runtime.internal import fill, package_interface
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.executor_commands import Restore
 from cozy_runtime.internal.local import (
     LocalRequest,
     stage_development_placement,
@@ -295,7 +296,7 @@ def test_a_parked_component_is_page_warmed_before_its_first_stage(
                 neighbour.close()
                 executor = booted.worker.supervision.current
                 assert executor is not None
-                reply = executor.call({"cmd": "restore", "names": ["unet"]}, timeout=None)
+                reply = executor.call(Restore(names=("unet",)), timeout=None)
                 restored = reply["restored"]
                 assert restored["restored"].get("unet", 0) >= unet * 0.99, restored
                 assert 0 <= restored["read_bytes"] <= restored["restored_bytes"] // 2, restored

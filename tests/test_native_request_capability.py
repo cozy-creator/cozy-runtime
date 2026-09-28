@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import msgspec
 import pytest
 
 from cozy_runtime import canonical_json
@@ -16,6 +17,7 @@ from cozy_runtime.author import CapabilityError
 from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.internal import native_interfaces, source_interfaces
 from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.executor_commands import CallInterface
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.worker import workspace_sources
 from cozy_runtime.internal.worker.machine_sources import Sources
@@ -30,7 +32,7 @@ def _broker(tmp_path: Path, rows: list[dict[str, Any]]) -> Any:
     left, right = socket.socketpair()
     with left, right:
         broker = Executor(Channel(left), tmp_path)._call_broker(
-            {"request_id": "parent", "call_interfaces": rows}
+            "parent", msgspec.convert(rows, tuple[CallInterface, ...])
         )
     broker.bind(fake_context(request_id="parent"))
     return broker

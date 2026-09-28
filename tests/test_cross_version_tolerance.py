@@ -24,6 +24,7 @@ from cozy_runtime.internal import (
     witness,
 )
 from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.executor_commands import CallInterface
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.models.minimax_h3.table_layout import TableLayout
 
@@ -32,7 +33,7 @@ def _broker(tmp_path: Path, rows: list[dict[str, object]]) -> object:
     left, right = socket.socketpair()
     with left, right:
         return Executor(Channel(left), tmp_path)._call_broker(
-            {"request_id": "parent", "call_interfaces": rows}
+            "parent", msgspec.convert(rows, tuple[CallInterface, ...])
         )
 
 

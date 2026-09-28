@@ -25,6 +25,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 
 from cozy_runtime.author._observations import (
@@ -41,12 +42,14 @@ from cozy_runtime.internal import (
     attention_fp8,
     attention_upstream,
     child_env,
+    executor_commands,
     kernel_site,
     package_interface,
 )
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import DeviceFacts
+from cozy_runtime.internal.executor_commands import Binding
 from cozy_runtime.internal.local import LocalRequest, run_slice
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.plan import DeclaredBinding, ModelBinding
@@ -1047,7 +1050,7 @@ def test_a_serving_prepare_carries_no_pin_at_all() -> None:
     served = executor_load_command(
         _binding(), construction="c", devices="0", authorized_device_limit_bytes=7
     )
-    assert "attention_pin" not in served
+    assert "attention_pin" not in executor_commands.encode(served)
     # And nothing can put one there from a `serve` launch: the flag set is CLOSED and does
     # not carry it, so the guard is the absence of a way to say it rather than a condition.
     assert not any("attention" in flag for flag in host._SERVE_FLAGS)
@@ -1064,7 +1067,7 @@ def test_a_pinned_prepare_names_one_kernel_for_every_model_of_the_construction()
         authorized_device_limit_bytes=7,
         attention_pin="sageattention",
     )
-    assert single["attention_pin"] == "sageattention"
+    assert single.attention_pin == "sageattention"
     group = executor_load_command(
         _binding(models=2),
         construction="c",
@@ -1074,8 +1077,8 @@ def test_a_pinned_prepare_names_one_kernel_for_every_model_of_the_construction()
     )
     # It sits on the COMMAND, not inside a model row: `_prepare_many` hands the same value
     # to every child prepare, the way it hands them one device authorization.
-    assert group["attention_pin"] == "sageattention"
-    assert all("attention_pin" not in row["binding"] for row in group["models"])
+    assert executor_commands.encode(group)["attention_pin"] == "sageattention"
+    assert "attention_pin" not in {f.name for f in msgspec.structs.fields(Binding)}
 
 
 @pytest.mark.parametrize(

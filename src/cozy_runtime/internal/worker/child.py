@@ -39,12 +39,13 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime.internal import accel, jit_cache, liveness, proctree, spawn
+from cozy_runtime.internal import accel, executor_commands, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import (
     ALLOWLIST,
     EXECUTOR_SCOPE_ENV,
     FLASH_ATTENTION_CACHE_ENABLED_ENV,
 )
+from cozy_runtime.internal.executor_commands import Command, Hello
 from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
     Channel,
@@ -209,7 +210,7 @@ class Executor:
 
     def call(
         self,
-        command: dict[str, Any],
+        command: Command,
         *,
         timeout: float | None = None,
         total_timeout: float | None = None,
@@ -230,9 +231,9 @@ class Executor:
         # originate on different worker lanes; serializing here prevents their frames and
         # replies from corrupting each other even if a caller violates the higher-level lane.
         with self._calls:
-            name = command["cmd"]
+            name = command.__struct_config__.tag
             deadline = time.monotonic() + total_timeout if total_timeout is not None else None
-            self.channel.send(command)
+            self.channel.send(executor_commands.encode(command))
             while True:
                 try:
                     remaining = None if deadline is None else max(deadline - time.monotonic(), 0)
@@ -927,7 +928,7 @@ class ExecutorSupervision:
             # this spawn merely because it reached the shared listener.  Unlike cold import,
             # hello performs no long work, so a bounded read is a lifecycle requirement.
             executor.hello = executor.call(
-                {"cmd": "hello"}, timeout=HELLO_SECONDS, total_timeout=HELLO_SECONDS
+                Hello(), timeout=HELLO_SECONDS, total_timeout=HELLO_SECONDS
             )
             sealed = executor.hello.get("sealed")
             # An executor from another Runtime version reports its own allowlist: compare

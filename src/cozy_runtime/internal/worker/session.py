@@ -53,7 +53,9 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
+
+import msgspec
 
 from cozy_runtime.internal import (
     accel,
@@ -71,6 +73,19 @@ from cozy_runtime.internal import (
     weights_sink,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
+from cozy_runtime.internal.executor_commands import (
+    Activate,
+    Binding,
+    Budgets,
+    Custody,
+    DescribeInstalled,
+    Load,
+    ModelLoad,
+    Restore,
+    Start,
+    Unload,
+    Vacate,
+)
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker import (
     acquire,
@@ -868,7 +883,7 @@ def executor_load_command(
     sequence_parallel_degree: int = 1,
     parameter_names: Sequence[Sequence[str]] = (),
     attention_pin: str = "",
-) -> dict[str, Any]:
+) -> Load:
     """Translate one resolved callable binding into the executor's closed `load` shape.
 
     `construction` is the binding's construction key: the executor builds it once and
@@ -893,59 +908,52 @@ def executor_load_command(
         if index < len(parameter_names):
             names.update(parameter_names[index])
         models.append(
-            {
-                "binding": {
-                    "application": binding.application,
-                    "package_interface": binding.interface_path,
-                    "development_project": binding.development_project,
-                    "model_class": model.model_class,
-                    "model_binding_path": model.model_binding_path,
-                    "model_parameter_name": model.model_parameter_name,
-                    "model_parameter_names": sorted(names),
-                    "component": model.components[0] if model.components else "",
-                    "components": list(model.components),
-                    "snapshots": dict(model.snapshots),
-                    "store": model.store,
-                    "snapshot": model.reference_snapshot,
-                    "release": binding.release,
-                    "variant": model.variant,
-                    "development": binding.development,
-                    "custody": model.custody,
-                    "objective": model.objective,
-                    "steps_basis": model.steps_basis,
-                    "package": binding.package,
-                    "model": model.model,
-                },
-                "budgets": {"declared_weight_bytes": model.model_weight_bytes},
-            }
+            ModelLoad(
+                binding=Binding(
+                    application=binding.application,
+                    package_interface=binding.interface_path,
+                    development_project=binding.development_project,
+                    model_class=model.model_class,
+                    model_binding_path=model.model_binding_path,
+                    model_parameter_name=model.model_parameter_name,
+                    model_parameter_names=tuple(sorted(names)),
+                    component=model.components[0] if model.components else "",
+                    components=tuple(model.components),
+                    snapshots=dict(model.snapshots),
+                    store=model.store,
+                    snapshot=model.reference_snapshot,
+                    release=binding.release,
+                    variant=model.variant,
+                    development=binding.development,
+                    # The executor's decode refuses any other custody.
+                    custody=cast(Custody, model.custody),
+                    objective=model.objective,
+                    steps_basis=model.steps_basis,
+                    package=binding.package,
+                    model=model.model,
+                ),
+                budgets=Budgets(declared_weight_bytes=model.model_weight_bytes),
+            )
         )
-    command: dict[str, Any] = {
-        "cmd": "load",
-        "construction": construction,
-        "devices": devices,
-        "authorized_device_limit_bytes": int(authorized_device_limit_bytes),
-    }
-    if sequence_parallel_degree > 1:
-        command["sequence_parallel_degree"] = int(sequence_parallel_degree)
-    if attention_pin:
-        command["attention_pin"] = attention_pin
-    if not models:
-        command.update(
-            {
-                "binding": {
-                    "application": binding.application,
-                    "package_interface": binding.interface_path,
-                    "development_project": binding.development_project,
-                    "model_class": "",
-                },
-                "budgets": {},
-            }
+    single = models[0] if len(models) == 1 else None
+    return Load(
+        construction=construction,
+        devices=devices,
+        authorized_device_limit_bytes=int(authorized_device_limit_bytes),
+        sequence_parallel_degree=sequence_parallel_degree,
+        attention_pin=attention_pin,
+        binding=single.binding
+        if single is not None
+        else Binding(
+            application=binding.application,
+            package_interface=binding.interface_path,
+            development_project=binding.development_project,
         )
-    elif len(models) == 1:
-        command.update(models[0])
-    else:
-        command["models"] = models
-    return command
+        if not models
+        else Binding(),
+        budgets=single.budgets if single is not None else Budgets(),
+        models=tuple(models) if len(models) > 1 else msgspec.UNSET,
+    )
 
 
 def _claim_descriptor_headroom() -> None:
@@ -2004,12 +2012,11 @@ class Worker:
                 # work and its death, never by a number of seconds (xs-007 row 8).
                 with executor.watched("describe_installed"):
                     reply = executor.call(
-                        {
-                            "cmd": "describe_installed",
-                            "distribution": distribution,
-                            "application": application,
-                            "output": str(output),
-                        },
+                        DescribeInstalled(
+                            distribution=distribution,
+                            application=application,
+                            output=str(output),
+                        ),
                         timeout=None,
                     )
             except ExecutorProtocolMismatch as exc:
@@ -5082,7 +5089,7 @@ class Worker:
                         ):
                             continue
                     try:
-                        reply = executor.call({"cmd": "unload", "construction": key}, timeout=None)
+                        reply = executor.call(Unload(construction=key), timeout=None)
                     except ExecutorGone as exc:
                         self.note(
                             "residency",
@@ -6103,14 +6110,13 @@ class Worker:
         first = next(iter(tenant.bindings.values()), None)
         if first is None:
             return "prepare refused: every binding"
-        command = {
-            "cmd": "start",
-            "devices": lane.devices,
-            "sequence_parallel_degree": _rank_degree(lane, tenant.bindings.values()),
-            "application": first.application,
-            "package_interface": first.interface_path,
-            "development_project": first.development_project,
-        }
+        command = Start(
+            devices=lane.devices,
+            sequence_parallel_degree=_rank_degree(lane, tenant.bindings.values()),
+            application=first.application,
+            package_interface=first.interface_path,
+            development_project=first.development_project,
+        )
         began = time.perf_counter()
         self.monitor.start(f"start:{placement_id}", "load")
         try:
@@ -6468,11 +6474,7 @@ class Worker:
         try:
             with executor.watched("activate"):
                 reply = executor.call(
-                    {
-                        "cmd": "activate",
-                        "construction": key,
-                        "authorized_device_limit_bytes": authorized,
-                    },
+                    Activate(construction=key, authorized_device_limit_bytes=authorized),
                     timeout=None,
                     on_request=self._room(tenant.lane, tenant.slot),
                 )
@@ -6786,7 +6788,7 @@ class Worker:
             return
         try:
             with executor.watched("restore"):
-                reply = executor.call({"cmd": "restore", "names": sorted(missing)}, timeout=None)
+                reply = executor.call(Restore(names=tuple(sorted(missing))), timeout=None)
         except ExecutorGone as exc:
             row.ledger.device_unreadable(f"the executor died while restoring: {exc}")
             self.note("residency", f"{slot!r} died while restoring: {exc}"[:256])
@@ -7008,7 +7010,7 @@ class Worker:
         fill leg instead of measured (cr-100)."""
         try:
             with executor.watched("vacate"):
-                reply = executor.call({"cmd": "vacate", "residents": residents}, timeout=None)
+                reply = executor.call(Vacate(residents=residents), timeout=None)
         except ExecutorGone as exc:
             row.ledger.device_unreadable(f"the executor died while vacating: {exc}")
             self.note("residency", f"{victim!r} died while vacating: {exc}"[:256])

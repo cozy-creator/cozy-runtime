@@ -8,6 +8,7 @@ import threading
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import proctree
+from cozy_runtime.internal.executor_commands import Probe
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.worker import workspace_recovery
 from cozy_runtime.internal.worker.child import Executor
@@ -34,7 +35,7 @@ def test_executor_event_this_worker_does_not_know_is_skipped() -> None:
     )
     progressed: list[int] = []
     reply = executor.call(
-        {"cmd": "probe"}, timeout=5, on_progress=lambda frame: progressed.append(frame["position"])
+        Probe(), timeout=5, on_progress=lambda frame: progressed.append(frame["position"])
     )
     thread.join()
     ours.close()

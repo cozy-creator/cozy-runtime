@@ -54,8 +54,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import msgspec
+from msgspec import UNSET, UnsetType
+
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime.author._assets import GrantedInput, InputMetadata
+from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
@@ -68,8 +71,8 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._model import Model, _derive_model, component_use
-from cozy_runtime.author._services import MAX_OUTPUT_BYTES, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
+from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import (
     accel,
     attention,
@@ -78,6 +81,7 @@ from cozy_runtime.internal import (
     canonical,
     child_env,
     execution_evidence,
+    executor_commands,
     kernel_cache,
     kernel_site,
     model_config,
@@ -89,6 +93,31 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
+from cozy_runtime.internal.executor_commands import (
+    Activate,
+    Attention,
+    Binding,
+    CallInterface,
+    DescribeInstalled,
+    GroupHardware,
+    Hello,
+    Invoke,
+    Join,
+    KnownCommand,
+    Load,
+    ModelLoad,
+    PrepareRequest,
+    Probe,
+    Release,
+    Residency,
+    Restore,
+    RunJob,
+    Shutdown,
+    Start,
+    Unload,
+    Vacate,
+    Warm,
+)
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.parallel import cp, mirror, wire
 from cozy_runtime.internal.parallel.group import (
@@ -118,7 +147,6 @@ from cozy_runtime.internal.seam import (
     connect,
 )
 from cozy_runtime.internal.worker.plan import shape_cell
-from cozy_runtime.protocol import documents
 
 #: The inline-result door (worker-protocol/01 `ResultEnvelope`): a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
@@ -234,20 +262,13 @@ def _deadline(seconds: float | None) -> float:
     return math.inf if seconds is None else time.monotonic() + seconds
 
 
-def _granted_inputs(command: Mapping[str, Any]) -> dict[str, GrantedInput]:
+def _granted_inputs(command: Invoke | RunJob) -> dict[str, GrantedInput]:
     """Verified input paths, projected identically into either execution lane."""
-    return {
-        input_id: GrantedInput(
-            input_id=input_id,
-            local=Path(row["local"]),
-            file_state=tuple(row["file_state"]) if row.get("file_state") else None,
-            media_type=str(row["media_type"]),
-            digest=str(row["digest"]),
-            length=int(row["length"]),
-            order=int(row.get("order", 0)),
-        )
-        for input_id, row in (command.get("inputs") or {}).items()
-    }
+    return {input_id: row.granted(input_id) for input_id, row in command.inputs.items()}
+
+
+def _trees(command: Invoke | RunJob) -> dict[str, tuple[Path, str]]:
+    return {ref: (Path(root), digest) for ref, (root, digest) in command.trees.items()}
 
 
 def _working_peak(peak: int, at_entry: int, residency: Mapping[str, Any]) -> int:
@@ -502,20 +523,6 @@ _CONSTRUCTION_MODULES = (
 )
 
 
-def _model_parameter_names(binding: Mapping[str, Any]) -> tuple[str, ...]:
-    """Every declared name for this shared construction, including its primary."""
-    return tuple(
-        dict.fromkeys(
-            str(name)
-            for name in (
-                binding.get("model_parameter_name"),
-                *(binding.get("model_parameter_names") or ()),
-            )
-            if name
-        )
-    )
-
-
 def _local_attention_pin(pin: str, parameters: tuple[str, ...]) -> str:
     scope, _ = attention._pin_parts(pin)
     if "/" in scope and scope.split("/", 1)[0] not in parameters:
@@ -629,16 +636,77 @@ class Executor:
 
     # ------------------------------------------------------------------ prepare
 
-    def describe_installed(self, command: dict[str, Any]) -> dict[str, Any]:
-        """Import one installed package and write its interface to brokered scratch."""
+    def handle(self, command: KnownCommand) -> dict[str, Any]:
+        """Answer one decoded worker command (`shutdown` ends the loop before this)."""
+        match command:
+            case Hello():
+                return self.hello()
+            case Join():
+                return self.join(command)
+            case Attention():
+                return self.select_attention(command)
+            case DescribeInstalled():
+                return self.describe_installed(command)
+            case Start():
+                return self.start(command)
+            case Warm():
+                return self.warm(command)
+            case Load():
+                return self.load(command)
+            case Activate():
+                return self.activate(command)
+            case Unload():
+                return self.unload(command)
+            case Residency():
+                return self.residency_document()
+            case PrepareRequest():
+                return self.serve_request(command)
+            case Invoke():
+                return self.serve_invoke(command)
+            case RunJob():
+                return self.run_job(command)
+            case Probe():
+                return self.probe()
+            case Vacate():
+                return self.vacate(residents=command.residents)
+            case Restore():
+                return self.restore(names=command.names)
+            case Shutdown():
+                raise AssertionError("shutdown ends the command loop")
 
-        distribution = str(command.get("distribution", ""))
-        output = Path(str(command.get("output", "")))
-        if not distribution or not output.is_absolute():
+    def hello(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "python_version": platform.python_version(),
+            "python_abi": (sys.implementation.cache_tag or "").replace("cpython-", "cp"),
+            "python_executable": sys.executable,
+            "runtime_version": RUNTIME_VERSION,
+            "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
+            "native_interfaces": native_interfaces.stated(),
+            "pgid": os.getpgrp(),
+            "no_new_privs": _proc_status("NoNewPrivs"),
+            "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
+            "uid": os.getuid(),
+            "euid": os.geteuid(),
+            "sealed": dict(_SEALED),
+            "torch_loaded": "torch" in sys.modules,
+            "kernel_site": kernel_site.current().document(),
+            "rss_bytes": _rss(),
+            "rank": self.rank,
+            "world": self.world,
+        }
+
+    def describe_installed(self, command: DescribeInstalled) -> dict[str, Any]:
+        """Import one installed package and write its interface to brokered scratch."""
+        output = Path(command.output)
+        if not command.distribution or not output.is_absolute():
             return {"ok": False, "code": "package_prepare_path_invalid", "detail": "paths"}
-        application = str(command.get("application", ""))
         discovered = (
-            discover_installed(application) if application else discover_distribution(distribution)
+            discover_installed(command.application)
+            if command.application
+            else discover_distribution(command.distribution)
         )
         body = package_interface.build(discovered)
         raw = package_interface.canonical_bytes(body)
@@ -758,7 +826,7 @@ class Executor:
             return torch.device("cuda", self.rank if self.world > 1 else 0)
         return torch.device("cpu")
 
-    def join(self, command: dict[str, Any]) -> dict[str, Any]:
+    def join(self, command: Join) -> dict[str, Any]:
         """A FOLLOWER joins rank 0's store and forms its half of the process group."""
         if self.rank == 0:
             return {"ok": False, "code": "not_a_follower", "detail": "rank 0 forms the group"}
@@ -771,8 +839,8 @@ class Executor:
         spec = RankSpec(
             rank=self.rank,
             world=self.world,
-            port=int(command["port"]),
-            backend=str(command.get("backend") or "nccl"),
+            port=command.port,
+            backend=command.backend or "nccl",
         )
         if spec.backend == "nccl":
             # This rank's card becomes current HERE, through the one init boundary: the
@@ -1158,7 +1226,7 @@ class Executor:
 
     # ------------------------------------------------------------ the process (proto-061)
 
-    def start(self, command: dict[str, Any]) -> dict[str, Any]:
+    def start(self, command: Start) -> dict[str, Any]:
         """Bring EVERY rank up before any construction: seal, group, torch, package, warmup.
 
         Rank 0 spawns its followers first and hands them this command, so every rank's
@@ -1173,16 +1241,16 @@ class Executor:
         if self.started:
             return self._start_reply([], reused=True)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
-        if str(command.get("devices", "")) != sealed_devices:
+        if command.devices != sealed_devices:
             self.poisoned = "env seal names other devices"
             return {
                 "ok": False,
                 "code": "env_seal_broken",
                 "detail": "this executor is sealed to CUDA_VISIBLE_DEVICES="
-                f"{sealed_devices!r} and the start names {command.get('devices')!r}: "
+                f"{sealed_devices!r} and the start names {command.devices!r}: "
                 "an executor serves exactly its lane's devices",
             }
-        degree = int(command.get("sequence_parallel_degree") or 1)
+        degree = command.sequence_parallel_degree or 1
         expected = self.world if self.rank > 0 else max(degree, 1)
         if degree != expected or (degree > 1 and degree != len(_sealed_entries())):
             self.poisoned = "sequence-parallel degree mismatch"
@@ -1196,8 +1264,7 @@ class Executor:
         _restore_seal()
         try:
             interface = package_interface.read_bytes(
-                Path(str(command.get("package_interface") or "")).read_bytes(),
-                str(command.get("package_interface") or ""),
+                Path(command.package_interface).read_bytes(), command.package_interface
             )
         except (OSError, ValueError) as exc:
             self.poisoned = "start without a readable package interface"
@@ -1242,7 +1309,7 @@ class Executor:
                 if not self.group.followers:
                     self.group.spawn()
                     self.group.dial_back(_SEALED)
-                self.group.broadcast({**command, "cmd": "start"})
+                self.group.broadcast(executor_commands.encode(command))
                 stage("followers_spawned")
             if model_bearing:
                 import torch
@@ -1266,7 +1333,7 @@ class Executor:
                     importlib.import_module(name)
                 stage("runtime_imports")
             if self.discovered is None:
-                self._discover_provisioned(command)
+                self._discover_provisioned(command.release())
             stage("package_import")
             warmup_error = self._warm_package()
             stage("package_warmup")
@@ -1319,7 +1386,7 @@ class Executor:
             "rss_bytes": _rss(),
         }
 
-    def warm(self, command: dict[str, Any]) -> dict[str, Any]:
+    def warm(self, command: Warm) -> dict[str, Any]:
         """The startup warm (h3a-087): a started process with nothing constructed proves, on
         every rank's own card, what its first construction will otherwise pay for there —
         the fused glue's loads and the attention probes of the model's preferred chain and
@@ -1334,7 +1401,7 @@ class Executor:
         started = time.perf_counter()
         try:
             if self.group is not None and self.rank == 0:
-                self.group.broadcast({**command, "cmd": "warm"})
+                self.group.broadcast(executor_commands.encode(command))
             rows = [self._warm_rank()]
             if self.group is not None and self.rank == 0:
                 rows += [reply.get("rank_warm") or {} for reply in self.group.collect("warm")]
@@ -1441,7 +1508,7 @@ class Executor:
     def _refusal(self, code: str, detail: str) -> dict[str, Any]:
         return {"ok": False, "code": code, "detail": detail}
 
-    def load(self, command: dict[str, Any]) -> dict[str, Any]:
+    def load(self, command: Load) -> dict[str, Any]:
         """Construct and fill ONE construction under its key; a loaded key answers again.
 
         The worker names the key (its construction key) and assigns the process-wide
@@ -1457,7 +1524,7 @@ class Executor:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if not self.started:
             return self._refusal("executor_not_started", "load before start")
-        key = str(command.get("construction") or "")
+        key = command.construction
         if not key:
             return self._refusal("construction_key_absent", "a load names its construction")
         loaded = self.constructions.get(key)
@@ -1465,8 +1532,8 @@ class Executor:
             loaded._bind_parameters(command)
             self.arbiter.touch(key)
             return self._load_reply(key, loaded, reused=True)
-        if "authorized_device_limit_bytes" in command:
-            self.authorized = int(command["authorized_device_limit_bytes"])
+        if command.authorized_device_limit_bytes is not UNSET:
+            self.authorized = command.authorized_device_limit_bytes
         child = self._construction_child(key)
         try:
             reply = child._prepare_first(command)
@@ -1483,16 +1550,15 @@ class Executor:
         self._register(key, child, reply)
         return self._load_reply(key, child, reused=False)
 
-    def _bind_parameters(self, command: Mapping[str, Any]) -> None:
+    def _bind_parameters(self, command: Load) -> None:
         """A reload names the construction under every parameter its bindings now spell
         (h3a-018): an added entrypoint over loaded bytes binds the same model object."""
-        rows = command.get("models") or [command]
         members = self.model_executors or [self]
-        for row, member in zip(rows, members, strict=False):
+        for row, member in zip(command.rows(), members, strict=False):
             model = next(iter(member.models.values()), None)
             if model is None:
                 continue
-            for name in _model_parameter_names(row.get("binding") or {}):
+            for name in row.binding.parameter_names():
                 member.models.setdefault(name, model)
                 self.models.setdefault(name, model)
 
@@ -1516,17 +1582,16 @@ class Executor:
             "resident_bytes": row.resident_bytes(),
         }
 
-    def _follower_load(self, command: dict[str, Any]) -> dict[str, Any]:
+    def _follower_load(self, command: Load) -> dict[str, Any]:
         """Rank r's half of rank 0's load: one construction, or one model of a many-model
         construction (`model_key`), filled under rank 0's agreed plan and ceiling."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        key = str(command.get("construction") or "")
-        model_key = command.get("model_key")
-        if not key or (model_key is None and key in self.constructions):
+        key, model_key = command.construction, command.model_key
+        if not key or (model_key is UNSET and key in self.constructions):
             self.poisoned = "rank divergence"
             return self._refusal("rank_divergence", "rank 0 loaded an unnamed or loaded key")
-        if model_key is None:
+        if model_key is UNSET:
             child = self._construction_child(key)
             reply = child._prepare_first(command)
             if not reply.get("ok"):
@@ -1537,9 +1602,7 @@ class Executor:
         container = self.constructions.get(key)
         if container is None:
             container = self._construction_child(key)
-        if not isinstance(model_key, str) or any(
-            member._group_model_key == model_key for member in container.model_executors
-        ):
+        if any(member._group_model_key == model_key for member in container.model_executors):
             self.poisoned = "group model identity changed or was prepared twice"
             return self._refusal("rank_divergence", self.poisoned)
         member = container._construction_child(key)
@@ -1638,7 +1701,7 @@ class Executor:
                 transient = max(transient, peak - resting)
         return settled + transient
 
-    def activate(self, command: dict[str, Any]) -> dict[str, Any]:
+    def activate(self, command: Activate) -> dict[str, Any]:
         """Make one loaded construction the resident, active one.
 
         A resident construction activates in 0 ms. A parked one first parks least recently
@@ -1648,13 +1711,13 @@ class Executor:
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        key = str(command.get("construction") or "")
+        key = command.construction
         if key not in self.constructions:
             return self._refusal(
                 "construction_not_loaded", f"{key!r} is not loaded in this executor"
             )
-        if "authorized_device_limit_bytes" in command:
-            self.authorized = int(command["authorized_device_limit_bytes"])
+        if command.authorized_device_limit_bytes is not UNSET:
+            self.authorized = command.authorized_device_limit_bytes
         started = time.perf_counter()
         row = self.arbiter.rows[key]
         restored: RestoreReport = {"restored": {}, "held": {}, "restored_bytes": 0}
@@ -1662,9 +1725,11 @@ class Executor:
             if self.rank == 0:
                 parked = self._make_room(key, self.arbiter.need(key)) if row.parked else []
                 if self.group is not None:
-                    self.group.broadcast({"cmd": "activate", "construction": key, "park": parked})
+                    self.group.broadcast(
+                        executor_commands.encode(Activate(construction=key, park=tuple(parked)))
+                    )
             else:
-                parked = [str(name) for name in command.get("park") or []]
+                parked = list(command.park)
                 self._park(parked)
             if row.parked is not None:
                 restored = self.arbiter.restore(key)
@@ -1698,17 +1763,17 @@ class Executor:
             "ms": round((time.perf_counter() - started) * 1000, 2),
         }
 
-    def unload(self, command: dict[str, Any]) -> dict[str, Any]:
+    def unload(self, command: Unload) -> dict[str, Any]:
         """Drop one construction: vacate it, release its leases, drop every reference."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        key = str(command.get("construction") or "")
+        key = command.construction
         child = self.constructions.pop(key, None)
         if child is None:
             return {"ok": True, "construction": key, "freed_bytes": 0, "absent": True}
         try:
             if self.rank == 0 and self.group is not None:
-                self.group.broadcast({"cmd": "unload", "construction": key})
+                self.group.broadcast(executor_commands.encode(Unload(construction=key)))
             self._synchronize()
             before = accel.allocated(self.torch, self.device_kind) if self.torch else 0
             self.arbiter.remove(key)
@@ -1788,7 +1853,7 @@ class Executor:
         self.poisoned = poison
 
     def _prepare_first(
-        self, command: dict[str, Any], *, optional_attention_scope: bool = False
+        self, command: Load, *, optional_attention_scope: bool = False
     ) -> dict[str, Any]:
         """Construct and fill one construction (or one model of a many-model one)."""
         if self.poisoned:
@@ -1799,7 +1864,7 @@ class Executor:
                 "generation has no recovery edge to Ready — the worker replaces it",
             }
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
-        if str(command.get("devices", "")) != sealed_devices:
+        if command.devices != sealed_devices:
             # THE SEAL IS THE DEVICE SELECTION (cr-066). The worker names the lane it
             # sealed this process to; a prepare for any other set of devices is a prepare
             # in the wrong process, refused before Torch can pick a card.
@@ -1808,13 +1873,13 @@ class Executor:
                 "ok": False,
                 "code": "env_seal_broken",
                 "detail": "this executor is sealed to CUDA_VISIBLE_DEVICES="
-                f"{sealed_devices!r} and the prepare names {command.get('devices')!r}: "
+                f"{sealed_devices!r} and the prepare names {command.devices!r}: "
                 "an executor serves exactly its lane's devices",
             }
         # THE DEGREE (cr-068): the process started at K; every load names the same K, and a
         # mismatch refuses before any weight moves. Degree 1 (or absent) is a plain
         # executor, whatever the seal's width - a job's envelope lane.
-        degree = int(command.get("sequence_parallel_degree") or 1)
+        degree = command.sequence_parallel_degree or 1
         if degree != max(self.world, 1) or (degree > 1 and degree != len(_sealed_entries())):
             self.poisoned = "sequence-parallel degree mismatch"
             return {
@@ -1828,23 +1893,20 @@ class Executor:
             # THE BROADCAST HARDWARE HALF: the degree and the devices are this rank's own
             # facts already, and a rank 0 that planned for other cards is divergence, not
             # something to fill under.
-            hardware = dict(command.get("group") or {})
-            devices = tuple(str(entry) for entry in hardware.get("devices") or ())
-            if (hardware.get("degree"), devices) != (self.world, _sealed_entries()):
+            hardware = command.group
+            if hardware is UNSET or (hardware.degree, hardware.devices) != (
+                self.world,
+                _sealed_entries(),
+            ):
                 self.poisoned = "rank divergence"
                 return {
                     "ok": False,
                     "code": "rank_divergence",
                     "detail": f"rank {self.rank} is sealed to {list(_sealed_entries())} in a "
-                    f"world of {self.world}; rank 0 broadcast degree {hardware.get('degree')} "
-                    f"over {list(devices)}",
+                    f"world of {self.world}; rank 0 broadcast {hardware}",
                     "rank": self.rank,
                 }
-        if (
-            degree > 1
-            and "models" not in command
-            and not command.get("binding", {}).get("model_class")
-        ):
+        if degree > 1 and command.models is UNSET and not command.binding.model_class:
             self.poisoned = "sequence-parallel construction unsupported"
             return {
                 "ok": False,
@@ -1858,11 +1920,10 @@ class Executor:
                 "code": "group_unformed",
                 "detail": "a group load needs a started process whose ranks have joined",
             }
-        if "models" in command:
-            return self._prepare_many(command)
-        binding = command["binding"]
-        self._group_model_key = f"{self.construction}#{binding.get('model_binding_path', '')}"
-        budgets = command["budgets"]
+        if command.models is not UNSET:
+            return self._prepare_many(command, command.models)
+        binding, budgets = command.binding, command.budgets
+        self._group_model_key = f"{self.construction}#{binding.model_binding_path}"
         started = time.perf_counter()
         # THE SEGMENT LEDGER (cr-102). A `prepare` that reports one total and one fill leg
         # cannot say which of construction, qualification or lease acquisition spent the
@@ -1876,8 +1937,8 @@ class Executor:
             _mark[0] = now
 
         self._stages = stages
-        pin = str(command.get("attention_pin", ""))
-        if not binding.get("model_class"):
+        pin = command.attention_pin
+        if not binding.model_class:
             if pin:
                 # A PIN IS NEVER SILENTLY IGNORED (cr-125). A weightless binding constructs
                 # nothing and therefore holds no attention site, so there is nowhere to put
@@ -1891,10 +1952,11 @@ class Executor:
                 }
             return self._prepare_weightless(binding, started)
         try:
-            attention.admit(_local_attention_pin(pin, _model_parameter_names(binding)), self.world)
+            attention.admit(_local_attention_pin(pin, binding.parameter_names()), self.world)
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)}
-        if "authorized_device_limit_bytes" not in command:
+        authorized = command.authorized_device_limit_bytes
+        if authorized is UNSET:
             # NO SELF-DERIVED CEILING (cr-025/cr-066): the worker assigns one before every
             # model-bearing prepare. An absent assignment is a worker defect, refused
             # rather than defaulted to a read of free bytes.
@@ -1905,7 +1967,6 @@ class Executor:
                 "detail": "the prepare carries no authorized_device_limit_bytes; the worker "
                 "assigns the residence ceiling and this executor derives none",
             }
-        authorized = int(command["authorized_device_limit_bytes"])
 
         _restore_seal()
 
@@ -1933,10 +1994,6 @@ class Executor:
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
         from cozy_runtime.internal.fill import (
-            INFLIGHT,
-            READERS,
-            RING_SLOTS,
-            WINDOW_BYTES,
             Checkpoint,
             FillRefusal,
             StreamingFillBackend,
@@ -1965,12 +2022,13 @@ class Executor:
             assert self.group is not None
             try:
                 self.group.broadcast(
-                    {
-                        **command,
-                        "cmd": "load",
-                        "construction": self.construction,
-                        "group": {"degree": self.world, "devices": list(_sealed_entries())},
-                    }
+                    executor_commands.encode(
+                        msgspec.structs.replace(
+                            command,
+                            construction=self.construction,
+                            group=GroupHardware(degree=self.world, devices=_sealed_entries()),
+                        )
+                    )
                 )
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
@@ -1988,8 +2046,8 @@ class Executor:
         # path, it widened the one that existed. `snapshots` names ONE snapshot per
         # component, because a TensorFS read plan is complete over its header and a
         # partial read of a whole-pipeline snapshot has no representation (tfs-007).
-        names: list[str] = list(binding.get("components") or [binding["component"]])
-        per_component: dict[str, str] = dict(binding.get("snapshots") or {})
+        names = list(binding.components or [binding.component])
+        per_component = dict(binding.snapshots)
 
         # --------------------------------------------------------- PLAN RESOLUTION (#549.1)
         #
@@ -2015,7 +2073,7 @@ class Executor:
         device_index = self.rank if self.world > 1 else 0
         device_facts = measure_device(torch, device_index)
         stage("measure_device")
-        hardware_variant = str(binding.get("variant") or "")
+        hardware_variant = binding.variant
         if not hardware_variant:
             if device_facts.kind != "cuda" or device_facts.sm <= 0:
                 self.poisoned = "modeled accelerator unavailable"
@@ -2028,8 +2086,8 @@ class Executor:
             hardware_variant = f"sm{device_facts.sm}"
         reference = Variant(
             name=hardware_variant,
-            store=binding["store"],
-            snapshot=binding["snapshot"],
+            store=binding.store,
+            snapshot=binding.snapshot,
             snapshots=dict(per_component),
             reference=True,
         )
@@ -2046,7 +2104,7 @@ class Executor:
         stage("checkpoint_headers")
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
         # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
-        runtime_identity = measure_runtime(torch, binding["release"])
+        runtime_identity = measure_runtime(torch, binding.release)
         providers = launch_providers()
         # MEASURED ONCE PER (card, build, providers, dtypes), NOT ONCE PER PREPARE
         # (cr-103). The decode suite is 3.2-6.1 s of every model-bearing prepare and none
@@ -2058,14 +2116,14 @@ class Executor:
             providers,
             device_facts,
             sorted({dtype_name(r.dtype) for r in rows}),
-            release=binding["release"],
+            release=binding.release,
             runtime=runtime_identity,
             cache=_qualification_cache(),
         )
         qualified_pair = (qualification.capabilities, qualification.result)
         stage("qualify")
-        objective = str(binding.get("objective") or "latency")
-        model_cls = getattr(self.discovered.module, binding["model_class"])
+        objective = binding.objective or "latency"
+        model_cls = getattr(self.discovered.module, binding.model_class)
         config_checkpoint = next(
             (
                 checkpoint
@@ -2080,10 +2138,10 @@ class Executor:
             raise RuntimeError("the CozyTensors construction config is not an object")
         stage("construction_config")
         construction = ConstructionFacts(
-            release=str(binding["release"]),
+            release=binding.release,
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             components=tuple(names),
-            custody=str(binding.get("custody", "canonical")),
+            custody=binding.custody,
         )
         # CONSENT IS AN INPUT TO RESOLUTION (#549.1). It used to fire at `materialize`, with
         # the plan already chosen and the package already imported; a plan whose route the
@@ -2101,9 +2159,9 @@ class Executor:
                 construction=construction,
                 facts=facts,
                 objective=objective,
-                placement=str(binding.get("placement") or "all_resident"),
+                placement=binding.placement or "all_resident",
                 encoded_leaves=consent,
-                steps_basis=int(binding.get("steps_basis") or 20),
+                steps_basis=binding.steps_basis or 20,
                 dtype_name=dtype_name,
             )
         except PlanRefusal as exc:
@@ -2113,7 +2171,7 @@ class Executor:
                 "ok": False,
                 "code": exc.code,
                 "detail": str(exc).splitlines()[0][:900],
-                "plan": {"walk": exc.walk, "objective": binding.get("objective")},
+                "plan": {"walk": exc.walk, "objective": binding.objective},
             }
         stage("resolve")
         mine = GroupPlan(
@@ -2132,9 +2190,9 @@ class Executor:
                 self.channel.send(
                     {
                         "event": "progress",
-                        "request_id": f"prepare:{binding['component']}",
+                        "request_id": f"prepare:{binding.component}",
                         "kind": "load",
-                        "name": binding["component"],
+                        "name": binding.component,
                         "value": None,
                         "position": mib,
                     }
@@ -2147,16 +2205,16 @@ class Executor:
             plan=plan,
             device=str(self._rank_device(torch)),
             on_position=position,
-            window_bytes=binding.get("window_bytes", WINDOW_BYTES),
-            slots=binding.get("slots", RING_SLOTS),
-            readers=binding.get("readers", READERS),
-            inflight=binding.get("inflight", INFLIGHT),
-            release=binding["release"],
+            window_bytes=binding.window_bytes,
+            slots=binding.slots,
+            readers=binding.readers,
+            inflight=binding.inflight,
+            release=binding.release,
             # The suite already ran, above, to resolve the plan. Running it a second time
             # here would re-measure a device fact that has not changed.
             qualified=qualified_pair,
             forensics_dir=self.fill_forensics_dir,
-            custody=str(binding.get("custody", "canonical")),
+            custody=binding.custody,
         )
         stage("backend_ctor")
         # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The provisioned binding derives its
@@ -2165,7 +2223,7 @@ class Executor:
         # overhead. Derived buffers remain live beside that overhead, so the complete peak
         # is additive and the larger destination census wins if the two have not yet met.
         # This refusal runs before allocation instead of discovering an OOM mid-fill.
-        declared = int(budgets["declared_weight_bytes"])
+        declared = budgets.declared_weight_bytes
         envelope = complete_device_envelope(backend.device_envelope(), declared)
         destinations = int(envelope["base_bytes"])
         overhead = int(envelope["fill_overhead_bytes"])
@@ -2310,12 +2368,12 @@ class Executor:
             # through the border is canonical and a serve-time extra key is drift, while a
             # local bind of an un-bordered checkpoint tiers its extras (§1.1). Defaulting
             # to canonical keeps the strict reading for any record that does not say.
-            custody=binding.get("custody", "canonical"),
+            custody=binding.custody,
             unnormalized=model_config.unnormalized(config_checkpoint.header.get("configs")),
         )
         seen = Observations()
         registry = ModelRegistry(
-            release=binding["release"],
+            release=binding.release,
             backend=backend,
             substrate=lambda: serving_substrate(hardware_variant, seen),
         )
@@ -2330,22 +2388,22 @@ class Executor:
             stage("lease_acquire")
             adapter_rows = tuple(
                 AdapterRef(
-                    ref=str(row.get("model_id", row.get("ref", ""))),
-                    scale=float(row.get("scale", 1.0)),
-                    kind=str(row.get("kind", "lora")),
-                    component=str(row.get("component", "")),
-                    source_component=str(row.get("source_component", "")),
-                    family=str(row.get("family", "")),
+                    ref=row.model_id or row.ref,
+                    scale=row.scale,
+                    kind=row.kind,
+                    component=row.component,
+                    source_component=row.source_component,
+                    family=row.family,
                 )
-                for row in binding.get("adapters", ())
+                for row in binding.adapters
             )
             model = registry.acquire(
-                binding["model_binding_path"], model_cls, artifact, adapters=adapter_rows
+                binding.model_binding_path, model_cls, artifact, adapters=adapter_rows
             )
             stage("construct_and_fill")
             optimization, optimization_refusal = apply_anima_execution_plan(
                 model,
-                application=str(binding["application"]),
+                application=binding.application,
                 model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             )
             # THE FUSED GLUE (h3a-015), under the class's `fusion=` consent only: a
@@ -2397,9 +2455,9 @@ class Executor:
                 "ok": False,
                 "code": exc.code,
                 "detail": (
-                    f"{binding.get('package') or binding['application']} "
-                    f"{binding['model_binding_path']} does not fit "
-                    f"{binding.get('model') or reference.snapshot}: {exc.message}"
+                    f"{binding.package or binding.application} "
+                    f"{binding.model_binding_path} does not fit "
+                    f"{binding.model or reference.snapshot}: {exc.message}"
                 )[:900],
                 "fit": exc.fit,
                 "state": backend.state,
@@ -2469,7 +2527,7 @@ class Executor:
                 reply["shortfall"] = {
                     "resource": "vram",
                     "scope": "component_generation",
-                    "needed_bytes": int(budgets["declared_weight_bytes"]),
+                    "needed_bytes": budgets.declared_weight_bytes,
                     "available_bytes": int(free),
                     "evidence_class": "measured",
                 }
@@ -2478,7 +2536,7 @@ class Executor:
         self.registry = registry
         # ONE generation under EVERY parameter name the placement's bindings spell
         # (h3a-018): two entrypoints over one construction share the object.
-        self.models = {name: model for name in _model_parameter_names(binding)}
+        self.models = {name: model for name in binding.parameter_names()}
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY, installed on the constructed
         # generation. From here on, entering a declared scope admits and materializes its
         # set before the body runs; the package cannot observe that it happened.
@@ -2681,7 +2739,7 @@ class Executor:
             # THE CONFESSION (§1.1). "Loudly ignored, never silently" is only true if the
             # ignoring is named where a person and a RecordOwner both see it, so the extras
             # this bind dropped ride the bind result.
-            "custody": binding.get("custody", "canonical"),
+            "custody": binding.custody,
             # THE COMPONENT-USE CONTRACT, as a construction fact. The worker prices a
             # staged rung against it and cannot read it any other way: the declaration lives
             # on the package's class, and that class is only ever imported here.
@@ -2715,24 +2773,16 @@ class Executor:
             "facts": self.facts,
         }
 
-    def _prepare_many(self, command: dict[str, Any]) -> dict[str, Any]:
+    def _prepare_many(self, command: Load, rows: tuple[ModelLoad, ...]) -> dict[str, Any]:
         """Prepare one complete bounded multi-model callable in this device process."""
-
-        rows = command.get("models")
-        if (
-            not isinstance(rows, list)
-            or not 2 <= len(rows) <= 16
-            or any(
-                not isinstance(row, dict) or not {"binding", "budgets"} <= set(row) for row in rows
-            )
-        ):
+        if not 2 <= len(rows) <= 16:
             return {
                 "ok": False,
                 "code": "model_binding_set_invalid",
                 "detail": "models must be an array of 2 through 16 binding rows with budgets",
             }
-        paths = [str(row["binding"].get("model_binding_path", "")) for row in rows]
-        parameters = [str(row["binding"].get("model_parameter_name", "")) for row in rows]
+        paths = [row.binding.model_binding_path for row in rows]
+        parameters = [row.binding.model_parameter_name for row in rows]
         if (
             not all(paths)
             or paths != sorted(set(paths))
@@ -2745,7 +2795,8 @@ class Executor:
                 "detail": "model paths must be sorted unique and parameters must be unique",
             }
 
-        if "authorized_device_limit_bytes" not in command:
+        authorized = command.authorized_device_limit_bytes
+        if authorized is UNSET:
             self.poisoned = "prepare without an authorized device limit"
             return {
                 "ok": False,
@@ -2753,14 +2804,14 @@ class Executor:
                 "detail": "the prepare carries no authorized_device_limit_bytes; the worker "
                 "assigns the residence ceiling and this executor derives none",
             }
-        aggregate_pin = str(command.get("attention_pin", ""))
+        aggregate_pin = command.attention_pin
         try:
             scope, _ = attention._pin_parts(aggregate_pin)
             attention.admit(aggregate_pin, self.world)
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)}
         declared_parameters = tuple(
-            dict.fromkeys(name for row in rows for name in _model_parameter_names(row["binding"]))
+            dict.fromkeys(name for row in rows for name in row.binding.parameter_names())
         )
         if "/" in scope and scope.split("/", 1)[0] not in declared_parameters:
             return {
@@ -2771,30 +2822,27 @@ class Executor:
 
         # ONE authorization for the PROCESS: each model fits under what everything already
         # loaded left of it, measured by this process's own allocator before its fill.
-        authorized = int(command["authorized_device_limit_bytes"])
         children: list[tuple[str, Executor, dict[str, Any]]] = []
         for row in rows:
-            binding = row["binding"]
-            parameter = str(binding["model_parameter_name"])
+            binding = row.binding
+            parameter = binding.model_parameter_name
             child = self._construction_child(self.construction)
             child._group_parent = self
             reply = child._prepare_first(
-                {
-                    **row,
-                    **(
-                        {
-                            "model_key": f"{self.construction}#{binding['model_binding_path']}",
-                            "sequence_parallel_degree": self.world,
-                        }
-                        if self.world > 1
-                        else {}
-                    ),
-                    "devices": command.get("devices", ""),
-                    "authorized_device_limit_bytes": authorized,
-                    "attention_pin": aggregate_pin
-                    if attention.for_model(aggregate_pin, _model_parameter_names(binding))
+                Load(
+                    construction=self.construction,
+                    binding=binding,
+                    budgets=row.budgets,
+                    devices=command.devices,
+                    authorized_device_limit_bytes=authorized,
+                    attention_pin=aggregate_pin
+                    if attention.for_model(aggregate_pin, binding.parameter_names())
                     else "",
-                },
+                    model_key=f"{self.construction}#{binding.model_binding_path}"
+                    if self.world > 1
+                    else UNSET,
+                    sequence_parallel_degree=max(self.world, 1),
+                ),
                 optional_attention_scope=True,
             )
             self.load_parked += child.load_parked
@@ -2991,23 +3039,19 @@ class Executor:
             "facts": self.facts,
         }
 
-    def _discover_provisioned(self, binding: Mapping[str, Any]) -> None:
+    def _discover_provisioned(self, release: Release) -> None:
         """Import the installed release or development source and bind its PackageInterface."""
-
-        application = str(binding.get("application") or "")
-        interface_path = str(binding.get("package_interface") or "")
-        if not application or not interface_path:
+        if not release.application or not release.package_interface:
             raise RuntimeError("executor requires the canonical installed release identity")
-        development_project = str(binding.get("development_project") or "")
         discovered = (
-            discover(Path(development_project))
-            if development_project
-            else discover_installed(application)
+            discover(Path(release.development_project))
+            if release.development_project
+            else discover_installed(release.application)
         )
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 
-    def _prepare_weightless(self, binding: dict[str, Any], started: float) -> dict[str, Any]:
+    def _prepare_weightless(self, binding: Binding, started: float) -> dict[str, Any]:
         """A binding that declares NO MODEL: discover the release, be ready, import nothing.
 
         The whole cold path below is a fill, and there is nothing to fill. Returning here is
@@ -3049,9 +3093,11 @@ class Executor:
 
     # ------------------------------------------------------------------ invoke
 
-    def _target(self, command: Mapping[str, Any], *, attempt: bool) -> Executor | dict[str, Any]:
+    def _target(
+        self, command: PrepareRequest | Invoke, *, attempt: bool
+    ) -> Executor | dict[str, Any]:
         """The construction a request or attempt runs on: the one it names, or the active."""
-        key = str(command.get("construction") or self.active)
+        key = command.construction or self.active
         child = self.constructions.get(key)
         if child is None:
             return {
@@ -3067,13 +3113,13 @@ class Executor:
             }
         return child
 
-    def serve_request(self, command: dict[str, Any]) -> dict[str, Any]:
+    def serve_request(self, command: PrepareRequest) -> dict[str, Any]:
         target = self._target(command, attempt=False)
         if isinstance(target, dict):
             return target
         return target.prepare_request(command)
 
-    def serve_invoke(self, command: dict[str, Any]) -> dict[str, Any]:
+    def serve_invoke(self, command: Invoke) -> dict[str, Any]:
         target = self._target(command, attempt=True)
         if isinstance(target, dict):
             return target
@@ -3088,7 +3134,7 @@ class Executor:
         reply["poisoned"] = self.poisoned
         return reply
 
-    def prepare_request(self, command: dict[str, Any]) -> dict[str, Any]:
+    def prepare_request(self, command: PrepareRequest) -> dict[str, Any]:
         """Resolve ONE request through the kernel's pre-admission half, and retain it.
 
         The worker calls this BEFORE it prices a plan, so the normalized features and
@@ -3109,14 +3155,14 @@ class Executor:
             }
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if self.surface_names.get(command["entrypoint"]) is None:
+        if self.surface_names.get(command.entrypoint) is None:
             return {
                 "ok": False,
                 "code": "unknown_entrypoint",
-                "detail": f"{command['entrypoint']!r} is not an entrypoint of this release",
+                "detail": f"{command.entrypoint!r} is not an entrypoint of this release",
             }
-        registration = self.discovered.app.get(command["entrypoint"])
-        pin = str(command.get("attention_kernel", ""))
+        registration = self.discovered.app.get(command.entrypoint)
+        pin = command.attention_kernel
         if pin:
             try:
                 self._attention_plan(pin)
@@ -3129,14 +3175,7 @@ class Executor:
                 }
         try:
             self._capture_options(command, registration.surface)
-            prepared = prepare(
-                registration,
-                command["payload"],
-                input_metadata={
-                    name: InputMetadata(**row)
-                    for name, row in command.get("input_metadata", {}).items()
-                },
-            )
+            prepared = prepare(registration, command.payload, input_metadata=command.input_metadata)
         except Exception as exc:
             outcome = classify(exc)
             return {
@@ -3147,7 +3186,7 @@ class Executor:
                 "origin": outcome.origin,
                 "fields": list(outcome.fields),
             }
-        self.prepared[command["request_id"]] = prepared
+        self.prepared[command.request_id] = prepared
         # A prepared request the worker never dispatched (a refusal after the plan, a
         # cancel while it queued) would otherwise be retained for the generation's life.
         for stale in list(self.prepared)[: -PREPARED_HELD or None]:
@@ -3162,7 +3201,7 @@ class Executor:
             **prepared.digests(),
         }
 
-    def invoke(self, command: dict[str, Any]) -> dict[str, Any]:
+    def invoke(self, command: Invoke) -> dict[str, Any]:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""
         if not self.ready:
             return {
@@ -3173,34 +3212,34 @@ class Executor:
             }
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        surface = self.surface_names.get(command["entrypoint"])
+        surface = self.surface_names.get(command.entrypoint)
         if surface is None:
             return {
                 "ok": False,
                 "code": "unknown_entrypoint",
-                "detail": f"{command['entrypoint']!r} is not an entrypoint of this release",
+                "detail": f"{command.entrypoint!r} is not an entrypoint of this release",
             }
-        prepared = self.prepared.pop(command["request_id"], None)
+        prepared = self.prepared.pop(command.request_id, None)
         if prepared is None:
             return {
                 "ok": False,
                 "code": "prepared_request_absent",
-                "detail": f"nothing was prepared for {command['request_id']!r}: an attempt "
+                "detail": f"nothing was prepared for {command.request_id!r}: an attempt "
                 "runs the record its plan was priced against, and this executor holds none "
                 "(a fresh epoch holds nothing at all)",
             }
-        pin = str(command.get("attention_kernel", ""))
+        pin = command.attention_kernel
         try:
             swap = self._attention_plan(pin) if pin else None
             self._restore_attention()
         except attention.AttentionRefusal as exc:
             self._restore_attention()
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "origin": "request"}
-        spool = Path(command["spool"])
-        deadline = _deadline(command["deadline_s"])
+        spool = Path(command.spool)
+        deadline = _deadline(command.deadline_s)
         torch = self.torch
         self._attempt_spool = self.host._attempt_spool = spool
-        self.host._attempt_request = command["request_id"]
+        self.host._attempt_request = command.request_id
         if self.group is not None:
             self.group.working_peaks.clear()
             self.group.rank_records.clear()
@@ -3213,20 +3252,17 @@ class Executor:
         # only crosses in the reply crosses never when the process is killed, which is the
         # exact case triage exists for. A seam refusal there is dropped live output, the ONE
         # loss this lane may incur.
-        progress = self._progress_sink(command["request_id"])
+        progress = self._progress_sink(command.request_id)
 
         # The attempt's PLACEMENT RUNG, fixed by the PlanChooser before durable acceptance
         # and applied here. The executor decides nothing: it is handed a rung and obeys it,
         # which is what keeps `all_resident` from quietly starting to swap.
         if self.residency is not None:
             self.residency.open_attempt(
-                str(command.get("placement", "all_resident")),
-                int(command.get("headroom_bytes", 0)),
-                {
-                    str(method): int(value)
-                    for method, value in (command.get("scope_headroom_bytes") or {}).items()
-                },
-                tuple(str(method) for method in command.get("measured_scopes") or ()),
+                command.placement,
+                command.headroom_bytes,
+                command.scope_headroom_bytes,
+                command.measured_scopes,
             )
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
@@ -3256,11 +3292,11 @@ class Executor:
                     envelope, outcome, record = run_prepared(
                         prepared,
                         Invocation(
-                            request_id=command["request_id"],
+                            request_id=command.request_id,
                             spool=spool,
                             deadline=deadline,
                             device=self._device(),
-                            cancel=lambda: _cancelled(self.root, command["request_id"]),
+                            cancel=lambda: _cancelled(self.root, command.request_id),
                             models=self.models,
                             progress=progress,
                             # cr-012: the inputs the WORKER already fetched, verified and spooled.
@@ -3269,13 +3305,10 @@ class Executor:
                             # Input bytes arrive only through the worker grant.
                             # That fence is Python-level (cr-042) — it bounds a buggy package, not a
                             # hostile one, and there is no netns or seccomp under it.
-                            trees={
-                                ref: (Path(root), digest)
-                                for ref, (root, digest) in (command.get("trees") or {}).items()
-                            },
+                            trees=_trees(command),
                             assets=_granted_inputs(command),
-                            max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
-                            max_output_bytes=int(command.get("max_output_bytes", MAX_OUTPUT_BYTES)),
+                            max_input_bytes=command.max_input_bytes or 64 << 20,
+                            max_output_bytes=command.max_output_bytes,
                         ),
                     )
                 if capture is not None and outcome.terminal == "succeeded":
@@ -3283,7 +3316,7 @@ class Executor:
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             if record is None:
-                record = AuthorAttempt(command["request_id"], spool, 0, sink=progress)
+                record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
         if served_attention is not None:
             self._emit_attention(record, served_attention, "attention.selected")
@@ -3428,7 +3461,7 @@ class Executor:
 
     def _prepare_attention(
         self,
-        binding: Mapping[str, Any],
+        binding: Binding,
         roots: Mapping[str, Any],
         pin: str,
         device: Any,
@@ -3437,7 +3470,7 @@ class Executor:
         optional_scope: bool = False,
     ) -> attention.Applied:
         """Select locally while preserving the caller's explicit qualified pin."""
-        local = _local_attention_pin(pin, _model_parameter_names(binding))
+        local = _local_attention_pin(pin, binding.parameter_names())
         scope, _ = attention._pin_parts(local)
         if (
             optional_scope
@@ -3508,12 +3541,13 @@ class Executor:
         chosen = {c: next(iter(k)) for c, k in applied.hosts.items() if len(k) == 1}
         try:
             self.group.broadcast(
-                {
-                    "cmd": "attention",
-                    "construction": self.construction,
-                    "model_key": self._group_model_key,
-                    "adopt": chosen,
-                }
+                executor_commands.encode(
+                    Attention(
+                        construction=self.construction,
+                        model_key=self._group_model_key,
+                        adopt=chosen,
+                    )
+                )
             )
             replies = self.group.collect("attention")
         except GroupRefusal as exc:
@@ -3530,18 +3564,18 @@ class Executor:
                 )
         return None
 
-    def _adopt_attention(self, command: Mapping[str, Any]) -> dict[str, Any]:
+    def _adopt_attention(self, command: Attention, adopt: dict[str, str]) -> dict[str, Any]:
         """A follower's half of `_agree_attention`: take rank 0's kernel per component as
         this construction's prepared selection."""
-        container = self.constructions.get(str(command.get("construction") or ""))
+        container = self.constructions.get(command.construction)
         members = (container.model_executors or [container]) if container is not None else []
-        target = next((m for m in members if m._group_model_key == command.get("model_key")), None)
+        target = next((m for m in members if m._group_model_key == command.model_key), None)
         if self.rank == 0 or target is None or target.backend is None:
             return {"ok": False, "code": "rank_divergence", "detail": "no such construction"}
         roots = {**target.backend.components, **target.backend.parked}
         held = attention.observed(roots).hosts
         try:
-            for component, name in sorted(dict(command["adopt"]).items()):
+            for component, name in sorted(adopt.items()):
                 if set(held.get(component) or ()) == {name}:
                     continue
                 if component not in roots or target.device_facts is None:
@@ -3565,18 +3599,18 @@ class Executor:
             target.attention = replace(target.attention, hosts=hosts)
         return {"ok": True, "rank": self.rank, "hosts": hosts}
 
-    def select_attention(self, command: dict[str, Any]) -> dict[str, Any]:
+    def select_attention(self, command: Attention) -> dict[str, Any]:
         """A FOLLOWER restores its prepared selection and, given rank 0's `pin` for the next
         attempt (empty is the prepared one), holds it and answers what its sites now hold."""
-        if "adopt" in command:
-            return self._adopt_attention(command)
+        if command.adopt is not UNSET:
+            return self._adopt_attention(command, command.adopt)
         self._attention_hold.close()
-        if "pin" not in command:
+        if command.pin is UNSET:
             return {"ok": True, "rank": self.rank}
-        target = self.constructions.get(str(command.get("construction") or ""))
+        target = self.constructions.get(command.construction)
         if self.rank == 0 or target is None:
             return {"ok": False, "code": "rank_divergence", "detail": "no such construction"}
-        pin = str(command["pin"])
+        pin = command.pin
         try:
             swap = target._attention_plan(pin) if pin else None
             held = self._attention_hold.enter_context(
@@ -3588,9 +3622,11 @@ class Executor:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
         return {"ok": True, "rank": self.rank, "hosts": held.hosts}
 
-    def _followers_attention(self, **command: Any) -> list[dict[str, Any]]:
+    def _followers_attention(self, pin: str | UnsetType = UNSET) -> list[dict[str, Any]]:
         assert self.group is not None
-        self.group.broadcast({"cmd": "attention", "construction": self.construction, **command})
+        self.group.broadcast(
+            executor_commands.encode(Attention(construction=self.construction, pin=pin))
+        )
         replies = self.group.collect("attention")
         for reply in (reply for reply in replies if not reply.get("ok")):
             detail = f"rank {reply.get('rank')}: {reply.get('detail', '')}"[:900]
@@ -3616,19 +3652,18 @@ class Executor:
             self._followers_attention()
 
     @staticmethod
-    def _capture_options(command: Mapping[str, Any], surface: Any) -> ActivationCapture | None:
-        import msgspec
-
+    def _capture_options(
+        command: PrepareRequest | Invoke, surface: Any
+    ) -> ActivationCapture | None:
         from cozy_runtime.probe._capture import validate_components
 
-        raw = command.get("capture")
-        if raw is None:
+        if command.capture is None:
             return None
-        options = msgspec.convert(raw, type=ActivationCapture, strict=True)
+        options = msgspec.convert(command.capture, type=ActivationCapture, strict=True)
         validate_components(options, [binding.model_class for binding in surface.model_bindings])
         return options
 
-    def _capture_session(self, command: Mapping[str, Any], surface: Any) -> Any:
+    def _capture_session(self, command: PrepareRequest | Invoke, surface: Any) -> Any:
         from cozy_runtime.author._errors import InvalidRequest
         from cozy_runtime.probe._capture import CaptureSession
 
@@ -3689,66 +3724,40 @@ class Executor:
 
     # ------------------------------------------------------------------ job
 
-    def _job_models(self, surface: Any, command: Mapping[str, Any]) -> dict[str, Any]:
+    def _job_models(self, surface: Any, command: RunJob) -> dict[str, Any]:
         """Create typed Manifest-only Model instances; construct/load no package state."""
         declared = {binding.param: binding for binding in surface.model_bindings}
-        rows = command.get("models")
-        if rows is None:
-            rows = {}
-        if not isinstance(rows, Mapping) or not set(declared) <= set(rows):
-            carried = sorted(str(key) for key in rows) if isinstance(rows, Mapping) else []
+        rows = command.models
+        if not set(declared) <= set(rows):
             raise CapabilityError(
                 f"job declares Model parameters {sorted(declared) or 'none'} and the worker "
-                f"passed {carried if isinstance(rows, Mapping) else 'a non-object'}",
+                f"passed {sorted(rows)}",
                 code="job_model_binding_mismatch",
             )
+        payload = command.payload if isinstance(command.payload, Mapping) else {}
         models: dict[str, Any] = {}
         for parameter in sorted(declared):
-            row = rows[parameter]
-            binding = declared[parameter]
-            if not isinstance(row, Mapping) or row.get("class") != binding.class_key:
+            row, binding = rows[parameter], declared[parameter]
+            if row.class_key != binding.class_key:
                 raise CapabilityError(
                     f"job Model parameter {parameter!r} changed its interface class",
                     code="job_model_class_mismatch",
                 )
-            manifest = str(row.get("manifest", ""))
-            try:
-                length = int(row.get("length", 0))
-            except (TypeError, ValueError) as exc:
-                raise CapabilityError(
-                    f"job Model parameter {parameter!r} has a malformed Manifest length",
-                    code="job_model_manifest_invalid",
-                ) from exc
-            try:
-                digest = documents.raw(manifest)
-            except (documents.DocumentError, ValueError) as exc:
-                raise CapabilityError(
-                    f"job Model parameter {parameter!r} has a malformed Manifest identity",
-                    code="job_model_manifest_invalid",
-                ) from exc
-            if manifest != documents.spell(digest) or length <= 0:
-                raise CapabilityError(
-                    f"job Model parameter {parameter!r} has a noncanonical Manifest ref",
-                    code="job_model_manifest_invalid",
-                )
-            if (
-                surface.invocable
-                and (artifact := command.get("payload", {}).get(parameter)) is not None
-            ):
+            if surface.invocable and (artifact := payload.get(parameter)) is not None:
                 expected = artifact.get("manifest") if isinstance(artifact, Mapping) else None
                 if (
                     not isinstance(expected, Mapping)
-                    or expected.get("digest") != manifest
-                    or expected.get("length") != length
+                    or expected.get("digest") != row.manifest
+                    or expected.get("length") != row.length
                 ):
                     raise CapabilityError(
                         "model call artifact differs from its admitted native input",
                         code="model_artifact_binding",
                     )
-            models[parameter] = _derive_model(binding.model_class, manifest)
+            models[parameter] = _derive_model(binding.model_class, row.manifest)
         return models
 
-    def run_job(self, command: dict[str, Any]) -> dict[str, Any]:
+    def run_job(self, command: RunJob) -> dict[str, Any]:
         """ONE `@app.job`, run to completion through the SAME invocation kernel (cr-009).
 
         Everything structural about a job is here and it is short, which is the point: a job
@@ -3764,7 +3773,7 @@ class Executor:
         3. **Quiescence is proven by what exists.** A torch-free job has no stream that
            could still be moving, so the proof is structural rather than a device query.
         """
-        if command.get("capture") is not None:
+        if command.capture is not None:
             return {
                 "ok": False,
                 "code": "capture_mode",
@@ -3774,8 +3783,8 @@ class Executor:
             }
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        budget = command.get("budget") or {}
-        if int(budget.get("gpu_count", 0)) > 0:
+        budget = command.budget
+        if budget.gpu_count > 0:
             import torch
 
             self.torch = torch
@@ -3784,12 +3793,12 @@ class Executor:
                 return refused
         if self.discovered is None:
             try:
-                self._install_call_proxies(command)
+                self._install_call_proxies(command.call_interfaces)
                 self._discover_provisioned(
-                    {
-                        "application": command["application"],
-                        "package_interface": command["package_interface"],
-                    }
+                    Release(
+                        application=command.application,
+                        package_interface=command.package_interface,
+                    )
                 )
             except Exception as exc:
                 return {
@@ -3797,7 +3806,7 @@ class Executor:
                     "code": "job_release_undiscoverable",
                     "detail": f"{type(exc).__name__}: {exc}"[:1024],
                 }
-        name = command["job"]
+        name = command.job
         surface = self.surface_names.get(name)
         if surface is None or surface.kind != "job":
             return {
@@ -3807,8 +3816,8 @@ class Executor:
                 f"{sorted(s.name for s in self.surface_names.values() if s.kind == 'job')})",
             }
         registration = self.discovered.app.get(name)
-        spool = Path(command["spool"])
-        scratch = Path(command["scratch"]) if command.get("scratch") else None
+        spool = Path(command.spool)
+        scratch = Path(command.scratch) if command.scratch else None
         if scratch is not None:
             scratch.mkdir(parents=True, exist_ok=True)
 
@@ -3879,23 +3888,20 @@ class Executor:
             accel.reset_peak(self.torch, self.device_kind)
         envelope, outcome, record = attempt(
             registration,
-            command["payload"],
+            command.payload,
             Invocation(
-                request_id=command["request_id"],
+                request_id=command.request_id,
                 spool=spool,
-                deadline=_deadline(command["deadline_s"]),
-                calls=self._call_broker(command),
-                publish_to=str(command.get("publish_to") or ""),
+                deadline=_deadline(command.deadline_s),
+                calls=self._call_broker(command.request_id, command.call_interfaces),
+                publish_to=command.publish_to,
                 device=self._device() if self.torch is not None else Device(),
-                cancel=lambda: _cancelled(self.root, command["request_id"]),
+                cancel=lambda: _cancelled(self.root, command.request_id),
                 models=job_models,
-                trees={
-                    ref: (Path(root), digest)
-                    for ref, (root, digest) in (command.get("trees") or {}).items()
-                },
+                trees=_trees(command),
                 assets=_granted_inputs(command),
-                max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
-                max_output_bytes=int(command.get("max_output_bytes", MAX_OUTPUT_BYTES)),
+                max_input_bytes=command.max_input_bytes or 64 << 20,
+                max_output_bytes=command.max_output_bytes,
                 scratch=scratch,
                 checkpoints=durable_checkpoint,
                 weights_values=weights_values,
@@ -3903,12 +3909,12 @@ class Executor:
                 tensorfs_output=tensorfs_output,
                 tensorfs_adopt=tensorfs_adopt,
                 budget=BudgetFacts(
-                    gpu_rate_usd_per_hour=int(budget.get("gpu_rate_micro_usd_per_hour", 0)) / 1e6,
-                    gpu_count=int(budget.get("gpu_count", 0)),
-                    cap_usd=int(budget.get("cap_micro_usd", 0)) / 1e6,
+                    gpu_rate_usd_per_hour=budget.gpu_rate_micro_usd_per_hour / 1e6,
+                    gpu_count=budget.gpu_count,
+                    cap_usd=budget.cap_micro_usd / 1e6,
                     started_monotonic=time.monotonic(),
                 ),
-                progress=self._progress_sink(command["request_id"]),
+                progress=self._progress_sink(command.request_id),
             ),
         )
         handler_ms = (time.perf_counter() - started) * 1000
@@ -3961,7 +3967,7 @@ class Executor:
             },
         }
 
-    def _install_call_proxies(self, command: Mapping[str, Any]) -> None:
+    def _install_call_proxies(self, rows: tuple[CallInterface, ...]) -> None:
         """Expose managed dependency imports before importing a private workflow.
 
         App registrations keep their original implementations. Only public module
@@ -3973,9 +3979,8 @@ class Executor:
         from cozy_runtime.internal import call_types, interface_wheel
 
         prepared: set[str] = set()
-        for row in command.get("call_interfaces") or []:
-            document = row.get("interface_document")
-            module = row["module"]
+        for row in rows:
+            document, module = row.interface_document, row.module
             if not document or module in prepared:
                 continue
             prepared.add(module)
@@ -3998,45 +4003,36 @@ class Executor:
             for export in bindings:
                 imported.__dict__[export] = companion.__dict__[export]
 
-    def _call_broker(self, command: Mapping[str, Any]) -> Any:
-        import msgspec
-
+    def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> Any:
         from cozy_runtime.author._calls import _Broker, _CallType
 
-        rows = command.get("call_interfaces") or []
         if not rows:
             return None
-        if not isinstance(rows, list) or len(rows) > 256:
+        if len(rows) > 256:
             raise CapabilityError(
                 "call interface inventory exceeds its bound", code="child_interface"
             )
         bindings: dict[tuple[str, str], _CallType] = {}
         own = native_interfaces.bindings()
         for row in rows:
-            interface, module, export = (
-                row.get("interface_digest", ""),
-                row["module"],
-                row["export"],
-            )
-            if row.get("native_source") or row.get("native_effect"):
+            interface, module, export = row.interface_digest, row.module, row.export
+            if row.native_source or row.native_effect:
                 # Admission is per operation: the worker judged this one against what this
                 # Runtime stated at hello. One this Runtime lacks cannot be called from here.
                 native = own.get((module, export))
                 if native is None:
                     continue
-                served = row.get("request_fields")
-                if isinstance(served, list) and all(isinstance(name, str) for name in served):
-                    native = dataclasses.replace(native, served_fields=frozenset(served))
-                unavailable = row.get("unavailable")
-                if isinstance(unavailable, str) and unavailable:
-                    native = dataclasses.replace(native, unavailable=unavailable[:1024])
+                if row.request_fields is not None:
+                    native = dataclasses.replace(
+                        native, served_fields=frozenset(row.request_fields)
+                    )
+                if row.unavailable:
+                    native = dataclasses.replace(native, unavailable=row.unavailable[:1024])
                 bindings[(module, export)] = native
-            elif row.get("builtin"):
-                import msgspec
-
+            elif row.builtin:
                 from cozy_runtime.internal import builtin_operations
 
-                if row["builtin"] != "operations":
+                if row.builtin != "operations":
                     raise CapabilityError("unknown Runtime builtin", code="child_interface")
                 builtin_operations.validate_binding(interface, module, export)
                 from cozy_runtime.author import describe
@@ -4057,7 +4053,7 @@ class Executor:
                     raise CapabilityError("Runtime builtin types changed", code="child_interface")
                 binding = _CallType(interface, module, export, request_type, result_type)
                 bindings[(module, export)] = binding
-            elif row.get("self"):
+            elif row.self_call:
                 assert self.discovered is not None
                 surface = next(
                     (
@@ -4087,7 +4083,7 @@ class Executor:
                 if declared is not None:
                     surface = Registration(
                         name=export,
-                        kind=row.get("kind", "job"),
+                        kind=row.kind,
                         fn=declared.implementation,
                         invocable=True,
                         memoize=declared.memoize,
@@ -4119,7 +4115,7 @@ class Executor:
                 bindings[(module, export)] = binding
         for module, export in own.keys() - bindings.keys():
             bindings[(module, export)] = native_interfaces.unserved(module, export)
-        return _Broker(str(command["request_id"]), bindings, self._durable, self._child_events)
+        return _Broker(request_id, bindings, self._durable, self._child_events)
 
     def _child_events(self) -> int | None:
         """The worker's nudge socket for this attempt's calls; None from an older worker."""
@@ -4237,7 +4233,7 @@ class Executor:
             # EVERY RANK VACATES (cr-068): each replica frees its own card. The reply is
             # rank 0's; the worker reads the K devices itself, through NVML.
             try:
-                self.group.broadcast({"cmd": "vacate", "residents": residents})
+                self.group.broadcast(executor_commands.encode(Vacate(residents=residents)))
             except GroupRefusal as exc:
                 return self._group_refusal(exc, closing=False)
         self._synchronize()
@@ -4287,7 +4283,7 @@ class Executor:
             # EVERY RANK RESTORES (cr-068), for the reason every rank vacates: the ranks
             # hold one plan between them and a partially restored group is not a plan.
             try:
-                self.group.broadcast({"cmd": "restore", "names": list(names)})
+                self.group.broadcast(executor_commands.encode(Restore(names=names)))
             except GroupRefusal as exc:
                 return self._group_refusal(exc, closing=False)
         try:
@@ -4619,87 +4615,39 @@ def main(argv: list[str] | None = None) -> int:
 
     while True:
         try:
-            command = channel.recv()
+            frame = channel.recv()
         except SeamError:
             return int(Exit.unavailable)
-        if command is None:
+        if frame is None:
             return int(Exit.ok)
-        name = command.get("cmd", "")
+        name = str(frame.get("cmd", ""))
         if executor.group is not None and executor.group.broken and not executor.poisoned:
             # A FOLLOWER DIED BETWEEN COMMANDS (cr-068): the group is one executor, so this
             # process is poisoned before it answers anything, and the worker's next
             # command reads `poisoned_generation` and rebuilds the whole cgroup.
             executor.poisoned = f"group: {executor.group.broken}"[:200]
         try:
-            if name == "hello":
-                reply = {
-                    "ok": True,
-                    "pid": os.getpid(),
-                    "ppid": os.getppid(),
-                    "python_version": platform.python_version(),
-                    "python_abi": (sys.implementation.cache_tag or "").replace("cpython-", "cp"),
-                    "python_executable": sys.executable,
-                    "runtime_version": RUNTIME_VERSION,
-                    "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
-                    "native_interfaces": native_interfaces.stated(),
-                    "pgid": os.getpgrp(),
-                    "no_new_privs": _proc_status("NoNewPrivs"),
-                    "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
-                    "uid": os.getuid(),
-                    "euid": os.geteuid(),
-                    "sealed": dict(_SEALED),
-                    "torch_loaded": "torch" in sys.modules,
-                    "kernel_site": kernel_site.current().document(),
-                    "rss_bytes": _rss(),
-                    "rank": executor.rank,
-                    "world": executor.world,
-                }
-            elif executor.rank > 0 and name not in _FOLLOWER_COMMANDS:
+            if executor.rank > 0 and name not in _FOLLOWER_COMMANDS:
                 reply = {
                     "ok": False,
                     "code": "follower_command_unsupported",
                     "detail": f"rank {executor.rank} answers {sorted(_FOLLOWER_COMMANDS)}, "
                     f"not {name!r}",
                 }
-            elif name == "join":
-                reply = executor.join(command)
             elif name == "run":
-                reply = executor.run(command)
-            elif name == "attention":
-                reply = executor.select_attention(command)
-            elif name == "describe_installed":
-                reply = executor.describe_installed(command)
-            elif name == "start":
-                reply = executor.start(command)
-            elif name == "warm":
-                reply = executor.warm(command)
-            elif name == "load":
-                reply = executor.load(command)
-            elif name == "activate":
-                reply = executor.activate(command)
-            elif name == "unload":
-                reply = executor.unload(command)
-            elif name == "residency":
-                reply = executor.residency_document()
-            elif name == "prepare_request":
-                reply = executor.serve_request(command)
-            elif name == "invoke":
-                reply = executor.serve_invoke(command)
-            elif name == "run_job":
-                reply = executor.run_job(command)
-            elif name == "probe":
-                reply = executor.probe()
-            elif name == "vacate":
-                reply = executor.vacate(residents=bool(command.get("residents", True)))
-            elif name == "restore":
-                reply = executor.restore(names=tuple(str(n) for n in (command.get("names") or ())))
-            elif name == "shutdown":
-                if executor.group is not None:
-                    executor.group.close()
-                channel.send({"reply": name, "ok": True})
-                return int(Exit.ok)
-            else:
+                reply = executor.run(frame)
+            elif name not in executor_commands.NAMES:
                 reply = {"ok": False, "code": "unknown_command", "detail": name}
+            else:
+                command = executor_commands.decode(frame)
+                if isinstance(command, Shutdown):
+                    if executor.group is not None:
+                        executor.group.close()
+                    channel.send({"reply": name, "ok": True})
+                    return int(Exit.ok)
+                reply = executor.handle(command)
+        except msgspec.ValidationError as exc:
+            reply = {"ok": False, "code": "command_malformed", "detail": str(exc)[:1024]}
         except Exception as exc:  # the executor reports its own faults; it never hides one
             outcome: Outcome = classify(exc)
             reply = {

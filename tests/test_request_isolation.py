@@ -10,12 +10,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 
 from cozy_runtime.internal import attention, attention_ulysses, executor, package_interface
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor
+from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
 from cozy_runtime.internal.seam import Channel
 
 MODULE = "request_isolation_fixture"
@@ -70,7 +72,7 @@ def host(tmp_path: Path) -> Iterator[tuple[Executor, dict[str, Any]]]:
     with left, right:
         executor = Executor(Channel(left), tmp_path / "root")
         (tmp_path / "root").mkdir()
-        started = executor.start({**binding, "devices": devices})
+        started = executor.start(msgspec.convert({**binding, "devices": devices}, Start))
         assert started["ok"], started
         yield executor, {"devices": devices, "binding": binding, "budgets": {}}
     sys.modules.pop(MODULE, None)
@@ -78,7 +80,7 @@ def host(tmp_path: Path) -> Iterator[tuple[Executor, dict[str, Any]]]:
 
 def _serve(executor: Executor, request_id: str, mode: str) -> dict[str, Any]:
     prepared = executor.serve_request(
-        {"request_id": request_id, "entrypoint": "generate", "payload": {"mode": mode}}
+        PrepareRequest(request_id=request_id, entrypoint="generate", payload={"mode": mode})
     )
     assert prepared["ok"], prepared
     spool = executor.root / request_id
@@ -86,7 +88,7 @@ def _serve(executor: Executor, request_id: str, mode: str) -> dict[str, Any]:
     if mode == "cancel":
         (executor.root / "executor.cancel").write_text(request_id)
     return executor.serve_invoke(
-        {"request_id": request_id, "entrypoint": "generate", "spool": str(spool), "deadline_s": 30}
+        Invoke(request_id=request_id, entrypoint="generate", spool=str(spool), deadline_s=30)
     )
 
 
@@ -94,8 +96,8 @@ def test_handler_refusals_and_cancels_keep_the_generation_ready(
     host: tuple[Executor, dict[str, Any]],
 ) -> None:
     executor, load = host
-    assert executor.load({**load, "construction": "a"})["ok"]
-    assert executor.activate({"construction": "a"})["ok"]
+    assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert executor.activate(Activate(construction="a"))["ok"]
 
     refused = _serve(executor, "refused", "refuse")
     assert (refused["outcome"]["terminal"], refused["outcome"]["code"]) == (
@@ -115,11 +117,13 @@ def test_a_refused_load_leaves_loaded_constructions_serving(
     host: tuple[Executor, dict[str, Any]],
 ) -> None:
     executor, load = host
-    assert executor.load({**load, "construction": "a"})["ok"]
-    refused = executor.load({**load, "construction": "b", "attention_pin": "sdpa"})
+    assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    refused = executor.load(
+        msgspec.convert({**load, "construction": "b", "attention_pin": "sdpa"}, Load)
+    )
     assert refused["code"] == "attention_kernel_unsupported", refused
     assert not executor.poisoned and "b" not in executor.constructions
-    assert executor.activate({"construction": "a"})["ok"]
+    assert executor.activate(Activate(construction="a"))["ok"]
     assert _serve(executor, "after", "ok")["outcome"]["terminal"] == "succeeded"
 
 
@@ -149,8 +153,8 @@ def test_package_environment_changes_are_restored_not_refused(
     runner, load = host
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
     monkeypatch.setattr(executor, "_SEALED", seal_snapshot())
-    assert runner.load({**load, "construction": "a"})["ok"]
-    assert runner.activate({"construction": "a"})["ok"]
+    assert runner.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert runner.activate(Activate(construction="a"))["ok"]
     served = _serve(runner, "env", "env")
     assert served["outcome"]["terminal"] == "succeeded", served
     assert served["env_intact"] and served["env_changed"] == ["OMP_NUM_THREADS"], served

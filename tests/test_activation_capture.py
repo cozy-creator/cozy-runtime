@@ -301,12 +301,24 @@ def test_job_capture_refuses_before_any_executor_device_or_job_work(tmp_path: Pa
     import socket
 
     from cozy_runtime.internal.executor import Executor
+    from cozy_runtime.internal.executor_commands import RunJob
     from cozy_runtime.internal.seam import Channel
 
     left, right = socket.socketpair()
     try:
         executor = Executor(Channel(left), tmp_path)
-        response = executor.run_job({"capture": {"components": ["denoiser"], "steps": [0]}})
+        response = executor.run_job(
+            RunJob(
+                request_id="job",
+                spool=str(tmp_path / "spool"),
+                deadline_s=None,
+                job="job",
+                payload={},
+                application="app",
+                package_interface="interface.json",
+                capture={"components": ["denoiser"], "steps": [0]},
+            )
+        )
         assert response["code"] == "capture_mode" and response["terminal"] == "refused"
         assert executor.torch is None and not executor.models
         assert list(tmp_path.iterdir()) == []

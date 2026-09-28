@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 
 from conftest import sample_python
@@ -19,6 +20,7 @@ from cozy_runtime.internal import child_env, execution_evidence, package_interfa
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor
+from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
 from cozy_runtime.internal.local import LocalRequest, run_slice
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.worker.session import WorkerOptions
@@ -80,29 +82,32 @@ def executor(tmp_path: Path) -> Iterator[Executor]:
     with left, right:
         host = Executor(Channel(left), tmp_path / "root")
         (tmp_path / "root").mkdir()
-        assert host.start({**binding, "devices": devices})["ok"]
+        assert host.start(msgspec.convert({**binding, "devices": devices}, Start))["ok"]
         load = {"devices": devices, "binding": binding, "budgets": {}, "construction": "a"}
-        assert host.load(load)["ok"]
-        assert host.activate({"construction": "a"})["ok"]
+        assert host.load(msgspec.convert(load, Load))["ok"]
+        assert host.activate(Activate(construction="a"))["ok"]
         yield host
     sys.modules.pop(MODULE, None)
 
 
 def _invoke(host: Executor, request_id: str, **extra: Any) -> dict[str, Any]:
     prepared = host.serve_request(
-        {"request_id": request_id, "entrypoint": "generate", "payload": {"steps": 4}}
+        PrepareRequest(request_id=request_id, entrypoint="generate", payload={"steps": 4})
     )
     assert prepared["ok"], prepared
     spool = host.root / request_id
     spool.mkdir()
     return host.serve_invoke(
-        {
-            "request_id": request_id,
-            "entrypoint": "generate",
-            "spool": str(spool),
-            "deadline_s": 30,
-            **extra,
-        }
+        msgspec.convert(
+            {
+                "request_id": request_id,
+                "entrypoint": "generate",
+                "spool": str(spool),
+                "deadline_s": 30,
+                **extra,
+            },
+            Invoke,
+        )
     )
 
 

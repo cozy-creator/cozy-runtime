@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime.internal import accel, package_installation, package_interface
+from cozy_runtime.internal.executor_commands import Start, Warm
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.gpu_scheduler import Ordinals, model_degrees, width_for
 from cozy_runtime.internal.worker.lanes import DeviceLane, lane_id_for
@@ -213,14 +214,12 @@ class Prespawns:
             if not slot.claimed.is_set():
                 _nice(executor, 19)
             reply = executor.call(
-                {
-                    "cmd": "start",
-                    "devices": lane.devices,
-                    "sequence_parallel_degree": len(slot.ordinals),
-                    "application": str(interface.get("application", "")),
-                    "package_interface": str(path),
-                    "development_project": "",
-                },
+                Start(
+                    devices=lane.devices,
+                    sequence_parallel_degree=len(slot.ordinals),
+                    application=str(interface.get("application", "")),
+                    package_interface=str(path),
+                ),
                 timeout=None,
             )
             if not reply.get("ok"):
@@ -247,7 +246,7 @@ class Prespawns:
             return
         started, began = time.time(), time.perf_counter()
         try:
-            reply = executor.call({"cmd": "warm"}, timeout=None)
+            reply = executor.call(Warm(), timeout=None)
             ranks = reply.get("ranks") or []
             detail = "; ".join(
                 f"rank {row.get('rank')}: "

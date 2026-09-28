@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import msgspec
 import numpy as np
 import tensorfs
 import torch
@@ -32,6 +33,7 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE
 from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.executor import main as executor_main
+from cozy_runtime.internal.executor_commands import Activate, ModelLoad, Start
 from cozy_runtime.internal.local import stage_development_placement
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
@@ -302,14 +304,27 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         sequence_parallel_degree=degree,
         authorized_device_limit_bytes=2 << 30,
     )
-    command["attention_pin"] = "base/dit=sdpa"
-    # Tiny weights do not need the production 256 MiB staging ring on every rank.
-    for row in command["models"]:
-        row["binding"].update(window_bytes=1 << 20, slots=2, readers=1, inflight=1)
-    # The test's explicit CPU variant is qualified on CPU; no CUDA claim is substituted.
-    if backend == "cpu":
-        for row in command["models"]:
-            row["binding"]["variant"] = "cpu"
+    assert command.models is not msgspec.UNSET
+    # Tiny weights do not need the production 256 MiB staging ring on every rank. The
+    # test's explicit CPU variant is qualified on CPU; no CUDA claim is substituted.
+    command = msgspec.structs.replace(
+        command,
+        attention_pin="base/dit=sdpa",
+        models=tuple(
+            ModelLoad(
+                binding=msgspec.structs.replace(
+                    row.binding,
+                    window_bytes=1 << 20,
+                    slots=2,
+                    readers=1,
+                    inflight=1,
+                    variant="cpu" if backend == "cpu" else row.binding.variant,
+                ),
+                budgets=row.budgets,
+            )
+            for row in command.models
+        ),
+    )
     ours, theirs = socket.socketpair()
     # Thread caps are sealed process inputs; set them before leader and followers snapshot the seal.
     os.environ.update({"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"})
@@ -341,18 +356,18 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
                 __import__("cozy_runtime.internal.executor", fromlist=["_SEALED"])._SEALED
             )
         started = executor.start(
-            {
-                "devices": command["devices"],
-                "sequence_parallel_degree": degree,
-                "application": binding.application,
-                "package_interface": binding.interface_path,
-                "development_project": binding.development_project,
-            }
+            Start(
+                devices=command.devices,
+                sequence_parallel_degree=degree,
+                application=binding.application,
+                package_interface=binding.interface_path,
+                development_project=binding.development_project,
+            )
         )
         assert started.get("ok"), started
         reply = executor.load(command)
         assert reply.get("ok"), reply
-        activated = executor.activate({"construction": command["construction"]})
+        activated = executor.activate(Activate(construction=command.construction))
         assert activated.get("ok"), activated
         host, executor = executor, executor.constructions[executor.active]
         assert len(executor.model_executors) == 2

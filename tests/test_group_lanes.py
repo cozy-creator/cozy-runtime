@@ -14,12 +14,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 
 from cozy_runtime.author._signature import ModelBinding
-from cozy_runtime.internal import accel, canonical, package_interface, spawn
+from cozy_runtime.internal import accel, canonical, executor_commands, package_interface, spawn
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.executor_commands import Start
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDivergence
@@ -617,9 +619,10 @@ def test_the_load_command_carries_the_degree_only_above_one() -> None:
         authorized_device_limit_bytes=7,
         sequence_parallel_degree=1,
     )
-    assert canonical.write(plain) == canonical.write(one)
-    assert "sequence_parallel_degree" not in plain
-    assert plain["cmd"] == "load" and plain["construction"] == key
+    wire = executor_commands.encode(plain)
+    assert canonical.write(wire) == canonical.write(executor_commands.encode(one))
+    assert "sequence_parallel_degree" not in wire
+    assert wire["cmd"] == "load" and plain.construction == key
     group = executor_load_command(
         binding,
         construction=key,
@@ -627,7 +630,7 @@ def test_the_load_command_carries_the_degree_only_above_one() -> None:
         authorized_device_limit_bytes=7,
         sequence_parallel_degree=2,
     )
-    assert group["sequence_parallel_degree"] == 2 and group["devices"] == "0,1"
+    assert group.sequence_parallel_degree == 2 and group.devices == "0,1"
 
 
 # ------------------------------------------------------------------------ the opt-in
@@ -738,14 +741,16 @@ def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
 # ------------------------------------------------------------------- the seal (real)
 
 
-def _weightless_start(body: dict[str, Any], interface: Path, **extra: Any) -> dict[str, Any]:
-    return {
-        "cmd": "start",
-        "application": str(body["application"]),
-        "package_interface": str(interface),
-        "development_project": str(PACKAGE),
-        **extra,
-    }
+def _weightless_start(body: dict[str, Any], interface: Path, **extra: Any) -> Start:
+    return msgspec.convert(
+        {
+            "application": str(body["application"]),
+            "package_interface": str(interface),
+            "development_project": str(PACKAGE),
+            **extra,
+        },
+        Start,
+    )
 
 
 @needs_executor
@@ -816,7 +821,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
             assert worker.supervision.devices == ("0", "1")
             command = _weightless_start(body, interface, devices="0,1")
             # the seal fences the devices before the degree is even read
-            other = executor.call({**command, "devices": "0"}, timeout=60.0)
+            other = executor.call(msgspec.structs.replace(command, devices="0"), timeout=60.0)
             assert other["code"] == "env_seal_broken", other
         finally:
             evidence = worker.supervision.retire_current(executor, "seal arm done")

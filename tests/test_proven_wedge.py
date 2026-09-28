@@ -38,6 +38,7 @@ from pathlib import Path
 import pytest
 
 from cozy_runtime.internal import canonical, child_env, egress, liveness, native_wheel, spawn
+from cozy_runtime.internal.executor_commands import Probe
 from cozy_runtime.internal.worker import child
 from test_end_to_end import NO_EXECUTOR
 
@@ -98,7 +99,7 @@ def test_a_watched_seam_call_answers_normally() -> None:
     with _supervision() as supervision:
         executor = supervision.spawn(imposed={})
         with executor.watched("probe"):
-            reply = executor.call({"cmd": "probe"}, timeout=None)
+            reply = executor.call(Probe(), timeout=None)
         assert reply.get("ok") is True, reply
         assert executor.alive()
         assert not executor.wedged
@@ -117,7 +118,7 @@ def test_a_watched_seam_call_ends_on_the_executor_wedging() -> None:
         os.kill(executor.pid, signal.SIGSTOP)
         started = time.monotonic()
         with pytest.raises(child.ExecutorGone) as caught, executor.watched("probe"):
-            executor.call({"cmd": "probe"}, timeout=None)
+            executor.call(Probe(), timeout=None)
         elapsed = time.monotonic() - started
         assert "wedged during 'probe'" in str(caught.value), caught.value
         assert "no measurable progress for" in str(caught.value)

@@ -185,8 +185,10 @@ def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_pat
     command = AttemptEngine._command(
         cast(AttemptEngine, SimpleNamespace(attention_pin="")), parent, "report#1", tmp_path, 30
     )
-    assert command["max_output_bytes"] == 256 << 20
-    assert output_budget.effective(parent.spec, command) == 18
+    assert command.max_output_bytes == 256 << 20
+    assert (
+        output_budget.effective(parent.spec, {"max_output_bytes": command.max_output_bytes}) == 18
+    )
 
 
 class Request(msgspec.Struct):

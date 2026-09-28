@@ -30,9 +30,10 @@ import pytest
 
 from conftest import sample_python
 from cozy.worker.v1.wire_version import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
-from cozy_runtime.internal import accel, child_env, package_interface
+from cozy_runtime.internal import accel, child_env, executor_commands, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.executor_commands import Start
 from cozy_runtime.internal.local import (
     LocalRecordOwner,
     LocalRequest,
@@ -247,14 +248,14 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
         executor = worker.supervision.spawn(imposed=worker.imposed(lane))
         try:
             assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "1"
-            weightless = {
-                "cmd": "start",
-                "application": str(body["application"]),
-                "package_interface": str(interface),
-                "development_project": str(PACKAGE),
-            }
             refused = executor.call(
-                {**weightless, "devices": worker.lanes.lanes[0].devices}, timeout=60.0
+                Start(
+                    application=str(body["application"]),
+                    package_interface=str(interface),
+                    development_project=str(PACKAGE),
+                    devices=worker.lanes.lanes[0].devices,
+                ),
+                timeout=60.0,
             )
             assert refused["code"] == "env_seal_broken", refused
             assert "'1'" in refused["detail"] and "'0'" in refused["detail"], refused
@@ -340,8 +341,8 @@ def test_a_load_without_an_assigned_ceiling_is_a_worker_defect() -> None:
     command = executor_load_command(
         binding, construction="sha256:" + "1" * 64, devices="1", authorized_device_limit_bytes=7
     )
-    assert command["devices"] == "1" and command["cmd"] == "load"
-    assert command["authorized_device_limit_bytes"] == 7
+    assert command.devices == "1" and executor_commands.encode(command)["cmd"] == "load"
+    assert command.authorized_device_limit_bytes == 7
 
 
 # --------------------------------------------------------------------------- step 3/4

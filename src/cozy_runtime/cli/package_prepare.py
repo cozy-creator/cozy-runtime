@@ -13,6 +13,7 @@ from pathlib import Path
 from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import package_environment, package_installation
 from cozy_runtime.internal.config import RuntimeConfig
+from cozy_runtime.internal.executor_commands import DescribeInstalled
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.child import (
     INTERFACE_DOCUMENT,
@@ -100,7 +101,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         output = supervisor.handoff(executor.epoch, INTERFACE_DOCUMENT)
         with executor.watched("describe_installed"):
             reply = executor.call(
-                {"cmd": "describe_installed", "distribution": distribution, "output": str(output)},
+                DescribeInstalled(distribution=distribution, output=str(output)),
                 timeout=None,
             )
         if not reply.get("ok"):

@@ -7,7 +7,8 @@ import pytest
 
 from cozy_runtime.internal import attention
 from cozy_runtime.internal.encoding import DeviceFacts
-from cozy_runtime.internal.executor import Executor, _local_attention_pin, _model_parameter_names
+from cozy_runtime.internal.executor import Executor, _local_attention_pin
+from cozy_runtime.internal.executor_commands import Binding, Budgets, Load, ModelLoad
 
 
 def _roots() -> dict[str, Any]:
@@ -31,7 +32,7 @@ def test_preparation_accepts_declared_single_model_names_and_retains_pin(
     torch = pytest.importorskip("torch")
     executor = Executor(None, tmp_path)  # type: ignore[arg-type]
     roots = _roots()
-    binding = {"model_parameter_name": "model", "model_parameter_names": ["alias", "model"]}
+    binding = Binding(model_parameter_name="model", model_parameter_names=("alias", "model"))
     device = DeviceFacts(kind="cpu", name="CPU", sm=0, driver="", configuration="", index=0)
     chosen: list[str] = []
 
@@ -52,38 +53,41 @@ def test_preparation_accepts_declared_single_model_names_and_retains_pin(
 
 def test_prepare_many_validates_aliases_before_model_work(tmp_path: Path) -> None:
     executor = Executor(None, tmp_path)  # type: ignore[arg-type]
-    rows = [
-        {
-            "binding": {
-                "model_binding_path": "generate.models.base",
-                "model_parameter_name": "base",
-                "model_parameter_names": ["base", "alternate"],
-            },
-            "budgets": {},
-        },
-        {
-            "binding": {
-                "model_binding_path": "generate.models.other",
-                "model_parameter_name": "other",
-                "model_parameter_names": ["other"],
-            },
-            "budgets": {},
-        },
-    ]
+    rows = (
+        ModelLoad(
+            binding=Binding(
+                model_binding_path="generate.models.base",
+                model_parameter_name="base",
+                model_parameter_names=("base", "alternate"),
+            ),
+            budgets=Budgets(),
+        ),
+        ModelLoad(
+            binding=Binding(
+                model_binding_path="generate.models.other",
+                model_parameter_name="other",
+                model_parameter_names=("other",),
+            ),
+            budgets=Budgets(),
+        ),
+    )
     # The actual aggregate validation must recognize all aliases. An unknown
     # model refuses before the deliberately incomplete binding can reach fill.
-    reply = executor._prepare_many(
-        {"models": rows, "authorized_device_limit_bytes": 1, "attention_pin": "absent/dit=sdpa"}
+    command = Load(
+        construction="k",
+        models=rows,
+        authorized_device_limit_bytes=1,
+        attention_pin="absent/dit=sdpa",
     )
+    reply = executor._prepare_many(command, rows)
     assert reply["code"] == "attention_kernel_unsupported"
     assert "alternate" in reply["detail"]
     for row in rows:
-        names = _model_parameter_names(row["binding"])
+        names = row.binding.parameter_names()
         translated = attention.for_model("alternate/dit=sdpa", names)
         assert translated == ("dit=sdpa" if row is rows[0] else "")
     assert (
-        _local_attention_pin("alternate/dit=sdpa", _model_parameter_names(rows[0]["binding"]))
-        == "dit=sdpa"
+        _local_attention_pin("alternate/dit=sdpa", rows[0].binding.parameter_names()) == "dit=sdpa"
     )
 
 
@@ -93,7 +97,7 @@ def test_component_scope_can_skip_unrelated_construction_without_broadening(tmp_
     roots = _roots()
     del roots["dit"]
     result = executor._prepare_attention(
-        {"model_parameter_name": "other"}, roots, "dit=sdpa", device, optional_scope=True
+        Binding(model_parameter_name="other"), roots, "dit=sdpa", device, optional_scope=True
     )
     assert result.pin == ""
     assert result.hosts == {"vae": {"sdpa": 1}}

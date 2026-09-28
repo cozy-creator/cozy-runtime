@@ -43,7 +43,10 @@ from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from typing import Any, cast
 
+import msgspec
+
 from cozy_runtime.author import _codec
+from cozy_runtime.author._assets import InputMetadata
 from cozy_runtime.author._errors import DEVICE_OOM, OutputError
 from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import (
@@ -56,6 +59,16 @@ from cozy_runtime.internal import (
     weights_writer,
 )
 from cozy_runtime.internal import weights_sink as weights_bridge
+from cozy_runtime.internal.executor_commands import (
+    CallInterface,
+    InputFile,
+    Invoke,
+    JobBudget,
+    ModelManifest,
+    PrepareRequest,
+    Probe,
+    RunJob,
+)
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
 from cozy_runtime.internal.worker.calls import Calls
@@ -90,9 +103,8 @@ def safe(text: str, cap: int = 1024) -> str:
     return ascii_only[:cap]
 
 
-def _attention_pin(spec: Mapping[str, Any], default: str) -> dict[str, str]:
-    kernel = str(spec.get("attention_kernel") or default)
-    return {"attention_kernel": kernel} if kernel else {}
+def _attention_pin(spec: Mapping[str, Any], default: str) -> str:
+    return str(spec.get("attention_kernel") or default)
 
 
 def _coded(outcome: Mapping[str, Any]) -> str:
@@ -826,26 +838,25 @@ class AttemptEngine:
         """
         try:
             reply = executor.call(
-                {
-                    "cmd": "prepare_request",
-                    "construction": declared.construction_key(),
-                    "request_id": f"{attempt.request_id}#{attempt.attempt}",
-                    "entrypoint": declared.entrypoint,
-                    "payload": attempt.payload,
-                    **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
-                    **_attention_pin(attempt.spec, self.attention_pin),
-                    "input_metadata": {
-                        name: {
-                            "input_id": name,
-                            "media_type": item.kind_mime,
-                            "digest": documents.spell(item.digest),
-                            "length": item.length,
-                            "order": item.order,
-                        }
+                PrepareRequest(
+                    construction=declared.construction_key(),
+                    request_id=f"{attempt.request_id}#{attempt.attempt}",
+                    entrypoint=declared.entrypoint,
+                    payload=attempt.payload,
+                    capture=attempt.spec.get("capture"),
+                    attention_kernel=_attention_pin(attempt.spec, self.attention_pin),
+                    input_metadata={
+                        name: InputMetadata(
+                            input_id=name,
+                            media_type=item.kind_mime,
+                            digest=documents.spell(item.digest),
+                            length=item.length,
+                            order=item.order,
+                        )
                         for name, item in attempt.grant.inputs.items()
                         if name != "payload"
                     },
-                },
+                ),
                 timeout=None,
             )
         except ExecutorGone as exc:
@@ -1422,7 +1433,7 @@ class AttemptEngine:
             if not executor.poisoned and attempt.spool:
                 try:
                     with executor.watched("probe"):
-                        probe = executor.call({"cmd": "probe"}, timeout=None)
+                        probe = executor.call(Probe(), timeout=None)
                         ledger.observe_probe(probe)
                         processes = list(probe.get("processes") or [])
                     ledger.device_process = self.device_process(executor.pid)
@@ -1864,83 +1875,79 @@ class AttemptEngine:
 
     def _command(
         self, attempt: AttemptRecord, key: str, spool: Path, seconds: float | None
-    ) -> dict[str, Any]:
+    ) -> RunJob | Invoke:
         """The ONE thing the two lanes genuinely differ in: what they ask the executor."""
         inputs = {
-            input_id: {
-                "local": str(granted.local),
-                "file_state": granted.file_state,
-                "media_type": granted.media_type,
-                "digest": granted.digest,
-                "length": granted.length,
-                "order": granted.order,
-            }
+            input_id: InputFile(
+                local=str(granted.local),
+                file_state=granted.file_state,
+                media_type=granted.media_type,
+                digest=granted.digest,
+                length=granted.length,
+                order=granted.order,
+            )
             for input_id, granted in attempt.inputs.items()
         }
+        trees = {ref: (str(root), digest) for ref, (root, digest) in attempt.trees.items()}
+        max_output_bytes = output_budget.intermediate(attempt.spec)
         if attempt.job is not None:
             if not attempt.weights_work_fingerprint and self.work_fingerprint is not None:
                 attempt.weights_work_fingerprint = self.work_fingerprint(attempt)
-            return {
-                "cmd": "run_job",
-                "request_id": key,
-                "application": attempt.job.application,
-                "package_interface": attempt.job.package_interface,
-                "job": attempt.job.job,
-                "call_interfaces": self.calls.bindings(attempt) if self.calls is not None else [],
-                "publish_to": output_destination(
+            return RunJob(
+                request_id=key,
+                application=attempt.job.application,
+                package_interface=attempt.job.package_interface,
+                job=attempt.job.job,
+                call_interfaces=msgspec.convert(
+                    self.calls.bindings(attempt) if self.calls is not None else [],
+                    tuple[CallInterface, ...],
+                ),
+                publish_to=output_destination(
                     output.url for output in attempt.grant.outputs.values()
                 ),
-                "payload": attempt.payload,
-                "deadline_s": seconds,
-                "spool": str(spool),
-                "scratch": str(attempt.scratch) if attempt.scratch else "",
-                "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
-                "inputs": inputs,
-                "models": {
-                    parameter: {
-                        "class": model.class_name,
-                        "manifest": model.manifest,
-                        "length": model.length,
-                    }
+                payload=attempt.payload,
+                deadline_s=seconds,
+                spool=str(spool),
+                scratch=str(attempt.scratch) if attempt.scratch else "",
+                trees=trees,
+                inputs=inputs,
+                models={
+                    parameter: ModelManifest(
+                        class_key=model.class_name, manifest=model.manifest, length=model.length
+                    )
                     for parameter, model in sorted(attempt.job_models.items())
                 },
-                "max_input_bytes": 64 << 20,
-                "max_output_bytes": output_budget.intermediate(attempt.spec),
-                "tensorfs_root": str(self.tensorfs_root) if self.tensorfs_root else "",
-                "weights_owner_scope": self.owner_scope(),
-                "weights_request_id": attempt.request_id,
-                "invocation_spec_digest": documents.spell(attempt.digest),
-                "weights_work_fingerprint": attempt.weights_work_fingerprint,
-                "budget": {
-                    "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
-                    "gpu_count": self.slot_of(attempt).job_device_count,
-                    "cap_micro_usd": attempt.job.cap_micro_usd,
-                },
-            }
+                max_input_bytes=64 << 20,
+                max_output_bytes=max_output_bytes,
+                budget=JobBudget(
+                    gpu_rate_micro_usd_per_hour=attempt.job.gpu_rate_micro_usd_per_hour,
+                    gpu_count=self.slot_of(attempt).job_device_count,
+                    cap_micro_usd=attempt.job.cap_micro_usd,
+                ),
+            )
         assert attempt.declared is not None and attempt.plan is not None
-        return {
-            "cmd": "invoke",
-            "construction": attempt.declared.construction_key(),
-            **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
-            **_attention_pin(attempt.spec, self.attention_pin),
-            "request_id": key,
-            "entrypoint": attempt.declared.entrypoint,
-            "deadline_s": seconds,
-            "spool": str(spool),
-            "placement": attempt.plan.placement,
-            "headroom_bytes": attempt.plan.headroom_bytes,
-            "scope_headroom_bytes": dict(attempt.plan.scope_headroom_bytes),
-            "measured_scopes": list(attempt.plan.measured_scopes),
+        return Invoke(
+            construction=attempt.declared.construction_key(),
+            capture=attempt.spec.get("capture"),
+            attention_kernel=_attention_pin(attempt.spec, self.attention_pin),
+            request_id=key,
+            entrypoint=attempt.declared.entrypoint,
+            deadline_s=seconds,
+            spool=str(spool),
+            placement=attempt.plan.placement,
+            headroom_bytes=attempt.plan.headroom_bytes,
+            scope_headroom_bytes=dict(attempt.plan.scope_headroom_bytes),
+            measured_scopes=tuple(attempt.plan.measured_scopes),
             # cr-012: the VERIFIED inputs, by their stable identity. Paths into this
             # attempt's own spool and nothing else — no URL, no credential and no fetch
             # reaches the executor. What the executor CAN still do is dial one of its own,
             # which is why it installs `sandbox.refuse_network` (cr-042); that fence bounds
             # a buggy package at the Python layer and is not a kernel bound.
-            "inputs": inputs,
-            "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
-            "max_input_bytes": attempt.declared.max_input_bytes,
-            "max_output_bytes": output_budget.intermediate(attempt.spec),
-        }
+            inputs=inputs,
+            trees=trees,
+            max_input_bytes=attempt.declared.max_input_bytes,
+            max_output_bytes=max_output_bytes,
+        )
 
     def release(
         self, attempt: AttemptRecord, reply: dict[str, Any], spool: Path, key: str
