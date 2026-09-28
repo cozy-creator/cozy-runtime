@@ -98,6 +98,7 @@ def test_reserved_capture_grant_commits_native_tree_without_author_asset(tmp_pat
         _encode_frames=lambda *args: None,
         _publication=lambda *args: SimpleNamespace(document=lambda: {}, digest=lambda: b"r" * 32),
         records=SimpleNamespace(append=lambda *args: None),
+        products=None,
     )
     # Only the post-processing collaborators are needed; TensorFS custody is real.
     post = cast(AttemptEngine, engine)

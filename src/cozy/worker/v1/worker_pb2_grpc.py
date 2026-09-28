@@ -127,13 +127,15 @@ class WorkerControlServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def CollectMachineExecution(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Retired at wire 65: the terminal entry of ListMachineExecutionEvents carries the outcome.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def AcknowledgeMachineExecutionCollection(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """The owner holds every product of the log and the terminal: Runtime releases the log's holds.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')

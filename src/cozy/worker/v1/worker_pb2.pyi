@@ -7,6 +7,12 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class RunProductOp(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    RUN_PRODUCT_OP_UNSPECIFIED: _ClassVar[RunProductOp]
+    RUN_PRODUCT_OP_SET: _ClassVar[RunProductOp]
+    RUN_PRODUCT_OP_APPEND: _ClassVar[RunProductOp]
+
 class MachineExecutionAction(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     MACHINE_EXECUTION_ACTION_UNSPECIFIED: _ClassVar[MachineExecutionAction]
@@ -307,6 +313,9 @@ class WeightsFinalizeOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     WEIGHTS_FINALIZE_OUTCOME_UNSPECIFIED: _ClassVar[WeightsFinalizeOutcome]
     WEIGHTS_FINALIZE_OUTCOME_ADOPTED: _ClassVar[WeightsFinalizeOutcome]
     WEIGHTS_FINALIZE_OUTCOME_ABANDONED: _ClassVar[WeightsFinalizeOutcome]
+RUN_PRODUCT_OP_UNSPECIFIED: RunProductOp
+RUN_PRODUCT_OP_SET: RunProductOp
+RUN_PRODUCT_OP_APPEND: RunProductOp
 MACHINE_EXECUTION_ACTION_UNSPECIFIED: MachineExecutionAction
 MACHINE_EXECUTION_ACTION_PAUSE: MachineExecutionAction
 MACHINE_EXECUTION_ACTION_RESUME: MachineExecutionAction
@@ -628,7 +637,7 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., describe: _Optional[_Union[PackageSelection, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "described_release")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "described_release", "run_output_log")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -636,6 +645,7 @@ class MachineExecutionWorkspace(_message.Message):
     ACCELERATOR_BACKEND_FIELD_NUMBER: _ClassVar[int]
     EXECUTOR_UID_ISOLATION_FIELD_NUMBER: _ClassVar[int]
     DESCRIBED_RELEASE_FIELD_NUMBER: _ClassVar[int]
+    RUN_OUTPUT_LOG_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -643,7 +653,8 @@ class MachineExecutionWorkspace(_message.Message):
     accelerator_backend: str
     executor_uid_isolation: bool
     described_release: DescribedRelease
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., described_release: _Optional[_Union[DescribedRelease, _Mapping]] = ...) -> None: ...
+    run_output_log: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., described_release: _Optional[_Union[DescribedRelease, _Mapping]] = ..., run_output_log: bool = ...) -> None: ...
 
 class DescribedRelease(_message.Message):
     __slots__ = ("package", "release", "package_interface")
@@ -840,18 +851,52 @@ class MachineExecutionEventsQuery(_message.Message):
     def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., after: _Optional[int] = ..., limit: _Optional[int] = ..., wait: bool = ...) -> None: ...
 
 class MachineExecutionEvent(_message.Message):
-    __slots__ = ("sequence", "attempt_ordinal", "at_ms", "kind", "body_canonical_bytes")
+    __slots__ = ("sequence", "attempt_ordinal", "at_ms", "kind", "body_canonical_bytes", "product", "outcome")
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
     AT_MS_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     BODY_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PRODUCT_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
     sequence: int
     attempt_ordinal: int
     at_ms: int
     kind: str
     body_canonical_bytes: bytes
-    def __init__(self, sequence: _Optional[int] = ..., attempt_ordinal: _Optional[int] = ..., at_ms: _Optional[int] = ..., kind: _Optional[str] = ..., body_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+    product: RunProduct
+    outcome: AttemptOutcome
+    def __init__(self, sequence: _Optional[int] = ..., attempt_ordinal: _Optional[int] = ..., at_ms: _Optional[int] = ..., kind: _Optional[str] = ..., body_canonical_bytes: _Optional[bytes] = ..., product: _Optional[_Union[RunProduct, _Mapping]] = ..., outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ...) -> None: ...
+
+class RunProduct(_message.Message):
+    __slots__ = ("output", "op", "index", "content", "media_type", "label", "source", "parts")
+    OUTPUT_FIELD_NUMBER: _ClassVar[int]
+    OP_FIELD_NUMBER: _ClassVar[int]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_FIELD_NUMBER: _ClassVar[int]
+    MEDIA_TYPE_FIELD_NUMBER: _ClassVar[int]
+    LABEL_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    PARTS_FIELD_NUMBER: _ClassVar[int]
+    output: str
+    op: RunProductOp
+    index: int
+    content: Ref
+    media_type: str
+    label: str
+    source: NativeByteRetentionRequest
+    parts: _containers.RepeatedCompositeFieldContainer[RunProductPart]
+    def __init__(self, output: _Optional[str] = ..., op: _Optional[_Union[RunProductOp, str]] = ..., index: _Optional[int] = ..., content: _Optional[_Union[Ref, _Mapping]] = ..., media_type: _Optional[str] = ..., label: _Optional[str] = ..., source: _Optional[_Union[NativeByteRetentionRequest, _Mapping]] = ..., parts: _Optional[_Iterable[_Union[RunProductPart, _Mapping]]] = ...) -> None: ...
+
+class RunProductPart(_message.Message):
+    __slots__ = ("content", "source", "duration_us")
+    CONTENT_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    DURATION_US_FIELD_NUMBER: _ClassVar[int]
+    content: Ref
+    source: NativeByteRetentionRequest
+    duration_us: int
+    def __init__(self, content: _Optional[_Union[Ref, _Mapping]] = ..., source: _Optional[_Union[NativeByteRetentionRequest, _Mapping]] = ..., duration_us: _Optional[int] = ...) -> None: ...
 
 class MachineExecutionEventPage(_message.Message):
     __slots__ = ("events", "next_after", "head_sequence", "compacted_through")

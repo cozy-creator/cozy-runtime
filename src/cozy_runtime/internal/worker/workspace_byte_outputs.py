@@ -26,6 +26,8 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 TREE_MIME = "application/vnd.cozy.tree-manifest"
 MAX_RESULTS = 32
+#: Distinct byte strings one attempt may publish as products (parts included).
+MAX_PRODUCTS = 4096
 
 
 class ByteOutput(msgspec.Struct, frozen=True, kw_only=True):
@@ -226,7 +228,8 @@ def reserve_native(
         )
         if row is None:
             count = db.execute(
-                "SELECT count(*) FROM byte_outputs WHERE owner=? AND request=? AND ordinal=?",
+                "SELECT count(*) FROM byte_outputs WHERE owner=? AND request=? AND ordinal=? "
+                "AND substr(slot,1,8)<>'product.'",
                 (owner, call.parent_request, call.parent_ordinal),
             ).fetchone()[0]
             if count >= MAX_RESULTS:
@@ -442,11 +445,15 @@ def commit(
             raise WorkspaceRefusal("ordinary output has no current accepted execution")
         row = db.one(ByteOutput, "SELECT * FROM byte_outputs WHERE id=?", (root_id,))
         if row is None:
+            # A run's published products are one inventory, its returned outputs another.
+            product = slot.startswith("product.")
             count = db.execute(
-                "SELECT count(*) FROM byte_outputs WHERE owner=? AND request=? AND ordinal=?",
-                (owner, request, ordinal),
+                "SELECT count(*) FROM byte_outputs WHERE owner=? AND request=? AND ordinal=? "
+                "AND (substr(slot,1,8)='product.')=?",
+                (owner, request, ordinal, product),
             ).fetchone()[0]
-            if count >= MAX_RESULTS or not slot or len(slot.encode()) > 1024:
+            bound = MAX_PRODUCTS if product else MAX_RESULTS
+            if count >= bound or not slot or len(slot.encode()) > 1024:
                 raise WorkspaceRefusal("ordinary output slot inventory exceeds its bound")
             db.execute(
                 "INSERT INTO byte_outputs(id,owner,request,ordinal,spec,slot,manifest_body,"

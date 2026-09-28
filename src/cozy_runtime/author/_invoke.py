@@ -60,6 +60,7 @@ from cozy_runtime.author._errors import (
     OutputError,
     classify,
 )
+from cozy_runtime.author._executor_requests import Publish, Published
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
@@ -143,6 +144,8 @@ class Invocation:
     calls: _Broker | None = None
     publish_to: str = ""
     """The repository the owner granted this root: each Model it returns is uploaded there."""
+    publish: Callable[[Publish], Published] | None = None
+    """`Outputs.publish`'s exchange with the worker, which journals the run's output log."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,7 +381,9 @@ def run_prepared(
     fails (§2). What crosses is FACTS — terminal, origin, code — and never a retry command:
     RETRYABLE and FATAL are RecordOwner projections over these, never observations here.
     """
-    record = Attempt(inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress)
+    record = Attempt(
+        inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress, publish=inv.publish
+    )
     try:
         return invoke(prepared, inv, record), SUCCEEDED, record
     except (KeyboardInterrupt, SystemExit):
@@ -1115,7 +1120,8 @@ def _validate_result(
 
     _check_result_bounds(surface, result, attempt)
 
-    unreturned = sorted(pending_handles - set(returned))
+    # A published asset was delivered as a product already; returning it is optional.
+    unreturned = sorted(pending_handles - set(returned) - attempt.shown)
     if unreturned:
         raise OutputError(
             f"saved but never returned: {', '.join(unreturned)} — an unreturned pending "

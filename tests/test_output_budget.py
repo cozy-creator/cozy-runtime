@@ -266,6 +266,7 @@ def test_two_large_outputs_commit_within_their_admitted_aggregate(tmp_path: Path
         _blob_path=AttemptEngine._blob_path,
         _publication=lambda *args: SimpleNamespace(document=lambda: {}, digest=lambda: b"r" * 32),
         records=SimpleNamespace(append=lambda *args: None),
+        products=None,
     )
     manifest, error = AttemptEngine._tail(
         cast(AttemptEngine, engine),

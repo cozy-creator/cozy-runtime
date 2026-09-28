@@ -50,6 +50,7 @@ import platform
 import resource
 import socket
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
@@ -72,6 +73,8 @@ from cozy_runtime.author._executor_requests import (
     ChildEvents,
     DeviceRoom,
     Handoff,
+    Publish,
+    Published,
     Request,
     Room,
 )
@@ -647,6 +650,9 @@ class Executor:
         self.attempts = 0
         #: the DURABLE exchange counter (cr-009). Worker-answered, never sheddable.
         self._exchange = 0
+        #: one exchange at a time: a publish from a joining thread and a child poll from the
+        #: event loop share the seam, and each answer belongs to its own request.
+        self._durable_lock = threading.Lock()
 
     # ------------------------------------------------------------------ prepare
 
@@ -3331,6 +3337,7 @@ class Executor:
                             assets=_granted_inputs(command),
                             max_input_bytes=command.max_input_bytes or 64 << 20,
                             max_output_bytes=command.max_output_bytes,
+                            publish=self._publish,
                         ),
                     )
                 if capture is not None and outcome.terminal == "succeeded":
@@ -3946,6 +3953,7 @@ class Executor:
                 deadline=_deadline(command.deadline_s),
                 calls=self._call_broker(command.request_id, command.call_interfaces),
                 publish_to=command.publish_to,
+                publish=self._publish,
                 device=self._device() if self.torch is not None else Device(),
                 cancel=lambda: _cancelled(self.root, command.request_id),
                 models=job_models,
@@ -4168,6 +4176,10 @@ class Executor:
             bindings[(module, export)] = native_interfaces.unserved(module, export)
         return _Broker(request_id, bindings, self._durable, self._child_events)
 
+    def _publish(self, request: Publish) -> Published:
+        """One product onto the run's output log, durable before this returns."""
+        return self._durable(request, Published)
+
     def _child_events(self) -> int | None:
         """The worker's nudge socket for this attempt's calls; None from an older worker."""
         answer = self._durable(ChildEvents(), Handoff)
@@ -4181,25 +4193,26 @@ class Executor:
         the lossy lane's whole contract is that it may shed.
         """
         body = encode_request(request)
-        self._exchange += 1
-        exchange = f"{body['kind']}#{self._exchange}"
-        self.channel.send({"event": "request", "seq": self._exchange, **body})
-        frame = self.channel.recv()
-        if frame is None:
-            raise SeamError("seam_closed", f"the worker closed during {exchange}")
-        if frame.get("event") != "answer" or frame.get("seq") != self._exchange:
-            raise SeamError(
-                "seam_out_of_order",
-                f"expected the answer to {exchange}, got {frame.get('event')!r}",
-            )
-        handoff = issubclass(into, Handoff)
-        if frame.get("descriptor") is True:
-            if not handoff:
-                self.channel.close()
-                raise SeamError("seam_descriptor", "unexpected capability in control reply")
-            frame["descriptor"] = self.channel.recv_descriptor()
-        elif handoff and frame.get("ok") is True:
-            raise SeamError("seam_descriptor", "successful reply omitted its capability")
+        with self._durable_lock:
+            self._exchange += 1
+            exchange = f"{body['kind']}#{self._exchange}"
+            self.channel.send({"event": "request", "seq": self._exchange, **body})
+            frame = self.channel.recv()
+            if frame is None:
+                raise SeamError("seam_closed", f"the worker closed during {exchange}")
+            if frame.get("event") != "answer" or frame.get("seq") != self._exchange:
+                raise SeamError(
+                    "seam_out_of_order",
+                    f"expected the answer to {exchange}, got {frame.get('event')!r}",
+                )
+            handoff = issubclass(into, Handoff)
+            if frame.get("descriptor") is True:
+                if not handoff:
+                    self.channel.close()
+                    raise SeamError("seam_descriptor", "unexpected capability in control reply")
+                frame["descriptor"] = self.channel.recv_descriptor()
+            elif handoff and frame.get("ok") is True:
+                raise SeamError("seam_descriptor", "successful reply omitted its capability")
         try:
             return msgspec.convert(frame, into)
         except msgspec.ValidationError as exc:

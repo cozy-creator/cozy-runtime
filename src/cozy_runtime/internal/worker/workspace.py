@@ -767,6 +767,9 @@ class Workspace:
                         and recorded_projection(db, output)
                     ):
                         continue
+                    if output.slot.startswith("product."):
+                        continue  # a published product: the run's output log holds it
+
                     if output.native_service_id:
                         if not recorded_native(db, output, complete=True):
                             raise WorkspaceRefusal(

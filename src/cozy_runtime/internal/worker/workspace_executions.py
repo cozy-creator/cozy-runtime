@@ -946,6 +946,18 @@ class Executions:
         with self.workspace.locked() as db, transaction(db):
             return self._event(db, self._row(db, owner, request), kind, raw)
 
+    def product_bodies(self, owner: str, request: str) -> list[bytes]:
+        """The run's `product` entries in log order: the canonical RunProduct documents."""
+        with self.workspace.locked() as db:
+            return [
+                bytes(row[0])
+                for row in db.execute(
+                    "SELECT body FROM execution_events WHERE owner=? AND request=? "
+                    "AND kind='product' ORDER BY sequence",
+                    (owner, request),
+                )
+            ]
+
     def noticed(self, owner: str, request: str, kind: str) -> bool:
         with self.workspace.locked() as db:
             return (

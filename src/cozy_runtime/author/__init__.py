@@ -156,6 +156,7 @@ from cozy_runtime.author._services import (
     Secrets,
     Settings,
     Telemetry,
+    VideoJoin,
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._spread import spread
@@ -293,6 +294,7 @@ __all__ = [
     "Tree",
     "UnsupportedInput",
     "VideoAsset",
+    "VideoJoin",
     "WeightsOutput",
     "WeightsReader",
     "WeightsReceipt",

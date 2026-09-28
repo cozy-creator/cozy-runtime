@@ -160,6 +160,7 @@ from cozy_runtime.internal.worker.plan import (
     PlanRefusal,
     PreparedModel,
 )
+from cozy_runtime.internal.worker.products import Products
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.supervisor import Stopping, Supervisor, Unit, fault_text
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
@@ -1140,6 +1141,8 @@ class Worker:
         from .machine_effects import Effects
 
         self.machine_calls = MachineCalls(self) if self.workspace is not None else None
+        if self.workspace is not None and self.executions is not None:
+            self.engine.products = Products(self.workspace, self.executions, self.calls)
         if self.executions is not None:
             self.executions.changed = self._journal_changed
         self.gpu = GpuBroker(
@@ -2873,7 +2876,15 @@ class Worker:
         self, claim: pb.Claim, ack: pb.AttemptOutcomeAck
     ) -> workspace_executions.State:
         executions, owner = self._execution_service(claim)
-        return executions.acknowledge_collection(owner, ack)
+        state = executions.acknowledge_collection(owner, ack)
+        if (
+            self.engine.products is not None
+            and ack.attempt_ordinal == state.attempt_ordinal
+            and state.state in workspace_executions.TERMINAL
+        ):
+            # The owner holds the whole log: its products are the owner's now.
+            self.engine.products.release(owner, ack.request_id)
+        return state
 
     def prepare_model_source(
         self, request: pb.PrepareModelSourceRequest

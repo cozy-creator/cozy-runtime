@@ -133,6 +133,7 @@ class MachineExecutionRPC:
                 else "",
                 executor_uid_isolation=options.executor_uid >= 0,
                 described_release=described,
+                run_output_log=True,
             )
 
         return self._call(request.claim, context, get)
@@ -315,21 +316,35 @@ class MachineExecutionRPC:
                     request.after,
                     request.limit or 256,
                 )
-            return pb.MachineExecutionEventPage(
-                events=[
-                    pb.MachineExecutionEvent(
-                        sequence=e.sequence,
-                        attempt_ordinal=e.attempt_ordinal,
-                        at_ms=e.at_ms,
-                        kind=e.kind,
-                        body_canonical_bytes=e.body,
-                    )
-                    for e in page.events
-                ],
+            reply = pb.MachineExecutionEventPage(
                 next_after=page.next_after,
                 head_sequence=page.head_sequence,
                 compacted_through=page.compacted_through,
             )
+            for e in page.events:
+                event = reply.events.add(
+                    sequence=e.sequence,
+                    attempt_ordinal=e.attempt_ordinal,
+                    at_ms=e.at_ms,
+                    kind=e.kind,
+                    body_canonical_bytes=e.body,
+                )
+                if e.kind == "product":
+                    event.product.CopyFrom(documents.parse(e.body, pb.RunProduct))
+                elif e.kind == "outcome":
+                    # The run's terminal entry carries its exact outcome, and ends the page:
+                    # the outcome may be as large as a page.
+                    assert self.worker.executions is not None
+                    event.outcome.CopyFrom(
+                        self.worker.executions.outcome(
+                            self.worker.authorize_workspace(request.execution.claim),
+                            request.execution.request_id,
+                            e.attempt_ordinal,
+                        )
+                    )
+                    reply.next_after = e.sequence
+                    break
+            return reply
 
         return self._call(request.execution.claim, context, events)
 

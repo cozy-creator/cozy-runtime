@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from typing import Any
 
 from cozy_runtime.author._call_results import result_at
@@ -11,6 +11,33 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import machine_models
 from .workspace import Workspace, WorkspaceRefusal
+
+#: The suffix of a list output's slot: `references.*` grants `references.0`, `references.1`, ...
+LIST = ".*"
+
+
+def slot_of(output_id: str, slots: Collection[str]) -> str | None:
+    """The granted slot an output id fills: itself, or the list slot it is an item of."""
+    if output_id in slots and not output_id.endswith(LIST):
+        return output_id
+    head, _, index = output_id.rpartition(".")
+    if head and index.isdigit() and str(int(index)) == index and head + LIST in slots:
+        return head + LIST
+    return None
+
+
+def expand(fields: Sequence[tuple[str, int]], produced: Collection[str]) -> list[tuple[str, int]]:
+    """Fixed slots as they are and each list slot as the items that were produced."""
+    slots = {path for path, _ in fields}
+    result = []
+    for path, bound in fields:
+        if not path.endswith(LIST):
+            result.append((path, bound))
+    for output_id in sorted(produced):
+        slot = slot_of(output_id, slots)
+        if slot is not None and slot.endswith(LIST):
+            result.append((output_id, dict(fields)[slot]))
+    return result
 
 
 def paths(schema: Any, path: str = "", bound: int = 256 << 20) -> Iterator[tuple[str, int]]:
@@ -31,6 +58,11 @@ def paths(schema: Any, path: str = "", bound: int = 256 << 20) -> Iterator[tuple
     elif "tuple" in schema:
         for index, member in enumerate(schema["tuple"]):
             yield from paths(member, path + "." + str(index) if path else str(index), bound)
+    elif "list" in schema and isinstance(schema["list"], dict) and schema["list"].get("asset"):
+        # A list output: its items `path.0`, `path.1`, ... are granted by one `path.*` slot.
+        if not path:
+            raise WorkspaceRefusal("native byte result needs a named result field")
+        yield path + LIST, bound
     elif "union" in schema or "list" in schema or "map" in schema:
         # These shapes need output slots only known after executing the program. The
         # existing fixed-slot grant protocol cannot promise their cardinality.
@@ -62,7 +94,7 @@ def retain(
     protobuf, so an empty output (proto3 `content_bytes` 0, omitted from its document) reads
     as 0 rather than a missing key."""
     by_id = {entry.output_id: entry for entry in outputs}
-    fields = list(paths(schema))
+    fields = expand(list(paths(schema)), by_id)
     if capture:
         fields.append(("runtime.capture", 64 << 20))
     for path, _ in fields:
@@ -98,14 +130,23 @@ def grants(
 ) -> list[pb.ChildByteResultGrant]:
     result = []
     with workspace.locked() as db:
-        fields = list(paths(schema))
+        prefix = f"call.{index}.output/"
+        held = {
+            row["path"].removeprefix(prefix)
+            for row in db.execute(
+                "SELECT path FROM execution_model_holds WHERE owner=? AND recipient=? "
+                "AND substr(path,1,?)=?",
+                (owner, parent, len(prefix), prefix),
+            )
+        }
+        fields = expand(list(paths(schema)), held)
         if capture:
             fields.append(("runtime.capture", 64 << 20))
         for path, _ in fields:
             registered = db.execute(
                 "SELECT retention FROM execution_model_holds "
                 "WHERE owner=? AND recipient=? AND path=?",
-                (owner, parent, f"call.{index}.output/{path}"),
+                (owner, parent, prefix + path),
             ).fetchone()
             if registered is None:
                 raise WorkspaceRefusal("typed child output has no registered parent custody")
