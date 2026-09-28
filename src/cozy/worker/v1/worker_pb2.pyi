@@ -688,7 +688,7 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus", "owner_publication_reconciliation", "source_credentials", "deferred_installations", "resolves_model_defaults", "release_roots", "input_object_reuse", "event_wait", "memo_lookup", "release_root_sources")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "cpu_slot_model_inputs", "exact_execution_gpus", "owner_publication_reconciliation", "source_credentials", "deferred_installations", "resolves_model_defaults", "release_roots", "input_object_reuse", "event_wait", "memo_lookup", "release_root_sources", "release_root_jobs")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -706,6 +706,7 @@ class MachineExecutionWorkspace(_message.Message):
     EVENT_WAIT_FIELD_NUMBER: _ClassVar[int]
     MEMO_LOOKUP_FIELD_NUMBER: _ClassVar[int]
     RELEASE_ROOT_SOURCES_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_ROOT_JOBS_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -723,7 +724,8 @@ class MachineExecutionWorkspace(_message.Message):
     event_wait: bool
     memo_lookup: bool
     release_root_sources: bool
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ..., owner_publication_reconciliation: bool = ..., source_credentials: bool = ..., deferred_installations: bool = ..., resolves_model_defaults: bool = ..., release_roots: bool = ..., input_object_reuse: bool = ..., event_wait: bool = ..., memo_lookup: bool = ..., release_root_sources: bool = ...) -> None: ...
+    release_root_jobs: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., cpu_slot_model_inputs: bool = ..., exact_execution_gpus: bool = ..., owner_publication_reconciliation: bool = ..., source_credentials: bool = ..., deferred_installations: bool = ..., resolves_model_defaults: bool = ..., release_roots: bool = ..., input_object_reuse: bool = ..., event_wait: bool = ..., memo_lookup: bool = ..., release_root_sources: bool = ..., release_root_jobs: bool = ...) -> None: ...
 
 class MachineDevice(_message.Message):
     __slots__ = ("ordinal", "name", "uuid", "memory_bytes", "pci_bus_id", "driver_version")
@@ -774,7 +776,7 @@ class MachineExecutionSubmit(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., release_root: _Optional[_Union[ReleaseRoot, _Mapping]] = ..., owner_memo: bool = ...) -> None: ...
 
 class ReleaseRoot(_message.Message):
-    __slots__ = ("package", "release", "entrypoint", "callees", "installations", "models", "inputs", "input_access", "deadline_unix_ms", "attention_kernel", "capture", "catalog_origin")
+    __slots__ = ("package", "release", "entrypoint", "callees", "installations", "models", "inputs", "input_access", "deadline_unix_ms", "attention_kernel", "capture", "catalog_origin", "job", "weights_destination", "publication_grant")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
     ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
@@ -787,6 +789,9 @@ class ReleaseRoot(_message.Message):
     ATTENTION_KERNEL_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_FIELD_NUMBER: _ClassVar[int]
     CATALOG_ORIGIN_FIELD_NUMBER: _ClassVar[int]
+    JOB_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_DESTINATION_FIELD_NUMBER: _ClassVar[int]
+    PUBLICATION_GRANT_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
     entrypoint: str
@@ -799,7 +804,10 @@ class ReleaseRoot(_message.Message):
     attention_kernel: str
     capture: ActivationCapture
     catalog_origin: str
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., entrypoint: _Optional[str] = ..., callees: _Optional[_Iterable[_Union[ReleaseEdge, _Mapping]]] = ..., installations: _Optional[_Iterable[_Union[DeferredInstallation, _Mapping]]] = ..., models: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., input_access: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., attention_kernel: _Optional[str] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., catalog_origin: _Optional[str] = ...) -> None: ...
+    job: bool
+    weights_destination: str
+    publication_grant: str
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., entrypoint: _Optional[str] = ..., callees: _Optional[_Iterable[_Union[ReleaseEdge, _Mapping]]] = ..., installations: _Optional[_Iterable[_Union[DeferredInstallation, _Mapping]]] = ..., models: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., input_access: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., attention_kernel: _Optional[str] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., catalog_origin: _Optional[str] = ..., job: bool = ..., weights_destination: _Optional[str] = ..., publication_grant: _Optional[str] = ...) -> None: ...
 
 class ReleaseEdge(_message.Message):
     __slots__ = ("caller", "callee")

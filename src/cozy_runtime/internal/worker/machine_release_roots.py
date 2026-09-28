@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import re
 import threading
 import uuid
 from collections.abc import Mapping
@@ -17,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 from google.protobuf import json_format
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import package_installation, package_interface
+from cozy_runtime.internal import job_plan, package_installation, package_interface
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -29,6 +31,7 @@ from . import (
     machine_source_models,
 )
 from .machine_child_target import Target
+from .plan import JobBinding
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
 from .workspace_executions import Receipt
@@ -40,6 +43,16 @@ if TYPE_CHECKING:
 MAX_OUTPUT_BYTES = 512 << 20
 #: Finished preparations held for a submission that has not come back; oldest leave first.
 MAX_HELD = 32
+#: A device job's resident-memory ceiling, as the controller's root jobs are given it.
+JOB_RSS_CAP = 8 << 30
+#: The accelerator half of the base-owned Python stack: requiring one needs a device.
+ACCELERATOR_DISTRIBUTIONS = frozenset({"torch", "torchaudio", "torchvision", "triton"})
+
+
+def _requirement(line: str) -> str:
+    """A locked requirement's normalized distribution name."""
+    name = re.match(r"[A-Za-z0-9._-]*", line.strip())
+    return re.sub(r"[-_.]+", "-", name.group(0).lower()) if name else ""
 
 
 class Preparing(Exception):
@@ -235,19 +248,27 @@ class ReleaseRoots:
             base64.b64decode(prepared["placement"]["package_interface"], validate=True),
             "release root",
         )
+        section, kind = ("jobs", "job") if root.job else ("entrypoints", "inference entrypoint")
         declaration = next(
-            (entry for entry in interface["entrypoints"] if entry["name"] == root.entrypoint), None
+            (entry for entry in interface[section] if entry["name"] == root.entrypoint), None
         )
         if declaration is None:
-            raise WorkspaceRefusal(f"{key} serves no inference entrypoint {root.entrypoint}")
+            raise WorkspaceRefusal(f"{key} serves no {kind} {root.entrypoint}")
         if declaration.get("internal", False):
             raise WorkspaceRefusal("internal_callable: an internal callable cannot be a root")
+        binding = None
+        if root.job:
+            descriptor = package_interface.job_descriptor_id(interface, root.entrypoint)
+            plan = job_plan.path(
+                worker.config.cozy_home / "job-plans", prepared["installation_id"], descriptor
+            )
+            binding = JobBinding.read(json.loads(plan.read_bytes()))
         target = Target(
             prepared["installation_id"],
             root.entrypoint,
             declaration,
             prepared,
-            None,
+            binding,
             str(declaration.get("invocable", {}).get("operation_identity", "")),
             False,
             prepared["installation_id"],
@@ -258,6 +279,17 @@ class ReleaseRoots:
             machine_source_models.credentials(request.source_credentials),
             lambda stage, done, total: self._note(job, stage, 100 * done // total if total else -1),
         )
+        if root.job:
+            # A job reads its Models as inputs: land each catalog checkpoint here now.
+            machine_model_defaults.materialize(
+                worker,
+                models,
+                None,
+                progress=lambda done, total: self._note(
+                    job, "downloading model weights", 100 * done // total if total else -1
+                ),
+            )
+            return _Prepared(target, dict(prepared["placement"]), models, installed)
         serving = worker.machine_calls.serving
         call = Call(
             request.offer.request_id,
@@ -435,11 +467,6 @@ class ReleaseRoots:
         executions = worker.executions
         assert executions is not None
         placement = prepared.placement
-        selected = next(
-            (row for row in placement["entrypoints"] if row["name"] == root.entrypoint), None
-        )
-        if selected is None:
-            raise WorkspaceRefusal("release root has no complete prepared Model binding")
         payload = request.payload_canonical_bytes
         digest = documents.spell(hashlib.sha256(payload).digest())
         bindings, access = machine_model_defaults.inputs(prepared.models)
@@ -464,21 +491,17 @@ class ReleaseRoots:
             ],
             deadline_unix_ms=root.deadline_unix_ms,
             attention_kernel=root.attention_kernel,
-            serving=pb.ServingInvocationSpec(
-                entrypoint_binding_digest=selected["entrypoint_binding_digest"],
-                attempt_binding_id=selected["entrypoint_binding_digest"],
-                bindings_digest=placement["bindings_digest"],
-            ),
         )
-        if root.HasField("capture"):
-            spec.capture.CopyFrom(root.capture)
-            spec.outputs.append(pb.OutputBinding(output_id="runtime.capture", max_bytes=64 << 20))
+        if root.job:
+            desired = self._job(root, prepared, spec)
+        else:
+            desired = self._serving(root, prepared, spec)
         spec.inputs.sort(key=lambda entry: entry.input_id)
         raw, identity = documents.identity(spec)
         offer = pb.AttemptOffer(
             request_id=request.offer.request_id,
             attempt_ordinal=1,
-            placement_id=placement["placement_id"],
+            placement_id="" if root.job else placement["placement_id"],
             invocation_spec_canonical_bytes=raw,
             invocation_spec_digest=identity,
             grant=pb.DeliveryGrant(
@@ -494,20 +517,14 @@ class ReleaseRoots:
                 outputs=[pb.OutputAccess(output_id=output.output_id) for output in spec.outputs],
             ),
         )
+        weights = {
+            row["output_id"] for row in prepared.target.declaration.get("weights_outputs", [])
+        }
+        for output in offer.grant.outputs:
+            if root.weights_destination and output.output_id in weights:
+                # `--upload-to`: Runtime sends this weights output to the named repository.
+                output.url = "model://" + root.weights_destination
         offer.grant.inputs.sort(key=lambda entry: entry.input_id)
-        placement_bytes = canonical_json.encode(
-            {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
-        )
-        width = max((int(row.get("gpus", 0)) for row in prepared.models), default=0)
-        desired = pb.DesiredWorkerState(
-            wire_minor=worker.fence.wire_minor,
-            posture=pb.POSTURE_ACCEPTING,
-            placement_set=pb.DesiredPlacementSet(
-                placement_set_digest=hashlib.sha256(placement_bytes).digest(),
-                placement_set_canonical_bytes=placement_bytes,
-                execution_gpus=width,
-            ),
-        )
         capture, capture_digest, installed = self._capture(root, prepared)
         installations = {
             held["installation_id"]: {
@@ -537,6 +554,7 @@ class ReleaseRoots:
             capture_document=capture,
             preparation=canonical_json.encode(preparation),
             publication_authorization_id=request.publication_authorization_id,
+            arguments=canonical_json.decode(payload) if root.job else None,
             owner_memo=request.owner_memo,
         )
         worker.machine_sources.declare(owner, offer.request_id)
@@ -569,6 +587,98 @@ class ReleaseRoots:
             },
         )
         return self._receipt(receipt)
+
+    def _serving(
+        self, root: pb.ReleaseRoot, prepared: _Prepared, spec: pb.InvocationSpec
+    ) -> pb.DesiredWorkerState:
+        """The serving invocation of the prepared placement, and that placement as state."""
+        placement = prepared.placement
+        selected = next(
+            (row for row in placement["entrypoints"] if row["name"] == root.entrypoint), None
+        )
+        if selected is None:
+            raise WorkspaceRefusal("release root has no complete prepared Model binding")
+        spec.serving.CopyFrom(
+            pb.ServingInvocationSpec(
+                entrypoint_binding_digest=selected["entrypoint_binding_digest"],
+                attempt_binding_id=selected["entrypoint_binding_digest"],
+                bindings_digest=placement["bindings_digest"],
+            )
+        )
+        if root.HasField("capture"):
+            spec.capture.CopyFrom(root.capture)
+            spec.outputs.append(pb.OutputBinding(output_id="runtime.capture", max_bytes=64 << 20))
+        placement_bytes = canonical_json.encode(
+            {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
+        )
+        width = max((int(row.get("gpus", 0)) for row in prepared.models), default=0)
+        return pb.DesiredWorkerState(
+            wire_minor=self.worker.fence.wire_minor,
+            posture=pb.POSTURE_ACCEPTING,
+            placement_set=pb.DesiredPlacementSet(
+                placement_set_digest=hashlib.sha256(placement_bytes).digest(),
+                placement_set_canonical_bytes=placement_bytes,
+                execution_gpus=width,
+            ),
+        )
+
+    def _job(
+        self, root: pb.ReleaseRoot, prepared: _Prepared, spec: pb.InvocationSpec
+    ) -> pb.DesiredWorkerState:
+        """The job invocation and its directive, by the rules a controller used to apply."""
+        target, declaration = prepared.target, prepared.target.declaration
+        assert target.binding is not None
+        spec.outputs.extend(
+            pb.OutputBinding(**row) for row in declaration.get("weights_outputs", [])
+        )
+        spec.job.CopyFrom(
+            pb.JobInvocationSpec(
+                installation_id=target.installation_id,
+                job_descriptor_id=target.binding.job_descriptor_id,
+            )
+        )
+        if root.publication_grant:
+            spec.job.publication_contract.CopyFrom(
+                pb.PublicationContract(grant_id=root.publication_grant, outputs=spec.outputs)
+            )
+        device = self._needs_device(root, target)
+        return pb.DesiredWorkerState(
+            wire_minor=self.worker.fence.wire_minor,
+            posture=pb.POSTURE_ACCEPTING,
+            job=pb.JobDirective(
+                installation_id=target.installation_id,
+                job_descriptor_id=target.binding.job_descriptor_id,
+                resource_caps=pb.ResourceCaps(
+                    device_required=device, max_rss_bytes=JOB_RSS_CAP if device else 0
+                ),
+                device_count=1 if device else 0,
+                orchestration=not device,
+                reclaim_on_terminal=True,
+            ),
+        )
+
+    def _needs_device(self, root: pb.ReleaseRoot, target: Target) -> bool:
+        """A job's own `accelerator` decides; an undeclared one follows its locked closure,
+        except a composer that holds no Model or weights and only calls published callees."""
+        declaration = target.declaration
+        if declaration.get("accelerator") is not None:
+            return bool(declaration["accelerator"])
+        locked = (
+            Path(self.worker.options.install_root or "")
+            / "installations"
+            / target.installation_id
+            / "requirements.txt"
+        )
+        try:
+            names = {_requirement(line) for line in locked.read_text().splitlines()}
+        except FileNotFoundError:
+            names = set()
+        if not names & ACCELERATOR_DISTRIBUTIONS:
+            return False
+        composes = any(edge.caller == _key(root.package, root.release) for edge in root.callees)
+        return not (
+            composes and not declaration.get("models") and not declaration.get("weights_outputs")
+        )
 
     @staticmethod
     def _receipt(receipt: Receipt) -> pb.MachineExecutionReceipt:
