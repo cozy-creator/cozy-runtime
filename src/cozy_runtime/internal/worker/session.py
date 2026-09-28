@@ -2478,10 +2478,12 @@ class Worker:
             return
         owner = self.fence.record_owner_id
         for root, event, body in events:
+            if event == "gpu.wait":
+                body = {**body, **self._waiting_call(owner, str(body["key"]))}
             with contextlib.suppress(WorkspaceRefusal):
                 self.executions.record(owner, root, event, body)
             if event == "gpu.wait":
-                self._gpu_waiting(owner, body)
+                self._gpu_waiting(owner, root, body, view)
 
     def readable_gpus(self) -> tuple[int, ...]:
         """Ordinals whose memory the driver answers; an unreadable GPU cannot fit anything."""
@@ -2520,22 +2522,42 @@ class Worker:
             )
         )
 
-    def _gpu_waiting(self, owner: str, body: gpu_scheduler.Document) -> None:
-        """Once per transition, tell the waiting call's parent (or root) why it waits."""
+    def _waiting_call(self, owner: str, key: str) -> dict[str, str]:
+        """The waiting call's function and author label: what waits, not only for what."""
+        assert self.machine_calls is not None
+        call = self.machine_calls.journal.child(owner, key.rpartition("#")[0])
+        if call is None:
+            return {}
+        label = self.calls.progress_label(call.parent_request, call.parent_ordinal, call.call_index)
+        return {"function": call.target().export, **({"label": label} if label else {})}
+
+    def _gpu_waiting(
+        self, owner: str, root: str, body: gpu_scheduler.Document, view: gpu_scheduler.Document
+    ) -> None:
+        """Once per transition, tell the waiting call's parent (or root) why it waits. A root's
+        own calls holding the cards are not a run it is behind."""
         assert self.executions is not None
         request = str(body["key"]).rpartition("#")[0]
         _root, parent = self.executions.scheduling_root(owner, request)
         target = self.engine.live.get(parent or request)
-        blocked = ", ".join(body["blocked_by"]) or "released devices"
-        if target is not None:
-            self.emit_progress(
-                target.request_id,
-                target.attempt,
-                {
-                    "kind": "progress",
-                    "stage": f"Waiting for GPU (needs {body['width']}, behind {blocked})"[:120],
-                },
-            )
+        if target is None:
+            return
+        others = [blocker for blocker in body["blocked_by"] if blocker != root]
+        if others or not body["blocked_by"]:
+            why = "behind " + (", ".join(others) or "released devices")
+        else:
+            held = {
+                o
+                for held_by, ordinals in view["grants"].values()
+                if held_by == root
+                for o in ordinals
+            }
+            why = f"{len(held)} in use by this run's other calls"
+        self.emit_progress(
+            target.request_id,
+            target.attempt,
+            {"kind": "progress", "stage": f"Waiting for GPU (needs {body['width']}, {why})"[:120]},
+        )
 
     def _defer_rebuild(self, placement_id: str) -> child.Executor | None:
         """A dead GPU replica rebuilds on its next grant, never on devices it no longer holds.

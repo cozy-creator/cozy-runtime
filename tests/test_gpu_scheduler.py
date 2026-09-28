@@ -647,7 +647,7 @@ def test_an_older_root_holds_all_four_gpus_through_its_gap_and_b_starts_after(
     )
     b_grant = next(seq for seq, kind, body in machine.journal("B") if kind == "gpu.grant")
     b_wait = [body for _, kind, body in machine.journal("B") if kind == "gpu.wait"]
-    assert b_wait == [{"key": b1 + "#1", "width": 4, "blocked_by": ["A"]}]  # once, not per tick
+    assert b_wait == [{"key": b1 + "#1", "width": 4, "blocked_by": ["A"], "function": "h3"}]
     # B's grant is written after A's release; both journals share one workspace clock order
     a_release_at = next(
         e.at_ms for e in machine.executions.events(OWNER, "A").events if e.sequence == released
@@ -675,6 +675,32 @@ def test_three_reference_calls_fan_out_on_three_distinct_gpus(
     shot = machine.child("C", "h3")
     machine.tick()
     assert machine.granted(shot) == [0, 1, 2, 3]
+
+
+def test_a_fifth_reference_waits_on_its_own_runs_calls_and_names_itself(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    downloaded = machine.hold_activations(monkeypatch)
+    machine.root("C")
+    references = [machine.child("C", "qwen") for _ in range(5)]
+    machine.await_granted(*references[:4])
+    own = "Waiting for GPU (needs 1, 4 in use by this run's other calls)"
+
+    def stages() -> list[str]:
+        return [
+            canonical_json.decode(event.body)["payload"]["stage"]
+            for event in machine.executions.events(OWNER, "C").events
+            if event.kind == "progress"
+        ]
+
+    bound = time.monotonic() + 120  # a hang bound on a loaded box, not a budget
+    while own not in stages():
+        assert time.monotonic() < bound, stages()
+        time.sleep(0.01)
+    waits = [body for _, kind, body in machine.journal("C") if kind == "gpu.wait"]
+    fifth = references[4] + "#1"
+    assert waits == [{"key": fifth, "width": 1, "blocked_by": ["C"], "function": "qwen"}]
+    downloaded.set()
 
 
 def test_weightless_calls_never_wait_and_a_device_job_waits_for_the_holder(
