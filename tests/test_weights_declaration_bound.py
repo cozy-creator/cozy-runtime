@@ -78,15 +78,12 @@ def test_a_large_declaration_is_journaled_and_opens_its_writer(
     ):
         if shape == "additions":
             writer.add_part("unet", keys[0], "value", struct.pack("<4e", 0, 1, 2, 3))
-        (intent,) = [f.weights_intent for f in owner.frames if f.HasField("weights_intent")]
+        (transaction,) = {key[2] for key in owner.owner.writer_broker.bindings}
         assert owner.owner.workspace is not None
-        row = owner.owner.workspace.weights_row("package-proof", intent.weights_transaction_id)
+        row = owner.owner.workspace.weights_row("package-proof", transaction)
         declaration = row["declaration"]
         assert len(declaration) > above
-        # Over the Host's inline bound the frame names the journaled declaration by reference.
-        assert not intent.tensorfs_declaration_canonical_bytes
-        assert intent.tensorfs_declaration_length == len(declaration)
-        assert intent.tensorfs_declaration_digest == hashlib.sha256(declaration).digest()
+        assert row["declaration_digest"] == hashlib.sha256(declaration).digest()
 
 
 def test_a_whole_model_declaration_commits_with_a_constant_size_receipt(tmp_path: Path) -> None:
@@ -109,14 +106,12 @@ def test_a_whole_model_declaration_commits_with_a_constant_size_receipt(tmp_path
         with owner.client.open_output("model", definition) as writer:
             receipt = writer.commit()
         artifact = owner.client.adopt_model(receipt)
-    (intent,) = [f.weights_intent for f in owner.frames if f.HasField("weights_intent")]
-    recorded = [f.weights_receipt for f in owner.frames if f.HasField("weights_receipt")]
-    assert recorded and intent.tensorfs_declaration_length > 1 << 20
+    assert owner.owner.workspace is not None
+    row = owner.owner.workspace.weights_row("package-proof", str(receipt["transaction_id"]))
+    assert len(row["declaration"]) > 1 << 20
     # The receipt names the declaration by digest, so it stays small however large the model.
-    assert all(
-        len(frame.weights_receipt.weights_receipt_canonical_bytes) < 16 << 10 for frame in recorded
-    )
-    assert receipt["declaration_digest"] == documents.spell(intent.tensorfs_declaration_digest)
+    assert row["receipt"] and len(row["receipt"]) < 16 << 10
+    assert receipt["declaration_digest"] == documents.spell(row["declaration_digest"])
     header_bytes = store.manifest(artifact.manifest.digest)["header"]
     assert header_bytes is not None
     header = tensorfs.parse_header(header_bytes)

@@ -85,20 +85,20 @@ def upload(workspace: Workspace, parent: str, attempt: int = 1) -> pb.NativeSour
 
 def run(
     calls: SourceCalls,
-    messages: queue.Queue[pb.WorkerFrame],
+    messages: queue.Queue[pb.NativeSourceStatus],
     command: pb.NativeSourceCommand,
     started: threading.Event | None = None,
 ) -> pb.NativeSourceStatus:
     command.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
     calls.handle(command)
-    resolved = messages.get(timeout=120).native_source_status
+    resolved = messages.get(timeout=120)
     assert resolved.state == pb.NATIVE_SOURCE_STATE_RESOLVED, resolved.safe_code
     command.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
     command.selection.CopyFrom(resolved.selection)
     calls.handle(command)
     if started is not None:
         started.set()
-    return messages.get(timeout=900).native_source_status
+    return messages.get(timeout=900)
 
 
 @pytest.fixture(autouse=True)
@@ -122,7 +122,7 @@ def test_upload_larger_than_the_disk_resumes_and_matches_an_unbounded_machine(
     with origin.running() as hf, hub.running(), supervisor.running() as channel:
         monkeypatch.setattr(storage_admission, "_channel", channel)
         workspace = Workspace(root)
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
 
         def calls() -> SourceCalls:
             return SourceCalls(
@@ -194,7 +194,7 @@ def test_upload_larger_than_the_disk_resumes_and_matches_an_unbounded_machine(
         replay = calls()
         resumed.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         replay.handle(resumed)
-        again = messages.get(timeout=60).native_source_status
+        again = messages.get(timeout=60)
         assert again.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED
         assert again.result_canonical_bytes == finished.result_canonical_bytes
         assert (origin.total(), hub.uploaded_bytes) == moved

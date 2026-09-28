@@ -97,7 +97,7 @@ def _converted(tmp_path: Path) -> tuple[Workspace, ModelArtifact, str]:
     thread.start()
     try:
         workspace = Workspace(tmp_path / "store")
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         calls = SourceCalls(
             workspace,
             lambda: "owner",
@@ -109,11 +109,11 @@ def _converted(tmp_path: Path) -> tuple[Workspace, ModelArtifact, str]:
         source = accepted(workspace, "converter")
         source.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
         calls.handle(source)
-        resolution = messages.get(timeout=30).native_source_status
+        resolution = messages.get(timeout=30)
         source.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         source.selection.CopyFrom(resolution.selection)
         calls.handle(source)
-        downloaded = messages.get(timeout=30).native_source_status
+        downloaded = messages.get(timeout=30)
         assert downloaded.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, downloaded.safe_code
         command = pb.NativeSourceCommand()
         command.CopyFrom(source)
@@ -137,7 +137,7 @@ def _converted(tmp_path: Path) -> tuple[Workspace, ModelArtifact, str]:
         ).digest()
         command.service_id = workspace_sources.identity("owner", "converter", 1)
         calls.handle(command)
-        converted = messages.get(timeout=30).native_source_status
+        converted = messages.get(timeout=30)
         assert converted.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, converted.safe_code
     finally:
         origin.shutdown()

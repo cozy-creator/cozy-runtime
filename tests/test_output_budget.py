@@ -307,14 +307,14 @@ def test_two_large_outputs_commit_within_their_admitted_aggregate(tmp_path: Path
         byte_result_grants=byte_grants,
     )
     consumer = AttemptRecord("consumer", 1, digest, body, spool=tmp_path / "consumer")
-    calls = Calls(lambda _: None, lambda: 1, workspace=workspace, owner=lambda: "owner")
-    pending = _Pending(pb.ChildCallRequest(), 1, result=child_result)
+    calls = Calls(lambda *_: pb.ChildCallResult(), workspace=workspace, owner=lambda: "owner")
+    pending = _Pending(pb.ChildCallRequest(), child_result)
     materialized = calls._materialize(consumer, pending)
     assert sum(row["content_bytes"] for row in materialized) == size * 2
     assert calls.materialized[("consumer", 1)][1] == size * 2
     child_result.call_index = 2
     with pytest.raises(ValueError, match="byte bound"):
-        calls._materialize(consumer, _Pending(pb.ChildCallRequest(), 1, result=child_result))
+        calls._materialize(consumer, _Pending(pb.ChildCallRequest(), child_result))
     # Authority is rechecked after encoding/commit even when a reply claims more.
     manifest, error = AttemptEngine._tail(
         cast(AttemptEngine, engine),

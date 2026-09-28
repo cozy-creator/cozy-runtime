@@ -53,7 +53,7 @@ def prepared(tmp_path: Path, *, root_input: bool = False) -> tuple[Any, ...]:
     local = tmp_path / "spool" / "bundle"
     byte_inputs.copy_retained(workspace, "owner", hold, local)
     parent = AttemptRecord("producer", 1, spec, {}, state="running", spool=tmp_path / "spool")
-    calls = Calls(lambda _: None, lambda: 1, workspace=workspace, owner=lambda: "owner")
+    calls = Calls(lambda *_: pb.ChildCallResult(), workspace=workspace, owner=lambda: "owner")
     digest = documents.spell(native.manifest.digest)
     if root_input:
         parent.grant.inputs["bundle"] = grants.BoundInput(

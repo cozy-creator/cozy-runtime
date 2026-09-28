@@ -61,7 +61,7 @@ def test_native_child_inputs_hold_independently_and_forward_after_parent_gc(tmp_
         ),
         identity,
     )
-    calls = Calls(lambda _: None, lambda: 1, workspace=workspace, owner=lambda: "owner")
+    calls = Calls(lambda *_: pb.ChildCallResult(), workspace=workspace, owner=lambda: "owner")
     request = {"report": file_digest, "bundle": tree_digest}
     bindings, access = machine_byte_inputs.inputs(
         workspace, "owner", parent, "child", schema.render(NativeInputs), request, calls
@@ -150,7 +150,7 @@ def test_native_child_input_refuses_missing_or_changed_authority(
             }
         ]
     }
-    calls = Calls(lambda _: None, lambda: 1, workspace=workspace, owner=lambda: "owner")
+    calls = Calls(lambda *_: pb.ChildCallResult(), workspace=workspace, owner=lambda: "owner")
     with pytest.raises(WorkspaceRefusal):
         machine_byte_inputs.inputs(
             workspace,

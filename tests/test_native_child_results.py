@@ -441,8 +441,8 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
     from cozy_runtime.internal.worker.calls import Calls, _Pending
 
     workspace, reply, data = retained(tmp_path)
-    sent: list[pb.WorkerFrame] = []
-    worker = Calls(sent.append, lambda: 1, workspace=workspace, owner=lambda: "owner")
+    # The parent's poll reads the settled child call (`Worker.child_call`).
+    worker = Calls(lambda *_: reply, workspace=workspace, owner=lambda: "owner")
     request = pb.ChildCallRequest(
         parent_request_id="parent",
         parent_attempt_ordinal=1,
@@ -450,7 +450,7 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
         intent_digest=reply.intent_digest,
         call_index=0,
     )
-    worker.pending[("parent", 1, 0)] = _Pending(request, 1)
+    worker.pending[("parent", 1, 0)] = _Pending(request, reply)
     parent = AttemptRecord(
         "parent",
         1,
@@ -459,7 +459,6 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
         state="running",
         spool=tmp_path / "parent",
     )
-    assert worker.absorb(reply)
     first = worker.handle(parent, ChildPoll(call_index=0))
     assert isinstance(first, CallState) and first.ok, first
     local = first.byte_grants[0]["local"]
@@ -470,7 +469,6 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
     assert not worker.pending
     assert worker.materialized[("parent", 1)][1] > 0
     assert Path(local).read_bytes() == data
-    assert not sent
     returned = canonical_json.decode(reply.result_canonical_bytes)["report"]
     forwarded = worker.received_output(
         parent, msgspec.convert({**returned, "output_id": "report"}, OutputRow)

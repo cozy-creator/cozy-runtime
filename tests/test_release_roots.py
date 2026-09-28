@@ -321,7 +321,7 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
 
         def forget() -> None:
             call = pb.ForgetPackageCall(claim=machine.claim, package=PACKAGE)
-            Forget().WorkspaceForgetPackage(call, Context())  # type: ignore[arg-type]
+            Forget().WorkspaceForgetPackage(call, Context())
 
         forget()
         catalog.reads.clear()

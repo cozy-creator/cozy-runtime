@@ -156,18 +156,21 @@ REQUEST = {"version": VERSION, "destination": "example/sdxl", "profiles": [], "f
 
 
 def upload(
-    calls: SourceCalls, workspace: Workspace, messages: queue.Queue[pb.WorkerFrame], parent: str
+    calls: SourceCalls,
+    workspace: Workspace,
+    messages: queue.Queue[pb.NativeSourceStatus],
+    parent: str,
 ) -> tuple[pb.NativeSourceStatus, pb.NativeSourceStatus | None]:
     built = command(workspace, REQUEST, parent)
     built.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
     calls.handle(built)
-    resolved = messages.get(timeout=120).native_source_status
+    resolved = messages.get(timeout=120)
     if resolved.state != pb.NATIVE_SOURCE_STATE_RESOLVED:
         return resolved, None
     built.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
     built.selection.CopyFrom(resolved.selection)
     calls.handle(built)
-    return resolved, messages.get(timeout=600).native_source_status
+    return resolved, messages.get(timeout=600)
 
 
 def test_a_civitai_sdxl_upload_is_normalized_with_its_reference_configs_and_tokenizers(
@@ -184,7 +187,7 @@ def test_a_civitai_sdxl_upload_is_normalized_with_its_reference_configs_and_toke
     ):
         monkeypatch.setattr(storage_admission, "_channel", channel)
         workspace = Workspace(root)
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         calls = SourceCalls(
             workspace,
             lambda: "owner",
@@ -269,7 +272,7 @@ def test_convert_cozytensors_of_a_civitai_sdxl_file_is_the_same_self_contained_c
     ):
         monkeypatch.setattr(storage_admission, "_channel", channel)
         workspace = Workspace(root)
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         calls = SourceCalls(
             workspace,
             lambda: "owner",
@@ -282,12 +285,12 @@ def test_convert_cozytensors_of_a_civitai_sdxl_file_is_the_same_self_contained_c
         )
         download.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
         calls.handle(download)
-        resolved = messages.get(timeout=120).native_source_status
+        resolved = messages.get(timeout=120)
         assert resolved.state == pb.NATIVE_SOURCE_STATE_RESOLVED, resolved.safe_detail
         download.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         download.selection.CopyFrom(resolved.selection)
         calls.handle(download)
-        source = messages.get(timeout=120).native_source_status
+        source = messages.get(timeout=120)
         assert source.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, source.safe_detail
         request = {
             "source": canonical_json.decode(source.result_canonical_bytes),
@@ -303,7 +306,7 @@ def test_convert_cozytensors_of_a_civitai_sdxl_file_is_the_same_self_contained_c
         )
         convert.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         calls.handle(convert)
-        converted = messages.get(timeout=600).native_source_status
+        converted = messages.get(timeout=600)
         assert converted.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, calls.failure_detail(
             convert.service_id
         )
@@ -328,7 +331,7 @@ def test_an_unreachable_reference_refuses_the_upload_by_name(
     ):
         monkeypatch.setattr(storage_admission, "_channel", channel)
         workspace = Workspace(root)
-        messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+        messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         calls = SourceCalls(
             workspace,
             lambda: "owner",

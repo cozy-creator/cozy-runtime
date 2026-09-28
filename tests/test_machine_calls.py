@@ -120,11 +120,9 @@ def test_child_progress_poll_reuses_journal_and_fences_owner_parent_and_attempt(
         },
     }
     executions.progress("owner", child.child_request, 1, document)
-    pending = _Pending(
-        incoming, 1, local=True, result=pb.ChildCallResult(child_request_id=child.child_request)
-    )
+    pending = _Pending(incoming, pb.ChildCallResult(child_request_id=child.child_request))
     transport = Transport(
-        lambda _: None, lambda: 1, workspace=Workspace(root), owner=lambda: "owner"
+        lambda *_: pb.ChildCallResult(), workspace=Workspace(root), owner=lambda: "owner"
     )
     observed = transport._progress(pending)
     assert observed is not None and observed.payload == document["payload"]
@@ -180,17 +178,13 @@ def test_optional_child_progress_cannot_turn_a_valid_result_into_failure(
 
     from cozy_runtime.internal.worker import calls as transport
 
-    held = transport._Pending(
-        pb.ChildCallRequest(),
-        1,
-        result=pb.ChildCallResult(
-            state=pb.CHILD_CALL_STATE_SUCCEEDED,
-            child_request_id="child",
-            result_canonical_bytes=b'"done"',
-        ),
-        byte_grants=[],
+    done = pb.ChildCallResult(
+        state=pb.CHILD_CALL_STATE_SUCCEEDED,
+        child_request_id="child",
+        result_canonical_bytes=b'"done"',
     )
-    broker = transport.Calls(lambda _: None, lambda: 1)
+    held = transport._Pending(pb.ChildCallRequest(), done, byte_grants=[])
+    broker = transport.Calls(lambda *_: done)
     broker.pending[("parent", 1, 0)] = held
     expected = CallState(ok=True, state="succeeded", child_request_id="child", result='"done"')
     monkeypatch.setattr(transport, "MAX_FRAME", len(msgspec.json.encode(expected)) + 128)
