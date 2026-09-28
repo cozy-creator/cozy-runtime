@@ -41,6 +41,7 @@ from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionR
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import TERMINAL
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -293,6 +294,7 @@ class Machine:
         spec: pb.InvocationSpec,
         preparation: dict[str, Any] | None,
         placement: str = "",
+        admit: bool = False,
     ) -> None:
         raw, digest = documents.identity(spec)
         offer = pb.AttemptOffer(
@@ -303,6 +305,17 @@ class Machine:
             invocation_spec_digest=digest,
             grant=pb.DeliveryGrant(invocation_spec_digest=digest),
         )
+        prepared = canonical_json.encode(preparation) if preparation else b""
+        if admit:  # the worker's root intake, as SubmitMachineExecution reaches it
+            self.worker.submit_execution(
+                self.claim,
+                request,
+                hashlib.sha256(request.encode()).digest(),
+                offer,
+                expected_execution_workspace_id=self.executions.workspace_id,
+                preparation=prepared,
+            )
+            return
         self.executions.submit(
             OWNER,
             request,
@@ -310,7 +323,7 @@ class Machine:
             offer,
             expected_execution_workspace_id=self.executions.workspace_id,
             worker_boot=self.worker.fence.worker_boot_id,
-            preparation=canonical_json.encode(preparation) if preparation else b"",
+            preparation=prepared,
         )
 
     def root(self, name: str) -> None:
@@ -369,7 +382,7 @@ class Machine:
         self.serving(call.child_request, kind)
         return call.child_request
 
-    def serving(self, request: str, kind: str, gpus: int = 0) -> None:
+    def serving(self, request: str, kind: str, gpus: int = 0, admit: bool = False) -> None:
         """A serving execution of `kind` against its prepared template, as Creator submits
         a rented root: `gpus` is the exact group width it names, zero for none."""
         digest = "sha256:" + hashlib.sha256(kind.encode()).hexdigest()
@@ -409,6 +422,7 @@ class Machine:
             ),
             {"installations": {}, "state": base64.b64encode(state.SerializeToString()).decode()},
             placement="tmpl-" + kind,
+            admit=admit,
         )
 
     def finish(self, request: str, status: pb.OutcomeStatus = pb.OUTCOME_STATUS_SUCCEEDED) -> None:
@@ -650,6 +664,21 @@ def test_a_submitted_exact_width_is_the_group_and_leaves_the_rest_free(machine: 
         outcome = machine.executions.collect(OWNER, refused).outcome_canonical_bytes
         message = documents.read(outcome, pb.AttemptOutcomeBody)["safe_message"]
         assert message.startswith("gpu_count_unavailable") and f"exactly {gpus} GPUs" in message
+
+
+def test_work_this_machine_can_never_run_is_refused_at_admission(machine: Machine) -> None:
+    """Never journaled, so it never queues and never holds the rental; runnable work is
+    accepted through the same intake."""
+    machine.serving("A", "h3", gpus=2, admit=True)
+    assert machine.executions.status(OWNER, "A").state == "queued"
+    for request, gpus in (("C", 3), ("D", 8)):
+        with pytest.raises(WorkspaceRefusal, match=f"gpu_count_unavailable: exactly {gpus} GPUs"):
+            machine.serving(request, "h3", gpus=gpus, admit=True)
+        assert not machine.executions.owns(OWNER, request)
+    machine.unreadable.update({"0", "1", "2", "3"})  # type: ignore[attr-defined]
+    with pytest.raises(WorkspaceRefusal, match="gpu_unavailable"):
+        machine.serving("E", "qwen", admit=True)
+    assert not machine.executions.owns(OWNER, "E")
 
 
 def test_an_unreadable_gpu_leaves_the_inventory_and_the_group_narrows(machine: Machine) -> None:

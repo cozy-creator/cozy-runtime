@@ -15,6 +15,7 @@ from cozy_runtime.internal.worker import (
     machine_byte_inputs,
     machine_byte_results,
     machine_child_target,
+    machine_lanes,
     workspace_memo,
 )
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
@@ -403,6 +404,7 @@ class Calls:
                 )
                 capture = canonical_json.encode(executions.capture(owner, parent.request_id))
                 max_attempts, retry_delay_ms = executions.retry_policy(owner, parent.request_id)
+                machine_lanes.admit(self.worker, parent.request_id, preparation, offer)
                 executions.submit(
                     owner,
                     call.child_request,

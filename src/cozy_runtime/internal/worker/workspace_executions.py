@@ -56,6 +56,8 @@ MAX_EVENT_BYTES = 64 << 10
 MAX_PAGE = 256
 MAX_PAGE_BYTES = 256 << 10
 TERMINAL = frozenset({"succeeded", "failed", "paused", "canceled"})
+#: Accepted and not terminal, delayed retries included: work this machine still owes.
+OPEN = "('queued','running','pausing','canceling','retrying')"
 
 
 class StaleExecutionGeneration(WorkspaceRefusal):
@@ -458,7 +460,7 @@ class Executions:
                 row[0]
                 for row in db.execute(
                     "SELECT request FROM executions WHERE owner=? "
-                    "AND (state IN ('queued','running','pausing','canceling','retrying') "
+                    f"AND (state IN {OPEN} "
                     "OR (desired='cancel' AND retention_waived=0)) "
                     "ORDER BY accepted_ms,request",
                     (owner,),
@@ -504,36 +506,21 @@ class Executions:
         with self.workspace.locked() as db:
             return (
                 db.execute(
-                    "SELECT 1 FROM executions WHERE owner=? "
-                    "AND state IN ('queued','running','pausing','canceling','retrying') LIMIT 1",
+                    f"SELECT 1 FROM executions WHERE owner=? AND state IN {OPEN} LIMIT 1",
                     (owner,),
                 ).fetchone()
                 is not None
             )
 
     def active_count(self) -> int:
-        """All durable roots that could execute, including work with no connected observer."""
-        with self.workspace.locked() as db:
-            return int(
-                db.execute(
-                    "SELECT count(*) FROM executions "
-                    "WHERE state IN ('queued','running','pausing','canceling','retrying')"
-                ).fetchone()[0]
-            )
+        """Every accepted, non-terminal execution, with or without a connected observer.
 
-    def work_in_progress(self) -> bool:
-        """Started work, including parents awaiting children or cooperative stop.
-
-        Queued requests and delayed retries do not keep an otherwise idle rental
-        alive. Model preparation and admitted attempts are observed separately.
+        Each one holds the rental: queued behind other work, awaiting a delayed retry,
+        running or stopping. Work this machine can never run is refused at admission.
         """
         with self.workspace.locked(allow_frozen=True) as db:
-            return (
-                db.execute(
-                    "SELECT 1 FROM executions "
-                    "WHERE state IN ('running','pausing','canceling') LIMIT 1"
-                ).fetchone()
-                is not None
+            return int(
+                db.execute(f"SELECT count(*) FROM executions WHERE state IN {OPEN}").fetchone()[0]
             )
 
     def retained_installations(self) -> set[str]:

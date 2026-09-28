@@ -105,7 +105,8 @@ class ActivityFile:
 
 
 def active_work(worker: Worker) -> bool:
-    """Work executing here, including detached parents waiting for their children.
+    """Work this machine owes: preparation, held attempts, and every accepted execution not
+    yet terminal, queued or awaiting a delayed retry included.
 
     Do not take the control lock: model preparation can hold it for minutes while
     the reporter must keep telling the supervisor that preparation is active.
@@ -124,7 +125,7 @@ def active_work(worker: Worker) -> bool:
         for attempt in tuple(worker.engine.history.values())
     ):
         return True
-    return worker.executions is not None and worker.executions.work_in_progress()
+    return worker.executions is not None and worker.executions.active_count() > 0
 
 
 def meter(worker: Worker) -> str | None:
