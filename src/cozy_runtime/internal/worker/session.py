@@ -4169,7 +4169,6 @@ class Worker:
                     self.workspace,
                     self.fence.record_owner_id,
                     inner,
-                    legacy_root=self.root,
                     on_abandon=self.weights.abandon,
                 )
             except Exception as exc:

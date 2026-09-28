@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cozy_runtime import canonical_json
@@ -23,7 +22,6 @@ def finalize(
     owner: str,
     request: pb.WeightsFinalizeRequest,
     *,
-    legacy_root: Path | None = None,
     on_abandon: Callable[[str], None] | None = None,
 ) -> pb.WeightsFinalizeResult:
     decision = canonical_json.encode(weights_finalize._decision(request, owner))
@@ -36,14 +34,6 @@ def finalize(
     directory = workspace.directory / "weights-finalizations"
     directory.mkdir(mode=0o700, exist_ok=True)
     name = transaction.removeprefix("sha256:")
-    legacy: dict[str, bytes] = {}
-    if legacy_root is not None and legacy_root != workspace.directory:
-        for suffix in ("intent", "result"):
-            value = weights_finalize._read(
-                legacy_root / "weights-finalizations" / (name + "." + suffix)
-            )
-            if value is not None:
-                legacy[suffix] = value
     with workspace.locked() as db:
 
         def attempts() -> list[AttemptRecord]:
@@ -86,18 +76,14 @@ def finalize(
         weights_finalize._authorize(
             request, current_attempts, bool(observed.get("writer_session_id"))
         )
-        # Import legacy decisions and choose the immutable winner while holding
-        # the SAME journal lock used by all local/private Runtime processes.
-        if legacy.get("intent") is not None:
-            weights_finalize._record(directory / (name + ".intent"), legacy["intent"])
+        # Choose the immutable winner while holding the SAME journal lock used by all
+        # local/private Runtime processes.
         previous = weights_finalize._read(directory / (name + ".intent"))
         if previous is not None and previous != decision:
             raise weights_finalize.FinalizationRefusal(
                 "weights finalization conflicts with its first-wins decision"
             )
         weights_finalize._record(directory / (name + ".intent"), decision)
-        if legacy.get("result") is not None:
-            weights_finalize._record(directory / (name + ".result"), legacy["result"])
         # A memoized attempt's checkpointed, uncommitted output is retired rather than
         # destroyed: the owner abandons it, a later identical attempt may still adopt it.
         retire = False
