@@ -53,6 +53,8 @@ from cozy_runtime.author._executor_requests import (
     CheckpointReceipt,
     DeviceRoom,
     Handler,
+    Publish,
+    Published,
     Reply,
     Request,
     TreeMember,
@@ -93,7 +95,7 @@ from cozy_runtime.internal.executor_replies import (
     Shortfall,
 )
 from cozy_runtime.internal.pathkey import opaque_key
-from cozy_runtime.internal.worker import grants, observe, refusal, triage
+from cozy_runtime.internal.worker import grants, machine_byte_results, observe, refusal, triage
 from cozy_runtime.internal.worker.calls import Calls
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger
@@ -106,6 +108,7 @@ from cozy_runtime.internal.worker.plan import (
     PreparedModel,
     PreparedRequest,
 )
+from cozy_runtime.internal.worker.products import Products
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.tree_members import project as project_tree_member
 from cozy_runtime.internal.worker.weights import WeightsExchange
@@ -581,6 +584,8 @@ class AttemptEngine:
         self.work_fingerprint = work_fingerprint
         #: a serving attempt's answer to its executor asking for device room mid-call
         self.room = room
+        #: the run output log: `Outputs.publish` mid-run and the returned result at post
+        self.products: Products | None = None
         #: the demand falsifier. It ships first, it counts, and it decides nothing — the
         #: `timing-decides-nothing` fence proves the module it lives in cannot reach the
         #: planner, the ledger or the fill plane.
@@ -1584,6 +1589,8 @@ class AttemptEngine:
     def durable_exchange(self, attempt: AttemptRecord, request: Request) -> Reply:
         """Answer one durable request of a job attempt's executor."""
         match request:
+            case Publish():
+                return self.publish(attempt, request)
             case Checkpoint():
                 return self.checkpoint_exchange(attempt, request)
             case DeviceRoom():
@@ -1598,6 +1605,26 @@ class AttemptEngine:
                 if self.calls is None:
                     return refuse("child_broker_absent", "no RecordOwner call lane")
                 return self.calls.handle(attempt, request)
+
+    def publish(self, attempt: AttemptRecord, request: Publish) -> Reply:
+        """One product onto the run's output log; nothing to show without a journal."""
+        if self.products is None:
+            return Published(ok=True)
+        return self.products.publish(self.owner_scope(), attempt, request)
+
+    def _serving_request(self, attempt: AttemptRecord) -> Handler | None:
+        """A serving attempt's mid-call requests: products, and device room when granted."""
+        room = self.room(attempt) if self.room else None
+
+        def answer(request: Request) -> Reply:
+            attempt.moved()
+            if isinstance(request, Publish):
+                return self.publish(attempt, request)
+            if room is None:
+                return refuse("no_durable_exchange", "a serving attempt asks only for room")
+            return room(request)
+
+        return answer
 
     def _writer(self, attempt: AttemptRecord, request: WriterRequest) -> Reply:
         if self.weights is None or attempt.spool is None:
@@ -1720,7 +1747,7 @@ class AttemptEngine:
                     command,
                     timeout=None,
                     on_progress=on_progress,
-                    on_request=on_request if job else self.room(attempt) if self.room else None,
+                    on_request=on_request if job else self._serving_request(attempt),
                 ),
                 AttemptReply,
             )
@@ -2269,7 +2296,11 @@ class AttemptEngine:
         if spool is None:
             return None, "the attempt has no spool to read outputs from"
         produced = {row.output_id: row for row in rows}
-        if set(produced) != granted:
+        # A list output's one `x.*` slot grants every produced item `x.0`, `x.1`, ...
+        slot = {
+            output_id: machine_byte_results.slot_of(output_id, granted) for output_id in produced
+        }
+        if None in slot.values() or {s for s in granted if not s.endswith(".*")} - set(produced):
             grants.abort_outputs(spool)
             return None, (
                 f"destination_absent: the attempt produced {sorted(produced) or 'nothing'} "
@@ -2300,7 +2331,7 @@ class AttemptEngine:
                     else None
                 )
                 tree = row.kind == "tree"
-                if tree or (native and not attempt.grant.outputs[output_id].url):
+                if tree or (native and not attempt.grant.outputs[slot[output_id] or output_id].url):
                     if not native:
                         raise grants.GrantRefusal(
                             "native_tree_unsupported", "tree outputs require wire43 native custody"
@@ -2320,7 +2351,7 @@ class AttemptEngine:
                         raise grants.GrantRefusal(
                             "output_spool_io", "tree output has no owned spool"
                         )
-                    destination = attempt.grant.outputs[output_id]
+                    destination = attempt.grant.outputs[slot[output_id] or output_id]
                     media_type = grants._output_media_type(
                         output_id,
                         destination.mime_type,
@@ -2384,7 +2415,8 @@ class AttemptEngine:
                             output_id,
                             received[1],
                             tree=False,
-                            max_bytes=attempt.grant.outputs[output_id].max_bytes or (256 << 20),
+                            max_bytes=attempt.grant.outputs[slot[output_id] or output_id].max_bytes
+                            or (256 << 20),
                             media_type=entries[-1].mime_type,
                         )
                     else:
@@ -2397,7 +2429,8 @@ class AttemptEngine:
                             output_id,
                             blob,
                             tree=False,
-                            max_bytes=attempt.grant.outputs[output_id].max_bytes or (256 << 20),
+                            max_bytes=attempt.grant.outputs[slot[output_id] or output_id].max_bytes
+                            or (256 << 20),
                             media_type=entries[-1].mime_type,
                         )
                     if (
@@ -2457,6 +2490,11 @@ class AttemptEngine:
                 raise grants.GrantRefusal(
                     "output_too_large", "returned bytes exceed the output budget"
                 )
+            if self.products is not None and (
+                changed := self.products.finish(self.owner_scope(), attempt, entries)
+            ):
+                grants.abort_outputs(spool)
+                return None, changed
         except grants.GrantRefusal as exc:
             grants.abort_outputs(spool)
             return None, f"{exc.code}: {exc.detail}"

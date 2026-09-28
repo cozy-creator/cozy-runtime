@@ -82,6 +82,27 @@ class ModelPrefetch(_Request, frozen=True, kw_only=True, tag="model_prefetch"):
     payload: str
 
 
+class PublishPart(msgspec.Struct, frozen=True, kw_only=True):
+    """One part of a composite product: a spool file and the media time it adds."""
+
+    local: str
+    duration_us: Annotated[int, msgspec.Meta(ge=0)] = 0
+
+
+class Publish(_Request, frozen=True, kw_only=True, tag="publish"):
+    """Show one asset to the run's owner now, as a product of a declared output."""
+
+    output: str
+    label: str = ""
+    asset_ref: str
+    asset_kind: str
+    media_type: str = ""
+    size_bytes: int = 0
+    digest: str = ""
+    #: A composite product: its bytes are these parts concatenated in order.
+    parts: tuple[PublishPart, ...] = ()
+
+
 class TreeMember(_Request, frozen=True, kw_only=True, tag="tree_member"):
     tree: str
     path: str
@@ -120,6 +141,7 @@ type _Tagged = (
     | GpuRelease
     | ModelPrefetch
     | TreeMember
+    | Publish
 )
 #: One request of a managed call to the worker's call lane.
 type CallRequest = (
@@ -175,6 +197,14 @@ class CallState(Answer, frozen=True, kw_only=True):
     progress: CallProgress | None = None
     #: The child's execution observation document.
     observation: object = None
+
+
+class Published(Answer, frozen=True, kw_only=True):
+    """The product's sha256 and length; `sequence` 0 means nothing is shown (a child call)."""
+
+    digest: str = ""
+    length: int = 0
+    sequence: int = 0
 
 
 class Member(Answer, frozen=True, kw_only=True):

@@ -31,9 +31,10 @@ import io
 import math
 import os
 import queue
+import struct
 import threading
 from array import array
-from collections.abc import Buffer, Callable, Mapping
+from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
@@ -522,63 +523,69 @@ class VideoCopy:
     color_range: int
 
 
+def _refuse_copy(why: str) -> OutputError:
+    return OutputError(
+        f"videos cannot be joined by packet copy: {why}", code="video_copy_incompatible"
+    )
+
+
+def _copy_facts(path: Path) -> tuple[tuple[Any, ...], int]:
+    """One H.264 track's copy parameters and frame count, or `video_copy_incompatible`
+    unless it begins on a keyframe on a zero-based fixed frame clock."""
+    with _av().open(str(path), "r") as container:
+        streams = list(container.streams.video)
+        if len(streams) != 1 or streams[0].codec_context.name != "h264":
+            raise _refuse_copy(f"{path.name} is not exactly one H.264 track")
+        stream = streams[0]
+        context = stream.codec_context
+        facts = (
+            bytes(context.extradata or b""),
+            int(context.width or 0),
+            int(context.height or 0),
+            Fraction(stream.average_rate or 0),
+            Fraction(stream.sample_aspect_ratio or 1),
+            stream.time_base,
+            int(context.color_primaries),
+            int(context.color_trc),
+            int(context.colorspace),
+            int(context.color_range),
+        )
+        if not facts[3] or (1 / (facts[3] * facts[5])).denominator != 1:
+            raise _refuse_copy("the frame rate is not a whole number of time-base ticks")
+        step = int(1 / (facts[3] * facts[5]))
+        times: list[int] = []
+        prior: int | None = None
+        for packet in container.demux(stream):
+            if packet.size == 0:
+                continue
+            if not times and not packet.is_keyframe:
+                raise _refuse_copy(f"{path.name} does not begin on a keyframe")
+            if (
+                packet.dts is None
+                or packet.pts is None
+                or packet.dts > packet.pts
+                or (prior is not None and packet.dts <= prior)
+            ):
+                raise _refuse_copy(f"{path.name} has no monotone decode clock")
+            prior = packet.dts
+            times.append(packet.pts)
+        if sorted(times) != list(range(0, step * len(times), step)) or not times:
+            raise _refuse_copy(f"{path.name} is not on a zero-based fixed frame clock")
+        return facts, len(times)
+
+
 def plan_video_copy(paths: tuple[Path, ...]) -> VideoCopy:
     """Refuse `video_copy_incompatible` unless every track shares one set of H.264
     parameters and one zero-based frame clock, and each begins on a keyframe."""
-
-    def refuse(why: str) -> OutputError:
-        return OutputError(
-            f"videos cannot be joined by packet copy: {why}", code="video_copy_incompatible"
-        )
-
-    av = _av()
     shared: tuple[Any, ...] | None = None
     frames: list[int] = []
     for path in paths:
-        with av.open(str(path), "r") as container:
-            streams = list(container.streams.video)
-            if len(streams) != 1 or streams[0].codec_context.name != "h264":
-                raise refuse(f"{path.name} is not exactly one H.264 track")
-            stream = streams[0]
-            context = stream.codec_context
-            facts = (
-                bytes(context.extradata or b""),
-                int(context.width or 0),
-                int(context.height or 0),
-                Fraction(stream.average_rate or 0),
-                Fraction(stream.sample_aspect_ratio or 1),
-                stream.time_base,
-                int(context.color_primaries),
-                int(context.color_trc),
-                int(context.colorspace),
-                int(context.color_range),
-            )
-            if shared is None:
-                shared = facts
-                if not facts[3] or (1 / (facts[3] * facts[5])).denominator != 1:
-                    raise refuse("the frame rate is not a whole number of time-base ticks")
-            elif facts != shared:
-                raise refuse(f"{path.name} differs in codec parameters or clock")
-            step = int(1 / (facts[3] * facts[5]))
-            times: list[int] = []
-            prior: int | None = None
-            for packet in container.demux(stream):
-                if packet.size == 0:
-                    continue
-                if not times and not packet.is_keyframe:
-                    raise refuse(f"{path.name} does not begin on a keyframe")
-                if (
-                    packet.dts is None
-                    or packet.pts is None
-                    or packet.dts > packet.pts
-                    or (prior is not None and packet.dts <= prior)
-                ):
-                    raise refuse(f"{path.name} has no monotone decode clock")
-                prior = packet.dts
-                times.append(packet.pts)
-            if sorted(times) != list(range(0, step * len(times), step)) or not times:
-                raise refuse(f"{path.name} is not on a zero-based fixed frame clock")
-            frames.append(len(times))
+        facts, count = _copy_facts(path)
+        if shared is None:
+            shared = facts
+        elif facts != shared:
+            raise _refuse_copy(f"{path.name} differs in codec parameters or clock")
+        frames.append(count)
     assert shared is not None
     return VideoCopy(
         paths,
@@ -909,6 +916,262 @@ class StreamingMP4Encoder:
             self._container.close()
         self._raw.close()
         self.path.unlink(missing_ok=True)
+
+
+def _boxes(data: bytes | bytearray, start: int = 0, end: int | None = None) -> Iterator[_Box]:
+    """ISO-BMFF boxes between `start` and `end`: (type, offset, header length, size)."""
+    end = len(data) if end is None else end
+    at = start
+    while at < end:
+        if end - at < 8:
+            raise OutputError("fragmented MP4 box is truncated", code="output_probe")
+        size, kind = struct.unpack_from(">I4s", data, at)
+        head = 8
+        if size == 1:
+            size, head = struct.unpack_from(">Q", data, at + 8)[0], 16
+        elif size == 0:
+            size = end - at
+        if size < head or at + size > end:
+            raise OutputError("fragmented MP4 box overruns its parent", code="output_probe")
+        yield kind.decode("latin-1"), at, head, size
+        at += size
+
+
+type _Box = tuple[str, int, int, int]
+
+
+def _restamp(
+    data: bytes, sequence: int, times: Mapping[int, list[int]]
+) -> tuple[bytes, bytes, int]:
+    """Split one closed fragmented MP4 into its init (`ftyp`+`moov`) and its fragments, the
+    fragments renumbered after `sequence` and each track's `tfdt` set to the decode time of
+    its first sample on the joined timeline (`times[track]`, one entry per sample)."""
+    init, fragments = bytearray(), bytearray()
+    used = dict.fromkeys(times, 0)
+    for kind, at, head, size in _boxes(data):
+        if kind in ("ftyp", "moov"):
+            init += data[at : at + size]
+            continue
+        if kind != "moof" and kind != "mdat":
+            raise OutputError(
+                f"fragmented MP4 holds an unexpected {kind!r} box", code="output_probe"
+            )
+        box = bytearray(data[at : at + size])
+        if kind == "moof":
+            for child, cat, chead, csize in _boxes(box, head, size):
+                if child == "mfhd":
+                    sequence += 1
+                    struct.pack_into(">I", box, cat + chead + 4, sequence)
+                elif child == "traf":
+                    track, tfdt, count = 0, -1, 0
+                    for grand, gat, ghead, _ in _boxes(box, cat + chead, cat + csize):
+                        if grand == "tfhd":
+                            track = struct.unpack_from(">I", box, gat + ghead + 4)[0]
+                        elif grand == "tfdt":
+                            tfdt = gat + ghead
+                        elif grand == "trun":
+                            count += struct.unpack_from(">I", box, gat + ghead + 4)[0]
+                    if track not in used or tfdt < 0 or used[track] + count > len(times[track]):
+                        raise OutputError(
+                            "fragment names samples the join did not write", code="output_probe"
+                        )
+                    value = times[track][used[track]]
+                    if box[tfdt] == 1:
+                        struct.pack_into(">Q", box, tfdt + 4, value)
+                    elif value < 1 << 32:
+                        struct.pack_into(">I", box, tfdt + 4, value)
+                    else:
+                        raise OutputError(
+                            "fragment decode time overflows its box", code="output_probe"
+                        )
+                    used[track] += count
+        fragments += box
+    if any(used[track] != len(samples) for track, samples in times.items()):
+        raise OutputError("the muxer dropped samples of a joined video", code="output_probe")
+    return bytes(init), bytes(fragments), sequence
+
+
+class FragmentedJoin:
+    """H.264 videos joined by packet copy under one AAC soundtrack, written as CMAF: one init
+    segment, then one run of fragments per appended video, complete when `append` returns.
+
+    The one-muxer join cannot hand out what it wrote: its last fragment stays in the muxer until
+    the next keyframe, and PyAV exposes no fragment flush. So each video is muxed by a fresh
+    muxer that is then closed, which flushes it, and its `moof`/`mdat` boxes are restamped onto
+    the one timeline (`_restamp`). The AAC encoder persists across appends, so init plus the
+    parts decode to exactly the frames and samples the one-muxer join writes, after every append.
+    """
+
+    def __init__(
+        self, directory: Path, *, audio_channels: int, audio_sample_rate: int, max_bytes: int
+    ) -> None:
+        if audio_channels not in (0, 1, 2) or bool(audio_channels) != bool(audio_sample_rate):
+            raise OutputError(
+                "a joined soundtrack is mono or stereo with its rate", code="audio_shape"
+            )
+        self.directory, self.max_bytes = directory, max_bytes
+        self.audio_channels, self.audio_sample_rate = audio_channels, audio_sample_rate
+        #: (file, media microseconds) per part, init first.
+        self.parts: list[tuple[Path, int]] = []
+        self.frames = 0
+        self.samples = 0
+        self.flushed = False
+        self._sequence = 0
+        #: How far the first video's decode clock and the soundtrack start before zero (frame
+        #: reordering; AAC priming): the joined media timeline begins there.
+        self._delay: int | None = None
+        self._priming: int | None = None
+        self._first: tuple[Path, tuple[Any, ...]] | None = None
+        self._bytes = 0
+        self._av = _av()
+        self._aac: Any = None
+        if audio_channels:
+            aac = self._av.CodecContext.create("aac", "w")
+            aac.sample_rate = audio_sample_rate
+            aac.layout = "mono" if audio_channels == 1 else "stereo"
+            aac.format = "fltp"
+            aac.bit_rate = _AAC_BIT_RATE
+            aac.thread_count = 1
+            aac.time_base = Fraction(1, audio_sample_rate)
+            aac.open()
+            self._aac = aac
+
+    def append(
+        self, video: Path, audio: Callable[[int], Iterable[Planar]], *, last: bool = False
+    ) -> list[Path]:
+        """Join one more video and its stretch of the soundtrack, which `audio` returns given
+        the video's frame count; the parts it added."""
+        if self.flushed:
+            raise OutputError("the joined video is already finished", code="media_join")
+        facts, frames = _copy_facts(video)
+        if self._first is None:
+            self._first = video, facts
+        elif facts != self._first[1]:
+            raise _refuse_copy(f"{video.name} differs in codec parameters or clock")
+        packets = []
+        for planar in audio(frames):
+            packets += self._encode(planar)
+        if last:
+            packets += self._flush()
+        added = self._mux(video, packets, Fraction(frames) / facts[3])
+        self.frames += frames
+        return added
+
+    def finish(self) -> list[Path]:
+        """Close the soundtrack: its last frames as one audio part, unless an append was last."""
+        if self.flushed or self._first is None:
+            self.flushed = True
+            return []
+        packets = self._flush()
+        return (
+            self._mux(
+                None,
+                packets,
+                Fraction(sum(p.duration or 0 for p in packets), self.audio_sample_rate or 1),
+            )
+            if packets
+            else []
+        )
+
+    def _encode(self, planar: Planar) -> list[Any]:
+        if self._aac is None or planar.shape[0] != self.audio_channels:
+            raise OutputError(
+                "joined audio does not match the declared soundtrack", code="audio_shape"
+            )
+        frames = _audio_frames(
+            self._av,
+            planar,
+            self.audio_sample_rate,
+            "flt",
+            AAC_FRAME_SAMPLES,
+            start_pts=self.samples,
+        )
+        self.samples += planar.shape[1]
+        return [packet for frame in frames for packet in self._aac.encode(frame)]
+
+    def _flush(self) -> list[Any]:
+        self.flushed = True
+        return list(self._aac.encode()) if self._aac is not None else []
+
+    def _mux(self, video: Path | None, audio: list[Any], duration: Fraction) -> list[Path]:
+        assert self._first is not None
+        first = not self.parts
+        temporary = self.directory / f".join-{len(self.parts)}.mp4"
+        options = {
+            "fflags": "+bitexact",
+            "frag_duration": "1000000",
+            "movflags": "+empty_moov+default_base_moof+frag_keyframe+skip_sidx+skip_trailer"
+            + ("+delay_moov" if first and self._aac is not None else ""),
+            "use_editlist": "1" if first and self._aac is not None else "0",
+        }
+        container = self._av.open(str(temporary), "w", format="mp4", options=options)
+        try:
+            with self._av.open(str(video or self._first[0]), "r") as source:
+                stream = source.streams.video[0]
+                track = container.add_stream_from_template(stream)
+                sound = None
+                if self._aac is not None:
+                    sound = container.add_stream("aac", rate=self.audio_sample_rate)
+                    sound.codec_context.layout = self._aac.layout
+                    sound.codec_context.format = "fltp"
+                    sound.codec_context.bit_rate = _AAC_BIT_RATE
+                    sound.codec_context.thread_count = 1
+                pictures = (
+                    [packet for packet in source.demux(stream) if packet.size] if video else []
+                )
+                step = int(1 / (Fraction(stream.average_rate) * stream.time_base))
+                if pictures and self._delay is None:
+                    self._delay = max(0, -int(pictures[0].dts))
+                times = {
+                    1: [self.frames * step + int(p.dts) + (self._delay or 0) for p in pictures]
+                }
+                if audio and self._priming is None:
+                    self._priming = max(0, -int(audio[0].pts))
+                if sound is not None:
+                    times[2] = [int(packet.pts) + (self._priming or 0) for packet in audio]
+                # A later muxer starts both tracks at zero, so it shifts and pads nothing: its
+                # decode times are restamped onto the joined timeline anyway. The first keeps
+                # the source clocks, whose negative starts become the init's edit lists.
+                origin = 0 if first or not audio else int(audio[0].pts)
+                for packet in audio:
+                    packet.pts -= origin
+                    packet.dts -= origin
+                    packet.stream = sound
+                shift = 0 if first or not pictures else -int(pictures[0].dts)
+                for packet in pictures:
+                    packet.pts += shift
+                    packet.dts += shift
+                    packet.stream = track
+                container.start_encoding()
+                for packet in sorted([*pictures, *audio], key=lambda p: p.dts * p.time_base):
+                    container.mux(packet)
+            container.close()
+            data = temporary.read_bytes()
+        finally:
+            with suppress(Exception):
+                container.close()
+            temporary.unlink(missing_ok=True)
+        init, fragments, self._sequence = _restamp(data, self._sequence, times)
+        self._bytes += len(fragments) + (len(init) if first else 0)
+        if self._bytes > self.max_bytes:
+            raise OutputError(
+                f"the joined video would cross the {self.max_bytes}-byte limit",
+                code="output_too_large",
+            )
+        added = []
+        for body, micros in (
+            ((init, 0), (fragments, round(duration * 1_000_000)))
+            if first
+            else ((fragments, round(duration * 1_000_000)),)
+        ):
+            part = self.directory / f"join-part-{len(self.parts):04d}"
+            with part.open("xb") as writer:
+                writer.write(body)
+                writer.flush()
+                os.fsync(writer.fileno())
+            self.parts.append((part, micros))
+            added.append(part)
+        return added
 
 
 def probe_mp4(path: Path) -> EncodedVideoFacts:

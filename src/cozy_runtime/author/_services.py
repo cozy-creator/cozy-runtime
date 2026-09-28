@@ -19,7 +19,7 @@ import shutil
 import stat
 import threading
 import time
-from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
+from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -48,6 +48,7 @@ from cozy_runtime.author._decode import (
     MediaDecoder,
 )
 from cozy_runtime.author._errors import AuthorError, CapabilityError, OutputError
+from cozy_runtime.author._executor_requests import Publish, Published, PublishPart
 from cozy_runtime.author._model_reader import WeightsReader
 from cozy_runtime.author._observations import Attribution, EventRing, Observation, Scalar
 
@@ -182,6 +183,14 @@ class Attempt:
     metrics_dropped: int = 0
     _counter: int = 0
     _step_mark: float = 0.0
+    #: Sends one publish to the worker, which journals it on the run's output log. None in a
+    #: harness with no worker: `published` then records what would have been shown.
+    publish: Callable[[Publish], Published] | None = None
+    published: list[Publish] = field(default_factory=list)
+    #: Handles delivered as products, or joined into one: the result need not return them.
+    shown: set[str] = field(default_factory=set)
+    #: A composite asset's parts, by its handle: what `publish` sends instead of one file.
+    parts: dict[str, tuple[PublishPart, ...]] = field(default_factory=dict)
     _overall_fraction: float | None = None
     _progress_diagnostics: set[str] = field(default_factory=set)
     #: Overlapped calls (`author.concurrently`) record from their own threads.
@@ -582,6 +591,19 @@ class Outputs(_Bound):
             copy,
         )
 
+    def join_video(self, audio: DecodedAudioFormat | None) -> VideoJoin:
+        """A packet-copy join that grows one video at a time, for publishing as it grows.
+
+        Each `append` copies one more H.264 video's packets (no picture is decoded or encoded)
+        with its stretch of `audio`, the one soundtrack encoded across the join, and returns
+        the video joined so far: init plus one part per append, publishable with
+        `publish`. `finish` returns the joined video, which is the last of them byte for byte
+        when the last append said `last=True`.
+        """
+        self._attempt.check_open("Outputs.join_video")
+        _codec.require_encoder()
+        return VideoJoin(self, audio)
+
     def _write_audio(
         self,
         encoder: _codec.StreamingMP4Encoder,
@@ -590,6 +612,14 @@ class Outputs(_Bound):
         written: int,
     ) -> int:
         """One chunk on the declared format and sample clock; the samples now written."""
+        planar = self._audio_planar(audio_format, event, written)
+        encoder.write_audio(planar)
+        return written + planar.shape[1]
+
+    def _audio_planar(
+        self, audio_format: DecodedAudioFormat | None, event: DecodedMediaEvent, written: int
+    ) -> _codec.Planar:
+        """One chunk checked against the declared format and continuing the sample clock."""
         if not isinstance(event, DecodedAudioChunk):
             raise OutputError(
                 f"streaming video received {type(event).__name__}, not a media event",
@@ -613,8 +643,7 @@ class Outputs(_Bound):
             )
         planar, clipped = _codec.audio_chunk(event.pcm_f32le, event.sample_count)
         self._clip_row(clipped)
-        encoder.write_audio(planar)
-        return written + event.sample_count
+        return planar
 
     def _save_mp4(
         self,
@@ -761,6 +790,41 @@ class Outputs(_Bound):
                     source="policy",
                 )
             )
+
+    def publish(self, output: str, asset: Asset, *, label: str = "") -> None:
+        """Show `asset` to the run's owner now, as a product of `output`: an asset field of
+        this function's declared result. A single field's product is replaced by each publish;
+        a `list[...]` field grows by one. Returning the result is the last publish, so the
+        returned value keeps what was published (a list extends it). `label` is for people:
+        its first 256 characters, printable ASCII (others read "?"). A child call's publishes
+        are not shown; its parent publishes what it wants seen."""
+        attempt = self._attempt
+        attempt.check_open("Outputs.publish")
+        if not isinstance(asset, Asset):
+            raise OutputError("publish takes one saved or received asset", code="output_kind")
+        # The log carries printable ASCII: anything else reads as "?", never a refusal.
+        label = "".join(char if 0x20 <= ord(char) <= 0x7E else "?" for char in label[:256])
+        if asset.ref in attempt.frames:
+            settle_frame(attempt, asset.ref)
+        request = Publish(
+            output=output,
+            label=label,
+            asset_ref=asset.ref,
+            asset_kind=asset.kind,
+            media_type=asset.media_type,
+            size_bytes=asset.size_bytes,
+            digest=asset.digest,
+            parts=attempt.parts.get(asset.ref, ()),
+        )
+        if attempt.publish is None:
+            attempt.published.append(request)
+        else:
+            answer = attempt.publish(request)
+            if not answer.ok:
+                raise OutputError(
+                    answer.detail or "the worker refused the publish", code=answer.code
+                )
+        attempt.shown.add(asset.ref)
 
     def save_bytes(self, data: bytes, *, media_type: str) -> FileAsset:
         return self._register(data, FileAsset, media_type)
@@ -918,6 +982,139 @@ class Outputs(_Bound):
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+
+class VideoJoin:
+    """`Outputs.join_video`: a copy join published as it grows (CMAF parts)."""
+
+    def __init__(self, outputs: Outputs, audio: DecodedAudioFormat | None) -> None:
+        self._outputs, self._attempt, self._audio = outputs, outputs._attempt, audio
+        self._written = 0
+        directory = (
+            self._attempt.spool / f"join-{self._attempt.next_handle('join').rsplit('/', 1)[-1]}"
+        )
+        directory.mkdir()
+        self._join = _codec.FragmentedJoin(
+            directory,
+            audio_channels=audio.channels if audio is not None else 0,
+            audio_sample_rate=audio.sample_rate if audio is not None else 0,
+            max_bytes=self._attempt.max_output_bytes,
+        )
+
+    def append(
+        self,
+        video: VideoAsset,
+        soundtrack: Callable[[int], Iterable[DecodedMediaEvent]] = lambda frames: (),
+        *,
+        last: bool = False,
+    ) -> VideoAsset:
+        """Join `video` after the others with its stretch of the soundtrack: the audio chunks
+        `soundtrack` returns given the video's frame count, continuing the joined sample
+        clock. The video joined so far comes back. `last` closes the soundtrack."""
+        self._attempt.check_open("VideoJoin.append")
+        if (
+            not isinstance(video, VideoAsset)
+            or video._local is None
+            or video._attempt != self._attempt.request_id
+        ):
+            raise CapabilityError(
+                "joined videos must be hydrated inputs of this attempt", code="foreign_asset"
+            )
+        video._check_file()
+
+        def planars(frames: int) -> Iterator[_codec.Planar]:
+            for event in soundtrack(frames):
+                planar = self._outputs._audio_planar(self._audio, event, self._written)
+                self._written += planar.shape[1]
+                yield planar
+
+        self._join.append(video._local, planars, last=last)
+        video._check_file()
+        # Its bytes live on in the joined video: a saved segment need not be returned.
+        self._attempt.shown.add(video.ref)
+        return self._revision()
+
+    def finish(self) -> SavedVideo:
+        """The joined video, registered as this attempt's output; its parts are the last
+        revision's, so publishing it again costs nothing."""
+        self._attempt.check_open("VideoJoin.finish")
+        if not self._join.parts:
+            raise OutputError("a joined video needs at least one video", code="media_header")
+        self._join.finish()
+        handle = self._attempt.next_handle(VideoAsset.kind)
+        final = self._attempt.spool / f"video-{handle.rsplit('/', 1)[-1]}"
+        with final.open("xb") as writer:
+            for part, _ in self._join.parts:
+                with part.open("rb") as reader:
+                    shutil.copyfileobj(reader, writer, 1 << 20)
+            writer.flush()
+            os.fsync(writer.fileno())
+        facts = _codec.probe_mp4(final)
+        if facts.frame_count != self._join.frames or (
+            self._audio is not None and facts.audio_decoded_samples != self._written
+        ):
+            final.unlink()
+            raise OutputError(
+                f"joined MP4 probe disagrees: {facts.frame_count} frames of {self._join.frames}, "
+                f"{facts.audio_decoded_samples} samples of {self._written}",
+                code="output_probe",
+            )
+        size, digest = self._outputs._measure_file(final)
+        asset = VideoAsset(
+            handle,
+            media_type="video/mp4",
+            size_bytes=size,
+            digest=digest,
+            local=final,
+            attempt=self._attempt.request_id,
+        )
+        self._attempt.pending[handle] = asset
+        self._attempt.parts[handle] = self._parts()
+        return SavedVideo(
+            video=asset,
+            width=facts.width,
+            height=facts.height,
+            frame_count=facts.frame_count,
+            frame_rate=facts.frame_rate,
+            pixel_aspect_ratio=facts.pixel_aspect_ratio,
+            video_codec=facts.video_codec,
+            video_profile=facts.video_profile,
+            color_primaries=facts.color_primaries,
+            color_transfer=facts.color_transfer,
+            color_matrix=facts.color_matrix,
+            color_range=facts.color_range,
+            audio=(
+                SavedAudioFacts(
+                    codec=facts.audio_codec,
+                    profile=facts.audio_profile,
+                    channels=facts.audio_channels,
+                    sample_rate=facts.audio_sample_rate,
+                    codec_frame_samples=facts.audio_frame_samples,
+                    decoded_samples=facts.audio_decoded_samples,
+                )
+                if self._audio is not None
+                else None
+            ),
+            submitted_audio_samples=self._written,
+        )
+
+    def _parts(self) -> tuple[PublishPart, ...]:
+        return tuple(
+            PublishPart(local=f"{part.parent.name}/{part.name}", duration_us=micros)
+            for part, micros in self._join.parts
+        )
+
+    def _revision(self) -> VideoAsset:
+        """The video joined so far: a composite of the parts, published without a copy."""
+        handle = self._attempt.next_handle("revision")
+        revision = VideoAsset(
+            handle,
+            media_type="video/mp4",
+            size_bytes=sum(part.stat().st_size for part, _ in self._join.parts),
+            attempt=self._attempt.request_id,
+        )
+        self._attempt.parts[handle] = self._parts()
+        return revision
 
 
 class Telemetry(_Bound):
