@@ -165,11 +165,15 @@ def request_control_metadata(
 
 @contextmanager
 def _catalog_get(
-    host: str, port: int | None, tls: ssl.SSLContext | None, path: str
+    host: str,
+    port: int | None,
+    tls: ssl.SSLContext | None,
+    path: str,
+    credential: Mapping[str, str],
 ) -> Iterator[http.client.HTTPResponse]:
-    """One anonymous GET at the public catalog, which the caller checked. Plain HTTP (no
-    TLS context) is for a loopback development catalog only. No credential is sent and
-    nothing is retried."""
+    """One GET at the catalog, which the caller checked. Plain HTTP (no TLS context) is for
+    a loopback development catalog only. `credential` is the machine's worker capability,
+    sent only to its own Hub, else empty; nothing is retried."""
     if not path.startswith("/v1/"):
         raise EgressRefusal("catalog_route_invalid", "catalog route is invalid")
     connection: http.client.HTTPConnection = (
@@ -178,7 +182,7 @@ def _catalog_get(
         else http.client.HTTPConnection(host, port, timeout=SILENCE_SECONDS)
     )
     try:
-        connection.request("GET", path, headers={"Accept": "application/json"})
+        connection.request("GET", path, headers={"Accept": "application/json", **credential})
         yield connection.getresponse()
     except (OSError, http.client.HTTPException) as exc:
         raise EgressRefusal(
@@ -189,12 +193,18 @@ def _catalog_get(
 
 
 def request_catalog_metadata(
-    host: str, port: int | None, tls: ssl.SSLContext | None, path: str, *, limit: int
+    host: str,
+    port: int | None,
+    tls: ssl.SSLContext | None,
+    path: str,
+    *,
+    limit: int,
+    credential: Mapping[str, str],
 ) -> tuple[int, bytes]:
-    """Bounded public catalog metadata (bindings, lane resolutions): status and body."""
+    """Bounded catalog metadata (bindings, lane resolutions): status and body."""
     if not 0 < limit <= 8 << 20:
         raise EgressRefusal("catalog_route_invalid", "catalog route is invalid")
-    with _catalog_get(host, port, tls, path) as response:
+    with _catalog_get(host, port, tls, path, credential) as response:
         raw = response.read(limit + 1)
         if len(raw) > limit:
             raise EgressRefusal("catalog_response_bound", "catalog response exceeds its bound")
@@ -202,11 +212,17 @@ def request_catalog_metadata(
 
 
 def measure_catalog_document(
-    host: str, port: int | None, tls: ssl.SSLContext | None, path: str, *, limit: int
+    host: str,
+    port: int | None,
+    tls: ssl.SSLContext | None,
+    path: str,
+    *,
+    limit: int,
+    credential: Mapping[str, str],
 ) -> tuple[int, int, bytes]:
-    """A public catalog document streamed, never held: status, length and SHA-256.
-    `limit` is the document kind's own cap."""
-    with _catalog_get(host, port, tls, path) as response:
+    """A catalog document streamed, never held: status, length and SHA-256. `limit` is the
+    document kind's own cap."""
+    with _catalog_get(host, port, tls, path, credential) as response:
         digest, length = hashlib.sha256(), 0
         while chunk := response.read(CHUNK):
             length += len(chunk)

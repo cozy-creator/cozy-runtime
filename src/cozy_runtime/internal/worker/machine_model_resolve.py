@@ -29,27 +29,35 @@ type Fits = Callable[[Mapping[str, Any]], bool]
 
 
 class Catalog:
-    """Anonymous public reads at one catalog origin; a package's bindings are read once."""
+    """Reads at one catalog origin; a package's bindings are read once. At the machine's own
+    Hub each read presents its worker capability, which reads its owner's unpublished
+    checkpoints; a refusal is never retried anonymously."""
 
-    def __init__(self, origin: str, context: ssl.SSLContext | None = None) -> None:
+    def __init__(
+        self,
+        origin: str,
+        context: ssl.SSLContext | None = None,
+        credential: Mapping[str, str] | None = None,
+    ) -> None:
         parts = urlsplit(origin)
         self.origin = origin
         self.host, self.port = parts.hostname or "", parts.port
         self.tls = (context or ssl.create_default_context()) if parts.scheme == "https" else None
+        self.credential = dict(credential or {})
         self.bindings: dict[str, dict[str, Any]] = {}
 
     def text(self, path: str, limit: int = MAX_METADATA) -> bytes | None:
-        """One bounded public document's bytes, or None when the catalog has none."""
+        """One bounded document's bytes, or None when the catalog has none."""
         try:
             status, raw = egress.request_catalog_metadata(
-                self.host, self.port, self.tls, path, limit=limit
+                self.host, self.port, self.tls, path, limit=limit, credential=self.credential
             )
         except egress.EgressRefusal as exc:
             raise WorkspaceRefusal(f"catalog read failed: {exc.code}") from exc
         if status == 404:
             return None
         if status != 200:
-            raise WorkspaceRefusal(f"catalog answered {status} for {path[:200]}")
+            raise WorkspaceRefusal(f"catalog answered {status} {_code(raw)} for {path[:200]}")
         return raw
 
     def get(self, path: str, limit: int = MAX_METADATA) -> Any:
@@ -105,6 +113,7 @@ class Catalog:
                 self.tls,
                 path,
                 limit=fill.tensorfs_module().manifest_max_bytes(),
+                credential=self.credential,
             )
         except egress.EgressRefusal as exc:
             raise WorkspaceRefusal(f"model catalog manifest read failed: {exc.code}") from exc
@@ -116,11 +125,25 @@ class Catalog:
 
 
 def own(worker: Worker) -> Catalog:
-    """This machine's own Hub, as its grant names it: where it reads packages and Models."""
+    """This machine's own Hub, as its grant names it: where it reads packages and Models,
+    its owner's unpublished ones included."""
     authority = worker.options.publication_authority
     if authority is None:
         raise WorkspaceRefusal("this machine has no Hub grant to read the catalog at")
-    return Catalog(authority.origin, authority.context())
+    return Catalog(
+        authority.origin,
+        authority.context(),
+        {"X-Cozy-Worker-ID": authority.worker_id, "X-Cozy-Worker-Token": authority.worker_token},
+    )
+
+
+def _code(raw: bytes) -> str:
+    """The Hub's typed error code, e.g. worker.unauthorized or worker.ended, else ""."""
+    try:
+        error = json.loads(raw).get("error", {})
+        return str(error.get("code", ""))[:128] if isinstance(error, dict) else ""
+    except (ValueError, AttributeError):
+        return ""
 
 
 def _ladder(

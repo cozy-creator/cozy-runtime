@@ -73,6 +73,10 @@ class Catalog:
     ) -> None:
         self.reads: list[str] = []
         self.served = served
+        # Private: the Models are the owner's unpublished checkpoints, read only with the
+        # machine's worker capability (absent: 404, as if absent; another: 401).
+        self.private = False
+        self.presented: list[tuple[str, str, str]] = []
         catalog = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -82,6 +86,19 @@ class Catalog:
             def do_GET(self) -> None:
                 catalog.reads.append(self.path)
                 url = urlsplit(self.path)
+                presented = (
+                    self.headers.get("X-Cozy-Worker-ID", ""),
+                    self.headers.get("X-Cozy-Worker-Token", ""),
+                )
+                if url.path.startswith("/v1/models/"):
+                    catalog.presented.append((url.path, *presented))
+                    if catalog.private and presented != ("worker", "token"):
+                        error = b'{"error":{"code":"worker.ended","message":"worker ended"}}'
+                        self.send_response(401 if presented[0] else 404)
+                        self.send_header("Content-Length", str(len(error)))
+                        self.end_headers()
+                        self.wfile.write(error)
+                        return
                 release = catalog.releases.get(url.path)
                 if release is not None:
                     body: Any = release
@@ -136,9 +153,9 @@ class Catalog:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
-    def serve(self, machine: Machine) -> None:
+    def serve(self, machine: Machine, token: str = "token") -> None:
         """Make this catalog the machine's own Hub, as its grant names it."""
-        authority = PublicationAuthority(self.origin, "worker", "token")
+        authority = PublicationAuthority(self.origin, "worker", token)
         worker = machine.worker
         worker.options = dataclasses.replace(worker.options, publication_authority=authority)
 
@@ -697,5 +714,43 @@ def test_a_custody_handoff_answers_not_now(
         fence("active")
         receipt, _ = submit(machine, root)
         assert receipt.request_id == "handoff"
+    finally:
+        catalog.close()
+
+
+def test_the_owners_unpublished_checkpoint_resolves_with_the_worker_capability(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The machine's own Hub serves its owner's unpublished Model only to its worker
+    capability: the lane resolution and the digest's manifest bytes both present it, and an
+    ended grant is refused typed, never retried anonymously."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    raw = tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+    catalog = Catalog(
+        machine.manifest, None, [{"gpu": "H100", "lane": LANE}], raw, interface=machine.interface
+    )
+    catalog.private = True
+    catalog.serve(machine)
+    try:
+        # The lane resolves at the Hub, and its unstated length is measured from the
+        # digest's manifest bytes: both are the owner's, read with the capability.
+        receipt, _ = submit(machine, submission(machine, "by-lane"))
+        assert receipt.request_id == "by-lane"
+        assert [path for path, *_ in catalog.presented] == [
+            "/v1/models/resolve",
+            f"/v1/models/{PACKAGE}/checkpoints/{machine.manifest}",
+        ]
+        assert all((who, token) == ("worker", "token") for _, who, token in catalog.presented)
+
+        catalog.presented.clear()
+        catalog.serve(machine, token="ended")
+        with pytest.raises(Refused, match=r"catalog answered 401 worker\.ended"):
+            submit(machine, submission(machine, "ended"))
+        assert catalog.presented == [("/v1/models/resolve", "worker", "ended")], catalog.presented
     finally:
         catalog.close()
