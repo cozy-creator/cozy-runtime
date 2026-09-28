@@ -3647,6 +3647,16 @@ class Executor:
         if self.rank == 0 or target is None or target.backend is None:
             return {"ok": False, "code": "gpu_divergence", "detail": "no such construction"}
         roots = {**target.backend.components, **target.backend.parked}
+        device, applied = target.device_facts, target.attention
+        if (
+            target._reselect is not None
+            and applied is not None
+            and device is not None
+            and attention.pending(applied, device)
+        ):
+            # Rank 0 upgraded at a request boundary; a kernel this rank skipped while it
+            # compiled joins here too, e.g. Sol's dense reference, which `adopt` cannot name.
+            target.attention = replace(target._reselect(), pin=applied.pin)
         held = attention.observed(roots).hosts
         try:
             for component, name in sorted(adopt.items()):

@@ -110,12 +110,11 @@ def record_rank(rank: int, counts: dict[str, int]) -> None:
 
 
 def bind_dense(call: Callable[..., Any], identity: str) -> None:
-    """Install the already-resolved dense reference once before construction warmup."""
+    """Install the dense reference a selection resolved. Selection runs at preparation and at
+    request boundaries, never inside a request, so a rebind never changes a running one."""
     if not callable(call) or not identity:
         raise ValueError("Sol requires a resolved dense attention reference and its identity")
     global _DENSE, _DENSE_IDENTITY
-    if _DENSE is not None and identity != _DENSE_IDENTITY:
-        raise RuntimeError("Sol dense reference is already bound to a different implementation")
     _DENSE, _DENSE_IDENTITY = call, identity
 
 
