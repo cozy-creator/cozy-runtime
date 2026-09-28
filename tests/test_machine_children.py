@@ -342,6 +342,7 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
         "internal_serving",
         "pause",
         "cycle",
+        "child_failure",
         "capacity",
         "model",
         "model_sequence",
@@ -494,6 +495,10 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             )
         if case == "cycle":
             source = source.replace("first = await leaf(n=n)", "first = await compose(n=n)")
+        if case == "child_failure":
+            source = source.replace(
+                "    return Result(n * 2)", "    raise RuntimeError('leaf broke')"
+            )
         if case in ("internal", "internal_root", "internal_serving"):
             source = source.replace("app.job(leaf)", "app.job(leaf, internal=True)")
             source = source.replace("app.entrypoint(leaf)", "app.entrypoint(leaf, internal=True)")
@@ -722,6 +727,27 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 time.sleep(0.02)
             outcome = worker.collect_execution(claim, "root")
             body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+            if case == "child_failure":
+                assert body["status"] == pb.OUTCOME_STATUS_FAILED, body
+                assert worker.workspace is not None
+                with worker.workspace.locked() as db:
+                    rows = db.execute(
+                        "SELECT e.request,e.body FROM execution_events e LEFT JOIN "
+                        "execution_calls c ON c.child_request=e.request WHERE e.kind='log'"
+                    ).fetchall()
+                by_request = {
+                    request: log["payload"]["fields"]
+                    for request, raw in rows
+                    if (log := canonical_json.decode(raw))["payload"].get("name")
+                    == "executor release"
+                }
+                # The leaf's own failure poisons its process. Each parent only awaited it and
+                # stopped at the call boundary, so its process stays reusable (run 1516).
+                assert len(by_request) == 3, by_request
+                reasons = sorted(row["reuse_miss_reason"] for row in by_request.values())
+                assert reasons == ["", "", "failed/unhandled_exception"], by_request
+                assert by_request["root"]["reusable"], by_request
+                return
             if case == "source_conflict":
                 assert body["status"] == pb.OUTCOME_STATUS_FAILED, body
                 assert worker.workspace is not None

@@ -3399,9 +3399,10 @@ class Executor:
         quiescent = self._quiescent() if torch is not None else True
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        # Only a failure inside the handler leaves package state unknown. A request refusal
-        # or a cooperative cancel/deadline stops at a safe point and keeps the generation Ready.
-        if outcome.terminal == "failed" and record.entered:
+        # Only a failure inside the handler leaves package state unknown. A request refusal,
+        # a cooperative cancel/deadline or a failed package call stops at a safe point and
+        # keeps the generation Ready.
+        if outcome.terminal == "failed" and record.entered and not record.failed_at_call:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         terminal = {
             "terminal": outcome.terminal,
@@ -3968,7 +3969,7 @@ class Executor:
             peak_vram = accel.peak_allocated(self.torch, self.device_kind)
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        if outcome.terminal == "failed" and record.entered:
+        if outcome.terminal == "failed" and record.entered and not record.failed_at_call:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         return {
             "ok": True,

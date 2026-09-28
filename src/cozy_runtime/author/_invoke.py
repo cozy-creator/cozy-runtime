@@ -44,7 +44,7 @@ from cozy_runtime.author._assets import (
     bind,
     bind_tree,
 )
-from cozy_runtime.author._calls import _Broker, _current
+from cozy_runtime.author._calls import ChildCallError, _Broker, _current
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, MediaDecoder, image_decoded_bytes
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
@@ -384,6 +384,7 @@ def run_prepared(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
+        record.failed_at_call = isinstance(exc, ChildCallError)
         return None, classify(exc), record
     finally:
         record.closed = True
