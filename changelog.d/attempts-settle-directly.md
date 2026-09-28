@@ -1,0 +1,1 @@
+An attempt's terminal settles directly on its execution (`Worker.settle`); attempt frames, direct-stream attempts (`AttemptRecord.machine`), Control child calls, the job RECYCLE exit and GPU holders outside the scheduler are gone.

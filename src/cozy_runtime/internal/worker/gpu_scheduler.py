@@ -247,7 +247,7 @@ class GpuScheduler:
 
 @dataclass(frozen=True)
 class Want:
-    """One unit's standing GPU demand; warm ordinals and outside holders are read per pass."""
+    """One unit's standing GPU demand; warm ordinals are read per pass."""
 
     root: str
     width: int
@@ -269,13 +269,12 @@ class GpuBroker(GpuScheduler):
         *,
         granted_to: Callable[[str], None],
         observed: Observed,
-        outside: Callable[[], set[int]],
         warm: Callable[[tuple[str, str]], Ordinals],
         fault: Callable[[str], None],
     ) -> None:
         super().__init__(devices)
         self.granted_to, self.observed, self.fault = granted_to, observed, fault
-        self.outside, self.warm = outside, warm
+        self.warm = warm
         self.changes = threading.Lock()
         self.roots: dict[str, int] = {}
         self.wants: dict[str, Want] = {}
@@ -315,14 +314,13 @@ class GpuBroker(GpuScheduler):
     def resync(self) -> None:
         with self.changes:
             try:
-                outside = self.outside()
                 demands = [
                     Demand(
                         key,
                         want.root,
                         want.width,
                         self.warm(want.template),
-                        tuple(sorted(outside | set(want.exclude))),
+                        tuple(sorted(want.exclude)),
                     )
                     for key, want in self.wants.items()
                 ]

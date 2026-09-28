@@ -41,9 +41,9 @@ independently adopt stopped progress. Conversion adoption snapshots already-fsyn
 tensor groups before continuing missing operations; the native snapshot never executes an
 unfinished transform. Script stacks and arbitrary Python lines are not checkpointed.
 
-Stopping or pausing execution retains partial work. Permanent cleanup follows the owner's
-exact terminal acknowledgment with `retain_work=false`: native subprocesses finish stopping
-before their source access and producer roots are released. A memo entry has its own root,
+Stopping or pausing execution retains partial work. Permanent cleanup follows the
+execution's release (`retain_work=false`), which frees its source access and producer roots.
+A memo entry has its own root,
 so cleanup of one script cannot remove another recipient's work. Process death also stops
 the native subprocess; its durable native checkpoints remain resumable.
 

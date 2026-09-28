@@ -365,7 +365,6 @@ class Machine:
         selected = self.executions.offer(OWNER, name)
         self.executions.dispatched(OWNER, name, 1)
         attempt = AttemptRecord(name, 1, selected.invocation_spec_digest, {}, state="running")
-        attempt.machine = True
         self.worker.engine.history[attempt.key()] = attempt
         self.worker.engine.live[name] = attempt
         self.worker.execution(OWNER, name)

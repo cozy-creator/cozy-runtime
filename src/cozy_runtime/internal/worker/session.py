@@ -179,10 +179,6 @@ PROGRESS_QUEUE = 256
 #: always see a directive it issued but the worker did not apply.
 REPORT_SECONDS = 2.0
 
-#: The RUN-ONCE RECYCLE exit (cr-009, v1 rc 75). A job worker that completed its one attempt
-#: and had its terminal acknowledged asks to be RECLAIMED, and that is not a death.
-RECYCLE_EXIT = 75
-
 
 def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
     """Preserve the measured progress coordinates the executor already supplied.
@@ -1198,11 +1194,9 @@ class Worker:
         self.model_transfer_lock = threading.Lock()
         self.model_transfers: dict[str, threading.Lock] = {}
         self.calls = Calls(
-            self.send,
-            lambda: self.fence.control_stream_epoch,
+            self._machine_call,
             workspace=self.workspace,
             owner=lambda: self.fence.record_owner_id,
-            local=self._machine_call,
             prefetch=self._machine_prefetch,
             release_gpus=self._release_gpus,
             installed_bindings=self._installed_call_bindings,
@@ -1217,7 +1211,6 @@ class Worker:
             len(self.lanes.entries),
             granted_to=lambda key: self.supervisor.poke(execution_unit.key(key.rpartition("#")[0])),
             observed=self._gpu_observed,
-            outside=self._gpu_outside,
             warm=self._warm,
             fault=self.fail_machine,
         )
@@ -1314,7 +1307,6 @@ class Worker:
         self.exit_code: int = int(Exit.ok)
         self.boot_at = time.perf_counter()
         self.job_caps = pb.ResourceCaps()
-        self.reclaim_on_terminal = False
         self.boot_fatal: pb.BootFailure | None = None
         # Same-boot verification receipts. A worker restart intentionally loses this table
         # and re-hashes every retained cache file once before trusting it again.
@@ -2188,23 +2180,18 @@ class Worker:
         return self.executions, owner
 
     def _machine_prefetch(self, attempt: AttemptRecord, request: ModelPrefetch) -> Answer:
-        if not attempt.machine:
-            return Answer(ok=True)
         assert self.machine_calls is not None
         return self.machine_calls.serving.prefetch(attempt, request)
 
     def _release_gpus(self, attempt: AttemptRecord) -> None:
-        """`ctx.release_gpus()`: the attempt's root ends its GPU lease now. A direct attempt
-        holds no lease."""
-        if self.executions is not None and attempt.machine:
+        """`ctx.release_gpus()`: the attempt's root ends its GPU lease now."""
+        if self.executions is not None:
             owner = self.fence.record_owner_id
             self.gpu.release_root(self.executions.scheduling_root(owner, attempt.request_id)[0])
 
     def _machine_call(
         self, attempt: AttemptRecord, request: pb.ChildCallRequest, action: str
-    ) -> pb.ChildCallResult | None:
-        if not attempt.machine:
-            return None
+    ) -> pb.ChildCallResult:
         assert self.machine_calls is not None
         return self.machine_calls.handle(attempt, request, action)
 
@@ -2275,13 +2262,10 @@ class Worker:
     def _dispatched(self, attempt: AttemptRecord) -> None:
         """Execution STARTS, journaled just before the executor gets its command: a terminal
         recorded first (a stop that won) keeps the executor from ever being called."""
-        owner = self.fence.record_owner_id
-        if attempt.machine and self.executions is not None:
-            self.executions.dispatched(owner, attempt.request_id, attempt.attempt)
-        elif self.workspace is not None and self.workspace.contains(
-            owner, attempt.request_id, attempt.attempt
-        ):
-            self.workspace.mark_running(owner, self.engine.accepted_message(attempt))
+        if self.executions is not None:
+            self.executions.dispatched(
+                self.fence.record_owner_id, attempt.request_id, attempt.attempt
+            )
 
     def reconcile_executions(self) -> None:
         """BOOT, once per process: rebuild live work from the journal. A dead process's
@@ -2455,15 +2439,6 @@ class Worker:
         )
         self.execution(owner, executions.scheduling_root(owner, request_id)[0])
         return executions.status(owner, request_id)
-
-    def _gpu_outside(self) -> set[int]:
-        """GPUs held by attempts no execution unit schedules: direct stream offers."""
-        return {
-            ordinal
-            for attempt in list(self.engine.history.values())
-            if not attempt.machine and attempt.state in self.engine.PRE_RELEASE
-            for ordinal in getattr(self.lanes.by_id.get(attempt.lane_id), "ordinals", ())
-        }
 
     def _gpu_observed(
         self,
@@ -2724,13 +2699,12 @@ class Worker:
                 "execution_preparation_unavailable",
                 f"Retained preparation is unavailable ({type(exc).__name__}): {exc}",
                 CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
-                machine=True,
             )
             return None
         try:
             attempt = self.engine.offer(offered)
         except AttemptRefusal as exc:
-            self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin, machine=True)
+            self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
             return None
         if attempt.state in ("outcome", "closed"):
             return None
@@ -2740,7 +2714,6 @@ class Worker:
                 "binding_faulted",
                 f"Model preparation failed: {fault}",
                 CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                machine=True,
             )
             return None
         # Desired-state replacement can still expose an older placement while the selected
@@ -2750,9 +2723,8 @@ class Worker:
         ):
             return None
         if refusal := self._admission_refusal(offered, attempt, machine_owned=True):
-            self.refuse(offered, *refusal, machine=True)
+            self.refuse(offered, *refusal)
             return None
-        attempt.machine = True
         attempt.lane_id = self._offer_lane(offered.placement_id, attempt).lane_id
         self.engine.hold(attempt)
         if attempt.deadline_ms:
@@ -3091,11 +3063,8 @@ class Worker:
 
     def send(self, frame: pb.WorkerFrame) -> None:
         """Durable. Queued, never shed; the inner message is stamped with the CURRENT fence
-        so a frame authored before a re-claim still leaves under the live envelope, and an
-        unacknowledged terminal is replayed after a reconnect.
-
-        A machine execution's attempt frames never reach a stream: its outcome is projected
-        onto its execution here and acknowledged at once (its unit settles custody).
+        so a frame authored before a re-claim still leaves under the live envelope. A frame
+        about an execution never reaches the stream: the execution records its effect.
 
         STAMP AND ENQUEUE ARE ONE STEP, under the same lock claim acceptance takes: the
         envelope a frame carries and the stream it is queued on are then the same epoch
@@ -3104,73 +3073,27 @@ class Worker:
         """
         inner = getattr(frame, frame.WhichOneof("msg"))
         owner = self.fence.record_owner_id
-        subject = (
-            frame.attempt_outcome
-            if frame.HasField("attempt_outcome")
-            else frame.attempt_accepted
-            if frame.HasField("attempt_accepted")
-            else None
-        )
-        held = (
-            self.engine.history.get((subject.request_id, subject.attempt_ordinal))
-            if subject is not None
-            else None
-        )
-        machine = held is not None and held.machine
-        if (
-            frame.HasField("attempt_outcome")
-            and self.workspace is not None
-            and self.workspace.contains(
-                owner, frame.attempt_outcome.request_id, frame.attempt_outcome.attempt_ordinal
-            )
-        ):
-            # Outcome forwarding follows the same workspace commit that observes
-            # native receipts. A transport projection is never the authority.
-            self.workspace.outcome(owner, frame.attempt_outcome)
-        if machine and frame.HasField("attempt_outcome") and self.executions is not None:
-            self.executions.reconcile(owner, frame.attempt_outcome.request_id)
-        subject_id = getattr(inner, "request_id", "") or getattr(inner, "parent_request_id", "")
-        machine_message = machine or (
-            subject is None
-            and self.executions is not None
-            and bool(subject_id)
-            and self.executions.owns(owner, subject_id)
-        )
-        if machine_message and frame.HasField("native_source_status"):
-            self.machine_sources.observe(frame.native_source_status)
-        if machine_message and frame.HasField("child_call_request"):
-            request = frame.child_call_request
-            self.calls.absorb(
-                pb.ChildCallResult(
-                    parent_request_id=request.parent_request_id,
-                    parent_attempt_ordinal=request.parent_attempt_ordinal,
-                    parent_invocation_spec_digest=request.parent_invocation_spec_digest,
-                    call_index=request.call_index,
-                    intent_digest=request.intent_digest,
-                    state=pb.CHILD_CALL_STATE_REFUSED,
-                    safe_code="machine_children_unavailable",
-                    safe_detail="This Runtime does not yet support child operations for scripts.",
-                )
-            )
+        subject = getattr(inner, "request_id", "") or getattr(inner, "parent_request_id", "")
+        if subject and self.executions is not None and self.executions.owns(owner, subject):
+            if frame.HasField("native_source_status"):
+                self.machine_sources.observe(frame.native_source_status)
+            return
         with self.claim_lock:
             if frame.WhichOneof("msg") != "weights_transaction":
                 self.stamp(inner)
-            if not machine_message:
-                self.outbound.put(frame)
-        if machine and frame.HasField("attempt_outcome"):
-            terminal = frame.attempt_outcome
-            self.on_outcome_ack(
-                self.stamp(
-                    pb.AttemptOutcomeAck(
-                        request_id=terminal.request_id,
-                        attempt_ordinal=terminal.attempt_ordinal,
-                        invocation_spec_digest=terminal.invocation_spec_digest,
-                        outcome_id=terminal.outcome_id,
-                        outcome_digest=terminal.outcome_digest,
-                        retain_work=True,
-                    )
-                )
-            )
+            self.outbound.put(frame)
+
+    def settle(self, outcome: pb.AttemptOutcome) -> None:
+        """An attempt's terminal lands on its execution and closes the attempt at once; the
+        execution's unit settles custody. Outcome forwarding follows the same workspace
+        commit that observes native receipts."""
+        owner = self.fence.record_owner_id
+        request, ordinal = outcome.request_id, outcome.attempt_ordinal
+        if self.workspace is not None and self.workspace.contains(owner, request, ordinal):
+            self.workspace.outcome(owner, outcome)
+        if self.executions is not None and self.executions.owns(owner, request):
+            self.executions.reconcile(owner, request)
+        self._close(outcome)
 
     def set_serving(self, state: pb.ServingState, why: str = "") -> None:
         """Move the placement's SERVING axis and REPORT IT IMMEDIATELY — dispatchability is
@@ -3940,64 +3863,35 @@ class Worker:
         if kind is not None:
             self.note("control", f"dropped a {kind}: the Control stream carries only the Claim")
 
-    def on_outcome_ack(
-        self, acked: pb.AttemptOutcomeAck, *, native_finalized: bool = False
-    ) -> None:
-        """A closed outcome leaves the lane; it does not bump `admission_epoch` (§6)."""
-        if not native_finalized and self.source_calls is not None:
-
-            def finished() -> None:
-                held = self.engine.history.get((acked.request_id, acked.attempt_ordinal))
-                if not self.fenced(acked) or (held is not None and held.machine):
-                    self.on_outcome_ack(acked, native_finalized=True)
-
-            try:
-                if self.source_calls.acknowledge(acked, finished):
-                    return
-            except ValueError:
-                self.note("source", "native source finalization was refused")
-                return
+    def _close(self, outcome: pb.AttemptOutcome) -> None:
+        """A closed attempt leaves its lane; it does not bump `admission_epoch` (§6). Its work
+        stays retained until its execution releases it."""
+        owner = self.fence.record_owner_id
+        ack = pb.AttemptOutcomeAck(
+            request_id=outcome.request_id,
+            attempt_ordinal=outcome.attempt_ordinal,
+            invocation_spec_digest=outcome.invocation_spec_digest,
+            outcome_id=outcome.outcome_id,
+            outcome_digest=outcome.outcome_digest,
+            retain_work=True,
+        )
         if self.workspace is not None and self.workspace.contains(
-            self.fence.record_owner_id, acked.request_id, acked.attempt_ordinal
+            owner, ack.request_id, ack.attempt_ordinal
         ):
             try:
-                self.workspace.acknowledge(self.fence.record_owner_id, acked)
+                self.workspace.acknowledge(owner, ack)
             except ValueError as exc:
                 self.note("outcome", f"workspace acknowledgment refused: {exc}")
                 return
-        closed = self.engine.history.get((acked.request_id, acked.attempt_ordinal))
-        job = closed.job if closed is not None else None
-        disposition = self.engine.close(acked)
+        disposition = self.engine.close(ack)
         self.note("outcome", disposition)
         if disposition != "closed":
             return
-        self.calls.close(acked.request_id, acked.attempt_ordinal)
-        machine_slots.release(self, acked.request_id, ordinal=acked.attempt_ordinal)
+        self.calls.close(ack.request_id, ack.attempt_ordinal)
+        machine_slots.release(self, ack.request_id, ordinal=ack.attempt_ordinal)
         # A closed child is its parent's result: its unit settles custody now.
-        self.supervisor.poke(execution_unit.key(acked.request_id))
+        self.supervisor.poke(execution_unit.key(ack.request_id))
         self._capacity_changed()
-        # An acknowledged stopped attempt can leave retained work for another
-        # attempt on this worker. The owner's per-outcome retention decision
-        # overrides the job's ordinary one-shot process recycling policy.
-        if (
-            self.reclaim_on_terminal
-            and not acked.retain_work
-            and not self.engine.live
-            # Managed composition remains under the owner's lifetime, including
-            # independent native holds which Runtime does not own or enumerate.
-            and not self.job_slots
-            and closed is not None
-            and closed.kind == "job"
-            and job is not None
-            and self.jobs.get(job.job_descriptor_id) is job
-        ):
-            self.note(
-                "session",
-                f"job attempt {acked.request_id}#{acked.attempt_ordinal} is acknowledged and "
-                f"reclaim_on_terminal is set: exiting {RECYCLE_EXIT} (recycle, not a death)",
-            )
-            self.exit_code = RECYCLE_EXIT
-            self.shutdown_from_stream()
 
     def request_stop(self) -> None:
         """Wake every unit and the sender so the worker can leave; the host is the caller's."""
@@ -5245,9 +5139,6 @@ class Worker:
                 self.placement = None
                 self.pending = None
                 self._retire_hosted(set())
-                self.reclaim_on_terminal = (
-                    parent.reclaim_on_terminal if parent is not None else True
-                )
             self.jobs = {
                 slot.binding.job_descriptor_id: slot.binding for slot in self.job_slots.values()
             }
@@ -5390,12 +5281,10 @@ class Worker:
         self.engine.jobs = self.jobs
         self.engine.job_device_count = job.device_count
         self.job_caps = job.resource_caps
-        self.reclaim_on_terminal = job.reclaim_on_terminal
         self.note(
             "desired_state",
             f"revision {self.accepted.accepted_desired_state_revision} accepted in JOB mode: "
-            f"{self.jobs[job.job_descriptor_id].job!r}, device floor {job.device_count}, "
-            f"reclaim_on_terminal={job.reclaim_on_terminal}",
+            f"{self.jobs[job.job_descriptor_id].job!r}, device floor {job.device_count}",
         )
         try:
             # A JOB IS SEALED TO THE WHOLE ENVELOPE: the group lane, one seat (cr-018's
@@ -6656,8 +6545,6 @@ class Worker:
         detail: str,
         cause: pb.CauseCode,
         origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_WORKER,
-        *,
-        machine: bool = False,
     ) -> None:
         """A typed refusal is an outcome recorded before send, like any other (§7).
 
@@ -6688,7 +6575,6 @@ class Worker:
             )
         else:
             attempt = held
-        attempt.machine = attempt.machine or machine
         outcome = self.engine.outcome(
             attempt,
             STATUS.OUTCOME_STATUS_REFUSED,
@@ -6697,7 +6583,7 @@ class Worker:
             f"{code}: {detail}",
         )
         self.engine.history[attempt.key()] = attempt
-        self.send(pb.WorkerFrame(attempt_outcome=outcome))
+        self.settle(outcome)
 
     # ------------------------------------------------------------------ the device lane
 
@@ -6882,14 +6768,13 @@ class Worker:
         # Fetch and hydrate move bytes; the control plane keeps answering meanwhile. The
         # slot bound above is re-bound under the lock at device entry.
         try:
-            accepted = self.engine.stage(attempt)
+            self.engine.stage(attempt)
         except AttemptRefusal as exc:
             self.note("attempt", f"{key} refused: {exc.code}")
             self.terminate(
                 attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
             )
             return False
-        self.send(pb.WorkerFrame(attempt_accepted=accepted))
         if attempt.canceling and self.engine.claim_staged(attempt):
             # cancelled while it hydrated: nothing reached the device
             self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
@@ -6984,7 +6869,7 @@ class Worker:
                 return False
             try:
                 slot = self._bind_attempt_slot(attempt)
-                accepted = self.engine.prepare_and_accept(
+                self.engine.prepare_and_accept(
                     attempt, before_plan=lambda: self._arbitrate_residency(attempt, slot)
                 )
             except AttemptRefusal as exc:
@@ -6993,7 +6878,6 @@ class Worker:
                     attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
                 )
                 return False
-        self.send(pb.WorkerFrame(attempt_accepted=accepted))
         return True
 
     def _admission_refused(self, attempt: AttemptRecord) -> bool:
@@ -7089,7 +6973,7 @@ class Worker:
                 self.terminate(attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}")
                 return None
         if not isinstance(released, Released):
-            self.send(pb.WorkerFrame(attempt_outcome=released))
+            self.settle(released)
             return None
         self._mark_device_outcome(attempt, released, lane)
         return released
@@ -7147,7 +7031,7 @@ class Worker:
             )
             return
         self._attention_record(attempt)
-        self.send(pb.WorkerFrame(attempt_outcome=outcome))
+        self.settle(outcome)
 
     def _attention_record(self, attempt: AttemptRecord) -> None:
         """A request's pin is the run's: whichever of its calls hold attention sites apply
@@ -7182,13 +7066,13 @@ class Worker:
         """Build one outcome for a held attempt, record it, and send it."""
         why = ""
         try:
-            self.send(pb.WorkerFrame(attempt_outcome=build(attempt, *args)))
+            self.settle(build(attempt, *args))
             return
         except Exception as exc:
             why = f"{type(exc).__name__}: {exc}"
             self.note("attempt", f"the outcome could not be built ({why}); last resort")
         try:
-            self.send(pb.WorkerFrame(attempt_outcome=self.engine.last_resort(attempt, why)))
+            self.settle(self.engine.last_resort(attempt, why))
         except Exception as inner:
             self.note("attempt", f"even the last-resort outcome failed: {inner}")
             self.fail_machine("last_resort_failed")

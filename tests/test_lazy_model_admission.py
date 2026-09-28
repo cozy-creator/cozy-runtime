@@ -93,8 +93,7 @@ def test_cold_model_queue_validates_without_loading_or_losing_faults(tmp_path: P
             attempt = worker.engine.offer(offer(f"cold-{index}", seed=index))
             worker._bind_attempt_slot(attempt)
             worker.engine.hold(attempt)
-            accepted = worker.engine.stage(attempt)
-            assert accepted.request_id == attempt.request_id
+            worker.engine.stage(attempt)
             assert attempt.state == "staged" and attempt.payload == {"seed": index}
             assert attempt.prepared_model is None and attempt.executor is None
             assert attempt.spool is not None and attempt.spool.is_dir()

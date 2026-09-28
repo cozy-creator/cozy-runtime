@@ -529,7 +529,6 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
             expected_execution_workspace_id=worker.executions.workspace_id,
         )
         attempt = worker.engine.offer(submitted)
-        attempt.machine = True  # held as its execution's unit holds it
         worker.engine.hold(attempt)
         terminal = worker.engine.outcome(
             attempt,
@@ -541,7 +540,7 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
                 canonical=b"null", schema_digest="sha256:" + "34" * 32, adjustments=()
             ),
         )
-        worker.send(pb.WorkerFrame(attempt_outcome=terminal))
+        worker.settle(terminal)
         assert (
             attempt.state == "closed"
             and worker.execution_status(claim, "scalar").state == "succeeded"

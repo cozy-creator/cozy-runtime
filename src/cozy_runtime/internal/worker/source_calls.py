@@ -258,7 +258,6 @@ class SourceCalls:
         self.commands: dict[str, pb.NativeSourceCommand] = {}
         self.process_owners: dict[str, str] = {}
         self.canceled: set[str] = set()
-        self.finalizers: set[tuple[str, int]] = set()
 
     def handle(self, command: pb.NativeSourceCommand) -> None:
         owner = self.owner()
@@ -339,70 +338,6 @@ class SourceCalls:
         """A call parked on its owner's memo answer sees its cancellation."""
         if self.memo is not None:
             self.memo.wake()
-
-    def acknowledge(self, ack: pb.AttemptOutcomeAck, finished: Callable[[], None]) -> bool:
-        """Drain native processes and finalize off the heartbeat/control thread."""
-        if ack.retain_work:
-            return False
-        owner = self.owner()
-        with self.workspace.locked() as db:
-            found = db.execute(
-                "SELECT 1 FROM native_calls WHERE owner=? AND parent_request=? "
-                "AND state<>'released' LIMIT 1",
-                (owner, ack.request_id),
-            ).fetchone()
-            if found is None:
-                return False
-            parent = db.execute(
-                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
-                (owner, ack.request_id, ack.attempt_ordinal),
-            ).fetchone()
-            if parent is not None:
-                if (
-                    parent["state"] not in ("outcome", "released")
-                    or parent["spec"] != ack.invocation_spec_digest
-                    or parent["outcome_id"] != ack.outcome_id
-                    or parent["outcome_digest"] != ack.outcome_digest
-                ):
-                    raise WorkspaceRefusal("native finalization changed its terminal ACK")
-            elif (
-                db.execute(
-                    "SELECT 1 FROM native_calls WHERE owner=? AND parent_request=? "
-                    "AND release_ack=? AND state='releasing' LIMIT 1",
-                    (owner, ack.request_id, workspace_sources.ack_identity(ack)),
-                ).fetchone()
-                is None
-            ):
-                raise WorkspaceRefusal("native finalization has no recorded terminal ACK")
-        key = (ack.request_id, ack.attempt_ordinal)
-        copied = pb.AttemptOutcomeAck()
-        copied.CopyFrom(ack)
-        with self.lock:
-            if key in self.finalizers:
-                return True
-            self.finalizers.add(key)
-
-        def finalize() -> None:
-            try:
-                self.cancel_parent(copied.request_id, through=copied.attempt_ordinal)
-                with self.lock:
-                    tasks = [
-                        done
-                        for service, done in self.tasks.items()
-                        if self.parents.get(service) == copied.request_id
-                        and self.commands[service].parent_call.parent_attempt_ordinal
-                        <= copied.attempt_ordinal
-                    ]
-                for done in tasks:
-                    done.wait()
-                self.workspace.acknowledge(owner, copied)
-                finished()
-            finally:
-                with self.lock:
-                    self.finalizers.discard(key)
-
-        threading.Thread(target=finalize, daemon=True, name="native-source-release").start()
-        return True
 
     def _latest(self, command: pb.NativeSourceCommand) -> pb.NativeSourceCommand:
         with self.lock:

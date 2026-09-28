@@ -60,12 +60,9 @@ class CapabilityUnavailable(ValueError):
 @dataclass(slots=True)
 class _Pending:
     request: pb.ChildCallRequest
-    stream_epoch: int
-    result: pb.ChildCallResult | None = None
+    result: pb.ChildCallResult
     byte_grants: list[dict[str, Any]] | None = None
     spool: Path | None = None
-    forgotten: bool = False
-    local: bool = False
     progress_label: str = ""
 
 
@@ -89,13 +86,10 @@ class _Received:
 class Calls:
     def __init__(
         self,
-        send: Callable[[pb.WorkerFrame], None],
-        stream: Callable[[], int],
+        call: Callable[[AttemptRecord, pb.ChildCallRequest, str], pb.ChildCallResult],
         *,
         workspace: Workspace | None = None,
         owner: Callable[[], str] = lambda: "",
-        local: Callable[[AttemptRecord, pb.ChildCallRequest, str], pb.ChildCallResult | None]
-        | None = None,
         installed_bindings: Callable[[AttemptRecord], list[dict[str, Any]]] | None = None,
         prefetch: Callable[[AttemptRecord, ModelPrefetch], Answer] | None = None,
         release_gpus: Callable[[AttemptRecord], None] | None = None,
@@ -103,9 +97,8 @@ class Calls:
         self.prefetch = prefetch
         self.release_gpus = release_gpus
         self.installed_bindings = installed_bindings
-        self.send, self.stream = send, stream
+        self.call = call
         self.workspace, self.owner = workspace, owner
-        self.local = local
         self.pending: dict[tuple[str, int, int], _Pending] = {}
         self.materialized: dict[tuple[str, int], tuple[Path, int]] = {}
         self.received: dict[tuple[str, int], dict[str, _Received]] = {}
@@ -176,14 +169,8 @@ class Calls:
                 key = (attempt.request_id, attempt.attempt, request.call_index)
                 pending = self.pending.get(key)
                 if isinstance(request, ChildForget):
-                    if pending is not None:
-                        if (
-                            pending.result is None
-                            or pending.result.state == pb.CHILD_CALL_STATE_PENDING
-                        ):
-                            pending.forgotten = True
-                        else:
-                            del self.pending[key]
+                    if pending is not None and pending.result.state != pb.CHILD_CALL_STATE_PENDING:
+                        del self.pending[key]
                     return Answer(ok=True)
                 if isinstance(request, ChildCall):
                     intent = self._request(attempt, request)
@@ -199,49 +186,22 @@ class Calls:
                         if len(label) > 120 or not label.isprintable():
                             label = ""
                         pending = self.pending[key] = _Pending(
-                            intent, self.stream(), progress_label=label
+                            intent, self.call(attempt, intent, "call"), progress_label=label
                         )
-                        local = (
-                            self.local(attempt, intent, "call") if self.local is not None else None
-                        )
-                        if local is not None:
-                            pending.local, pending.result = True, local
-                        else:
-                            self.send(pb.WorkerFrame(child_call_request=intent))
                 if pending is None:
                     raise ValueError("parent call has not been activated")
                 canceling = isinstance(request, ChildCancel)
-                if pending.local:
-                    assert self.local is not None
-                    pending.result = self.local(
-                        attempt, pending.request, "cancel" if canceling else "poll"
-                    )
+                pending.result = self.call(
+                    attempt, pending.request, "cancel" if canceling else "poll"
+                )
                 if canceling:
-                    if not pending.local:
-                        intent = pending.request
-                        self.send(
-                            pb.WorkerFrame(
-                                child_call_cancel=pb.ChildCallCancel(
-                                    parent_request_id=intent.parent_request_id,
-                                    parent_attempt_ordinal=intent.parent_attempt_ordinal,
-                                    parent_invocation_spec_digest=intent.parent_invocation_spec_digest,
-                                    call_index=intent.call_index,
-                                    intent_digest=intent.intent_digest,
-                                )
-                            )
-                        )
                     return CallState(ok=True, state="pending")
-                # A new owner stream re-establishes accepted calls by the same
-                # canonical index/intent. No durable cursor lives in Runtime.
-                if not pending.local and pending.stream_epoch != self.stream():
-                    pending.stream_epoch = self.stream()
-                    self.send(pb.WorkerFrame(child_call_request=pending.request))
                 result = pending.result
-                if result is None or result.state == pb.CHILD_CALL_STATE_PENDING:
+                if result.state == pb.CHILD_CALL_STATE_PENDING:
                     return CallState(
                         ok=True,
                         state="pending",
-                        child_request_id=result.child_request_id if result else "",
+                        child_request_id=result.child_request_id,
                         progress=self._progress(pending),
                     )
                 observation = (
@@ -308,7 +268,7 @@ class Calls:
     def _progress(self, pending: _Pending) -> CallProgress | None:
         """Reuse the child's existing journal; polling progress does not change call identity."""
         result, workspace = pending.result, self.workspace
-        if result is None or not result.child_request_id or not pending.local or workspace is None:
+        if not result.child_request_id or workspace is None:
             return None
         with workspace.locked() as db:
             row = db.execute(
@@ -371,67 +331,8 @@ class Calls:
         request.intent_digest = hashlib.sha256(canonical_intent(request)).digest()
         return request
 
-    def absorb(self, result: pb.ChildCallResult) -> bool:
-        with self.lock:
-            pending = self.pending.get(
-                (result.parent_request_id, result.parent_attempt_ordinal, result.call_index)
-            )
-            if (
-                pending is None
-                or result.parent_invocation_spec_digest
-                != pending.request.parent_invocation_spec_digest
-                or result.intent_digest != pending.request.intent_digest
-            ):
-                return False
-            if (
-                result.state
-                not in (
-                    pb.CHILD_CALL_STATE_PENDING,
-                    pb.CHILD_CALL_STATE_SUCCEEDED,
-                    pb.CHILD_CALL_STATE_REFUSED,
-                    pb.CHILD_CALL_STATE_FAILED,
-                    pb.CHILD_CALL_STATE_CANCELED,
-                )
-                or len(result.result_canonical_bytes) > MAX_CALL_BYTES
-                or len(result.safe_detail.encode()) > 1024
-            ):
-                return False
-            if (
-                result.state in (pb.CHILD_CALL_STATE_PENDING, pb.CHILD_CALL_STATE_SUCCEEDED)
-                and not result.child_request_id
-            ):
-                return False
-            try:
-                child_byte_results.validate(result)
-            except ValueError:
-                return False
-            if result.HasField("observation"):
-                try:
-                    observation_document(result.observation)
-                except (ValueError, documents.DocumentError):
-                    return False
-            if result.state == pb.CHILD_CALL_STATE_SUCCEEDED:
-                try:
-                    canonical.parse_canonical(result.result_canonical_bytes)
-                except (ValueError, canonical.CanonicalError):
-                    return False
-            elif result.result_canonical_bytes:
-                return False
-            if pending.result is not None and pending.result.state != pb.CHILD_CALL_STATE_PENDING:
-                return pending.result == result
-            held = pb.ChildCallResult()
-            held.CopyFrom(result)
-            pending.result = held
-            if pending.forgotten and result.state != pb.CHILD_CALL_STATE_PENDING:
-                del self.pending[
-                    (result.parent_request_id, result.parent_attempt_ordinal, result.call_index)
-                ]
-            self.wake(result.parent_request_id)
-            return True
-
     def _materialize(self, attempt: AttemptRecord, pending: _Pending) -> list[dict[str, Any]]:
         result = pending.result
-        assert result is not None
         if not result.byte_result_grants:
             return []
         if self.workspace is None or attempt.spool is None:

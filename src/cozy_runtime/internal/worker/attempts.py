@@ -370,9 +370,6 @@ class AttemptRecord:
     poke: Callable[[], None] = lambda: None
     #: a guard is running for this attempt (one per attempt: escalation is single-flight)
     guarded: bool = False
-    #: held by a machine execution's own unit, not offered on a control stream: its frames
-    #: go to the journal, and its outcome is acknowledged the moment it is recorded
-    machine: bool = False
     #: monotonic instant the cancel was marked; `math.inf` once escalation has finished
     cancel_started: float = 0.0
     #: the executor's frames for this attempt, counted: the meter a cancel is judged by
@@ -664,7 +661,7 @@ class AttemptEngine:
                 # a refresh swaps ACCESS; identity never moves (#439's structural half:
                 # the bind refuses a grant whose subject or id sets disagree)
                 held.grant = self._bind(spec, offered)
-                return held  # idempotent: re-send AttemptAccepted, run once
+                return held  # idempotent: run once
             if held.state in ("queued", "staged", "entering", "accepted", "running", "finalizing"):
                 raise AttemptRefusal(
                     "live_attempt_supersession",
@@ -1081,7 +1078,7 @@ class AttemptEngine:
                     type(exc).__name__,
                 )
 
-    def _accept_job(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
+    def _accept_job(self, attempt: AttemptRecord) -> None:
         """BOUNDED ACCEPT-THEN-PREPARE — the ONE mode difference from serving (cr-009).
 
         Serving never accepts-then-cold-loads: a warm generation is the whole point of a
@@ -1177,16 +1174,17 @@ class AttemptEngine:
         except Exception:
             self._release_job_models(attempt)
             raise
-        return self._accepted(attempt)
+        self._accepted(attempt)
 
     def prepare_and_accept(
         self, attempt: AttemptRecord, *, before_plan: Callable[[], None] | None = None
-    ) -> pb.AttemptAccepted:
+    ) -> None:
         """Stage and enter in one step: the path of an attempt whose lane has no queue ahead
         of it (a job, or a caller that holds the device already)."""
         if attempt.spec.get("job") is not None:
-            return self._accept_job(attempt)
-        accepted = self.stage(attempt)
+            self._accept_job(attempt)
+            return
+        self.stage(attempt)
         if not self.claim_staged(attempt):
             raise AttemptRefusal(
                 "attempt_left_queue",
@@ -1194,9 +1192,8 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
         self.enter(attempt, before_plan=before_plan)
-        return accepted
 
-    def stage(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
+    def stage(self, attempt: AttemptRecord) -> None:
         """QUEUE ADMISSION (proto-026, proto-061 G): validate -> fetch -> hydrate -> journal.
 
         Everything an attempt needs that is not the device happens here, while the lane's
@@ -1235,7 +1232,7 @@ class AttemptEngine:
                 "entrypoint_binding_digest": serving["entrypoint_binding_digest"],
             },
         )
-        return self._accepted(attempt, "staged")
+        self._accepted(attempt, "staged")
 
     def _resolve_declared_binding(self, attempt: AttemptRecord) -> DeclaredBinding:
         """Validate queued work against its declaration, before any model is loaded.
@@ -2870,29 +2867,13 @@ class AttemptEngine:
             )
             return None
 
-    def _accepted(self, attempt: AttemptRecord, state: str = "accepted") -> pb.AttemptAccepted:
-        """HOLD the accepted attempt and publish it. The one acceptance both lanes make: a
-        job is bound at acceptance ("accepted"), a serving attempt queues ("staged")."""
+    def _accepted(self, attempt: AttemptRecord, state: str = "accepted") -> None:
+        """HOLD the accepted attempt. The one acceptance both lanes make: a job is bound at
+        acceptance ("accepted"), a serving attempt queues ("staged")."""
         attempt.state = state
         attempt.accepted_at = time.perf_counter()
         self.live[attempt.request_id] = attempt
         self.history[attempt.key()] = attempt
-        return self.accepted_message(attempt)
-
-    def accepted_message(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
-        """THE acceptance message — one constructor, for a first send and for a re-send.
-
-        Acceptance is queue ADMISSION (minor 23, proto-026): journaled, hydrated, queued on
-        a lane. It binds neither a plan nor an executor epoch — both bind at device entry
-        and ride HeldAttempt from RUNNING on — so a re-send can never move anything.
-        """
-        return pb.AttemptAccepted(
-            request_id=attempt.request_id,
-            attempt_ordinal=attempt.attempt,
-            invocation_spec_digest=attempt.digest,
-            placement_id=attempt.placement_id,
-            lane_id=attempt.lane_id,
-        )
 
     def wrap(self, attempt: AttemptRecord) -> pb.AttemptOutcome:
         """Wrap the SAME recorded body in the current session envelope. The body and accepted

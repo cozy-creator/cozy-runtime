@@ -601,8 +601,8 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 records, the same output transaction. What differs is stated out loud and is short — a
 `JobDirective`/`JobExecutionSpec` instead of the serving pair, BOUNDED ACCEPT-THEN-PREPARE
 (serving never accepts-then-cold-loads; a job has nothing to be warm for), the job
-services (`Scratch`, `Checkpoints`, `Budget`), typed input `Tree` fields whose path rides
-the value, and a RECYCLE process exit distinct from a death. `corpus/job/` is the live
+services (`Scratch`, `Checkpoints`, `Budget`) and typed input `Tree` fields whose path rides
+the value. `corpus/job/` is the live
 project: a structural census over the real 6.9 GB cozytensors store, read-only.
 
 Model-producing jobs declare `WeightsOutput` slots and use `Context.tensorfs_source`,

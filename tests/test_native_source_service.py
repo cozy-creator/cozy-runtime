@@ -395,7 +395,6 @@ def test_permanent_ack_releases_native_producer_and_access_but_keeps_cache(tmp_p
     messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
     calls = SourceCalls(workspace, lambda: "owner", messages.put, lambda _: True)
     calls.handle(stopped)
-    done = threading.Event()
     ack = pb.AttemptOutcomeAck(
         request_id=command.parent_call.parent_request_id,
         attempt_ordinal=1,
@@ -404,8 +403,7 @@ def test_permanent_ack_releases_native_producer_and_access_but_keeps_cache(tmp_p
         outcome_digest=digest,
         retain_work=False,
     )
-    assert calls.acknowledge(ack, done.set)
-    assert done.wait(30), "source finalizer did not complete"
+    workspace.acknowledge("owner", ack)
     store = tensorfs.Store.open(str(workspace.store_root))
     released_root = store.tree_root(root["owner"])
     assert released_root is not None and released_root["released"]

@@ -129,9 +129,7 @@ def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
 
 def _release(machine: Machine, root: str, ordinal: int = 1) -> Reply:
     """`ctx.release_gpus()` as the root's executor sends it, through the worker's handler."""
-    attempt = AttemptRecord(
-        root, ordinal, b"", {}, lane_id="orchestration", state="running", machine=True
-    )
+    attempt = AttemptRecord(root, ordinal, b"", {}, lane_id="orchestration", state="running")
     return machine.worker.engine.durable_exchange(attempt, GpuRelease())
 
 
