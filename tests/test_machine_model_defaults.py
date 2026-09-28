@@ -68,11 +68,17 @@ def peer(capture: dict[str, Any]) -> Worker:
         Worker,
         SimpleNamespace(
             config=SimpleNamespace(),
-            options=SimpleNamespace(accelerator_backend="none", publication_authority=None),
+            options=SimpleNamespace(
+                accelerator_backend="none", publication_authority=None, hubs=()
+            ),
             host_facts=lambda: hostfacts.measure("none"),
             model_transfer_lock=threading.Lock(),
             model_transfers={},
-            executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
+            executions=SimpleNamespace(
+                capture_root=lambda *_: "root",
+                capture=lambda *_: capture,
+                prepared=lambda *_: SimpleNamespace(hub=""),
+            ),
             lanes=SimpleNamespace(entries=()),
         ),
     )
@@ -646,15 +652,22 @@ def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hu
     own, own_seen = hub(private=True)
     other, other_seen = hub(private=False)
 
-    def materialize(name: str, public_origin: str, authority: PublicationAuthority | None) -> None:
+    def materialize(
+        name: str,
+        public_origin: str,
+        authority: PublicationAuthority | None,
+        hubs: tuple[PublicationAuthority, ...] = (),
+        hosts: tuple[str, ...] = ("127.0.0.1",),
+    ) -> None:
         root = tmp_path / name
         tensorfs.Store.init(str(root))
         worker = peer({})
         worker.workspace = Workspace(root)
         worker.options = cast(
-            Any, SimpleNamespace(accelerator_backend="none", publication_authority=authority)
+            Any,
+            SimpleNamespace(accelerator_backend="none", publication_authority=authority, hubs=hubs),
         )
-        worker.config = cast(Any, SimpleNamespace(object_storage_hosts=("127.0.0.1",)))
+        worker.config = cast(Any, SimpleNamespace(object_storage_hosts=hosts))
         row = {
             "parameter": "model",
             "public_origin": public_origin,
@@ -674,6 +687,14 @@ def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hu
 
         materialize("other", other, grant)
         assert other_seen and all(row[1:] == ("", "") for row in other_seen)
+
+        # Registered at the other Hub too, the machine presents that registration there and
+        # reaches that Hub's object hosts, not its default Hub's.
+        other_seen.clear()
+        there = PublicationAuthority(other, "worker-2", token, None, ("127.0.0.1",))
+        materialize("registered", other, grant, (there,), ())
+        posts = [row for row in other_seen if row[0] != "GET"]
+        assert posts and all(row[1:] == ("worker-2", token) for row in posts)
 
         for name, authority, code in (
             ("ended", PublicationAuthority(own, "worker-1", "e" * 43), "CREDENTIAL_REQUIRED"),

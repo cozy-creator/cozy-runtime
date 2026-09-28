@@ -713,7 +713,7 @@ class MachineExecutionSubmit(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., release_root: _Optional[_Union[ReleaseRoot, _Mapping]] = ..., owner_memo: bool = ...) -> None: ...
 
 class ReleaseRoot(_message.Message):
-    __slots__ = ("package", "release", "entrypoint", "models", "inputs", "input_access", "deadline_unix_ms", "attention_kernel", "capture", "job", "weights_destination", "publication_grant", "installation_id", "owner")
+    __slots__ = ("package", "release", "entrypoint", "models", "inputs", "input_access", "deadline_unix_ms", "attention_kernel", "capture", "job", "weights_destination", "publication_grant", "installation_id", "owner", "hub")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
     ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
@@ -728,6 +728,7 @@ class ReleaseRoot(_message.Message):
     PUBLICATION_GRANT_FIELD_NUMBER: _ClassVar[int]
     INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     OWNER_FIELD_NUMBER: _ClassVar[int]
+    HUB_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
     entrypoint: str
@@ -742,7 +743,8 @@ class ReleaseRoot(_message.Message):
     publication_grant: str
     installation_id: str
     owner: str
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., entrypoint: _Optional[str] = ..., models: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., input_access: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., attention_kernel: _Optional[str] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., job: bool = ..., weights_destination: _Optional[str] = ..., publication_grant: _Optional[str] = ..., installation_id: _Optional[str] = ..., owner: _Optional[str] = ...) -> None: ...
+    hub: str
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., entrypoint: _Optional[str] = ..., models: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., input_access: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., attention_kernel: _Optional[str] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., job: bool = ..., weights_destination: _Optional[str] = ..., publication_grant: _Optional[str] = ..., installation_id: _Optional[str] = ..., owner: _Optional[str] = ..., hub: _Optional[str] = ...) -> None: ...
 
 class ModelChoice(_message.Message):
     __slots__ = ("parameter", "repository", "release", "lane", "manifest", "source", "profiles")
@@ -1225,7 +1227,7 @@ class ProtocolInfoResult(_message.Message):
     def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
-    __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "python_requires", "python_version", "package_interface")
+    __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "python_requires", "python_version", "package_interface", "hub")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
     APPLICATION_FIELD_NUMBER: _ClassVar[int]
@@ -1235,6 +1237,7 @@ class PreparePackageSetCall(_message.Message):
     PYTHON_REQUIRES_FIELD_NUMBER: _ClassVar[int]
     PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
+    HUB_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     package_set: DesiredPackageSet
     application: str
@@ -1244,7 +1247,8 @@ class PreparePackageSetCall(_message.Message):
     python_requires: str
     python_version: str
     package_interface: bytes
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ...) -> None: ...
+    hub: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ..., hub: _Optional[str] = ...) -> None: ...
 
 class PrepareLocalPackageCall(_message.Message):
     __slots__ = ("claim", "local_package_set")
@@ -1571,7 +1575,7 @@ class LocalPackageUploadChunk(_message.Message):
     def __init__(self, offset: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
 
 class PreparePackageSetRequest(_message.Message):
-    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root", "download_delegation_signature", "python_requires", "python_version", "package_interface", "models_landing")
+    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root", "download_delegation_signature", "python_requires", "python_version", "package_interface", "models_landing", "hub")
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     APPLICATION_FIELD_NUMBER: _ClassVar[int]
     MODEL_SLOT_PATHS_FIELD_NUMBER: _ClassVar[int]
@@ -1583,6 +1587,7 @@ class PreparePackageSetRequest(_message.Message):
     PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     MODELS_LANDING_FIELD_NUMBER: _ClassVar[int]
+    HUB_FIELD_NUMBER: _ClassVar[int]
     download_delegation: bytes
     application: str
     model_slot_paths: _containers.RepeatedScalarFieldContainer[str]
@@ -1594,7 +1599,8 @@ class PreparePackageSetRequest(_message.Message):
     python_version: str
     package_interface: bytes
     models_landing: bool
-    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ..., download_delegation_signature: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ..., models_landing: bool = ...) -> None: ...
+    hub: str
+    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ..., download_delegation_signature: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ..., models_landing: bool = ..., hub: _Optional[str] = ...) -> None: ...
 
 class ImageInventory(_message.Message):
     __slots__ = ("profile", "python", "distributions", "interpreters")
@@ -2459,12 +2465,14 @@ class Ref(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., length: _Optional[int] = ...) -> None: ...
 
 class PackageSelection(_message.Message):
-    __slots__ = ("package", "release")
+    __slots__ = ("package", "release", "hub")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
+    HUB_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ...) -> None: ...
+    hub: str
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., hub: _Optional[str] = ...) -> None: ...
 
 class DevelopmentPackage(_message.Message):
     __slots__ = ("package", "release", "installation_id")

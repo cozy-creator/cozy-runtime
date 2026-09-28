@@ -343,6 +343,9 @@ class WorkerOptions:
     """An already-complete local package venv; mutually exclusive with materialization root."""
     publication_authority: PublicationAuthority | None = None
     """Privileged worker publication authority, never an executor or captured-code value."""
+    hubs: tuple[PublicationAuthority, ...] = ()
+    """Every other Hub this machine is registered at (wire 67): a run naming one reads its
+    release, index and Models there. Publication stays at the default Hub."""
     tensorfs_root: Path | None = None
     """The one host-local executable TensorFS Store."""
     artifact_cache: Path | None = None

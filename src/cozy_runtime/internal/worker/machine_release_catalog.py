@@ -16,7 +16,7 @@ from cozy_runtime.internal import canonical, package_interface
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from .machine_model_resolve import Catalog, own
+from .machine_model_resolve import Catalog, hub_key, own
 from .workspace import WorkspaceRefusal
 
 if TYPE_CHECKING:
@@ -114,19 +114,26 @@ def callees(package: str, locked: bytes) -> list[str]:
 
 
 def complete(worker: Worker, request: pb.PreparePackageSetRequest) -> pb.PreparePackageSetRequest:
-    """A preparation naming a release without its facts, completed from this machine's own
-    Hub; one that carries them is prepared as sent."""
-    if request.locked_requirements:
+    """A preparation naming a release without its facts, completed from the Hub it names
+    (empty: this machine's default); one that carries them is prepared as sent. Its Hub is
+    spelled as `hub_key` keys it, so what it installs is held as that Hub's."""
+    hub = hub_key(worker, request.hub)
+    if request.locked_requirements and hub == request.hub:
         return request
+    completed = pb.PreparePackageSetRequest()
+    completed.CopyFrom(request)
+    completed.hub = hub
+    if request.locked_requirements:
+        return completed
     try:
         packages = documents.read(request.download_delegation, pb.DownloadDelegation)["packages"]
     except (documents.DocumentError, KeyError) as exc:
         raise WorkspaceRefusal("preparation names no package release") from exc
     if not isinstance(packages, list) or len(packages) != 1 or not isinstance(packages[0], dict):
         raise WorkspaceRefusal("preparation names no single package release")
-    selected = facts(own(worker), str(packages[0].get("package")), str(packages[0].get("release")))
-    completed = pb.PreparePackageSetRequest()
-    completed.CopyFrom(request)
+    selected = facts(
+        own(worker, hub=hub), str(packages[0].get("package")), str(packages[0].get("release"))
+    )
     for name in (
         "application",
         "python_requires",

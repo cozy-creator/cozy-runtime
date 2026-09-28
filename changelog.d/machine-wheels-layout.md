@@ -1,0 +1,1 @@
+The machine's kept Runtime and TensorFS wheels are found through the machine layout (`<machine root>/opt/cozy/wheels`, the root `COZY_MACHINE_ROOT` names), not beside the interpreter, so a pod's system Python finds them too.

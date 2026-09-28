@@ -136,6 +136,8 @@ class Preparation(msgspec.Struct, frozen=True):
     installations: dict[str, PreparedInstallation] = {}
     #: the wire minor its root was admitted under; a release root keeps none
     wire_minor: int | msgspec.UnsetType = msgspec.UNSET
+    #: the Hub its run came from, as `machine_model_resolve.hub_key` spells it
+    hub: str = ""
 
     @classmethod
     def read(cls, raw: bytes) -> Preparation:

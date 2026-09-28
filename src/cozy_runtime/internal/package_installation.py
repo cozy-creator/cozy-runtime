@@ -26,6 +26,7 @@ from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 
+from cozy_runtime.internal import host_paths
 from cozy_runtime.internal.config import package_install_environment
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
 
@@ -63,6 +64,14 @@ def machine_sdk() -> dict[str, str]:
         with contextlib.suppress(importlib.metadata.PackageNotFoundError):
             found[name] = importlib.metadata.version(name)
     return found
+
+
+def machine_wheels(install_root: Path) -> Path | None:
+    """Where `cozy machine install` keeps the wheels this machine's Runtime and TensorFS were
+    installed from (`<machine root>/opt/cozy/wheels`); None for an install root outside a
+    machine layout."""
+    layout = host_paths.Layout.of_install_root(install_root)
+    return layout.machine_wheels if layout is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,11 +261,16 @@ def _select_sdk(
     constraints: Path,
     install: Callable[[list[str]], None],
     as_locked: Callable[[], None],
+    mine: dict[str, str],
+    wheels: Path | None,
 ) -> None:
     """Install the SDK the requirements admit (the installed distributions' and `declared`):
-    this machine's own Runtime and TensorFS, else the newest published Runtime they admit
-    (TensorFS as installed, where that Runtime accepts it), else the lock's own. Every other
-    distribution stays as installed."""
+    this machine's own Runtime and TensorFS (`mine`, found on the index or among `wheels`),
+    else the newest published Runtime they admit (TensorFS as installed, where that Runtime
+    accepts it), else the lock's own. Every other distribution stays as installed.
+
+    A machine running a local build (a `+` version) never hands a package a different SDK:
+    when its own wheels cannot be installed, the installation refuses, naming both."""
     bounds = {name: (SpecifierSet(), frozenset[str]()) for name in SDK}
     pinned: dict[str, str] = {}
     requirements = list(declared)
@@ -274,7 +288,6 @@ def _select_sdk(
             specifier, extras = bounds[wanted]
             bounds[wanted] = (specifier & requirement.specifier, extras | requirement.extras)
     constraints.write_text("".join(f"{name}=={version}\n" for name, version in pinned.items()))
-    mine = machine_sdk()
     named = {
         name: name + (f"[{','.join(sorted(extras))}]" if extras else "")
         for name, (_, extras) in bounds.items()
@@ -286,9 +299,26 @@ def _select_sdk(
         else named[name] + str(specifier)
         for name, (specifier, _) in bounds.items()
     ]
+    links = ["--find-links", str(wheels)] if wheels is not None and wheels.is_dir() else []
+    local = {name: version for name, version in mine.items() if "+" in version}
+    if local:
+        # A local build is what the owner is testing: the package runs it or nothing.
+        builds = ", ".join(f"{name} {version}" for name, version in sorted(local.items()))
+        try:
+            if any(not bounds[name][0].contains(v, prereleases=True) for name, v in local.items()):
+                raise EnvironmentRefusal("package_runtime_incompatible", "outside the bounds")
+            install([*links, *preferred])
+        except EnvironmentRefusal as exc:
+            raise EnvironmentRefusal(
+                "package_runtime_unavailable",
+                f"this machine runs {builds}, a local build; the package admits "
+                f"{', '.join(ranged)} and {wheels} does not install it, so no other SDK is "
+                f"put in its place ({exc.code})",
+            ) from exc
+        return
     for rows in dict.fromkeys((tuple(preferred), tuple(ranged))):
         with contextlib.suppress(EnvironmentRefusal):
-            install(list(rows))
+            install([*links, *rows])
             return
     as_locked()
 
@@ -373,6 +403,8 @@ def _build(
             constraints,
             lambda rows: run(*pip, "--constraints", str(constraints), *rows),
             as_locked,
+            machine_sdk(),
+            machine_wheels(directory.parent.parent),
         )
     return {
         name: distribution.version

@@ -96,38 +96,33 @@ def local_origin(origin: str) -> bool:
 
 
 def local_development(worker: Worker) -> bool:
-    """A machine whose own Hub, as its registration grant names it, is on loopback: a
-    development machine, which may reach the private addresses that Hub hands it
-    (checkpoint pulls, object uploads). A production Hub is never loopback, and a job
-    never names the grant."""
-    authority = worker.options.publication_authority
-    return authority is not None and local_origin(authority.origin)
-
-
-def _same_origin(a: str, b: str) -> bool:
-    try:
-        left, right = urlsplit(a.rstrip("/")), urlsplit(b.rstrip("/"))
-        return (left.scheme, left.hostname, left.port) == (right.scheme, right.hostname, right.port)
-    except ValueError:
-        return False
+    """A machine registered at a Hub on loopback, as its grants name them: a development
+    machine, which may reach the private addresses that Hub hands it (checkpoint pulls,
+    object uploads). A production Hub is never loopback, and a job never names a grant."""
+    held = (worker.options.publication_authority, *worker.options.hubs)
+    return any(authority is not None and local_origin(authority.origin) for authority in held)
 
 
 def hub_ca(worker: Worker, origin: str) -> str | None:
-    """The private CA of this machine's own Hub, when it uses one; no other origin's."""
-    authority = worker.options.publication_authority
-    if authority is None or authority.ca is None or not _same_origin(authority.origin, origin):
-        return None
-    return str(authority.ca)
+    """The private CA of a Hub this machine is registered at, when it uses one."""
+    authority = machine_model_resolve.registration(worker, origin)
+    return None if authority is None or authority.ca is None else str(authority.ca)
 
 
 def credential(worker: Worker, origin: str) -> str:
-    """This machine's worker capability, for its own Hub only: there it reads its owner's
-    unpublished checkpoints. Any other origin gets nothing, and a refusal is never retried
-    anonymously."""
-    authority = worker.options.publication_authority
-    if authority is None or not _same_origin(authority.origin, origin):
-        return ""
-    return f"worker {authority.worker_id} {authority.worker_token}"
+    """This machine's worker capability at a Hub it is registered at: there it reads its
+    owner's unpublished checkpoints. Any other origin gets nothing, and a refusal is never
+    retried anonymously."""
+    authority = machine_model_resolve.registration(worker, origin)
+    return "" if authority is None else f"worker {authority.worker_id} {authority.worker_token}"
+
+
+def storage_hosts(worker: Worker, origin: str) -> tuple[str, ...]:
+    """Where a Hub this machine is registered at keeps its bytes; else the default's."""
+    authority = machine_model_resolve.registration(worker, origin)
+    if authority is None or authority is worker.options.publication_authority:
+        return worker.config.object_storage_hosts
+    return authority.object_storage_hosts
 
 
 def valid_origin(origin: str, *, local: bool) -> bool:
@@ -268,9 +263,13 @@ def select(
     package = str(
         (placement.get("package") or placement.get("development") or {}).get("package", "")
     )
-    # A slot the capture left open is resolved here, at this machine's own Hub.
+    # A slot the capture left open is resolved here, at the Hub its run came from.
     open_slots = any(parameter not in defaults for parameter in missing)
-    catalog = machine_model_resolve.own(worker, package) if open_slots else None
+    catalog = (
+        machine_model_resolve.own(worker, package, worker.executions.prepared(owner, root).hub)
+        if open_slots
+        else None
+    )
     fits = fitter(worker)
     selected: list[dict[str, Json]] = []
     for parameter in missing:
@@ -373,7 +372,7 @@ def materialize(
                             hub=row.public_origin,
                             credential=credential(worker, row.public_origin),
                             ca_file=hub_ca(worker, row.public_origin),
-                            allowed_hosts=worker.config.object_storage_hosts,
+                            allowed_hosts=storage_hosts(worker, row.public_origin),
                             allow_local=local_development(worker),
                             keep=keep,
                             cancellation=cancellation,
@@ -387,7 +386,7 @@ def materialize(
                             row.public_origin,
                             row.repository + "@" + manifest.digest,
                             credential=credential(worker, row.public_origin),
-                            allowed_hosts=worker.config.object_storage_hosts,
+                            allowed_hosts=storage_hosts(worker, row.public_origin),
                             allow_local=local_development(worker),
                             streams=8,
                             cancellation=cancellation,

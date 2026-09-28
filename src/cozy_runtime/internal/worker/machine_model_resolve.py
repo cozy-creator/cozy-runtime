@@ -22,8 +22,10 @@ from cozy_runtime.internal import egress, fill
 from cozy_runtime.protocol import documents
 
 from .workspace import WorkspaceRefusal
+from .workspace_executions import ExecutionWorkspaceRefusal
 
 if TYPE_CHECKING:
+    from .machine_publication import PublicationAuthority
     from .session import Worker
 
 MAX_METADATA = 1 << 20
@@ -44,23 +46,24 @@ class Resolved:
 
 
 class Resolutions:
-    """What this machine read of each package at its Hub, for its lifetime: its newest
-    release, and its slots' resolutions."""
+    """What this machine read of each package at each Hub (`hub_key`), for its lifetime: its
+    newest release, and its slots' resolutions."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.held: dict[str, Resolved] = {}
-        self.newest: dict[str, str] = {}
+        self.held: dict[tuple[str, str], Resolved] = {}
+        self.newest: dict[tuple[str, str], str] = {}
 
-    def of(self, package: str) -> Resolved:
+    def of(self, package: str, hub: str = "") -> Resolved:
         with self.lock:
-            return self.held.setdefault(package, Resolved())
+            return self.held.setdefault((hub, package), Resolved())
 
     def forget(self, package: str) -> None:
-        """Drop what was read of a package; its next run reads it once more."""
+        """Drop what was read of a package at every Hub; its next run reads it once more."""
         with self.lock:
-            self.newest.pop(package, None)
-            self.held.pop(package, None)
+            for held in (self.newest, self.held):
+                for key in [key for key in held if key[1] == package]:
+                    del held[key]
 
 
 class Catalog:
@@ -169,17 +172,57 @@ class Catalog:
         return length
 
 
-def own(worker: Worker, package: str = "") -> Catalog:
-    """This machine's own Hub, as its grant names it: where it reads packages and Models,
-    its owner's unpublished ones included. For a package, what it already read of it."""
-    authority = worker.options.publication_authority
+def _origin(value: str) -> tuple[str, str, int]:
+    parts = urlsplit(value.rstrip("/"))
+    return (
+        parts.scheme,
+        (parts.hostname or "").lower(),
+        parts.port or (443 if parts.scheme == "https" else 80),
+    )
+
+
+def same_origin(a: str, b: str) -> bool:
+    try:
+        return _origin(a) == _origin(b)
+    except ValueError:
+        return False
+
+
+def registration(worker: Worker, origin: str) -> PublicationAuthority | None:
+    """This machine's registration at an origin, its default Hub's first; else None."""
+    for held in (worker.options.publication_authority, *worker.options.hubs):
+        if held is not None and same_origin(held.origin, origin):
+            return held
+    return None
+
+
+def hub_key(worker: Worker, hub: str) -> str:
+    """A run's Hub as this machine keys what it reads there: "" is its default Hub. A Hub
+    it is not registered at is refused."""
+    default = worker.options.publication_authority
+    if not hub or (default is not None and same_origin(default.origin, hub)):
+        return ""
+    held = registration(worker, hub)
+    if held is None:
+        raise ExecutionWorkspaceRefusal(
+            "hub_unregistered", f"this machine is not registered at {hub[:256]}"
+        )
+    return held.origin
+
+
+def own(worker: Worker, package: str = "", hub: str = "") -> Catalog:
+    """The run's Hub (empty: this machine's default), as its registration there names it:
+    where it reads packages and Models, its owner's unpublished ones included. For a
+    package, what it already read of it there."""
+    key = hub_key(worker, hub)
+    authority = registration(worker, key) if key else worker.options.publication_authority
     if authority is None:
         raise WorkspaceRefusal("this machine has no Hub grant to read the catalog at")
     return Catalog(
         authority.origin,
         authority.context(),
         {"X-Cozy-Worker-ID": authority.worker_id, "X-Cozy-Worker-Token": authority.worker_token},
-        worker.resolutions.of(package) if package else None,
+        worker.resolutions.of(package, key) if package else None,
     )
 
 
