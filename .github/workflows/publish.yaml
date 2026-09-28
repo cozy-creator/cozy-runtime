@@ -6,8 +6,7 @@ name: Publish to PyPI
 # Two jobs because each bills at least one minute: `build` runs every refusal and builds
 # all three files; `publish` holds the PyPI OIDC token and runs no project code.
 # Success means PyPI's JSON API lists exactly the built files: lock dependents after the
-# simple index lists them too. Both jobs run on the org's self-hosted release runner (owner,
-# 2026-09-28: no CI, no GitHub-hosted minutes), without the lint and fence steps.
+# simple index lists them too. No lint or fence steps (owner, 2026-09-28: no CI).
 on:
   workflow_dispatch:
     inputs:
@@ -29,7 +28,7 @@ jobs:
     outputs:
       version: ${{ steps.dist.outputs.version }}
       sha256sums: ${{ steps.dist.outputs.sha256sums }}
-    runs-on: cozy-local
+    runs-on: ubuntu-latest
     # Hang bound, not a work budget: a native-input change adds image pull + CUDA toolkit +
     # six-architecture compile.
     timeout-minutes: 45
@@ -133,28 +132,25 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"version={v}\nsha256sums<<SUMS\n{sums}\nSUMS\n")
           PY
-      # Both jobs run on the one cozy-local runner, and the org's artifact storage quota is
-      # exhausted, so the files pass through a runner-local directory keyed by this run.
-      - name: Hand the release set to publish
-        run: |
-          out="$HOME/actions-runner/_release/cozy-runtime/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          rm -rf "$out" && mkdir -p "$out"
-          cp source/dist/cozy_runtime-* "$out"/
-          ls -l "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: source/dist/
+          if-no-files-found: error
 
   publish:
     needs: build
-    runs-on: cozy-local
+    runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.
     timeout-minutes: 20
     permissions:
       id-token: write  # PyPI trusted publishing (OIDC)
     steps:
-      - name: Take the release set build handed over
-        run: |
-          src="$HOME/actions-runner/_release/cozy-runtime/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          rm -rf dist && mkdir dist && cp "$src"/* dist/ && ls -l dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
       - name: Upload set is exactly what build hashed
         env:
           SUMS: ${{ needs.build.outputs.sha256sums }}
@@ -162,12 +158,8 @@ jobs:
         run: |
           printf '%s\n' "$SUMS" | sha256sum --check --strict
           [ "$(ls | sort)" = "$(printf '%s\n' "$SUMS" | awk '{print $2}' | sort)" ]
-      # Trusted publishing is unchanged. This box cannot reach fulcio.sigstore.dev, so the
-      # optional PEP 740 attestations are off while releases run here.
       - name: Publish (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          attestations: false
       # Uploads land one file at a time; a lock taken mid-upload silently misses platform
       # files. Wait while files are absent, refuse at once on any file this run did not build.
       - name: PyPI serves exactly the built files
@@ -202,6 +194,3 @@ jobs:
               print(f"not yet served: {missing}", flush=True)
               time.sleep(5)
           PY
-      # Docker actions leave root-owned files in the self-hosted runner's workspace.
-      - if: always()
-        run: docker run --rm -v "$GITHUB_WORKSPACE:/w" alpine:3.20 chown -R "$(id -u):$(id -g)" /w
