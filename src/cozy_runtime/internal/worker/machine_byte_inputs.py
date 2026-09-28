@@ -225,7 +225,9 @@ def bind_root_grant(owner: str, offer: pb.AttemptOffer) -> None:
     Only a job root's inputs are adopted at submission; a serving root dispatches from the
     submitter's own hold, which the submitter keeps until the execution ends.
     """
-    if "job" not in documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec):
+    if not documents.parse(offer.invocation_spec_canonical_bytes, pb.InvocationSpec).HasField(
+        "job"
+    ):
         return
     for item in offer.grant.inputs:
         if item.HasField("native_tree"):

@@ -35,12 +35,12 @@ def require_child(
     plan = canonical_json.decode(row["prepared"])
     parent = pb.AttemptOffer.FromString(row["parent_offer"])
     child = pb.AttemptOffer.FromString(row["child_offer"])
-    parent_spec = documents.read(parent.invocation_spec_canonical_bytes, pb.InvocationSpec)
+    parent_spec = documents.parse(parent.invocation_spec_canonical_bytes, pb.InvocationSpec)
     if (
         not installation_id
         or plan.get("installation_id") != installation_id
         or plan.get("entrypoint") != entrypoint
-        or parent_spec.get("job", {}).get("installation_id") != installation_id
+        or parent_spec.job.installation_id != installation_id
         or child.invocation_spec_digest != offered.invocation_spec_digest
         or child.invocation_spec_canonical_bytes != offered.invocation_spec_canonical_bytes
     ):

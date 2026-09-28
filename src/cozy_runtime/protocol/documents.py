@@ -28,10 +28,15 @@ of spelling it. Within the admissible profile the two writers are byte-identical
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 from typing import Any
 
 from google.protobuf.descriptor import FieldDescriptor as FD
+from google.protobuf.internal.containers import (
+    RepeatedCompositeFieldContainer,
+    RepeatedScalarFieldContainer,
+)
 from google.protobuf.message import Message
 
 from cozy_runtime.internal import canonical
@@ -54,6 +59,15 @@ _INT_TYPES = frozenset(
     }
 )
 _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
+type _Scalar = bool | int | str | bytes
+_INT_BOUNDS = {
+    **dict.fromkeys(
+        (FD.TYPE_INT32, FD.TYPE_SINT32, FD.TYPE_SFIXED32, FD.TYPE_ENUM), (-(1 << 31), (1 << 31) - 1)
+    ),
+    **dict.fromkeys((FD.TYPE_UINT32, FD.TYPE_FIXED32), (0, (1 << 32) - 1)),
+    **dict.fromkeys((FD.TYPE_UINT64, FD.TYPE_FIXED64), (0, INT_MAX)),
+    **dict.fromkeys((FD.TYPE_INT64, FD.TYPE_SINT64, FD.TYPE_SFIXED64), (INT_MIN, INT_MAX)),
+}
 
 # Closed collection fields have one spelling even when empty (worker-protocol
 # scripts/canonical.py EXPLICIT_REPEATED; the same table in Creator's canonical writer).
@@ -161,20 +175,6 @@ def document(message: Message) -> dict[str, Any]:
     return rendered
 
 
-def embedded_document_digest(sub: dict[str, Any], full_name: str) -> bytes:
-    """The raw digest of a document NESTED inside another (#510g).
-
-    A nested document travels WITHOUT its own `format` tag — the tag domain-separates
-    top-level documents, and repeating it inside would put one document's identity in two
-    places. Its identity is the tag-bearing canonical bytes, which the receiver reconstructs
-    from the bytes it already holds. Verifying the ENCLOSING document needs no canonicalizer;
-    naming a nested one does.
-    """
-    if "format" in sub:
-        raise DocumentError("unknown_field", "`format` is reserved for the document tag")
-    return digest_of(canonical.write({**sub, "format": doc_format(full_name)}))
-
-
 def canonical_bytes(message: Message) -> bytes:
     return canonical.write(document(message))
 
@@ -188,13 +188,96 @@ def identity(message: Message) -> tuple[bytes, bytes]:
 # --------------------------------------------------------------------------- reader
 
 
-def read(data: bytes, cls: type[Message]) -> dict[str, Any]:
-    """Exact canonical bytes -> a typed document; unknown keys are ignored.
+def parse[M: Message](data: bytes, cls: type[M]) -> M:
+    """Exact canonical bytes -> the typed message, decoded once at this boundary.
 
-    Deliberately returns the JSON value, not a parsed message: the document is the subject of
-    the digest, and re-encoding it into a message would create a second representation that
-    is free to disagree. Callers read fields off the mapping.
+    The bytes stay the document's identity: a caller that names the document digests `data`,
+    never a re-encoding of the message. A field the writer omitted reads as its proto3
+    default, which is exactly what omission means. Keys this binding does not know are
+    additive fields from a newer writer and are skipped; a known key of the wrong JSON type
+    is refused here by name, not discovered later as a KeyError in the consumer.
     """
+    if len(data) > canonical.DOC_MAX_BYTES:
+        raise DocumentError("size_cap", f"{len(data)} B over the document cap")
+    try:
+        value = canonical.parse_canonical(data)
+    except canonical.CanonicalError as exc:
+        raise DocumentError(exc.code, exc.detail) from exc
+    if not isinstance(value, dict):
+        raise DocumentError("wrong_type", "a document is a JSON object")
+    want = doc_format(cls.DESCRIPTOR.full_name)
+    if value.get("format") != want:
+        raise DocumentError("unknown_format", f"{value.get('format')!r} is not {want!r}")
+    _integers_only(value)
+    message = cls()
+    _fill(message, {key: item for key, item in value.items() if key != "format"})
+    return message
+
+
+def _fill(message: Message, fields: dict[str, object]) -> None:
+    for name, value in fields.items():
+        fd = message.DESCRIPTOR.fields_by_name.get(name)
+        if fd is None:
+            continue
+        where = fd.full_name
+        if fd.is_repeated:
+            if not isinstance(value, list):
+                raise DocumentError("wrong_type", f"{where} is not a list")
+            if fd.type == FD.TYPE_MESSAGE:
+                messages: RepeatedCompositeFieldContainer[Message] = getattr(message, name)
+                for item in value:
+                    _fill(messages.add(), _object(item, where))
+            else:
+                scalars: RepeatedScalarFieldContainer[_Scalar] = getattr(message, name)
+                scalars.extend(_scalar(fd.type, name, item, where) for item in value)
+        elif fd.type == FD.TYPE_MESSAGE:
+            child: Message = getattr(message, name)
+            child.SetInParent()
+            _fill(child, _object(value, where))
+        else:
+            setattr(message, name, _scalar(fd.type, name, value, where))
+
+
+def _object(value: object, where: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise DocumentError("wrong_type", f"{where} is not an object")
+    return value
+
+
+def _scalar(kind: int, name: str, value: object, where: str) -> _Scalar:
+    if kind == FD.TYPE_BOOL and isinstance(value, bool):
+        return value
+    if kind in _INT_BOUNDS and isinstance(value, int) and not isinstance(value, bool):
+        low, high = _INT_BOUNDS[kind]
+        if not low <= value <= high:
+            raise DocumentError("number_range", f"{where}={value} is outside its field")
+        return value
+    if kind == FD.TYPE_STRING and isinstance(value, str):
+        return value
+    if kind == FD.TYPE_BYTES and isinstance(value, str):
+        if name == "digest" or name.endswith(("_digest", "_digests")):
+            return raw(value)
+        try:
+            return base64.b64decode(value, validate=True)
+        except binascii.Error as exc:
+            raise DocumentError("malformed_bytes", f"{where} is not base64") from exc
+    raise DocumentError("wrong_type", f"{where} is not a proto type {kind} value")
+
+
+def _integers_only(value: object) -> None:
+    """A float has no single canonical spelling across writers, so it is an ambiguous encoding."""
+    if isinstance(value, float):
+        raise DocumentError("non_integer_number", "documents are integer-only")
+    if isinstance(value, dict):
+        for item in value.values():
+            _integers_only(item)
+    elif isinstance(value, list):
+        for item in value:
+            _integers_only(item)
+
+
+def read(data: bytes, cls: type[Message]) -> dict[str, Any]:
+    """Exact canonical bytes -> the untyped document. Prefer `parse`, which returns the message."""
     if len(data) > canonical.DOC_MAX_BYTES:
         raise DocumentError("size_cap", f"{len(data)} B over the document cap")
     try:
@@ -208,15 +291,3 @@ def read(data: bytes, cls: type[Message]) -> dict[str, Any]:
     if value.get("format") != want:
         raise DocumentError("unknown_format", f"{value.get('format')!r} is not {want!r}")
     return value
-
-
-def _integers_only(value: Any) -> None:
-    """A float has no single canonical spelling across writers, so it is an ambiguous encoding."""
-    if isinstance(value, float):
-        raise DocumentError("non_integer_number", "documents are integer-only")
-    if isinstance(value, dict):
-        for item in value.values():
-            _integers_only(item)
-    elif isinstance(value, list):
-        for item in value:
-            _integers_only(item)

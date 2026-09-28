@@ -161,8 +161,8 @@ def test_canonical_documents() -> None:
         assert documents.doc_format(message.DESCRIPTOR.full_name) == row["document"], (
             f"{name}: format tag differs from the frozen document tag"
         )
-        # The reading half accepts what the writer produced.
-        documents.read(frozen, cls)
+        # The reading half decodes exactly the message the writer rendered.
+        assert documents.parse(frozen, cls) == message, f"{name}: decode differs"
         arms += 1
     assert arms == len(canonical_rows) and arms > 0, (
         f"exercised {arms} of {len(canonical_rows)} canonical documents"
@@ -177,7 +177,7 @@ def test_tolerated_documents_are_read() -> None:
         body = (CORPUS / "tolerated" / f"{name}.json").read_bytes()
         assert documents.spell(documents.digest_of(body)) == row["id"], name
         cls = getattr(worker_pb2, row["type"].rpartition(".")[2])
-        documents.read(body, cls)
+        documents.parse(body, cls)
         if cls is worker_pb2.PlacementSet:
             read_placement_set(
                 worker_pb2.DesiredPlacementSet(
@@ -196,7 +196,7 @@ def test_red_twins_refuse_ambiguous_encodings() -> None:
     }.items():
         body = (CORPUS / "red" / f"{name}.json").read_bytes()
         with pytest.raises(documents.DocumentError) as refusal:
-            documents.read(body, worker_pb2.InvocationSpec)
+            documents.parse(body, worker_pb2.InvocationSpec)
         assert refusal.value.code == want_code, (
             f"{name}: refused as {refusal.value.code!r}, wanted {want_code!r}"
         )

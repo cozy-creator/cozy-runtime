@@ -101,21 +101,21 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
     if len(targets) > 4096:
         raise WorkspaceRefusal("execution callable inventory exceeds its bound")
     machine_model_defaults.verify(worker, request, capture, interfaces)
-    spec = documents.read(request.offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+    spec = documents.parse(request.offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
     root = capture["root_installation_id"]
     state = request.prepared_state
-    if "job" in spec:
+    if spec.HasField("job"):
         if (
             state.WhichOneof("mode") != "job"
             or state.job.installation_id != root
-            or spec["job"].get("installation_id") != root
-            or state.job.job_descriptor_id != spec["job"].get("job_descriptor_id")
+            or spec.job.installation_id != root
+            or state.job.job_descriptor_id != spec.job.job_descriptor_id
         ):
             raise WorkspaceRefusal("execution root does not bind its prepared job directive")
     else:
         if state.WhichOneof("mode") != "placement_set":
             raise WorkspaceRefusal("execution inference has no exact prepared placement")
-        placements = documents.read(
+        placements = documents.parse(
             state.placement_set.placement_set_canonical_bytes, pb.PlacementSet
         )
         if (
@@ -126,8 +126,8 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         selected_entry = next(
             (
                 entry
-                for entry in placements["placements"]
-                if entry["placement_id"] == request.offer.placement_id
+                for entry in placements.placements
+                if entry.placement_id == request.offer.placement_id
             ),
             None,
         )
@@ -137,26 +137,22 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         # one release never displace another.
         held = (
             worker.prepared_installations.get(
-                (
-                    request.offer.placement_id,
-                    root,
-                    documents.raw(str(selected_entry.get("bindings_digest", ""))),
-                )
+                (request.offer.placement_id, root, selected_entry.bindings_digest)
             )
-            if selected_entry is not None and selected_entry.get("bindings_digest")
+            if selected_entry is not None and selected_entry.bindings_digest
             else None
         )
-        if held is None or installation_identity(selected_entry or {}) != root:
+        if held is None or selected_entry is None or selected_entry.installation_id != root:
             raise WorkspaceRefusal("execution inference does not name the captured root")
         prepared[root]["placement"] = held.document
     root_interface = interfaces[root]
-    if "job" in spec:
+    if spec.HasField("job"):
         root_callable = next(
             (
                 entry
                 for entry in root_interface["jobs"]
                 if package_interface.job_descriptor_id(root_interface, entry["name"])
-                == spec["job"]["job_descriptor_id"]
+                == spec.job.job_descriptor_id
             ),
             None,
         )
@@ -165,8 +161,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             (
                 entry
                 for entry in prepared[root]["placement"]["entrypoints"]
-                if entry["entrypoint_binding_digest"]
-                == spec.get("serving", {}).get("entrypoint_binding_digest")
+                if entry["entrypoint_binding_digest"] == spec.serving.entrypoint_binding_digest
             ),
             None,
         )

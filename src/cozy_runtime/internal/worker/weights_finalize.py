@@ -40,15 +40,15 @@ def _decision(request: pb.WeightsFinalizeRequest, owner_scope: str) -> dict[str,
             "weights finalization's original invocation digest does not match"
         )
     try:
-        spec = documents.read(request.invocation_spec_canonical_bytes, pb.InvocationSpec)
+        spec = documents.parse(request.invocation_spec_canonical_bytes, pb.InvocationSpec)
     except documents.DocumentError as exc:
         raise FinalizationRefusal(
             "weights finalization has no canonical invocation declaration"
         ) from exc
-    if "job" not in spec or not any(
-        row.get("output_id") == request.output_slot
-        and row.get("mime_type") == "application/vnd.cozy.model-manifest"
-        for row in spec.get("outputs", ())
+    if not spec.HasField("job") or not any(
+        row.output_id == request.output_slot
+        and row.mime_type == "application/vnd.cozy.model-manifest"
+        for row in spec.outputs
     ):
         raise FinalizationRefusal("weights finalization names no declared model output")
     uncommitted = request.disposition == pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED

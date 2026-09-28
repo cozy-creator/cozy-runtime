@@ -9,8 +9,6 @@ Exchange no longer grants writer authority.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import io
 import json
@@ -460,13 +458,13 @@ class WeightsExchange:
             weights_receipt_digest=receipt_digest,
             weights_receipt_canonical_bytes=canonical_receipt,
         )
-        receipt = documents.read(canonical_receipt, pb.WeightsReceipt)
+        receipt = documents.parse(canonical_receipt, pb.WeightsReceipt)
         if (
-            receipt.get("request_id") != attempt.request_id
-            or receipt.get("owner_authority_scope") != self.owner_scope()
-            or receipt.get("invocation_spec_digest") != documents.spell(attempt.digest)
-            or receipt.get("output_slot") != output_slot
-            or receipt.get("weights_transaction_id") != transaction_id
+            receipt.request_id != attempt.request_id
+            or receipt.owner_authority_scope != self.owner_scope()
+            or receipt.invocation_spec_digest != documents.spell(attempt.digest)
+            or receipt.output_slot != output_slot
+            or receipt.weights_transaction_id != transaction_id
         ):
             raise WeightsExchangeError(
                 "weights_receipt_identity_mismatch", "receipt does not bind this attempt/output"
@@ -711,7 +709,7 @@ class WeightsExchange:
             raise WeightsExchangeError(
                 "weights_receipt_invalid", "receipt ref digest does not match exact bytes"
             )
-        documents.read(raw, pb.WeightsReceipt)
+        documents.parse(raw, pb.WeightsReceipt)
         return digest
 
     def _hold(
@@ -742,20 +740,20 @@ class WeightsExchange:
                     "weights_receipt_mismatch", "held transaction carries another receipt"
                 )
             return existing
-        value = documents.read(reference.weights_receipt_canonical_bytes, pb.WeightsReceipt)
-        if value.get("weights_transaction_id") != transaction_id:
+        value = documents.parse(reference.weights_receipt_canonical_bytes, pb.WeightsReceipt)
+        if value.weights_transaction_id != transaction_id:
             raise WeightsExchangeError(
                 "weights_receipt_identity_mismatch", "receipt names another transaction"
             )
+        inner = value.tensorfs_receipt_canonical_bytes
         try:
-            inner = base64.b64decode(str(value["tensorfs_receipt_canonical_bytes"]), validate=True)
-            if hashlib.sha256(inner).hexdigest() != str(value["tensorfs_receipt_digest"])[7:]:
+            if documents.spell(hashlib.sha256(inner).digest()) != value.tensorfs_receipt_digest:
                 raise ValueError("nested digest mismatch")
             facts = json.loads(inner)
             manifest = facts["manifest"]
             manifest_id = "sha256:" + str(manifest["sha256"])
             manifest_length = int(manifest["length"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError, binascii.Error) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             raise WeightsExchangeError(
                 "weights_tensorfs_receipt_invalid", f"TensorFS receipt is invalid: {exc}"
             ) from exc

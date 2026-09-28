@@ -8,7 +8,6 @@ is never placed in an ephemeral worker or author environment.
 
 from __future__ import annotations
 
-import base64
 import fcntl
 import hashlib
 import logging
@@ -496,7 +495,7 @@ class Workspace:
             != offer.invocation_spec_digest
         ):
             raise WorkspaceRefusal("workspace attempt does not bind its exact invocation")
-        documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+        documents.parse(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
 
     @staticmethod
     def accept_in(
@@ -525,8 +524,8 @@ class Workspace:
                 return Workspace._outcome_frame(row)
             return None
         if any(entry.HasField("catalog_model") for entry in offer.grant.inputs):
-            spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
-            if "serving" in spec:
+            spec = documents.parse(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+            if spec.HasField("serving"):
                 # A direct control offer cannot bypass the retained input gate
                 # used by machine children. Replay above preserves collected rows.
                 from .machine_checkpoint_inputs import check_submit
@@ -751,11 +750,11 @@ class Workspace:
         raw = outcome.outcome_canonical_bytes
         if hashlib.sha256(raw).digest() != outcome.outcome_digest:
             raise WorkspaceRefusal("outcome digest differs from exact bytes")
-        body = documents.read(raw, pb.AttemptOutcomeBody)
+        body = documents.parse(raw, pb.AttemptOutcomeBody)
         if (
-            body["request_id"] != outcome.request_id
-            or body["attempt_ordinal"] != outcome.attempt_ordinal
-            or body["invocation_spec_digest"] != documents.spell(outcome.invocation_spec_digest)
+            body.request_id != outcome.request_id
+            or body.attempt_ordinal != outcome.attempt_ordinal
+            or body.invocation_spec_digest != documents.spell(outcome.invocation_spec_digest)
         ):
             raise WorkspaceRefusal("outcome body differs from its execution identity")
         with self.locked() as db:
@@ -781,12 +780,11 @@ class Workspace:
                 "SELECT * FROM byte_outputs WHERE owner=? AND request=? AND ordinal=?",
                 (row["owner"], outcome.request_id, outcome.attempt_ordinal),
             ).fetchall()
-            body = documents.read(raw, pb.AttemptOutcomeBody)
-            if body["status"] == pb.OUTCOME_STATUS_SUCCEEDED:
+            if body.status == pb.OUTCOME_STATUS_SUCCEEDED:
                 native = {
-                    item["output_id"]: item["native_tree"]
-                    for item in body.get("output_manifest", {}).get("outputs", [])
-                    if "native_tree" in item
+                    item.output_id: item.native_tree
+                    for item in body.output_manifest.outputs
+                    if item.HasField("native_tree")
                 }
                 returned_rows = []
                 for output in output_rows:
@@ -808,8 +806,10 @@ class Workspace:
                         "terminal native byte outputs do not match completed intents"
                     )
                 for output in returned_rows:
-                    expected = documents.body(reference(dict(output)))
-                    if output["state"] != "complete" or expected != native[output["slot"]]:
+                    if (
+                        output["state"] != "complete"
+                        or reference(dict(output)) != native[output["slot"]]
+                    ):
                         raise WorkspaceRefusal(
                             "terminal native byte output differs from its receipt"
                         )
@@ -1021,18 +1021,18 @@ class Workspace:
         digest = hashlib.sha256(raw).digest()
         if not raw or digest != frame.weights_receipt.weights_receipt_digest:
             raise WorkspaceRefusal("receipt bytes differ from their digest")
-        receipt = documents.read(raw, pb.WeightsReceipt)
+        receipt = documents.parse(raw, pb.WeightsReceipt)
         if (
-            receipt["owner_authority_scope"] != owner
-            or receipt["request_id"] != frame.request_id
-            or receipt["invocation_spec_digest"] != documents.spell(frame.invocation_spec_digest)
-            or receipt["output_slot"] != frame.output_slot
-            or receipt["weights_transaction_id"] != frame.weights_transaction_id
+            receipt.owner_authority_scope != owner
+            or receipt.request_id != frame.request_id
+            or receipt.invocation_spec_digest != documents.spell(frame.invocation_spec_digest)
+            or receipt.output_slot != frame.output_slot
+            or receipt.weights_transaction_id != frame.weights_transaction_id
         ):
             raise WorkspaceRefusal("receipt differs from its admitted execution")
-        native = base64.b64decode(receipt["tensorfs_receipt_canonical_bytes"], validate=True)
+        native = receipt.tensorfs_receipt_canonical_bytes
         native_digest = hashlib.sha256(native).digest()
-        if documents.spell(native_digest) != receipt["tensorfs_receipt_digest"]:
+        if documents.spell(native_digest) != receipt.tensorfs_receipt_digest:
             raise WorkspaceRefusal("native receipt digest differs")
         with self.locked() as db:
             row = db.execute(

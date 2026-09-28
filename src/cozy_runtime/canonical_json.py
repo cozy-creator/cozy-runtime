@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import msgspec
+
 from cozy_runtime.internal import canonical
 
 
@@ -26,6 +28,12 @@ def decode(data: bytes) -> Any:
         return canonical.parse(data)
     except canonical.CanonicalError as exc:
         raise ValueError(str(exc)) from exc
+
+
+def decode_as[T](data: bytes, into: type[T]) -> T:
+    """`decode`, then convert once into `into`: a wrong shape raises `msgspec.ValidationError`
+    naming the JSON path, at this boundary rather than as a KeyError in the reader."""
+    return msgspec.convert(decode(data), type=into, strict=True)
 
 
 def normalize(data: bytes) -> bytes:
