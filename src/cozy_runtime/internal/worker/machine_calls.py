@@ -312,7 +312,6 @@ class Calls:
                 orchestration=not bool(
                     target.declaration.get("models") or target.declaration.get("weights_outputs")
                 ),
-                reclaim_on_terminal=True,
             ),
         )
         preparation = canonical_json.encode(

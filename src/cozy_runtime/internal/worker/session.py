@@ -1074,7 +1074,6 @@ class Worker:
             WorkspaceService(
                 self.workspace,
                 self.authorize_workspace,
-                self.workspace_weights_ready,
                 self.resolutions,
                 allow_private_egress=machine_model_defaults.local_development(self),
             )
@@ -2870,30 +2869,6 @@ class Worker:
     ) -> workspace_executions.State:
         executions, owner = self._execution_service(claim)
         return executions.acknowledge_collection(owner, ack)
-
-    def workspace_weights_ready(self, call: pb.WeightsIntentReadyCall) -> pb.WeightsHostAck:
-        from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-
-        owner = self.authorize_workspace(call.claim)
-        if self.workspace is None:
-            raise WorkspaceRefusal("worker has no workspace")
-        row = self.workspace.ready_weights(owner, call.request)
-        ack = pb.WeightsHostAck(
-            request_id=row["request"],
-            attempt_ordinal=row["ordinal"],
-            invocation_spec_digest=row["spec"],
-            output_slot=row["slot"],
-            weights_transaction_id=row["id"],
-            writer_epoch=row["epoch"],
-            tensorfs_declaration_digest=row["declaration_digest"],
-            stage=pb.WEIGHTS_HOST_STAGE_INTENT,
-            outcome=pb.WEIGHTS_HOST_OUTCOME_RECORDED,
-            record_owner_epoch=call.request.record_owner_epoch,
-            worker_boot_id=call.request.worker_boot_id,
-        )
-        if row["restore_checkpoint"]:
-            ack.checkpoint.CopyFrom(pb.CheckpointRef.FromString(row["restore_checkpoint"]))
-        return ack
 
     def prepare_model_source(
         self, request: pb.PrepareModelSourceRequest

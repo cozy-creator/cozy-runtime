@@ -236,7 +236,6 @@ def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Pa
         workspace_service = Service(
             workspace,
             authorize,
-            lambda _ready: pb.WeightsHostAck(),
             Resolutions(),
             allow_private_egress=True,
         )
@@ -272,7 +271,7 @@ def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Pa
     # A machine whose own Hub is not local never uploads to a private address.
     class Production(WorkspaceRPC):
         workspace_service = Service(
-            workspace, authorize, lambda _ready: pb.WeightsHostAck(), Resolutions()
+            workspace, authorize, Resolutions()
         )
 
     with serving(ObjectStore()) as url:

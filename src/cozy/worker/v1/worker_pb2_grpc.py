@@ -589,11 +589,6 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
                 _registered_method=True)
-        self.WorkspaceWeightsIntentReady = channel.unary_unary(
-                '/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
-                _registered_method=True)
         self.PreparePackageSet = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/PreparePackageSet',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
@@ -757,12 +752,6 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def WorkspaceWeightsIntentReady(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
     def PreparePackageSet(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -907,11 +896,6 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.ImportInputTree,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.SerializeToString,
-            ),
-            'WorkspaceWeightsIntentReady': grpc.unary_unary_rpc_method_handler(
-                    servicer.WorkspaceWeightsIntentReady,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.SerializeToString,
             ),
             'PreparePackageSet': grpc.unary_unary_rpc_method_handler(
                     servicer.PreparePackageSet,
@@ -1359,33 +1343,6 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/ImportInputTree',
             cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def WorkspaceWeightsIntentReady(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
             options,
             channel_credentials,
             insecure,
@@ -2007,21 +1964,6 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
                 _registered_method=True)
-        self.LocalPackageAbort = channel.unary_unary(
-                '/cozy.worker.v1.PodHost/LocalPackageAbort',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortStatus.FromString,
-                _registered_method=True)
-        self.WeightsTransfer = channel.unary_stream(
-                '/cozy.worker.v1.PodHost/WeightsTransfer',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferStatus.FromString,
-                _registered_method=True)
-        self.WeightsIntentReady = channel.unary_unary(
-                '/cozy.worker.v1.PodHost/WeightsIntentReady',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
-                _registered_method=True)
 
 
 class PodHostServicer(object):
@@ -2264,24 +2206,6 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def LocalPackageAbort(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def WeightsTransfer(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def WeightsIntentReady(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
 
 def add_PodHostServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -2454,21 +2378,6 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.LocalPackageUpload,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.SerializeToString,
-            ),
-            'LocalPackageAbort': grpc.unary_unary_rpc_method_handler(
-                    servicer.LocalPackageAbort,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortStatus.SerializeToString,
-            ),
-            'WeightsTransfer': grpc.unary_stream_rpc_method_handler(
-                    servicer.WeightsTransfer,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferStatus.SerializeToString,
-            ),
-            'WeightsIntentReady': grpc.unary_unary_rpc_method_handler(
-                    servicer.WeightsIntentReady,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -3414,87 +3323,6 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/LocalPackageUpload',
             cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def LocalPackageAbort(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/cozy.worker.v1.PodHost/LocalPackageAbort',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortStatus.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def WeightsTransfer(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/cozy.worker.v1.PodHost/WeightsTransfer',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferStatus.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def WeightsIntentReady(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/cozy.worker.v1.PodHost/WeightsIntentReady',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
             options,
             channel_credentials,
             insecure,

@@ -43,7 +43,6 @@ def test_unreadable_job_plan_latches_only_that_job(tmp_path: Path) -> None:
             pb.JobDirective(
                 installation_id=INSTALLATION,
                 job_descriptor_id=DESCRIPTOR,
-                reclaim_on_terminal=True,
             )
         )
         assert worker.latched == "job_plan_unreadable"

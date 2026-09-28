@@ -225,7 +225,6 @@ def test_job_root_publishes_its_weights_output_to_the_granted_destination(
                                 job=pb.JobDirective(
                                     installation_id=binding.installation_id,
                                     job_descriptor_id=binding.job_descriptor_id,
-                                    reclaim_on_terminal=True,
                                 ),
                             ),
                             payload_canonical_bytes=canonical_json.encode({"n": 3}),

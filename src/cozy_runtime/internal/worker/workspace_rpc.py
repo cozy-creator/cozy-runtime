@@ -31,12 +31,11 @@ class Service:
         self,
         workspace: Workspace,
         authorize: Callable[[pb.Claim], str],
-        ready: Callable[[pb.WeightsIntentReadyCall], pb.WeightsHostAck],
         resolutions: machine_model_resolve.Resolutions,
         *,
         allow_private_egress: bool = False,
     ):
-        self.workspace, self.authorize, self.ready = workspace, authorize, ready
+        self.workspace, self.authorize = workspace, authorize
         self.resolutions = resolutions
         #: Uploads may reach private addresses only for a machine whose own Hub is local.
         self.allow_private_egress = allow_private_egress
@@ -238,11 +237,6 @@ class WorkspaceRPC:
                 )
             else:
                 context.abort(grpc.StatusCode.UNAVAILABLE, "ordinary artifact read failed")
-
-    def WorkspaceWeightsIntentReady(
-        self, request: pb.WeightsIntentReadyCall, context: ServicerContext
-    ) -> pb.WeightsHostAck:
-        return self._workspace_call(request.claim, context, lambda s, _: s.ready(request))
 
     def ImportInputTree(
         self, requests: Iterable[pb.InputTreeImportFrame], context: ServicerContext
