@@ -23,7 +23,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
@@ -150,6 +150,37 @@ def test_a_root_keeps_its_lease_through_the_gap_and_the_head_waiter_reserves() -
     assert gpus.sync({"O": 1, "Y": 5, "Z": 9}, live) == {"y#1": (0, 1)}
     assert gpus.view()["leases"] == {"Y": [0, 1], "O": [2, 3]}  # Z cannot take a reserved GPU
     assert gpus.sync({"O": 1, "Z": 9}, live[1:]) == {"o#1": (0, 1, 2, 3)}
+
+
+def test_two_fanned_out_roots_take_their_group_calls_in_order_and_name_no_cycle() -> None:
+    """Runs 1572 and 1573: each root's references leased the cards they ran on, then each
+    root's 4-GPU call waited behind the other's lease, forever. The older root's call takes
+    the younger's idle cards and waits only on calls actually on them; the younger's is
+    named behind its own calls while the older waits on those, then behind the older."""
+    gpus = GpuScheduler(4)
+    roots = {"A": 1, "B": 2}
+    refs = [Demand(f"{r}{n}#1", r.upper(), 1) for n in (1, 2) for r in "ab"]
+    for arrived in range(1, 5):
+        gpus.sync(roots, refs[:arrived])
+    assert gpus.view()["leases"] == {"A": [0, 2], "B": [1, 3]}
+    gpus.release("a1#1")
+    gpus.release("a2#1")
+    live = [refs[1], refs[3], Demand("sa#1", "A", 4), Demand("sb#1", "B", 4)]
+    assert gpus.sync(roots, live) == {"b1#1": (1,), "b2#1": (3,)}
+    assert gpus.view()["waiting"] == {"sa#1": ["B"], "sb#1": ["B"]}
+    gpus.release("b1#1")
+    assert gpus.sync(roots, live) == {"b2#1": (3,)}
+    assert gpus.view()["leases"] == {"A": [0, 1, 2], "B": [3]}  # A reserves B's idle card
+    gpus.release("b2#1")
+    assert gpus.sync(roots, live) == {"sa#1": (0, 1, 2, 3)}
+    assert gpus.view()["waiting"] == {"sb#1": ["A"]} and gpus.view()["leases"] == {
+        "A": [0, 1, 2, 3]
+    }
+    gpus.release("sa#1")
+    assert gpus.sync(roots, live) == {}  # A's gap holds against the younger B
+    assert gpus.sync({"B": 2}, live) == {"sb#1": (0, 1, 2, 3)}  # A ended
+    leases = [body for root, kind, body in gpus.drain() if (root, kind) == ("B", "gpu.lease")]
+    assert [body["cause"] for body in leases].count("yielded to sa#1") == 2
 
 
 def test_fifo_within_a_root_warm_first_and_release_before_the_next_tick() -> None:
@@ -981,6 +1012,109 @@ def test_consecutive_roots_of_different_widths_reuse_every_warm_executor(
     assert machine.executors() == warm, "no executor was spawned, replaced or retired"
     assert {p: machine.worker._lane_of(p).lane_id for p in warm} == lanes_of
     assert machine.worker.admission_epoch == epoch
+
+
+@needs_executor
+def test_two_long_forms_fanned_out_on_one_machine_both_run_their_group_calls(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs 1572 and 1573, on real executors: two roots' references fan out interleaved over
+    the four GPUs, then each root asks for all four. Both group calls run, both roots end, and
+    no wait is named behind a run that is named behind it, or behind its own run."""
+    machine.activate_warm(monkeypatch)
+    lock = threading.Lock()
+    gates: dict[str, threading.Event] = {}
+
+    def gate(request: str) -> threading.Event:
+        with lock:
+            if request not in gates:
+                gates[request] = threading.Event()
+                machine.holds.append(gates[request])
+            return gates[request]
+
+    activate = Worker._activate_replica
+
+    def downloading(worker: Worker, *args: Any) -> None:
+        gate(args[4]).wait()  # this call's weights arrive when the test says so
+        activate(worker, *args)
+
+    monkeypatch.setattr(Worker, "_activate_replica", downloading)
+
+    def until(ready: Callable[[], bool]) -> None:
+        bound = time.monotonic() + 120  # a hang bound on a loaded box, not a budget
+        while not ready():
+            assert time.monotonic() < bound
+            time.sleep(0.01)
+
+    def ended(*requests: str) -> bool:
+        return all(machine.executions.status(OWNER, r).state in TERMINAL for r in requests)
+
+    def waits(root: str) -> list[tuple[int, list[str]]]:
+        at = {e.sequence: e.at_ms for e in machine.executions.events(OWNER, root).events}
+        return [
+            (at[s], body["blocked_by"])
+            for s, kind, body in machine.journal(root)
+            if kind == "gpu.wait"
+        ]
+
+    def said(root: str) -> list[str]:
+        return [
+            stage
+            for event in machine.executions.events(OWNER, root).events
+            if event.kind == "progress"
+            and (stage := canonical_json.decode(event.body)["payload"]["stage"]).startswith(
+                "Waiting for GPU"
+            )
+        ]
+
+    machine.root("A")
+    machine.root("B")
+    references: dict[str, list[str]] = {"A": [], "B": []}
+    for root in "ABAB":
+        call = machine.child(root, "qwen")
+        machine.await_granted(call)
+        references[root].append(call)
+    assert [machine.granted(r) for r in references["A"]] == [[0], [2]]
+    assert [machine.granted(r) for r in references["B"]] == [[1], [3]]
+    for call in references["A"]:
+        gate(call).set()
+    until(lambda: ended(*references["A"]))
+    # A's segment asks for all four while B's references are still on GPUs 1 and 3.
+    shot_a = machine.child("A", "h3")
+    until(lambda: [b for _, b in waits("A")] == [["B"]])
+    shot_b = machine.child("B", "h3")
+    until(lambda: [b for _, b in waits("B")] == [["B"]])  # its own calls: A waits on them
+    for call in references["B"]:
+        gate(call).set()
+    machine.await_granted(shot_a)
+    assert machine.granted(shot_a) == [0, 1, 2, 3]
+    until(lambda: [b for _, b in waits("B")] == [["B"], ["A"]])
+    gate(shot_a).set()
+    until(lambda: ended(shot_a))
+    machine.finish("A")
+    machine.await_granted(shot_b)
+    assert machine.granted(shot_b) == [0, 1, 2, 3]
+    gate(shot_b).set()
+    until(lambda: ended(shot_b))
+    machine.finish("B")
+    machine.tick()
+
+    assert {machine.executions.status(OWNER, r).state for r in "AB"} == {"succeeded"}
+    for root in "AB":
+        calls = [body for _, kind, body in machine.journal(root) if kind == "gpu.release"]
+        assert len(calls) == 3 and all(body["cause"] == "exited" for body in calls), calls
+    assert said("A") == ["Waiting for GPU (needs 4, behind B)"]
+    assert said("B") == [
+        "Waiting for GPU (needs 4, 2 in use by this run's other calls)",
+        "Waiting for GPU (needs 4, behind A)",
+    ]
+    # B is named behind A only once A no longer waits on B: A's grant ends its wait.
+    a_granted = next(
+        e.at_ms
+        for e in machine.executions.events(OWNER, "A").events
+        if e.kind == "gpu.grant" and canonical_json.decode(e.body)["key"] == shot_a + "#1"
+    )
+    assert waits("B")[1][0] >= a_granted
 
 
 def _warm_shot(machine: Machine, monkeypatch: pytest.MonkeyPatch) -> tuple[str, dict[str, str]]:
