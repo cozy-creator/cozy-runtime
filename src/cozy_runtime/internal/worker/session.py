@@ -8283,8 +8283,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--development-installation-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
-    # Ignored: cancel escalation is measured, not a grace. Deployed launchers still pass it.
-    parser.add_argument("--grace", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--executor-uid", type=int, default=-1, help=argparse.SUPPRESS)
     parser.add_argument("--executor-gid", type=int, default=-1, help=argparse.SUPPRESS)
     parser.add_argument("--tls-cert", default="", help="PEM cert for a non-loopback listener")
