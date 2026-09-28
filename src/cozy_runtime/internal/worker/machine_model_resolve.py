@@ -135,7 +135,9 @@ class Catalog:
         spec = model + ("@" + release if release else "")
         query = {"ref": spec, **({"lane": lane} if lane else {})}
         value = self.get("/v1/models/resolve?" + urlencode(query))
-        if not isinstance(value, dict) or value.get("model") != model:
+        # Names are case-insensitive: "Fidika/Anima" is the Hub's "fidika/anima".
+        named = str(value.get("model", "")) if isinstance(value, dict) else ""
+        if not isinstance(value, dict) or named.casefold() != model.casefold():
             raise WorkspaceRefusal(f"model catalog cannot resolve {spec}/{lane}")
         digest, length = value.get("manifest_id"), value.get("manifest_length")
         try:
@@ -143,8 +145,9 @@ class Catalog:
         except documents.DocumentError as exc:
             raise WorkspaceRefusal(f"model catalog returned no manifest for {spec}/{lane}") from exc
         if type(length) is not int or length <= 0:
-            length = self.measure(model, str(digest))
+            length = self.measure(named, str(digest))
         return {
+            "repository": named,
             "manifest": {"digest": digest, "length": length},
             "release": str(value.get("release") or release),
             "lane": str(value.get("lane") or lane),

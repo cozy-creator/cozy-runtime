@@ -114,6 +114,8 @@ class Catalog:
                     }
                 elif url.path == "/v1/models/resolve":
                     query = parse_qs(url.query)
+                    # The Hub folds names: any spelling of the model resolves to its own.
+                    query["ref"] = [ref.lower() for ref in query["ref"]]
                     assert query == {"ref": [f"{PACKAGE}@{RELEASE}"], "lane": [LANE]}, query
                     if together is not None:
                         together.wait(30)  # each lane is read beside the others
@@ -336,10 +338,15 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
         catalog.reads.clear()
         chosen = submission(machine, "chosen")
         chosen.release_root.models.add(
-            parameter="model", repository=PACKAGE, release=RELEASE, lane=LANE
+            parameter="model", repository=PACKAGE.title(), release=RELEASE, lane=LANE
         )
         submit(machine, chosen)
         assert [urlsplit(path).path for path in catalog.reads] == ["/v1/models/resolve"]
+        assert [
+            canonical_json.decode(event.body)["models"][0]["repository"]
+            for event in machine.executions.events(OWNER, "chosen").events
+            if event.kind == "resolved"
+        ] == [PACKAGE]
         # A checkpoint named by digest alone that this machine holds costs no catalog read.
         catalog.reads.clear()
         pinned = submission(machine, "pinned")

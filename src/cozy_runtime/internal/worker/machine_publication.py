@@ -278,12 +278,13 @@ def _require(condition: bool, code: str = "publication.response_changed") -> Non
 
 
 def destination_path(destination: str) -> str:
-    parts = destination.split("/")
+    """The Hub path of an `org/name` repository, in any case: the Hub folds names."""
+    parts = destination.strip().lower().split("/")
     _require(
         len(parts) == 2 and parts[0] != "local" and all(_NAME.fullmatch(p) for p in parts),
         "publication.destination_invalid",
     )
-    return "/v1/models/" + destination
+    return "/v1/models/" + "/".join(parts)
 
 
 # A job root's weights output access spelled ``model://org/name`` publishes that output
@@ -294,7 +295,9 @@ DESTINATION_SCHEME = "model://"
 def output_destination(urls: Iterable[str]) -> str:
     """The one repository a root's output grants name, or "" when none names one."""
     named = {
-        url.removeprefix(DESTINATION_SCHEME) for url in urls if url.startswith(DESTINATION_SCHEME)
+        url.removeprefix(DESTINATION_SCHEME).strip().lower()
+        for url in urls
+        if url.startswith(DESTINATION_SCHEME)
     }
     _require(len(named) <= 1, "publication.destination_ambiguous")
     if not named:
@@ -450,7 +453,7 @@ def prepare_release(
     for name, checkpoint in lanes.items():
         _require(_LABEL.fullmatch(name) is not None)
         _require(
-            checkpoint.destination == destination
+            checkpoint.destination.lower() == destination.lower()
             and checkpoint.checkpoint == checkpoint.manifest.digest
             and _DIGEST.fullmatch(checkpoint.checkpoint) is not None
             and checkpoint.manifest.length > 0
