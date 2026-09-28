@@ -56,13 +56,14 @@ def test_a_released_root_hands_its_gpus_on_and_a_later_call_waits_its_turn() -> 
     gpus.release_root("A")  # idempotent
     assert gpus.view()["leases"] == {}
     assert gpus.sync(roots, [Demand("b1#1", "B", 4)]) == {"b1#1": (0, 1, 2, 3)}
-    # A's GPU call after its release waits at A's priority; B keeps its grant and its gap
+    # A's GPU call after its release waits at A's priority for B's call on the GPUs; B's
+    # gap then holds nothing against the older A
     live = [Demand("b1#1", "B", 4), Demand("a2#1", "A", 4)]
     assert gpus.sync(roots, live) == {"b1#1": (0, 1, 2, 3)}
-    gpus.release("b1#1")
-    assert gpus.sync(roots, live[1:]) == {}
     assert gpus.view()["waiting"] == {"a2#1": ["B"]}
-    assert gpus.sync({"A": 1}, live[1:]) == {"a2#1": (0, 1, 2, 3)}  # B ended
+    gpus.release("b1#1")
+    assert gpus.sync(roots, live[1:]) == {"a2#1": (0, 1, 2, 3)}
+    assert gpus.view()["leases"] == {"A": [0, 1, 2, 3]}
     gpus.release("a2#1")  # the new lease holds A's next gap again
     assert gpus.sync({"A": 1, "C": 3}, [Demand("c#1", "C", 1)]) == {}
     leases = [(root, body) for root, kind, body in gpus.drain() if kind == "gpu.lease"]
@@ -168,16 +169,14 @@ def test_a_released_root_lets_the_next_root_start_while_its_python_runs(
         e.at_ms for e in machine.executions.events(OWNER, "B").events if e.kind == "gpu.grant"
     )
     assert granted_at >= released_at
-    # A calls a GPU function again: it waits behind B, and B keeps its GPUs through its gap
+    # A calls a GPU function again. B's call has left the GPUs (its template names no
+    # installed package), and B's gap holds nothing against the older A.
+    assert machine.worker.gpu.view()["leases"] == {"B": [0, 1, 2, 3]}
     a2 = machine.child("A", "h3")
-    view = machine.tick()
-    assert view["waiting"] == {a2 + "#1": ["B"]} and view["leases"] == {"B": [0, 1, 2, 3]}
-    machine.finish(b1)
-    view = machine.tick()
-    assert a2 + "#1" in view["waiting"] and machine.granted(a2) == []
-    machine.finish("B")
     machine.tick()
     assert machine.granted(a2) == [0, 1, 2, 3]
+    b_leases = [body for _, kind, body in machine.journal("B") if kind == "gpu.lease"]
+    assert b_leases[-1] == {"ordinals": [], "cause": f"yielded to {a2}#1"}
 
 
 def test_a_serving_root_releases_its_gpus_at_device_exit(
