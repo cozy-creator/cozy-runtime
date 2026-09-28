@@ -130,13 +130,28 @@ class MemoryManager:
         when it was never measured and every idle tenant has gone."""
         lane.touch(slot)
         need = self.need(lane, slot, shape)
-        measured = self.make_room(lane, slot, need, why)
-        return need is None or all(
+        evicted: list[str] = []
+        measured = self.make_room(lane, slot, need, why, evicted)
+        fits = need is None or all(
             measured[o].state == "measured" and measured[o].free_bytes >= n for o, n in need.items()
         )
+        if evicted or need is None:
+            self.note(
+                "residency",
+                f"{lane.lane_id}: admitted {slot!r} for {why} ({shape[0]} {shape[1] or '-'}): "
+                + (
+                    "never measured, so it has the whole of its devices"
+                    if need is None
+                    else "needs " + ", ".join(f"{need[o]} B on device {o}" for o in sorted(need))
+                )
+                + f"; evicted {evicted or 'nobody'}; free "
+                + ", ".join(f"{measured[o].free_bytes} B on device {o}" for o in sorted(measured))
+                + ("" if fits else "; it runs staged in what is left"),
+            )
+        return fits
 
     def make_room(
-        self, lane: DeviceLane, slot: str, need: Need, why: str
+        self, lane: DeviceLane, slot: str, need: Need, why: str, evicted: list[str] | None = None
     ) -> dict[int, DeviceMemory]:
         """Evict idle tenants from `lane`'s short devices until `need` fits on every one:
         dead tenants first (killed and reaped), then weights, least recently used first.
@@ -164,6 +179,8 @@ class MemoryManager:
                 return measured
             other, other_lane, row, executor = victim
             tried.add(other)
+            if evicted is not None:
+                evicted.append(other)
             if executor.poisoned or not executor.alive():
                 why_dead = executor.poisoned or "exited"
                 if self.end(other, executor, f"reclaimed for {slot!r} on {why}: {why_dead}"):

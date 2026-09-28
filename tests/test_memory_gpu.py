@@ -320,6 +320,15 @@ class Card:
                 self.replicas[name] = attempt.placement_id
 
         monkeypatch.setattr(AttemptEngine, "enter", entered)
+        #: every step the worker narrated, whole (its activity keeps the last 64, capped)
+        self.notes: list[str] = []
+        note = Worker.note
+
+        def noted(worker: Worker, kind: str, step: str) -> None:
+            self.notes.append(step)
+            note(worker, kind, step)
+
+        monkeypatch.setattr(Worker, "note", noted)
         monkeypatch.setattr(package_prepare, "_census", census)
         base = {
             k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"
@@ -468,8 +477,8 @@ class Card:
         outcome = self.worker.collect_execution(self.claim, request)
         return documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
 
-    def steps(self, kind: str = "") -> list[str]:
-        return [e.step for e in self.worker.activity if not kind or e.kind == kind]
+    def steps(self) -> list[str]:
+        return list(self.notes)
 
     def vacated(self) -> list[tuple[str, str]]:
         """(victim, for whom) per eviction the memory manager made."""
