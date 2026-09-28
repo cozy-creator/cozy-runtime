@@ -1178,9 +1178,7 @@ class Worker:
                 self.workspace,
                 self.authorize_workspace,
                 self.workspace_weights_ready,
-                allow_private_egress=machine_model_defaults.local_development(
-                    self, getattr(self.options.publication_authority, "origin", "")
-                ),
+                allow_private_egress=machine_model_defaults.local_development(self),
             )
             if self.workspace is not None
             else None

@@ -1,0 +1,1 @@
+A development machine is one whose own Hub, as its registration grant names it, is on loopback. Only such a machine pulls checkpoints from, accepts captured model origins at, and uploads retained outputs to private addresses its Hub hands it. The old test (a launcher bootstrap credential) was never true on a Host-launched machine.

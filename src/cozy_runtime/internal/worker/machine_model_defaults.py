@@ -31,10 +31,13 @@ def local_origin(origin: str) -> bool:
         return False
 
 
-def local_development(worker: Worker, origin: str) -> bool:
-    """A machine of a loopback Hub, for local development: it may reach the private
-    addresses that Hub hands it (checkpoint pulls, object uploads)."""
-    return bool(worker.config.bootstrap_credential) and local_origin(origin)
+def local_development(worker: Worker) -> bool:
+    """A machine whose own Hub, as its registration grant names it, is on loopback: a
+    development machine, which may reach the private addresses that Hub hands it
+    (checkpoint pulls, object uploads). A production Hub is never loopback, and a job
+    never names the grant."""
+    authority = worker.options.publication_authority
+    return authority is not None and local_origin(authority.origin)
 
 
 def _same_origin(a: str, b: str) -> bool:
@@ -117,7 +120,7 @@ def verify(
                 raise WorkspaceRefusal("captured Model default has conflicting availability")
             continue
         if not 1 <= len(rungs) <= 32 or not valid_origin(
-            row.get("public_origin", ""), local=bool(worker.config.bootstrap_credential)
+            row.get("public_origin", ""), local=local_development(worker)
         ):
             raise WorkspaceRefusal("captured Model default has no exact public origin or ladder")
         selectors = []
@@ -280,7 +283,7 @@ def materialize(
                             row["repository"] + "@" + manifest["digest"],
                             credential=credential(worker, row["public_origin"]),
                             allowed_hosts=worker.config.object_storage_hosts,
-                            allow_local=local_development(worker, row["public_origin"]),
+                            allow_local=local_development(worker),
                             streams=8,
                             cancellation=cancellation,
                             progress=progress,

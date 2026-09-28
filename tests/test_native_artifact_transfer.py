@@ -9,6 +9,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import machine_model_defaults
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
+from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_rpc import Service, WorkspaceRPC
@@ -371,15 +372,14 @@ def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Pa
         call.request.command_id, call.request.grant.url = 3, url
         refused = Production().WorkspaceNativeArtifactTransfer(call, Context())  # type: ignore[arg-type]
     assert refused.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED, refused
-    for origin, bootstrap, private in (
-        ("https://tensorhub.example", "b", False),
-        ("http://127.0.0.1:8819", "b", True),
-        ("http://127.0.0.1:8819", "", False),
+    # Only a machine whose own Hub (its grant's origin) is on loopback is a development one.
+    for grant, private in (
+        (PublicationAuthority("http://127.0.0.1:8819", "w", "t"), True),
+        (PublicationAuthority("https://tensorhub.example", "w", "t"), False),
+        (None, False),
     ):
-        worker = cast(
-            Worker, SimpleNamespace(config=SimpleNamespace(bootstrap_credential=bootstrap))
-        )
-        assert machine_model_defaults.local_development(worker, origin) is private, origin
+        worker = cast(Worker, SimpleNamespace(options=SimpleNamespace(publication_authority=grant)))
+        assert machine_model_defaults.local_development(worker) is private, grant
     call.claim.record_owner_id = "stranger"
     try:
         machine.WorkspaceNativeArtifactTransfer(call, Context())  # type: ignore[arg-type]
