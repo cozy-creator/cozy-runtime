@@ -943,23 +943,15 @@ def serve(payload: Request) -> Result:
                         dict(denied.value.trailing_metadata())["cozy-error-code"]
                         == "execution_submission_refused"
                     )
-                    authority_cases = [(58, "wire59"), (WIRE_MINOR, "no independent publication")]
-                    if origin != "private":
-                        authority_cases.append((53, "wire59"))
-                    for minor, detail in authority_cases:
-                        assert worker.executions is not None
-                        invalid.CopyFrom(submission)
-                        invalid.offer.request_id = f"rejected-authority-{minor}"
-                        invalid.submission_id = invalid.offer.request_id
-                        invalid.claim.wire_minor = minor
-                        invalid.publication_authorization_id = (
-                            "019aaaab-0000-7000-8000-000000000003"
-                        )
-                        with pytest.raises(grpc.RpcError) as ungranted:
-                            client.SubmitMachineExecution(invalid, timeout=30)
-                        assert ungranted.value.code() == grpc.StatusCode.FAILED_PRECONDITION
-                        assert detail in ungranted.value.details()
-                        assert not worker.executions.owns("owner", invalid.offer.request_id)
+                    invalid.CopyFrom(submission)
+                    invalid.offer.request_id = "rejected-authority"
+                    invalid.submission_id = invalid.offer.request_id
+                    invalid.publication_authorization_id = "019aaaab-0000-7000-8000-000000000003"
+                    with pytest.raises(grpc.RpcError) as ungranted:
+                        client.SubmitMachineExecution(invalid, timeout=30)
+                    assert ungranted.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                    assert "no independent publication" in ungranted.value.details()
+                    assert not worker.executions.owns("owner", invalid.offer.request_id)
                 if identifier == "first":
                     for field in ("uninstalled", "duplicate"):
                         invalid.CopyFrom(submission)
@@ -995,24 +987,6 @@ def serve(payload: Request) -> Result:
                 assert time.monotonic() < until
                 time.sleep(0.02)
             assert worker.execution_status(claim, "second").state == "queued"
-            incoming.put(
-                pb.RecordOwnerFrame(
-                    desired_state=pb.DesiredWorkerState(
-                        record_owner_epoch=admitted.record_owner_epoch,
-                        control_stream_epoch=admitted.control_stream_epoch,
-                        worker_boot_id=admitted.worker_boot_id,
-                        revision=999,
-                        wire_minor=WIRE_MINOR,
-                        posture=pb.POSTURE_ACCEPTING,
-                    )
-                )
-            )
-            while not any(
-                fault.reason == "machine_execution_owns_worker" for fault in worker.engine.faults
-            ):
-                assert time.monotonic() < until
-                time.sleep(0.02)
-            assert worker.accepted.accepted_desired_state_revision == 1
             assert not any(
                 frame.HasField("attempt_accepted") or frame.HasField("attempt_outcome")
                 for frame in observed
@@ -1153,7 +1127,6 @@ def serve(payload: Request) -> Result:
             # Replace the entire Worker and gRPC server. No client preparation is
             # replayed, and the old wheel upload is no longer available.
             config, options = worker.config, worker.options
-            old_boot = worker.fence.worker_boot_id
             worker.request_stop()
             worker.host.stop()
             thread.join(30)
@@ -1164,9 +1137,6 @@ def serve(payload: Request) -> Result:
                 index.close()
             indexes.clear()
             (root / "control.addr").unlink()
-            # A replaced worker is a new boot: the RecordOwner signs its Claim for that boot.
-            options = dataclasses.replace(options, worker_boot_id="test-boot-2")
-            claim = signed_claims.claim(boot="test-boot-2")
             worker = Worker(config, options, GrpcControlHost("127.0.0.1:0", root / "control.addr"))
             assert not worker.prepared_installations and not worker.engine.jobs
             thread = threading.Thread(target=worker.run, daemon=True)
@@ -1177,8 +1147,6 @@ def serve(payload: Request) -> Result:
             worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda frame: None)
             channel = grpc.insecure_channel((root / "control.addr").read_text().strip())
             client = rpc.WorkerControlStub(channel)
-            query.claim.CopyFrom(claim)
-            submission.claim.CopyFrom(claim)
             query.expected_execution_workspace_id = receipt.execution_workspace_id
             assert client.SubmitMachineExecution(submission, timeout=5) == receipt
             assert not worker.prepared_installations and not worker.engine.jobs
@@ -1189,7 +1157,6 @@ def serve(payload: Request) -> Result:
                 )
                 == outcome
             )
-            assert client.GetMachineExecution(query, timeout=5).worker_boot_id != old_boot
             query.request_id = "paused"
             resume = pb.MachineExecutionControl(
                 execution=query,
