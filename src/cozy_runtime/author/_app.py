@@ -40,23 +40,6 @@ class RegistrationError(ConformanceError):
     default_code = "registration"
 
 
-def _refuse_source_profiles(source_profiles: Mapping[str, str] | None) -> None:
-    """The retired declared-pair door (cr-077). HARD CUT: a package that still spells
-    `source_profiles=` gets one typed refusal, never a silent ignore or a shim.
-
-    Capability is the slot's class annotation — the publish-time slot facts (shape-only
-    tensor requirements + acceptable encodings) derive from the class's own factory. Selection
-    defaults live in `package.toml [bindings]`; the actual binding is dispatch."""
-    if source_profiles:
-        raise ConformanceError(
-            "source_profiles is retired: capability is the slot's class annotation "
-            "(slot facts derive from the class at publish); declare selection defaults "
-            "in package.toml [bindings] and bind at dispatch (--model / JobDirective)",
-            code="source_profiles_retired",
-            fields=sorted(source_profiles),
-        )
-
-
 @dataclass(slots=True)
 class Registration:
     """One registered callable plus the doors it opened. cr-003 reads `surface`."""
@@ -142,7 +125,6 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
-        source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         hidden: bool = False,
         internal: bool = False,
@@ -159,7 +141,6 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
-        source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         hidden: bool = False,
         internal: bool = False,
@@ -178,12 +159,7 @@ class App:
         `memoize=True` explicitly admits deterministic measurement results to the managed
         operation cache. Optional `memo_dependencies` and `memo_version` declare
         result-affecting helpers/resources/native builds just as for `invocable`.
-        Ordinary generation remains nonmemoized by default.
-
-        ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
-        and the publish-time slot facts are derived from the class itself. Passing it
-        refuses with the typed code ``source_profiles_retired``."""
-        _refuse_source_profiles(source_profiles)
+        Ordinary generation remains nonmemoized by default."""
         if type(memoize) is not bool:
             raise RegistrationError("entrypoint memoize must be a boolean")
         return self._register(
@@ -212,7 +188,6 @@ class App:
         publishes: bool = False,
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
-        source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         demand: Bound | None = None,
         internal: bool = False,
@@ -228,7 +203,6 @@ class App:
         publishes: bool = False,
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
-        source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         demand: Bound | None = None,
         internal: bool = False,
@@ -244,7 +218,6 @@ class App:
         publishes: bool = False,
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
-        source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         demand: Bound | None = None,
         internal: bool = False,
@@ -260,12 +233,7 @@ class App:
         `internal=True` retains this job for same-package managed child calls only.
         `accelerator=` is the job's own execution device: False runs it on a CPU machine
         even when its dependencies include torch, True requires an accelerator.
-
-        ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
-        and selection defaults live in ``package.toml [bindings]``. Passing it refuses with
-        the typed code ``source_profiles_retired``.
         """
-        _refuse_source_profiles(source_profiles)
         return self._register(
             "job",
             fn,

@@ -8,8 +8,7 @@ side does.
 `package.toml` is a DEFAULT, never a source of truth: it governs only when nothing else
 speaks (a bare-venv `run` with no `--model`). Production authority is the hub-side binding
 alone. ONE grammar, the slot path: `[bindings."<callable>.models.<param>"]` (model-code-fit
-§1, th-116). The class-keyed spelling `[bindings."<ModelClass>"]` is deleted and refuses
-typed, naming the paths it would have covered.
+§1, th-116).
 """
 
 from __future__ import annotations
@@ -79,14 +78,6 @@ def resolve(
     ladder = ((overrides or {}, "--model"), (deploy or {}, "deploy binding"))
     paths = {s.path for s in slots}
     for key in sorted(set(table) - paths):
-        covered = sorted(s.path for s in slots if s.class_key == key)
-        if covered:
-            raise ConformanceError(
-                f"[bindings.{key!r}] is the deleted class-keyed grammar; bind the slot path "
-                f"instead: {', '.join(covered)}",
-                code="binding_class_key_retired",
-                fields=[key, *covered],
-            )
         raise ConformanceError(
             f"package.toml binds {key}, which this release declares no slot for "
             f"(slots: {', '.join(sorted(paths))})",

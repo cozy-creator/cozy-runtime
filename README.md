@@ -370,8 +370,8 @@ Known-next calls can [prepare their models in the background](docs/model-prefetc
 with `prefetch(callee, models={...})` while another model runs, and a request done with its
 GPUs can [release them early](docs/gpu-release.md) with `ctx.release_gpus()`.
 The existing `package.toml [bindings."<callable>.models.<param>"]` remains the explicit local
-development binding; it is not copied into a package's published default. The retired `source_profiles=` decorator field refuses with the typed
-code `source_profiles_retired`. Each `WeightsOutput` declares only its name and new-byte ceiling;
+development binding; it is not copied into a package's published default.
+Each `WeightsOutput` declares only its name and new-byte ceiling;
 the produced CozyTensors header is the sole tensor-schema and encoding authority. The
 executor still receives only verified model capabilities, never the foreign source credential or
 destination authority. Multiple transformations are ordinary code inside one bounded job—there is

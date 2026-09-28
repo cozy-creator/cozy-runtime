@@ -46,8 +46,6 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 VALUE_FLAGS = (
     "--model",
-    "--lane",
-    "--adapter",
     "--seed",
     "--out",
     "--timeout",
@@ -57,7 +55,7 @@ VALUE_FLAGS = (
     "--tensorfs-root",
     "--capture",
 )
-BOOL_FLAGS = ("--offline", "--stream", "--strict-keys")
+BOOL_FLAGS = ("--stream",)
 
 #: THE EXECUTION-PATH OVERRIDE's reserved run keys (cr-125). `kernel.` is a dotted namespace
 #: claimed BEFORE the payload grammar sees a term, exactly as `--model` claims the weights

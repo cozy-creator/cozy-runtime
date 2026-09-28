@@ -201,7 +201,6 @@ def prefetch(
     if not answer.get("ok") and answer.get("code") not in (
         "model_prefetch_unsupported",
         "weights_host_unavailable",
-        "weights_operation_unknown",
         "unknown_durable_request",
     ):
         broker._check(answer, 0)
@@ -333,7 +332,6 @@ class _Broker:
         # A worker that predates the release declines it; the lease then ends with the root.
         if not answer.get("ok") and answer.get("code") not in (
             "weights_host_unavailable",
-            "weights_operation_unknown",
             "unknown_durable_request",
             "no_durable_exchange",
         ):

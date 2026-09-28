@@ -64,9 +64,7 @@ run/job flags:
   key=@/absolute/file   stage a local file only at a declared Asset field
   kernel.attention=<k>  DEV: pin one attention kernel for this run instead of the fastest
                         one this device and image support; refuses if it cannot serve
-  --offline             CAS-only; a miss is exit 8, never a fetch
   --timeout <dur>       attempt deadline (<n>ms|s|m|h)
-  --strict-keys         a local bind's unknown extra keys refuse instead of confessing
   --stream              typed deltas as NDJSON
 
 serve storage:

@@ -2,9 +2,7 @@
 
 Three planes, each driven for real:
 
-* the author surface — capability is the slot's class annotation and NOTHING else: the
-  retired `source_profiles` door refuses typed, and the interface slot grammar no
-  longer admits the field (hard cut, cr-077);
+* the author surface — capability is the slot's class annotation and NOTHING else;
 * the pod preparation plane — the hub-committed manifest + PackageInterface staged beside the
   set are the authoritative wiring, import-time derivation is a byte-compared cross-check,
   and NOTHING on this plane may load the derive machinery (the hard guard, proven red);
@@ -87,36 +85,6 @@ def _described(app: App) -> dict[str, object]:
         bindings={},
     )
     return package_interface.build(found)
-
-
-def test_source_profiles_refuse_typed_at_registration() -> None:
-    """cr-077 hard cut: the retired declared-pairs door refuses with ONE typed code on
-    both decorators, before any surface analysis runs."""
-    app = App()
-
-    with pytest.raises(ConformanceError) as on_entrypoint:
-
-        @app.entrypoint(source_profiles={"denoiser": "acme/sd-turbo/1.0.0/bf16"})
-        def generate(payload: Request, denoiser: Denoiser) -> Reply:
-            return Reply(text="no")
-
-    assert on_entrypoint.value.code == "source_profiles_retired"
-    assert on_entrypoint.value.fields == ("denoiser",)
-
-    with pytest.raises(ConformanceError) as on_job:
-
-        @app.job(source_profiles={"denoiser": "acme/sd-turbo/1.0.0/bf16"})
-        def train(payload: Request, denoiser: Denoiser) -> Reply:
-            return Reply(text="no")
-
-    assert on_job.value.code == "source_profiles_retired"
-
-    # An explicit empty mapping is the absent case, not a declaration: registers fine.
-    @app.entrypoint(source_profiles={})
-    def clean(payload: Request, denoiser: Denoiser) -> Reply:
-        return Reply(text="ok")
-
-    assert describe(app)
 
 
 def test_lane_words_are_not_selection_leaks() -> None:
