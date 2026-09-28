@@ -30,6 +30,7 @@ import re
 import secrets
 import signal
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -391,12 +392,24 @@ class ExecutorSupervision:
             os.chown(self.root, 0, self.executor_gid)
             self.root.chmod(0o710)
         self._scope_namespace = proctree.executor_scope_namespace(self.root)
+        lock = self.root / "worker.lock"
         try:
-            self._root_lease = proctree.acquire_worker_root_lease(self.root / "worker.lock")
+            self._root_lease = proctree.acquire_worker_root_lease(lock)
         except BlockingIOError as exc:
-            raise ExecutorGone(
-                f"worker root {self.root} is already supervised by another live worker"
-            ) from exc
+            holder = proctree.lease_holder(lock)
+            if holder is None or holder == os.getpid():
+                raise ExecutorGone(
+                    f"worker root {self.root} is already supervised by another live worker"
+                ) from exc
+            # The previous generation still holds this root while it exits; its Host waits
+            # for it and kills it if it stalls, so this wait ends (run 1486).
+            print(
+                f"[worker] boot: waiting for the previous worker (pid {holder}) "
+                f"to release {self.root}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._root_lease = proctree.acquire_worker_root_lease(lock, wait=True)
         # Rank 0 writes warm-call tensors before any request has an attempt spool.
         # Provision that subtree before dropping privileges; the worker root remains
         # traverse-only for the executor and cannot be created beneath by that UID.

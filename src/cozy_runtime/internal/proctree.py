@@ -1088,18 +1088,37 @@ def remove_executor_scope(scope: ExecutorScope) -> None:
         )
 
 
-def acquire_worker_root_lease(path: Path) -> WorkerRootLease:
-    """Acquire the process-lifetime single-worker lease for one worker root."""
+def acquire_worker_root_lease(path: Path, *, wait: bool = False) -> WorkerRootLease:
+    """Acquire the process-lifetime single-worker lease for one worker root; with `wait`,
+    block until its holder releases it."""
     _posix_only("acquire_worker_root_lease")
     import fcntl
 
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
     except BaseException:
         os.close(descriptor)
         raise
     return WorkerRootLease(descriptor)
+
+
+def lease_holder(path: Path) -> int | None:
+    """The pid holding a flock on `path`, from /proc/locks, else None."""
+    try:
+        inode = os.stat(path).st_ino
+        with open("/proc/locks", encoding="ascii") as locks:
+            for line in locks:
+                fields = line.split()
+                if (
+                    len(fields) >= 6
+                    and fields[1] == "FLOCK"
+                    and fields[5].rsplit(":", 1)[-1] == str(inode)
+                ):
+                    return int(fields[4])
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def release_worker_root_lease(lease: WorkerRootLease) -> None:

@@ -1,0 +1,1 @@
+A worker whose root is still held by another process (the previous generation, exiting) waits for it to release the root instead of failing boot with ExecutorGone (run 1486), and says which pid it waits on. The Host now waits for its Runtime to exit and kills one that stalls (tensorhub #871), so the wait ends. A root held in the same process is still refused.
