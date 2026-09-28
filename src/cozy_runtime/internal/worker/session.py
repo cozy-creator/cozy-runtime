@@ -1670,8 +1670,16 @@ class Worker:
                 f"executor epoch {executor.epoch} pid {executor.pid} exited",
             ):
                 return
-        if rebuild and not self.stop.is_set():
+        if self.stop.is_set():
+            return
+        if rebuild:
             self._executor_died(self._lane_of(placement_id), executor, placement_id)
+            return
+        # Withdrawn: nothing rebuilds it, and its process is reaped and proved gone now.
+        self.supervisor.spawn(
+            f"reap:{placement_id}:{executor.epoch}",
+            lambda _: self._reclaim_dead(placement_id, executor, "exited after withdrawal"),
+        )
 
     # ------------------------------------------------------------------ plumbing
 
@@ -6464,22 +6472,26 @@ class Worker:
         why = fault_text(exc)
         self.note("attempt", f"{attempt.request_id}#{attempt.attempt} faulted: {why}"[:400])
         executor = attempt.executor
-        if attempt.executions and executor is not None and attempt.slot is not None:
+        dispatched = bool(attempt.executions and executor is not None and attempt.slot)
+        if dispatched and executor is not None:
             self.engine.supervision_for(attempt).invalidate(
                 executor, f"attempt faulted: {why}"[:200]
             )
-        if attempt.state in ("outcome", "closed"):
-            return
-        if attempt.spool is not None:
-            grants.abort_outputs(attempt.spool)
-        self.terminate(
-            attempt,
-            self.engine.outcome,
-            STATUS.OUTCOME_STATUS_FAILED,
-            CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            ORIGIN.CAUSE_ORIGIN_WORKER,
-            why,
-        )
+        if attempt.state not in ("outcome", "closed"):
+            if attempt.spool is not None:
+                grants.abort_outputs(attempt.spool)
+            self.terminate(
+                attempt,
+                self.engine.outcome,
+                STATUS.OUTCOME_STATUS_FAILED,
+                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                ORIGIN.CAUSE_ORIGIN_WORKER,
+                why,
+            )
+        lane = self.lanes.by_id.get(attempt.lane_id)
+        if dispatched and lane is not None:
+            # What it left on the card is reclaimed now; only its successor waits.
+            self._rebuild_lane(lane, attempt.placement_id)
 
     def _guarded(self, attempt: AttemptRecord) -> None:
         """Start this attempt's guard, once: one per attempt, so escalation is single-flight."""

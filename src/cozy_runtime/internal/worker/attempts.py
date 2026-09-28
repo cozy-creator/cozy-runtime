@@ -3140,7 +3140,8 @@ class AttemptEngine:
         """An accepted-but-incomplete attempt ALWAYS produces a terminal, never silence."""
         if attempt.spool is not None:
             grants.abort_outputs(attempt.spool)
-        if attempt.executor is not None:
+        if attempt.executor is not None and attempt.executions:
+            # Only a dispatched attempt can have left the process mid-command.
             self.supervision_for(attempt).invalidate(attempt.executor, "executor invalidated")
         return self.outcome(
             attempt,

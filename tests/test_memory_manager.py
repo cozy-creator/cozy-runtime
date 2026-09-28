@@ -9,14 +9,18 @@ reclaim moves them exactly as NVML would.
 from __future__ import annotations
 
 import os
+import signal
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from cozy_runtime.internal import accel
+from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
 from cozy_runtime.internal.worker.memory import Watch
+from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
 from test_gpu_scheduler import Machine
 
@@ -201,3 +205,48 @@ def test_an_unmeasured_shape_is_bounded_only_by_a_larger_measured_one() -> None:
     assert bound(("s", "frames=500,width=512"), peaks) is None, "nothing measured covers it"
     assert bound(("s", "frames=121"), peaks) is None, "other axes describe another shape"
     assert bound(("t", "frames=121,width=512"), peaks) is None, "another entrypoint"
+
+
+@needs_executor
+def test_a_dispatched_attempt_that_faults_leaves_nothing_on_the_card(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception after dispatch poisons the executor it may have left mid-command; its
+    process is reclaimed at once, not whenever its placement is next granted."""
+    h3, _qwen = long_form(machine, monkeypatch)
+    worker = machine.worker
+    hosted, group = worker.hosted[h3], worker._lane_of(h3)
+    faulted = hosted.supervision.current
+    assert faulted is not None
+    row = group.row(h3)
+    attempt = AttemptRecord("shot", 1, b"", {}, placement_id=h3)
+    attempt.executor, attempt.executions, attempt.lane_id = faulted, 1, group.lane_id
+    attempt.slot = AttemptSlot(
+        supervision=hosted.supervision,
+        ledger=row.ledger,
+        chooser=row.chooser,
+        bindings=hosted.bindings,
+        failed_bindings={},
+        lane_id=group.lane_id,
+    )
+    attempt.state = "closed"
+    worker._attempt_faulted(attempt, RuntimeError("the post phase broke"))
+    assert hosted.supervision.current is None
+    assert not os.path.exists(f"/proc/{faulted.pid}"), "killed and reaped"
+
+
+@needs_executor
+def test_an_executor_that_exits_after_its_withdrawal_is_reaped(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h3, _qwen = long_form(machine, monkeypatch)
+    worker = machine.worker
+    hosted = worker.hosted[h3]
+    executor = hosted.supervision.current
+    assert executor is not None
+    hosted.placement.serving = pb.ServingState.SERVING_STATE_OFFLINE
+    os.kill(executor.pid, signal.SIGKILL)
+    bound = time.monotonic() + 60  # a hang bound on a loaded box, not a budget
+    while hosted.supervision.current is not None or os.path.exists(f"/proc/{executor.pid}"):
+        assert time.monotonic() < bound, [e.step for e in worker.activity][-5:]
+        time.sleep(0.05)
