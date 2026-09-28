@@ -926,6 +926,10 @@ class ComponentResidency:
                     self._clear(name, op.peak - self._allocated())
                 versions = self._versions(args, kwargs)
                 rng = self.torch.cuda.get_rng_state() if self.kind == "cuda" else None
+                # A call that may not fit keeps its modules' counters (a step index a
+                # forward advances), so running it again sees what the first run saw.
+                armed = not op.peak or op.peak - self._allocated() > self._allocatable()
+                counters = _counters(self.backend.components.get(name)) if armed else None
                 self.windows.append([0])
                 failure: Exception | None = None
                 try:
@@ -950,6 +954,8 @@ class ComponentResidency:
                     )
                 if rng is not None:
                     self.torch.cuda.set_rng_state(rng)
+                for (module, attribute), value in (counters or {}).items():
+                    setattr(module, attribute, value)
                 step = self._descend(name, ladder, op, asked)
                 if step is None:
                     raise self.torch.cuda.OutOfMemoryError(self._exhausted(name, op, asked, detail))
@@ -1538,6 +1544,19 @@ class ComponentResidency:
             "cap_bytes": self.cap,
             "kept_bytes": self.kept_bytes,
         }
+
+
+def _counters(root: object) -> dict[tuple[object, str], int | float]:
+    """Every public number a module tree holds, by (module, attribute)."""
+    modules = getattr(root, "modules", None)
+    if not callable(modules):
+        return {}
+    return {
+        (module, attribute): value
+        for module in modules()
+        for attribute, value in vars(module).items()
+        if not attribute.startswith("_") and type(value) in (int, float)
+    }
 
 
 #: The tile attributes of the two codec families diffusers ships.
