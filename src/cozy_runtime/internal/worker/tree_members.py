@@ -24,38 +24,34 @@ if TYPE_CHECKING:
 PROJECTION_PREFIX = "runtime.tree_member."
 
 
-def recorded_projection(db: Journal, row: Mapping[str, Any]) -> bool:
+def recorded_projection(db: Journal, row: workspace_byte_outputs.ByteOutput) -> bool:
     """An internal view needs its exact committed root and journaled recipient hold."""
-    body = row["manifest_body"]
+    body = row.manifest_body
     if (
-        row["slot"] != PROJECTION_PREFIX + hashlib.sha256(body).hexdigest()
-        or row["id"]
-        != workspace_byte_outputs.identity(
-            row["owner"], row["request"], row["ordinal"], row["spec"], row["slot"]
-        )
-        or row["state"] != "complete"
-        or row["native_service_id"]
+        row.slot != PROJECTION_PREFIX + hashlib.sha256(body).hexdigest()
+        or row.id
+        != workspace_byte_outputs.identity(row.owner, row.request, row.ordinal, row.spec, row.slot)
+        or row.state != "complete"
+        or row.native_service_id
     ):
         return False
     members = workspace_byte_outputs.manifest_members(body, byte_inputs.MAX_BYTES)
     if len(members) != 1 or members[0].path != "payload":
         return False
-    source = workspace_byte_outputs.reference(dict(row))
+    source = workspace_byte_outputs.reference(row)
     retention = pb.DerivedRetentionRequest(
         weights_transaction_id=source.producer_root_id,
         tensorfs_receipt_digest=source.receipt_digest,
-        retention_id=machine_models.byte_retention_id(
-            row["owner"], row["request"], row["slot"], source
-        ),
+        retention_id=machine_models.byte_retention_id(row.owner, row.request, row.slot, source),
     )
     binding = db.execute(
         "SELECT retention FROM execution_model_holds WHERE owner=? AND recipient=? AND path=?",
-        (row["owner"], row["request"], row["slot"]),
+        (row.owner, row.request, row.slot),
     ).fetchone()
     held = db.execute(
         "SELECT 1 FROM holds WHERE id=? AND owner=? AND transaction_id=? AND native_digest=? "
         "AND kind='tree' AND state='held'",
-        (retention.retention_id, row["owner"], source.producer_root_id, source.receipt_digest),
+        (retention.retention_id, row.owner, source.producer_root_id, source.receipt_digest),
     ).fetchone()
     return (
         binding is not None

@@ -149,7 +149,7 @@ def test_file_commit_manifest_with_additive_members_reserves_its_accepted_blob(
         canonical_json.encode({"entries": [entry]}),
         MAX_OUTPUT_BYTES,
     )
-    assert row["state"] == "intent" and row["content_bytes"] == len(data)
+    assert row.state == "intent" and row.content_bytes == len(data)
 
 
 def test_typed_model_result_with_additive_members_records_and_agrees(tmp_path: Path) -> None:

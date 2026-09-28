@@ -21,6 +21,7 @@ from cozy_runtime.internal.worker.workspace import (
     WorkspaceRefusal,
     same_ref,
 )
+from cozy_runtime.internal.worker.workspace_byte_outputs import ByteOutput
 from cozy_runtime.internal.worker.workspace_byte_outputs import reference as byte_reference
 from cozy_runtime.internal.worker.workspace_memo_rows import (
     Hold,
@@ -306,12 +307,13 @@ def _source(db: Journal, owner: str, call: pb.RecordOperationResultCall) -> Memo
     for output in outputs:
         if output.HasField("native_tree"):
             native = output.native_tree
-            original = db.execute(
+            original = db.one(
+                ByteOutput,
                 "SELECT * FROM byte_outputs WHERE owner=? AND request=? AND ordinal=? "
                 "AND slot=? AND state='complete'",
                 (owner, call.request_id, call.attempt_ordinal, output.output_id),
-            ).fetchone()
-            if original is None or byte_reference(dict(original)) != native:
+            )
+            if original is None or byte_reference(original) != native:
                 raise _Uncacheable("memo byte output has no exact original native receipt")
             holds.append(
                 Hold(

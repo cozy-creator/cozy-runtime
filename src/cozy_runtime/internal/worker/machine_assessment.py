@@ -12,7 +12,7 @@ from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.internal.worker import machine_models, workspace_byte_outputs
 from cozy_runtime.internal.worker.machine_publication import PublicationRefusal
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
-from cozy_runtime.internal.worker.workspace_byte_outputs import Blob, FileMember
+from cozy_runtime.internal.worker.workspace_byte_outputs import Blob, ByteOutput, FileMember
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -246,13 +246,15 @@ def verify(
                         and row.get("length", 0) > 0
                     ]
                     _check(len(matched) == 1)
-                    output = db.execute(
+                    output = db.one(
+                        ByteOutput,
                         "SELECT * FROM byte_outputs WHERE owner=? "
                         "AND request=? AND ordinal=? AND slot=?",
                         (owner, request, execution["ordinal"], matched[0]["output_id"]),
-                    ).fetchone()
-                    _check(output is not None)
-                    byte_outputs.append((dict(output), matched[0]))
+                    )
+                    if output is None:
+                        raise PublicationRefusal("assessment.execution_binding_mismatch")
+                    byte_outputs.append((output, matched[0]))
                 expected_capture = {
                     "components": plan.get("capture", []),
                     "steps": plan.get("capture_steps", []),
@@ -264,19 +266,21 @@ def verify(
                         and observation.get("capture", {}).get("content_digest")
                         == arm["captures"][index]
                     )
-                    output = db.execute(
+                    output = db.one(
+                        ByteOutput,
                         "SELECT * FROM byte_outputs WHERE owner=? "
                         "AND request=? AND ordinal=? AND slot='runtime.capture'",
                         (owner, request, execution["ordinal"]),
-                    ).fetchone()
-                    _check(output is not None)
-                    byte_outputs.append((dict(output), None))
+                    )
+                    if output is None:
+                        raise PublicationRefusal("assessment.execution_binding_mismatch")
+                    byte_outputs.append((output, None))
                 else:
                     _check(not intent.get("capture") and not observation.get("capture"))
             for output, claimed in byte_outputs:
                 source = workspace_byte_outputs.reference(output)
                 retained = machine_models.retain_bytes(
-                    workspace, owner, recipient, f"render.{request}.{output['slot']}", source
+                    workspace, owner, recipient, f"render.{request}.{output.slot}", source
                 )
                 with workspace_byte_outputs.leased(
                     workspace,

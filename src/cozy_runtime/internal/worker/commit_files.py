@@ -58,10 +58,10 @@ def prepare(
             (owner, call.parent_request_id, call.parent_attempt_ordinal),
         ).fetchone()
         budget = output_budget.intermediate(documents.read(parent["invocation"], pb.InvocationSpec))
-        if detail := unsupported_detail(native["accepted"]):
+        if detail := unsupported_detail(native.accepted):
             # Dropping an unknown option could write a different output; only this call fails.
             raise UnsupportedCommitRequest(detail)
-        request = msgspec.json.decode(native["accepted"], type=source_interfaces.CommitFile)
+        request = msgspec.json.decode(native.accepted, type=source_interfaces.CommitFile)
         tail = request.slot.removeprefix("file/")
         if (
             spool_root is None
@@ -86,7 +86,7 @@ def prepare(
         total = db.execute(
             "SELECT coalesce(sum(content_bytes),0) FROM byte_outputs "
             "WHERE owner=? AND request=? AND ordinal=? AND slot LIKE 'runtime.commit_file.%'",
-            (owner, row["request"], row["ordinal"]),
+            (owner, row.request, row.ordinal),
         ).fetchone()[0]
         if total > budget:
             raise WorkspaceRefusal("file commit exceeds its parent output byte budget")
@@ -97,7 +97,7 @@ def prepare(
         )
     return Commit(
         request=request,
-        view_owner=row["id"],
+        view_owner=row.id,
         spool=str(spool),
         basename=f"file-{tail}",
         staging=str(workspace.directory / "byte-staging"),

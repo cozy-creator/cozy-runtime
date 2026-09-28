@@ -43,10 +43,10 @@ def _access(db: Journal, owner: str, parent: str, artifact: SourceArtifact) -> s
 
 def _source(db: Journal, owner: str, command: pb.NativeSourceCommand) -> tuple[SourceArtifact, str]:
     call = byte_outputs.native_call(db, owner, command)
-    if call["operation"] != "source_files":
+    if call.operation != "source_files":
         raise WorkspaceRefusal("source projection requires its own native operation")
-    artifact = msgspec.json.decode(call["accepted"], type=SourceFiles).source
-    return artifact, _access(db, owner, call["parent_request"], artifact)
+    artifact = msgspec.json.decode(call.accepted, type=SourceFiles).source
+    return artifact, _access(db, owner, call.parent_request, artifact)
 
 
 def prepare(
@@ -89,10 +89,10 @@ def prepare(
         )
         return View(
             source_owner=access,
-            view_owner=row["id"],
+            view_owner=row.id,
             manifest=manifest,
             receipt_digest=artifact.tensorfs_receipt_digest,
-            view_bytes=row["content_bytes"],
+            view_bytes=row.content_bytes,
         )
 
 

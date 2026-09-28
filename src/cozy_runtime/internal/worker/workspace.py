@@ -16,12 +16,14 @@ import re
 import sqlite3
 import threading
 import weakref
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, weights_sink, weights_writer
@@ -90,6 +92,15 @@ class Journal(sqlite3.Connection):
     mutex: threading.Lock
     guard: Callable[[], None]
 
+    def one[T](self, into: type[T], sql: str, parameters: Sequence[object] = ()) -> T | None:
+        """The row `sql` selects, decoded once into `into`; None when it selects none."""
+        row = self.execute(sql, parameters).fetchone()
+        return None if row is None else _decode_row(row, into)
+
+    def all[T](self, into: type[T], sql: str, parameters: Sequence[object] = ()) -> list[T]:
+        """Every row `sql` selects, each decoded once into `into`."""
+        return [_decode_row(row, into) for row in self.execute(sql, parameters).fetchall()]
+
     def native[T](self, operation: Callable[[], T]) -> T:
         """Native owns object/GC locking; no workspace transaction spans its IO."""
         if self.in_transaction:
@@ -104,6 +115,13 @@ class Journal(sqlite3.Connection):
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             self.lock_fd, self.guard = lock_fd, guard
             guard()
+
+
+def _decode_row[T](row: sqlite3.Row, into: type[T]) -> T:
+    try:
+        return msgspec.convert(dict(zip(row.keys(), row, strict=True)), into, strict=True)
+    except msgspec.ValidationError as exc:
+        raise WorkspaceRefusal(f"journal row is not a {into.__name__}: {exc}") from exc
 
 
 _LOG = logging.getLogger(__name__)
@@ -736,12 +754,13 @@ class Workspace:
             if row["state"] == "released" or row["outcome"] == raw:
                 return
             from .tree_members import PROJECTION_PREFIX, recorded_projection
-            from .workspace_byte_outputs import recorded_native, reference
+            from .workspace_byte_outputs import ByteOutput, recorded_native, reference
 
-            output_rows = db.execute(
+            output_rows = db.all(
+                ByteOutput,
                 "SELECT * FROM byte_outputs WHERE owner=? AND request=? AND ordinal=?",
                 (row["owner"], outcome.request_id, outcome.attempt_ordinal),
-            ).fetchall()
+            )
             if body.status == pb.OUTCOME_STATUS_SUCCEEDED:
                 native = {
                     item.output_id: item.native_tree
@@ -751,27 +770,24 @@ class Workspace:
                 returned_rows = []
                 for output in output_rows:
                     if (
-                        output["slot"] not in native
-                        and output["slot"].startswith(PROJECTION_PREFIX)
+                        output.slot not in native
+                        and output.slot.startswith(PROJECTION_PREFIX)
                         and recorded_projection(db, output)
                     ):
                         continue
-                    if output["native_service_id"]:
+                    if output.native_service_id:
                         if not recorded_native(db, output, complete=True):
                             raise WorkspaceRefusal(
                                 "terminal source view has no completed native call"
                             )
                     else:
                         returned_rows.append(output)
-                if set(native) != {output["slot"] for output in returned_rows}:
+                if set(native) != {output.slot for output in returned_rows}:
                     raise WorkspaceRefusal(
                         "terminal native byte outputs do not match completed intents"
                     )
                 for output in returned_rows:
-                    if (
-                        output["state"] != "complete"
-                        or reference(dict(output)) != native[output["slot"]]
-                    ):
+                    if output.state != "complete" or reference(output) != native[output.slot]:
                         raise WorkspaceRefusal(
                             "terminal native byte output differs from its receipt"
                         )
