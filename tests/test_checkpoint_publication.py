@@ -606,6 +606,9 @@ def test_upload_reports_held_bytes_then_publication_with_stage_timings(
     hub.finalize_seconds = 1.5
     call = settle(staged, effects)
     assert not call.safe_code and call.result
+    # The parent's poll reads the call's plan; an effect's frozen plan names no kind or
+    # result schema (production run 1511 refused `child_call_refused` here).
+    assert call.plan().result_schema is None
     progress = staged.progress()
     upload = [event for event in progress if event.get("stage") == "Uploading checkpoint"]
     assert upload[0] == {"stage": "Uploading checkpoint", "step_ms": 0.0}

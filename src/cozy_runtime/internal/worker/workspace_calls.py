@@ -31,9 +31,10 @@ CREATE TABLE execution_calls (
 
 
 class CallPlan(msgspec.Struct, frozen=True):
-    """A job or serving call's frozen plan (`execution_calls.prepared`)."""
+    """A call's frozen plan (`execution_calls.prepared`). An effect call freezes its own
+    plan there, which names none of these fields."""
 
-    kind: str
+    kind: str = ""
     installation_id: str = ""
     entrypoint: str = ""
     parent_attempt: int = 0
