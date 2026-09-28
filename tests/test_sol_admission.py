@@ -7,6 +7,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
+import msgspec
 import pytest
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
@@ -73,16 +74,16 @@ def test_sparse_approximation_is_reported_after_separate_arithmetic_control(
     entry = _control(monkeypatch)
     device = DeviceFacts(kind="cpu", name="CPU control", sm=0, driver="", configuration="", index=0)
     report = attention._probe_sol(entry, device, *_inputs())
-    assert report["arithmetic_rel_l2_to_fp32"] < 0.02
-    assert report["sparse_policy_rel_l2_to_fp32"] > 0.2
-    assert report["sparse_error_meaning"] == "approximation_only_not_model_quality"
-    assert report["calls"] == dict(sparse=2, dense_step=0, dense_path=0, dense_prefix=2)
+    assert report.rel_l2_by_rows["all_keys"] < 0.02
+    assert report.sparse_policy_rel_l2_to_fp32 > 0.2
+    assert report.calls == dict(sparse=2, dense_step=0, dense_path=0, dense_prefix=2)
     assert _ACTIVE_LAYOUT.get() is None
     assert attention_sol._SITE.get() is None
     applied = attention.Swap(replace(entry, admission=report), ()).apply()
-    assert applied.document()["admission"]["sol-attn"] == report
+    document = msgspec.to_builtins(report)
+    assert applied.document()["admission"] == {"sol-attn": document}
     merged = attention.merge({"model": replace(applied, hosts={"dit": {"sol-attn": 1}}).document()})
-    assert merged is not None and merged["admission"]["model"]["sol-attn"] == report
+    assert merged is not None and merged["admission"] == {"model": {"sol-attn": document}}
 
 
 def test_broken_native_all_keys_control_refuses_before_prefix_can_hide_it(
@@ -113,7 +114,5 @@ def test_native_sol_admission_separates_all_keys_from_sparse_policy() -> None:
     )
     with torch.no_grad():
         report = attention.probe(entry, device)
-    assert report is not None
-    assert report["arithmetic_control"] == "native_all_keys_selected"
-    assert report["arithmetic_rel_l2_to_fp32"] <= 0.02
-    assert report["repeat_equal"] and report["inputs_unchanged"]
+    assert isinstance(report, attention.SolProbe)
+    assert report.rel_l2_by_rows["all_keys"] <= 0.02

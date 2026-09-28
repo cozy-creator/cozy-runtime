@@ -34,8 +34,11 @@ from types import MethodType
 from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
+from cozy_runtime.author._observations import Scalar
 from cozy_runtime.internal import config, kernel_cache, kernel_compile
 from cozy_runtime.internal.attention_ulysses import Local
+
+# Tensors, devices, modules and the dense reference are `Any`: torch is not in the check venv.
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +54,7 @@ _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", defau
 _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
     "cozy_sol_rank_counts", default=None
 )
-_KERNEL_ROWS: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+_KERNEL_ROWS: ContextVar[list[dict[str, Scalar]] | None] = ContextVar(
     "cozy_sol_kernel_rows", default=None
 )
 
@@ -60,7 +63,7 @@ _KERNEL_ROWS: ContextVar[list[dict[str, Any]] | None] = ContextVar(
 def observing(
     *,
     ranks: dict[int, dict[str, int]] | None = None,
-    kernels: list[dict[str, Any]] | None = None,
+    kernels: list[dict[str, Scalar]] | None = None,
 ) -> Iterator[dict[str, int]]:
     """Count successful calls in this request, restoring any outer observation. `kernels`
     receives one row per kernel this request started building or resolved."""
@@ -76,7 +79,7 @@ def observing(
         _KERNEL_ROWS.reset(kernel_token)
 
 
-def _kernel_row(row: dict[str, Any]) -> None:
+def _kernel_row(row: dict[str, Scalar]) -> None:
     rows = _KERNEL_ROWS.get()
     if rows is not None:
         rows.append(row)
@@ -250,9 +253,8 @@ class _Builder:
     ms: float = 0.0
     detail: str = ""
 
-    def document(self) -> dict[str, Any]:
-        """Flat scalar fields, the only shape an observation row carries. `builder_exit` is
-        None while the builder still runs."""
+    def document(self) -> dict[str, Scalar]:
+        """The observation row's builder fields; `builder_exit` is None while it runs."""
         return {
             "builder_step": self.step,
             "builder_exit": self.exit_status,
@@ -384,8 +386,8 @@ def _spawn(
 
 
 def _row(
-    wanted: tuple[int, int], key: str, source: str, started: float, **extra: Any
-) -> dict[str, Any]:
+    wanted: tuple[int, int], key: str, source: str, started: float, **extra: Scalar
+) -> dict[str, Scalar]:
     builder = _BUILDERS.get(wanted)
     # `source` becomes the observation's value; the key digest names the split count too.
     return {

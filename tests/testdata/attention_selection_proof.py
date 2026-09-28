@@ -95,9 +95,10 @@ def _selfcheck(out: dict[str, Any], device: DeviceFacts) -> None:
         candidate = attention.BY_NAME[name]
         if candidate.min_sm and device.sm < candidate.min_sm:
             continue
-        admission = attention._resolve(candidate, device).admission or {}
-        measured[name] = admission["rel_l2_to_exact"]
-        floors[name] = admission["rounding_floor"]
+        admission = attention._resolve(candidate, device).admission
+        assert isinstance(admission, attention.Probe)
+        measured[name] = admission.rel_l2_to_exact
+        floors[name] = admission.rounding_floor
     out["selfcheck_rel_l2"] = measured
     out["selfcheck_floor"] = floors
     out["selfcheck_budgets"] = {
@@ -217,12 +218,14 @@ def _fp8(device: DeviceFacts, dit: WanAttention) -> dict[str, Any]:
     except attention.AttentionRefusal as exc:
         return {"code": exc.code, "detail": str(exc)[:300]}
     applied = attention.install(ready, {"dit": dit}, "flash-attn3-fp8")
+    admission = ready[0].admission
+    assert isinstance(admission, attention.Probe)
     hidden = torch.randn(1, 64, 1024, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
         result = dit(hidden)
     return {
         "code": "",
-        "rel_l2": (ready[0].admission or {})["rel_l2_to_exact"],
+        "rel_l2": admission.rel_l2_to_exact,
         "backend": _backends({"dit": dit})["dit"][0],
         "line": applied.line(),
         "forward": {"shape": list(result.shape), "dtype": str(result.dtype)},

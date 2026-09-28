@@ -112,8 +112,8 @@ over four row groups, each gated alone so a localized fault cannot average out: 
 both rows at every multiple of 16 (every tile edge). Non-finite output fails first; then
 the worst group's rel L2 against the kernel's
 declared budget: past 1 it is `attention_kernel_wrong`, otherwise
-`attention_kernel_out_of_budget` (FA3 FP8 at H3 length). `attention.capabilities`
-is the per-rank document of every kernel: status, version/artifact and probe.
+`attention_kernel_out_of_budget` (FA3 FP8 at H3 length). Each rank's execution evidence
+carries its probe of every kernel it served and of every kernel its probe refused.
 
 `cozy-runtime attention-qualify --degree 4 --out report.json` spawns one process per
 GPU and, per kernel, runs the registered backend at degree 4 on identical global

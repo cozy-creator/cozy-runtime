@@ -28,6 +28,27 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import msgspec
+
+
+class ProbeRow(msgspec.Struct, frozen=True):
+    """One kernel's latest numeric probe in this process (`probe` above)."""
+
+    kernel: str
+    status: str
+    source: str
+    shape: list[int]
+    rel_l2_by_rows: dict[str, float]
+    budget: float
+    budget_state: str
+
+
+class Probed(msgspec.Struct, frozen=True, omit_defaults=True):
+    """A rank's probes of the kernels it served, and of every kernel its probe refused."""
+
+    probes: list[ProbeRow] = []
+    skipped: list[ProbeRow] = []
+
 
 def identity(torch: Any, cuda: bool, local: int, sealed: Sequence[str]) -> dict[str, Any]:
     """This process's `pid`, host `ordinal`, `uuid` and `arch` for device `local` of its seal."""
@@ -47,9 +68,14 @@ def attention(
     requested: str = "",
     observed: str = "",
     impl: str = "",
-    probed: Mapping[str, Any] | None = None,
+    probed: Probed | None = None,
 ) -> dict[str, Any]:
-    return {"requested": requested, "observed": observed, "impl": impl, **(probed or {})}
+    return {
+        "requested": requested,
+        "observed": observed,
+        "impl": impl,
+        **(msgspec.to_builtins(probed) if probed is not None else {}),
+    }
 
 
 def observed(hosts: Mapping[str, Mapping[str, int]]) -> str:

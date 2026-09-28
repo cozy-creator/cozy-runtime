@@ -178,17 +178,13 @@ def test_a_kernel_the_probe_refuses_is_evidence_with_its_measurement() -> None:
         with pytest.raises(attention.AttentionRefusal) as refused:
             attention._resolve(candidate, DeviceFacts("cpu", "CPU", 0, "", "", 0))
         assert refused.value.code == "attention_kernel_out_of_budget"
-        [row] = [r for r in attention.evidence(())["skipped"] if r["kernel"] == "off-by-five"]
-        assert row["status"] == "attention_kernel_out_of_budget"
-        assert (row["source"], row["budget"], row["budget_state"]) == (
-            "prepare",
-            1e-2,
-            "calibrated",
-        )
-        assert row["shape"] == list(attention.PROBE_SHORT)
-        assert set(row["rel_l2_by_rows"]) == {"sampled", "first", "last", "tile_edges"}
-        assert min(row["rel_l2_by_rows"].values()) == pytest.approx(0.05, abs=5e-3)
-        assert "off-by-five" not in str(attention.evidence(("off-by-five",)).get("skipped"))
+        [row] = [r for r in attention.evidence(()).skipped if r.kernel == "off-by-five"]
+        assert row.status == "attention_kernel_out_of_budget"
+        assert (row.source, row.budget, row.budget_state) == ("prepare", 1e-2, "calibrated")
+        assert row.shape == list(attention.PROBE_SHORT)
+        assert set(row.rel_l2_by_rows) == {"sampled", "first", "last", "tile_edges"}
+        assert min(row.rel_l2_by_rows.values()) == pytest.approx(0.05, abs=5e-3)
+        assert "off-by-five" not in [r.kernel for r in attention.evidence(("off-by-five",)).skipped]
     finally:
         attention._MEASURED.pop("off-by-five", None)
 

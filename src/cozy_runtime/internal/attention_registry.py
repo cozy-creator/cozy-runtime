@@ -3,6 +3,8 @@
 from collections.abc import Callable, Sequence
 from typing import Any
 
+# Diffusers' backend functions and enum members are `Any`: diffusers is not in the check venv.
+
 
 def register(
     name: str,

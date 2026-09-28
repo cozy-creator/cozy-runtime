@@ -14,9 +14,22 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 from cozy_runtime.internal.attention_registry import register
+
+# Tensors, process groups, parallel configs and Diffusers' backend members are `Any`: neither
+# torch nor diffusers is installed in the check venv.
+
+
+class Options(TypedDict):
+    """The keyword options every `Local.forward` takes; `attn_mask` is a tensor or None."""
+
+    attn_mask: Any
+    dropout_p: float
+    is_causal: bool
+    scale: float | None
+    enable_gqa: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,13 +88,13 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Any]:
     ) -> Any:
         if return_lse:
             raise ValueError(f"{backend} does not return log-sum-exp")
-        options = {
-            "attn_mask": attn_mask,
-            "dropout_p": dropout_p,
-            "is_causal": is_causal,
-            "scale": scale,
-            "enable_gqa": enable_gqa,
-        }
+        options = Options(
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
         if _parallel_config is None:
             return _call(backend, local, query, key, value, options)
         if not local.head_local:
@@ -101,7 +114,7 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Any]:
     return attention
 
 
-def _call(backend: str, local: Local, query: Any, key: Any, value: Any, options: Any) -> Any:
+def _call(backend: str, local: Local, query: Any, key: Any, value: Any, options: Options) -> Any:
     import torch
 
     seen = _SEEN.get()

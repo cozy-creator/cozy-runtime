@@ -12,33 +12,69 @@ requires an explicit backend choice.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from importlib import import_module, metadata
 from itertools import count
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, NotRequired, TypedDict
 from urllib.parse import parse_qs, urlsplit
+
+import msgspec
 
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._attention_scope import _EXPECTED
 from cozy_runtime.author._numeric import within, worst_of
-from cozy_runtime.internal import attention_sol, attention_ulysses, kernel_site
+from cozy_runtime.internal import attention_sol, attention_ulysses, execution_evidence, kernel_site
 from cozy_runtime.internal import attention_upstream as upstream
-from cozy_runtime.internal.attention_ulysses import Local
+from cozy_runtime.internal.attention_ulysses import Local, Options
 from cozy_runtime.internal.encoding import DeviceFacts
+
+# Tensors, torch modules and Diffusers' registry, backend members and processors are `Any`:
+# neither torch nor diffusers is installed in the check venv.
+
+
+class Measured(msgspec.Struct, frozen=True, kw_only=True):
+    """A numeric probe's arithmetic check of one kernel on this device, never a model-quality
+    qualification. A refusal carries what was measured before it refused."""
+
+    shape: list[int]
+    rel_l2_by_rows: dict[str, float]
+    rel_l2_max: float
+
+
+class Probe(Measured, frozen=True, kw_only=True, omit_defaults=True):
+    """Every row group held to exact float64 attention (`probe`)."""
+
+    checked_rows: int
+    rel_l2_to_exact: float
+    rounding_floor: float
+    impl: str
+    logit_std: float
+    #: "uncalibrated" where no probe has measured `rel_l2_max` on this SM yet.
+    budget: str = ""
+
+
+class SolProbe(Measured, frozen=True, kw_only=True):
+    """Sol's native all-keys arithmetic control (`rel_l2_by_rows["all_keys"]`), and its sparse
+    policy's approximation error to FP32, which is not model quality."""
+
+    sparse_policy_rel_l2_to_fp32: float
+    protected_prefix: int
+    padding: int
+    calls: dict[str, int]
 
 
 class AttentionRefusal(RuntimeError):
     """An unsupported explicit selection or unavailable attention implementation."""
 
-    def __init__(self, code: str, detail: str, measured: Mapping[str, Any] | None = None) -> None:
+    def __init__(self, code: str, detail: str, measured: Measured | None = None) -> None:
         super().__init__(detail)
         self.code = code
         #: the probe's measurement behind a numeric refusal
@@ -277,9 +313,9 @@ class Ready:
     member: Any
     location: str = ""
     """The selected local snapshot variant directory; empty for ordinary modules."""
-    admission: dict[str, Any] | None = None
-    """Retained arithmetic/contract checks; never a model-quality qualification."""
-    artifact: dict[str, Any] | None = None
+    admission: Measured | None = None
+    #: The installed bytes: flat string fields, as an observation row carries them.
+    artifact: dict[str, str] | None = None
 
     @property
     def name(self) -> str:
@@ -335,22 +371,42 @@ def _covers(declared: str, sm: int) -> bool:
     return suffix != "a" and major == sm // 10 and minor <= sm % 10
 
 
-def _declared_archs(variant: Path) -> list[str]:
-    """The architectures a `kernels` build variant says it carries, from its own metadata.
+class _Backend(msgspec.Struct, frozen=True):
+    archs: list[str] = []
 
-    `build/<variant>/metadata.json` is written by kernel-builder beside the `.so` it describes,
-    so this is the artifact's statement about itself and not a second copy of it. An empty
-    answer is a refusal at the call site, never an admission.
-    """
+
+class _Build(msgspec.Struct, frozen=True):
+    """`build/<variant>/metadata.json`, written by kernel-builder beside the `.so` it describes:
+    the artifact's statement about itself. No `backend.archs` is a refusal at the call site,
+    never an admission."""
+
+    id: str = ""
+    backend: _Backend = _Backend()
+
+
+def _build(variant: Path) -> tuple[bytes, _Build]:
+    path = variant / "metadata.json"
     try:
-        document = json.loads((variant / "metadata.json").read_text())
-        archs = document["backend"]["archs"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return []
-    return [str(arch) for arch in archs] if isinstance(archs, list) else []
+        body = path.read_bytes()
+        return body, msgspec.json.decode(body, type=_Build)
+    except (OSError, msgspec.DecodeError) as exc:
+        raise AttentionRefusal(
+            "attention_kernel_unsupported", f"{path} does not decode: {exc}"
+        ) from exc
 
 
-def _artifact(distribution: str) -> dict[str, Any]:
+class _Archive(msgspec.Struct, frozen=True):
+    hashes: dict[str, str] = {}
+
+
+class _DirectUrl(msgspec.Struct, frozen=True):
+    """PEP 610 `direct_url.json`, as far as it names the installed wheel's digest."""
+
+    url: str
+    archive_info: _Archive = _Archive()
+
+
+def _artifact(distribution: str) -> dict[str, str]:
     """Identify installed bytes using the wheel inventory already retained by the closure."""
     installed = metadata.distribution(distribution)
     record = installed.read_text("RECORD")
@@ -358,7 +414,7 @@ def _artifact(distribution: str) -> dict[str, Any]:
         raise AttentionRefusal(
             "attention_kernel_absent", f"{distribution} has no installed wheel RECORD"
         )
-    result: dict[str, Any] = {
+    result = {
         "distribution": installed.metadata["Name"],
         "version": installed.version,
         "record_digest": "sha256:" + hashlib.sha256(record.encode()).hexdigest(),
@@ -366,22 +422,18 @@ def _artifact(distribution: str) -> dict[str, Any]:
     direct = installed.read_text("direct_url.json")
     if direct:
         try:
-            origin = json.loads(direct)
-            archive = origin.get("archive_info", {})
-            digest = archive.get("hashes", {}).get("sha256")
-            if not digest and str(archive.get("hash", "")).startswith("sha256="):
-                digest = archive["hash"].removeprefix("sha256=")
-            if not digest:
-                # uv can retain a hash-qualified wheel URL with empty archive_info.
-                digest = parse_qs(urlsplit(origin.get("url", "")).fragment).get("sha256", [""])[0]
-            if (
-                isinstance(digest, str)
-                and len(digest) == 64
-                and all(char in "0123456789abcdef" for char in digest.lower())
-            ):
-                result["wheel_digest"] = "sha256:" + digest.lower()
-        except (ValueError, TypeError, AttributeError):
-            pass
+            origin = msgspec.json.decode(direct, type=_DirectUrl)
+        except msgspec.DecodeError as exc:
+            raise AttentionRefusal(
+                "attention_kernel_absent", f"{distribution}'s direct_url.json: {exc}"
+            ) from exc
+        # uv can retain a hash-qualified wheel URL with empty archive_info.
+        digest = (
+            origin.archive_info.hashes.get("sha256")
+            or parse_qs(urlsplit(origin.url).fragment).get("sha256", [""])[0]
+        )
+        if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest.lower()):
+            result["wheel_digest"] = "sha256:" + digest.lower()
     urls = installed.metadata.get_all("Project-URL") or []
     for url in urls:
         label, _, value = url.partition(",")
@@ -396,7 +448,7 @@ def _snapshot_archs(candidate: Candidate) -> dict[str, list[str]]:
     if builds is None or not builds.is_dir():
         return {}
     return {
-        variant.name: _declared_archs(variant)
+        variant.name: _build(variant)[1].backend.archs
         for variant in sorted(builds.iterdir())
         if (variant / "metadata.json").is_file()
     }
@@ -446,8 +498,11 @@ def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: Devic
     )
 
 
-def _load_snapshot(candidate: Candidate, loader: Any, device: DeviceFacts) -> str:
-    """Load the image's `kernels` snapshot locally (never fetched) and bind its forward."""
+def _load_snapshot(
+    candidate: Candidate, loader: ModuleType, device: DeviceFacts
+) -> tuple[str, dict[str, str]]:
+    """Load the image's `kernels` snapshot locally (never fetched), bind its forward, and name
+    the variant it loaded from and that variant's metadata."""
     location = kernel_site.snapshot(candidate.snapshot)
     builds = location / "build"
     if not builds.is_dir() or not any((p / "metadata.json").is_file() for p in builds.iterdir()):
@@ -475,13 +530,18 @@ def _load_snapshot(candidate: Candidate, loader: Any, device: DeviceFacts) -> st
             f"{candidate.name} resolved outside its selected snapshot: {module_path}; "
             f"expected a variant under {builds}",
         )
-    _admit_arch(candidate, {loaded.name: _declared_archs(loaded)}, device)
+    body, build = _build(loaded)
+    _admit_arch(candidate, {loaded.name: build.backend.archs}, device)
     if getattr(module, "flash_attn_func", None) is None:
         raise AttentionRefusal(
             "attention_kernel_absent", f"{candidate.name} does not expose flash_attn_func"
         )
     upstream.bind_fa3(module, loaded.name)
-    return str(loaded)
+    return str(loaded), {
+        "snapshot": loaded.name,
+        "id": build.id,
+        "metadata_digest": "sha256:" + hashlib.sha256(body).hexdigest(),
+    }
 
 
 #: The probe: one H3 rank's post-exchange document at 10 s (a measured packed length, odd so
@@ -517,7 +577,7 @@ _PROBE_SEEDS = count(0x5A6E)
 
 def probe(
     entry: Ready, device: DeviceFacts, shape: tuple[int, int, int, int] | None = None
-) -> dict[str, Any]:
+) -> Measured:
     """PROVE the served function computes attention on THIS device, or refuse it by name.
 
     `shape` overrides the probe geometry (default `PROBE` on CUDA and `PROBE_SHORT` on CPU,
@@ -545,13 +605,7 @@ def probe(
         with torch.no_grad(), current:
             return _probe_sol(entry, device, query, key, value)
     query, key, value = probe_inputs(shape or (PROBE if cuda else PROBE_SHORT), seed, target, dtype)
-    options = {
-        "attn_mask": None,
-        "dropout_p": 0.0,
-        "is_causal": False,
-        "scale": None,
-        "enable_gqa": False,
-    }
+    options = Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False)
     with torch.no_grad(), current:
         impl = entry.candidate.local.impl(query, key, value, options)
         if impl == "math":
@@ -560,17 +614,17 @@ def probe(
         got = _validate_probe_contract(entry, device, got, query)
         by_rows, floor, checked = _disagreement(got, query, key, value, seed)
     worst, disagreement = worst_of(by_rows)
-    measured = {
-        "shape": list(query.shape),
-        "checked_rows": checked,
-        "rel_l2_by_rows": by_rows,
-        "rel_l2_to_exact": disagreement,
-        "rounding_floor": floor,
-        "rel_l2_max": entry.candidate.rel_l2_max,
-        **({"budget": "uncalibrated"} if device.sm in entry.candidate.uncalibrated else {}),
-        "impl": impl,
-        "logit_std": PROBE_LOGIT_STD,
-    }
+    measured = Probe(
+        shape=list(query.shape),
+        checked_rows=checked,
+        rel_l2_by_rows=by_rows,
+        rel_l2_to_exact=disagreement,
+        rounding_floor=floor,
+        rel_l2_max=entry.candidate.rel_l2_max,
+        budget="uncalibrated" if device.sm in entry.candidate.uncalibrated else "",
+        impl=impl,
+        logit_std=PROBE_LOGIT_STD,
+    )
     where = f"{worst} rows of {checked} checked over {query.shape[1]} keys"
     _gate(entry, device, disagreement, where, measured)
     return measured
@@ -656,7 +710,7 @@ def _gate(
     device: DeviceFacts,
     disagreement: float,
     where: str,
-    measured: Mapping[str, Any] | None = None,
+    measured: Measured | None = None,
 ) -> None:
     """Hold a finite result to its declared budget. Past rel L2 1 the output carries no
     attention at all (a kernel returning its uninitialized buffer raises nothing and has the
@@ -678,9 +732,7 @@ def _gate(
     )
 
 
-def _probe_sol(
-    entry: Ready, device: DeviceFacts, query: Any, key: Any, value: Any
-) -> dict[str, Any]:
+def _probe_sol(entry: Ready, device: DeviceFacts, query: Any, key: Any, value: Any) -> SolProbe:
     """Separate native arithmetic from the wrapper's approximate sparse policy."""
     import torch
     from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -698,11 +750,11 @@ def _probe_sol(
         entry, device, attention_sol._native(query, key, value, None, sequence), query
     )
     arithmetic = float((native.float() - exact).norm() / exact.norm())
-    measured = {
-        "shape": list(query.shape),
-        "rel_l2_by_rows": {"all_keys": arithmetic},
-        "rel_l2_max": entry.candidate.rel_l2_max,
-    }
+    measured = Measured(
+        shape=list(query.shape),
+        rel_l2_by_rows={"all_keys": arithmetic},
+        rel_l2_max=entry.candidate.rel_l2_max,
+    )
     _gate(entry, device, arithmetic, "all-keys", measured)
     if any(
         not torch.equal(t.view(torch.uint8), old.view(torch.uint8))
@@ -745,21 +797,17 @@ def _probe_sol(
             "or input-ownership contracts",
             measured,
         )
-    return {
-        **measured,
-        "arithmetic_control": "native_all_keys_selected",
-        "arithmetic_rel_l2_to_fp32": arithmetic,
-        "arithmetic_rel_l2_max": entry.candidate.rel_l2_max,
-        "sparse_policy_rel_l2_to_fp32": float(
+    return SolProbe(
+        shape=measured.shape,
+        rel_l2_by_rows=measured.rel_l2_by_rows,
+        rel_l2_max=measured.rel_l2_max,
+        sparse_policy_rel_l2_to_fp32=float(
             (sparse[:, :sequence].float() - exact).norm() / exact.norm()
         ),
-        "sparse_error_meaning": "approximation_only_not_model_quality",
-        "protected_prefix": prefix,
-        "padding": padding,
-        "repeat_equal": True,
-        "inputs_unchanged": True,
-        "calls": counts,
-    }
+        protected_prefix=prefix,
+        padding=padding,
+        calls=counts,
+    )
 
 
 def _validate_probe_contract(entry: Ready, device: DeviceFacts, got: Any, query: Any) -> Any:
@@ -789,7 +837,7 @@ def _validate_probe_contract(entry: Ready, device: DeviceFacts, got: Any, query:
     return got
 
 
-def _import(candidate: Candidate) -> Any:
+def _import(candidate: Candidate) -> ModuleType:
     """The candidate's upstream module, from this environment or the image's kernel site."""
     try:
         installed = metadata.version(candidate.distribution)
@@ -808,25 +856,16 @@ def _import(candidate: Candidate) -> Any:
         ) from exc
 
 
-def _snapshot_artifact(location: str) -> dict[str, Any]:
-    body = (Path(location) / "metadata.json").read_bytes()
-    declared = json.loads(body)
-    return {
-        "snapshot": Path(location).name,
-        "id": str(declared.get("id", "")),
-        "metadata_digest": "sha256:" + hashlib.sha256(body).hexdigest(),
-    }
-
-
 #: Each kernel's probe verdict, proven once per (kernel, device, kernel site, registered
 #: implementation): all fixed for the process's life. The startup warm (`warm`) fills it
 #: before the first request, so construction and a request's pin check read it instead of
 #: probing again. Presence refusals are cheap and asked again.
-_PROVEN: dict[tuple[Any, ...], Ready | AttentionRefusal] = {}
+_ProofKey = tuple[Candidate, DeviceFacts, kernel_site.KernelSite, object]
+_PROVEN: dict[_ProofKey, Ready | AttentionRefusal] = {}
 _VERDICTS = frozenset({"attention_kernel_wrong", "attention_kernel_out_of_budget"})
 
 
-def _proof_key(candidate: Candidate, device: DeviceFacts) -> tuple[Any, ...] | None:
+def _proof_key(candidate: Candidate, device: DeviceFacts) -> _ProofKey | None:
     try:
         served = _registry()._backends.get(_member(candidate))
     except Exception:
@@ -852,11 +891,21 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     return known
 
 
-def warm(device: DeviceFacts, preferred: Sequence[str] = ()) -> list[dict[str, Any]]:
+class WarmRow(TypedDict):
+    """One kernel the startup warm proved: its verdict and what proving it cost; `held` when
+    an earlier proof served it."""
+
+    kernel: str
+    status: str
+    ms: float
+    held: NotRequired[bool]
+
+
+def warm(device: DeviceFacts, preferred: Sequence[str] = ()) -> list[WarmRow]:
     """Prove, before any construction exists, what this device's first construction will
     select: the model's preference walk up to its first kernel that serves, then the ranked
-    table `available` resolves. One row per kernel: its verdict and what proving it cost."""
-    rows: list[dict[str, Any]] = []
+    table `available` resolves. One row per kernel."""
+    rows: list[WarmRow] = []
 
     def one(candidate: Candidate) -> bool:
         started = time.perf_counter()
@@ -865,15 +914,15 @@ def warm(device: DeviceFacts, preferred: Sequence[str] = ()) -> list[dict[str, A
             _resolve(candidate, device)
             status = "ready"
         except Exception as exc:
-            status = str(getattr(exc, "code", type(exc).__name__))
-        rows.append(
-            {
-                "kernel": candidate.name,
-                "status": status,
-                "ms": round((time.perf_counter() - started) * 1000, 1),
-                **({"held": True} if held else {}),
-            }
+            status = exc.code if isinstance(exc, AttentionRefusal) else type(exc).__name__
+        row = WarmRow(
+            kernel=candidate.name,
+            status=status,
+            ms=round((time.perf_counter() - started) * 1000, 1),
         )
+        if held:
+            row["held"] = True
+        rows.append(row)
         return status == "ready"
 
     with measuring("warm"):
@@ -907,21 +956,23 @@ _EXPECTED.append(_expected)
 def _prove(candidate: Candidate, device: DeviceFacts) -> Ready:
     _admit_arch(candidate, _baked_archs(candidate), device)
     registry = _registry()
-    module = _import(candidate) if candidate.distribution else None
     location, artifact = "", None
-    if candidate.snapshot:
-        location = _load_snapshot(candidate, module, device)
-        artifact = _snapshot_artifact(location)
-    elif candidate.distribution:
-        artifact = _artifact(candidate.distribution)
+    if candidate.distribution:
+        module = _import(candidate)
+        if candidate.snapshot:
+            location, artifact = _load_snapshot(candidate, module, device)
+        else:
+            artifact = _artifact(candidate.distribution)
     if candidate.name == "sol-attn":
         _bind_sol_dense(device, registry)
     ready = Ready(candidate, _member(candidate), location, artifact=artifact)
     try:
         admission = probe(ready, device)
+    except AttentionRefusal as exc:
+        _note(candidate, device, exc.code, exc.measured)
+        raise
     except Exception as exc:
-        code = getattr(exc, "code", type(exc).__name__)
-        _note(candidate, device, code, getattr(exc, "measured", None))
+        _note(candidate, device, type(exc).__name__, None)
         raise
     _note(candidate, device, "ready", admission)
     return replace(ready, admission=admission)
@@ -931,7 +982,7 @@ def _prove(candidate: Candidate, device: DeviceFacts) -> Ready:
 #: (`prepare`) or a request's pin (`request`). Verdicts are kept, so it is when each was MEASURED.
 _SOURCE: ContextVar[str] = ContextVar("attention_probe_source", default="prepare")
 #: kernel -> this process's latest probe of it. One process serves one device.
-_MEASURED: dict[str, dict[str, Any]] = {}
+_MEASURED: dict[str, execution_evidence.ProbeRow] = {}
 
 
 @contextmanager
@@ -944,31 +995,31 @@ def measuring(source: str) -> Iterator[None]:
 
 
 def _note(
-    candidate: Candidate, device: DeviceFacts, status: str, measured: Mapping[str, Any] | None
+    candidate: Candidate, device: DeviceFacts, status: str, measured: Measured | None
 ) -> None:
-    row = measured or {}
-    _MEASURED[candidate.name] = {
-        "kernel": candidate.name,
-        "status": status,
-        "source": _SOURCE.get(),
-        "shape": list(row.get("shape") or ()),
-        "rel_l2_by_rows": dict(row.get("rel_l2_by_rows") or {}),
-        "budget": candidate.rel_l2_max,
-        "budget_state": "uncalibrated" if device.sm in candidate.uncalibrated else "calibrated",
-    }
+    _MEASURED[candidate.name] = execution_evidence.ProbeRow(
+        kernel=candidate.name,
+        status=status,
+        source=_SOURCE.get(),
+        shape=measured.shape if measured else [],
+        rel_l2_by_rows=measured.rel_l2_by_rows if measured else {},
+        budget=candidate.rel_l2_max,
+        budget_state="uncalibrated" if device.sm in candidate.uncalibrated else "calibrated",
+    )
 
 
-def evidence(served: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
+def evidence(served: Iterable[str]) -> execution_evidence.Probed:
     """This process's probes as per-rank execution evidence: `probes` for the kernels it
-    `served`, `skipped` for every kernel its probe refused. Empty lists are absent."""
+    `served`, `skipped` for every kernel its probe refused."""
     names = set(served)
-    probes = [dict(_MEASURED[name]) for name in sorted(names) if name in _MEASURED]
-    skipped = [
-        dict(row)
-        for name, row in sorted(_MEASURED.items())
-        if name not in names and row["status"] != "ready"
-    ]
-    return {**({"probes": probes} if probes else {}), **({"skipped": skipped} if skipped else {})}
+    return execution_evidence.Probed(
+        probes=[_MEASURED[name] for name in sorted(names) if name in _MEASURED],
+        skipped=[
+            row
+            for name, row in sorted(_MEASURED.items())
+            if name not in names and row.status != "ready"
+        ],
+    )
 
 
 def _bind_sol_dense(device: DeviceFacts, registry: Any) -> None:
@@ -1079,10 +1130,10 @@ def pinned(name: str, device: DeviceFacts) -> list[Ready]:
 # ------------------------------------------------------------------------------ the pin
 
 
-def _trees(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any]]:
+def _trees(roots: Mapping[str, object]) -> Iterator[tuple[str, Any]]:
     """Yield each constructed module tree, preserving component labels."""
     seen: set[int] = set()
-    queue: deque[tuple[str, Any, int]] = deque(
+    queue: deque[tuple[str, object, int]] = deque(
         (name, root, 0) for name, root in sorted(roots.items())
     )
     while queue:
@@ -1106,7 +1157,7 @@ def _trees(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any]]:
                     queue.append((name, item, depth + 1))
 
 
-def _attention_records(roots: Mapping[str, Any]) -> Iterator[tuple[str, str, Any, Any]]:
+def _attention_records(roots: Mapping[str, object]) -> Iterator[tuple[str, str, Any, Any]]:
     """All Diffusers attention processors, including those with no backend dispatch."""
     try:
         from diffusers.models.attention import AttentionModuleMixin
@@ -1123,7 +1174,7 @@ def _attention_records(roots: Mapping[str, Any]) -> Iterator[tuple[str, str, Any
                 yield component, path, module, processor
 
 
-def _site_records(roots: Mapping[str, Any]) -> Iterator[tuple[str, str, Any, Any]]:
+def _site_records(roots: Mapping[str, object]) -> Iterator[tuple[str, str, Any, Any]]:
     """Only processors implementing Diffusers' per-site backend selection contract."""
     for record in _attention_records(roots):
         if hasattr(record[3], "_attention_backend"):
@@ -1137,7 +1188,7 @@ def _unmanaged_reason(component: str, path: str, processor: Any) -> str:
     )
 
 
-def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
+def _sites(roots: Mapping[str, object]) -> Iterator[tuple[str, Any, Any]]:
     for component, _path, module, processor in _site_records(roots):
         yield component, module, processor
 
@@ -1212,6 +1263,21 @@ def _context_parallel(member: Any) -> bool:
     return bool(_AttentionBackendRegistry._is_context_parallel_available(member))
 
 
+class Boot(TypedDict):
+    """`Applied.document()`, the boot record as it crosses the executor seam (cr-124). A
+    group's `merge` keys `admission` and `artifacts` by model parameter, then kernel."""
+
+    kernels: dict[str, int]
+    hosts: dict[str, dict[str, int]]
+    offered: list[str]
+    locations: dict[str, str]
+    pin: str
+    admission: NotRequired[dict[str, object]]
+    artifacts: NotRequired[dict[str, object]]
+    skipped: NotRequired[dict[str, str]]
+    line: str
+
+
 @dataclass(frozen=True, slots=True)
 class Applied:
     """What the runtime pinned, per component and per kernel. The BOOT record, and all of it."""
@@ -1224,8 +1290,8 @@ class Applied:
     offered: tuple[str, ...]
     #: set when the caller PINNED one through the execution-path override (cr-125).
     pin: str = ""
-    admission: dict[str, dict[str, Any]] | None = None
-    artifacts: dict[str, dict[str, Any]] | None = None
+    admission: dict[str, Measured] | None = None
+    artifacts: dict[str, dict[str, str]] | None = None
     #: ranked kernels auto-selection could not use here, and why
     skipped: dict[str, str] | None = None
 
@@ -1236,25 +1302,21 @@ class Applied:
                 out[name] = out.get(name, 0) + sites
         return out
 
-    def document(self) -> dict[str, Any]:
-        return {
-            "kernels": self.totals(),
-            "hosts": {name: dict(kernels) for name, kernels in self.hosts.items()},
-            "offered": list(self.offered),
-            "locations": dict(self.locations),
-            "pin": self.pin,
-            **({"admission": self.admission} if self.admission else {}),
-            **({"artifacts": self.artifacts} if self.artifacts else {}),
-            **({"skipped": self.skipped} if self.skipped else {}),
-            # RENDERED HERE, not by the worker: one renderer for the one line, in the module
-            # that knows what it means.
-            "line": self.line(),
-        }
+    def document(self) -> Boot:
+        return _boot(
+            self.totals(),
+            {name: dict(kernels) for name, kernels in self.hosts.items()},
+            list(self.offered),
+            dict(self.locations),
+            self.pin,
+            msgspec.to_builtins(self.admission or {}),
+            self.artifacts or {},
+            self.skipped or {},
+        )
 
     def line(self) -> str:
         """The ONE line a pod prints at boot. It is the whole per-run attention record."""
-        skipped = f"; skipped {sorted(self.skipped)}" if self.skipped else ""
-        return line(self.totals(), self.hosts, list(self.offered), self.pin) + skipped
+        return line(self.totals(), self.hosts, list(self.offered), self.pin, self.skipped or {})
 
 
 def line(
@@ -1262,60 +1324,89 @@ def line(
     hosts: Mapping[str, Mapping[str, int]],
     offered: Sequence[str],
     pin: str,
+    skipped: Collection[str] = (),
 ) -> str:
     """The boot line, from the facts alone — so a GROUP prepare renders the same sentence from
     its merged facts as a single one does from its own `Applied` (cr-124)."""
+    ignored = f"; skipped {sorted(skipped)}" if skipped else ""
     if not totals:
-        return "NONE — this construction holds no backend-selectable diffusers attention site"
+        none = "NONE — this construction holds no backend-selectable diffusers attention site"
+        return none + ignored
     chosen = ", ".join(f"{name} x{sites}" for name, sites in sorted(totals.items()))
     where = "; ".join(
         f"{component}: {'+'.join(sorted(kernels))}" for component, kernels in sorted(hosts.items())
     )
     how = f"PINNED {pin}" if pin else f"auto over {list(offered)}"
-    return f"{chosen} ({how}) — {where}"
+    return f"{chosen} ({how}) — {where}{ignored}"
 
 
-def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
-    """A GROUP prepare's one attention fact, from its models' own `Applied.document()`s."""
+def _boot(
+    kernels: dict[str, int],
+    hosts: dict[str, dict[str, int]],
+    offered: list[str],
+    locations: dict[str, str],
+    pin: str,
+    admission: Mapping[str, object],
+    artifacts: Mapping[str, object],
+    skipped: dict[str, str],
+) -> Boot:
+    # RENDERED HERE, not by the worker: one renderer for the one line, in the module that
+    # knows what it means.
+    boot = Boot(
+        kernels=kernels,
+        hosts=hosts,
+        offered=offered,
+        locations=locations,
+        pin=pin,
+        line=line(kernels, hosts, offered, pin, skipped),
+    )
+    if admission:
+        boot["admission"] = dict(admission)
+    if artifacts:
+        boot["artifacts"] = dict(artifacts)
+    if skipped:
+        boot["skipped"] = skipped
+    return boot
+
+
+def merge(documents: Mapping[str, object]) -> Boot | None:
+    """A GROUP prepare's one attention fact, from its models' own `Applied.document()`s,
+    each decoded here once; a model holding no attention site sends none."""
     hosts: dict[str, dict[str, int]] = {}
     kernels: dict[str, int] = {}
     offered: list[str] = []
     locations: dict[str, str] = {}
     pins: set[str] = set()
-    admission: dict[str, Any] = {}
-    artifacts: dict[str, Any] = {}
+    admission: dict[str, object] = {}
+    artifacts: dict[str, object] = {}
     skipped: dict[str, str] = {}
-    for parameter, row in documents.items():
-        for component, chosen in (row.get("hosts") or {}).items():
-            hosts[f"{parameter}/{component}"] = dict(chosen)
-        for name, sites in (row.get("kernels") or {}).items():
-            kernels[name] = kernels.get(name, 0) + int(sites)
-        locations.update(row.get("locations") or {})
-        for name in row.get("offered") or ():
-            if name not in offered:
-                offered.append(name)
-        if row.get("pin"):
-            pins.add(str(row["pin"]))
-        if row.get("admission"):
+    for parameter, document in documents.items():
+        if not document:
+            continue
+        try:
+            row = msgspec.convert(document, Boot, strict=True)
+        except msgspec.ValidationError as exc:
+            raise AttentionRefusal(
+                "attention_fact_malformed", f"{parameter}'s attention fact: {exc}"
+            ) from exc
+        for component, chosen in row["hosts"].items():
+            hosts[f"{parameter}/{component}"] = chosen
+        for name, sites in row["kernels"].items():
+            kernels[name] = kernels.get(name, 0) + sites
+        locations.update(row["locations"])
+        offered += [name for name in row["offered"] if name not in offered]
+        if row["pin"]:
+            pins.add(row["pin"])
+        if "admission" in row:
             admission[parameter] = row["admission"]
-        if row.get("artifacts"):
+        if "artifacts" in row:
             artifacts[parameter] = row["artifacts"]
-        skipped.update(row.get("skipped") or {})
+        if "skipped" in row:
+            skipped.update(row["skipped"])
     if not kernels:
         return None
     pin = "+".join(sorted(pins))
-    return {
-        "kernels": kernels,
-        "hosts": hosts,
-        "offered": offered,
-        "locations": locations,
-        "pin": pin,
-        **({"admission": admission} if admission else {}),
-        **({"artifacts": artifacts} if artifacts else {}),
-        **({"skipped": skipped} if skipped else {}),
-        "line": line(kernels, hosts, offered, pin)
-        + (f"; skipped {sorted(skipped)}" if skipped else ""),
-    }
+    return _boot(kernels, hosts, offered, locations, pin, admission, artifacts, skipped)
 
 
 def _pin_parts(pin: str) -> tuple[str, str]:
@@ -1438,7 +1529,7 @@ def _preferred(
 
 def install(
     ready: list[Ready],
-    roots: Mapping[str, Any],
+    roots: Mapping[str, object],
     pin: str = "",
     degree: int = 1,
     *,
@@ -1590,7 +1681,7 @@ def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
         raise
 
 
-def observed(roots: Mapping[str, Any], pin: str = "") -> Applied:
+def observed(roots: Mapping[str, object], pin: str = "") -> Applied:
     """Read actual processor choices; never substitute the prepared recommendation."""
     names = {candidate.backend: candidate.name for candidate in BY_NAME.values()}
     hosts: dict[str, dict[str, int]] = {}
@@ -1600,7 +1691,7 @@ def observed(roots: Mapping[str, Any], pin: str = "") -> Applied:
         name = names.get(value, value)
         hosts.setdefault(component, {})
         hosts[component][name] = hosts[component].get(name, 0) + 1
-    artifacts: dict[str, dict[str, Any]] = {}
+    artifacts: dict[str, dict[str, str]] = {}
     for name in {name for kernels in hosts.values() for name in kernels}:
         candidate = BY_NAME.get(name)
         if candidate is None or not candidate.distribution or candidate.snapshot:
@@ -1621,7 +1712,7 @@ class Snapshot:
             processor._attention_backend = member
 
 
-def snapshot(roots: Mapping[str, Any]) -> Snapshot:
+def snapshot(roots: Mapping[str, object]) -> Snapshot:
     return Snapshot(
         tuple((processor, processor._attention_backend) for _, _, processor in _sites(roots))
     )
@@ -1629,7 +1720,7 @@ def snapshot(roots: Mapping[str, Any]) -> Snapshot:
 
 @contextmanager
 def override(
-    defaults: Snapshot, roots: Mapping[str, Any], swap: Swap | None, pin: str = ""
+    defaults: Snapshot, roots: Mapping[str, object], swap: Swap | None, pin: str = ""
 ) -> Iterator[Applied]:
     """Observe one temporary request selection and restore it even when execution raises."""
     defaults.restore()
@@ -1674,7 +1765,7 @@ def _site_refusal(name: str, component: str, dtype: str, head_dim: int) -> Atten
     )
 
 
-def _baked_in(roots: Mapping[str, Any]) -> str:
+def _baked_in(roots: Mapping[str, object]) -> str:
     for label, tree in _trees(roots):
         for module in tree.modules():
             if hasattr(module, "_orig_mod"):
@@ -1710,7 +1801,7 @@ class Swap:
         )
 
 
-def _is_selected(defaults: Snapshot, roots: Mapping[str, Any], pin: str) -> bool:
+def _is_selected(defaults: Snapshot, roots: Mapping[str, object], pin: str) -> bool:
     """A repeated prepared pin is a no-op only at every site in its nonempty scope."""
     scope, name = _pin_parts(pin)
     candidate = BY_NAME.get(name)
@@ -1746,7 +1837,9 @@ def admit(pin: str, degree: int) -> None:
             )
 
 
-def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, degree: int = 1) -> Candidate:
+def check(
+    device: DeviceFacts, roots: Mapping[str, object], name: str, degree: int = 1
+) -> Candidate:
     """Refuse a request pin these sites, this device or this group degree cannot serve."""
     admit(name, degree)
     scope, backend = _pin_parts(name)
@@ -1780,7 +1873,7 @@ def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, degree: int 
     return candidate
 
 
-def plan(device: DeviceFacts, roots: Mapping[str, Any], name: str, degree: int = 1) -> Swap:
+def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: int = 1) -> Swap:
     candidate = check(device, roots, name, degree)
     scope, _ = _pin_parts(name)
     entry = pinned(candidate.name, device)[0]
@@ -1799,7 +1892,7 @@ def plan(device: DeviceFacts, roots: Mapping[str, Any], name: str, degree: int =
 
 def select(
     device: DeviceFacts,
-    roots: Mapping[str, Any],
+    roots: Mapping[str, object],
     pin: str = "",
     degree: int = 1,
     *,
@@ -1815,55 +1908,15 @@ def select(
     return replace(applied, skipped=skipped or None)
 
 
-def capabilities(device: DeviceFacts) -> dict[str, Any]:
-    """This rank's attention capability document: its kernel site and, for every kernel this
-    runtime knows, whether it serves here — version, artifact and numeric probe when it does,
-    the typed refusal when it does not. Computed per rank; ranks may differ."""
-    kernels: dict[str, dict[str, Any]] = {}
-    for candidate in (*CANDIDATES, *PINNABLE):
-        declared = {
-            "context_parallel": candidate.local.head_local,
-            "dtypes": sorted(candidate.dtypes),
-            "max_head_dim": candidate.max_head_dim,
-            "rel_l2_max": candidate.rel_l2_max,
-            **({"budget": "uncalibrated"} if device.sm in candidate.uncalibrated else {}),
-        }
-        unsupported = _device_admits(candidate, device)
-        if unsupported:
-            kernels[candidate.name] = {
-                **declared,
-                "status": "attention_kernel_unsupported",
-                "detail": unsupported,
-            }
-            continue
-        try:
-            ready = _resolve(candidate, device)
-        except Exception as exc:
-            kernels[candidate.name] = {
-                **declared,
-                "status": getattr(exc, "code", "attention_kernel_absent"),
-                "detail": f"{type(exc).__name__}: {exc}"[:600],
-            }
-            continue
-        kernels[candidate.name] = {
-            **declared,
-            "status": "ready",
-            **({"artifact": ready.artifact} if ready.artifact else {}),
-            **({"location": ready.location} if ready.location else {}),
-            **({"admission": ready.admission} if ready.admission else {}),
-        }
-    return {
-        "device": {"kind": device.kind, "name": device.name, "sm": device.sm},
-        "kernel_site": kernel_site.current().document(),
-        "kernels": kernels,
-    }
-
-
 def image_kernels(device: DeviceFacts) -> str:
-    """What this environment and device can run, for a refusal message (cr-125)."""
-    ready = [
-        name for name, row in capabilities(device)["kernels"].items() if row["status"] == "ready"
-    ]
+    """What this environment and device can run, for a refusal message (cr-125): every kernel
+    this runtime knows that resolves AND computes here."""
+    ready = []
+    for candidate in (*CANDIDATES, *PINNABLE):
+        if _device_admits(candidate, device):
+            continue
+        with suppress(Exception):
+            ready.append(_resolve(candidate, device).name)
     return ", ".join(ready) or "none"
 
 

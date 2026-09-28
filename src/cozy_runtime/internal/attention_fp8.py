@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
+# Tensors and triton's kernels are `Any`: neither torch nor triton is installed in the check venv.
+
 #: The largest finite e4m3fn magnitude, and the value a head's amax is mapped onto instead.
 E4M3_MAX = 448.0
 E4M3_TARGET = 440.0

@@ -9,15 +9,20 @@ sequence of its heads, so a head-local kernel must reproduce one GPU.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+
+import msgspec
 
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
 from cozy_runtime.author._numeric import within
 from cozy_runtime.internal import attention, attention_sol, attention_ulysses, kernel_site
 from cozy_runtime.internal.encoding import DeviceFacts
+from cozy_runtime.internal.kernel_site import KernelSite
+
+# torch, torch.distributed, their tensors and Diffusers' parallel config are `Any`: neither
+# torch nor diffusers is installed in the check venv.
 
 #: One H3 rank group's packed 10 s document (unequal shards) and its 56 heads.
 ROWS, HEADS = 73_439, 56
@@ -26,6 +31,39 @@ ROWS, HEADS = 73_439, 56
 EQUIVALENT_REL_L2 = 2e-3
 #: H3's measured protected prefix (text + reference + audio rows) for Sol's sparse arm.
 SOL_PREFIX = 1254
+
+
+class Verdict(msgspec.Struct, frozen=True, omit_defaults=True):
+    """One kernel on one rank: its refusal, or its degree-N shard against degree 1. `probe` is
+    the kernel's per-rank numeric probe, carried through as it was measured."""
+
+    kernel: str
+    rank: int
+    status: str
+    detail: str = ""
+    impl: str | None = None
+    probe: object = None
+    shape: list[int] | None = None
+    byte_equal: bool | None = None
+    rel_l2_to_degree1: float | None = None
+    rel_l2_max: float | None = None
+
+
+class RankReport(msgspec.Struct, frozen=True):
+    rank: int
+    device: str
+    sm: int
+    kernel_site: KernelSite
+    kernels: list[Verdict]
+
+
+class Report(msgspec.Struct, frozen=True):
+    degree: int
+    device: str
+    shape: list[int]
+    ok: bool
+    verdicts: dict[str, list[str]]
+    ranks: list[RankReport]
 
 
 def _device(torch: Any, kind: str, rank: int) -> DeviceFacts:
@@ -51,19 +89,18 @@ def _kernel(
     facts: DeviceFacts,
     config: Any,
     shape: tuple[int, int, int, int],
-) -> dict[str, Any]:
+) -> Verdict:
     from diffusers.models.attention_dispatch import _AttentionBackendRegistry
 
-    row: dict[str, Any] = {"kernel": name, "rank": rank}
     device = torch.device("cuda", rank) if facts.kind == "cuda" else torch.device("cpu")
+    status, detail, ready = "skipped: another rank refused this kernel", "", None
     try:
         ready = attention.pinned(name, facts)[0]
     except Exception as exc:
-        row.update(status=getattr(exc, "code", type(exc).__name__), detail=str(exc)[:600])
-        ready = None
+        status = exc.code if isinstance(exc, attention.AttentionRefusal) else type(exc).__name__
+        detail = str(exc)[:600]
     if not _agreed(torch, dist, ready is not None, device):
-        row.setdefault("status", "skipped: another rank refused this kernel")
-        return row
+        return Verdict(name, rank, status, detail)
     assert ready is not None
     backend = _AttentionBackendRegistry._backends[ready.member]
     dtype = torch.bfloat16 if facts.kind == "cuda" else torch.float32
@@ -83,8 +120,10 @@ def _kernel(
     finally:
         attention_sol._SITE.reset(token)
     difference = float((got.double() - one.double()).norm() / one.double().norm())
-    row.update(
-        status="ready" if within(difference, EQUIVALENT_REL_L2) else "not_equivalent",
+    return Verdict(
+        name,
+        rank,
+        "ready" if within(difference, EQUIVALENT_REL_L2) else "not_equivalent",
         impl=impl,
         probe=ready.admission,
         shape=list(shape),
@@ -94,7 +133,6 @@ def _kernel(
         rel_l2_to_degree1=difference,
         rel_l2_max=EQUIVALENT_REL_L2,
     )
-    return row
 
 
 def _rank(
@@ -137,24 +175,15 @@ def _rank(
             if not attention._device_admits(candidate, facts)
         ]
         rows = [_kernel(torch, dist, name, rank, degree, facts, config, shape) for name in names]
-        (Path(root) / f"rank-{rank}.json").write_text(
-            json.dumps(
-                {
-                    "rank": rank,
-                    "device": facts.name,
-                    "sm": facts.sm,
-                    "kernel_site": kernel_site.current().document(),
-                    "kernels": rows,
-                }
-            )
-        )
+        report = RankReport(rank, facts.name, facts.sm, kernel_site.current(), rows)
+        (Path(root) / f"rank-{rank}.json").write_bytes(msgspec.json.encode(report))
     finally:
         dist.destroy_process_group()
 
 
 def qualify(
     degree: int, kernels: list[str], kind: str, rows: int = ROWS, heads: int = HEADS
-) -> dict[str, Any]:
+) -> Report:
     """Spawn `degree` ranks, qualify `kernels` on each, and return the merged report."""
     from torch.multiprocessing.spawn import spawn as start
 
@@ -170,19 +199,20 @@ def qualify(
             join=True,
         )
         ranks = [
-            json.loads((Path(root) / f"rank-{rank}.json").read_text()) for rank in range(degree)
+            msgspec.json.decode((Path(root) / f"rank-{rank}.json").read_bytes(), type=RankReport)
+            for rank in range(degree)
         ]
     verdicts: dict[str, list[str]] = {}
     for rank in ranks:
-        for row in rank["kernels"]:
-            verdicts.setdefault(row["kernel"], [])
-            if row["status"] not in verdicts[row["kernel"]]:
-                verdicts[row["kernel"]].append(row["status"])
-    return {
-        "degree": degree,
-        "device": kind,
-        "shape": [1, rows, heads, 128],
-        "ok": bool(verdicts) and all(statuses == ["ready"] for statuses in verdicts.values()),
-        "verdicts": verdicts,
-        "ranks": ranks,
-    }
+        for row in rank.kernels:
+            statuses = verdicts.setdefault(row.kernel, [])
+            if row.status not in statuses:
+                statuses.append(row.status)
+    return Report(
+        degree,
+        kind,
+        [1, rows, heads, 128],
+        bool(verdicts) and all(statuses == ["ready"] for statuses in verdicts.values()),
+        verdicts,
+        ranks,
+    )

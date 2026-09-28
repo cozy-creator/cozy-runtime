@@ -10,20 +10,23 @@ dependencies, and the executor imports torch only after its environment seal.
 from __future__ import annotations
 
 import math
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from importlib import import_module
+from types import ModuleType
 from typing import Any
 
 from cozy_runtime.internal import attention_fp8
-from cozy_runtime.internal.attention_ulysses import Local
+from cozy_runtime.internal.attention_ulysses import Local, Options
+
+# Tensors and torch's SDPA backend enum are `Any`: torch is not installed in the check venv.
 
 #: The loaded FlashAttention-3 snapshot (`kernels` loads it under a generated module name)
 #: and the build variant it came from.
-_FA3: Any = None
+_FA3: ModuleType | None = None
 _FA3_VARIANT = ""
 
 
-def bind_fa3(module: Any, variant: str) -> None:
+def bind_fa3(module: ModuleType, variant: str) -> None:
     global _FA3, _FA3_VARIANT
     _FA3, _FA3_VARIANT = module, variant
 
@@ -98,7 +101,7 @@ def sdpa(
     ).transpose(1, 2)
 
 
-def sdpa_impl(query: Any, key: Any, value: Any, options: dict[str, Any]) -> str:
+def sdpa_impl(query: Any, key: Any, value: Any, options: Options) -> str:
     """The backend torch's SDPA dispatcher picks for exactly these operands."""
     import torch
     from torch.nn.attention import SDPBackend
@@ -157,7 +160,7 @@ def cudnn(
 # ------------------------------------------------------------------- FlashAttention 3 and 4
 
 
-def _fa3() -> Any:
+def _fa3() -> ModuleType:
     if _FA3 is None:
         raise RuntimeError("flash-attn3 was dispatched before its snapshot was loaded")
     return _FA3
@@ -497,7 +500,7 @@ def sage3_fp4(
     return _output(output, q).transpose(1, 2)
 
 
-def _named(name: str) -> Any:
+def _named(name: str) -> Callable[..., str]:
     return lambda *_: name
 
 

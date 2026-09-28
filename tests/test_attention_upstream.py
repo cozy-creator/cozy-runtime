@@ -83,13 +83,9 @@ def test_every_registered_kernel_is_head_local_and_a_cross_head_one_refuses_ulys
 
 def test_sdpa_names_the_backend_torch_dispatches_and_matches_it() -> None:
     q = torch.randn((1, 16, 2, 64))
-    options: dict[str, Any] = {
-        "attn_mask": None,
-        "dropout_p": 0.0,
-        "is_causal": False,
-        "scale": None,
-        "enable_gqa": False,
-    }
+    options = attention_ulysses.Options(
+        attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False
+    )
     expected = torch.nn.functional.scaled_dot_product_attention(
         *(t.transpose(1, 2) for t in (q, q, q))
     ).transpose(1, 2)

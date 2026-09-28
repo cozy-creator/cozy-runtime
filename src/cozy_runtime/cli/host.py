@@ -16,6 +16,8 @@ import os
 import re
 from pathlib import Path
 
+import msgspec
+
 from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import attention_qualify as attention_qualification
 from cozy_runtime.internal import canonical, hostfacts
@@ -509,16 +511,15 @@ def attention_qualify(argv: list[str]) -> Result:
         )
     except ValueError as exc:
         raise CliError("usage", str(exc), "name kernels this runtime knows", Exit.usage) from exc
+    document = msgspec.to_builtins(report)
     if args.out:
-        args.out.write_text(json.dumps(report, indent=2) + "\n")
-    if not report["ok"]:
+        args.out.write_text(json.dumps(document, indent=2) + "\n")
+    if not report.ok:
         raise CliError(
             "attention_unqualified",
-            f"degree {args.degree}: {json.dumps(report['verdicts'], sort_keys=True)}",
+            f"degree {args.degree}: {json.dumps(report.verdicts, sort_keys=True)}",
             "read the per-rank rows with --out; a refusal names its measured cause",
             Exit.validation,
         )
-    rows = tuple(
-        (name, "+".join(statuses)) for name, statuses in sorted(report["verdicts"].items())
-    )
-    return Result(rows=rows, document=report)
+    rows = tuple((name, "+".join(statuses)) for name, statuses in sorted(report.verdicts.items()))
+    return Result(rows=rows, document=document)

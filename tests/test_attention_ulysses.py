@@ -28,13 +28,13 @@ ENV = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "CUDA_VISIB
 def test_the_wrapper_reproduces_one_process_at_degree(degree: int) -> None:
     # 1031 rows split unequally at every degree (258/258/258/257 at 4), H3's 56 heads.
     report = attention_qualify.qualify(degree, [], "cpu", rows=1031, heads=56)
-    assert report["ok"] and report["verdicts"] == {"sdpa": ["ready"]}, report["verdicts"]
-    assert [rank["kernels"][0]["rank"] for rank in report["ranks"]] == list(range(degree))
-    for rank in report["ranks"]:
-        [row] = rank["kernels"]
-        assert row["byte_equal"] and row["rel_l2_to_degree1"] == 0.0
-        assert row["impl"] in {"flash", "efficient", "math"}
-        assert rank["kernel_site"]["path"] == ""  # no image site on this host
+    assert report.ok and report.verdicts == {"sdpa": ["ready"]}, report.verdicts
+    assert [rank.kernels[0].rank for rank in report.ranks] == list(range(degree))
+    for rank in report.ranks:
+        [row] = rank.kernels
+        assert row.byte_equal and row.rel_l2_to_degree1 == 0.0
+        assert row.impl in {"flash", "efficient", "math"}
+        assert rank.kernel_site.path == ""  # no image site on this host
 
 
 def test_the_cli_verb_runs_the_same_check_and_refuses_unknown_kernels(
