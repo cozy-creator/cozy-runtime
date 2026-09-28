@@ -1,0 +1,1 @@
+A release root's preparation reports its Models' download to the submitter: each "preparing" answer carries `cozy-progress-bytes: <landed> <total>` beside its stage, refreshed at most once a second, so a controller shows bytes and rate before the machine accepts the run.

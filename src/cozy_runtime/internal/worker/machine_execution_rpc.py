@@ -53,7 +53,10 @@ class MachineExecutionRPC:
         except _ExecutionNotFound as exc:
             context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
         except machine_release_roots.Preparing as exc:
-            context.set_trailing_metadata((("cozy-error-code", "release_root_preparing"),))
+            trailers = [("cozy-error-code", "release_root_preparing")]
+            if exc.total:  # bytes landed of the Models' total, while they download
+                trailers.append(("cozy-progress-bytes", f"{exc.moved} {exc.total}"))
+            context.set_trailing_metadata(tuple(trailers))
             context.abort(grpc.StatusCode.UNAVAILABLE, str(exc)[:512])
         except ExecutionWorkspaceRefusal as exc:
             context.set_trailing_metadata((("cozy-error-code", exc.code),))

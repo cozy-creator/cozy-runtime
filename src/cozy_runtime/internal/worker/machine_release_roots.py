@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -66,7 +67,12 @@ def _requirement(line: str) -> str:
 
 
 class Preparing(Exception):
-    """The release root is still being prepared; the message is its progress."""
+    """The release root is still being prepared; the message is its progress, and `moved` of
+    `total` bytes have landed while its Models download."""
+
+    def __init__(self, progress: str, moved: int = 0, total: int = 0) -> None:
+        super().__init__(progress)
+        self.moved, self.total = moved, total
 
 
 @dataclass
@@ -84,7 +90,9 @@ class _Job:
     request: bytes
     version: int = 0
     progress: str = "preparing"
-    percent: int = -1
+    moved: int = 0
+    total: int = 0
+    noted: float = 0.0  # when a byte count last woke the waiting submitter
     done: bool = False
     result: _Prepared | None = None
     error: BaseException | None = None
@@ -138,7 +146,7 @@ class ReleaseRoots:
                 ).start()
             self._wait(job, context)
             if not job.done:
-                raise Preparing(job.progress)
+                raise Preparing(job.progress, job.moved, job.total)
             del self.jobs[identity]
         if job.error is not None:
             raise job.error
@@ -160,11 +168,15 @@ class ReleaseRoots:
         while not job.done and job.version == seen and not gone.is_set():
             self.changed.wait()
 
-    def _note(self, job: _Job, progress: str, percent: int = -1) -> None:
+    def _note(self, job: _Job, progress: str, moved: int = 0, total: int = 0) -> None:
+        """A new stage wakes the waiting submitter at once; a byte count, once a second."""
         with self.changed:
-            if progress == job.progress and percent == job.percent:
+            now = time.monotonic()
+            if progress == job.progress and (
+                (moved, total) == (job.moved, job.total) or now - job.noted < 1
+            ):
                 return
-            job.progress, job.percent = progress, percent
+            job.progress, job.moved, job.total, job.noted = progress, moved, total, now
             job.version += 1
             self.changed.notify_all()
 
@@ -358,7 +370,7 @@ class ReleaseRoots:
             root,
             declaration,
             machine_source_models.credentials(request.source_credentials),
-            lambda stage, done, total: self._note(job, stage, 100 * done // total if total else -1),
+            lambda stage, done, total: self._note(job, stage, done, total),
         )
         if root.job:
             # A job reads its Models as inputs: land each catalog checkpoint here now.
@@ -367,7 +379,7 @@ class ReleaseRoots:
                 models,
                 None,
                 progress=lambda done, total: self._note(
-                    job, "downloading model weights", 100 * done // total if total else -1
+                    job, "downloading model weights", done, total
                 ),
             )
             return _Prepared(key, target, dict(prepared["placement"]), models, installed, edges)
@@ -485,7 +497,7 @@ class ReleaseRoots:
     def _progress(self, job: _Job, frame: Mapping[str, Any]) -> None:
         position, total = frame.get("position"), frame.get("total")
         if isinstance(position, int) and isinstance(total, int) and total > 0:
-            self._note(job, "downloading model weights", 100 * position // total)
+            self._note(job, "downloading model weights", position, total)
         elif frame.get("kind") == "progress" and frame.get("stage"):
             stage = str(frame["stage"])
             if "Downloading" in stage or "compatibility" in stage:

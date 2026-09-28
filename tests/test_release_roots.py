@@ -823,3 +823,49 @@ def test_a_root_names_an_unpublished_installation_the_machine_holds(
                 catalog.close()
         finally:
             machine.worker.shutdown()
+
+
+def test_a_roots_download_progress_reaches_its_submitter(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While a root's Models download, each answer to its submitter says how many bytes have
+    landed of how many, so the run shows its download moving before acceptance."""
+    machine = published
+    catalog = Catalog(machine.manifest, 1, [], interface=machine.interface)
+    catalog.serve(machine)
+    seen = threading.Event()
+
+    def materialize(*_: Any, progress: Any = None, **__: Any) -> None:
+        progress(1 << 30, 4 << 30)
+        seen.wait(30)
+
+    monkeypatch.setattr(machine_model_defaults, "materialize", materialize)
+    request = pb.MachineExecutionSubmit(
+        claim=machine.claim,
+        submission_id="downloading",
+        offer=pb.AttemptOffer(request_id="downloading"),
+        payload_canonical_bytes=canonical_json.encode({"shots": 2}),
+        expected_execution_workspace_id=machine.executions.workspace_id,
+        release_root=pb.ReleaseRoot(
+            package=PACKAGE,
+            release=RELEASE,
+            entrypoint="workflow",
+            job=True,
+            publication_grant="cozytest/_job-downloading",
+        ),
+    )
+    answers: list[tuple[str, str]] = []
+    try:
+        while True:
+            try:
+                receipt = machine.rpc.SubmitMachineExecution(request, Context())
+                break
+            except Refused as refused:
+                assert refused.trailers.get("cozy-error-code") == "release_root_preparing"
+                if "cozy-progress-bytes" in refused.trailers:
+                    answers.append((str(refused), refused.trailers["cozy-progress-bytes"]))
+                    seen.set()
+    finally:
+        catalog.close()
+    assert receipt.request_id == "downloading"
+    assert ("downloading model weights", f"{1 << 30} {4 << 30}") in answers, answers
