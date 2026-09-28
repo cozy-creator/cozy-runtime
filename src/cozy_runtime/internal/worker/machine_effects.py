@@ -5,24 +5,25 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
-from typing import Any
 
 import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._assets import asset_dec_hook
-from cozy_runtime.author.publication import CheckpointRef
+from cozy_runtime.author.publication import AssessmentRef, CheckpointRef, ReleaseReceipt
 from cozy_runtime.internal import effect_interfaces, fill
-from cozy_runtime.internal.worker import machine_models
+from cozy_runtime.internal.canonical import Json
+from cozy_runtime.internal.worker import machine_assessment, machine_models
 from cozy_runtime.internal.worker.machine_artifacts import model_retention
+from cozy_runtime.internal.worker.machine_models import ModelHold
 from cozy_runtime.internal.worker.machine_publication import (
-    FINALIZATION_ABSENT,
     PublicationAuthority,
     PublicationClient,
     PublicationRefusal,
     PublicationUncommitted,
     apply_release,
     attach_assessment,
+    finalization_absent,
     prepare_release,
     reconcile_checkpoint,
     settle_checkpoint,
@@ -84,27 +85,49 @@ def _refusal(exc: Exception) -> Exception:
     return PublicationRefusal(code[:128], status=503 if native in _TRANSIENT_NATIVE else 409)
 
 
-def _publication(call: Call) -> dict[str, Any] | None:
+class _Effect(msgspec.Struct, frozen=True):
+    """An effect call's intent (`execution_calls.intent`); its request decodes by export."""
+
+    module: str = ""
+    export: str = ""
+    request: Json = None
+
+    def upload(self) -> effect_interfaces.Upload | None:
+        if self.module != effect_interfaces.MODULE or self.export != "upload_checkpoint":
+            return None
+        return msgspec.convert(self.request, type=effect_interfaces.Upload, strict=True)
+
+
+class _Publication(msgspec.Struct, frozen=True):
+    """The Hub publication a checkpoint upload call names, as its owner's notices spell it."""
+
+    call_index: int
+    publication: str
+    destination: str
+
+
+class _Staged(msgspec.Struct, frozen=True):
+    """An upload's frozen preparation: the native subject it retained."""
+
+    source: dict[str, Json] = {}
+
+
+class _Assessed(msgspec.Struct, frozen=True):
+    """An assessment's frozen preparation: the sources and verdict it verified."""
+
+    report: str = ""
+    workloads: str = ""
+    verdict: str = ""
+    producer: str = ""
+    kind: str = "assessment"
+
+
+def _publication(call: Call) -> _Publication | None:
     """The Hub publication a checkpoint upload call names, or None for other effects."""
-    intent = canonical_json.decode(call.intent)
-    if (
-        intent.get("module") != effect_interfaces.MODULE
-        or intent.get("export") != "upload_checkpoint"
-    ):
+    upload = canonical_json.decode_as(call.intent, _Effect).upload()
+    if upload is None:
         return None
-    return {
-        "call_index": call.call_index,
-        "publication": call.child_request,
-        "destination": intent["request"]["destination"],
-    }
-
-
-def _document(body: bytes) -> dict[str, Any] | None:
-    try:
-        value = canonical_json.decode(body)
-    except ValueError:
-        return None
-    return value if isinstance(value, dict) else None
+    return _Publication(call.call_index, call.child_request, upload.destination)
 
 
 class Effects:
@@ -176,10 +199,11 @@ class Effects:
             not call.sent and (call.safe_code or self.journal.canceled(owner, call))
         ):
             with self.workspace.locked() as db:
-                held = db.execute(
-                    "SELECT 1 FROM execution_model_holds WHERE owner=? AND recipient=? LIMIT 1",
+                held = db.one(
+                    ModelHold,
+                    "SELECT * FROM execution_model_holds WHERE owner=? AND recipient=? LIMIT 1",
                     (owner, call.child_request),
-                ).fetchone()
+                )
             if held is not None:
                 machine_models.release(self.workspace, owner, call.child_request)
 
@@ -192,7 +216,7 @@ class Effects:
         if current is not None:
             current.finish(True)
 
-        def emit(frame: dict[str, Any]) -> None:
+        def emit(frame: dict[str, object]) -> None:
             if self.report is not None:
                 self.report(call.parent_request, call.parent_ordinal, call.call_index, frame)
 
@@ -241,40 +265,39 @@ class Effects:
                     "SELECT memoize FROM attempts WHERE owner=? AND request=? AND ordinal=?",
                     (owner, call.parent_request, call.parent_ordinal),
                 ).fetchone()
-            intent = canonical_json.decode(call.intent)
-            operation = intent["export"]
+            intent = canonical_json.decode_as(call.intent, _Effect)
+            operation = intent.export
+            upload = intent.upload()
             # A memoized root may upload only its own result, to the destination its
             # owner granted; its memo identity never includes that upload.
-            granted = operation == "upload_checkpoint" and intent["request"].get(
-                "destination"
-            ) == self.executions.destination(owner, call.parent_request)
+            granted = upload is not None and upload.destination == self.executions.destination(
+                owner, call.parent_request
+            )
             if pure is None or (pure["memoize"] and not granted):
                 raise PublicationRefusal("publication.impure_call_forbidden")
             grant = self.executions.publication_authorization(owner, call.parent_request)
             if not grant or self.authority is None:
                 raise PublicationRefusal("publication.authority_absent", status=403)
-            if intent["module"] != effect_interfaces.MODULE:
+            if intent.module != effect_interfaces.MODULE:
                 raise PublicationRefusal("publication.interface_changed")
             client = self.authority.client(grant)
+            result: ReleaseReceipt | CheckpointRef | AssessmentRef
             if operation == "publish_release":
                 request = msgspec.convert(
-                    intent["request"], type=effect_interfaces.Publish, strict=True
+                    intent.request, type=effect_interfaces.Publish, strict=True
                 )
                 if not call.prepared:
                     frozen = prepare_release(client, **msgspec.structs.asdict(request))
                     call = self.journal.freeze(owner, call, frozen)
                 self._stage(key, call, "Publishing release")
-                result: Any = apply_release(
+                result = apply_release(
                     client,
                     call.prepared,
                     sent=call.sent,
                     before_write=lambda: self._before_write(owner, call),
                 )
-            elif operation == "upload_checkpoint":
-                request_upload = msgspec.convert(
-                    intent["request"], type=effect_interfaces.Upload, strict=True
-                )
-                result = self._upload(owner, call, request_upload, client)
+            elif upload is not None:
+                result = self._upload(owner, call, upload, client)
                 # The owner settles a destination from these, at least once per output.
                 self.executions.record(
                     owner,
@@ -283,13 +306,13 @@ class Effects:
                     {
                         "destination": result.destination,
                         "checkpoint": result.checkpoint,
-                        "output_slot": request_upload.artifact.output_slot,
+                        "output_slot": upload.artifact.output_slot,
                         "observation": result.observation,
                     },
                 )
             elif operation == "attach_assessment":
                 attachment = msgspec.convert(
-                    intent["request"],
+                    intent.request,
                     type=effect_interfaces.AttachAssessment,
                     strict=True,
                     dec_hook=asset_dec_hook,
@@ -378,7 +401,7 @@ class Effects:
                         **({"stage": f"{stage.stage} / {phase}"} if stage is not None else {}),
                         "operation": "publication",
                         "call_index": call.call_index,
-                        **(target or {}),
+                        **(msgspec.structs.asdict(target) if target is not None else {}),
                         "phase": phase,
                         "code": exc.code
                         if isinstance(exc, PublicationRefusal)
@@ -388,14 +411,17 @@ class Effects:
             )
             raise
 
-    def _notice_unresolved(self, owner: str, call: Call, target: dict[str, Any], code: str) -> None:
+    def _notice_unresolved(self, owner: str, call: Call, target: _Publication, code: str) -> None:
         key = owner, call.child_request
         with self.lock:
             if key in self.noticed:
                 return
             self.noticed.add(key)
         self.executions.notice(
-            owner, call.parent_request, "publication_unresolved", {**target, "code": code}
+            owner,
+            call.parent_request,
+            "publication_unresolved",
+            {**msgspec.structs.asdict(target), "code": code},
         )
 
     def _notice_settled(self, owner: str, call: Call, committed: bool) -> None:
@@ -405,7 +431,10 @@ class Effects:
         with self.lock:
             self.noticed.discard((owner, call.child_request))
         self.executions.notice(
-            owner, call.parent_request, "publication_settled", {**target, "committed": committed}
+            owner,
+            call.parent_request,
+            "publication_settled",
+            {**msgspec.structs.asdict(target), "committed": committed},
         )
 
     def reconcile(
@@ -418,16 +447,11 @@ class Effects:
         objects; a queued or running finalization is refused as pending.
         """
         call = self.journal.get(owner, request, call_index)
-        target = _publication(call)
-        if target is None:
+        upload = canonical_json.decode_as(call.intent, _Effect).upload()
+        if upload is None:
             raise WorkspaceRefusal("call is not a checkpoint publication")
         if call.result or not call.sent:
             return
-        upload = msgspec.convert(
-            canonical_json.decode(call.intent)["request"],
-            type=effect_interfaces.Upload,
-            strict=True,
-        )
         checkpoint, objects = self._closure(call, upload)
         try:
             grant = self.executions.publication_authorization(owner, call.parent_request)
@@ -449,32 +473,22 @@ class Effects:
             raise WorkspaceRefusal(
                 "machine publication authority still reads Hub; it reconciles this call"
             )
-        document = _document(body)
         committed, raw, code, detail = False, b"", "", ""
-        if 200 <= status < 300 and document is not None:
-            try:
+        try:
+            if 200 <= status < 300:
                 settled = settle_checkpoint(
-                    document, operation=call.child_request, checkpoint=checkpoint, objects=objects
+                    body, operation=call.child_request, checkpoint=checkpoint, objects=objects
                 )
-            except PublicationUncommitted as exc:
-                code, detail = exc.code, "the owner's Hub reports the commit did not land"
-            except PublicationRefusal as exc:
-                raise WorkspaceRefusal(
-                    f"owner finalization read does not settle: {exc.code}"
-                ) from exc
+                committed, raw = True, canonical_json.encode(msgspec.to_builtins(settled))
+            elif status == 404 and finalization_absent(body):
+                code = "publication.finalize_absent"
+                detail = "the owner's Hub holds no finalization for this publication"
             else:
-                committed = True
-                raw = canonical_json.encode(msgspec.to_builtins(settled))
-        elif (
-            status == 404
-            and document is not None
-            and isinstance(document.get("error"), dict)
-            and document["error"].get("code") in FINALIZATION_ABSENT
-        ):
-            code = "publication.finalize_absent"
-            detail = "the owner's Hub holds no finalization for this publication"
-        else:
-            raise WorkspaceRefusal("owner finalization read is not a settlement")
+                raise WorkspaceRefusal("owner finalization read is not a settlement")
+        except PublicationUncommitted as exc:
+            code, detail = exc.code, "the owner's Hub reports the commit did not land"
+        except PublicationRefusal as exc:
+            raise WorkspaceRefusal(f"owner finalization read does not settle: {exc.code}") from exc
         try:
             if committed:
                 self.journal.complete(owner, call, raw)
@@ -521,8 +535,7 @@ class Effects:
         serialized = documents.body(source)
         # Preparation survives a crash before retaining or before the first upload.
         if call.prepared:
-            prepared = canonical_json.decode(call.prepared)
-            if prepared.get("source") != serialized:
+            if canonical_json.decode_as(call.prepared, _Staged).source != serialized:
                 raise WorkspaceRefusal("publication input changed its retained native subject")
         else:
             self.journal.check_active(owner, call)
@@ -620,9 +633,7 @@ class Effects:
         call: Call,
         request: effect_interfaces.AttachAssessment,
         client: PublicationClient,
-    ) -> Any:
-        from . import machine_assessment
-
+    ) -> AssessmentRef:
         report, producer = machine_assessment.read_file(
             self.workspace,
             owner,
@@ -651,28 +662,22 @@ class Effects:
                 report,
                 workloads,
             )
+            frozen = _Assessed(request.report.ref, request.workloads.ref, verdict, producer)
             call = self.journal.freeze(
-                owner,
-                call,
-                canonical_json.encode(
-                    {
-                        "kind": "assessment",
-                        "report": request.report.ref,
-                        "workloads": request.workloads.ref,
-                        "verdict": verdict,
-                        "producer": producer,
-                    }
-                ),
+                owner, call, canonical_json.encode(msgspec.to_builtins(frozen))
             )
         else:
-            frozen = canonical_json.decode(call.prepared)
-            if (
-                frozen.get("report") != request.report.ref
-                or frozen.get("workloads") != request.workloads.ref
-                or frozen.get("producer") != producer
+            frozen = canonical_json.decode_as(call.prepared, _Assessed)
+            if (frozen.report, frozen.workloads, frozen.producer) != (
+                request.report.ref,
+                request.workloads.ref,
+                producer,
             ):
                 raise WorkspaceRefusal("assessment changed its frozen source identity")
-            verdict = frozen["verdict"]
         return attach_assessment(
-            client, request.checkpoint, report, verdict, lambda: self._before_write(owner, call)
+            client,
+            request.checkpoint,
+            report,
+            frozen.verdict,
+            lambda: self._before_write(owner, call),
         )

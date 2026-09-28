@@ -383,7 +383,7 @@ Path(sys.argv[2]).write_text(sent[0]["payload"])
         "tags": {},
         "wire_count": 3,
     }
-    assert models["model"]["producer_request_id"] == "producer"
+    assert models["model"].producer_request_id == "producer"
     body = canonical_json.decode(frozen)
     for wrong in [
         body["payload"],
@@ -401,7 +401,7 @@ Path(sys.argv[2]).write_text(sent[0]["payload"])
     # happen to be named payload and models. No heuristic peeks inside user data.
     from dataclasses import replace
 
-    assert arguments(replace(target, serving_envelope=False), frozen) == (frozen, body)
+    assert arguments(replace(target, serving_envelope=False), frozen) == (frozen, {})
     caller = output / "uses.py"
     caller.write_text(
         "from serving_fixture import generate, Result\n"

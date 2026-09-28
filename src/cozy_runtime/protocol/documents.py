@@ -208,9 +208,15 @@ def parse[M: Message](data: bytes, cls: type[M]) -> M:
     want = doc_format(cls.DESCRIPTOR.full_name)
     if value.get("format") != want:
         raise DocumentError("unknown_format", f"{value.get('format')!r} is not {want!r}")
+    return from_body({key: item for key, item in value.items() if key != "format"}, cls)
+
+
+def from_body[M: Message](value: object, cls: type[M]) -> M:
+    """A message's fields as another document embeds them -> the typed message, refused as
+    `parse` refuses."""
     _integers_only(value)
     message = cls()
-    _fill(message, {key: item for key, item in value.items() if key != "format"})
+    _fill(message, _object(value, cls.DESCRIPTOR.full_name))
     return message
 
 

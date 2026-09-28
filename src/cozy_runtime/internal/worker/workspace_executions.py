@@ -10,7 +10,7 @@ import base64
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -18,6 +18,7 @@ from typing import Any, Literal, cast
 import msgspec
 
 from cozy_runtime import canonical_json
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.machine_publication import PublicationRefusal, output_destination
 from cozy_runtime.internal.worker.workspace import Journal, Row, Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -93,24 +94,52 @@ class Receipt:
     publication_authorization_id: str = ""
 
 
-@dataclass(frozen=True)
-class State:
-    request_id: str
-    attempt_ordinal: int
-    generation: int
-    state: str
-    collected: bool
-    sequence: int
+class State(msgspec.Struct, frozen=True):
+    """An execution's state, as a control command's journaled answer (`execution_commands`)."""
 
-    def document(self) -> dict[str, Any]:
-        return {
-            "request_id": self.request_id,
-            "attempt_ordinal": self.attempt_ordinal,
-            "generation": self.generation,
-            "state": self.state,
-            "collected": self.collected,
-            "sequence": self.sequence,
-        }
+    request_id: str = ""
+    attempt_ordinal: int = 0
+    generation: int = 0
+    state: str = ""
+    collected: bool = False
+    sequence: int = 0
+
+    def encode(self) -> bytes:
+        return canonical_json.encode(msgspec.to_builtins(self))
+
+
+def _placement(kind: type, value: object) -> pb.Placement:
+    if kind is not pb.Placement:
+        raise NotImplementedError(kind)
+    return documents.from_body(value, pb.Placement)
+
+
+class PreparedInstallation(msgspec.Struct, frozen=True):
+    """An installation the execution may run, and the placement it was prepared under."""
+
+    installation_id: str = ""
+    placement: pb.Placement = msgspec.field(default_factory=pb.Placement)
+
+
+class Preparation(msgspec.Struct, frozen=True):
+    """An execution's retained preparation (`executions.preparation`), decoded once."""
+
+    #: the base64 `DesiredWorkerState` its placement or job directive converges
+    state: str = ""
+    installations: dict[str, PreparedInstallation] = {}
+    #: the wire minor its root was admitted under; a release root keeps none
+    wire_minor: int | msgspec.UnsetType = msgspec.UNSET
+
+    @classmethod
+    def read(cls, raw: bytes) -> Preparation:
+        return cls.of(canonical_json.decode(raw)) if raw else cls()
+
+    @classmethod
+    def of(cls, document: Mapping[str, object]) -> Preparation:
+        return msgspec.convert(document, cls, strict=True, dec_hook=_placement)
+
+    def desired(self) -> pb.DesiredWorkerState:
+        return pb.DesiredWorkerState.FromString(base64.b64decode(self.state, validate=True))
 
 
 class ExecutionRow(msgspec.Struct, frozen=True):
@@ -565,7 +594,7 @@ class Executions:
                 request = parent[0]
         raise WorkspaceRefusal("execution has no bounded scheduling ancestry")
 
-    def record(self, owner: str, request: str, kind: str, document: dict[str, Any]) -> None:
+    def record(self, owner: str, request: str, kind: str, document: Mapping[str, Json]) -> None:
         """Journal one bounded worker observation on an execution, terminal or not."""
         with self.workspace.locked() as db, transaction(db):
             self._event(db, self._row(db, owner, request), kind, canonical_json.encode(document))
@@ -587,15 +616,19 @@ class Executions:
                 "SELECT preparation FROM executions WHERE collected=0 AND preparation<>x''"
             ).fetchall()
         return {
-            str(identifier)
+            identifier
             for row in rows
-            for identifier in canonical_json.decode(row["preparation"]).get("installations", {})
+            for identifier in Preparation.read(row["preparation"]).installations
         }
 
     def preparation(self, owner: str, request: str) -> dict[str, Any]:
         with self.workspace.locked() as db:
             raw = self._row(db, owner, request)["preparation"]
             return cast(dict[str, Any], canonical_json.decode(raw)) if raw else {}
+
+    def prepared(self, owner: str, request: str) -> Preparation:
+        with self.workspace.locked() as db:
+            return Preparation.read(self._row(db, owner, request)["preparation"])
 
     def wire_minor(self, owner: str, request: str) -> int:
         """The wire minor this execution was admitted under: its root's submitting Claim.
@@ -604,12 +637,11 @@ class Executions:
         which forgets every control stream, cannot change what accepted work may do.
         """
         root, _ = self.scheduling_root(owner, request)
-        prepared = self.preparation(owner, root)
-        if "wire_minor" in prepared:
-            return int(prepared["wire_minor"])
-        # A root accepted before the minor was retained: its owner's prepared state names it.
-        state = pb.DesiredWorkerState.FromString(base64.b64decode(prepared.get("state", "")))
-        return state.wire_minor
+        prepared = self.prepared(owner, root)
+        if prepared.wire_minor is not msgspec.UNSET:
+            return prepared.wire_minor
+        # A root that retained no minor (a release root): its prepared state names it.
+        return prepared.desired().wire_minor
 
     def assigned_here(self, owner: str, request: str, ordinal: int, worker_boot: str) -> bool:
         from .workspace_recovery import process_identity
@@ -886,7 +918,9 @@ class Executions:
                     db, row, "running", canonical_json.encode({"generation": row["generation"]})
                 )
 
-    def progress(self, owner: str, request: str, ordinal: int, document: dict[str, Any]) -> None:
+    def progress(
+        self, owner: str, request: str, ordinal: int, document: Mapping[str, Json]
+    ) -> None:
         """Telemetry for a held execution, if any; recorded with the next journal access."""
         raw = canonical_json.encode(document)
         if len(raw) > MAX_EVENT_BYTES:
@@ -903,7 +937,7 @@ class Executions:
 
         self.workspace.defer(write)
 
-    def notice(self, owner: str, request: str, kind: str, document: dict[str, Any]) -> int:
+    def notice(self, owner: str, request: str, kind: str, document: Mapping[str, Json]) -> int:
         """A durable effect fact on the execution in any state: its owner acts on it."""
         raw = canonical_json.encode(document)
         with self.workspace.locked() as db, transaction(db):
@@ -984,9 +1018,7 @@ class Executions:
             if previous is not None:
                 if previous["intent"] != intent:
                     raise WorkspaceRefusal("execution command identity changed")
-                answered = canonical_json.decode(previous["response"])
-                known = State.__dataclass_fields__
-                return State(**{k: v for k, v in answered.items() if k in known})
+                return canonical_json.decode_as(previous["response"], State)
             if row["generation"] != expected_generation:
                 raise StaleExecutionGeneration("execution command generation is stale")
             state, ordinal, desired = row["state"], row["ordinal"], row["desired"]
@@ -994,7 +1026,7 @@ class Executions:
                 result = self._state(row)
                 db.execute(
                     "INSERT INTO execution_commands VALUES(?,?,?,?,?)",
-                    (owner, request, command_id, intent, canonical_json.encode(result.document())),
+                    (owner, request, command_id, intent, result.encode()),
                 )
                 return result
             if action == "resume":
@@ -1040,7 +1072,7 @@ class Executions:
             result = self._state(self._row(db, owner, request))
             db.execute(
                 "INSERT INTO execution_commands VALUES(?,?,?,?,?)",
-                (owner, request, command_id, intent, canonical_json.encode(result.document())),
+                (owner, request, command_id, intent, result.encode()),
             )
             return result
 

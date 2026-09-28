@@ -3,6 +3,7 @@
 import hashlib
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -79,19 +80,23 @@ def test_serving_association_uses_only_the_selected_exact_placement() -> None:
     entry = next(row for row in placement["entrypoints"] if row["name"] == "upscale")
     artifact = next(row["manifest"] for row in placement["models"] if row["id"] == "upscaler")
     checkpoint = artifact["digest"]
-    intent = {"request": {"upscaler": {"manifest": artifact}, "seed": 1234}}
-    spec = {
-        "payload_digest": documents.spell(
-            hashlib.sha256(canonical_json.encode(intent["request"])).digest()
-        ),
-        "installation_id": placement["installation_id"],
-        "serving": {
-            "bindings_digest": placement["bindings_digest"],
-            "entrypoint_binding_digest": entry["entrypoint_binding_digest"],
-        },
-    }
+    request = {"upscaler": {"manifest": artifact}, "seed": 1234}
+    intent = machine_assessment.Intent("module", "export", request)
     installation = placement["installation_id"]
-    preparation = canonical_json.encode({"installations": {installation: {"placement": placement}}})
+    spec = pb.InvocationSpec(
+        payload_digest=documents.spell(hashlib.sha256(canonical_json.encode(request)).digest()),
+        installation_id=installation,
+        serving=pb.ServingInvocationSpec(
+            bindings_digest=placement["bindings_digest"],
+            entrypoint_binding_digest=entry["entrypoint_binding_digest"],
+        ),
+    )
+
+    def prepared(placement: dict[str, Any]) -> bytes:
+        held = {"placement": placement, "installation_id": installation}
+        return canonical_json.encode({"installations": {installation: held}})
+
+    preparation = prepared(placement)
     call = canonical_json.encode(
         {"kind": "serving", "installation_id": installation, "entrypoint": "upscale"}
     )
@@ -105,22 +110,19 @@ def test_serving_association_uses_only_the_selected_exact_placement() -> None:
             spec, intent, preparation, call, placement["models"][0]["manifest"]["digest"]
         )
     changed = deepcopy(spec)
-    changed["serving"]["bindings_digest"] = "sha256:" + "11" * 32
+    changed.serving.bindings_digest = "sha256:" + "11" * 32
     with pytest.raises(PublicationRefusal, match="binding_mismatch"):
         machine_assessment.render_arguments(changed, intent, preparation, call, checkpoint)
     changed = deepcopy(spec)
-    changed["installation_id"] = "install-other"
+    changed.installation_id = "install-other"
     with pytest.raises(PublicationRefusal, match="binding_mismatch"):
         machine_assessment.render_arguments(changed, intent, preparation, call, checkpoint)
-    changed_intent = deepcopy(intent)
-    changed_intent["request"]["seed"] = 1235
+    changed_intent = machine_assessment.Intent("module", "export", request | {"seed": 1235})
     with pytest.raises(PublicationRefusal, match="binding_mismatch"):
         machine_assessment.render_arguments(spec, changed_intent, preparation, call, checkpoint)
     changed_placement = deepcopy(placement)
     selected = next(row for row in changed_placement["entrypoints"] if row["name"] == "upscale")
     selected["slots"][0]["components"][0]["model_id"] = "h3"
-    mixed = canonical_json.encode(
-        {"installations": {installation: {"placement": changed_placement}}}
-    )
+    mixed = prepared(changed_placement)
     with pytest.raises(PublicationRefusal, match="binding_mismatch"):
         machine_assessment.render_arguments(spec, intent, mixed, call, checkpoint)

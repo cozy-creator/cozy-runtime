@@ -175,6 +175,12 @@ class _Finalization(msgspec.Struct, frozen=True):
     error: _Failure | None = None
 
 
+class _Refused(msgspec.Struct, frozen=True):
+    """Hub's error answer."""
+
+    error: _Failure = msgspec.field(default_factory=_Failure)
+
+
 class _Report(msgspec.Struct, frozen=True):
     digest: str
     length: int
@@ -495,24 +501,22 @@ def _settle(
     return _checkpointed(view.result, operation, checkpoint, objects)
 
 
-#: Hub codes of the owner's finalization read meaning no finalize ever reached it.
-FINALIZATION_ABSENT = frozenset({"publication.not_found", "publication.finalization_absent"})
-
-
 def settle_checkpoint(
-    view: Mapping[str, object],
+    body: bytes,
     *,
     operation: str,
     checkpoint: CheckpointRef,
     objects: Mapping[str, int],
 ) -> CheckpointRef:
-    """Settle a sent finalize from a finalization document another reader fetched."""
+    """Settle a sent finalize from the finalization status another reader fetched."""
     path, _ = _checkpoint_inputs(operation, checkpoint, objects)
-    try:
-        finalization = msgspec.convert(dict(view), _Finalization)
-    except msgspec.ValidationError as exc:
-        raise PublicationRefusal("publication.response_invalid") from exc
-    return _settle(finalization, path, operation, checkpoint, objects)
+    return _settle(_decode(body, _Finalization), path, operation, checkpoint, objects)
+
+
+def finalization_absent(body: bytes) -> bool:
+    """Whether another reader's 404 finalization read says no finalize ever reached Hub."""
+    code = _decode(body, _Refused).error.code
+    return code in {"publication.not_found", "publication.finalization_absent"}
 
 
 def reconcile_checkpoint(

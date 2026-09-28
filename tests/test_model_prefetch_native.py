@@ -13,10 +13,11 @@ from typing import Any, cast
 
 import tensorfs
 
+from cozy_runtime import canonical_json
 from cozy_runtime.internal import hostfacts
 from cozy_runtime.internal.worker import store_gc
 from cozy_runtime.internal.worker.machine_child_target import Target
-from cozy_runtime.internal.worker.machine_serving import Serving
+from cozy_runtime.internal.worker.machine_serving import Serving, arguments
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Call
@@ -147,14 +148,10 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         first = serving._shared("owner", call, target, request, {}, speculative=True)
         assert started.wait(5)
         # A's image becomes available later. It must not change the preparation key.
-        joined = serving._shared(
-            "owner",
-            call,
-            target,
-            request,
-            {"image": "now-available", "model": None},
-            speculative=False,
+        _, models = arguments(
+            target, canonical_json.encode({"image": "now-available", "model": None})
         )
+        joined = serving._shared("owner", call, target, request, models, speculative=False)
         assert joined is first and joined is not None
         release.set()
         prepared = joined.result(5)

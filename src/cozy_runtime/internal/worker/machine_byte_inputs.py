@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from collections.abc import Iterator, Mapping
+from typing import TYPE_CHECKING, NamedTuple
+
+import msgspec
 
 from cozy_runtime.author._media import admits, normalize
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from . import byte_inputs, machine_models, workspace_byte_outputs
+from . import byte_inputs, grants, machine_models, workspace_byte_outputs
 from .workspace import Workspace, WorkspaceRefusal
 
 if TYPE_CHECKING:
@@ -17,13 +20,47 @@ if TYPE_CHECKING:
     from .calls import Calls
 
 
+class Bound(msgspec.Struct, frozen=True):
+    """A field's declared `asset_bound`; absent limits are the input plane's own."""
+
+    max_bytes: int = byte_inputs.MAX_BYTES
+    media_types: tuple[str, ...] = ()
+
+    @property
+    def limit(self) -> int:
+        return min(self.max_bytes, byte_inputs.MAX_BYTES)
+
+    def admits(self, media_type: str) -> bool:
+        return not self.media_types or media_type in self.media_types
+
+
+_UNDECLARED = Bound()
+
+
+class Leaf(NamedTuple):
+    name: str
+    order: int
+    kind: str  # "tree", or the asset kind of a file
+    digest: str
+    bound: Bound
+
+
+class _Received(msgspec.Struct, frozen=True):
+    """A byte capability the parent holds (`Calls.received_inputs` metadata)."""
+
+    kind: str
+    digest: str
+    media_type: str
+    length: int = 0  # a file's; a tree's is its manifest's
+
+
 def _leaves(
-    value: Any,
-    schema: Any,
+    value: Json,
+    schema: Json,
     path: tuple[str | int, ...] = (),
     order: int = 0,
-    bound: dict[str, Any] | None = None,
-) -> Iterator[tuple[str, int, str, str, dict[str, Any]]]:
+    bound: Bound = _UNDECLARED,
+) -> Iterator[Leaf]:
     if not isinstance(schema, dict):
         return
     if schema.get("asset") or schema.get("input") == "tree":
@@ -35,7 +72,7 @@ def _leaves(
         if not isinstance(value, str):
             raise WorkspaceRefusal("native child input must carry an exact digest reference")
         documents.raw(value)
-        yield name, order, str(schema.get("asset") or "tree"), value, bound or {}
+        yield Leaf(name, order, str(schema.get("asset") or "tree"), value, bound)
     elif "fields" in schema and isinstance(value, dict):
         for field in schema["fields"]:
             if field["name"] in value:
@@ -44,7 +81,9 @@ def _leaves(
                     field["type"],
                     (*path, field["name"]),
                     order,
-                    field.get("asset_bound", bound),
+                    msgspec.convert(field["asset_bound"], Bound, strict=True)
+                    if "asset_bound" in field
+                    else bound,
                 )
     elif "list" in schema and isinstance(value, list):
         for index, item in enumerate(value):
@@ -79,34 +118,37 @@ def inputs(
     owner: str,
     parent: AttemptRecord,
     recipient: str,
-    schema: Any,
-    arguments: dict[str, Any],
+    schema: Json,
+    arguments: Json,
     calls: Calls,
 ) -> tuple[list[pb.InputBinding], list[pb.InputAccess]]:
     """Acquire recipient custody before dispatch; existing grant loaders own byte access."""
     selected = list(_leaves(arguments, schema))
     if not selected:
         return [], []
-    candidates = calls.received_inputs(parent)
+    candidates = [
+        (msgspec.convert(metadata, _Received, strict=True), source)
+        for metadata, source in calls.received_inputs(parent)
+    ]
     if parent.grant is not None:
         for entry in parent.grant.inputs.values():
             if entry.native_tree is not None:
+                tree = entry.kind_mime == byte_inputs.TREE_MIME or entry.input_id.startswith(
+                    "tree:"
+                )
+                media_type = (
+                    parent.inputs[entry.input_id].media_type
+                    if entry.input_id in parent.inputs
+                    else normalize(entry.kind_mime)
+                )
                 candidates.append(
                     (
-                        {
-                            "kind": "tree"
-                            if entry.kind_mime == byte_inputs.TREE_MIME
-                            or entry.input_id.startswith("tree:")
-                            else "file",
-                            "digest": documents.spell(entry.digest),
-                            "length": entry.length,
-                            "content_bytes": entry.native_tree.source.content_bytes,
-                            "media_type": (
-                                parent.inputs[entry.input_id].media_type
-                                if entry.input_id in parent.inputs
-                                else normalize(entry.kind_mime)
-                            ),
-                        },
+                        _Received(
+                            "tree" if tree else "file",
+                            documents.spell(entry.digest),
+                            media_type,
+                            entry.length,
+                        ),
                         entry.native_tree,
                     )
                 )
@@ -115,18 +157,17 @@ def inputs(
         matches = [
             (metadata, source)
             for metadata, source in candidates
-            if metadata["digest"] == digest
-            and (metadata["kind"] == "tree") == (kind == "tree")
-            and (kind == "tree" or admits(kind, metadata["media_type"]))
-            and (not bound.get("media_types") or metadata["media_type"] in bound["media_types"])
+            if metadata.digest == digest
+            and (metadata.kind == "tree") == (kind == "tree")
+            and (kind == "tree" or admits(kind, metadata.media_type))
+            and bound.admits(metadata.media_type)
         ]
         if not matches:
             raise WorkspaceRefusal("native child input has no exact parent capability")
         metadata, source = matches[0]
-        size = source.source.content_bytes
-        if size > min(bound.get("max_bytes") or byte_inputs.MAX_BYTES, byte_inputs.MAX_BYTES):
+        if source.source.content_bytes > bound.limit:
             raise WorkspaceRefusal("native child input exceeds its declared byte bound")
-        media = metadata["media_type"]
+        media = metadata.media_type
         with workspace_byte_outputs.leased(workspace, owner, source) as (_, _, members):
             if kind == "tree":
                 if digest != documents.spell(source.source.manifest.digest):
@@ -134,7 +175,7 @@ def inputs(
                 length, media = source.source.manifest.length, byte_inputs.TREE_MIME
             else:
                 blob = byte_inputs.file_member(source, members)
-                if (digest, metadata["length"]) != ("sha256:" + blob.sha256, blob.length):
+                if (digest, metadata.length) != ("sha256:" + blob.sha256, blob.length):
                     raise WorkspaceRefusal("native child file differs from its source payload")
                 length = blob.length
             retained = machine_models.retain_bytes(
@@ -160,12 +201,10 @@ def retain_root(
     workspace: Workspace,
     owner: str,
     offer: pb.AttemptOffer,
-    schema: Any,
-    arguments: dict[str, Any],
+    schema: Json,
+    arguments: Mapping[str, Json],
 ) -> None:
     """Acquire execution custody before acceptance without changing replay identity."""
-    from . import grants
-
     selected = list(_leaves(arguments, schema))
     native = {
         item.input_id: item.native_tree
@@ -174,16 +213,15 @@ def retain_root(
     }
     if not selected and not native:
         return
-    if set(native) != {item[0] for item in selected}:
+    if set(native) != {leaf.name for leaf in selected}:
         raise WorkspaceRefusal("root byte inputs differ from the captured job arguments")
     spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
     bound = grants.bind(spec, offer.grant, offer.invocation_spec_digest)
     # Validate every declared object before creating any execution recipient.
     for name, order, kind, digest, capacity in selected:
         source, entry = native[name], bound.inputs[name]
-        limit = min(capacity.get("max_bytes") or byte_inputs.MAX_BYTES, byte_inputs.MAX_BYTES)
         if (
-            source.source.content_bytes > limit
+            source.source.content_bytes > capacity.limit
             or documents.spell(entry.digest) != digest
             or entry.order != order
         ):
@@ -201,13 +239,10 @@ def retain_root(
                 if (
                     (digest, entry.length) != ("sha256:" + blob.sha256, blob.length)
                     or not admits(kind, entry.kind_mime)
-                    or (
-                        capacity.get("media_types")
-                        and entry.kind_mime not in capacity["media_types"]
-                    )
+                    or not capacity.admits(entry.kind_mime)
                 ):
                     raise WorkspaceRefusal("root file differs from its exact native payload")
-    for name, _, _, _, _ in selected:
+    for name, *_ in selected:
         machine_models.retain_bytes(
             workspace, owner, offer.request_id, "input/" + name, native[name].source
         )

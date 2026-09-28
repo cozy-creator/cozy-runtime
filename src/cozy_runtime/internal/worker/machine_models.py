@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Iterator, Mapping
 
 import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
+from cozy_runtime.internal import package_interface
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker import grants, workspace_byte_outputs
 from cozy_runtime.internal.worker.workspace import HeldTree, NativeHold, Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_byte_outputs import Blob, FileMember
@@ -169,44 +170,40 @@ def inputs(
     owner: str,
     recipient: str,
     entrypoint: str,
-    declaration: dict[str, Any],
-    arguments: dict[str, Any],
+    declaration: Mapping[str, object],
+    arguments: Mapping[str, Json],
 ) -> tuple[list[pb.InputBinding], list[pb.InputAccess]]:
-    retain_result(workspace, owner, recipient, "input", arguments, declaration["request"])
-    if not declaration.get("models"):
-        return [], []
+    declared = msgspec.convert(declaration, package_interface.CallableDoc, strict=True)
+    retain_result(workspace, owner, recipient, "input", arguments, declared.request)
     bindings, accesses = [], []
-    for model in declaration.get("models", []):
+    for model in declared.models:
         prefix = f"{entrypoint}.models."
-        parameter = model["path"].removeprefix(prefix)
-        if not model["path"].startswith(prefix) or not parameter.isidentifier():
+        parameter = model.path.removeprefix(prefix)
+        if not model.path.startswith(prefix) or not parameter.isidentifier():
             raise WorkspaceRefusal("captured Model parameter has no exact declared name")
-        artifact = arguments.get(parameter)
-        if not isinstance(artifact, dict):
+        supplied = arguments.get(parameter)
+        if not isinstance(supplied, dict):
             raise WorkspaceRefusal("captured Model input requires a retained artifact")
-        retention, held = retain(
-            workspace,
-            owner,
-            recipient,
-            "input/" + parameter,
-            msgspec.convert(artifact, type=ModelArtifact, strict=True),
-        )
-        manifest = artifact["manifest"]
-        if documents.body(held.manifest) != manifest:
+        artifact = msgspec.convert(supplied, type=ModelArtifact, strict=True)
+        retention, held = retain(workspace, owner, recipient, "input/" + parameter, artifact)
+        manifest = artifact.manifest
+        if (documents.spell(held.manifest.digest), held.manifest.length) != (
+            manifest.digest,
+            manifest.length,
+        ):
             raise WorkspaceRefusal("native Model custody differs from its argument")
         with workspace.held_model(owner, retention, held.manifest):
             bindings.append(
                 pb.InputBinding(
                     input_id=grants.MODEL_PREFIX + parameter,
-                    digest=manifest["digest"],
-                    length=manifest["length"],
+                    digest=manifest.digest,
+                    length=manifest.length,
                     kind_mime=grants.MODEL_MIME,
                 )
             )
             accesses.append(
                 pb.InputAccess(
-                    input_id=grants.MODEL_PREFIX + parameter,
-                    url="model://" + manifest["digest"],
+                    input_id=grants.MODEL_PREFIX + parameter, url="model://" + manifest.digest
                 )
             )
     return bindings, accesses
@@ -216,7 +213,7 @@ def _path(parent: str, key: str | int) -> str:
     return parent + "/" + str(key).replace("~", "~0").replace("/", "~1")
 
 
-def artifacts(value: Any, schema: Any, path: str = "") -> Iterator[tuple[str, ModelArtifact]]:
+def artifacts(value: Json, schema: Json, path: str = "") -> Iterator[tuple[str, ModelArtifact]]:
     """Select only schema-declared Models, preserving arbitrary user JSON unchanged."""
     if not isinstance(schema, dict):
         return
@@ -264,8 +261,8 @@ def retain_result(
     owner: str,
     recipient: str,
     path: str,
-    value: Any,
-    schema: Any,
+    value: Json,
+    schema: Json,
 ) -> None:
     result_records(workspace, owner, recipient, value, schema, prefix=path)
 
@@ -274,8 +271,8 @@ def result_records(
     workspace: Workspace,
     owner: str,
     recipient: str,
-    value: Any,
-    schema: Any,
+    value: Json,
+    schema: Json,
     *,
     prefix: str = "result",
 ) -> list[tuple[str, bytes, pb.DerivedRetentionRequest]]:

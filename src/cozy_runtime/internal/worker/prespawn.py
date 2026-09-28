@@ -30,22 +30,31 @@ import json
 import os
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+import msgspec
 
 from cozy_runtime.internal import accel, package_installation, package_interface
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.executor_commands import Start, Warm
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.gpu_scheduler import Ordinals, model_degrees, width_for
 from cozy_runtime.internal.worker.lanes import DeviceLane, lane_id_for
+from cozy_runtime.internal.worker.stage_progress import Emit
 
 if TYPE_CHECKING:
     from .machine_child_target import Target
     from .session import Worker
 
-Emit = Callable[[dict[str, Any]], None]
+
+class _Cards(msgspec.Struct, frozen=True):
+    """The GPU scheduler's `view()`: each root's leased cards and each grant's root and cards."""
+
+    leases: dict[str, tuple[int, ...]]
+    grants: dict[str, tuple[str, tuple[int, ...]]]
 
 
 @dataclass
@@ -65,10 +74,10 @@ class Slot:
     executor: Executor | None = None
     #: where phase rows go; rows wait here until a root's journal takes them
     sink: Emit | None = None
-    frames: list[dict[str, Any]] = field(default_factory=list)
+    frames: list[dict[str, Json]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def emit(self, frame: dict[str, Any]) -> None:
+    def emit(self, frame: dict[str, Json]) -> None:
         with self.lock:
             sink = self.sink
             if sink is None:
@@ -107,7 +116,7 @@ class Prespawns:
             self.worker.note("warm", f"no prespawn: {type(exc).__name__}: {exc}"[:256])
 
     def request_landing(
-        self, installation: str, interface: bytes, models: Sequence[Mapping[str, Any]]
+        self, installation: str, interface: bytes, models: Sequence[object]
     ) -> None:
         """Start `installation`'s executor while the Host lands the weights of a root not yet
         submitted, on free cards; the first root to ask for it or be granted there adopts it."""
@@ -121,7 +130,7 @@ class Prespawns:
         root: str,
         installation: str,
         interface: bytes,
-        models: Sequence[Mapping[str, Any]],
+        models: Sequence[object],
         emit: Emit | None,
     ) -> None:
         worker = self.worker
@@ -198,7 +207,7 @@ class Prespawns:
             installed = package_installation.open_installation(
                 Path(worker.options.install_root or ""), slot.installation
             )
-            interface = package_interface.read_bytes(raw, "prespawned installation")
+            interface = package_interface.parse(raw, "prespawned installation")
             path = (
                 Path(worker.options.artifact_cache or "")
                 / "selections"
@@ -217,7 +226,7 @@ class Prespawns:
                 Start(
                     devices=lane.devices,
                     sequence_parallel_degree=len(slot.ordinals),
-                    application=str(interface.get("application", "")),
+                    application=interface.application,
                     package_interface=str(path),
                 ),
                 timeout=None,
@@ -286,7 +295,7 @@ class Prespawns:
             return self.slots.get((slot.installation, slot.ordinals)) is slot
 
     def _busy(self, ordinals: Ordinals) -> bool:
-        grants = self.worker.gpu.view()["grants"]
+        grants = msgspec.convert(self.worker.gpu.view(), _Cards, strict=True).grants
         return any(set(held) & set(ordinals) for _root, held in grants.values())
 
     def ordinals(self, installation: str) -> Ordinals:
@@ -335,19 +344,20 @@ class Prespawns:
     def reconcile(
         self,
         roots: Mapping[str, int],
-        view: Mapping[str, Any],
+        view: Mapping[str, object],
         installations: Mapping[str, str] | None = None,
     ) -> None:
         """Yield every slot another root now leases or was granted a card of, and every slot
         whose root ended. A slot started for no root is adopted by the one root granted its
         cards for its installation (`installations`: grant key -> installation)."""
         installations = installations or {}
+        cards = msgspec.convert(view, _Cards, strict=True)
         taken: dict[int, set[str]] = {}
         granted: dict[int, set[tuple[str, str]]] = {}
-        for root, held in view["leases"].items():
+        for root, held in cards.leases.items():
             for ordinal in held:
                 taken.setdefault(ordinal, set()).add(root)
-        for key, (root, held) in view["grants"].items():
+        for key, (root, held) in cards.grants.items():
             for ordinal in held:
                 taken.setdefault(ordinal, set()).add(root)
                 granted.setdefault(ordinal, set()).add((root, installations.get(key, "")))

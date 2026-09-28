@@ -12,15 +12,16 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol
 
 import msgspec
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author._artifacts import ModelArtifact
+from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_BYTES
 from cozy_runtime.author._executor_requests import Answer, ModelPrefetch
 from cozy_runtime.internal import fill, package_installation
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -40,6 +41,7 @@ from . import (
 )
 from .machine_child_target import Target
 from .preparations import Preparations
+from .stage_progress import Emit
 from .supervisor import Unit
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
@@ -50,7 +52,7 @@ if TYPE_CHECKING:
     from .session import Worker
 
 
-def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
+def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, ModelArtifact]]:
     """Generated library callers separate Model overrides from the handler payload.
 
     A registered self-call uses the original invocable's flat request. The frozen
@@ -62,7 +64,7 @@ def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
     names = {model["path"].rpartition(".")[2] for model in target.declaration.get("models", [])}
     if not target.serving_envelope:
         payload = {key: item for key, item in value.items() if key not in names}
-        return canonical_json.encode(payload), value
+        return canonical_json.encode(payload), _models(value, names)
     # Envelope fields another generator adds are ignored; absent models select defaults.
     models = value.get("models", {})
     if (
@@ -71,15 +73,38 @@ def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
         or not set(models) <= names
     ):
         raise WorkspaceRefusal("generated serving call has invalid payload or Model slots")
-    return canonical_json.encode(value["payload"]), {
-        name: model for name, model in models.items() if model is not None
+    return canonical_json.encode(value["payload"]), _models(models, names)
+
+
+def _models(values: dict[str, Json], names: set[str]) -> dict[str, ModelArtifact]:
+    return {
+        name: msgspec.convert(value, type=ModelArtifact, strict=True)
+        for name, value in values.items()
+        if name in names and value is not None
     }
+
+
+class _Default(msgspec.Struct, frozen=True):
+    """A selected Model default (`machine_model_defaults.select`), as preparation reads it."""
+
+    parameter: str
+    repository: str
+    manifest: ObjectRef
+
+
+class _Cancellation(Protocol):
+    @property
+    def cancelled(self) -> bool: ...
+
+    def cancel(self) -> None: ...
 
 
 @dataclass
 class Prepared:
-    placement: dict[str, Any]
-    defaults: list[dict[str, Any]]
+    #: the prepared `Placement` document
+    placement: dict[str, object]
+    #: `machine_model_defaults.select`'s rows, which only its `inputs` reads
+    defaults: list[dict[str, object]]
     access: contextlib.ExitStack
     generation: int = 0  # `store_gc.generation` when its bytes were verified
 
@@ -167,7 +192,7 @@ class Serving:
         #: call units waiting for a free preparation entry; any completion pokes them
         self.waiting: set[str] = set()
         # A preparation with no parent execution (a release root) reports here instead.
-        self.observers: dict[str, Callable[[dict[str, Any]], None]] = {}
+        self.observers: dict[str, Emit] = {}
         #: the tenth of its download each prefetch last narrated, until the download lands
         self.narrated: dict[str, int] = {}
         # Read leases die with the old process, but durable temporary holds need
@@ -193,15 +218,16 @@ class Serving:
                 (owner, recipient),
             )
 
-    def _progress(self, call: Call, request: pb.ChildCallRequest, frame: dict[str, Any]) -> None:
+    def _progress(self, call: Call, request: pb.ChildCallRequest, frame: dict[str, object]) -> None:
         if (observer := self.observers.get(call.child_request)) is not None:
             observer(frame)
             return
         if call.call_index == (1 << 32) - 1 and frame.get("kind") == "progress":
             # A prefetch narrates on its parent's durable log, so once per tenth of its bytes:
             # every position filled 4,065 of run 1510's 4,096 events and hid its segments.
-            if isinstance(total := frame.get("total"), int) and total > 0:
-                tenth = int(frame.get("position", 0)) * 10 // total
+            total, position = frame.get("total"), frame.get("position", 0)
+            if isinstance(total, int) and isinstance(position, int) and total > 0:
+                tenth = position * 10 // total
                 if tenth <= self.narrated.get(call.child_request, -1):
                     return
                 self.narrated[call.child_request] = tenth
@@ -266,13 +292,11 @@ class Serving:
         raw = hint.payload.encode()
         if len(raw) > MAX_CALL_BYTES:
             raise WorkspaceRefusal("model prefetch exceeds its inline bound")
-        models = canonical_json.decode(raw)
+        selected = canonical_json.decode_as(raw, dict[str, ModelArtifact | None])
         names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
-        if not isinstance(models, dict) or not models.keys() <= names:
+        if not selected.keys() <= names:
             raise WorkspaceRefusal("model prefetch names an undeclared Model slot")
-        for artifact in models.values():
-            if artifact is not None:
-                msgspec.convert(artifact, type=ModelArtifact, strict=True)
+        models = {name: artifact for name, artifact in selected.items() if artifact is not None}
         # Only the preparation context is needed; this is never journal.accept'ed
         # and does not reserve a managed-call index or a child execution.
         call = Call(
@@ -310,14 +334,10 @@ class Serving:
         call: Call,
         target: Target,
         request: pb.ChildCallRequest,
-        models: dict[str, Any],
+        models: dict[str, ModelArtifact],
         *,
         speculative: bool,
     ) -> Future[Prepared] | None:
-        names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
-        models = {
-            name: value for name, value in models.items() if name in names and value is not None
-        }
         defaults = machine_model_defaults.select(self.worker, owner, call, target, models)
         identity = hashlib.sha256(
             canonical_json.encode(
@@ -326,7 +346,7 @@ class Serving:
                     "installation": target.installation_id,
                     "interface": target.prepared_installation["placement"]["package_interface"],
                     "entrypoint": target.entrypoint,
-                    "models": models,
+                    "models": msgspec.to_builtins(models),
                     "defaults": defaults,
                 }
             )
@@ -430,25 +450,19 @@ class Serving:
         prepared = None
         try:
             prepared = future.result()
-            placement = prepared.placement
+            placement = documents.from_body(prepared.placement, pb.Placement)
             # The durable row holds the placement template; its devices are chosen at grant.
-            names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
             for name, supplied in models.items():
-                if name in names and supplied is not None:
-                    machine_models.retain(
-                        workspace,
-                        owner,
-                        call.child_request,
-                        "input/" + name,
-                        msgspec.convert(supplied, type=ModelArtifact, strict=True),
-                    )
+                machine_models.retain(
+                    workspace, owner, call.child_request, "input/" + name, supplied
+                )
             journal.check_active(owner, call)
             selected = next(
-                (entry for entry in placement["entrypoints"] if entry["name"] == target.entrypoint),
-                None,
+                (entry for entry in placement.entrypoints if entry.name == target.entrypoint), None
             )
             if selected is None:
                 raise WorkspaceRefusal("captured inference has no complete prepared Model binding")
+            binding = documents.spell(selected.entrypoint_binding_digest)
             digest = documents.spell(hashlib.sha256(payload).digest())
             with workspace.locked() as db:
                 row = db.execute(
@@ -457,7 +471,7 @@ class Serving:
                 ).fetchone()
             parent = documents.parse(row["invocation"], pb.InvocationSpec)
             spec = pb.InvocationSpec(
-                installation_id=placement["installation_id"],
+                installation_id=placement.installation_id,
                 payload_digest=digest,
                 inputs=[
                     pb.InputBinding(
@@ -473,9 +487,9 @@ class Serving:
                 ],
                 deadline_unix_ms=parent.deadline_unix_ms,
                 serving=pb.ServingInvocationSpec(
-                    entrypoint_binding_digest=selected["entrypoint_binding_digest"],
-                    attempt_binding_id=selected["entrypoint_binding_digest"],
-                    bindings_digest=placement["bindings_digest"],
+                    entrypoint_binding_digest=binding,
+                    attempt_binding_id=binding,
+                    bindings_digest=documents.spell(placement.bindings_digest),
                 ),
             )
             if request.HasField("capture"):
@@ -503,7 +517,7 @@ class Serving:
             offer = pb.AttemptOffer(
                 request_id=call.child_request,
                 attempt_ordinal=1,
-                placement_id=placement["placement_id"],
+                placement_id=placement.placement_id,
                 invocation_spec_canonical_bytes=raw,
                 invocation_spec_digest=identity,
                 grant=pb.DeliveryGrant(
@@ -524,7 +538,7 @@ class Serving:
             offer.grant.inputs.extend(default_access)
             offer.grant.inputs.sort(key=lambda entry: entry.input_id)
             placement_bytes = canonical_json.encode(
-                {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
+                {"format": "cozy.worker.v1.PlacementSet/1", "placements": [prepared.placement]}
             )
             desired = pb.DesiredWorkerState(
                 wire_minor=executions.wire_minor(owner, call.parent_request),
@@ -538,7 +552,7 @@ class Serving:
                 {
                     "installations": {
                         target.installation_id: {
-                            "placement": placement,
+                            "placement": prepared.placement,
                             "installation_id": target.installation_id,
                         }
                     },
@@ -562,7 +576,7 @@ class Serving:
                     owner,
                     offer,
                     catalog,
-                    resident=self.worker.holds_construction(selected["entrypoint_binding_digest"]),
+                    resident=self.worker.holds_construction(binding),
                 )
                 for entry in catalog.values():
                     machine_checkpoint_inputs.retain(workspace, owner, offer, entry)
@@ -590,9 +604,9 @@ class Serving:
         target: Target,
         request: pb.ChildCallRequest,
         *,
-        model_arguments: dict[str, Any] | None = None,
-        defaults: list[dict[str, Any]] | None = None,
-        cancellation: Any = None,
+        model_arguments: dict[str, ModelArtifact] | None = None,
+        defaults: list[dict[str, object]] | None = None,
+        cancellation: _Cancellation | None = None,
         retention_prefix: str = "input/",
     ) -> Prepared:
         worker, workspace = self.worker, self.worker.workspace
@@ -608,6 +622,7 @@ class Serving:
                 defaults = machine_model_defaults.select(
                     worker, owner, call, target, model_arguments
                 )
+        selected = [msgspec.convert(row, _Default, strict=True) for row in defaults]
         access = contextlib.ExitStack()
         try:
             for model in target.declaration["models"]:
@@ -615,10 +630,9 @@ class Serving:
                 path = model["path"]
                 if not path.startswith(prefix) or not path.removeprefix(prefix).isidentifier():
                     raise WorkspaceRefusal("captured serving Model has no exact parameter")
-                supplied = model_arguments.get(path.removeprefix(prefix))
-                if supplied is None:
+                artifact = model_arguments.get(path.removeprefix(prefix))
+                if artifact is None:
                     continue
-                artifact = msgspec.convert(supplied, type=ModelArtifact, strict=True)
                 retention, held = machine_models.retain(
                     workspace,
                     owner,
@@ -643,7 +657,7 @@ class Serving:
                 )
                 for model in native
             }
-            expected.update({row["parameter"]: row["manifest"] for row in defaults})
+            expected.update({row.parameter: msgspec.to_builtins(row.manifest) for row in selected})
             with worker.control_lock:
                 candidates = [
                     dict(value.document) for value in worker.prepared_installations.values()
@@ -704,12 +718,12 @@ class Serving:
                                     "package": (prepared.get("package") or prepared["development"])[
                                         "package"
                                     ],
-                                    "slot": target.entrypoint + ".models." + row["parameter"],
-                                    "model": row["repository"],
-                                    "manifest": row["manifest"]["digest"],
-                                    "manifest_length": row["manifest"]["length"],
+                                    "slot": target.entrypoint + ".models." + row.parameter,
+                                    "model": row.repository,
+                                    "manifest": row.manifest.digest,
+                                    "manifest_length": row.manifest.length,
                                 }
-                                for row in defaults
+                                for row in selected
                             ],
                             prepared=prepared,
                             installed=installed,
@@ -720,7 +734,7 @@ class Serving:
 
                 check = _Compatibility(
                     compatible,
-                    [row["manifest"]["digest"] for row in defaults],
+                    [row.manifest.digest for row in selected],
                     workspace.store_root,
                     cancellation.cancel,
                 )

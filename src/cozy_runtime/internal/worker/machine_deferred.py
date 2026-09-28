@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import base64
 import threading
+from collections.abc import Mapping
 from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from google.protobuf import json_format
-
 from cozy_runtime.internal import package_interface
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.machine_builtin import Preparing
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
@@ -22,26 +22,26 @@ if TYPE_CHECKING:
 Installed = dict[str, Any]
 
 
-def rows(capture: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def rows(capture: Mapping[str, object]) -> dict[str, pb.DeferredInstallation]:
     """The capture's deferred callees by key, each checked against its own release."""
-    out: dict[str, dict[str, Any]] = {}
+    out: dict[str, pb.DeferredInstallation] = {}
     listed = capture.get("deferred_installations", [])
     if not isinstance(listed, list) or len(listed) > 128:
         raise WorkspaceRefusal("execution capture has unbounded deferred installations")
-    for row in listed:
-        key = row.get("key", "") if isinstance(row, dict) else ""
-        if not key or key in out or key != f"{row.get('package', '')}@{row.get('release', '')}":
+    for row in (documents.from_body(item, pb.DeferredInstallation) for item in listed):
+        if not row.key or row.key in out or row.key != f"{row.package}@{row.release}":
             raise WorkspaceRefusal("execution capture repeats or misnames a deferred installation")
-        out[key] = row
+        out[row.key] = row
     return out
 
 
-def interface(row: dict[str, Any]) -> dict[str, Any]:
+def interface(row: pb.DeferredInstallation | Mapping[str, object]) -> dict[str, Json]:
     """The release interface a deferred row carries, for binding before it is installed."""
-    raw = row.get("preparation", {}).get("package_interface", "")
-    if not raw:
+    if not isinstance(row, pb.DeferredInstallation):  # machine_release_roots' facts document
+        row = documents.from_body(row, pb.DeferredInstallation)
+    if not row.preparation.package_interface:
         raise WorkspaceRefusal("deferred installation carries no release interface")
-    return package_interface.read_bytes(base64.b64decode(raw, validate=True), "deferred release")
+    return package_interface.read_bytes(row.preparation.package_interface, "deferred release")
 
 
 class Deferred:
@@ -53,10 +53,10 @@ class Deferred:
         self.lock = threading.Lock()
         self.installs: dict[str, Future[Installed]] = {}
 
-    def prepared(self, row: Installed, *, wait: bool = True) -> Installed:
+    def prepared(self, row: pb.DeferredInstallation, *, wait: bool = True) -> Installed:
         """The callee's retained installation. A call waits for it; a hint (`wait=False`)
         starts it and gets `Preparing` until it lands."""
-        key = row["key"]
+        key = row.key
         with self.lock:
             future = self.installs.get(key)
             mine = future is None or (future.done() and future.exception() is not None)
@@ -73,18 +73,17 @@ class Deferred:
             raise Preparing(key)
         return future.result()
 
-    def _prepare(self, row: Installed, future: Future[Installed]) -> None:
+    def _prepare(self, row: pb.DeferredInstallation, future: Future[Installed]) -> None:
         from .session import read_placement_set
 
-        key = row["key"]
+        key = row.key
         try:
-            request = json_format.ParseDict(
-                row["preparation"], pb.PreparePackageSetRequest(), ignore_unknown_fields=True
-            )
+            request = pb.PreparePackageSetRequest()
+            request.CopyFrom(row.preparation)
             request.install_root = str(Path(self.worker.options.install_root or ""))
             self.worker.note("preparation", f"installing {key} on its first selection")
             entries = read_placement_set(self.worker.prepare_package_set(request).placement_set)
-            if len(entries) != 1 or entries[0].get("package", {}).get("package") != row["package"]:
+            if len(entries) != 1 or entries[0].get("package", {}).get("package") != row.package:
                 raise WorkspaceRefusal("deferred preparation returned another installation")
             future.set_result(
                 {"placement": entries[0], "installation_id": entries[0]["installation_id"]}
