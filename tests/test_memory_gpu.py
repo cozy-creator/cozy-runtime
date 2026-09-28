@@ -572,6 +572,7 @@ def test_a_capacity_failure_is_not_inherited_and_poisons_no_binding(
     finally:
         neighbour.close()
     assert not succeeded(refused), refused
-    body = card.call("p-big-2", "burst", "p", scratch_bytes=free() - store.weight_bytes)
+    # The same call, sized to fit the card alone beside a fresh executor's context.
+    body = card.call("p-big-2", "burst", "p", scratch_bytes=free() - 3 * store.weight_bytes)
     assert succeeded(body), body
     assert succeeded(card.call("p-2", "touch", "p"))

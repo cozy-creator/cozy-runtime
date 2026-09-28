@@ -135,7 +135,6 @@ def test_actual_h3_scopes_fit_each_rank_without_dividing_weights(
     selected = binding(tmp_path)
     lane = assign(selected, degree)
     assert lane.degree == degree
-    assert selected.group_weight_bytes() == TEXT_ENCODER
     # Header estimates must not reject the text encoder before construction can
     # discover its smaller no-split block working set.
     assert assign(selected, degree, TEXT_ENCODER - 1).degree == degree
@@ -168,13 +167,12 @@ def test_header_scopes_defer_fit_to_bounded_construction(tmp_path: Path, scope: 
 def test_independent_slots_of_the_same_checkpoint_still_sum(tmp_path: Path) -> None:
     selected = binding(tmp_path, slots=2)
     assert len(selected.model_bindings()) == 2
-    assert selected.group_weight_bytes() == 2 * TEXT_ENCODER
     assert assign(selected).degree == 2
 
 
 def test_missing_component_still_refuses_native_model_fit(tmp_path: Path) -> None:
     selected = binding(tmp_path, scope="missing_component")
-    assert selected.group_weight_bytes() >= selected.logical_weight_bytes > 0
+    assert selected.logical_weight_bytes > 0
     # The same native fit used by StreamingFillBackend before it reserves any
     # destinations still judges the deliberately incomplete construction.
     verdict = tensorfs.fit(

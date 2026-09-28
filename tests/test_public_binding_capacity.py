@@ -14,7 +14,6 @@ from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
 from cozy_runtime.protocol import documents
 from test_device_lanes import _config
-from test_group_stage_residency import binding as independent_slots
 from test_group_stage_residency import current_placement
 
 FIXTURE = Path(__file__).parent / "testdata/h3-public-binding-sets"
@@ -72,8 +71,6 @@ def test_public_alternative_entrypoints_preserve_the_joint_call_cost(
     assert {b.entrypoint for b in bindings.values()} == {"fl2va_turbo", "ref2va_turbo"}
     assert len(placement.models) == 4  # Equal checkpoints were not deduplicated.
     assert all(len(b.model_bindings()) == 2 for b in bindings.values())
-    assert {b.group_weight_bytes() for b in bindings.values()} == {JOINT_WEIGHTS}
-    assert sum(b.group_weight_bytes() for b in bindings.values()) == 2 * JOINT_WEIGHTS
     assert len({b.construction_key() for b in bindings.values()}) == 1
     placement.device_pin = tuple(range(degree))
     monkeypatch.setattr(accel, "host_backend_family", lambda: "cuda")
@@ -91,8 +88,3 @@ def test_public_alternative_entrypoints_preserve_the_joint_call_cost(
         assert lane is not None and lane.degree == degree
     finally:
         worker.shutdown()
-
-
-def test_two_simultaneous_slots_still_add_even_for_the_same_checkpoint(tmp_path: Path) -> None:
-    selected = independent_slots(tmp_path, slots=2)
-    assert selected.group_weight_bytes() == 2 * 51_506_191_840 > ROOM

@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
@@ -478,7 +478,6 @@ class Acquirer:
                     f"{name}: duplicate or malformed interface model slot",
                 )
             members: list[ModelBinding] = []
-            staged_weights: list[int] = []
             for slot in slots:
                 path = f"{name}.models.{slot['slot']}"
                 declared = described_by_path.get(path)
@@ -509,9 +508,6 @@ class Acquirer:
                         "selected_model_manifest_unavailable",
                         f"{type(exc).__name__}: {exc}",
                     ) from exc
-                staged_weights.append(
-                    _staged_weight_bytes(logical, snapshots, declared.component_use)
-                )
                 degrees = (
                     ()
                     if declared.sequence_parallel is msgspec.UNSET
@@ -566,7 +562,6 @@ class Acquirer:
                 components=first.components,
                 snapshots=first.snapshots,
                 logical_weight_bytes=sum(member.logical_weight_bytes for member in model_set),
-                staged_weight_bytes=sum(staged_weights),
                 package=(
                     f"{development['package']}@{development['release']}"
                     if development
@@ -590,20 +585,6 @@ class Acquirer:
                 "PlacementSet/1 does not select the required interface entrypoints",
             )
         return bindings, count
-
-
-def _staged_weight_bytes(
-    logical: Mapping[str, int],
-    snapshots: Mapping[str, str],
-    scopes: Mapping[str, Sequence[str]],
-) -> int:
-    """The largest declared component-use scope's logical bytes. The whole model when the
-    scopes do not cover every constructed component, or one of them is absent from its
-    header: only model-code-fit judges that mismatch, and it cannot justify cheap staging."""
-    covered = {name for names in scopes.values() for name in names}
-    if not scopes or covered != set(snapshots) or set(logical) != set(snapshots):
-        return sum(logical.values())
-    return max(sum(logical[name] for name in set(names)) for names in scopes.values())
 
 
 def _verify_file(path: Path, digest: str, length: int | None) -> None:

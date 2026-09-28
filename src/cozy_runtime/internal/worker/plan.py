@@ -315,10 +315,6 @@ class PreparedModel:
     """Which offered variant this generation actually read."""
     model_deliveries: tuple[tuple[str, ModelDelivery], ...] = ()
     """Named child deliveries when this prepare constructed several models."""
-    weight_bytes: int = 0
-    """What the fill COMMITTED, measured. Distinct from the binding's declared
-    `logical_weight_bytes` and from the ledger's live resident map — three different facts
-    that were all called some form of "vram bytes"."""
     attention: Boot | None = None
     """WHAT THE RUNTIME PINNED on this generation's attention sites (cr-124): kernel per
     component, and what this device and image offered. A construction fact, read once at
@@ -334,7 +330,6 @@ class PreparedModel:
             delivery_rung=read.delivery.rung,
             delivery_variant=read.delivery.variant,
             model_deliveries=tuple((name, models[name]) for name in sorted(models)),
-            weight_bytes=read.facts.filled_bytes,
             attention=read.facts.attention,
         )
 
@@ -429,7 +424,6 @@ class DeclaredBinding:
     """The LOGICAL weight bytes of this model's constructed components, from their checkpoint
     headers: what their destinations hold, never the smaller stored closure of an encoded
     checkpoint. Not what is resident, and not what an attempt reserves."""
-    staged_weight_bytes: int | None = None
     """Header-derived weight requirement of the largest declared component-use scope,
     summed across independent model slots. A preflight bound, excluding derived buffers,
     fill scratch and activations; actual executor preparation still measures those."""
@@ -490,14 +484,6 @@ class DeclaredBinding:
             declared = set(model.sequence_parallel_degrees)
             degrees = declared if degrees is None else degrees & declared
         return tuple(sorted(degrees or ()))
-
-    def group_weight_bytes(self) -> int:
-        """Declared per-rank weight requirement before measured executor preparation."""
-        return (
-            self.logical_weight_bytes
-            if self.staged_weight_bytes is None
-            else self.staged_weight_bytes
-        )
 
     def snapshot_for(self, component: str) -> str:
         """This component's snapshot, or the binding's own when the map omits it."""
