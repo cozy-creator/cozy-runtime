@@ -701,6 +701,19 @@ def test_a_fifth_reference_waits_on_its_own_runs_calls_and_names_itself(
     fifth = references[4] + "#1"
     assert waits == [{"key": fifth, "width": 1, "blocked_by": ["C"], "function": "qwen"}]
     downloaded.set()
+    machine.tick()
+    # Each call's executor start is its own timed phase on the parent's record, never folded
+    # into "Checking model inputs" (run 1516: 12.6 s of start and load read as the check).
+    started = [
+        fields
+        for event in machine.executions.events(OWNER, "C").events
+        if event.kind == "log"
+        and (fields := canonical_json.decode(event.body)["payload"].get("fields", {})).get("phase")
+        == "Starting model executor"
+    ]
+    assert sorted(row["child_request"] for row in started) == sorted(references)
+    assert all(row["completed"] and row["elapsed_ms"] >= 0 for row in started), started
+    assert "Starting model executor" in stages()
 
 
 def test_weightless_calls_never_wait_and_a_device_job_waits_for_the_holder(

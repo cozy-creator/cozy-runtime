@@ -2658,6 +2658,43 @@ class Worker:
         with contextlib.suppress(WorkspaceRefusal, OSError):
             self.emit_progress(request, attempt, frame)
 
+    @contextlib.contextmanager
+    def _call_phase(self, request: str, attempt: int, name: str) -> Iterator[None]:
+        """Name one piece of a call's work before its handler, as `Checking model inputs` is
+        named: the parent's journal (a root's own) shows it under the call's label and times
+        it, so an executor start or a weight load never reads as the input check (run 1516)."""
+        calls = self.machine_calls
+        call = calls.journal.child(self.fence.record_owner_id, request) if calls else None
+        journal, label = (request, attempt), ""
+        if call is not None:
+            journal = (call.parent_request, call.parent_ordinal)
+            label = self.calls.progress_label(*journal, call.call_index)
+        self._journal_row(
+            *journal, {"kind": "progress", "stage": f"{label} / {name}" if label else name}
+        )
+        started, began, completed = time.time(), time.perf_counter(), False
+        try:
+            yield
+            completed = True
+        finally:
+            fields = {
+                "child_request": request,
+                "phase": name,
+                "completed": completed,
+                "started_unix_ms": int(started * 1000),
+                "elapsed_ms": round((time.perf_counter() - began) * 1000, 3),
+            }
+            self._journal_row(
+                *journal,
+                {
+                    "kind": "log",
+                    "name": name,
+                    "value": "info",
+                    "at_unix_ms": int(time.time() * 1000),
+                    "fields": fields,
+                },
+            )
+
     def dispatch_machine(
         self,
         unit: Unit,
@@ -2676,11 +2713,7 @@ class Worker:
                 self.executions.preparation(owner, request), offered, ordinals
             )
             if preparation and not self._prepare_execution(
-                preparation,
-                request,
-                functools.partial(self._journal_row, request, offered.attempt_ordinal),
-                unit,
-                moved,
+                preparation, request, offered.attempt_ordinal, unit, moved
             ):
                 return None
         except (Stopping, *execution_unit.FENCES):
@@ -2749,7 +2782,7 @@ class Worker:
         self,
         preparation: dict[str, Any],
         request_id: str,
-        journal: Callable[[dict[str, Any]], None],
+        attempt: int,
         unit: Unit,
         moved: Callable[[], bool],
     ) -> bool:
@@ -2767,7 +2800,7 @@ class Worker:
                 machine_capture.restore(self, preparation)
             return machine_slots.ensure(self, request_id, desired.job, binding)
         if desired.WhichOneof("mode") == "placement_set":
-            return self._bind_replica(preparation, desired, journal, unit, moved)
+            return self._bind_replica(preparation, desired, request_id, attempt, unit, moved)
         # A device job replaces the whole worker: it waits for every held attempt to leave.
         with self.control_lock:
             desired.revision = self.accepted.accepted_desired_state_revision
@@ -2801,7 +2834,8 @@ class Worker:
         self,
         preparation: dict[str, Any],
         desired: pb.DesiredWorkerState,
-        journal: Callable[[dict[str, Any]], None],
+        request_id: str,
+        attempt: int,
         unit: Unit,
         moved: Callable[[], bool],
     ) -> bool:
@@ -2844,9 +2878,10 @@ class Worker:
                 continue
             try:
                 if hosted is None:
-                    self._activate_replica(row, desired, preparation, pin, journal)
+                    self._activate_replica(row, desired, preparation, pin, request_id, attempt)
                 else:
-                    self._revive(placement_id)
+                    with self._call_phase(request_id, attempt, "Starting model executor"):
+                        self._revive(placement_id)
             finally:
                 with self.control_lock:
                     self._activating.discard(placement_id)
@@ -2876,7 +2911,8 @@ class Worker:
         desired: pb.DesiredWorkerState,
         preparation: dict[str, Any],
         pin: tuple[int, ...] | None,
-        journal: Callable[[dict[str, Any]], None],
+        request_id: str,
+        attempt: int,
     ) -> None:
         """Acquire, bind and start this replica's executor; a device job's leaves first."""
         with self.control_lock:
@@ -2884,6 +2920,7 @@ class Worker:
         placement = self._placement_from_entry(row, desired.placement_set.placement_set_digest)
         placement.device_pin = pin
         # The process started beside this replica's download (h3a-087), when there is one.
+        journal = functools.partial(self._journal_row, request_id, attempt)
         warm = self.prespawns.claim(placement.installation_id, pin or (), journal)
         supervision = (
             warm.supervision
@@ -2902,13 +2939,20 @@ class Worker:
                 self.lanes.envelope.forget("")
                 self.job_slots.pop("envelope", None)
             self.accepted.mode = "serving"
+        # A claimed prespawn journals its own start; only a start this call pays is named here.
+        starting = (
+            self._call_phase(request_id, attempt, "Starting model executor")
+            if warm is None
+            else contextlib.nullcontext()
+        )
         try:
-            if warm is not None:
-                self.prespawns.settle(warm, placement.placement_id)
-            current = self.supervision.current
-            if job and current is not None:
-                self.supervision.retire_current(current, "a machine replica takes the devices")
-            self._activate_hosted(hosted, None)
+            with starting:
+                if warm is not None:
+                    self.prespawns.settle(warm, placement.placement_id)
+                current = self.supervision.current
+                if job and current is not None:
+                    self.supervision.retire_current(current, "a machine replica takes the devices")
+                self._activate_hosted(hosted, None)
         except Exception as exc:
             hosted.latched = f"replica_activation_failed: {type(exc).__name__}: {exc}"[:200]
             self._settle()
@@ -5690,7 +5734,8 @@ class Worker:
                 or not {b.entrypoint_binding_digest for b in group} <= loaded.bindings
             )
         if load:
-            self._load_construction(tenant, executor, key, group)
+            with self._call_phase(attempt.request_id, attempt.attempt, "Loading model weights"):
+                self._load_construction(tenant, executor, key, group)
         if executor.active != key:
             self._activate_construction(tenant, executor, key)
 
