@@ -59,3 +59,18 @@ jobs:
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
             .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main(["tests/test_primary_handoff.py", "-q", "-rs"]))'
+      # Older Runtimes' executors against this worker; their locked environments are cached.
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cozy-runtime-tests
+          key: cross-version-seam-${{ hashFiles('tests/test_cross_version_seam.py') }}
+      - name: Cross-version seam under real supervised processes
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: |
+          sudo systemd-run --wait --pipe --collect \
+            --unit="cozy-runtime-seam-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main(["tests/test_cross_version_seam.py", "-q", "-rs"]))'
