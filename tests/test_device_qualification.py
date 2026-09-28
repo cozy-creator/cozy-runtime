@@ -23,8 +23,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -169,17 +167,6 @@ def test_only_evidence_that_actually_ran_crosses_the_boundary() -> None:
             assert pair not in reported or _also_ran(result, pair), (
                 f"{pair} was reported on evidence that did not run"
             )
-
-
-def test_the_cli_verb_refuses_an_unknown_argument() -> None:
-    done = subprocess.run(
-        [sys.executable, "-m", "cozy_runtime.cli.main", "capability", "--devices", "0"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert done.returncode != 0
-    assert "invalid argument" in done.stderr, done.stderr
 
 
 def _note_dtypes(record: dict[str, Any]) -> set[str]:

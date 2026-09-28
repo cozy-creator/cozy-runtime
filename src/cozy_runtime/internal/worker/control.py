@@ -162,13 +162,8 @@ class _RuntimeWeightsServicer:
 
 
 class GrpcControlHost:
-    """The production host: one gRPC server on the worker's own local binding.
-
-    `listen` is `unix:<path>` where the OS has a Unix socket worth having, or a loopback
-    `host:port` on win32 (cr-020 item 4; `host:0` binds an ephemeral port). Either way the
-    REAL bound address is published to `addr_file` after bind, which is the whole discovery
-    contract — the Windows ephemeral port is only knowable here.
-    """
+    """The production host: one gRPC server on the worker's `host:port` (`host:0` binds an
+    ephemeral port). The REAL bound address is published to `addr_file` after bind."""
 
     persistent = True
 
@@ -289,13 +284,10 @@ class GrpcControlHost:
             pb_grpc.add_RuntimeWeightsServicer_to_server(
                 _RuntimeWeightsServicer(self.weights), server
             )
-        if self.listen.startswith("unix:"):
-            server.add_insecure_port(self.listen)
-            address = self.listen
-        elif self.tls_cert is not None and self.tls_key is not None:
+        if self.tls_cert is not None and self.tls_key is not None:
             # THE REMOTE LEG (cl-015 / #445): one-way TLS with the worker's own cert —
             # self-signed on a pod, the owner pins it from the provision record — plus the
-            # bearer owner token verified at Claim. Never mTLS (#445).
+            # RecordOwner's signed Claim. Never mTLS (#445).
             credentials = grpc.ssl_server_credentials(
                 [(self.tls_key.read_bytes(), self.tls_cert.read_bytes())]
             )
@@ -592,8 +584,6 @@ def _prepared[Q, R](
 
 
 def _loopback_preparation_listener(listen: str) -> bool:
-    if listen.startswith("unix:"):
-        return True
     return listen.rsplit(":", 1)[0] in {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 

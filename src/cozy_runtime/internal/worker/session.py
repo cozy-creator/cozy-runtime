@@ -29,7 +29,6 @@ RUNNING process's loaded modules and mapped libraries, not against the import gr
 
 from __future__ import annotations
 
-import argparse
 import base64
 import contextlib
 import dataclasses
@@ -43,7 +42,6 @@ import queue
 import re
 import resource
 import shutil
-import signal
 import sys
 import threading
 import time
@@ -71,7 +69,7 @@ from cozy_runtime.internal import (
     readiness,
     weights_sink,
 )
-from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
+from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.executor_commands import (
     Activate,
     Binding,
@@ -133,9 +131,7 @@ from cozy_runtime.internal.worker.child import (
 )
 from cozy_runtime.internal.worker.control import (
     ControlHost,
-    GrpcControlHost,
     WatchFanout,
-    _loopback_preparation_listener,
 )
 from cozy_runtime.internal.worker.gpu_scheduler import GpuBroker, width_for
 from cozy_runtime.internal.worker.lanes import (
@@ -360,9 +356,8 @@ class WorkerOptions:
     """THE EXECUTION-PATH OVERRIDE (cr-125): one attention kernel by name, or empty.
 
     Empty is the whole product. A serving worker picks the fastest kernel this device and
-    image support by itself (cr-124) and has no knob at all — `_SERVE_FLAGS` is a closed
-    set and this is deliberately not in it, so the guard is the absence of a way to say it
-    rather than a condition somebody could get wrong. Only the ephemeral worker
+    image support by itself (cr-124) and has no knob at all: the guard is the absence of a
+    way to say it rather than a condition somebody could get wrong. Only the ephemeral worker
     `cozy-runtime run` builds in memory can carry one, which is exactly the dev mode the
     A/B needs: two runs, two pins, one honest comparison.
 
@@ -983,6 +978,10 @@ class Worker:
     executor management)."""
 
     def __init__(self, config: RuntimeConfig, options: WorkerOptions, host: ControlHost) -> None:
+        if host.persistent and not config.record_owner_public_key:
+            # A listener admits only the RecordOwner's signed Claim; only an in-process
+            # owner, which has no transport, has no key.
+            raise ValueError("a worker listener needs the RecordOwner's public key")
         self.config = config
         self.options = options
         self.host = host
@@ -2248,7 +2247,7 @@ class Worker:
             elif claim.worker_id not in ("", self.options.worker_id) or (
                 claim.worker_boot_id not in ("", self.fence.worker_boot_id)
             ):
-                # No key: the listener is a 0700 unix socket, whose permission is the proof.
+                # No key: the owner is in this process and has no transport.
                 raise WorkspaceRefusal("workspace call names another worker lifetime")
             return self.fence.record_owner_id
 
@@ -3659,8 +3658,8 @@ class Worker:
             send(pb.WorkerFrame(claim_ack=ack))
             return 0, queue.Queue()
 
-        # THE CREDENTIAL CHECK: a TCP listener verifies the RecordOwner's signed Claim; a
-        # keyless worker listens only on a 0700 unix socket, whose permission is the proof.
+        # THE CREDENTIAL CHECK: a listener verifies the RecordOwner's signed Claim; only an
+        # in-process owner, which has no transport, goes without.
         if self.config.record_owner_public_key:
             try:
                 downloads.verify_claim_proof(
@@ -8208,204 +8207,3 @@ class Worker:
 
 #: Written when the worker FAILS: the next boot fails what it held instead of running it.
 FAILED_MARKER = "worker-failed.json"
-
-#: The loopback names a worker may serve plaintext, and without a bootstrap credential.
-LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
-
-
-def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
-    """Parse the launch flags and run ONE worker hosting the protocol.
-
-    Not an entrypoint: the config arrives from whoever already read it (one config per
-    process, cl-004). `--listen` is the local binding this worker SERVES on — the owner
-    dials it; the worker never dials anyone (#436).
-    """
-    parser = argparse.ArgumentParser(description="cozy-runtime worker (no CUDA)")
-    parser.add_argument(
-        "--listen", required=True, help="local binding, e.g. unix:/path/control.sock or 127.0.0.1:0"
-    )
-    parser.add_argument("--root", required=True)
-    parser.add_argument("--worker-id", default="wrk-local")
-    parser.add_argument("--release-id", default="")
-    parser.add_argument("--git-commit", default="")
-    parser.add_argument("--python", default="")
-    parser.add_argument("--accelerator-backend", choices=("", "cuda", "none"), default="")
-    parser.add_argument("--devices", default="0")
-    parser.add_argument(
-        "--grant-root",
-        default="",
-        help="comma-separated directory trees a file:// grant may address (#506b)",
-    )
-    parser.add_argument(
-        "--install-root",
-        default="",
-        help="immutable install root containing exact receipts and content-keyed generations",
-    )
-    parser.add_argument(
-        "--environment-python",
-        default="",
-        help="installed local package Python; with --install-root, supplies dependencies "
-        "for a captured immutable generation",
-    )
-    parser.add_argument(
-        "--artifact-cache",
-        default="",
-        help="where the dynamic acquisition lane writes the exact bytes a placement reaches "
-        "(cr-049); content-addressed, so a replay re-fetches only what is missing",
-    )
-    parser.add_argument(
-        "--tensorfs-root",
-        required=True,
-        help="verified TensorFS store populated from selected model Manifests",
-    )
-    parser.add_argument("--development-project", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--development-package", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--development-release", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--development-installation-id", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--alloc-conf", default="expandable_segments:True")
-    parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--executor-uid", type=int, default=-1, help=argparse.SUPPRESS)
-    parser.add_argument("--executor-gid", type=int, default=-1, help=argparse.SUPPRESS)
-    parser.add_argument("--tls-cert", default="", help="PEM cert for a non-loopback listener")
-    parser.add_argument("--tls-key", default="", help="PEM key for a non-loopback listener")
-    args = parser.parse_args(argv)
-
-    isolated = args.executor_uid >= 0 or args.executor_gid >= 0
-    if isolated and (
-        args.executor_uid <= 0
-        or args.executor_gid <= 0
-        or os.geteuid() != 0
-        or args.executor_uid == os.geteuid()
-    ):
-        print(
-            "[worker] refusing executor identity split: --executor-uid/--executor-gid must "
-            "name a positive non-worker identity and the trusted worker must run as root",
-            file=sys.stderr,
-            flush=True,
-        )
-        return int(Exit.structural)
-    development_values = (
-        args.development_project,
-        args.development_package,
-        args.development_release,
-        args.development_installation_id,
-    )
-    if any(development_values) and not all(development_values):
-        print(
-            "[worker] development project, package, release, and source digest come together",
-            file=sys.stderr,
-            flush=True,
-        )
-        return int(Exit.structural)
-    if all(development_values) and (
-        args.development_package.count("/") != 1
-        or not all(args.development_package.split("/"))
-        or SEMVER.fullmatch(args.development_release) is None
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", args.development_installation_id)
-        is None
-    ):
-        print(
-            "[worker] development package identity, semantic release, or source digest is invalid",
-            file=sys.stderr,
-            flush=True,
-        )
-        return int(Exit.structural)
-    options = WorkerOptions(
-        root=Path(args.root),
-        worker_id=args.worker_id,
-        instance_id=f"ins-{uuid.uuid4().hex[:16]}",
-        release_id=args.release_id,
-        git_commit=args.git_commit,
-        python=args.python,
-        accelerator_backend=args.accelerator_backend,
-        devices=args.devices,
-        grant_roots=tuple(r for r in args.grant_root.split(",") if r),
-        install_root=Path(args.install_root).resolve() if args.install_root else None,
-        environment_python=(
-            Path(args.environment_python).expanduser().parent.resolve()
-            / Path(args.environment_python).name
-            if args.environment_python
-            else None
-        ),
-        tensorfs_root=Path(args.tensorfs_root).resolve(),
-        artifact_cache=Path(args.artifact_cache).resolve() if args.artifact_cache else None,
-        development_project=(
-            Path(args.development_project).resolve() if args.development_project else None
-        ),
-        development_package=args.development_package,
-        development_release=args.development_release,
-        development_installation_id=args.development_installation_id,
-        alloc_conf=args.alloc_conf,
-        threads=args.threads,
-        executor_uid=args.executor_uid,
-        executor_gid=args.executor_gid,
-    )
-    listen = args.listen
-    if listen.startswith("unix:"):
-        refusal = socket_path_refusal(listen[len("unix:") :])
-        if refusal:
-            print(f"[worker] {refusal}", file=sys.stderr, flush=True)
-            return int(Exit.structural)
-    tls_cert = Path(args.tls_cert) if args.tls_cert else None
-    tls_key = Path(args.tls_key) if args.tls_key else None
-    if (tls_cert is None) != (tls_key is None):
-        print("[worker] --tls-cert and --tls-key come together or not at all", file=sys.stderr)
-        return int(Exit.structural)
-    host_part = listen.rsplit(":", 1)[0]
-    remote = not listen.startswith("unix:") and host_part not in LOOPBACK
-    if remote and tls_cert is None:
-        # A worker never listens plaintext off-loopback: the remote leg is TLS + the
-        # bearer owner token, or it does not exist (#445; cr-020 item 4 keeps loopback).
-        print(
-            f"[worker] refusing to bind {listen} without TLS: a non-loopback listener "
-            "requires --tls-cert/--tls-key",
-            file=sys.stderr,
-            flush=True,
-        )
-        return int(Exit.structural)
-    if not listen.startswith("unix:") and not config.record_owner_public_key:
-        print(
-            f"[worker] refusing to bind {listen} without a signed Claim lane: a TCP "
-            "listener needs the RecordOwner's public key; a local worker uses a unix socket",
-            file=sys.stderr,
-            flush=True,
-        )
-        return int(Exit.structural)
-    host = GrpcControlHost(
-        listen, Path(args.root) / "control.addr", tls_cert=tls_cert, tls_key=tls_key
-    )
-    worker = Worker(config, options, host)
-    if _loopback_preparation_listener(listen):
-        host.preparer = worker.prepare_package_set
-        host.local_package_preparer = worker.prepare_local_package
-        host.unpublished_placement_preparer = worker.prepare_unpublished_placement
-        host.numerical_environment = worker.numerical_environment
-        host.workspace_service = worker.workspace_service
-
-    def terminate(signum: int, frame: object) -> None:
-        worker.request_stop()
-        host.stop()
-
-    signal.signal(signal.SIGTERM, terminate)
-    signal.signal(signal.SIGINT, terminate)
-    return worker.run()
-
-
-def main(argv: list[str] | None = None) -> int:
-    """The PROCESS entrypoint: read the ONE config here, then serve.
-
-    A configuration refusal is the worker's own verdict, printed the way every other
-    pre-bind refusal is: a launcher reading this process's output must see WHY nothing
-    bound, and a traceback is not that.
-    """
-    try:
-        config = read_config()
-    except ConfigError as err:
-        print(f"[worker] {err.message}", file=sys.stderr, flush=True)
-        print(f"[worker] remedy: {err.remedy}", file=sys.stderr, flush=True)
-        return int(err.code)
-    return serve_worker(config, argv)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

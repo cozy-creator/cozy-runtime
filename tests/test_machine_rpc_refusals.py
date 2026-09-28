@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 import signed_claims
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
-from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.control import GrpcControlHost, InMemoryControlHost
 from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
@@ -153,3 +153,12 @@ def test_a_verified_proof_stands_for_its_epoch_and_a_changed_one_is_verified(
         assert worker.authorize_workspace(claim) == "owner"
     finally:
         worker.shutdown()
+
+
+def test_a_listener_without_the_record_owners_key_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="public key"):
+        Worker(
+            RuntimeConfig(cozy_home=tmp_path / "home", credentials=Credentials()),
+            WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
+            GrpcControlHost("127.0.0.1:0", tmp_path / "address"),
+        )

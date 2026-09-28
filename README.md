@@ -332,10 +332,9 @@ way: the adapter's one job is fixed, so all that varies is whether the script ha
 `main`, and `author/_script.py`'s `script_signature` is the ONE definition of that shape, run
 by the adapter and the reader over the same parsed tree.
 
-The reader is also what the DEVELOPMENT placement is built from (`cozy-runtime host
---development-project`, `host development-placement`, the worker session's own staging): they
-supervise, they do not execute, so they read the source and take their model slots off the
-interface document. `cozy-runtime run` still imports — it is about to run the package.
+The reader is also what the DEVELOPMENT placement is built from (the worker session's own
+staging): it supervises and does not execute, so it reads the source and takes its model
+slots off the interface document. `cozy-runtime run` still imports — it is about to run the package.
 
 `internal/discovery.py` is the import path and the static reader's ORACLE: it imports exactly
 the ONE `App` export package.toml names, freezes it, and stops. `cozy-runtime --conformance
@@ -611,8 +610,7 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 `examples/marco-polo` is the weightless reference package — one entrypoint, one job, no model
 — and it is what the end-to-end suite builds, installs and runs.
 
-`run` · `serve` · `job` · `ingest` · `doctor` · `hostfacts` land in
-cr-016 over the real attempt kernel.
+`run` and `job` run over the real attempt kernel (cr-016).
 
 **Jobs (cr-009).** A job is an attempt class on the same machinery, not a second runtime:
 `@app.job` over the one invocation kernel, the same worker/executor split, the same

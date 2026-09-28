@@ -1183,6 +1183,9 @@ def serve(payload: Request) -> Result:
                 index.close()
             indexes.clear()
             (root / "control.addr").unlink()
+            # A replaced worker is a new boot: the RecordOwner signs its Claim for that boot.
+            options = dataclasses.replace(options, worker_boot_id="test-boot-2")
+            claim = signed_claims.claim(boot="test-boot-2")
             worker = Worker(config, options, GrpcControlHost("127.0.0.1:0", root / "control.addr"))
             assert not worker.prepared_installations and not worker.engine.jobs
             thread = threading.Thread(target=worker.run, daemon=True)
@@ -1193,6 +1196,8 @@ def serve(payload: Request) -> Result:
             worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda frame: None)
             channel = grpc.insecure_channel((root / "control.addr").read_text().strip())
             client = rpc.WorkerControlStub(channel)
+            query.claim.CopyFrom(claim)
+            submission.claim.CopyFrom(claim)
             query.expected_execution_workspace_id = receipt.execution_workspace_id
             assert client.SubmitMachineExecution(submission, timeout=5) == receipt
             assert not worker.prepared_installations and not worker.engine.jobs

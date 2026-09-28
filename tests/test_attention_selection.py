@@ -34,7 +34,6 @@ from cozy_runtime.author._observations import (
     EventRing,
     ObservationRefusal,
 )
-from cozy_runtime.cli import host
 from cozy_runtime.cli import run as cli_run
 from cozy_runtime.cli.io import CliError
 from cozy_runtime.internal import (
@@ -769,9 +768,6 @@ def test_a_serving_prepare_carries_no_pin_at_all() -> None:
         _binding(), construction="c", devices="0", authorized_device_limit_bytes=7
     )
     assert "attention_pin" not in executor_commands.encode(served)
-    # And nothing can put one there from a `serve` launch: the flag set is CLOSED and does
-    # not carry it, so the guard is the absence of a way to say it rather than a condition.
-    assert not any("attention" in flag for flag in host._SERVE_FLAGS)
     assert WorkerOptions(root=Path("/tmp")).attention_pin == ""
 
 

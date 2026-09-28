@@ -15,21 +15,12 @@ from cozy_runtime.internal.exits import Exit
 BUILT = (
     "run",
     "job",
-    "serve",
     "describe",
-    "bindings",
-    "doctor",
-    "capability",
-    "hostfacts",
     "new",
     "version",
 )
 PRIVATE = (
     "model-ingestion-plan",
-    "builtin-capture",
-    "builtin-prepare",
-    "development-placement",
-    "prepare-package",
     "image-prepare",
     "image-preparation-profile",
     "python-interpreters",
@@ -42,12 +33,7 @@ usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args
 verbs:
   run <fn> [<primary>] [k=v …]   one-shot inference: payload in, outputs to disk, exit
   job <fn> [k=v …]               run one @app.job to completion, same attempt kernel
-  serve --socket <path> <mode>   speak the worker protocol for a RecordOwner
   describe [<fn>]                the PackageInterface, from source alone (no package code runs)
-  bindings                       the RESOLVED binding records this project selects
-  doctor                         this host's device/driver/credential facts
-  capability [--out <path>]      the OBSERVED (encoding, device) qualification of this card
-  hostfacts [<fn>] [k=v …]       this host's capacity facts (exact with a payload)
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
 
@@ -66,18 +52,15 @@ run/job flags:
   --timeout <dur>       attempt deadline (<n>ms|s|m|h)
   --stream              typed deltas as NDJSON
 
-serve storage:
-  --tensorfs-root <dir>    serve selected model Manifests from one explicit local Store
-
 global flags:
   --json           the full typed result as one JSON document
   --full           widen output, lift truncation
   --fields a,b,c   pick columns
   --dir <path>     package project root (default: cwd)
   --package-interface <path>
-                   exact PackageInterface input for describe/bindings (no package import)
+                   exact PackageInterface input for describe (no package import)
   --environment-python <venv/bin/python>
-                   describe/bindings source roots of an explicit venv; never executes it
+                   describe source roots of an explicit venv; never executes it
   --distribution <name>
                    describe one installed wheel in --environment-python, without imports
   --builtin operations
@@ -97,17 +80,7 @@ _VALUE_FLAGS = (
 )
 #: Verbs that own their own flag parsing: everything after the verb belongs to them, so a
 #: payload term like `--in` is not eaten by the global pass.
-_OWNS_ARGS = (
-    "builtin-capture",
-    "builtin-prepare",
-    "run",
-    "job",
-    "hostfacts",
-    "capability",
-    "serve",
-    "development-placement",
-    "prepare-package",
-)
+_OWNS_ARGS = ("run", "job")
 
 
 def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
@@ -195,12 +168,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         from cozy_runtime.cli import model_ingestion
 
         return model_ingestion.run(args, opts)
-    if verb in ("builtin-prepare", "builtin-capture"):
-        from cozy_runtime.cli import builtin_prepare
-
-        return builtin_prepare.run(
-            args, opts, capture=verb == "builtin-capture", dependency_cache=config.dependency_cache
-        )
     if opts.builtin and (
         verb != "describe"
         or opts.distribution
@@ -226,19 +193,18 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             "cozy-runtime describe --distribution <name> --environment-python <venv/bin/python>",
             Exit.usage,
         )
-    if opts.environment_python and verb not in ("describe", "bindings"):
+    if opts.environment_python and verb != "describe":
         raise CliError(
             "usage",
-            "--environment-python belongs only to describe or bindings",
+            "--environment-python belongs only to describe",
             "cozy-runtime describe --environment-python <venv/bin/python>",
             Exit.usage,
         )
-    if opts.package_interface and verb not in ("describe", "bindings"):
+    if opts.package_interface and verb != "describe":
         raise CliError(
             "usage",
-            "--package-interface belongs only to describe or bindings",
-            "use --package-interface <exact-package-interface> with "
-            "cozy-runtime describe or bindings",
+            "--package-interface belongs only to describe",
+            "use --package-interface <exact-package-interface> with cozy-runtime describe",
             Exit.usage,
         )
     if opts.conformance and verb != "describe":
@@ -295,11 +261,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 exc.code, exc.detail, "check Python requirements and uv availability"
             ) from exc
     # Interpreter plumbing stays portable without importing executor-only modules.
-    from cozy_runtime.cli import host as host_verbs
-    from cozy_runtime.cli import hostfacts as hostfacts_verb
     from cozy_runtime.cli import image_prepare as image_prepare_verb
     from cozy_runtime.cli import new as new_verb
-    from cozy_runtime.cli import package_prepare as package_prepare_verbs
     from cozy_runtime.cli import run as run_verb
     from cozy_runtime.cli import version as version_verb
 
@@ -316,38 +279,10 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return new_verb.run(args[0], opts.dir)
     if verb in ("run", "job"):
         return run_verb.run(verb, args, opts, config)
-    if verb == "bindings":
-        if args:
-            raise CliError(
-                "usage",
-                f"bindings takes no arguments, got {len(args)}",
-                "cozy-runtime bindings [--json] [--dir <path>] — it resolves the project's "
-                "declared selection and constructs nothing, so it takes no payload",
-                Exit.usage,
-            )
-        return host_verbs.bindings(opts)
-    if verb == "development-placement":
-        return host_verbs.development_placement(config, args, opts)
-    if verb == "prepare-package":
-        return package_prepare_verbs.prepare_local_package(config, args, opts)
     if verb == "image-prepare":
         return image_prepare_verb.run(args)
     if verb == "image-preparation-profile":
         return image_prepare_verb.profile(args)
-    if verb == "hostfacts":
-        return hostfacts_verb.run(args, opts, config)
-    if verb == "capability":
-        return host_verbs.capability(config, args, opts)
-    if verb == "doctor":
-        if args:
-            raise CliError(
-                "usage",
-                f"doctor takes no arguments, got {len(args)}",
-                "cozy-runtime doctor [--json] — it takes no payload; `cozy-runtime hostfacts` "
-                "is the capacity verb",
-                Exit.usage,
-            )
-        return host_verbs.doctor(config, opts)
     raise CliError(
         "usage",
         f"unknown verb {verb!r}",
@@ -365,12 +300,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(HELP, end="")
             return int(Exit.ok)
         config = read_config()
-        if verb == "serve":
-            from cozy_runtime.cli import host as host_verbs
-
-            # `serve` never returns a Result: it IS the process, and it runs until the
-            # RecordOwner closes the session.
-            return host_verbs.serve(config, args)
         emit(dispatch(verb, args, opts, config), opts)
         return int(Exit.ok)
     except CliError as err:
