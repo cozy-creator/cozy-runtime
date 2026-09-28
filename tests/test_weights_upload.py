@@ -132,7 +132,7 @@ def request(base: str, **overrides: object) -> pb.WeightsUploadRequest:
 def test_upload_streams_the_exact_object_under_the_grant(tmp_path: Path) -> None:
     store = ObjectStore()
     with serving(store) as base:
-        result = exchange(tmp_path, allow_private=True).upload(request(base)).weights_upload_result
+        result = exchange(tmp_path, allow_private=True).upload(request(base))
 
     assert result.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED, result.safe_detail
     assert store.body == OBJECT
@@ -153,7 +153,7 @@ def test_precondition_failure_is_already_present_not_failure(tmp_path: Path) -> 
     store = ObjectStore()
     store.status = 412
     with serving(store) as base:
-        result = exchange(tmp_path, allow_private=True).upload(request(base)).weights_upload_result
+        result = exchange(tmp_path, allow_private=True).upload(request(base))
 
     assert result.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_ALREADY_PRESENT
     assert result.http_status == 412
@@ -180,11 +180,7 @@ def test_a_request_that_does_not_bind_the_held_object_refuses_typed(
 ) -> None:
     store = ObjectStore()
     with serving(store) as base:
-        result = (
-            exchange(tmp_path, allow_private=True)
-            .upload(request(base, **overrides))
-            .weights_upload_result
-        )
+        result = exchange(tmp_path, allow_private=True).upload(request(base, **overrides))
 
     assert result.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
     assert result.refusal == want
@@ -204,7 +200,7 @@ def test_a_grant_naming_an_unreachable_address_is_refused(tmp_path: Path) -> Non
     with serving(store) as base:
         message = request(base)
         message.grant.url = "http://169.254.169.254/objects/steal"
-        result = exchange(tmp_path, allow_private=False).upload(message).weights_upload_result
+        result = exchange(tmp_path, allow_private=False).upload(message)
 
     assert result.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
     assert result.refusal == pb.WEIGHTS_UPLOAD_REFUSAL_GRANT_REFUSED
@@ -255,21 +251,9 @@ def test_native_output_leases_belong_only_to_active_transfers(tmp_path: Path) ->
                 tensorfs.gc(str(native.root), dry_run=True)
         finally:
             backend.response_gate.set()
-        result = pending.result(timeout=5).weights_upload_result
+        result = pending.result(timeout=5)
     assert result.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED, result.safe_detail
     assert backend.body == b"\x31" * 2048
-    tensorfs.gc(str(native.root))
-    read = exchange.read(
-        pb.WeightsReadRequest(
-            weights_transaction_id=receipt.weights_transaction_id,
-            writer_epoch=1,
-            object_id=row.object_id,
-            source_ref=row.source_ref,
-            read_id="native-read",
-            max_bytes=row.length,
-        )
-    ).weights_read_result
-    assert read.outcome == pb.WEIGHTS_READ_OUTCOME_DATA and read.data == backend.body
     tensorfs.gc(str(native.root))
     assert native.manifest(held.manifest_id)
     exchange.close()

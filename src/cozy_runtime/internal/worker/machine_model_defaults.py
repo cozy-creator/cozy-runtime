@@ -11,11 +11,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from cozy_runtime.internal import fill
-from cozy_runtime.protocol import (
-    CAPTURED_MODEL_DEFAULTS_WIRE_MINOR,
-    MODEL_DEFAULT_GPU_COUNT_WIRE_MINOR,
-    documents,
-)
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import grants, machine_model_resolve
@@ -67,8 +63,6 @@ def verify(
     rows = capture.get("model_defaults", [])
     if not rows:
         return
-    if request.claim.wire_minor < CAPTURED_MODEL_DEFAULTS_WIRE_MINOR:
-        raise WorkspaceRefusal("captured Model defaults require wire56")
     expected: set[tuple[str, str, str]] = set()
     for binding in capture["bindings"]:
         revision, entrypoint = callee(binding), binding["entrypoint"]
@@ -122,8 +116,6 @@ def verify(
             gpus = rung.get("gpus", 0)
             if type(gpus) is not int or gpus < 0:
                 raise WorkspaceRefusal("captured Model default has invalid GPU count")
-            if gpus and request.claim.wire_minor < MODEL_DEFAULT_GPU_COUNT_WIRE_MINOR:
-                raise WorkspaceRefusal("counted Model defaults require wire63")
             selectors.append((gpu.lower(), gpus))
         if len(set(selectors)) != len(selectors):
             raise WorkspaceRefusal("captured Model default repeats a GPU and count selector")

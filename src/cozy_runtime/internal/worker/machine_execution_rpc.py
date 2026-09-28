@@ -14,12 +14,7 @@ import grpc
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, prepare_diagnostics
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
-from cozy_runtime.internal.worker import (
-    machine_capture,
-    machine_release_roots,
-    machine_slots,
-    triage,
-)
+from cozy_runtime.internal.worker import machine_capture, machine_release_roots, triage
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.servicer_context import ServicerContext
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
@@ -30,11 +25,7 @@ from cozy_runtime.internal.worker.workspace_executions import (
     StaleExecutionGeneration,
     State,
 )
-from cozy_runtime.protocol import (
-    MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR,
-    WORKSPACE_FENCED_EXECUTION_WIRE_MINOR,
-    documents,
-)
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
@@ -51,8 +42,6 @@ class MachineExecutionRPC:
 
     def _call[T](self, claim: pb.Claim, context: ServicerContext, operation: Callable[[], T]) -> T:
         try:
-            if claim.wire_minor < WORKSPACE_FENCED_EXECUTION_WIRE_MINOR:
-                raise WorkspaceRefusal("workspace-fenced machine execution requires wire59")
             if self.worker.executions is None:
                 raise WorkspaceRefusal("machine execution workspace is unavailable")
             self.worker.authorize_workspace(claim)
@@ -133,19 +122,7 @@ class MachineExecutionRPC:
                 if options.gpus or options.accelerator_backend == "none"
                 else "",
                 executor_uid_isolation=options.executor_uid >= 0,
-                owner_publication_reconciliation=self.worker.machine_effects is not None,
-                cpu_slot_model_inputs=machine_slots.MODEL_INPUTS,
-                exact_execution_gpus=True,
-                source_credentials=True,
-                deferred_installations=self.worker.machine_calls is not None,
-                resolves_model_defaults=True,
-                release_roots=self.worker.machine_calls is not None,
-                release_root_sources=self.worker.machine_calls is not None,
-                release_root_jobs=self.worker.machine_calls is not None,
                 described_release=described,
-                input_object_reuse=True,
-                event_wait=True,
-                memo_lookup=self.worker.owner_memo is not None,
             )
 
         return self._call(request.claim, context, get)
@@ -179,11 +156,6 @@ class MachineExecutionRPC:
         def submit() -> pb.MachineExecutionReceipt:
             assert self.worker.executions is not None
             self.worker.executions.require_workspace(request.expected_execution_workspace_id)
-            if (
-                request.publication_authorization_id
-                and request.claim.wire_minor < MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR
-            ):
-                raise WorkspaceRefusal("publication authority requires Runtime wire52")
             payload = request.payload_canonical_bytes
             if not 0 < len(payload) <= canonical.DOC_MAX_BYTES:
                 raise WorkspaceRefusal("execution payload exceeds its inline argument bound")
@@ -217,8 +189,6 @@ class MachineExecutionRPC:
                     request.capture_digest,
                     offered,
                     expected_execution_workspace_id=request.expected_execution_workspace_id,
-                    max_attempts=request.max_attempts or 1,
-                    retry_delay_ms=request.retry_delay_ms,
                     capture_document=request.capture_canonical_bytes,
                     preparation=canonical.write(prepared),
                     publication_authorization_id=request.publication_authorization_id,
@@ -232,8 +202,6 @@ class MachineExecutionRPC:
                     request.capture_digest,
                     offered,
                     expected_execution_workspace_id=request.expected_execution_workspace_id,
-                    max_attempts=request.max_attempts or 1,
-                    retry_delay_ms=request.retry_delay_ms,
                     capture_document=request.capture_canonical_bytes,
                     preparation=preparation,
                     publication_authorization_id=request.publication_authorization_id,

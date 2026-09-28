@@ -528,91 +528,9 @@ class WeightsExchange:
             self._abandoned.add(transaction_id)
             self._held.pop(transaction_id, None)
 
-    def read(self, request: pb.WeightsReadRequest) -> pb.WorkerFrame:
-        refusal = pb.WEIGHTS_READ_REFUSAL_UNSPECIFIED
-        detail = ""
-        data = b""
-        with self._lock:
-            held = self._held.get(request.weights_transaction_id)
-        row = held.objects.get(request.object_id) if held is not None else None
-        if held is None:
-            refusal, detail = (
-                pb.WEIGHTS_READ_REFUSAL_UNKNOWN_TRANSACTION,
-                "weights transaction is not held by this Runtime",
-            )
-        elif request.writer_epoch != held.writer_epoch:
-            refusal, detail = (
-                pb.WEIGHTS_READ_REFUSAL_STALE_WRITER,
-                "writer epoch is stale",
-            )
-        elif row is None:
-            refusal, detail = (
-                pb.WEIGHTS_READ_REFUSAL_UNKNOWN_OBJECT,
-                "object is outside the exact receipt inventory",
-            )
-        elif request.source_ref != row.source_ref:
-            refusal, detail = (
-                pb.WEIGHTS_READ_REFUSAL_SOURCE_REF_MISMATCH,
-                "source reference does not bind this object",
-            )
-        elif (
-            request.max_bytes <= 0
-            or request.max_bytes > weights_limits.MAX_WEIGHTS_READ_BYTES
-            or request.offset >= row.length
-            or request.offset + request.max_bytes > row.length
-        ):
-            refusal, detail = (
-                pb.WEIGHTS_READ_REFUSAL_RANGE_INVALID,
-                "requested range is outside the exact object length",
-            )
-        else:
-            try:
-                if row.source_ref.startswith("tensorfs-manifest:"):
-                    data = held.manifest_bytes[request.offset : request.offset + request.max_bytes]
-                else:
-                    target = bytearray(request.max_bytes)
-                    lease = self._store().acquire(held.manifest_id, [(row.object_id, row.length)])
-                    try:
-                        lease.read_into(
-                            row.object_id,
-                            row.length,
-                            request.offset,
-                            request.max_bytes,
-                            target,
-                        )
-                    finally:
-                        lease.release()
-                    data = bytes(target)
-            except Exception as exc:
-                refusal, detail = (
-                    pb.WEIGHTS_READ_REFUSAL_SOURCE_UNAVAILABLE,
-                    f"TensorFS source read refused: {type(exc).__name__}",
-                )
-        result = pb.WeightsReadResult(
-            weights_transaction_id=request.weights_transaction_id,
-            writer_epoch=request.writer_epoch,
-            object_id=request.object_id,
-            source_ref=request.source_ref,
-            read_id=request.read_id,
-            offset=request.offset,
-        )
-        if refusal:
-            result.outcome = pb.WEIGHTS_READ_OUTCOME_REFUSED
-            result.refusal = refusal
-            result.safe_detail = detail[:4096]
-        else:
-            result.outcome = pb.WEIGHTS_READ_OUTCOME_DATA
-            result.data = data
-            result.data_digest = hashlib.sha256(data).digest()
-        return pb.WorkerFrame(weights_read_result=result)
-
-    def upload(self, request: pb.WeightsUploadRequest) -> pb.WorkerFrame:
-        """Stream ONE held object to the exact presigned URL the supervisor granted.
-
-        Returns the answer as a `WorkerFrame`; `RuntimeWeights.Upload` unwraps its inner
-        `WeightsUploadResult`, and the pre-21 `WorkerControl` lane sends the frame as-is
-        (the session restamps the envelope). The bytes never enter the host process.
-        """
+    def upload(self, request: pb.WeightsUploadRequest) -> pb.WeightsUploadResult:
+        """Stream ONE held object to the exact presigned URL the supervisor granted
+        (`RuntimeWeights.Upload`). The bytes never enter the host process."""
         result = pb.WeightsUploadResult(
             weights_transaction_id=request.weights_transaction_id,
             writer_epoch=request.writer_epoch,
@@ -626,7 +544,7 @@ class WeightsExchange:
             result.outcome = pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
             result.refusal = _UPLOAD_REFUSALS.get(exc.code, pb.WEIGHTS_UPLOAD_REFUSAL_UNSPECIFIED)
             result.safe_detail = exc.detail[:4096]
-            return pb.WorkerFrame(weights_upload_result=result)
+            return result
         grant = request.grant
         host = urlparse(grant.url).hostname or ""
         try:
@@ -647,7 +565,7 @@ class WeightsExchange:
                 exc.code, pb.WEIGHTS_UPLOAD_REFUSAL_TRANSFER_FAILED
             )
             result.safe_detail = exc.detail[:4096]
-            return pb.WorkerFrame(weights_upload_result=result)
+            return result
         finally:
             source.close()
         result.transferred_bytes = receipt.length
@@ -660,7 +578,7 @@ class WeightsExchange:
         else:
             result.outcome = pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED
             result.checksum_sha256 = "sha256:" + receipt.sha256.hex()
-        return pb.WorkerFrame(weights_upload_result=result)
+        return result
 
     def _upload_source(self, request: pb.WeightsUploadRequest) -> tuple[Any, int]:
         """Bind the requested object to what this Runtime actually holds, or refuse."""

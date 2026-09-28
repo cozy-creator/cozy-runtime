@@ -259,7 +259,6 @@ def test_root_acceptance_and_intake_abort_have_one_durable_order(
         submitted,
         {"fields": [{"name": "files", "type": {"input": "tree"}}]},
         {"files": documents.spell(source.manifest.digest)},
-        wire_minor=55,
     )
     own = pb.NativeByteRetentionResult(
         source=source,

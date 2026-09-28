@@ -98,7 +98,6 @@ class Rig:
     fence: Fence
     control: ControlLane
     preparation: Any
-    legacy: Any
     invocation: bytes
     declaration: bytes
     targets: Any
@@ -199,7 +198,6 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
             fence,
             control,
             pb_grpc.RuntimePreparationStub(channel),
-            pb_grpc.RuntimeWeightsStub(channel),
             invocation,
             declaration,
             targets,
@@ -556,7 +554,6 @@ def test_local_control_host_serves_probe_without_preparation_handlers(tmp_path: 
                 WIRE_MINOR,
                 MIN_COMPATIBLE_WIRE_MINOR,
             )
-            assert not info.supports_mixed_model_inputs
             with pytest.raises(grpc.RpcError) as error:
                 api.ValidateWeightsCheckpoint(pb.ValidateWeightsCheckpointRequest(), timeout=WAIT)
             assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
@@ -564,14 +561,6 @@ def test_local_control_host_serves_probe_without_preparation_handlers(tmp_path: 
     finally:
         host.stop()
         thread.join(WAIT)
-
-
-def test_retired_exchange_cannot_grant_custody(rig: Rig) -> None:
-    with pytest.raises(grpc.RpcError) as error:
-        next(rig.legacy.Exchange(iter(()), timeout=WAIT))
-    assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
-    assert not rig.exchange.writer_broker.bindings
-    assert not rig.control.frames
 
 
 def test_scoped_native_commit_records_workspace_before_return_and_has_no_tensor_spool(

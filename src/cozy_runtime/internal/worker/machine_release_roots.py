@@ -627,8 +627,6 @@ class ReleaseRoots:
             capture_digest,
             offer,
             expected_execution_workspace_id=request.expected_execution_workspace_id,
-            max_attempts=request.max_attempts or 1,
-            retry_delay_ms=request.retry_delay_ms,
             capture_document=capture,
             preparation=canonical_json.encode(preparation),
             publication_authorization_id=request.publication_authorization_id,

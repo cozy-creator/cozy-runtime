@@ -44,6 +44,7 @@ from cozy_runtime.internal.worker.session import (
     WorkerOptions,
     executor_load_command,
 )
+from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import documents as documents_
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import PACKAGE, _config, _workspace
@@ -339,7 +340,7 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
         try:
             worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
             worker.fence.dispatch_open = True
-            worker.fence.wire_minor = lane_wire.LANES_WIRE_MINOR
+            worker.fence.wire_minor = WIRE_MINOR
             worker.accepted.mode = "serving"
             primary = _placement("p0", "lane-0")
             hosted = _placement("p1", "lane-1")
@@ -402,7 +403,6 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             assert queued["r"].state == pb.AttemptState.ATTEMPT_STATE_RUNNING
             del worker.engine.history[held.key()]
             del worker.engine.history[staged.key()]
-            assert lane_wire.lanes_on_wire(worker.fence.wire_minor)
             observed = worker.observed_state()
             assert _lane_rows(observed) == documents
             assert observed.available_attempt_slots == 2
@@ -482,7 +482,7 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
         try:
             worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
             worker.fence.dispatch_open = True
-            worker.fence.wire_minor = lane_wire.LANES_WIRE_MINOR
+            worker.fence.wire_minor = WIRE_MINOR
             worker.accepted.mode = "serving"
             primary = _placement("p0", "lane-0")
             hosted = _placement("p1", "lane-1")
@@ -551,7 +551,7 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
         try:
             worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
             worker.fence.dispatch_open = True
-            worker.fence.wire_minor = lane_wire.LANES_WIRE_MINOR
+            worker.fence.wire_minor = WIRE_MINOR
             worker.accepted.mode = "serving"
             worker.placement = _placement("p0", "lane-0")
             worker.lanes.lanes[0].placements.add("p0")

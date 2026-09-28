@@ -16,7 +16,7 @@ from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest, stage_de
 from cozy_runtime.internal.worker.attempts import AttemptRefusal, Released
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
 
@@ -122,7 +122,7 @@ def test_refused_load_then_success_on_the_same_executor() -> None:
                 worker._apply_desired_state(
                     pb.DesiredWorkerState(
                         revision=1,
-                        wire_minor=63,
+                        wire_minor=WIRE_MINOR,
                         posture=pb.POSTURE_ACCEPTING,
                         placement_set=pb.DesiredPlacementSet(
                             placement_set_digest=digest, placement_set_canonical_bytes=raw_set

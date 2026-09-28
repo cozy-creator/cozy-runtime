@@ -7,10 +7,11 @@ import pytest
 from cozy_runtime.internal import hostfacts
 from cozy_runtime.internal.worker import machine_model_defaults
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
-def test_counted_capture_needs_feature63_but_old_capture_accepts62() -> None:
+def test_counted_capture_verifies() -> None:
     rung: dict[str, Any] = {
         "gpu": "H100",
         "repository": "proof/h3",
@@ -31,15 +32,12 @@ def test_counted_capture_needs_feature63_but_old_capture_accepts62() -> None:
         "installed": {"entrypoints": [{"name": "run", "models": [{"path": "run.models.model"}]}]}
     }
     worker = cast(Any, SimpleNamespace(config=SimpleNamespace(bootstrap_credential="")))
-    request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=62))
+    request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=WIRE_MINOR))
     machine_model_defaults.verify(worker, request, capture, interfaces)
     rung["gpus"] = 2
     second = copy.deepcopy(rung)
     second["gpus"] = 4
     row["rungs"].append(second)
-    with pytest.raises(WorkspaceRefusal, match="require wire63"):
-        machine_model_defaults.verify(worker, request, capture, interfaces)
-    request.claim.wire_minor = 63
     machine_model_defaults.verify(worker, request, capture, interfaces)
 
 

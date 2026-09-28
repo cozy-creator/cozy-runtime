@@ -147,7 +147,7 @@ class _Servicer(MachineExecutionRPC):
 class RuntimeWeightsHost(Protocol):
     """A bounded native object upload; custody observations use WorkerControl."""
 
-    def upload(self, request: pb.WeightsUploadRequest) -> pb.WorkerFrame: ...
+    def upload(self, request: pb.WeightsUploadRequest) -> pb.WeightsUploadResult: ...
 
 
 class _RuntimeWeightsServicer:
@@ -155,19 +155,10 @@ class _RuntimeWeightsServicer:
     def __init__(self, weights: RuntimeWeightsHost) -> None:
         self.weights = weights
 
-    def Exchange(
-        self, request_iterator: Iterator[pb.WeightsHostAck], context: ServicerContext
-    ) -> Iterator[pb.WeightsHostEvent]:
-        context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "Host writer acknowledgments were retired in wire 41"
-        )
-
     def Upload(
         self, request: pb.WeightsUploadRequest, context: ServicerContext
     ) -> pb.WeightsUploadResult:
-        # `upload` answers as a WorkerFrame for the pre-21 control lane; the unary RPC wants
-        # its inner result.
-        return self.weights.upload(request).weights_upload_result
+        return self.weights.upload(request)
 
 
 class GrpcControlHost:
@@ -472,12 +463,6 @@ class _PreparationServicer(WorkspaceRPC):
         return pb.ProtocolInfoResult(
             wire_minor=WIRE_MINOR,
             minimum_wire_minor=MIN_COMPATIBLE_WIRE_MINOR,
-            supports_model_materialization_recovery=True,
-            supports_local_installation_reuse=self.local_package_handler is not None,
-            supports_mixed_model_inputs=self.unpublished_placement_handler is not None,
-            supports_weights_transaction_refusal=True,
-            supports_machine_execution_triage=True,
-            supports_prepare_while_landing=self.package_handler is not None,
         )
 
     def NumericalEnvironment(
@@ -517,26 +502,6 @@ class _PreparationServicer(WorkspaceRPC):
         if self.checkpoint_transfer is None:
             context.abort(grpc.StatusCode.UNIMPLEMENTED, "source checkpoint transfer unavailable")
         return self.checkpoint_transfer(request)
-
-    def CheckPackageSetCompatibility(
-        self, request: pb.PreparePackageSetRequest, context: ServicerContext
-    ) -> pb.CheckPackageSetCompatibilityResult:
-        """Minor 60's pre-check runs the same cached preparation as the following call."""
-        handler = self.package_handler
-        if handler is None:
-            context.abort(grpc.StatusCode.UNIMPLEMENTED, "package preparation is unavailable")
-        try:
-            handler(request)
-        except PreparationRefusal as exc:
-            return pb.CheckPackageSetCompatibilityResult(
-                refusal_code=exc.code,
-                refusal_detail="".join(
-                    character if " " <= character <= "~" else "?" for character in exc.detail
-                )[:1024],
-            )
-        except Exception as exc:
-            _refuse(context, exc)
-        return pb.CheckPackageSetCompatibilityResult()
 
     def PreparePackageSet(
         self, request: pb.PreparePackageSetRequest, context: ServicerContext

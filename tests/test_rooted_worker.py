@@ -447,8 +447,6 @@ def test_user_worker_runs_a_job_under_its_root_and_reports_a_virtual_inventory()
             ]
             assert observed.accelerator_backend == "cuda"
             assert not observed.executor_uid_isolation
-            info = machine.preparation.ProtocolInfo(pb.ProtocolInfoRequest())
-            assert info.supports_machine_execution_triage
 
             workspace, outcome = _run_job(machine, Path(raw) / "scratch")
             body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
@@ -535,7 +533,6 @@ def test_restarted_worker_runs_its_owners_next_submission_without_another_claim(
         root.mkdir()
         machine = Machine(root, VIRTUAL_GPUS)
         try:
-            assert machine.ack.claim_survives_restart
             resources = machine.ack.resources
             assert (
                 resources.backend,

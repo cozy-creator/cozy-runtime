@@ -257,7 +257,7 @@ def test_two_large_outputs_commit_within_their_admitted_aggregate(tmp_path: Path
     }
     engine = SimpleNamespace(
         tensorfs_root=workspace.store_root,
-        calls=SimpleNamespace(minor=lambda _: 56),
+        calls=SimpleNamespace(),
         owner_scope=lambda: "owner",
         _encode_frames=lambda *args: None,
         _blob_path=AttemptEngine._blob_path,
@@ -304,9 +304,7 @@ def test_two_large_outputs_commit_within_their_admitted_aggregate(tmp_path: Path
         byte_result_grants=byte_grants,
     )
     consumer = AttemptRecord("consumer", 1, digest, body, spool=tmp_path / "consumer")
-    calls = Calls(
-        lambda _: None, lambda: 1, lambda _: 56, workspace=workspace, owner=lambda: "owner"
-    )
+    calls = Calls(lambda _: None, lambda: 1, workspace=workspace, owner=lambda: "owner")
     pending = _Pending(pb.ChildCallRequest(), 1, result=child_result)
     materialized = calls._materialize(consumer, pending)
     assert sum(row["content_bytes"] for row in materialized) == size * 2

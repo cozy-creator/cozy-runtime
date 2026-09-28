@@ -22,6 +22,7 @@ from cozy_runtime.internal.worker import source_steps, workspace_memo
 from cozy_runtime.internal.worker.source_calls import SourceCalls
 from cozy_runtime.internal.worker.stage_progress import SAMPLE_SECONDS
 from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_workspace_native_memo import accepted
 
@@ -568,7 +569,7 @@ def test_current_source_validation_refusal_reaches_protocol_peer(tmp_path: Path)
                 record_owner_epoch=1,
                 control_stream_epoch=1,
                 worker_boot_id="boot",
-                wire_minor=42,
+                wire_minor=WIRE_MINOR,
                 dispatch_open=True,
             )
             self.source_calls = SourceCalls(

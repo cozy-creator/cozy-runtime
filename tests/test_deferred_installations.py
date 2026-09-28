@@ -218,7 +218,6 @@ def test_deferred_callee_installs_on_first_selection(case: str) -> None:
             workspace = client.GetMachineExecutionWorkspace(
                 pb.MachineExecutionWorkspaceQuery(claim=claim)
             )
-            assert workspace.deferred_installations
 
             def installed(label: str) -> bool:
                 return any(

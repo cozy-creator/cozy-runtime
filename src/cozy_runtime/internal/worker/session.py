@@ -148,7 +148,6 @@ from cozy_runtime.protocol import (
     MIN_COMPATIBLE_WIRE_MINOR,
     WIRE_MINOR,
     documents,
-    weights_limits,
 )
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -177,8 +176,7 @@ REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 #: from the offer's hold to DEVICE RELEASE (cr-079 D3); a released attempt holds none, but
 #: while more than `LANE_RELEASED` released attempts on a lane await `AttemptOutcomeAck` the
 #: lane advertises nothing. An offer over its lane's seats is a JOURNALED REFUSED outcome,
-#: never a silent hold. A multi-lane worker REFUSES a RecordOwner whose negotiated minor
-#: cannot read `lanes[]` (`device_lanes_unsupported`, proto-024 minor 22).
+#: never a silent hold.
 
 
 def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
@@ -543,8 +541,8 @@ def _stamped(message: Any, fence: OwnershipFence) -> Any:
 
 
 def _refused(revision: int, **fault: Any) -> pb.Fault:
-    """A desired revision left unapplied: structured, and in the subject older Hosts parse."""
-    return pb.Fault(subject=f"revision {revision}", desired_state_revision=revision, **fault)
+    """A desired revision left unapplied."""
+    return pb.Fault(desired_state_revision=revision, **fault)
 
 
 def _capability_unavailable(operation: str, minor: int) -> str:
@@ -1211,7 +1209,6 @@ class Worker:
         self.calls = Calls(
             self.send,
             lambda: self.fence.control_stream_epoch,
-            self.operation_minor,
             workspace=self.workspace,
             owner=lambda: self.fence.record_owner_id,
             local=self._machine_call,
@@ -2346,8 +2343,6 @@ class Worker:
 
                     assert binding is not None
                     declared = set(self.engine._job_model_declarations(binding, descriptor))
-                    if declared and claim.wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
-                        raise WorkspaceRefusal("durable root Model inputs require Runtime wire55")
                     machine_model_inputs.retain(executions.workspace, owner, offer, declared)
                     from . import machine_byte_inputs
 
@@ -2357,7 +2352,6 @@ class Worker:
                         offer,
                         declaration["request"],
                         arguments or {},
-                        wire_minor=claim.wire_minor,
                     )
                 elif any(
                     str(row.get("input_id", "")).startswith(grants.MODEL_PREFIX)
@@ -3773,8 +3767,6 @@ class Worker:
             control_runtime_digest="",
             git_commit=self.options.git_commit,
             resources=self.resources(),
-            # The owner is durable for this boot and executions keep their Claim's minor.
-            claim_survives_restart=True,
         )
         send(self.stamp(pb.WorkerFrame(claim_ack=ack)))
         self._send_snapshot(send)
@@ -3832,12 +3824,6 @@ class Worker:
                             outcome_digest=outcome.outcome_digest,
                         )
                     )
-            body.weights_transactions.extend(
-                self.workspace.status(row)
-                for row in self.workspace.projected_weights(
-                    self.fence.record_owner_id, self.fence.worker_boot_id
-                )
-            )
         if self.accepted.mode == "serving":
             lane_wire.emit_lanes(body, self.lane_documents())
         lane_wire.emit_held_manifests(body, self.held_manifests.digests())
@@ -3957,20 +3943,6 @@ class Worker:
             f"{pb.WeightsHostStage.Name(refused.stage)} "
             f"({pb.WeightsHostRefusal.Name(refused.refusal)}): {refused.safe_detail}"
         )
-        size = len(row["declaration"])
-        if (
-            refused.stage == pb.WEIGHTS_HOST_STAGE_INTENT
-            and refused.refusal == pb.WEIGHTS_HOST_REFUSAL_INTENT_CONFLICT
-            and size > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
-        ):
-            # A Host that predates by-reference intents refuses every declaration over its
-            # inline bound; only a newer worker image carries one that accepts it.
-            detail = safe(
-                f"output {refused.output_slot!r}: its weights declaration is {size} bytes, over "
-                f"this pod Host's {weights_limits.MAX_WEIGHTS_DECLARATION_BYTES}-byte inline "
-                "limit; the machine needs a worker image whose Host takes declarations by "
-                "reference"
-            )
         attempt = self.engine.history.get((refused.request_id, refused.attempt_ordinal))
         if attempt is not None and attempt.state not in ("outcome", "closed"):
             attempt.weights_refused = detail
@@ -4124,12 +4096,10 @@ class Worker:
                 content_digest=inner.content_digest,
             )
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
-        elif kind == "weights_host_ack":
-            self.note("artifact", "retired Host writer acknowledgment ignored")
         elif kind == "native_source_command":
             from cozy_runtime.internal.worker.source_calls import refusal_frame
 
-            if self.source_calls is None or self.fence.wire_minor < 42:
+            if self.source_calls is None:
                 self.send(refusal_frame(inner, "native_source_unavailable"))
             else:
                 try:
@@ -4137,7 +4107,7 @@ class Worker:
                 except Exception:
                     self.send(refusal_frame(inner, "native_source_refused"))
         elif kind == "native_artifact_transfer":
-            if self.artifact_transfers is not None and self.fence.wire_minor >= 42:
+            if self.artifact_transfers is not None:
                 self.artifact_transfers.handle(inner)
         elif kind == "child_call_result":
             if not self.calls.absorb(inner):
@@ -4153,12 +4123,6 @@ class Worker:
                     # The owner already committed this result. Optional metadata
                     # compaction cannot turn its successful computation into a failure.
                     self.note("workspace", f"result compaction deferred ({type(exc).__name__})")
-        elif kind == "weights_read_request":
-            self.send(self.weights.read(inner))
-        elif kind == "weights_upload_request":
-            # The pre-21 upload lane. A supervisor on RuntimeWeights calls Upload unary
-            # instead; this frame answer stays for one that has not opened it.
-            self.send(self.weights.upload(inner))
         elif kind == "weights_finalize_request":
             from . import workspace_finalize
 
@@ -4484,9 +4448,7 @@ class Worker:
                 else pb.WorkerPhase.WORKER_PHASE_ONLINE,
                 f"posture {pb.Posture.Name(desired.posture)}",
             )
-        # Minor skew is additive compatibility, not an equality gate. Never report a
-        # RecordOwner's future minor as if this worker had applied capabilities it does not
-        # implement; an older owner's lower minor remains visible as the effective level.
+        # Never report a RecordOwner's future minor as one this worker applied.
         self.fence.wire_minor = min(WIRE_MINOR, desired.wire_minor or self.fence.wire_minor)
         self.accepted.drain_grace_ms = desired.drain_grace_ms
         if self.accepted.mode == "job" and mode != "job":
@@ -4548,44 +4510,6 @@ class Worker:
         self.accepted.accepted_placement_set_digest = desired_set.placement_set_digest
         self.accepted.placement_set_canonical_bytes = desired_set.placement_set_canonical_bytes
         self.accepted.device_pins = lane_wire.read_device_pins(desired_set)
-        if self.lanes.wide and not lane_wire.lanes_on_wire(self.fence.wire_minor):
-            # THE FENCE (cr-066 step 0, ruling R3). This worker drives one lane per device
-            # of its envelope; a RecordOwner below minor 22 reads ONE `available_attempt_slots`
-            # and no lane per placement: reading the sum over lanes it would offer seats a
-            # placement cannot use, and reading one lane it would leave the paid cards idle —
-            # silently, since nothing it reads says a card is idle. Refusing typed is the
-            # "never advertise capacity it cannot use" rule applied to the silent-GPU-0
-            # defect; jobs keep the whole envelope and are untouched. An owner at 22 reads
-            # `lanes[]` and pins placements to devices (`DesiredPlacementSet.device_pins`),
-            # and `LaneSet.assign` decides per placement.
-            self.latched = "device_lanes_unsupported"
-            self._published_latch = self.latched  # this fault IS the publication
-            self.engine.fault(
-                _refused(
-                    desired.revision,
-                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    reason=self.latched,
-                    detail=(
-                        f"this worker's envelope {self.options.devices!r} is "
-                        f"{len(self.lanes.entries)} device lanes and the RecordOwner "
-                        f"negotiated wire minor {self.fence.wire_minor}, which carries no "
-                        "per-lane seats (proto-024 `lanes[]` is minor "
-                        f"{lane_wire.LANES_WIRE_MINOR}); a serving set here would idle "
-                        "every card but one, so it is refused (jobs still take the whole "
-                        "envelope)"
-                    ),
-                )
-            )
-            self.note(
-                "desired_state",
-                f"revision {desired.revision} REFUSED: {self.latched} "
-                f"({len(self.lanes.entries)} lanes over {self.options.devices!r}); the worker "
-                "stays ONLINE",
-            )
-            self.bump_admission(f"revision {desired.revision} refused: {self.latched}")
-            self._settle()
-            return
-
         previous = self.placement
         self.jobs = {}
         self.engine.jobs = {}
@@ -5518,8 +5442,8 @@ class Worker:
             self._apply_ordinary_job_directive(job)
             return
         try:
-            if self.fence.wire_minor < 40 or (job.orchestration and has_parent):
-                raise ValueError("orchestration requires wire40 and one CPU parent")
+            if job.orchestration and has_parent:
+                raise ValueError("orchestration takes one CPU parent")
             parent = job if job.orchestration else job.orchestration_parent if has_parent else None
             if parent is not None and (
                 not parent.orchestration or parent.HasField("orchestration_parent")
@@ -7026,7 +6950,7 @@ class Worker:
                         offered, "internal_callable", str(exc), CAUSE.CAUSE_CODE_INVALID_REQUEST
                     )
                     return
-        if ("job" in attempt.spec or minor >= 43) and attempt.state not in (
+        if attempt.state not in (
             "outcome",
             "closed",
         ):

@@ -252,7 +252,6 @@ class Machine:
             offer=offered.attempt_offer,
             prepared_state=state,
             payload_canonical_bytes=canonical_json.encode({}),
-            max_attempts=1,
             expected_execution_workspace_id=self.client.GetMachineExecutionWorkspace(
                 pb.MachineExecutionWorkspaceQuery(claim=self.claim)
             ).execution_workspace_id,

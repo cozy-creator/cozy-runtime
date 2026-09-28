@@ -162,12 +162,8 @@ def retain_root(
     offer: pb.AttemptOffer,
     schema: Any,
     arguments: dict[str, Any],
-    *,
-    wire_minor: int,
 ) -> None:
     """Acquire execution custody before acceptance without changing replay identity."""
-    from cozy_runtime.protocol import weights_limits
-
     from . import grants
 
     selected = list(_leaves(arguments, schema))
@@ -178,8 +174,6 @@ def retain_root(
     }
     if not selected and not native:
         return
-    if wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
-        raise WorkspaceRefusal("durable root byte inputs require Runtime wire55")
     if set(native) != {item[0] for item in selected}:
         raise WorkspaceRefusal("root byte inputs differ from the captured job arguments")
     spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)

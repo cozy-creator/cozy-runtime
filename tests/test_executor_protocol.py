@@ -17,8 +17,7 @@ from cozy_runtime.internal.worker.child import ExecutorProtocolMismatch, require
     [
         (1, "9.8.7", True),
         (2, "0.18.33", False),
-        (None, "0.18.33", True),
-        (None, "0.18.32", True),
+        (None, "0.18.33", False),
         (None, "0.18.20", False),
     ],
 )
@@ -85,3 +84,8 @@ def test_protocol_rejects_malformed_or_unreviewed_hello() -> None:
     for version in ("", "unknown", "0.18.29", "0.18.34"):
         with pytest.raises(ExecutorProtocolMismatch):
             require_executor_protocol({"runtime_version": version})
+    # Revision 1 without its stated native interfaces predates 0.18.51.
+    with pytest.raises(ExecutorProtocolMismatch, match=r"cozy-runtime>=0\.18\.51"):
+        require_executor_protocol(
+            {"executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION, "runtime_version": "0.18.49"}
+        )

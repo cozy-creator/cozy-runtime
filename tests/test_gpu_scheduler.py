@@ -46,7 +46,6 @@ from cozy_runtime.internal.worker.workspace_executions import TERMINAL
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
-from test_same_release_placements import Context
 
 GiB = 1 << 30
 OWNER = "owner"
@@ -650,9 +649,6 @@ def test_a_submitted_exact_width_is_the_group_and_leaves_the_rest_free(machine: 
     """An explicit model GPU count reaches Runtime as `execution_gpus`: 2 of 4 GPUs is a
     2-GPU group, never the widest declared degree, and a count no slot declares or the
     machine cannot form is refused typed."""
-    query = pb.MachineExecutionWorkspaceQuery(claim=machine.claim)
-    workspace = MachineExecutionRPC(machine.worker).GetMachineExecutionWorkspace(query, Context())
-    assert workspace.exact_execution_gpus  # what Creator reads before sending a count
     machine.serving("A", "h3", gpus=2)
     machine.serving("B", "h3", gpus=2)
     machine.serving("C", "h3", gpus=3)
