@@ -74,6 +74,11 @@ class TenantPipeline:
                 super().__init__()
                 self.blocks = nn.ModuleList([Block(hidden, ff, norm_q) for _ in range(blocks)])
 
+            def forward(self, scratch: int) -> Any:
+                """A forward whose work is `scratch` bytes: an activation of a chosen size."""
+                device = self.blocks[0].norm1.weight.device
+                return torch.ones(scratch, dtype=torch.uint8, device=device).max()
+
         class TextEncoder(nn.Module):
             def __init__(self, embed: int, norm: int) -> None:
                 super().__init__()
@@ -131,6 +136,14 @@ class TenantModel(Model[TenantPipeline]):
                     # them. The checksum is bounded and finite so the metric can be spelled.
                     total = total + torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
             return float(torch.tanh(total))
+
+    @uses_components("unet")
+    def work(self, scratch: int) -> int:
+        """The unet's forward, holding `scratch` bytes of work while it runs."""
+        import torch
+
+        with torch.inference_mode():
+            return int(self.pipe.components["unet"](scratch))
 
 
 @app.entrypoint

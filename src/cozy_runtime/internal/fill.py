@@ -75,7 +75,7 @@ from cozy_runtime.author._loader import (
     canonical_dtype,
     census,
 )
-from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal import accel, canonical, memory
 from cozy_runtime.internal.derive import placing, torch_module
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
@@ -94,7 +94,6 @@ from cozy_runtime.internal.encoding import (
     measure_runtime,
 )
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
-from cozy_runtime.internal import memory
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult, observed_capability_records, qualify
 from cozy_runtime.internal.resolution import (
@@ -1316,9 +1315,11 @@ class StreamingFillBackend:
         self.paging_plans: dict[str, ReadPlan] = {}
         self.page_resident: dict[str, memory.PageUnit] = {}
         #: paged units' weights kept in host memory: (component, unit path) -> key -> tensor
-        self.mirror: dict[tuple[str, str], dict[str, Any]] = {}
+        self.mirror: dict[tuple[str, str], dict[str, object]] = {}
+        #: the host buffers behind `mirror`, and whether each is page-locked
+        self.slabs: dict[tuple[str, str], tuple[object, int, int, bool]] = {}
         #: the next unit of a paged component, copying ahead: component -> (unit, event)
-        self.prefetched: dict[str, tuple[memory.PageUnit, Any]] = {}
+        self.prefetched: dict[str, tuple[memory.PageUnit, object]] = {}
         self.stats: FillStats = {"windows": 0, "waits": 0}
         #: Why this generation was poisoned and what the allocator held at that instant.
         #: Empty until a failure lands; the refusal reply carries it as evidence. Nothing
@@ -2040,6 +2041,9 @@ class StreamingFillBackend:
                 inflight=self.inflight,
                 fence=self.fence,
             )
+            # Destinations may reuse blocks whose last readers are still queued on the
+            # compute stream (a paged block freed in stream order): copy after them.
+            ring.stream.wait_stream(self.torch.cuda.current_stream())
             try:
                 for tensor in self.enqueued.values():
                     ring.track(tensor)
@@ -2154,7 +2158,7 @@ class StreamingFillBackend:
         for hook in self.paging_hooks:
             hook.remove()
         self.paging_hooks.clear()
-        self.mirror.clear()
+        self.drop_mirror()
         self.hold_lease = False
         self.release_lease()
 
@@ -2176,9 +2180,7 @@ class StreamingFillBackend:
                 )
             if name not in self.components:
                 return 0
-            ahead = self.prefetched.pop(name, None)
-            if ahead is not None:
-                self.abandon_page(name, ahead[0])
+            self._drop_ahead(name)
             self._park_page(name, self.paging[name].common)
             self.parked[name] = self.components.pop(name)
             return self.vram_charge.pop(name, 0)
@@ -2349,18 +2351,37 @@ class StreamingFillBackend:
         self.state = "ready"
 
     def keep(self, name: str, unit: memory.PageUnit) -> int:
-        """Copy a filled unit's weights to host memory, page-locked where the driver allows,
-        so its next page-in is a copy rather than a store read. Returns the bytes kept."""
-        kept: dict[str, Any] = {}
-        for key, tensor in unit.live(name).items():
-            try:
-                host = self.torch.empty_like(tensor, device="cpu", pin_memory=True)
-            except RuntimeError:
-                host = self.torch.empty_like(tensor, device="cpu")
-            host.copy_(tensor)
-            kept[key] = host
+        """Copy a filled unit's weights into one host buffer of exactly their size, page-locked
+        in place where the driver allows, so its next page-in is a copy rather than a store
+        read. Returns the bytes kept."""
+        torch = self.torch
+        live = unit.live(name)
+        offsets, total = {}, 0
+        for key, tensor in live.items():
+            offsets[key] = total
+            total += -(-tensor.numel() * tensor.element_size() // 64) * 64
+        slab = torch.empty(total, dtype=torch.uint8)
+        locked = int(torch.cuda.cudart().cudaHostRegister(slab.data_ptr(), total, 0)) == 0
+        kept: dict[str, object] = {}
+        for key, tensor in live.items():
+            size = tensor.numel() * tensor.element_size()
+            view = slab[offsets[key] : offsets[key] + size].view(tensor.dtype).view(tensor.shape)
+            view.copy_(tensor)
+            kept[key] = view
         self.mirror[(name, unit.path)] = kept
-        return sum(t.numel() * t.element_size() for t in kept.values())
+        self.slabs[(name, unit.path)] = (slab, slab.data_ptr(), total, locked)
+        return total
+
+    def drop_mirror(self) -> int:
+        """Release every kept unit; returns the host bytes given back."""
+        freed = 0
+        for _, pointer, size, locked in self.slabs.values():
+            if locked:
+                self.torch.cuda.cudart().cudaHostUnregister(pointer)
+            freed += size
+        self.slabs.clear()
+        self.mirror.clear()
+        return freed
 
     def _place(self, unit: memory.PageUnit, device: object) -> None:
         """Give a unit's parameters and buffers empty storage on `device`; the tensors'
@@ -2394,13 +2415,12 @@ class StreamingFillBackend:
             raise _refuse(
                 "leaf_schema", "paging requires one admitted component and no live block", [name]
             )
-        ahead = self.prefetched.pop(name, None)
+        ahead = self.prefetched.get(name)
         if ahead is not None and ahead[0] is unit:
+            self.prefetched.pop(name)
             self.torch.cuda.current_stream().wait_event(ahead[1])
         else:
-            if ahead is not None:
-                self.abandon_page(name, ahead[0])
-                self.vram_charge[name] -= ahead[0].nbytes
+            self._drop_ahead(name)
             self._fill_page(name, unit)
             self.vram_charge[name] += unit.nbytes
         self.page_resident[name] = unit
@@ -2432,6 +2452,14 @@ class StreamingFillBackend:
         self.page_resident.pop(name)
         self.vram_charge[name] -= unit.nbytes
 
+    def _drop_ahead(self, name: str) -> None:
+        """Free a unit copied ahead, once its copy has landed."""
+        ahead = self.prefetched.pop(name, None)
+        if ahead is not None:
+            self.torch.cuda.current_stream().wait_event(ahead[1])
+            self.vram_charge[name] = self.vram_charge.get(name, 0) - ahead[0].nbytes
+            self.abandon_page(name, ahead[0])
+
     def abandon_page(self, name: str, unit: memory.PageUnit) -> None:
         """A block whose fill or forward failed leaves; the component stays admitted."""
         self.enqueued.clear()
@@ -2450,10 +2478,10 @@ class StreamingFillBackend:
         self.enqueued.clear()
         self.leaf_sites.clear()
         self.state = "ready"
-        ahead = self.prefetched.pop(name, None)
-        for live in (self.page_resident.pop(name, None), ahead[0] if ahead else None):
-            if live is not None:
-                self.abandon_page(name, live)
+        self._drop_ahead(name)
+        live = self.page_resident.pop(name, None)
+        if live is not None:
+            self.abandon_page(name, live)
         if name in self.components:
             self.evict(name)
         member = self.parked.get(name)

@@ -67,7 +67,10 @@ def write(root: Path, weights: dict[str, dict[str, Any]]) -> Checkpoint:
     targets = {
         name: {
             key: Tensor(
-                NAMES[t.dtype], tuple(t.shape), SPEC_PLAIN, {"value": Part(NAMES[t.dtype], tuple(t.shape))}
+                NAMES[t.dtype],
+                tuple(t.shape),
+                SPEC_PLAIN,
+                {"value": Part(NAMES[t.dtype], tuple(t.shape))},
             )
             for key, t in state.items()
         }
@@ -147,10 +150,15 @@ def main(root: Path) -> None:
     del reference_models
     checkpoint = write(root, weights)
     residency, models = construct(checkpoint)
+    # A counter its forward advances, as HiDiffusion's windows do: a call run again, or run
+    # in pieces, must advance it exactly once.
+    unet = models["unet"]
+    unet.steps = 0
+    unet.register_forward_pre_hook(lambda module, _: setattr(module, "steps", module.steps + 1))
     side = 512
     reference = serve(residency, models, side)
     weights_bytes = sum(t.numel() * t.element_size() for s in weights.values() for t in s.values())
-    peaks = {name: op.peak for (name, _), op in residency.ops.items()}
+    peaks = {name: max(op.peaks.values()) for (name, _), op in residency.ops.items()}
     layout = residency.backend.layouts["unet"]
     activations = peaks["unet"] - weights_bytes
 
@@ -177,6 +185,7 @@ def main(root: Path) -> None:
     poisoned = residency.poisoned
     residency.set_limit(0)
     again = serve(residency, models, side)
+    residency.backend.close()
     print(
         json.dumps(
             {
@@ -192,6 +201,8 @@ def main(root: Path) -> None:
                 "floor": floor,
                 "poisoned": poisoned,
                 "again_error": float((again["noise"] - reference["noise"]).abs().max()),
+                "unet_steps": unet.steps,
+                "applied": sorted(residency.applied),
             }
         ),
         flush=True,

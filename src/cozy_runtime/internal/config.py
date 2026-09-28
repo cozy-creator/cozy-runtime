@@ -330,13 +330,7 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
     return RuntimeConfig(
         cozy_home=home,
         credentials=creds,
-        child_base_env=tuple(
-            sorted(
-                (k, v)
-                for k, v in env.items()
-                if not child_env.erased(k)
-            )
-        ),
+        child_base_env=tuple(sorted((k, v) for k, v in env.items() if not child_env.erased(k))),
         fill_forensics_dir=env.get(child_env.FILL_FORENSICS_DIR, "").strip(),
         dependency_cache=Path(dependency_cache) if dependency_cache else None,
         python_root=Path(python_root) if python_root else None,
@@ -519,13 +513,20 @@ def read_gpu_budget(path: Path) -> dict[str, int]:
         ) from exc
 
 
-_SIZE_UNITS = {"": 1, "b": 1, "kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30, "tib": 1 << 40}
+_SIZE_UNITS = {
+    "": 1, "b": 1,
+    "k": 1 << 10, "kb": 1000, "kib": 1 << 10,
+    "m": 1 << 20, "mb": 1000**2, "mib": 1 << 20,
+    "g": 1 << 30, "gb": 1000**3, "gib": 1 << 30,
+    "t": 1 << 40, "tb": 1000**4, "tib": 1 << 40,
+}  # fmt: skip
 
 
 def _size(value: object) -> int:
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([A-Za-z]*)", str(value).strip())
+    """Bytes, from an integer or float of bytes (`2.5e+09`) or a size such as 3GiB, 3GB, 3G."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)", str(value).strip())
     if match is None or match.group(2).lower() not in _SIZE_UNITS:
-        raise ValueError(f"{value!r} is not bytes or an IEC size such as 3GiB")
+        raise ValueError(f"{value!r} is not bytes or a size such as 3GiB, 3GB or 3G")
     size = int(float(match.group(1)) * _SIZE_UNITS[match.group(2).lower()])
     if size <= 0:
         raise ValueError(f"{value!r} is not a positive size")
@@ -556,7 +557,9 @@ def _yaml_map(text: str) -> dict[str, object]:
         elif value.startswith("{") and value.endswith("}"):
             parent[key.strip()] = {
                 k.strip().strip("'\""): v.strip().strip("'\"")
-                for k, _, v in (item.partition(":") for item in value[1:-1].split(",") if item.strip())
+                for k, _, v in (
+                    item.partition(":") for item in value[1:-1].split(",") if item.strip()
+                )
             }
         else:
             parent[key.strip().strip("'\"")] = value

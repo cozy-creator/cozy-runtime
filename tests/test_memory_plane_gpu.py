@@ -34,7 +34,8 @@ def test_a_capped_process_pages_tiles_and_recovers_in_place(tmp_path: Path) -> N
     assert result["phase"] == "passed", child.stdout + child.stderr
     recoveries = result["recoveries"]
     assert any(line.startswith("unet: pages its blocks") for line in recoveries), recoveries
-    assert any(line.startswith("vae: out of memory") and line.endswith("tile") for line in recoveries)
+    assert any(line.startswith("vae: out of memory") and "-> tile" in line for line in recoveries)
+    assert result["unet_steps"] == 3, "a forward's counters advance once per call"
     assert result["noise_error"] == 0.0
     assert result["poisoned"] == ""
     assert result["floor"].startswith(("device_shortfall", "unet: out of memory")), result["floor"]

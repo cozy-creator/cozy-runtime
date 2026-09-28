@@ -77,6 +77,14 @@ def burst(ctx: Context, payload: BurstInput, model: TenantModel, tel: Telemetry)
     return TouchOutput(checksum=checksum, components=sorted(model.pipe.components))
 
 
+@app.entrypoint
+def work(ctx: Context, payload: BurstInput, model: TenantModel, tel: Telemetry) -> TouchOutput:
+    """`burst`, with the work inside the unet's forward, where the runtime can recover it."""
+    model.for_request(ctx, seed=1)
+    model.work(payload.scratch_bytes)
+    return TouchOutput(checksum=0.0, components=sorted(model.pipe.components))
+
+
 from typing import Annotated
 
 from cozy_runtime.author import Shape, invocable
@@ -109,7 +117,7 @@ app.entrypoint(segment)
 BINDING = "".join(
     f'\n[bindings."{entrypoint}.models.model"]\nmodel = "cozytest/tenant"\nrelease = "1"\n'
     'lane = "bf16"\n'
-    for entrypoint in ("burst", "segment")
+    for entrypoint in ("burst", "segment", "work")
 )
 
 
@@ -587,6 +595,26 @@ def test_a_call_that_needs_room_evicts_the_idle_neighbour_instead_of_running_out
     assert len(evicted_for_burst) >= 2, card.vacated()
     assert set(card.epochs().values()) == {1}, "vacated, not killed"
     assert not any("out of memory" in step.lower() for step in card.steps())
+
+
+@needs_card
+def test_an_out_of_memory_error_inside_a_forward_recovers_in_the_same_attempt(
+    card: Card, store: Store
+) -> None:
+    """P's forward is measured small, then asks for more than fits beside the idle Q. The
+    worker admits it on the small peak, so the forward runs out of memory: the executor
+    asks for room, the worker vacates Q, and the same forward runs again in the same
+    attempt. Nothing is killed and the attempt succeeds."""
+    assert succeeded(card.call("q-touch", "retouch", "q"))
+    assert succeeded(card.call("p-small", "work", "p", scratch_bytes=1 << 20))
+    assert succeeded(card.call("q-again", "retouch", "q"))
+    scratch = free() + store.weight_bytes // 2
+    body = card.call("p-large", "work", "p", scratch_bytes=scratch)
+    assert succeeded(body), body
+    whom = card.replicas["p-large"]
+    assert card.replicas["q-again"] in [v for v, by in card.vacated() if by == whom]
+    assert any("its executor needs" in step for step in card.steps()), card.steps()[-10:]
+    assert set(card.epochs().values()) == {1}, "recovered in place, not respawned"
 
 
 @needs_card

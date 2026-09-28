@@ -95,6 +95,7 @@ from cozy_runtime.internal.executor_commands import (
     Vacate,
 )
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.memory import MemoryManager
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -155,7 +156,6 @@ from cozy_runtime.internal.worker.lanes import (
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
-from cozy_runtime.internal.memory import MemoryManager
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,

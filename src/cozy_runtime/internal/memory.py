@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import gc
+import itertools
 import os
 import re
 import sys
@@ -364,10 +365,10 @@ class MemoryManager:
             if (
                 victim is None
                 and need is not None
-                and all(need[o] <= measured[o].total_bytes for o in short)
+                and self._processes_cover(lane, slot, short, ended, need, measured)
             ):
-                # Weights are all gone and it could still fit an empty card: idle processes
-                # hold the rest (contexts, NCCL, kernels), and only their death returns it.
+                # Weights are all gone and the idle processes' own bytes (contexts, NCCL,
+                # kernels) are what stands in the way: only their death returns those.
                 victim = self._process(slot, short, ended)
                 if victim is not None:
                     other, _, row, executor = victim
@@ -419,6 +420,34 @@ class MemoryManager:
             if tier:
                 return min(tier, key=lambda item: item[2].last_used)
         return None
+
+    def _processes_cover(
+        self,
+        lane: DeviceLane,
+        slot: str,
+        short: set[int],
+        ended: set[str],
+        need: dict[int, int],
+        measured: Mapping[int, DeviceMemory],
+    ) -> bool:
+        """Would ending every idle process on `short` give `need`? Counted from the driver's
+        per-process rows; where it cannot say (a pod's PID namespace), assume it would."""
+        pids = {
+            executor.pid
+            for other, _, row in self.tenants(short)
+            if other != slot
+            and other not in ended
+            and (executor := row.supervision.current if row.supervision else None) is not None
+            and executor.alive()
+        }
+        for ordinal in short:
+            table = accel.device_processes(lane.entries[lane.ordinals.index(ordinal)])
+            if table is None:
+                continue
+            held = sum(max(table.get(pid, 0), 0) for pid in pids)
+            if measured[ordinal].free_bytes + held < need[ordinal]:
+                return False
+        return bool(pids)
 
     def _process(
         self, slot: str, short: set[int], ended: set[str]
@@ -664,26 +693,59 @@ class Fence:
 #: A capacity outcome: the attempt could not fit, and nothing in the process is broken.
 CAPACITY_CODES = frozenset({DEVICE_OOM, "device_shortfall"})
 
-#: The rungs a component forward descends, cheapest first. `room`: idle tenants of the
-#: device give theirs back; `evict`: this process's idle components leave; `page`: the
-#: component itself pages its blocks; `split`: the leading batch runs in halves.
+#: The rungs a component forward descends, cheapest first. `room`: idle tenants of its GPU
+#: give theirs back; `evict`: this process's idle components and constructions leave;
+#: `page`: the component pages its blocks; `split`: the leading batch runs in pieces.
 FORWARD_RUNGS = ("room", "evict", "page", "split")
 #: A decode or encode slices and tiles before paging: its work, not its weights, is large.
 CODEC_RUNGS = ("room", "evict", "slice", "tile", "page")
+#: The rungs that change how a call computes (and so possibly its bits): replayed on the
+#: next call of the same shape, and confessed on every attempt they touch.
+WORK_RUNGS = ("split", "slice", "tile")
 
 
 @dataclass(slots=True)
 class Op:
-    """What one kind of call (component, argument shapes) needed: the rungs that made it
-    fit and the most the allocator held during it."""
+    """One kind of call (component, argument shapes): the work rungs it last fit under, and
+    the peak each way of running it measured when it succeeded."""
 
     rungs: tuple[str, ...] = ()
-    peak: int = 0
+    peaks: dict[tuple[str, ...], int] = field(default_factory=dict)
     #: the leading batch of the call, and how many pieces it runs in
     batch: int = 0
     splits: int = 1
     #: the codec tile the call last fit in: attribute -> value
     tile: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _State:
+    """What running a call again must not see changed: the random streams it draws from and
+    the counters its modules advance."""
+
+    restores: list[Callable[[], object]]
+
+    @classmethod
+    def take(cls, torch: Any, member: object, leaves: list[object]) -> _State:
+        restores: list[Callable[[], object]] = [
+            functools.partial(torch.set_rng_state, torch.get_rng_state())
+        ]
+        if torch.cuda.is_initialized():
+            restores.append(functools.partial(torch.cuda.set_rng_state, torch.cuda.get_rng_state()))
+        restores += [
+            functools.partial(g.set_state, g.get_state())
+            for g in leaves
+            if isinstance(g, torch.Generator)
+        ]
+        restores += [
+            functools.partial(setattr, module, attribute, value)
+            for (module, attribute), value in _counters(member).items()
+        ]
+        return cls(restores)
+
+    def restore(self) -> None:
+        for restore in self.restores:
+            restore()
 
 
 @dataclass(slots=True)
@@ -731,6 +793,12 @@ class ComponentResidency:
     attempt_page_bytes: int = 0
     #: asks the worker for allocatable bytes this process cannot free (idle co-tenants)
     room: Callable[[int], None] | None = None
+    #: parks this process's other constructions until the bytes fit; True when it parked
+    siblings: Callable[[int], bool] | None = None
+    #: the shortfall of the clean exhaustion that is failing this attempt, else None
+    exhausted: Shortfall | None = None
+    #: the work rungs this attempt ran under, as confessions
+    applied: set[str] = field(default_factory=set)
     #: False in a rank group: a sharded forward cannot run again on one rank alone
     recoverable: bool = True
     #: the allocator bytes this process may hold, or 0 for the whole device
@@ -745,7 +813,7 @@ class ComponentResidency:
     #: the order paged blocks ran in: (component, block) -> the block after it
     next_unit: dict[tuple[str, str], str] = field(default_factory=dict)
     last_unit: dict[str, str] = field(default_factory=dict)
-    copy_stream: Any = None
+    copy_stream: object = None
 
     def __post_init__(self) -> None:
         for name, layout in self.backend.layouts.items():
@@ -798,6 +866,8 @@ class ComponentResidency:
         self.attempt_absolute_peak_bytes = 0
         self.attempt_page_bytes = 0
         self.recoveries.clear()
+        self.applied.clear()
+        self.exhausted = None
 
     def admit(self, method: str, components: tuple[str, ...]) -> None:
         """Make the declared set resident before the method body runs, paging what does not
@@ -845,23 +915,25 @@ class ComponentResidency:
 
     # ------------------------------------------------------------------ staging
 
-    def _stage(
-        self, name: str, declared: tuple[str, ...], headroom: int, method: str
-    ) -> None:
-        """Bring one absent component in: whole when it fits beside `headroom` after idle
-        components and co-tenants gave room, else its common weights with blocks paged."""
-        if name not in self.backend.paging:
-            whole = self.backend.stage_bytes(name, headroom)
-            self._free(whole, declared)
-            if not self._fits(whole) and self.room is not None:
-                self.room(whole - self._allocatable())
-            if not self._fits(whole) and name in self.backend.layouts:
-                self.backend.paging[name] = self.backend.layouts[name]
-                self.recoveries.append(f"{name}: pages its blocks (whole needs {whole} B)")
+    def _stage(self, name: str, declared: tuple[str, ...], headroom: int, method: str) -> None:
+        """Bring one absent component in: whole when it fits beside `headroom` once idle
+        components, sibling constructions and co-tenants gave room, else its common weights
+        with blocks paged through its forward."""
+        layout = self.backend.layouts.get(name)
+        whole = (
+            self.backend.component_memory[name].admission(headroom)
+            if name in self.backend.paging
+            else self.backend.stage_bytes(name, headroom)
+        )
+        if layout is None or self._reachable(whole, declared):
+            self._make_fit(whole, declared)
+        if self._fits(whole):
+            self.backend.paging.pop(name, None)
+        elif layout is not None and name not in self.backend.paging:
+            self._page(name, layout)
+            self.recoveries.append(f"{name}: pages its blocks (whole needs {whole} B)")
         need = self.backend.stage_bytes(name, headroom)
-        self._free(need, declared)
-        if not self._fits(need) and self.room is not None:
-            self.room(need - self._allocatable())
+        self._make_fit(need, declared)
         if not self._fits(need):
             refusal = self._shortfall(method, name, headroom, "nothing left to give before staging")
             self.last_shortfall = refusal.shortfall
@@ -890,6 +962,29 @@ class ComponentResidency:
         self.staged_ms += took
         self.attempt_staged_ms += took
 
+    def _reachable(self, need: int, declared: tuple[str, ...]) -> bool:
+        """Could `need` fit once this process's idle components left? (Co-tenants and
+        sibling constructions are asked either way.)"""
+        freeable = sum(self._charge(victim) for victim in self._victims(declared))
+        return self._allocatable() + freeable >= need or self._room_for(need)
+
+    def _room_for(self, need: int) -> bool:
+        if self._fits(need):
+            return True
+        if self.siblings is not None:
+            self.siblings(need)
+        if not self._fits(need) and self.room is not None:
+            self.room(need)
+        return self._fits(need)
+
+    def _make_fit(self, need: int, declared: tuple[str, ...]) -> None:
+        self._free(need, declared)
+        self._room_for(need)
+
+    def _page(self, name: str, layout: BlockLayout) -> None:
+        self.backend.paging[name] = layout
+        self.backend.hold_lease = True
+
     def _touch(self, name: str) -> None:
         self.clock += 1
         self.fences.setdefault(name, Fence()).last_used = self.clock
@@ -900,8 +995,9 @@ class ComponentResidency:
         """Wrap the component's forward (and a codec's decode/encode) without touching its
         signature: stage it if an eviction took it, and on an out-of-memory error descend
         one rung and run it again."""
-        call = getattr(member, "_call_impl")
-        setattr(member, "_call_impl", functools.partial(self._call, name, call, FORWARD_RUNGS))
+        call = getattr(member, "_call_impl")  # noqa: B009 - any module
+        guarded = functools.partial(self._call, name, call, FORWARD_RUNGS)
+        setattr(member, "_call_impl", guarded)  # noqa: B010 - any module
         for method in ("decode", "encode"):
             original = getattr(member, method, None)
             if callable(original) and callable(getattr(member, "enable_tiling", None)):
@@ -918,194 +1014,127 @@ class ComponentResidency:
     ) -> object:
         if name in self.running or name in self.hosted or self.torch.is_grad_enabled():
             return call(*args, **kwargs)
-        op = self.ops.setdefault((name, self._signature(args, kwargs)), Op())
-        op.batch = self._batch(args, kwargs)
+        leaves = self.torch.utils._pytree.tree_leaves((args, kwargs))
+        op = self.ops.setdefault((name, self._signature(leaves)), Op())
+        op.batch = next((int(t.shape[0]) for t in self._tensors(leaves) if t.dim()), 0)
+        member = self.backend.components.get(name) or self.backend.parked.get(name)
+        plain = op.peaks.get(())
+        rungs = () if plain is not None and self._fits(plain - self._allocated()) else op.rungs
         self.running.append(name)
         try:
             while True:
                 self._resident(name)
-                for rung in op.rungs:
-                    self._apply(name, rung, op)
-                if op.peak:
-                    self._clear(name, op.peak - self._allocated())
-                versions = self._versions(args, kwargs)
-                rng = self.torch.cuda.get_rng_state() if self.kind == "cuda" else None
-                # A call that may not fit keeps its modules' counters (a step index a
-                # forward advances), so running it again sees what the first run saw.
-                armed = not op.peak or op.peak - self._allocated() > self._allocatable()
-                counters = _counters(self.backend.components.get(name)) if armed else None
+                self._clear(name, op.peaks.get(rungs, 0) - self._allocated())
+                versions = self._versions(leaves)
+                state = _State.take(self.torch, member, leaves)
+                codec = _codec(member)
+                entered = self._allocated()
                 self.windows.append([0])
                 failure: Exception | None = None
                 try:
-                    result = self._split(call, args, kwargs, op)
+                    result = self._run(call, args, kwargs, op, rungs, member, state)
                 except Exception as exc:
                     if not self.recoverable or not is_device_oom(exc):
                         raise
                     failure = exc
                 finally:
                     window = self.windows.pop()
-                op.peak = max(op.peak, window[0], self._fold())
+                    _restore_codec(member, codec)
+                peak = max(window[0], self._fold())
                 if failure is None:
+                    op.peaks[rungs] = max(op.peaks.get(rungs, 0), peak)
+                    op.rungs = rungs
+                    self.fences.setdefault(name, Fence()).event = accel.completion_event(
+                        self.torch, self.kind
+                    )
+                    self.exhausted = None
+                    self.applied.update(f"{name}: {self._describe(r, op)}" for r in rungs)
                     return result
-                asked = requested_bytes(failure)
+                asked = self._allocated() - entered + requested_bytes(failure)
                 detail = str(failure).splitlines()[0][:200]
                 recover(self.torch, self.kind, failure)
-                del failure
-                if self._versions(args, kwargs) != versions:
-                    raise self.torch.cuda.OutOfMemoryError(
-                        f"{name}: out of memory after writing its inputs, so it cannot run "
-                        f"again ({detail})"
-                    )
-                if rng is not None:
-                    self.torch.cuda.set_rng_state(rng)
-                for (module, attribute), value in (counters or {}).items():
-                    setattr(module, attribute, value)
-                step = self._descend(name, ladder, op, asked)
+                if self._versions(leaves) != versions or _stateful_hooks(member):
+                    # Not safe to run this forward again; the declared method may be.
+                    raise failure
+                state.restore()
+                step = self._descend(name, ladder, op, asked, rungs)
                 if step is None:
-                    raise self.torch.cuda.OutOfMemoryError(self._exhausted(name, op, asked, detail))
+                    raise self._exhaust(name, op, asked, detail)
+                if step in WORK_RUNGS and step not in rungs:
+                    rungs = (*rungs, step)
                 self.recoveries.append(
-                    f"{name}: out of memory (asked {asked} B, {self._allocatable()} B "
-                    f"allocatable after recovery) -> {step}"
+                    f"{name}: out of memory (needed {asked} B, {self._allocatable()} B "
+                    f"allocatable after recovery) -> {self._describe(step, op)}"
                 )
                 print(f"memory: {self.recoveries[-1]}", file=sys.stderr, flush=True)
         finally:
             self.running.pop()
 
     def run[R](
-        self, method: str, body: Callable[[], R], args: tuple[object, ...], kwargs: object
+        self,
+        method: str,
+        components: tuple[str, ...],
+        body: Callable[[], R],
+        args: tuple[object, ...],
+        kwargs: object,
     ) -> R:
         """A declared method call. An out-of-memory error its forwards could not absorb
-        (glue between them, a weight cast) runs it again while idle co-tenants or this
-        process's idle components still give room, and its inputs are intact."""
-        if self.running or not self.recoverable or self.torch.is_grad_enabled():
+        (glue between them, a weight cast, a forward whose hooks hold state) runs the method
+        again when idle components, sibling constructions or co-tenants gave at least what
+        it needed, and its inputs are intact."""
+        if self.running or not self.recoverable:
             return body()
-        named = dict(kwargs) if isinstance(kwargs, dict) else {}
+        leaves = self.torch.utils._pytree.tree_leaves((args, kwargs))
         while True:
-            versions = self._versions(args, named)
+            versions = self._versions(leaves)
+            entered = self._allocated()
             try:
                 return body()
             except Exception as exc:
                 if not is_device_oom(exc):
                     raise
-                asked = requested_bytes(exc)
+                if not getattr(exc, "cozy_exhausted", False):
+                    self.exhausted = None
+                asked = self._allocated() - entered + requested_bytes(exc)
                 recover(self.torch, self.kind, exc)
-                if self._versions(args, named) != versions:
-                    raise
-                victims = self._victims(())
+                before = self._allocatable()
+                victims = self._victims(components)
                 for victim in victims:
                     self._evict(victim)
-                before = self._allocatable()
-                if self.room is not None:
-                    self.room(before + max(asked, 1))
-                if not victims and self._allocatable() <= before:
+                self._room_for(asked)
+                if self._versions(leaves) != versions or self._allocatable() <= max(
+                    before, asked - 1
+                ):
                     raise
-                self.recoveries.append(f"{method}(): out of memory -> room and idle components")
+                self.recoveries.append(
+                    f"{method}(): out of memory (needed {asked} B) -> room, runs again"
+                )
 
-    def _resident(self, name: str) -> None:
-        """A component an eviction took comes back before its forward runs."""
-        if name in self.backend.components or name not in self.backend.parked:
-            return
-        method = self.active[0] if self.active is not None else name
-        declared = (*(self.active[1] if self.active is not None else ()), *self.running)
-        self._touch(name)
-        self._stage(name, declared, self.scope_headrooms.get(method, self.headroom), method)
-
-    def _clear(self, name: str, need: int) -> None:
-        """Room for a call whose peak is known, before it runs."""
-        if need <= 0 or self._fits(need):
-            return
-        self._free(need, (name, *self.running))
-        if not self._fits(need) and self.room is not None:
-            self.room(need)
-
-    def _descend(self, name: str, ladder: tuple[str, ...], op: Op, asked: int) -> str | None:
-        """The first rung that still changes something, applied."""
-        for rung in ladder:
-            if self._apply(name, rung, op, asked=asked, descend=True):
-                if rung not in op.rungs:
-                    op.rungs = (*op.rungs, rung)
-                return rung
-        return None
-
-    def _apply(
-        self, name: str, rung: str, op: Op, *, asked: int = 0, descend: bool = False
-    ) -> bool:
-        """One rung. `descend` steps down from what failed; otherwise the rung is repeated
-        for a call that needed it before. True when it changed something."""
-        member = self.backend.components.get(name) or self.backend.parked.get(name)
-        if rung == "room":
-            if not descend or self.room is None:
-                return False
-            before = self._allocatable()
-            self.room(before + max(asked, 1))
-            return self._allocatable() > before
-        if rung == "evict":
-            victims = self._victims((name, *self.running))
-            for victim in victims:
-                self._evict(victim)
-            return bool(victims)
-        if rung == "page":
-            if name in self.backend.paging or name not in self.backend.layouts:
-                return False
-            self._evict(name)
-            self.backend.paging[name] = self.backend.layouts[name]
-            self._resident(name)
-            return True
-        if rung == "split":
-            if not descend:
-                return False
-            if op.splits * 2 > op.batch:
-                return False
-            op.splits *= 2
-            return True
-        if rung == "slice":
-            enable = getattr(member, "enable_slicing", None)
-            if not callable(enable) or getattr(member, "use_slicing", False) or op.batch < 2:
-                return False
-            enable()
-            return True
-        if rung == "tile":
-            return _tile(member, op, halve=descend)
-        return False
-
-    def _leaves(self, args: tuple[object, ...], kwargs: dict[str, object]) -> list[_Tensor]:
-        return [
-            leaf
-            for leaf in self.torch.utils._pytree.tree_leaves((args, kwargs))
-            if isinstance(leaf, self.torch.Tensor)
-        ]
-
-    def _signature(self, args: tuple[object, ...], kwargs: dict[str, object]) -> tuple[object, ...]:
-        """A call's structural identity: the shape and dtype of every tensor it is given."""
-        return tuple((tuple(leaf.shape), str(leaf.dtype)) for leaf in self._leaves(args, kwargs))
-
-    def _versions(self, args: tuple[object, ...], kwargs: dict[str, object]) -> list[int]:
-        """In-place writes bump a tensor's version: equal versions mean the inputs are
-        intact. Inference-mode tensors keep no version; an inference forward that writes its
-        own inputs is not one this Runtime serves."""
-        return [
-            leaf._version for leaf in self._leaves(args, kwargs) if not leaf.is_inference()
-        ]
-
-    def _batch(self, args: tuple[object, ...], kwargs: dict[str, object]) -> int:
-        """The leading dimension of the first tensor argument: the batch a split divides."""
-        return next((int(t.shape[0]) for t in self._leaves(args, kwargs) if t.dim()), 0)
-
-    def _split(
+    def _run(
         self,
         call: Callable[..., object],
         args: tuple[object, ...],
         kwargs: dict[str, object],
         op: Op,
+        rungs: tuple[str, ...],
+        member: object,
+        state: _State,
     ) -> object:
-        """Run `call` with its leading batch in `op.splits` pieces and join the outputs."""
-        if op.splits <= 1:
+        """The call under its work rungs: sliced, tiled, or its batch in pieces (each piece
+        sees the random streams and counters the whole call would have)."""
+        if "slice" in rungs:
+            getattr(member, "enable_slicing")()  # noqa: B009 - any codec
+        if "tile" in rungs:
+            _set_tile(member, op.tile)
+        if "split" not in rungs or op.splits <= 1:
             return call(*args, **kwargs)
         pytree = self.torch.utils._pytree
         leaves, spec = pytree.tree_flatten((args, kwargs))
         bounds = [op.batch * i // op.splits for i in range(op.splits + 1)]
         outputs = []
-        for start, stop in zip(bounds, bounds[1:], strict=False):
+        for start, stop in itertools.pairwise(bounds):
+            if start:
+                state.restore()
             piece = [
                 leaf[start:stop]
                 if isinstance(leaf, self.torch.Tensor) and leaf.dim() and leaf.shape[0] == op.batch
@@ -1123,11 +1152,82 @@ class ComponentResidency:
         ]
         return pytree.tree_unflatten(joined, flat[0][1])
 
-    def _exhausted(self, name: str, op: Op, asked: int, detail: str) -> str:
+    def _resident(self, name: str) -> None:
+        """A component an eviction took comes back before its forward runs."""
+        if name in self.backend.components or name not in self.backend.parked:
+            return
+        method = self.active[0] if self.active is not None else name
+        declared = (*(self.active[1] if self.active is not None else ()), *self.running)
+        self._touch(name)
+        self._stage(name, declared, self.scope_headrooms.get(method, self.headroom), method)
+
+    def _clear(self, name: str, need: int) -> None:
+        """Room for a call whose peak is known, before it runs."""
+        if need > 0 and not self._fits(need):
+            self._make_fit(need, (name, *self.running))
+
+    def _descend(
+        self, name: str, ladder: tuple[str, ...], op: Op, asked: int, rungs: tuple[str, ...]
+    ) -> str | None:
+        """The first rung that still changes something, applied."""
+        member = self.backend.components.get(name) or self.backend.parked.get(name)
+        for rung in ladder:
+            if rung == "room" and self.room is not None and self._allocatable() < asked:
+                before = self._allocatable()
+                self.room(asked)
+                if self._allocatable() > before:
+                    return rung
+            elif rung == "evict":
+                victims = self._victims((name, *self.running))
+                for victim in victims:
+                    self._evict(victim)
+                parked = self.siblings is not None and self.siblings(asked)
+                if victims or parked:
+                    return rung
+            elif rung == "page" and name not in self.backend.paging:
+                layout = self.backend.layouts.get(name)
+                if layout is not None:
+                    self._evict(name)
+                    self._page(name, layout)
+                    self._resident(name)
+                    return rung
+            elif rung == "split" and op.splits * 2 <= op.batch:
+                op.splits *= 2
+                return rung
+            elif rung == "slice" and "slice" not in rungs and op.batch > 1:
+                if callable(getattr(member, "enable_slicing", None)):
+                    return rung
+            elif rung == "tile" and _next_tile(member, op):
+                return rung
+        return None
+
+    def _describe(self, rung: str, op: Op) -> str:
+        if rung == "split":
+            return f"split its batch of {op.batch} into {op.splits}"
+        if rung == "tile":
+            if "tile_sample_min_size" in op.tile:
+                return f"tile {op.tile['tile_sample_min_size']} px"
+            return f"tile {op.tile['tile_sample_min_height']}x{op.tile['tile_sample_min_width']} px"
+        return {"slice": "slice its batch", "page": "page its blocks"}.get(rung, rung)
+
+    def _tensors(self, leaves: list[object]) -> list[_Tensor]:
+        return [leaf for leaf in leaves if isinstance(leaf, self.torch.Tensor)]
+
+    def _signature(self, leaves: list[object]) -> tuple[object, ...]:
+        """A call's structural identity: the shape and dtype of every tensor it is given."""
+        return tuple((tuple(t.shape), str(t.dtype)) for t in self._tensors(leaves))
+
+    def _versions(self, leaves: list[object]) -> list[int]:
+        """In-place writes bump a tensor's version: equal versions mean the inputs are
+        intact. Inference-mode tensors keep no version; an inference forward that writes its
+        own inputs is not one this Runtime serves."""
+        return [t._version for t in self._tensors(leaves) if not t.is_inference()]
+
+    def _exhaust(self, name: str, op: Op, asked: int, detail: str) -> Exception:
         rows = accel.allocation(self.torch, self.kind)
         layout = self.backend.layouts.get(name)
         floor = f"; its floor is {layout.working_bytes} B of weights" if layout else ""
-        refusal: Shortfall = {
+        self.exhausted = {
             "resource": "vram",
             "scope": "component_forward",
             "needed_bytes": asked,
@@ -1135,13 +1235,14 @@ class ComponentResidency:
             "evidence_class": "measured",
             "request_shape": name,
         }
-        self.last_shortfall = refusal
-        return (
+        exc: Exception = self.torch.cuda.OutOfMemoryError(
             f"{name}: out of memory at every rung ({', '.join(op.rungs) or 'none applied'}): "
-            f"asked {asked} B with {self._allocatable()} B allocatable, "
+            f"needed {asked} B with {self._allocatable()} B allocatable, "
             f"{rows['driver_free_bytes']} B driver-free of {rows['driver_total_bytes']} B"
             f"{f', capped at {self.cap} B' if self.cap else ''}{floor} ({detail})"
         )
+        setattr(exc, "cozy_exhausted", True)  # noqa: B010 - a mark on a torch exception
+        return exc
 
     def set_limit(self, limit: int) -> None:
         """The most this process's allocator may reserve on the device (0: no limit). Past
@@ -1174,7 +1275,7 @@ class ComponentResidency:
         self._fold()
         self._free(unit.nbytes, (name, *self.running))
         if not self._fits(unit.nbytes) and self.room is not None:
-            self.room(unit.nbytes - self._allocatable())
+            self.room(unit.nbytes)
         allocated = self._allocated()
         started = time.perf_counter()
         try:
@@ -1259,8 +1360,7 @@ class ComponentResidency:
         ):
             raise self._poison("paging_output_schema", "block outputs must be a tensor PyTree")
         if any(
-            isinstance(value, self.torch.Tensor)
-            and value.untyped_storage().data_ptr() in storages
+            isinstance(value, self.torch.Tensor) and value.untyped_storage().data_ptr() in storages
             for value in leaves
         ):
             raise self._poison("paging_output_alias", "a block output views a paged weight")
@@ -1285,7 +1385,9 @@ class ComponentResidency:
         held: dict[str, str] = {}
         allocated = self._allocated()
         started = time.perf_counter()
-        for name in sorted(self.backend.components, key=lambda n: self.fences.get(n, Fence()).last_used):
+        for name in sorted(
+            self.backend.components, key=lambda n: self.fences.get(n, Fence()).last_used
+        ):
             if not self._evictable(name):
                 held[name] = "the completion fence has not fired"
                 continue
@@ -1296,6 +1398,9 @@ class ComponentResidency:
                 continue
             self.evictions += 1
         accel.release_cached(self.torch, self.kind)
+        # Given the card up, it gives up the host memory its paged blocks were kept in too.
+        self.backend.drop_mirror()
+        self.kept_bytes = 0
         took = (time.perf_counter() - started) * 1000
         self.evicted_ms += took
         return {
@@ -1443,12 +1548,16 @@ class ComponentResidency:
                     self._evict(victim)
             return
         absent = sum(self._size(name) for name in declared if name not in self.backend.components)
-        self._free(absent + max(self.scope_headrooms.get(method, self.headroom), self.headroom), declared)
+        self._free(
+            absent + max(self.scope_headrooms.get(method, self.headroom), self.headroom), declared
+        )
 
     def _victims(self, declared: tuple[str, ...]) -> list[str]:
         """Resident components outside `declared` whose fences fired, least recent first."""
         candidates = [
-            name for name in list(self.backend.components) if name not in declared and self._evictable(name)
+            name
+            for name in list(self.backend.components)
+            if name not in declared and self._evictable(name)
         ]
         return sorted(candidates, key=lambda n: self.fences.get(n, Fence()).last_used)
 
@@ -1600,7 +1709,8 @@ class ComponentResidency:
 
 
 def _counters(root: object) -> dict[tuple[object, str], int | float]:
-    """Every public number a module tree holds, by (module, attribute)."""
+    """Every public number a module tree holds, by (module, attribute): the step indices a
+    forward advances."""
     modules = getattr(root, "modules", None)
     if not callable(modules):
         return {}
@@ -1612,46 +1722,74 @@ def _counters(root: object) -> dict[tuple[object, str], int | float]:
     }
 
 
-#: The tile attributes of the two codec families diffusers ships.
+def _stateful_hooks(root: object) -> bool:
+    """A module tree carrying diffusers hooks keeps state across forwards (a first-block
+    cache's residual), which running one forward again would corrupt."""
+    modules = getattr(root, "modules", None)
+    return callable(modules) and any(
+        getattr(getattr(module, "_diffusers_hook", None), "hooks", None) for module in modules()
+    )
+
+
+#: The tile attributes of the codec families diffusers ships.
 _TILES = (
     ("tile_sample_min_size",),
     ("tile_sample_min_height", "tile_sample_min_width"),
 )
+_CODEC = (
+    "use_tiling",
+    "use_slicing",
+    "tile_latent_min_size",
+    "tile_sample_min_size",
+    "tile_sample_min_height",
+    "tile_sample_min_width",
+    "tile_sample_stride_height",
+    "tile_sample_stride_width",
+)
 
 
-def _tile(member: object, op: Op, *, halve: bool) -> bool:
-    """Tile a codec at the op's remembered size; descending halves it, down to the codec's
-    own latent scale. False when there is nothing smaller to try."""
-    enable = getattr(member, "enable_tiling", None)
-    names = next((names for names in _TILES if all(hasattr(member, n) for n in names)), ())
-    if not callable(enable) or not names:
-        return False
-    if not halve:
-        if not op.tile:
-            return False
-        enable()
-    else:
-        scale = _scale(member)
-        current = op.tile or {n: int(getattr(member, n)) for n in names}
-        if min(current.values()) // 2 < scale * scale:
-            return False
-        op.tile = {n: value // 2 for n, value in current.items()}
-        enable()
-    tiles = dict(op.tile)
-    if "tile_sample_min_size" in tiles:
-        tiles["tile_latent_min_size"] = tiles["tile_sample_min_size"] // _scale(member)
-    else:
-        tiles["tile_sample_stride_height"] = tiles["tile_sample_min_height"] * 3 // 4
-        tiles["tile_sample_stride_width"] = tiles["tile_sample_min_width"] * 3 // 4
-    for attribute, value in tiles.items():
-        setattr(member, attribute, value)
-    return True
+def _codec(member: object) -> dict[str, object]:
+    """A codec's tiling and slicing settings, to put back after a call changed them."""
+    return {name: getattr(member, name) for name in _CODEC if hasattr(member, name)}
+
+
+def _restore_codec(member: object, saved: dict[str, object]) -> None:
+    for name, value in saved.items():
+        setattr(member, name, value)
 
 
 def _scale(member: object) -> int:
-    """A codec's latent scale: two to the number of its down-sampling stages."""
+    """A codec's latent scale: its declared compression, or two to its down stages."""
+    ratio = getattr(member, "spatial_compression_ratio", None)
+    if isinstance(ratio, int) and ratio > 0:
+        return ratio
     config = getattr(member, "config", None)
     return int(2 ** (len(getattr(config, "block_out_channels", ()) or (0,)) - 1))
+
+
+def _next_tile(member: object, op: Op) -> bool:
+    """Halve the op's codec tile, from the codec's own when it has none, down to the latent
+    scale squared. False when the codec cannot tile or nothing smaller is left."""
+    names = next((names for names in _TILES if all(hasattr(member, n) for n in names)), ())
+    if not callable(getattr(member, "enable_tiling", None)) or not names:
+        return False
+    scale = _scale(member)
+    current = op.tile or {n: int(getattr(member, n)) for n in names}
+    if min(current[n] for n in names) // 2 < scale * scale:
+        return False
+    op.tile = {n: current[n] // 2 for n in names}
+    if "tile_sample_min_size" in op.tile:
+        op.tile["tile_latent_min_size"] = op.tile["tile_sample_min_size"] // scale
+    else:
+        op.tile["tile_sample_stride_height"] = op.tile["tile_sample_min_height"] * 3 // 4
+        op.tile["tile_sample_stride_width"] = op.tile["tile_sample_min_width"] * 3 // 4
+    return True
+
+
+def _set_tile(member: object, tile: dict[str, int]) -> None:
+    getattr(member, "enable_tiling")()  # noqa: B009 - any codec
+    for attribute, value in tile.items():
+        setattr(member, attribute, value)
 
 
 # ---------------------------------------------------------------------------- constructions

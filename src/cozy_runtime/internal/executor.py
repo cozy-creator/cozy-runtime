@@ -65,7 +65,13 @@ from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
-from cozy_runtime.author._errors import CapabilityError, InvalidRequest, Outcome, classify
+from cozy_runtime.author._errors import (
+    DEVICE_OOM,
+    CapabilityError,
+    InvalidRequest,
+    Outcome,
+    classify,
+)
 from cozy_runtime.author._executor_requests import (
     Answer,
     Checkpoint,
@@ -134,6 +140,15 @@ from cozy_runtime.internal.executor_commands import (
     Warm,
 )
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.memory import (
+    CAPACITY_CODES,
+    ComponentResidency,
+    Construction,
+    ConstructionArbiter,
+    ResidencyRefusal,
+    RestoreReport,
+    Shortfall,
+)
 from cozy_runtime.internal.parallel import cp, mirror, wire
 from cozy_runtime.internal.parallel.group import (
     RankGroup,
@@ -147,14 +162,6 @@ from cozy_runtime.internal.parallel.plan import (
     GroupPlan,
     GroupRefusal,
     rank_invariant_digest,
-)
-from cozy_runtime.internal.memory import (
-    CAPACITY_CODES,
-    ComponentResidency,
-    Construction,
-    ConstructionArbiter,
-    ResidencyRefusal,
-    RestoreReport,
 )
 from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
@@ -354,6 +361,18 @@ class _CompositeResidency:
     def set_limit(self, limit: int) -> None:
         for row in self.rows.values():
             row.set_limit(limit)
+
+    @property
+    def exhausted(self) -> Shortfall | None:
+        return next((row.exhausted for row in self.rows.values() if row.exhausted), None)
+
+    @property
+    def recoveries(self) -> list[str]:
+        return [line for row in self.rows.values() for line in row.recoveries]
+
+    @property
+    def applied(self) -> set[str]:
+        return {line for row in self.rows.values() for line in row.applied}
 
     @property
     def last_shortfall(self) -> Any:
@@ -1705,6 +1724,18 @@ class Executor:
         if answer.ok and not isinstance(answer.free_bytes, UnsetType):
             host._cap(answer.free_bytes)
 
+    def _clean_capacity(self, code: str) -> bool:
+        """The attempt failed for room alone and left nothing broken: a typed shortfall, or
+        a guarded forward that exhausted every rung. Any other out-of-memory error may have
+        stopped mid-mutation (a half-cast module), and the process is replaced."""
+        if code == "device_shortfall":
+            return True
+        return code == DEVICE_OOM and self.residency is not None and bool(self.residency.exhausted)
+
+    def _siblings(self, need: int) -> bool:
+        """Park this process's other constructions until `need` bytes fit."""
+        return bool(self.host._make_room(self.construction, need))
+
     def _cap(self, free_bytes: int) -> None:
         """The worker's budget: what this process may add to what it reserves now (-1: no
         budget). One allocator per process, so every construction's plane hears it."""
@@ -2600,6 +2631,7 @@ class Executor:
             torch=torch,
             placement="all_resident",
             room=self._room,
+            siblings=self._siblings,
             recoverable=self.world == 1,
         )
         self.residency.set_limit(host.authorized)
@@ -3453,7 +3485,7 @@ class Executor:
             outcome.terminal == "failed"
             and record.entered
             and not record.failed_at_call
-            and outcome.code not in CAPACITY_CODES
+            and not self._clean_capacity(outcome.code)
         ):
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         terminal = {
@@ -3473,7 +3505,12 @@ class Executor:
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
-        shortfall = self.residency.last_shortfall if self.residency is not None else None
+        shortfall = None
+        if self.residency is not None and outcome.code in CAPACITY_CODES:
+            shortfall = self.residency.last_shortfall or self.residency.exhausted
+        if self.residency is not None:
+            for line in (*self.residency.recoveries, *sorted(self.residency.applied)):
+                record.emit("confession", "memory.rung", line.split(":", 1)[0], detail=line)
         return {
             "ok": True,
             "shortfall": shortfall,
@@ -4027,7 +4064,7 @@ class Executor:
             outcome.terminal == "failed"
             and record.entered
             and not record.failed_at_call
-            and outcome.code not in CAPACITY_CODES
+            and not self._clean_capacity(outcome.code)
         ):
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         return {
