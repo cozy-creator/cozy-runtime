@@ -41,7 +41,8 @@ def serve(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
 
 
 class HuggingFace:
-    """Serves one repository's listing and ranged member bodies, counting body bytes."""
+    """Serves one repository's listing and ranged member bodies, counting body bytes. As a
+    Civitai origin it serves a model version whose first file is the primary SafeTensors."""
 
     # TensorFS asks for at most this much of a carrier when it only wants the header.
     PROBE = 64 << 10
@@ -71,6 +72,7 @@ class HuggingFace:
             def do_GET(self) -> None:
                 with origin.lock:
                     origin.requests += 1
+                listing: object = None
                 if self.path.startswith("/api/models/"):
                     listing = [
                         {
@@ -81,6 +83,22 @@ class HuggingFace:
                         }
                         for path, body in origin.files.items()
                     ]
+                elif self.path.startswith("/api/v1/model-versions/"):
+                    base = f"http://{self.headers['Host']}/files/"
+                    listing = {
+                        "id": int(self.path.rsplit("/", 1)[1]),
+                        "files": [
+                            {
+                                "id": index + 1,
+                                "name": path,
+                                "primary": index == 0,
+                                "hashes": {"SHA256": hashlib.sha256(body).hexdigest()},
+                                "downloadUrl": base + path,
+                            }
+                            for index, (path, body) in enumerate(origin.files.items())
+                        ],
+                    }
+                if listing is not None:
                     data = json.dumps(listing).encode()
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(data)))

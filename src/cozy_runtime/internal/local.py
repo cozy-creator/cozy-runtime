@@ -1390,9 +1390,8 @@ def _resolve_development_models(
         try:
             config_bytes = model_config.construction_config(header.get("configs"))
         except model_config.ModelConfigRefusal as exc:
-            raise RuntimeError(
-                f"development_model_config_invalid: {binding.ref}: {type(exc).__name__}: {exc}"
-            ) from exc
+            code = exc.code or "development_model_config_invalid"
+            raise RuntimeError(f"{code}: {binding.ref}: {exc}") from exc
         if not header.get("components"):
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")
         assets = fill.Checkpoint(store_root, manifest_digest).model_assets()

@@ -96,6 +96,7 @@ from cozy_runtime.author._invoke import (
 from cozy_runtime.author._loader import (
     Artifact,
     Backend,
+    CheckpointUnnormalized,
     Config,
     ConstructionRecord,
     DerivedCache,
@@ -208,6 +209,7 @@ __all__ = [
     "CheckpointRef",
     "CheckpointSave",
     "CheckpointSinkUnbuilt",
+    "CheckpointUnnormalized",
     "Checkpoints",
     "ChildCallError",
     "Clamp",
