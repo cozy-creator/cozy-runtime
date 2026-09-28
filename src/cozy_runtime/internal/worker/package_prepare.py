@@ -15,6 +15,7 @@ from pathlib import Path
 
 import msgspec
 from packaging.requirements import Requirement
+from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import (
     base_observation,
@@ -343,6 +344,14 @@ def prepare_published_local(
     )
 
 
+def _same_version(locked: str, release: str) -> bool:
+    """`1.0.0rc1` (a wheel's spelling) and `1.0.0-rc.1` (a release's) are one version."""
+    try:
+        return Version(locked) == Version(release)
+    except InvalidVersion:
+        return locked == release
+
+
 def _filtered_rows(
     package_name: str,
     release: str,
@@ -352,7 +361,7 @@ def _filtered_rows(
 
     expected = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     projects = [row for row in locked.rows if row.name == expected]
-    if not projects or any(row.version != release for row in projects):
+    if not projects or any(not _same_version(row.version, release) for row in projects):
         raise PreparationRefusal(
             "package_prepare_project_pin_missing", f"the export must pin {expected}=={release}"
         )

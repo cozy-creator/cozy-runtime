@@ -108,7 +108,8 @@ def root_offer(
                 )
             ],
             outputs=[
-                pb.OutputAccess(output_id=str(row["output_id"]), url="model://alice/model")
+                # Typed with capitals: the Hub's names fold, so this is alice/model.
+                pb.OutputAccess(output_id=str(row["output_id"]), url="model://Alice/Model")
                 for row in weights
             ],
         ),

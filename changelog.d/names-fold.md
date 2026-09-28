@@ -1,0 +1,1 @@
+Names are case-insensitive where the Hub folds them. A model choice spelled `Fidika/Anima` resolves and runs as the Hub's `fidika/anima`, instead of being refused as "model catalog cannot resolve". A `model://Alice/Model` output publishes to `alice/model` instead of failing `publication.destination_invalid`. A package release spelled `1.0.4-rc.1` matches its lock's `1.0.4rc1`.

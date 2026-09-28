@@ -51,7 +51,7 @@ def _checkpoint(raw: bytes, destination: str) -> bytes:
         raise ExecutionWorkspaceRefusal(
             "memo_result_invalid", "memo answer is not an upload's checkpoint"
         ) from exc
-    if ref.destination != destination or not ref.checkpoint:
+    if ref.destination.lower() != destination.lower() or not ref.checkpoint:
         raise ExecutionWorkspaceRefusal(
             "memo_result_invalid", "memo answer names no checkpoint in the call's destination"
         )

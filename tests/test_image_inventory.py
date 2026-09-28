@@ -62,6 +62,8 @@ def test_locked_export_keeps_inventory_names() -> None:
         _locked([_pin("ranged-marco", "1.0.4")]),
     )
     assert [row.name for row in kept] == ["ranged-marco"]
+    # A release spelled `1.0.4-rc.1` is the wheel's normalised `1.0.4rc1`.
+    assert _filtered_rows("paul/ranged-marco", "1.0.4-rc.1", _locked([_pin("ranged-marco", "1.0.4rc1")]))
 
 
 def test_frameworks_remain_in_the_complete_locked_dependencies() -> None:

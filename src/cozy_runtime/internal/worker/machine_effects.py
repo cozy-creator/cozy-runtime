@@ -270,8 +270,8 @@ class Effects:
             upload = intent.upload()
             # A memoized root may upload only its own result, to the destination its
             # owner granted; its memo identity never includes that upload.
-            granted = upload is not None and upload.destination == self.executions.destination(
-                owner, call.parent_request
+            granted = upload is not None and upload.destination.lower() == (
+                self.executions.destination(owner, call.parent_request)
             )
             if pure is None or (pure["memoize"] and not granted):
                 raise PublicationRefusal("publication.impure_call_forbidden")
