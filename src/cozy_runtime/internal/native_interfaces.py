@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING
 
 import msgspec
 from packaging.version import InvalidVersion, Version
@@ -19,6 +19,24 @@ from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import _CallType
 from cozy_runtime.internal import effect_interfaces, source_interfaces
+from cozy_runtime.internal.canonical import Json
+
+if TYPE_CHECKING:
+    Schema = Json
+else:
+    Schema = object  # msgspec cannot analyze the recursive schema grammar; it stays JSON
+
+
+class Operation(msgspec.Struct, frozen=True):
+    request: Schema
+    result: Schema
+
+
+class Statement(msgspec.Struct, frozen=True):
+    """One native interface document; members a newer writer adds are ignored."""
+
+    operations: dict[str, Operation]
+
 
 _SERVICES = {
     source_interfaces.MODULE: (source_interfaces, "native_source"),
@@ -28,9 +46,13 @@ _SERVICES = {
 UPDATE_RENTAL = "run `cozy rental update <rental>`"
 
 
-def stated() -> dict[str, Any]:
+def stated() -> dict[str, Json]:
     """This Runtime's native interface documents, as its executor states them at hello."""
     return {module: canonical_json.decode(s.DOCUMENT) for module, (s, _) in _SERVICES.items()}
+
+
+def _offered(module: str) -> Statement:
+    return canonical_json.decode_as(_SERVICES[module][0].DOCUMENT, Statement)
 
 
 def bindings() -> dict[tuple[str, str], _CallType]:
@@ -50,7 +72,7 @@ def unserved(module: str, export: str) -> _CallType:
     return dataclasses.replace(bindings()[(module, export)], unavailable=detail)
 
 
-def rows(hello: Mapping[str, Any]) -> list[dict[str, Any]]:
+def rows(hello: Mapping[str, object]) -> list[dict[str, object]]:
     """Broker rows for every native operation the executor expects.
 
     Each expected operation is listed so that the executor binds it. One this worker cannot
@@ -59,15 +81,18 @@ def rows(hello: Mapping[str, Any]) -> list[dict[str, Any]]:
     expected = hello.get("native_interfaces")
     if not isinstance(expected, dict):
         return []
-    result: list[dict[str, Any]] = []
+    result: list[dict[str, object]] = []
     for module, document in expected.items():
-        operations = document.get("operations") if isinstance(document, dict) else None
-        if module not in _SERVICES or not isinstance(operations, dict):
+        if module not in _SERVICES:
+            continue
+        try:
+            statement = msgspec.convert(document, Statement, strict=True)
+        except msgspec.ValidationError:
             continue
         service, flag = _SERVICES[module]
-        offered = canonical_json.decode(service.DOCUMENT)["operations"]
-        for name, wanted in operations.items():
-            row: dict[str, Any] = {"module": module, "export": name, flag: True}
+        offered = _offered(module).operations
+        for name, wanted in statement.operations.items():
+            row: dict[str, object] = {"module": module, "export": name, flag: True}
             try:
                 problem = _refusal(module, name, wanted, offered.get(name))
             except (KeyError, TypeError, AttributeError):
@@ -83,7 +108,7 @@ def rows(hello: Mapping[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def _refusal(module: str, name: str, wanted: Any, offered: Any) -> str:
+def _refusal(module: str, name: str, wanted: Operation, offered: Operation | None) -> str:
     if offered is None:
         return (
             f'native operation "{name}" is not offered by this machine\'s Runtime '
@@ -92,8 +117,8 @@ def _refusal(module: str, name: str, wanted: Any, offered: Any) -> str:
     # The worker reads the request and ignores unknown options only when they are optional:
     # dropping a required one would change what was asked. The executor ignores unknown
     # result fields.
-    missing, unread = _gaps(wanted["request"], offered["request"], ignore="optional")
-    absent, extra = _gaps(offered["result"], wanted["result"], ignore="all")
+    missing, unread = _gaps(wanted.request, offered.request, ignore="optional")
+    absent, extra = _gaps(offered.result, wanted.result, ignore="all")
     problems = [
         *(f"request {field} is not sent" for field in missing),
         *(f"request {field} is not read" for field in unread),
@@ -108,7 +133,7 @@ def _refusal(module: str, name: str, wanted: Any, offered: Any) -> str:
     )
 
 
-def _gaps(written: Any, reader: Any, *, ignore: str, at: str = "") -> tuple[list[str], list[str]]:
+def _gaps(written: Json, reader: Json, *, ignore: str, at: str = "") -> tuple[list[str], list[str]]:
     """(fields the reader requires that the writer lacks, written fields the reader cannot take).
 
     ``ignore`` names which unknown written fields the reader drops: "optional", "all" or "".
@@ -137,15 +162,15 @@ def _gaps(written: Any, reader: Any, *, ignore: str, at: str = "") -> tuple[list
     return ([], []) if written == reader else ([], [at.rstrip(".") or "value"])
 
 
-def _struct(node: Any) -> bool:
+def _struct(node: Json) -> bool:
     return isinstance(node, dict) and isinstance(node.get("fields"), list)
 
 
-def _list(node: Any) -> bool:
+def _list(node: Json) -> bool:
     return isinstance(node, dict) and node.keys() == {"list"}
 
 
-def _remedy(hello: Mapping[str, Any]) -> str:
+def _remedy(hello: Mapping[str, object]) -> str:
     executor = str(hello.get("runtime_version", ""))
     try:
         newer = Version(executor) > Version(RUNTIME_VERSION)
