@@ -187,7 +187,10 @@ def test_a_serving_root_releases_its_gpus_at_device_exit(
     machine.root("B")
     b1 = machine.child("B", "qwen")
     machine.await_granted("A")
-    view = machine.worker.gpu.view()
+    bound = time.monotonic() + 120  # B's call asks for its GPU on its own unit
+    while not (view := machine.worker.gpu.view())["waiting"]:
+        assert time.monotonic() < bound
+        time.sleep(0.01)
     assert machine.granted("A") == [0, 1, 2, 3] and view["waiting"] == {b1 + "#1": ["A"]}
     # the lane's device exit (`Worker.run_lane`); A's encode and output transfer follow it
     machine.worker.gpu.release("A#1", ranks=[])
