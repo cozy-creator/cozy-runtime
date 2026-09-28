@@ -9,6 +9,7 @@ same `main` called with `gpus=`), with fd 3 as its stop pipe and no argument.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import datetime
 import hashlib
 import json
@@ -299,10 +300,17 @@ def _run_job(
 ) -> tuple[str, pb.AttemptOutcome]:
     """Prepare a CPU fixture package and run one job through the machine calls; an
     orchestration job takes the CPU slot, as Creator submits a job granted no device."""
-    installs = machine.root / "var/lib/cozy/installs"
     if staged is None:
         scratch.mkdir()
         staged = package(scratch, "rooted")
+    binding, prepared = _prepare(machine, staged)
+    return _submit(machine, scratch, binding, prepared, request_id, orchestration)
+
+
+def _prepare(
+    machine: Machine, staged: tuple[Path, pb.PrepareLocalPackageRequest]
+) -> tuple[JobBinding, pb.PreparePackageSetResult]:
+    installs = machine.root / "var/lib/cozy/installs"
     staged_environment, request = staged
     stage = installs / ".stage/rooted/wheels"
     stage.parent.mkdir(parents=True, exist_ok=True)
@@ -315,7 +323,17 @@ def _run_job(
         json.loads(path.read_bytes())
         for path in (machine.root / "run/cozy/job-plans").glob("*/*.json")
     ]
-    binding = JobBinding.read(next(row for row in plans if row.get("job") == "rooted"))
+    return JobBinding.read(next(row for row in plans if row.get("job") == "rooted")), prepared
+
+
+def _submit(
+    machine: Machine,
+    scratch: Path,
+    binding: JobBinding,
+    prepared: pb.PreparePackageSetResult,
+    request_id: str,
+    orchestration: bool,
+) -> tuple[str, pb.AttemptOutcome]:
     capture, capture_digest = documents.identity(
         pb.MachineExecutionCapture(
             root_installation_id=binding.installation_id,
@@ -538,6 +556,34 @@ def test_restarted_worker_runs_its_owners_next_submission_without_another_claim(
             # The boot's own readiness proof, named, and the owner hanging up after its Claim.
             assert "REFUSED (CLAIM_REJECTION_UNAUTHENTICATED) for readiness-negative-arm" in log
             assert "the control stream ended: RpcError: the peer closed the stream" in log
+        finally:
+            code = machine.close()
+        assert code == 0, machine.output()
+
+
+def test_concurrent_first_submissions_share_the_preparation_slot() -> None:
+    """A fresh worker's first submissions arrive together. Each captures the Runtime's
+    built-in operations in the one preparation executor slot; they share one capture and
+    none is refused for another's use of the slot (hakufu run 1416)."""
+    with tempfile.TemporaryDirectory(prefix="cz-concurrent.") as raw:
+        root = Path(raw) / "machine"
+        root.mkdir()
+        machine = Machine(root, VIRTUAL_GPUS)
+        try:
+            scratch = Path(raw) / "scratch"
+            scratch.mkdir()
+            binding, prepared = _prepare(machine, package(scratch, "rooted"))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                runs = [
+                    pool.submit(_submit, machine, scratch, binding, prepared, f"first-{i}", True)
+                    for i in range(3)
+                ]
+                outcomes = [run.result()[1] for run in runs]
+            assert sorted(outcome.request_id for outcome in outcomes) == [
+                "first-0",
+                "first-1",
+                "first-2",
+            ]
         finally:
             code = machine.close()
         assert code == 0, machine.output()
