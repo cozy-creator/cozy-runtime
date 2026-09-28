@@ -9,6 +9,7 @@ from cozy_runtime.author import App, Context, Invocation, ObjectRef, SourceArtif
 from cozy_runtime.author._calls import _Broker
 from cozy_runtime.author.sources import convert_cozytensors, download_civitai, download_huggingface
 from cozy_runtime.internal import source_interfaces
+from durable_seam import wire
 
 
 class Empty(msgspec.Struct):
@@ -37,7 +38,7 @@ def test_public_source_facades_use_the_admitted_broker(tmp_path: Path) -> None:
             (binding.module, binding.export): binding
             for binding in source_interfaces.bindings().values()
         },
-        exchange,
+        wire(exchange),
     )
     _, outcome, _ = attempt(
         app.get("script"), {}, Invocation("parent", tmp_path, time.monotonic() + 10, calls=broker)

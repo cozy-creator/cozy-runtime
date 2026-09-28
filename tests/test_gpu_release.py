@@ -25,6 +25,7 @@ import pytest
 
 import signed_claims
 from cozy_runtime import canonical_json
+from cozy_runtime.author._executor_requests import Answer, GpuRelease, Reply
 from cozy_runtime.internal import accel, child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.attempts import AttemptRecord
@@ -126,12 +127,12 @@ def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
             made.close()
 
 
-def _release(machine: Machine, root: str, ordinal: int = 1) -> dict[str, Any]:
+def _release(machine: Machine, root: str, ordinal: int = 1) -> Reply:
     """`ctx.release_gpus()` as the root's executor sends it, through the worker's handler."""
     attempt = AttemptRecord(
         root, ordinal, b"", {}, lane_id="orchestration", state="running", machine=True
     )
-    return machine.worker.engine.durable_exchange(attempt, {"kind": "gpu_release"})
+    return machine.worker.engine.durable_exchange(attempt, GpuRelease())
 
 
 def test_a_released_root_lets_the_next_root_start_while_its_python_runs(
@@ -145,8 +146,8 @@ def test_a_released_root_lets_the_next_root_start_while_its_python_runs(
     machine.finish(a1)
     view = machine.tick()
     assert view["leases"] == {"A": [0, 1, 2, 3]} and b1 + "#1" in view["waiting"]
-    assert _release(machine, "A") == {"ok": True}
-    assert _release(machine, "A") == {"ok": True}  # idempotent
+    assert _release(machine, "A") == Answer(ok=True)
+    assert _release(machine, "A") == Answer(ok=True)  # idempotent
     machine.tick()
     assert machine.granted(b1) == [0, 1, 2, 3]
     assert machine.executions.status(OWNER, "A").state == "running"  # its CPU tail runs on

@@ -24,6 +24,7 @@ from cozy_runtime.author import (  # noqa: E402
 )
 from cozy_runtime.author._errors import InvalidRequest  # noqa: E402
 from cozy_runtime.probe._capture import CaptureSession, validate_components  # noqa: E402
+from durable_seam import wire  # noqa: E402
 
 
 class Denoiser(torch.nn.Module):  # type: ignore[name-defined,misc]
@@ -273,7 +274,7 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
                 Result,
             )
         },
-        exchange,
+        wire(exchange),
     )
     broker.bind(Context("parent", time.monotonic() + 60))
     pending = broker.reserve("tiny", "render", {"fail": False})

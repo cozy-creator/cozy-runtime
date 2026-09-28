@@ -71,14 +71,6 @@ class SeamError(Exception):
         self.detail = detail
 
 
-class DescriptorReply(dict[str, Any]):
-    """A trusted request handler's one connected capability; never a JSON fd number."""
-
-    def __init__(self, body: dict[str, Any], descriptor: socket.socket) -> None:
-        super().__init__({**body, "descriptor": True})
-        self.descriptor = descriptor
-
-
 def _scan(value: Any, path: str = "") -> None:
     if isinstance(value, dict):
         for key, item in value.items():

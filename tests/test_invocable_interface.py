@@ -26,6 +26,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.internal import canonical, interface_wheel, package_interface
 from cozy_runtime.internal.discovery import Discovered
+from durable_seam import wire
 
 
 class Detail(msgspec.Struct, frozen=True):
@@ -224,7 +225,7 @@ def test_ordinary_main_reserves_self_call_with_implicit_attempt_lifetime(tmp_pat
                 Result,
             )
         },
-        no_exchange,
+        wire(no_exchange),
     )
     _, outcome, _ = attempt(
         app.get("wrapper"),
@@ -272,7 +273,7 @@ def test_implicit_operation_call_observes_actual_parent_cancellation(tmp_path: P
             tmp_path,
             time.monotonic() + 60,
             cancel=lambda: cancelled,
-            calls=_Broker("parent", {}, no_exchange),
+            calls=_Broker("parent", {}, wire(no_exchange)),
         ),
     )
     assert outcome.terminal == "canceled", outcome

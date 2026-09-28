@@ -22,6 +22,18 @@ from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._capture import ActivationCapture, ExecutionObservation
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
+from cozy_runtime.author._executor_requests import (
+    MAX_CALL_INDEX,
+    Answer,
+    CallState,
+    ChildCall,
+    ChildCancel,
+    ChildForget,
+    ChildPoll,
+    Exchange,
+    GpuRelease,
+    ModelPrefetch,
+)
 from cozy_runtime.author._memo import MemoDependency
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
@@ -30,7 +42,6 @@ from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressS
 P = ParamSpec("P")
 R = TypeVar("R")
 MAX_ACTIVE_CALLS = 32
-MAX_CALL_INDEX = (1 << 32) - 1
 MAX_CALL_BYTES = 48 * 1024
 #: Only a worker that cannot nudge its parent (Runtime before child_events) is polled.
 _UNNOTIFIED_POLL_SECONDS = 0.05
@@ -194,11 +205,11 @@ def prefetch(
     if len(payload) > MAX_CALL_BYTES:
         raise CapabilityError("model prefetch exceeds inline bound", code="child_payload_bound")
     answer = broker.exchange(
-        "model_prefetch", {"module": module, "export": name, "payload": payload.decode()}
+        ModelPrefetch(module=module, export=name, payload=payload.decode()), Answer
     )
     # An older/nonlocal worker can decline an optional optimization. Normal calls
     # retain their ordinary demand preparation path.
-    if not answer.get("ok") and answer.get("code") not in (
+    if answer.code not in (
         "model_prefetch_unsupported",
         "weights_host_unavailable",
         "unknown_durable_request",
@@ -299,7 +310,7 @@ class _Broker:
         self,
         request_id: str,
         bindings: Mapping[tuple[str, str], _CallType],
-        exchange: Callable[[str, dict[str, Any]], dict[str, Any]],
+        exchange: Exchange,
         watch: Callable[[], int | None] | None = None,
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
@@ -328,9 +339,9 @@ class _Broker:
         """`ctx.release_gpus()` of this attempt: its root's GPU lease ends at the worker."""
         if self.closed:
             raise CapabilityError("GPU release escaped its attempt", code="escaped_handle")
-        answer = self.exchange("gpu_release", {})
+        answer = self.exchange(GpuRelease(), Answer)
         # A worker that predates the release declines it; the lease then ends with the root.
-        if not answer.get("ok") and answer.get("code") not in (
+        if answer.code not in (
             "weights_host_unavailable",
             "unknown_durable_request",
             "no_durable_exchange",
@@ -410,16 +421,16 @@ class _Broker:
                     raise ChildCallError("escaped_handle", "parent attempt closed", call.index)
                 for ready in tuple(self.calls.values()):
                     if ready.task is not None and ready.index not in self.activated:
-                        answer = self.exchange("child_call", self._intent(ready))
+                        answer = self.exchange(self._intent(ready), CallState)
                         self._observe(ready, answer)
-                        self._check(answer, ready.index)
+                        self._check(answer, ready.index, answer.child_request_id)
                         self.activated.add(ready.index)
                 seen = self.nudged
-                answer = self.exchange("child_poll", {"call_index": call.index})
+                answer = self.exchange(ChildPoll(call_index=call.index), CallState)
                 self._observe(call, answer)
-                self._check(answer, call.index)
-                if answer.get("state") == "succeeded":
-                    raw = str(answer.get("result", "")).encode()
+                self._check(answer, call.index, answer.child_request_id)
+                if answer.state == "succeeded":
+                    raw = answer.result.encode()
                     if len(raw) > MAX_CALL_BYTES:
                         raise ChildCallError(
                             "child_result_bound", "child result exceeds inline bound", call.index
@@ -438,7 +449,7 @@ class _Broker:
                         result, call.observation = decode(
                             value,
                             call.binding.result,
-                            answer.get("byte_grants", []),
+                            list(answer.byte_grants),
                             request_id=self.request_id,
                             guard=guard,
                             observation=call.observation,
@@ -455,12 +466,12 @@ class _Broker:
                 await self._changed(seen, call.ctx.deadline)
         except asyncio.CancelledError:
             if call.index in self.activated and not self.closed:
-                self.exchange("child_cancel", {"call_index": call.index})
+                self.exchange(ChildCancel(call_index=call.index), CallState)
             raise
         finally:
             try:
                 if call.index in self.activated and not self.closed:
-                    self.exchange("child_forget", {"call_index": call.index})
+                    self.exchange(ChildForget(call_index=call.index), Answer)
             finally:
                 self.activated.discard(call.index)
                 self.calls.pop(call.index, None)
@@ -508,36 +519,27 @@ class _Broker:
             self.nudges = None
 
     @staticmethod
-    def _observe(call: PendingCall[Any], answer: Mapping[str, Any]) -> None:
-        child_id = answer.get("child_request_id")
+    def _observe(call: PendingCall[Any], answer: CallState) -> None:
+        child_id = answer.child_request_id
         if child_id:
-            if (
-                not isinstance(child_id, str)
-                or len(child_id) > 256
-                or call.request_id not in ("", child_id)
-            ):
+            if len(child_id) > 256 or call.request_id not in ("", child_id):
                 raise ChildCallError(
                     "child_identity_changed", "child request identity changed", call.index
                 )
             call.request_id = child_id
-        progress = answer.get("progress")
-        if (
-            isinstance(progress, dict)
-            and type(progress.get("sequence")) is int
-            and progress["sequence"] > call.progress_sequence
-            and isinstance(progress.get("payload"), dict)
-        ):
-            call.progress_sequence = progress["sequence"]
+        progress = answer.progress
+        if progress is not None and progress.sequence > call.progress_sequence:
+            call.progress_sequence = progress.sequence
             scope = call.progress_scope
             if scope is None and call.broker.telemetry is not None:
                 scope = _ProgressScope(call.broker.telemetry, call.binding.export, None)
             if scope is not None:
-                scope.telemetry._child_progress(progress["payload"], scope)
-        if answer.get("observation") is None:
+                scope.telemetry._child_progress(progress.payload, scope)
+        if answer.observation is None:
             return
         try:
             call.observation = msgspec.convert(
-                answer["observation"],
+                answer.observation,
                 type=ExecutionObservation,
                 dec_hook=asset_dec_hook,
                 strict=True,
@@ -548,25 +550,20 @@ class _Broker:
             ) from exc
 
     @staticmethod
-    def _intent(call: PendingCall[Any]) -> dict[str, Any]:
-        return {
-            "call_index": call.index,
-            "module": call.binding.module,
-            "export": call.binding.export,
-            "payload": call.payload.decode(),
-            **({"progress_label": call.progress_scope.name} if call.progress_scope else {}),
-            **({"capture": call.capture.document()} if call.capture is not None else {}),
-        }
+    def _intent(call: PendingCall[Any]) -> ChildCall:
+        return ChildCall(
+            call_index=call.index,
+            module=call.binding.module,
+            export=call.binding.export,
+            payload=call.payload.decode(),
+            progress_label=call.progress_scope.name if call.progress_scope else "",
+            capture=call.capture,
+        )
 
     @staticmethod
-    def _check(answer: Mapping[str, Any], index: int) -> None:
-        if not answer.get("ok"):
-            raise ChildCallError(
-                str(answer.get("code", "child_unavailable")),
-                str(answer.get("detail", "package call unavailable"))[:1024],
-                index,
-                str(answer.get("child_request_id", "")),
-            )
+    def _check(answer: Answer, index: int, child_request_id: str = "") -> None:
+        if not answer.ok:
+            raise ChildCallError(answer.code, answer.detail[:1024], index, child_request_id)
 
     def close(self) -> None:
         self.closed = True

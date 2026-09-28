@@ -27,6 +27,7 @@ from cozy_runtime.author import (
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._calls import _Broker, _CallType
 from cozy_runtime.author._services import ImageFrame, encode_png
+from durable_seam import wire
 
 
 class ImageInput(msgspec.Struct, tag="image"):
@@ -124,7 +125,7 @@ def test_broker_serializes_verified_nested_media_and_refuses_unhydrated_forgery(
                 DigestResult,
             )
         },
-        exchange,
+        wire(exchange),
     )
     result, outcome, _ = attempt(
         parent.get("main"),
@@ -236,7 +237,7 @@ def test_broker_forwards_only_this_attempts_verified_tree(tmp_path: Path, forwar
                 DigestResult,
             )
         },
-        exchange,
+        wire(exchange),
     )
     result, outcome, _ = attempt(
         parent.get("main"),

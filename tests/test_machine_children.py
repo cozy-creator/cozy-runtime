@@ -8,7 +8,6 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +17,7 @@ import pytest
 
 import signed_claims
 from cozy_runtime import canonical_json
+from cozy_runtime.author._executor_requests import CallRequest, Reply
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker import activity
@@ -697,14 +697,14 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 exchanged: list[str] = []
                 handle = worker.calls.handle
 
-                def counted(attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
-                    exchanged.append(str(frame.get("kind")))
-                    return handle(attempt, frame)
+                def counted(attempt: AttemptRecord, request: CallRequest) -> Reply:
+                    exchanged.append(type(request).__name__)
+                    return handle(attempt, request)
 
                 worker.calls.handle = counted  # type: ignore[method-assign]
                 time.sleep(1)
                 worker.calls.handle = handle  # type: ignore[method-assign]
-                assert exchanged.count("child_poll") <= 2, exchanged
+                assert exchanged.count("ChildPoll") <= 2, exchanged
                 worker.control_execution(claim, "root", "pause-root", 1, "pause")
                 while True:
                     assert advancing()

@@ -41,6 +41,7 @@ from cozy_runtime.internal.worker.control import _PreparationServicer
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
+from durable_seam import wire
 from native_weights import NativeExecution
 from test_weights_resume_native import _committed
 
@@ -83,7 +84,7 @@ def test_injected_model_refuses_as_model_before_reserving_a_child() -> None:
     broker = _Broker(
         "parent",
         {key[1:]: _CallType(*key, surface.payload_type, surface.result_type)},
-        exchange,
+        wire(exchange),
     )
     broker.bind(fake_context(request_id="parent"))
     with pytest.raises(CapabilityError, match="retained ModelArtifact") as error:

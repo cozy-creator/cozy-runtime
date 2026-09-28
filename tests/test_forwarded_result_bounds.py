@@ -23,6 +23,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.author._calls import _Broker, _CallType
 from cozy_runtime.author._services import ImageFrame, encode_png
+from durable_seam import wire
 
 
 class Empty(msgspec.Struct):
@@ -106,7 +107,7 @@ def _forwarding_parent(tmp_path: Path, result_type: type) -> tuple[Any, Any, lis
                 ImageReport,
             )
         },
-        exchange,
+        wire(exchange),
     )
     result, outcome, _ = attempt(
         parent.get("main"),

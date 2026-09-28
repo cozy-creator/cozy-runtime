@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import msgspec
 import pytest
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._executor_requests import CallProgress, CallState, ChildPoll
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
@@ -125,21 +127,20 @@ def test_child_progress_poll_reuses_journal_and_fences_owner_parent_and_attempt(
         lambda _: None, lambda: 1, workspace=Workspace(root), owner=lambda: "owner"
     )
     observed = transport._progress(pending)
-    assert observed["child_request_id"] == child.child_request
-    assert observed["progress"]["payload"] == document["payload"]
+    assert observed is not None and observed.payload == document["payload"]
     assert transport._progress(pending) == observed  # polling never adds journal rows
     incoming.parent_attempt_ordinal = 2
-    assert "progress" not in transport._progress(pending)
+    assert transport._progress(pending) is None
     incoming.parent_attempt_ordinal = 1
     incoming.parent_request_id = "another-parent"
-    assert "progress" not in transport._progress(pending)
+    assert transport._progress(pending) is None
     incoming.parent_request_id = "parent"
     transport.owner = lambda: "other-owner"
-    assert "progress" not in transport._progress(pending)
+    assert transport._progress(pending) is None
     transport.owner = lambda: "owner"
     complete(executions, child.child_request, status=pb.OUTCOME_STATUS_FAILED)
     executions.control("owner", child.child_request, "retry", 1, "resume")
-    assert "progress" not in transport._progress(pending)
+    assert transport._progress(pending) is None
 
 
 def test_preparation_start_is_visible_without_fabricated_fraction(tmp_path: Path) -> None:
@@ -174,7 +175,6 @@ def test_preparation_start_is_visible_without_fabricated_fraction(tmp_path: Path
 def test_optional_child_progress_cannot_turn_a_valid_result_into_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import json
     from types import SimpleNamespace
     from typing import Any, cast
 
@@ -192,18 +192,13 @@ def test_optional_child_progress_cannot_turn_a_valid_result_into_failure(
     )
     broker = transport.Calls(lambda _: None, lambda: 1)
     broker.pending[("parent", 1, 0)] = held
-    expected = {
-        "ok": True,
-        "state": "succeeded",
-        "child_request_id": "child",
-        "result": '"done"',
-        "byte_grants": [],
-    }
-    maximum = len(json.dumps(expected, separators=(",", ":"), sort_keys=True).encode()) + 128
-    monkeypatch.setattr(transport, "MAX_FRAME", maximum)
-    monkeypatch.setattr(broker, "_progress", lambda _: {"progress": {"stage": "x" * 120}})
+    expected = CallState(ok=True, state="succeeded", child_request_id="child", result='"done"')
+    monkeypatch.setattr(transport, "MAX_FRAME", len(msgspec.json.encode(expected)) + 128)
+    monkeypatch.setattr(
+        broker, "_progress", lambda _: CallProgress(sequence=1, payload={"stage": "x" * 120})
+    )
     attempt = SimpleNamespace(request_id="parent", attempt=1, state="running", canceling=False)
-    assert broker.handle(cast(Any, attempt), {"kind": "child_poll", "call_index": 0}) == expected
+    assert broker.handle(cast(Any, attempt), ChildPoll(call_index=0)) == expected
 
 
 def test_cancel_before_send_performs_no_write_or_forged_completion(tmp_path: Path) -> None:

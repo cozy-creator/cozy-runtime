@@ -169,15 +169,14 @@ class WeightsExchange:
         transaction = weights_sink.weights_transaction_id(
             self.owner_scope(), attempt.request_id, documents.spell(attempt.digest), output_slot
         )
-        self.intent(
+        epoch = self.intent(
             attempt,
             output_slot=output_slot,
             transaction_id=transaction,
             declaration_digest=hashlib.sha256(declaration).digest(),
             declaration=declaration,
-            requested_writer_epoch=0,
         )
-        return transaction, self._writer_epoch(transaction)
+        return transaction, epoch
 
     def record_native_receipt(
         self,
@@ -352,8 +351,8 @@ class WeightsExchange:
         transaction_id: str,
         declaration_digest: bytes,
         declaration: bytes,
-        requested_writer_epoch: int,
-    ) -> dict[str, object]:
+    ) -> int:
+        """Journal the writer intent and authorize its native writer; returns its epoch."""
         if self.workspace is None:
             raise WeightsExchangeError("workspace_unavailable", "worker has no workspace custody")
         self._require_open(transaction_id)
@@ -434,15 +433,7 @@ class WeightsExchange:
                 )
                 held = self._hold(transaction_id, epoch, reference)
                 attempt.weights_receipts[output_slot] = held.receipt
-            return {
-                "ok": True,
-                "weights_transaction_id": transaction_id,
-                "writer_epoch": epoch,
-                "weights_receipt_digest": documents.spell(row["receipt_digest"])
-                if row["receipt"]
-                else "",
-                "checkpoint": checkpoint,
-            }
+            return epoch
         except WeightsExchangeError:
             raise
         except Exception as exc:
@@ -459,7 +450,7 @@ class WeightsExchange:
         transaction_id: str,
         receipt_digest: bytes,
         canonical_receipt: bytes,
-    ) -> dict[str, object]:
+    ) -> None:
         if (
             len(receipt_digest) != 32
             or not canonical_receipt
@@ -518,10 +509,6 @@ class WeightsExchange:
             )
         )
         attempt.weights_receipts[output_slot] = reference
-        return {
-            "ok": True,
-            "weights_receipt_digest": documents.spell(receipt_digest),
-        }
 
     def close(self) -> None:
         """Forget receipt metadata; active transports release their own read leases."""

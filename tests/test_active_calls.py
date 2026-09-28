@@ -8,9 +8,11 @@ import msgspec
 import pytest
 
 from cozy_runtime.author import CapabilityError
-from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_INDEX, _Broker, _CallType
+from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, _Broker, _CallType
+from cozy_runtime.author._executor_requests import MAX_CALL_INDEX, CallProgress, CallState
 from cozy_runtime.author._services import Attempt, ProgressFrame, Telemetry
 from cozy_runtime.author.fakes import fake_context
+from durable_seam import wire
 
 
 class Arguments(msgspec.Struct):
@@ -36,7 +38,7 @@ def test_pending_bound_orders_activation_and_releases_completed_history() -> Non
             return {"ok": True}
         return {"ok": True, "state": "succeeded", "result": f'{{"value":{index}}}'}
 
-    broker = _Broker("parent", {key[1:]: _CallType(*key, Arguments, Result)}, exchange)
+    broker = _Broker("parent", {key[1:]: _CallType(*key, Arguments, Result)}, wire(exchange))
     broker.bind(fake_context(request_id="parent"))
 
     async def run() -> None:
@@ -62,7 +64,7 @@ def test_call_index_refuses_overflow_without_reusing_an_accepted_index() -> None
     def exchange(kind: str, frame: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "state": "succeeded", "result": '{"value":1}'}
 
-    broker = _Broker("parent", {key[1:]: _CallType(*key, Arguments, Result)}, exchange)
+    broker = _Broker("parent", {key[1:]: _CallType(*key, Arguments, Result)}, wire(exchange))
     broker.bind(fake_context(request_id="parent"))
     broker.next_index = MAX_CALL_INDEX
 
@@ -82,15 +84,16 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
     frames: list[Any] = []
     ctx = fake_context(request_id="parent")
     telemetry = Telemetry(Attempt("parent", tmp_path, sink=frames.append), ctx)
-    broker = _Broker("parent", {key[1:]: _CallType(*key, Arguments, Result)}, lambda *a: {})
+    broker = _Broker("parent", {key[1:]: _CallType(*key, Arguments, Result)}, wire(lambda *a: {}))
     broker.bind(ctx, telemetry)
     with telemetry.scope("Shot 2 of 7", overall_range=(0.2, 0.4)):
         first = broker.reserve(*key[1:], {"value": 1})
-        update = {
-            "child_request_id": "child-1",
-            "progress": {
-                "sequence": 10,
-                "payload": {
+        update = CallState(
+            ok=True,
+            child_request_id="child-1",
+            progress=CallProgress(
+                sequence=10,
+                payload={
                     "stage": "denoise",
                     "stage_fraction": 0.375,
                     "overall_fraction": 0.5,
@@ -98,8 +101,8 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
                     "total": 8,
                     "step_ms": 100,
                 },
-            },
-        }
+            ),
+        )
         broker._observe(first, update)
         measured = frames[-1]
         assert isinstance(measured, ProgressFrame)
@@ -114,6 +117,6 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
         assert len(frames) == count
     with telemetry.scope("Shot 3 of 7", overall_range=(0.4, 0.6)):
         second = broker.reserve(*key[1:], {"value": 2})
-        broker._observe(second, {**update, "child_request_id": "child-2"})
+        broker._observe(second, msgspec.structs.replace(update, child_request_id="child-2"))
         assert frames[-1].stage == "Shot 3 of 7 / denoise"
         assert frames[-1].overall_fraction == 0.5

@@ -24,6 +24,7 @@ from cozy_runtime.internal.worker.source_calls import SourceCalls
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from durable_seam import wire
 from test_native_source_views import finish_parent, reattach
 from test_workspace_native_memo import accepted
 
@@ -104,7 +105,7 @@ def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
     broker = _Broker(
         "script#1",
         {(b.module, b.export): b for b in source_interfaces.bindings().values()},
-        exchange,
+        wire(exchange),
     )
     _, outcome, _ = attempt(
         app.get("write"),

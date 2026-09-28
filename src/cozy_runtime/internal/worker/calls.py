@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
 import socket
 import threading
 from collections.abc import Callable, Mapping
@@ -14,9 +13,23 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 
-from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_BYTES, MAX_CALL_INDEX
-from cozy_runtime.author._capture import ActivationCapture
+from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_BYTES
 from cozy_runtime.author._errors import InvalidRequest
+from cozy_runtime.author._executor_requests import (
+    Answer,
+    CallProgress,
+    CallRequest,
+    CallState,
+    ChildCall,
+    ChildCancel,
+    ChildEvents,
+    ChildForget,
+    DescriptorReply,
+    GpuRelease,
+    ModelPrefetch,
+    Reply,
+    refuse,
+)
 from cozy_runtime.internal import (
     builtin_operations,
     canonical,
@@ -26,7 +39,8 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.capture_observation import document as observation_document
-from cozy_runtime.internal.seam import MAX_FRAME, DescriptorReply
+from cozy_runtime.internal.executor_commands import CallInterface
+from cozy_runtime.internal.seam import MAX_FRAME
 from cozy_runtime.internal.worker import byte_inputs, child_byte_results
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
@@ -54,6 +68,17 @@ class _Pending:
     progress_label: str = ""
 
 
+class _ProgressEvent(msgspec.Struct, frozen=True):
+    """A journaled progress event; its payload is the child's own narration."""
+
+    payload: dict[str, canonical.Json]
+
+
+def _framed(answer: CallState) -> int:
+    """The answer's control-frame size, with room for its envelope."""
+    return len(msgspec.json.encode(answer)) + 128
+
+
 @dataclass(frozen=True, slots=True)
 class _Received:
     metadata: dict[str, Any]
@@ -71,7 +96,7 @@ class Calls:
         local: Callable[[AttemptRecord, pb.ChildCallRequest, str], pb.ChildCallResult | None]
         | None = None,
         installed_bindings: Callable[[AttemptRecord], list[dict[str, Any]]] | None = None,
-        prefetch: Callable[[AttemptRecord, Mapping[str, Any]], dict[str, Any]] | None = None,
+        prefetch: Callable[[AttemptRecord, ModelPrefetch], Answer] | None = None,
         release_gpus: Callable[[AttemptRecord], None] | None = None,
     ):
         self.prefetch = prefetch
@@ -89,9 +114,9 @@ class Calls:
         #: one lock per parent attempt: parents never wait on each other's calls
         self.parents: dict[tuple[str, int], threading.RLock] = {}
 
-    def bindings(self, attempt: AttemptRecord) -> list[dict[str, Any]]:
+    def bindings(self, attempt: AttemptRecord) -> tuple[CallInterface, ...]:
         if attempt.job is None:
-            return []
+            return ()
         result = [dict(row) for row in attempt.job.call_interfaces]
         if self.installed_bindings is not None:
             result.extend(self.installed_bindings(attempt))
@@ -117,18 +142,22 @@ class Calls:
                         "self": True,
                     }
                 )
-        return result
+        return msgspec.convert(result, tuple[CallInterface, ...])
 
-    def handle(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
-        if frame.get("kind") == "gpu_release":
+    def handle(
+        self,
+        attempt: AttemptRecord,
+        request: CallRequest,
+    ) -> Reply:
+        if isinstance(request, GpuRelease):
             # Worker-local and always safe: no owner capability, and a canceling attempt
             # may release too.
             try:
                 if self.release_gpus is not None:
                     self.release_gpus(attempt)
             except (OSError, ValueError) as exc:
-                return {"ok": False, "code": "gpu_release_refused", "detail": str(exc)[:1024]}
-            return {"ok": True}
+                return refuse("gpu_release_refused", str(exc))
+            return Answer(ok=True)
         with self.lock:
             parent_lock = self.parents.setdefault(
                 (attempt.request_id, attempt.attempt), threading.RLock()
@@ -137,19 +166,15 @@ class Calls:
             try:
                 if attempt.state != "running" or attempt.canceling:
                     raise ValueError("parent call is not active")
-                if frame.get("kind") == "model_prefetch":
+                if isinstance(request, ModelPrefetch):
                     if self.prefetch is None:
-                        return {"ok": True, "scheduled": False}
-                    return self.prefetch(attempt, frame)
-                if frame.get("kind") == "child_events":
+                        return Answer(ok=True)
+                    return self.prefetch(attempt, request)
+                if isinstance(request, ChildEvents):
                     return self._watch(attempt)
-                index = frame.get("call_index")
-                if type(index) is not int or not 0 <= index <= MAX_CALL_INDEX:
-                    raise ValueError("parent call index exceeds its bound")
-                key = (attempt.request_id, attempt.attempt, index)
-                kind = frame.get("kind")
+                key = (attempt.request_id, attempt.attempt, request.call_index)
                 pending = self.pending.get(key)
-                if kind == "child_forget":
+                if isinstance(request, ChildForget):
                     if pending is not None:
                         if (
                             pending.result is None
@@ -158,59 +183,53 @@ class Calls:
                             pending.forgotten = True
                         else:
                             del self.pending[key]
-                    return {"ok": True}
-                if kind == "child_call":
-                    request = self._request(attempt, frame, index)
+                    return Answer(ok=True)
+                if isinstance(request, ChildCall):
+                    intent = self._request(attempt, request)
                     if (
                         pending is not None
-                        and pending.request.intent_digest != request.intent_digest
+                        and pending.request.intent_digest != intent.intent_digest
                     ):
                         raise ValueError("an existing parent call index changed its exact intent")
                     if pending is None:
                         if sum(k[:2] == key[:2] for k in list(self.pending)) >= MAX_ACTIVE_CALLS:
                             raise ValueError("active parent call bound exceeded")
-                        label = frame.get("progress_label", "")
-                        if (
-                            not isinstance(label, str)
-                            or len(label) > 120
-                            or not label.isprintable()
-                        ):
+                        label = request.progress_label
+                        if len(label) > 120 or not label.isprintable():
                             label = ""
                         pending = self.pending[key] = _Pending(
-                            request, self.stream(), progress_label=label
+                            intent, self.stream(), progress_label=label
                         )
                         local = (
-                            self.local(attempt, request, "call") if self.local is not None else None
+                            self.local(attempt, intent, "call") if self.local is not None else None
                         )
                         if local is not None:
                             pending.local, pending.result = True, local
                         else:
-                            self.send(pb.WorkerFrame(child_call_request=request))
+                            self.send(pb.WorkerFrame(child_call_request=intent))
                 if pending is None:
                     raise ValueError("parent call has not been activated")
+                canceling = isinstance(request, ChildCancel)
                 if pending.local:
                     assert self.local is not None
                     pending.result = self.local(
-                        attempt, pending.request, "cancel" if kind == "child_cancel" else "poll"
+                        attempt, pending.request, "cancel" if canceling else "poll"
                     )
-                if kind == "child_cancel":
-                    if pending.local:
-                        return {"ok": True, "state": "pending"}
-                    request = pending.request
-                    self.send(
-                        pb.WorkerFrame(
-                            child_call_cancel=pb.ChildCallCancel(
-                                parent_request_id=request.parent_request_id,
-                                parent_attempt_ordinal=request.parent_attempt_ordinal,
-                                parent_invocation_spec_digest=request.parent_invocation_spec_digest,
-                                call_index=request.call_index,
-                                intent_digest=request.intent_digest,
+                if canceling:
+                    if not pending.local:
+                        intent = pending.request
+                        self.send(
+                            pb.WorkerFrame(
+                                child_call_cancel=pb.ChildCallCancel(
+                                    parent_request_id=intent.parent_request_id,
+                                    parent_attempt_ordinal=intent.parent_attempt_ordinal,
+                                    parent_invocation_spec_digest=intent.parent_invocation_spec_digest,
+                                    call_index=intent.call_index,
+                                    intent_digest=intent.intent_digest,
+                                )
                             )
                         )
-                    )
-                    return {"ok": True, "state": "pending"}
-                if kind not in ("child_call", "child_poll"):
-                    raise ValueError("unknown managed call operation")
+                    return CallState(ok=True, state="pending")
                 # A new owner stream re-establishes accepted calls by the same
                 # canonical index/intent. No durable cursor lives in Runtime.
                 if not pending.local and pending.stream_epoch != self.stream():
@@ -218,53 +237,45 @@ class Calls:
                     self.send(pb.WorkerFrame(child_call_request=pending.request))
                 result = pending.result
                 if result is None or result.state == pb.CHILD_CALL_STATE_PENDING:
-                    return {"ok": True, "state": "pending", **self._progress(pending)}
-                if result.state == pb.CHILD_CALL_STATE_SUCCEEDED:
-                    if pending.byte_grants is None:
-                        pending.byte_grants = self._materialize(attempt, pending)
-                    answer = {
-                        "ok": True,
-                        "state": "succeeded",
-                        "child_request_id": result.child_request_id,
-                        "result": result.result_canonical_bytes.decode(),
-                        "byte_grants": pending.byte_grants,
-                        **self._progress(pending),
-                        **(
-                            {"observation": observation_document(result.observation)}
-                            if result.HasField("observation")
-                            else {}
-                        ),
-                    }
-                    if (
-                        len(json.dumps(answer, separators=(",", ":"), sort_keys=True).encode())
-                        + 128
-                        > MAX_FRAME
-                    ):
-                        # Optional narration cannot turn a valid child result into a refusal.
-                        answer.pop("progress", None)
-                        if (
-                            len(json.dumps(answer, separators=(",", ":"), sort_keys=True).encode())
-                            + 128
-                            > MAX_FRAME
-                        ):
-                            raise ValueError(
-                                "child result and native grants exceed the control frame"
-                            )
-                    return answer
-                return {
-                    "ok": False,
-                    **self._progress(pending),
-                    **(
-                        {"observation": observation_document(result.observation)}
-                        if result.HasField("observation")
-                        else {}
-                    ),
-                    "code": result.safe_code or "child_failed",
-                    "detail": result.safe_detail,
-                    "child_request_id": result.child_request_id,
-                }
+                    return CallState(
+                        ok=True,
+                        state="pending",
+                        child_request_id=result.child_request_id if result else "",
+                        progress=self._progress(pending),
+                    )
+                observation = (
+                    observation_document(result.observation)
+                    if result.HasField("observation")
+                    else None
+                )
+                if result.state != pb.CHILD_CALL_STATE_SUCCEEDED:
+                    return CallState(
+                        ok=False,
+                        code=result.safe_code or "child_failed",
+                        detail=result.safe_detail,
+                        child_request_id=result.child_request_id,
+                        progress=self._progress(pending),
+                        observation=observation,
+                    )
+                if pending.byte_grants is None:
+                    pending.byte_grants = self._materialize(attempt, pending)
+                answer = CallState(
+                    ok=True,
+                    state="succeeded",
+                    child_request_id=result.child_request_id,
+                    result=result.result_canonical_bytes.decode(),
+                    byte_grants=tuple(pending.byte_grants),
+                    progress=self._progress(pending),
+                    observation=observation,
+                )
+                if _framed(answer) > MAX_FRAME:
+                    # Optional narration cannot turn a valid child result into a refusal.
+                    answer = msgspec.structs.replace(answer, progress=None)
+                    if _framed(answer) > MAX_FRAME:
+                        raise ValueError("child result and native grants exceed the control frame")
+                return answer
             except CapabilityUnavailable as exc:
-                return {"ok": False, "code": exc.code, "detail": str(exc)[:1024]}
+                return refuse(exc.code, str(exc))
             except (
                 OSError,
                 ValueError,
@@ -272,7 +283,7 @@ class Calls:
                 canonical.CanonicalError,
                 documents.DocumentError,
             ) as exc:
-                return {"ok": False, "code": "child_call_refused", "detail": str(exc)[:1024]}
+                return refuse("child_call_refused", str(exc))
 
     def _watch(self, attempt: AttemptRecord) -> DescriptorReply:
         """The parent's wakeup: it awaits a nudge instead of polling on a clock."""
@@ -282,7 +293,7 @@ class Calls:
         if previous is not None:
             previous.close()
         self.watchers[(attempt.request_id, attempt.attempt)] = ours
-        return DescriptorReply({"ok": True}, theirs)
+        return DescriptorReply(Answer(ok=True), theirs)
 
     def wake(self, parent: str) -> None:
         """A call result, child progress or a cancel of `parent`'s may have moved: that
@@ -293,14 +304,11 @@ class Calls:
                 with contextlib.suppress(OSError):
                     watcher.send(b"\0")
 
-    def _progress(self, pending: _Pending) -> dict[str, Any]:
+    def _progress(self, pending: _Pending) -> CallProgress | None:
         """Reuse the child's existing journal; polling progress does not change call identity."""
         result, workspace = pending.result, self.workspace
-        if result is None or not result.child_request_id:
-            return {}
-        answer: dict[str, Any] = {"child_request_id": result.child_request_id}
-        if not pending.local or workspace is None:
-            return answer
+        if result is None or not result.child_request_id or not pending.local or workspace is None:
+            return None
         with workspace.locked() as db:
             row = db.execute(
                 "SELECT p.sequence,p.body FROM execution_events p "
@@ -317,53 +325,44 @@ class Calls:
                     pending.request.call_index,
                 ),
             ).fetchone()
-        if row is not None:
-            document = json.loads(row["body"])
-            answer["progress"] = {"sequence": row["sequence"], "payload": document["payload"]}
-        return answer
+        if row is None:
+            return None
+        event = msgspec.json.decode(row["body"], type=_ProgressEvent)
+        return CallProgress(sequence=row["sequence"], payload=event.payload)
 
     def progress_label(self, parent: str, ordinal: int, index: int) -> str:
         with self.lock:
             pending = self.pending.get((parent, ordinal, index))
             return pending.progress_label if pending is not None else ""
 
-    def _request(
-        self, attempt: AttemptRecord, frame: Mapping[str, Any], index: int
-    ) -> pb.ChildCallRequest:
-        module, export = str(frame.get("module", "")), str(frame.get("export", ""))
+    def _request(self, attempt: AttemptRecord, call: ChildCall) -> pb.ChildCallRequest:
+        module, export = call.module, call.export
         allowed = next(
-            (
-                row
-                for row in self.bindings(attempt)
-                if row["module"] == module and row["export"] == export
-            ),
+            (row for row in self.bindings(attempt) if (row.module, row.export) == (module, export)),
             None,
         )
         if allowed is None:
             raise ValueError(
                 "call does not name a locked interface dependency or current App export"
             )
-        if allowed.get("unavailable"):
-            raise CapabilityUnavailable(allowed["unavailable"])
-        payload = frame.get("payload")
-        if not isinstance(payload, str) or len(payload.encode()) > MAX_CALL_BYTES:
+        if allowed.unavailable:
+            raise CapabilityUnavailable(allowed.unavailable)
+        payload = call.payload.encode()
+        if len(payload) > MAX_CALL_BYTES:
             raise ValueError("call request exceeds its inline bound")
-        value = canonical.parse_canonical(payload.encode())
-        if not isinstance(value, dict):
+        if not isinstance(canonical.parse_canonical(payload), dict):
             raise ValueError("call request must be a canonical object")
-        capture = None
-        if frame.get("capture") is not None:
-            if allowed.get("native_source") or allowed.get("native_effect"):
-                raise ValueError("activation capture requires an ordinary serving invocation")
-            capture = msgspec.convert(frame["capture"], type=ActivationCapture, strict=True)
+        capture = call.capture
+        if capture is not None and (allowed.native_source or allowed.native_effect):
+            raise ValueError("activation capture requires an ordinary serving invocation")
         request = pb.ChildCallRequest(
             parent_request_id=attempt.request_id,
             parent_attempt_ordinal=attempt.attempt,
             parent_invocation_spec_digest=attempt.digest,
-            call_index=index,
+            call_index=call.call_index,
             module=module,
             export=export,
-            request_canonical_bytes=payload.encode(),
+            request_canonical_bytes=payload,
             capture=pb.ActivationCapture(components=capture.components, steps=capture.steps)
             if capture is not None
             else None,

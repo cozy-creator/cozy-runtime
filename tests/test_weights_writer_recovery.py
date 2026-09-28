@@ -7,13 +7,13 @@ import io
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import tensorfs
 from tensorfs.derived import Derivation, Part, Source, Target, Tensor
 
 from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._executor_requests import Request, WriterOutput, decode, encode
 from cozy_runtime.internal.weights_writer import WriterBroker
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from cozy_runtime.protocol import documents
@@ -47,7 +47,7 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
         weights_work_fingerprint=fingerprint,
         spec={"inputs": [], "outputs": [{"output_id": "model", "max_bytes": maximum}]},
     )
-    frames: list[dict[str, Any]] = []
+    frames: list[Request] = []
 
     transaction = "sha256:" + "72" * 32
     definition = Derivation(
@@ -67,16 +67,17 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
         {},
         order,
     )
-    retired = broker.handle(
-        attempt,
-        {
-            "operation": "open",
-            "weights_transaction_id": transaction,
-            "writer_epoch": 91,
-            "work_fingerprint": "sha256:" + "73" * 32,
-        },
-    )
-    assert retired["code"] == "weights_writer_ungranted"
+    with pytest.raises(CapabilityError) as retired:
+        decode(
+            {
+                "kind": "weights_writer",
+                "operation": "open",
+                "weights_transaction_id": transaction,
+                "writer_epoch": 91,
+                "work_fingerprint": "sha256:" + "73" * 32,
+            }
+        )
+    assert retired.value.code == "durable_request_malformed"
     assert store.derived_lookup(transaction)["state"] == "absent"
     writer = open_output(broker, attempt, transaction, definition, frames=frames)
     assert writer.completed_parts() == []
@@ -105,10 +106,12 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
     assert len(receipt["added_objects"]) == 2
     broker.close_attempt(attempt)
     assert broker.writers == {} and broker.bindings == {}
-    assert {frame["operation"] for frame in frames} == {"output"}
+    assert {type(frame) for frame in frames} == {WriterOutput}
     assert not list(spool.glob("*-input")) and not list(spool.glob("*-output"))
     # No payload or model-sized role inventory crosses the durable control request.
-    assert all(set(frame) <= {"operation", "output_slot", "length"} for frame in frames)
+    assert all(
+        set(encode(frame)) == {"kind", "operation", "output_slot", "length"} for frame in frames
+    )
 
 
 def test_parent_broker_spends_zero_protobuf_output_grant_on_native_graft(tmp_path: Path) -> None:

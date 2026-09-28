@@ -8,7 +8,7 @@ import hashlib
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -18,7 +18,8 @@ import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
+from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_BYTES
+from cozy_runtime.author._executor_requests import Answer, ModelPrefetch
 from cozy_runtime.internal import fill, package_installation
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -240,25 +241,21 @@ class Serving:
     def close(self) -> None:
         self.preparations.close()
 
-    def prefetch(self, parent: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
+    def prefetch(self, parent: AttemptRecord, hint: ModelPrefetch) -> Answer:
         """A model-only hint; never accepts a child execution or chooses a GPU lane."""
         owner = self.worker.fence.record_owner_id
         try:
             target = machine_child_target.resolve_export(
-                self.worker,
-                parent,
-                str(frame.get("module", "")),
-                str(frame.get("export", "")),
-                wait=False,
+                self.worker, parent, hint.module, hint.export, wait=False
             )
         except machine_builtin.Preparing:
-            return {"ok": True, "scheduled": False}  # the callee installs on its call
+            return Answer(ok=True)  # the callee installs on its call
         if target.binding is not None:
             raise WorkspaceRefusal("model prefetch requires a serving callable")
-        raw = frame.get("payload")
-        if not isinstance(raw, str) or len(raw.encode()) > 48 << 10:
+        raw = hint.payload.encode()
+        if len(raw) > MAX_CALL_BYTES:
             raise WorkspaceRefusal("model prefetch exceeds its inline bound")
-        models = canonical_json.decode(raw.encode())
+        models = canonical_json.decode(raw)
         names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
         if not isinstance(models, dict) or not models.keys() <= names:
             raise WorkspaceRefusal("model prefetch names an undeclared Model slot")
@@ -283,11 +280,10 @@ class Serving:
         )
         request = pb.ChildCallRequest(parent_attempt_ordinal=parent.attempt)
         try:
-            future = self._shared(owner, call, target, request, models, speculative=True)
+            self._shared(owner, call, target, request, models, speculative=True)
         except WorkspaceRefusal as error:
             self.worker.note("model-prefetch", str(error))
-            return {"ok": True, "scheduled": False}
-        return {"ok": True, "scheduled": future is not None}
+        return Answer(ok=True)
 
     def _changed(self) -> None:
         for key in tuple(self.waiting):

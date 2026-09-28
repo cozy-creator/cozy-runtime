@@ -25,6 +25,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._executor_requests import Answer, CallState, ChildForget, ChildPoll
 from cozy_runtime.internal.worker import byte_inputs, child_byte_results, grants
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
@@ -458,14 +459,16 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
         spool=tmp_path / "parent",
     )
     assert worker.absorb(reply)
-    first = worker.handle(parent, {"kind": "child_poll", "call_index": 0})
-    assert first["ok"], first
-    assert Path(first["byte_grants"][0]["local"]).read_bytes() == data
-    assert worker.handle(parent, {"kind": "child_poll", "call_index": 0}) == first
-    assert worker.handle(parent, {"kind": "child_forget", "call_index": 0})["ok"]
+    first = worker.handle(parent, ChildPoll(call_index=0))
+    assert isinstance(first, CallState) and first.ok, first
+    local = first.byte_grants[0]["local"]
+    assert isinstance(local, str) and Path(local).read_bytes() == data
+    assert worker.handle(parent, ChildPoll(call_index=0)) == first
+    forgotten = worker.handle(parent, ChildForget(call_index=0))
+    assert isinstance(forgotten, Answer) and forgotten.ok
     assert not worker.pending
     assert worker.materialized[("parent", 1)][1] > 0
-    assert Path(first["byte_grants"][0]["local"]).read_bytes() == data
+    assert Path(local).read_bytes() == data
     assert not sent
     returned = canonical_json.decode(reply.result_canonical_bytes)["report"]
     forwarded = worker.received_output(parent, returned)
@@ -474,7 +477,7 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
     with pytest.raises(ValueError, match="exact received"):
         worker.received_output(parent, changed)
     worker.close("parent", 1)
-    assert not Path(first["byte_grants"][0]["local"]).exists()
+    assert not Path(local).exists()
     assert not worker.pending
     assert not worker.materialized
     with pytest.raises(ValueError, match="exact received"):

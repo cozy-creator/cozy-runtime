@@ -18,6 +18,7 @@ from cozy_runtime.internal.worker import activity
 from cozy_runtime.internal.worker.preparations import Preparations
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.protocol import worker_pb2 as pb
+from durable_seam import wire
 
 
 class Payload(msgspec.Struct):
@@ -37,10 +38,10 @@ def test_hint_uses_locked_callable_without_reserving_a_call_or_future_payload() 
 
     def exchange(kind: str, body: dict[str, Any]) -> dict[str, Any]:
         received.append((kind, body))
-        return {"ok": True, "scheduled": True}
+        return {"ok": True}
 
     binding = _CallType("sha256:" + "a" * 64, __name__, "next_model", Payload, Result)
-    broker = _Broker("parent", {(__name__, "next_model"): binding}, exchange)
+    broker = _Broker("parent", {(__name__, "next_model"): binding}, wire(exchange))
     broker.bind(author.Context("parent", time.monotonic() + 60))
     token = _current.set(broker)
     try:
@@ -69,7 +70,7 @@ def test_hint_uses_locked_callable_without_reserving_a_call_or_future_payload() 
 def test_old_worker_can_decline_optional_hint(code: str) -> None:
     binding = _CallType("sha256:" + "a" * 64, __name__, "next_model", Payload, Result)
     broker = _Broker(
-        "parent", {(__name__, "next_model"): binding}, lambda *_: {"ok": False, "code": code}
+        "parent", {(__name__, "next_model"): binding}, wire(lambda *_: {"ok": False, "code": code})
     )
     broker.bind(author.Context("parent", time.monotonic() + 60))
     token = _current.set(broker)

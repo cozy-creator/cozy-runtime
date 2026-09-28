@@ -14,6 +14,14 @@ from cozy_runtime.author import CapabilityError, ConformanceError, FileAsset
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._capture import ExecutionObservation
+from cozy_runtime.author._executor_requests import (
+    Answer,
+    Checkpoint,
+    CheckpointReceipt,
+    ChildCall,
+    respond,
+)
+from cozy_runtime.author._executor_requests import decode as decode_request
 from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.internal import (
@@ -153,6 +161,39 @@ def test_derive_child_rows_from_another_runtime_ignore_additive_fields() -> None
     assert isinstance(rows[0], derive_child.TensorRequirements)
     assert rows[0].rows == (("unet", "w", None, (2,)),)
     assert rows[1] == derive_child.SourceSlot("source")
+
+
+def test_durable_requests_and_answers_cross_older_and_newer_peers(tmp_path: Path) -> None:
+    digest = "sha256:" + "0" * 64
+    checkpoint = Checkpoint(operation_key="op", logical_key="k", content_digest=digest, length=3)
+    # An older executor's frames: a checkpoint path, no capture or label, a future field.
+    older = {**msgspec.to_builtins(checkpoint), "path": "/spool/k", "future": 1}
+    assert decode_request(older) == checkpoint
+    call = {"kind": "child_call", "call_index": 0, "module": "m", "export": "e", "payload": "{}"}
+    assert decode_request(call) == ChildCall(call_index=0, module="m", export="e", payload="{}")
+    # A newer executor's kind is refused alone, answered under its own sequence number.
+    answer, handoff = respond(
+        {"event": "request", "seq": 7, "kind": "future"}, lambda _: Answer(ok=True)
+    )
+    assert handoff is None
+    assert (answer["seq"], answer["ok"], answer["code"]) == (7, False, "unknown_durable_request")
+    # The executor's real exchange against an older worker's answer, which has no code.
+    left, right = socket.socketpair()
+    with left, right:
+        worker = Channel(right)
+        worker.send({"event": "answer", "seq": 1, "ok": True, "receipt_id": "r", "future": 1})
+        received = Executor(Channel(left), tmp_path)._durable(checkpoint, CheckpointReceipt)
+        assert received == CheckpointReceipt(ok=True, receipt_id="r")
+        # Every key an older worker indexes is written.
+        assert worker.recv() == {
+            "event": "request",
+            "seq": 1,
+            "kind": "checkpoint",
+            "operation_key": "op",
+            "logical_key": "k",
+            "content_digest": digest,
+            "length": 3,
+        }
 
 
 def test_a_torn_census_entry_is_a_miss(tmp_path: Path) -> None:

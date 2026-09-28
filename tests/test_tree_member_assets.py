@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 import tensorfs
 from PIL import Image
@@ -15,6 +16,7 @@ from cozy_runtime.author import AssetBound, Context, ImageAsset, Tree
 from cozy_runtime.author._calls import _Broker, _current, _input_ref
 from cozy_runtime.author._decode import MediaDecoder
 from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._executor_requests import Reply, Request, TreeMember
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.internal.worker import (
     byte_inputs,
@@ -31,6 +33,7 @@ from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from durable_seam import seam
 from test_workspace_byte_outputs import producing
 
 
@@ -93,7 +96,12 @@ def test_member_projects_without_spool_copy_and_child_survives_parent_gc(
 ) -> None:
     workspace, parent, calls, hold, local, frame = prepared(tmp_path, root_input=root_input)
     inode = (local / "frame.png").stat().st_ino
-    broker = _Broker("producer", {}, lambda kind, value: tree_members.project(calls, parent, value))
+
+    def project(request: Request) -> Reply:
+        assert isinstance(request, TreeMember)
+        return tree_members.project(calls, parent, request)
+
+    broker = _Broker("producer", {}, seam(project))
     broker.bind(Context("producer", time.monotonic() + 30))
     tree = Tree(frame["tree"], digest=frame["tree"], root=local, attempt="producer")
     tree._member_token = broker.grant_token
@@ -220,8 +228,8 @@ def test_member_refuses_before_minting_custody(tmp_path: Path, mutation: str) ->
         parent.request_id = "foreign"
     else:
         parent.canceling = "requested"
-    reply = tree_members.project(calls, parent, frame)
-    assert not reply["ok"], reply
+    reply = tree_members.project(calls, parent, msgspec.convert(frame, TreeMember))
+    assert not reply.ok, reply
     with workspace.locked() as db:
         assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 1
 
@@ -261,7 +269,7 @@ def test_projected_members_are_not_required_terminal_outputs(
     root_input: bool,
 ) -> None:
     workspace, parent, calls, hold, _, frame = prepared(tmp_path, root_input=root_input)
-    assert tree_members.project(calls, parent, frame)["ok"]
+    assert tree_members.project(calls, parent, msgspec.convert(frame, TreeMember)).ok
     terminal_bundle(Workspace(workspace.store_root), parent, hold)
     with workspace.locked() as db:
         assert db.execute("SELECT state FROM attempts").fetchone()[0] == "outcome"
@@ -274,7 +282,7 @@ def test_projection_exclusion_requires_the_exact_completed_hold(
     mutation: str,
 ) -> None:
     workspace, parent, calls, hold, _, frame = prepared(tmp_path)
-    assert tree_members.project(calls, parent, frame)["ok"]
+    assert tree_members.project(calls, parent, msgspec.convert(frame, TreeMember)).ok
     with workspace.locked() as db:
         if mutation == "missing_binding":
             db.execute("DELETE FROM execution_model_holds WHERE path LIKE 'runtime.tree_member.%'")
@@ -333,7 +341,7 @@ def test_projection_terminal_replays_after_retained_collection(
 
     monkeypatch.setattr("test_tree_member_assets.producing", producing_execution)
     workspace, parent, calls, hold, _, frame = prepared(tmp_path)
-    assert tree_members.project(calls, parent, frame)["ok"]
+    assert tree_members.project(calls, parent, msgspec.convert(frame, TreeMember)).ok
     terminal_bundle(workspace, parent, hold)
     executions = Executions(workspace)
     # The execution unit projects a recorded outcome onto its execution (`reconcile`).

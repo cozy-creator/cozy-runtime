@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._assets import file_state
 from cozy_runtime.author._errors import RuntimeFailure
+from cozy_runtime.author._executor_requests import Answer, Member, TreeMember, refuse
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, admits, sniff
 from cozy_runtime.internal.worker import byte_inputs, machine_models, workspace_byte_outputs
+from cozy_runtime.internal.worker.calls import Calls, _Received
 from cozy_runtime.internal.worker.workspace import Journal, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
     from .attempts import AttemptRecord
-    from .calls import Calls
 
 
 PROJECTION_PREFIX = "runtime.tree_member."
@@ -61,34 +61,26 @@ def recorded_projection(db: Journal, row: workspace_byte_outputs.ByteOutput) -> 
     )
 
 
-def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
+def project(calls: Calls, attempt: AttemptRecord, request: TreeMember) -> Answer:
     """Only existing attempt capabilities can authorize a projection or its custody."""
-    from .calls import _Received
-
     try:
         with calls.lock:
             workspace = calls.workspace
             if workspace is None or attempt.state != "running" or attempt.canceling:
                 raise WorkspaceRefusal("Tree member requires an active native attempt")
-            digest, path, kind = frame.get("tree"), frame.get("path"), frame.get("asset_kind")
-            limit, media_types = frame.get("max_bytes"), frame.get("media_types")
+            digest, path, kind = request.tree, request.path, request.asset_kind
+            limit, media_types = request.max_bytes, request.media_types
             if (
-                not isinstance(digest, str)
-                or not isinstance(path, str)
-                or not path
+                not path
                 or len(path.encode()) > 4096
                 or "\\" in path
                 or "\x00" in path
                 or PurePosixPath(path).is_absolute()
                 or str(PurePosixPath(path)) != path
                 or any(part in (".", "..") for part in PurePosixPath(path).parts)
-                or not isinstance(kind, str)
                 or kind not in KIND_MEDIA
-                or type(limit) is not int
                 or not 0 < limit <= byte_inputs.MAX_BYTES
-                or not isinstance(media_types, list)
                 or len(media_types) > 32
-                or any(not isinstance(item, str) for item in media_types)
             ):
                 raise WorkspaceRefusal("Tree member requires a canonical path and bounded asset")
             parent = (attempt.request_id, attempt.attempt)
@@ -180,15 +172,15 @@ def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> d
                     calls.received.setdefault(parent, {})[identity] = held
                 if file_state(local) != state:
                     raise WorkspaceRefusal("Tree member changed during native projection")
-                return {
-                    "ok": True,
-                    "tree": digest,
-                    "path": path,
-                    "digest": "sha256:" + blob.sha256,
-                    "length": blob.length,
-                    "media_type": media,
-                    "local": str(local),
-                    "file_state": list(state),
-                }
+                return Member(
+                    ok=True,
+                    tree=digest,
+                    path=path,
+                    digest="sha256:" + blob.sha256,
+                    length=blob.length,
+                    media_type=media,
+                    local=str(local),
+                    file_state=state,
+                )
     except (OSError, ValueError, RuntimeFailure) as exc:
-        return {"ok": False, "code": "tree_member_refused", "detail": str(exc)[:1024]}
+        return refuse("tree_member_refused", str(exc))

@@ -18,7 +18,8 @@ from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import worker_pb2 as pb
-from weights_channel import exchange as channel_exchange
+from durable_seam import seam
+from weights_channel import broker_lane
 
 OWNER = "owner-scope"
 SLOT = "model"
@@ -51,7 +52,7 @@ def _attempt(worker: Worker, root: Path, request: str) -> tuple[AttemptRecord, E
     worker.engine.history[attempt.key()] = attempt
     storage = ExecutionStorage(
         attempt.spool,
-        channel_exchange(lambda frame: worker.weights.writer_broker.handle(attempt, frame)),
+        seam(broker_lane(worker.weights.writer_broker, attempt)),
         {SLOT: attempt.spec["outputs"][0]["max_bytes"]},
     )
     return attempt, storage

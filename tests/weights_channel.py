@@ -2,36 +2,29 @@
 
 from __future__ import annotations
 
-import socket
-from collections.abc import Callable
+import hashlib
 from typing import Any
 
-from cozy_runtime.internal.seam import Channel, DescriptorReply
+from cozy_runtime.author._executor_requests import (
+    Handler,
+    Reply,
+    Request,
+    WriterAdopt,
+    WriterOutput,
+    WriterSource,
+)
+from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterAttempt, WriterBroker
+from durable_seam import seam
 
 
-def exchange(
-    handle: Callable[[dict[str, Any]], dict[str, Any]],
-) -> Callable[..., dict[str, Any]]:
-    def call(kind: str, frame: dict[str, Any], *, descriptor: bool = False) -> dict[str, Any]:
-        assert kind == "weights_writer"
-        answer = handle(frame)
-        if not isinstance(answer, DescriptorReply):
-            return answer
-        assert descriptor
-        left, right = socket.socketpair()
-        try:
-            with left, right:
-                sender, receiver = Channel(left), Channel(right)
-                sender.send(dict(answer))
-                sender.send_descriptor(answer.descriptor)
-                result = receiver.recv()
-                assert result is not None
-                result["descriptor"] = receiver.recv_descriptor()
-                return result
-        finally:
-            answer.descriptor.close()
+def broker_lane(broker: WriterBroker, attempt: WriterAttempt) -> Handler:
+    """One attempt's native writer broker as a durable request handler."""
 
-    return call
+    def handle(request: Request) -> Reply:
+        assert isinstance(request, WriterSource | WriterOutput | WriterAdopt)
+        return broker.handle(attempt, request)
+
+    return handle
 
 
 def open_output(
@@ -42,13 +35,10 @@ def open_output(
     *,
     output: str = "model",
     checkpoint: tuple[str, int] | None = None,
-    frames: list[dict[str, Any]] | None = None,
+    frames: list[Request] | None = None,
     maximum: int | None = None,
 ) -> Any:
     """Supply the fixture's execution binding through the real executor output door."""
-    import hashlib
-
-    from cozy_runtime.internal.weights_writer import ExecutionStorage
 
     def bind(current: Any, slot: str, declaration: bytes) -> tuple[str, int]:
         broker.authorize(
@@ -61,18 +51,18 @@ def open_output(
         )
         return transaction, current.attempt
 
-    def handle(frame: dict[str, Any]) -> dict[str, Any]:
+    handle = broker_lane(broker, attempt)
+
+    def recorded(request: Request) -> Reply:
         if frames is not None:
-            frames.append(dict(frame))
-        answer = broker.handle(attempt, frame)
-        assert isinstance(answer, dict)
-        return answer
+            frames.append(request)
+        return handle(request)
 
     broker.bind_output = bind
     limit = next(
         row.get("max_bytes", 0) for row in attempt.spec["outputs"] if row["output_id"] == output
     )
     client = ExecutionStorage(
-        attempt.spool, exchange(handle), {output: limit if maximum is None else maximum}
+        attempt.spool, seam(recorded), {output: limit if maximum is None else maximum}
     )
     return client.open_output(output, definition)

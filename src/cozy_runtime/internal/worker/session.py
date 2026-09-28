@@ -54,6 +54,15 @@ from typing import Any, Literal, cast
 
 import msgspec
 
+from cozy_runtime.author._executor_requests import (
+    Answer,
+    DeviceRoom,
+    Handler,
+    ModelPrefetch,
+    Request,
+    Room,
+    refuse,
+)
 from cozy_runtime.internal import (
     accel,
     canonical,
@@ -118,7 +127,6 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptRecord,
     AttemptRefusal,
     AttemptSlot,
-    Exchange,
     Released,
     safe,
 )
@@ -2237,11 +2245,11 @@ class Worker:
             raise ValueError("worker has no execution workspace")
         return self.executions, owner
 
-    def _machine_prefetch(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
+    def _machine_prefetch(self, attempt: AttemptRecord, request: ModelPrefetch) -> Answer:
         if not attempt.machine:
-            return {"ok": True, "scheduled": False}
+            return Answer(ok=True)
         assert self.machine_calls is not None
-        return self.machine_calls.serving.prefetch(attempt, frame)
+        return self.machine_calls.serving.prefetch(attempt, request)
 
     def _release_gpus(self, attempt: AttemptRecord) -> None:
         """`ctx.release_gpus()`: the attempt's root ends its GPU lease now. A direct attempt
@@ -6822,24 +6830,23 @@ class Worker:
             f"back for {why}; the plan decides on {memory.free_bytes} B free",
         )
 
-    def _room(self, lane: DeviceLane, slot: str) -> Exchange:
+    def _room(self, lane: DeviceLane, slot: str) -> Handler:
         """Answer an executor whose own evictions cannot fit what it must place now: idle
         co-tenants of its devices give memory back, LRU-first, and it re-measures. What
         stays short after that is held by running work, and the executor refuses on it."""
 
-        def answer(frame: Mapping[str, object]) -> dict[str, object]:
-            need = frame.get("free_bytes")
-            if frame.get("kind") != "device_room" or not isinstance(need, int):
-                return {"ok": False, "code": "no_durable_exchange", "detail": "device_room only"}
+        def answer(request: Request) -> Answer:
+            if not isinstance(request, DeviceRoom):
+                return refuse("no_durable_exchange", "device_room only")
+            need = request.free_bytes
             why = f"its executor needs {need} B free"
             self._make_room(lane, slot, lambda memory: memory.free_bytes >= need, why)
             try:
-                return {
-                    "ok": True,
-                    "authorized_device_limit_bytes": self._process_ceiling(lane, slot),
-                }
+                return Room(
+                    ok=True, authorized_device_limit_bytes=self._process_ceiling(lane, slot)
+                )
             except LaneRefusal as exc:
-                return {"ok": False, "code": exc.code, "detail": exc.detail}
+                return refuse(exc.code, exc.detail)
 
         return answer
 

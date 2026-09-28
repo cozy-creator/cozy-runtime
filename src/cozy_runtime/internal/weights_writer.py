@@ -33,33 +33,25 @@ from tensorfs.derived import (
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._executor_requests import (
+    Adopted,
+    DescriptorReply,
+    Exchange,
+    Opened,
+    Reply,
+    WriterAdopt,
+    WriterOutput,
+    WriterRequest,
+    WriterSource,
+    refuse,
+)
 from cozy_runtime.internal import storage_admission, weights_sink
-from cozy_runtime.internal.seam import DescriptorReply
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
     from tensorfs.derived import Derivation
-
-
-class _Source(msgspec.Struct, frozen=True, tag_field="operation", tag="source"):
-    manifest: str
-
-
-class _Output(msgspec.Struct, frozen=True, tag_field="operation", tag="output"):
-    output_slot: str
-    length: int
-
-
-class _Adopt(msgspec.Struct, frozen=True, tag_field="operation", tag="adopt"):
-    output_slot: str
-    transaction: str
-    length: int
-
-
-#: One executor request to the worker's writer broker, decoded once where it arrives.
-type WriterRequest = _Source | _Output | _Adopt
 
 
 class DerivationArguments(NamedTuple):
@@ -138,48 +130,21 @@ def declaration_bound() -> int:
     return int(tensorfs.manifest_max_bytes())
 
 
-class _Answer(msgspec.Struct, frozen=True, kw_only=True):
-    ok: bool
-    code: str = "weights_host_refused"
-    detail: str = "execution storage refused"
-
-
-class _Opened(_Answer, frozen=True, kw_only=True):
-    descriptor: int
-    length: int = 0
-    transaction: str = ""
-
-
-class _Adopted(_Answer, frozen=True, kw_only=True):
-    request_id: str
-    manifest: str
-    manifest_length: int
-    receipt_digest: str
-
-
 class ExecutionStorage:
     """Execution bindings only: the executor receives TensorFS handles, never a Store."""
 
-    def __init__(
-        self,
-        spool: Path,
-        exchange: Callable[..., Mapping[str, object]],
-        outputs: Mapping[str, int],
-    ) -> None:
+    def __init__(self, spool: Path, exchange: Exchange, outputs: Mapping[str, int]) -> None:
         self.spool, self.exchange, self.outputs = spool, exchange, dict(outputs)
         self.opened: dict[str, str] = {}
 
-    def _call[T](self, request: WriterRequest, into: type[T], *, descriptor: bool = False) -> T:
-        answer = self.exchange(
-            "weights_writer", msgspec.to_builtins(request), descriptor=descriptor
-        )
-        refused = msgspec.convert(answer, _Answer)
-        if not refused.ok:
-            raise CapabilityError(refused.detail, code=refused.code)
-        return msgspec.convert(answer, into)
+    def _call[A: Opened | Adopted](self, request: WriterRequest, into: type[A]) -> A:
+        answer = self.exchange(request, into)
+        if not answer.ok:
+            raise CapabilityError(answer.detail, code=answer.code)
+        return answer
 
     def source(self, manifest: str) -> SourceCapability:
-        answer = self._call(_Source(manifest), _Opened, descriptor=True)
+        answer = self._call(WriterSource(manifest=manifest), Opened)
         return SourceCapability.from_fd(manifest, answer.length, answer.descriptor)
 
     def open_output(self, output_slot: str, definition: Derivation) -> DerivedTransaction:
@@ -192,7 +157,7 @@ class ExecutionStorage:
             data,
             declaration_bound(),
         )
-        answer = self._call(_Output(output_slot, length), _Opened, descriptor=True)
+        answer = self._call(WriterOutput(output_slot=output_slot, length=length), Opened)
         writer = DerivedTransaction.accept(answer.descriptor)
         self.opened[answer.transaction] = output_slot
         return writer
@@ -207,7 +172,9 @@ class ExecutionStorage:
             canonical_json.encode(dict(facts)),
             weights_limits.MAX_WEIGHTS_RECEIPT_BYTES,
         )
-        answer = self._call(_Adopt(slot, transaction, length), _Adopted)
+        answer = self._call(
+            WriterAdopt(output_slot=slot, transaction=transaction, length=length), Adopted
+        )
         return ModelArtifact(
             answer.request_id,
             slot,
@@ -316,14 +283,6 @@ class WriterBroker:
                 epoch, declaration, slot, checkpoint
             )
 
-    @staticmethod
-    def _refused(exc: Exception) -> dict[str, object]:
-        return {
-            "ok": False,
-            "code": str(getattr(exc, "code", "weights_writer_refused")),
-            "detail": str(exc)[:1024],
-        }
-
     def _current(self, attempt: WriterAttempt, transaction: str, binding: WriterBinding) -> None:
         with self.lock:
             if (
@@ -335,23 +294,17 @@ class WriterBroker:
                     "writer attempt is no longer current", code="weights_writer_closed"
                 )
 
-    def handle(self, attempt: WriterAttempt, frame: Mapping[str, object]) -> dict[str, object]:
+    def handle(self, attempt: WriterAttempt, request: WriterRequest) -> Reply:
         try:
-            try:
-                request = msgspec.convert(frame, WriterRequest, strict=True)
-            except msgspec.ValidationError as exc:
-                raise CapabilityError(
-                    f"writer request is malformed: {exc}", code="weights_writer_ungranted"
-                ) from exc
-            if isinstance(request, _Source):
+            if isinstance(request, WriterSource):
                 return self._source(attempt, request)
-            if isinstance(request, _Output):
+            if isinstance(request, WriterOutput):
                 return self._output(attempt, request)
             return self._adopt(attempt, request)
         except Exception as exc:
-            return self._refused(exc)
+            return refuse(str(getattr(exc, "code", "weights_writer_refused")), str(exc))
 
-    def _source(self, attempt: WriterAttempt, frame: _Source) -> DescriptorReply:
+    def _source(self, attempt: WriterAttempt, frame: WriterSource) -> DescriptorReply:
         manifest = frame.manifest
         length = _grant(attempt).sources().get(manifest)
         if length is None or length <= 0:
@@ -428,7 +381,7 @@ class WriterBroker:
                     self.sources.pop(key)
             stop.close()
             raise
-        return DescriptorReply({"ok": True, "length": length}, client)
+        return DescriptorReply(Opened(ok=True, length=length), client)
 
     def _arguments(self, attempt: WriterAttempt, slot: str, raw: bytes) -> DerivationArguments:
         try:
@@ -450,7 +403,7 @@ class WriterBroker:
             )
         return args
 
-    def _output(self, attempt: WriterAttempt, frame: _Output) -> DescriptorReply:
+    def _output(self, attempt: WriterAttempt, frame: WriterOutput) -> DescriptorReply:
         slot = frame.output_slot
         if self.bind_output is None:
             raise CapabilityError("output has no execution owner", code="weights_host_unavailable")
@@ -472,11 +425,10 @@ class WriterBroker:
         binding = self.bindings[self.key(attempt, transaction)]
         if binding.epoch != epoch:
             raise CapabilityError("output epoch changed", code="weights_writer_closed")
-        result = self._open_native(attempt, transaction, binding, args, fingerprint)
-        result["transaction"] = transaction
-        return result
+        channel = self._open_native(attempt, transaction, binding, args, fingerprint)
+        return DescriptorReply(Opened(ok=True, transaction=transaction), channel)
 
-    def _adopt(self, attempt: WriterAttempt, frame: _Adopt) -> dict[str, object]:
+    def _adopt(self, attempt: WriterAttempt, frame: WriterAdopt) -> Adopted:
         slot, transaction = frame.output_slot, frame.transaction
         binding = self.bindings.get(self.key(attempt, transaction))
         if binding is None or binding.slot != slot:
@@ -502,13 +454,13 @@ class WriterBroker:
         self.record_receipt(attempt, transaction, binding, facts)
         self._current(attempt, transaction, binding)
         manifest = weights_sink.native_receipt(facts).manifest
-        return {
-            "ok": True,
-            "request_id": attempt.request_id,
-            "manifest": manifest.digest,
-            "manifest_length": manifest.length,
-            "receipt_digest": "sha256:" + hashlib.sha256(canonical_json.encode(facts)).hexdigest(),
-        }
+        return Adopted(
+            ok=True,
+            request_id=attempt.request_id,
+            manifest=manifest.digest,
+            manifest_length=manifest.length,
+            receipt_digest="sha256:" + hashlib.sha256(canonical_json.encode(facts)).hexdigest(),
+        )
 
     def _open_native(
         self,
@@ -517,7 +469,7 @@ class WriterBroker:
         binding: WriterBinding,
         args: DerivationArguments,
         fingerprint: str,
-    ) -> DescriptorReply:
+    ) -> socket.socket:
         key = self.key(attempt, transaction)
         self._current(attempt, transaction, binding)
         with self.lock:
@@ -661,7 +613,7 @@ class WriterBroker:
             with self.lock:
                 self.writers.pop(key, None)
             raise
-        return DescriptorReply({"ok": True}, client)
+        return client
 
     @contextlib.contextmanager
     def _preflight_writers(

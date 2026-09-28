@@ -30,7 +30,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 import re
 import stat
 import threading
@@ -48,6 +47,21 @@ import msgspec
 from cozy_runtime.author import _codec
 from cozy_runtime.author._assets import InputMetadata
 from cozy_runtime.author._errors import DEVICE_OOM, OutputError
+from cozy_runtime.author._executor_requests import (
+    Answer,
+    Checkpoint,
+    CheckpointReceipt,
+    DeviceRoom,
+    Handler,
+    Reply,
+    Request,
+    TreeMember,
+    WriterAdopt,
+    WriterOutput,
+    WriterRequest,
+    WriterSource,
+    refuse,
+)
 from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.internal import (
     canonical,
@@ -56,11 +70,8 @@ from cozy_runtime.internal import (
     output_budget,
     package_interface,
     seam,
-    weights_writer,
 )
-from cozy_runtime.internal import weights_sink as weights_bridge
 from cozy_runtime.internal.executor_commands import (
-    CallInterface,
     InputFile,
     Invoke,
     JobBudget,
@@ -84,9 +95,10 @@ from cozy_runtime.internal.worker.plan import (
     PreparedRequest,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
+from cozy_runtime.internal.worker.tree_members import project as project_tree_member
 from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.internal.worker.workspace import Workspace
-from cozy_runtime.protocol import documents, weights_limits
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: `safe_message` and `cause.detail` are bounded and SANITIZED (01 §3): printable ASCII
@@ -136,52 +148,12 @@ UNVERIFIABLE = (
 )
 
 
-def weights_exchange_bytes(spool: Path, output_slot: str, kind: str, expected_length: int) -> bytes:
-    """Read one worker-chosen immutable spool file; the child never supplies a path."""
-    cap = (
-        weights_writer.declaration_bound()
-        if kind == "declaration"
-        else weights_limits.MAX_WEIGHTS_RECEIPT_BYTES
-    )
-    if not 0 < expected_length <= cap:
-        raise ValueError(f"weights {kind} length is outside 1..={cap}")
-    path = weights_bridge.exchange_file(spool, output_slot, kind)
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_size != expected_length:
-            raise ValueError(f"weights {kind} spool file is not an exact regular file")
-        chunks: list[bytes] = []
-        remaining = expected_length + 1
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 64 << 10))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-        after = os.fstat(descriptor)
-        if len(raw) != expected_length or (before.st_dev, before.st_ino, before.st_size) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-        ):
-            raise ValueError(f"weights {kind} spool file changed while being read")
-        return raw
-    finally:
-        os.close(descriptor)
-
-
 #: The fault tail this worker keeps. Every reader takes the last 8.
 FAULTS_HELD = 64
 
 CAUSE = pb.CauseCode
 ORIGIN = pb.CauseOrigin
 STATUS = pb.OutcomeStatus
-
-#: The worker's answer to one durable request an executor makes mid-call.
-Exchange = Callable[[Mapping[str, object]], dict[str, object]]
 
 #: The author-surface outcome vocabulary, mapped onto the wire's NEUTRAL one. The mapping is
 #: total and closed: a new author terminal without a wire meaning is a compile-time hole.
@@ -243,6 +215,19 @@ class Released:
     reply: dict[str, Any]
     spool: Path
     key: str
+
+
+class _Checkpointed(msgspec.Struct, frozen=True, kw_only=True):
+    """One journaled checkpoint declaration."""
+
+    request_id: str
+    attempt: int
+    worker_boot_id: str
+    operation_key: str
+    logical_key: str
+    content_digest: str
+    length: int
+    receipt_id: str
 
 
 class AttemptRefusal(Exception):
@@ -552,7 +537,7 @@ class AttemptEngine:
         owner_scope: Callable[[], str] = lambda: "",
         tensorfs_root: Path | None = None,
         work_fingerprint: Callable[[AttemptRecord], str] | None = None,
-        room: Callable[[AttemptRecord], Exchange] | None = None,
+        room: Callable[[AttemptRecord], Handler] | None = None,
     ) -> None:
         self.records = records
         self.authorizer = authorizer
@@ -595,7 +580,7 @@ class AttemptEngine:
         #: cr-009's DURABLE checkpoint ledger: (request_id, operation_key, logical_key) ->
         #: the recorded receipt. Identity replays; the same key with different bytes is a
         #: CONFLICT and never a replacement (§2).
-        self.receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self.receipts: dict[tuple[str, str, str], _Checkpointed] = {}
 
     def slot_of(self, attempt: AttemptRecord) -> AttemptSlot:
         """The placement slot bound at admission. An attempt with none is a defect: the
@@ -1521,9 +1506,7 @@ class AttemptEngine:
 
     # ------------------------------------------------------------------ the job lane
 
-    def checkpoint_exchange(
-        self, attempt: AttemptRecord, frame: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def checkpoint_exchange(self, attempt: AttemptRecord, request: Checkpoint) -> Answer:
         """Answer one checkpoint declaration request from the executor.
 
         Identity is (run, attempt, operation key, logical key, content digest). The row is
@@ -1544,54 +1527,41 @@ class AttemptEngine:
           * the SAME identity replays it and writes nothing a second time;
           * the same key with DIFFERENT bytes is a CONFLICT, never a replacement.
         """
-        if str(frame.get("kind")) != "checkpoint":
-            return {
-                "ok": False,
-                "code": "unknown_durable_request",
-                "detail": f"{frame.get('kind')!r} is not a durable exchange this worker answers",
-            }
         if attempt.job is None:
-            return {
-                "ok": False,
-                "code": pb.CheckpointFaultCode.Name(
+            return refuse(
+                pb.CheckpointFaultCode.Name(
                     pb.CheckpointFaultCode.CHECKPOINT_FAULT_CODE_NOT_JOB_MODE
                 ),
-                "detail": "checkpoints are a JOB service; this attempt is not a job",
-            }
-        operation_key = str(frame.get("operation_key", ""))
-        logical_key = str(frame.get("logical_key", ""))
-        content_digest = str(frame.get("content_digest", ""))
+                "checkpoints are a JOB service; this attempt is not a job",
+            )
+        operation_key, logical_key = request.operation_key, request.logical_key
+        content_digest = request.content_digest
         key = (attempt.request_id, operation_key, logical_key)
         held = self.receipts.get(key)
         if held is not None:
-            if held["content_digest"] != content_digest:
-                return {
-                    "ok": False,
-                    "code": pb.CheckpointFaultCode.Name(
+            if held.content_digest != content_digest:
+                return refuse(
+                    pb.CheckpointFaultCode.Name(
                         pb.CheckpointFaultCode.CHECKPOINT_FAULT_CODE_IDENTITY_CONFLICT
                     ),
-                    "detail": (
-                        f"{logical_key}: operation key {operation_key!r} is already durable at "
-                        f"{held['content_digest'][:23]}… and these bytes digest to "
-                        f"{content_digest[:23]}… — one identity is one content, and a "
-                        "checkpoint is never replaced"
-                    ),
-                    "recorded_content_digest": held["content_digest"],
-                }
-            return {"ok": True, "receipt_id": held["receipt_id"], "replayed": True}
+                    f"{logical_key}: operation key {operation_key!r} is already durable at "
+                    f"{held.content_digest[:23]}… and these bytes digest to "
+                    f"{content_digest[:23]}… — one identity is one content, and a "
+                    "checkpoint is never replaced",
+                )
+            return CheckpointReceipt(ok=True, receipt_id=held.receipt_id, replayed=True)
 
-        receipt_id = f"ckpt-{uuid.uuid4().hex[:24]}"
-        record = {
-            "request_id": attempt.request_id,
-            "attempt": attempt.attempt,
-            "worker_boot_id": self.boot_id,
-            "operation_key": operation_key,
-            "logical_key": logical_key,
-            "content_digest": content_digest,
-            "length": int(frame.get("length", 0)),
-            "receipt_id": receipt_id,
-        }
-        self.records.append("job_checkpoint", record)
+        record = _Checkpointed(
+            request_id=attempt.request_id,
+            attempt=attempt.attempt,
+            worker_boot_id=self.boot_id,
+            operation_key=operation_key,
+            logical_key=logical_key,
+            content_digest=content_digest,
+            length=request.length,
+            receipt_id=f"ckpt-{uuid.uuid4().hex[:24]}",
+        )
+        self.records.append("job_checkpoint", msgspec.to_builtins(record))
         self.receipts[key] = record
         # The RecordOwner's copy rides the DURABLE control lane, after the worker's own
         # record, at-least-once like every other control message. `artifact` stays
@@ -1616,101 +1586,55 @@ class AttemptEngine:
             "log",
             f"checkpoint {logical_key!r} DECLARED (bytes not stored: no weights sink)",
             "info",
-            declaration=receipt_id,
-            bytes=int(frame.get("length", 0)),
+            declaration=record.receipt_id,
+            bytes=request.length,
         )
-        return {"ok": True, "receipt_id": receipt_id, "replayed": False}
+        return CheckpointReceipt(ok=True, receipt_id=record.receipt_id)
 
-    def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
-        """Dispatch the existing executor control request lane by typed operation."""
-        kind = str(frame.get("kind", ""))
-        if kind == "tree_member" and self.calls is not None:
-            from cozy_runtime.internal.worker.tree_members import project
+    def durable_exchange(self, attempt: AttemptRecord, request: Request) -> Reply:
+        """Answer one durable request of a job attempt's executor."""
+        match request:
+            case Checkpoint():
+                return self.checkpoint_exchange(attempt, request)
+            case DeviceRoom():
+                return refuse("no_durable_exchange", "a job's executor is granted no device room")
+            case TreeMember():
+                if self.calls is None:
+                    return refuse("child_broker_absent", "no RecordOwner call lane")
+                return project_tree_member(self.calls, attempt, request)
+            case WriterSource() | WriterOutput() | WriterAdopt():
+                return self._writer(attempt, request)
+            case _:
+                if self.calls is None:
+                    return refuse("child_broker_absent", "no RecordOwner call lane")
+                return self.calls.handle(attempt, request)
 
-            return project(self.calls, attempt, frame)
-        if kind in (
-            "child_call",
-            "child_poll",
-            "child_cancel",
-            "child_forget",
-            "child_events",
-            "model_prefetch",
-            "gpu_release",
-        ):
-            if self.calls is None:
-                return {
-                    "ok": False,
-                    "code": "child_broker_absent",
-                    "detail": "no RecordOwner call lane",
-                }
-            return self.calls.handle(attempt, frame)
-        if kind == "checkpoint":
-            return self.checkpoint_exchange(attempt, frame)
+    def _writer(self, attempt: AttemptRecord, request: WriterRequest) -> Reply:
         if self.weights is None or attempt.spool is None:
-            return {
-                "ok": False,
-                "code": "weights_host_unavailable",
-                "detail": "this worker has no native TensorFS writer host",
-            }
-        try:
-            output_slot = str(frame.get("output_slot", ""))
-            if kind == "weights_intent" or (
-                kind == "weights_writer" and frame.get("operation") == "output"
-            ):
-                if attempt.job is None:
-                    raise ValueError("a weights intent requires the current job")
+            return refuse(
+                "weights_host_unavailable", "this worker has no native TensorFS writer host"
+            )
+        if isinstance(request, WriterOutput):
+            if attempt.job is None:
+                return refuse("weights_host_refused", "a weights output requires the current job")
+            try:
                 declared = self._job_declaration(attempt.job, attempt.job.job_descriptor_id)
-                outputs = {
-                    str(row["output_id"]): row for row in declared.get("weights_outputs", [])
-                }
-                bound = attempt.grant.outputs.get(output_slot)
-                if (
-                    output_slot not in outputs
-                    or bound is None
-                    or (
-                        bound.max_bytes != outputs[output_slot]["max_bytes"]
-                        or bound.mime_type != outputs[output_slot]["mime_type"]
-                    )
-                ):
-                    raise ValueError(
-                        "weights intent is outside the package and invocation output contract"
-                    )
-            if kind == "weights_writer":
-                return self.weights.writer_broker.handle(attempt, frame)
-            if kind == "weights_intent":
-                length = int(frame.get("tensorfs_declaration_length", 0))
-                raw = weights_exchange_bytes(attempt.spool, output_slot, "declaration", length)
-                return self.weights.intent(
-                    attempt,
-                    output_slot=output_slot,
-                    transaction_id=str(frame.get("weights_transaction_id", "")),
-                    declaration_digest=documents.raw(
-                        str(frame.get("tensorfs_declaration_digest", ""))
-                    ),
-                    declaration=raw,
-                    requested_writer_epoch=int(frame.get("requested_writer_epoch", 0)),
+            except AttemptRefusal as exc:
+                return refuse(exc.code, exc.detail)
+            outputs = {str(row["output_id"]): row for row in declared.get("weights_outputs", [])}
+            slot = request.output_slot
+            bound = attempt.grant.outputs.get(slot)
+            if (
+                slot not in outputs
+                or bound is None
+                or bound.max_bytes != outputs[slot]["max_bytes"]
+                or bound.mime_type != outputs[slot]["mime_type"]
+            ):
+                return refuse(
+                    "weights_host_refused",
+                    "weights intent is outside the package and invocation output contract",
                 )
-            if kind == "weights_receipt":
-                length = int(frame.get("weights_receipt_length", 0))
-                raw = weights_exchange_bytes(attempt.spool, output_slot, "receipt", length)
-                return self.weights.receipt(
-                    attempt,
-                    output_slot=output_slot,
-                    transaction_id=str(frame.get("weights_transaction_id", "")),
-                    receipt_digest=documents.raw(str(frame.get("weights_receipt_digest", ""))),
-                    canonical_receipt=raw,
-                )
-            return {
-                "ok": False,
-                "code": "unknown_durable_request",
-                "detail": f"{kind!r} is not a durable exchange this worker answers",
-            }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "code": str(getattr(exc, "code", "weights_host_refused")),
-                "detail": str(getattr(exc, "detail", exc))[:1024],
-            }
+        return self.weights.writer_broker.handle(attempt, request)
 
     def absorb_receipt(self, receipt: pb.JobCheckpointReceipt) -> None:
         """Record the RecordOwner's verdict on a checkpoint this worker already recorded.
@@ -1817,9 +1741,9 @@ class AttemptEngine:
             attempt.moved()
             self.progress(attempt.request_id, attempt.attempt, frame)
 
-        def on_request(frame: dict[str, Any]) -> dict[str, Any]:
+        def on_request(request: Request) -> Reply:
             attempt.moved()
-            return self.durable_exchange(attempt, frame)
+            return self.durable_exchange(attempt, request)
 
         try:
             reply = executor.call(
@@ -1892,10 +1816,7 @@ class AttemptEngine:
                 application=attempt.job.application,
                 package_interface=attempt.job.package_interface,
                 job=attempt.job.job,
-                call_interfaces=msgspec.convert(
-                    self.calls.bindings(attempt) if self.calls is not None else [],
-                    tuple[CallInterface, ...],
-                ),
+                call_interfaces=self.calls.bindings(attempt) if self.calls is not None else (),
                 publish_to=output_destination(
                     output.url for output in attempt.grant.outputs.values()
                 ),

@@ -15,6 +15,13 @@ import pytest
 import tensorfs
 
 from cozy_runtime.author import Cancelled, CapabilityError, WeightsReader
+from cozy_runtime.author._executor_requests import (
+    Answer,
+    Reply,
+    Request,
+    WriterSource,
+    decode,
+)
 from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.derive.quantization import QuantizationSource
@@ -28,7 +35,8 @@ from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterBroker
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
-from weights_channel import exchange as channel_exchange
+from durable_seam import seam
+from weights_channel import broker_lane
 
 
 def model(
@@ -107,7 +115,7 @@ def reader(
     WriterBroker,
     AttemptRecord,
     Attempt,
-    list[tuple[str, dict[str, Any]]],
+    list[Request],
 ]:
     spool = tmp_path / "spool"
     spool.mkdir(exist_ok=True)
@@ -126,13 +134,14 @@ def reader(
         kind="job",
     )
     broker = WriterBroker(lambda: store, store_root=Path(store.root))
-    frames = []
+    frames: list[Request] = []
+    handle = broker_lane(broker, record)
 
-    def handle(fields: dict[str, Any]) -> dict[str, Any]:
-        frames.append(("weights_writer", dict(fields)))
-        return broker.handle(record, fields)
+    def recorded(request: Request) -> Reply:
+        frames.append(request)
+        return handle(request)
 
-    client = ExecutionStorage(spool, channel_exchange(handle), {})
+    client = ExecutionStorage(spool, seam(recorded), {})
     models = {name: _derive_model(QuantizationSource, ref[0]) for name, ref in references.items()}
     attempt = Attempt(record.request_id, spool)
     service = WeightsReader(
@@ -177,7 +186,7 @@ def test_inherited_identity_and_changed_scale_use_native_read_custody(
         assert ref.components() == ("model",)
         assert ref.keys("model") == ("inherited", "changed")
         assert ref.identity("model", "inherited") == cand.identity("model", "inherited")
-        assert not any(frame["operation"] == "read" for _, frame in frames)
+        assert all(isinstance(frame, WriterSource) for frame in frames)
         assert ref.identity("model", "changed") != cand.identity("model", "changed")
         for role, facts in encoded["roles"].items():
             original_part = bytearray(len(facts["bytes"]))
@@ -264,12 +273,12 @@ def test_foreign_stale_canceled_and_released_views_refuse(tmp_path: Path) -> Non
     service, models, broker, record, _, _ = reader(tmp_path, store, {"source": reference})
     view = service.open(models["source"])
     assert len(broker.sources) == 1
-    retired = broker.handle(record, {"operation": "check", "view_id": "foreign"})
-    assert not retired["ok"] and retired["code"] == "weights_writer_ungranted"
+    with pytest.raises(CapabilityError) as retired:
+        decode({"kind": "weights_writer", "operation": "check", "view_id": "foreign"})
+    assert retired.value.code == "durable_request_malformed"
     assert len(broker.sources) == 1
-    assert not broker.handle(record, {"operation": "source", "manifest": "sha256:" + "ff" * 32})[
-        "ok"
-    ]
+    ungranted = broker.handle(record, WriterSource(manifest="sha256:" + "ff" * 32))
+    assert isinstance(ungranted, Answer) and not ungranted.ok
     record.spec["inputs"][0]["length"] += 1
     with pytest.raises(tensorfs.errors.Refusal):
         service.open(models["source"])

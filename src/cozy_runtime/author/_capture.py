@@ -21,9 +21,6 @@ class ActivationCapture(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
     components: tuple[str, ...]
     steps: tuple[int, ...] = ()
 
-    def document(self) -> dict[str, list[str] | list[int]]:
-        return {"components": list(self.components), "steps": list(self.steps)}
-
     def __post_init__(self) -> None:
         if (
             not self.components

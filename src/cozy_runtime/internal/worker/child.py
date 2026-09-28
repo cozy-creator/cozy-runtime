@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
+from cozy_runtime.author._executor_requests import Handler, respond
 from cozy_runtime.internal import accel, executor_commands, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import (
     ALLOWLIST,
@@ -50,7 +51,6 @@ from cozy_runtime.internal.executor_commands import Command, Hello
 from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
     Channel,
-    DescriptorReply,
     SeamError,
     listener,
 )
@@ -216,7 +216,7 @@ class Executor:
         timeout: float | None = None,
         total_timeout: float | None = None,
         on_progress: Callable[[dict[str, Any]], None] | None = None,
-        on_request: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        on_request: Handler | None = None,
     ) -> dict[str, Any]:
         """One command, its reply, and every frame in between.
 
@@ -252,23 +252,14 @@ class Executor:
                         on_progress(frame)
                     continue
                 if frame.get("event") == "request":
-                    answer = (
-                        on_request(frame)
-                        if on_request is not None
-                        else {
-                            "ok": False,
-                            "code": "no_durable_exchange",
-                            "detail": f"this attempt installed no handler for "
-                            f"{frame.get('kind')!r}",
-                        }
-                    )
+                    answer, handoff = respond(frame, on_request)
                     try:
-                        self.channel.send({"event": "answer", "seq": frame.get("seq"), **answer})
-                        if isinstance(answer, DescriptorReply):
-                            self.channel.send_descriptor(answer.descriptor)
+                        self.channel.send(answer)
+                        if handoff is not None:
+                            self.channel.send_descriptor(handoff)
                     finally:
-                        if isinstance(answer, DescriptorReply):
-                            answer.descriptor.close()
+                        if handoff is not None:
+                            handoff.close()
                     continue
                 if "reply" not in frame and frame.get("event") is not None:
                     # An event kind from a newer executor that this worker does not consume.

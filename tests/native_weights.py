@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import socket
 import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -14,13 +13,15 @@ from typing import Any, cast
 from tensorfs.derived import OutputCapability
 
 from cozy_runtime.author import Context, ModelArtifact, canonical_json
-from cozy_runtime.internal.seam import Channel, DescriptorReply
+from cozy_runtime.author._executor_requests import Answer, Request
 from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterAttempt, WriterBinding
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from durable_seam import seam
+from weights_channel import broker_lane
 
 
 class NativeExecution:
@@ -117,26 +118,8 @@ class NativeExecution:
     def checkpointed(self) -> bool:
         return any(frame.HasField("weights_checkpoint") for frame in self.frames)
 
-    def exchange(
-        self, kind: str, frame: dict[str, Any], *, descriptor: bool = False
-    ) -> dict[str, Any]:
-        assert kind == "weights_writer"
-        answer = self.owner.writer_broker.handle(self.attempt, frame)
-        if not isinstance(answer, DescriptorReply):
-            return answer
-        assert descriptor
-        left, right = socket.socketpair()
-        try:
-            with left, right:
-                sender, receiver = Channel(left), Channel(right)
-                sender.send(dict(answer))
-                sender.send_descriptor(answer.descriptor)
-                result = receiver.recv()
-                assert result is not None
-                result["descriptor"] = receiver.recv_descriptor()
-                return result
-        finally:
-            answer.descriptor.close()
+    def exchange[A: Answer](self, request: Request, into: type[A], /) -> A:
+        return seam(broker_lane(self.owner.writer_broker, self.attempt))(request, into)
 
     def context(self) -> Context:
         def open_output(slot: str, definition: Any) -> Any:

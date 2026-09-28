@@ -10,11 +10,13 @@ import pytest
 from tensorfs.derived import SourceCapability
 
 from cozy_runtime.author import CapabilityError
-from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterBroker, _Opened, _Source
+from cozy_runtime.author._executor_requests import Opened, WriterSource
+from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterBroker
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
+from durable_seam import seam
 from test_derived_config_runtime import _released_source
 from test_model_runtime_closure import _CONFIG
-from weights_channel import exchange as channel_exchange
+from weights_channel import broker_lane
 
 
 def test_native_source_fd_uses_exact_grant_and_is_fenced_with_attempt(tmp_path: Path) -> None:
@@ -33,9 +35,7 @@ def test_native_source_fd_uses_exact_grant_and_is_fenced_with_attempt(tmp_path: 
         },
     )
     broker = WriterBroker(lambda: store, store_root=Path(store.root))
-    client = ExecutionStorage(
-        spool, channel_exchange(lambda frame: broker.handle(attempt, frame)), {}
-    )
+    client = ExecutionStorage(spool, seam(broker_lane(broker, attempt)), {})
     try:
         with client.source(manifest) as source:
             inspection = source.inspect()
@@ -53,7 +53,7 @@ def test_native_source_fd_uses_exact_grant_and_is_fenced_with_attempt(tmp_path: 
             client.source("sha256:" + "ff" * 32)
         assert refused.value.code == "weights_source_ungranted"
 
-        answer = client._call(_Source(manifest), _Opened, descriptor=True)
+        answer = client._call(WriterSource(manifest=manifest), Opened)
         with SourceCapability.from_fd(manifest, length + 1, answer.descriptor) as forged:
             with pytest.raises(Exception) as refused_native:
                 forged.inspect()
@@ -103,10 +103,8 @@ def test_native_source_fd_preserves_repository_permissions(tmp_path: Path) -> No
         },
     )
     broker = WriterBroker(lambda: store, store_root=Path(store.root))
-    client = ExecutionStorage(
-        spool, channel_exchange(lambda frame: broker.handle(attempt, frame)), {}
-    )
-    fd = client._call(_Source(manifest), _Opened, descriptor=True).descriptor
+    client = ExecutionStorage(spool, seam(broker_lane(broker, attempt)), {})
+    fd = client._call(WriterSource(manifest=manifest), Opened).descriptor
     code = """
 import os, sys
 from pathlib import Path

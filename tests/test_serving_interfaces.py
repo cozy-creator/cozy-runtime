@@ -105,7 +105,9 @@ sys.path.insert(0,sys.argv[1])
 import serving_fixture as client
 from cozy_runtime.author import PendingCall,describe,ConformanceError
 from cozy_runtime.author._calls import _Broker,_CallType,_current
+from cozy_runtime.author._executor_requests import encode
 from cozy_runtime.author.fakes import fake_context
+import msgspec
 if sys.argv[2]=="self":
     describe(client.app)
     surface=client.app.get("generate").surface
@@ -117,7 +119,9 @@ sent=[]
 def exchange(kind,frame):
     if kind=="child_call":sent.append(frame)
     return {"ok":True,"state":"succeeded","result":'{"value":7}',"child_request_id":"child"}
-broker=_Broker("root",{(binding.module,binding.export):binding},exchange)
+def wire(request,into):
+    body=encode(request);return msgspec.convert(exchange(body.pop("kind"),body),into)
+broker=_Broker("root",{(binding.module,binding.export):binding},wire)
 broker.bind(fake_context(request_id="root"))
 token=_current.set(broker)
 async def run():
@@ -308,7 +312,9 @@ sys.path.insert(0, sys.argv[1])
 import serving_fixture as client
 from cozy_runtime.author import ActivationCapture, ModelArtifact, ObjectRef, PendingCall
 from cozy_runtime.author._calls import _Broker, _current
+from cozy_runtime.author._executor_requests import encode
 from cozy_runtime.author.fakes import fake_context
+import msgspec
 assert "FixtureModel" not in vars(client)
 assert list(inspect.signature(client.generate).parameters) == [
     "prompt", "mode", "tags", "wire_count", "model", "capture"]
@@ -321,7 +327,10 @@ def exchange(kind, frame):
     return {"ok": True, "state": "succeeded", "result": '{"value":7}',
             "child_request_id": "child-"+str(index)}
 key = (binding.module, binding.export)
-broker = _Broker("parent", {key:binding}, exchange)
+def wire(request, into):
+    body = encode(request)
+    return msgspec.convert(exchange(body.pop("kind"), body), into)
+broker = _Broker("parent", {key:binding}, wire)
 broker.bind(fake_context(request_id="parent"))
 model = ModelArtifact("producer", "model", ObjectRef("sha256:"+"11"*32, 321), "sha256:"+"22"*32)
 token = _current.set(broker)
@@ -350,7 +359,7 @@ assert body["payload"] == {"prompt":"same", "mode":"one", "tags":{}, "wire_count
 assert body["models"]["model"]["producer_request_id"] == "producer"
 assert "capture" not in body
 assert sent[0]["capture"]["components"] == ["unet"]
-assert "capture" not in sent[1]
+assert sent[1]["capture"] is None
 assert json.loads(sent[2]["payload"])["models"] == {"model":None}
 from pathlib import Path
 Path(sys.argv[2]).write_text(sent[0]["payload"])

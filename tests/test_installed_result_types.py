@@ -27,6 +27,7 @@ from cozy_runtime.author._calls import _Broker, _CallType
 from cozy_runtime.internal import call_types, static_interface
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import CallInterface
+from durable_seam import wire
 
 SOURCE = """from __future__ import annotations
 import msgspec
@@ -98,7 +99,7 @@ def test_plain_script_returns_installed_public_struct_after_managed_call(
             "result": canonical_json.encode({"projection": artifact, "ready": False}).decode(),
         }
 
-    broker = _Broker("parent", {(binding.module, binding.export): binding}, exchange)
+    broker = _Broker("parent", {(binding.module, binding.export): binding}, wire(exchange))
     app = script_app("selection_client")
     result, outcome, _ = attempt(
         app.get("main"),

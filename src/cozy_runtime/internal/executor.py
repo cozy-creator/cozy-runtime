@@ -64,6 +64,17 @@ from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._errors import CapabilityError, InvalidRequest, Outcome, classify
+from cozy_runtime.author._executor_requests import (
+    Answer,
+    Checkpoint,
+    CheckpointReceipt,
+    ChildEvents,
+    DeviceRoom,
+    Handoff,
+    Request,
+    Room,
+)
+from cozy_runtime.author._executor_requests import encode as encode_request
 from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
@@ -73,7 +84,7 @@ from cozy_runtime.author._invoke import (
 )
 from cozy_runtime.author._model import Model, _derive_model, component_use
 from cozy_runtime.author._services import Attempt as AuthorAttempt
-from cozy_runtime.author._services import ProgressFrame
+from cozy_runtime.author._services import CheckpointConflict, ProgressFrame
 from cozy_runtime.internal import (
     accel,
     attention,
@@ -1664,9 +1675,9 @@ class Executor:
             return
         memory = accel.allocation(host.torch, host.device_kind)
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
-        answer = host._durable("device_room", {"free_bytes": int(need) - slack})
-        if answer.get("ok") and "authorized_device_limit_bytes" in answer:
-            host.authorized = int(answer["authorized_device_limit_bytes"])
+        answer = host._durable(DeviceRoom(free_bytes=need - slack), Room)
+        if answer.ok and not isinstance(answer.authorized_device_limit_bytes, UnsetType):
+            host.authorized = answer.authorized_device_limit_bytes
 
     def _synchronize(self) -> None:
         if self.torch is not None:
@@ -3889,29 +3900,23 @@ class Executor:
             (#553a).
             """
             answer = self._durable(
-                "checkpoint",
-                {
-                    "operation_key": save.operation_key,
-                    "logical_key": save.logical_key,
-                    "content_digest": save.content_digest,
-                    "length": save.length,
-                    "path": str(save.path),
-                },
+                Checkpoint(
+                    operation_key=save.operation_key,
+                    logical_key=save.logical_key,
+                    content_digest=save.content_digest,
+                    length=save.length,
+                ),
+                CheckpointReceipt,
             )
-            if not answer.get("ok"):
-                from cozy_runtime.author._services import CheckpointConflict
-
-                raise CheckpointConflict(
-                    f"{save.logical_key}: {answer.get('detail', 'the durable exchange refused')}",
-                    code=str(answer.get("code", "checkpoint_refused")),
-                )
+            if not answer.ok:
+                raise CheckpointConflict(f"{save.logical_key}: {answer.detail}", code=answer.code)
             return CheckpointDeclaration(
-                declaration_id=str(answer["receipt_id"]),
+                declaration_id=answer.receipt_id,
                 operation_key=save.operation_key,
                 logical_key=save.logical_key,
                 content_digest=save.content_digest,
                 length=save.length,
-                replayed=bool(answer.get("replayed", False)),
+                replayed=answer.replayed,
             )
 
         started = time.perf_counter()
@@ -4151,38 +4156,40 @@ class Executor:
 
     def _child_events(self) -> int | None:
         """The worker's nudge socket for this attempt's calls; None from an older worker."""
-        answer = self._durable("child_events", {}, descriptor=True)
-        return int(answer["descriptor"]) if answer.get("ok") is True else None
+        answer = self._durable(ChildEvents(), Handoff)
+        return answer.descriptor if answer.ok else None
 
-    def _durable(
-        self, kind: str, body: dict[str, Any], *, descriptor: bool = False
-    ) -> dict[str, Any]:
+    def _durable[A: Answer](self, request: Request, into: type[A]) -> A:
         """One DURABLE mid-attempt exchange. Blocks until the worker answers.
 
         This is the seam's other half of `child.Executor.call(on_request=…)`. It is a
         separate lane from progress on purpose: a durable fact must not be sheddable, and
         the lossy lane's whole contract is that it may shed.
         """
+        body = encode_request(request)
         self._exchange += 1
-        seq = self._exchange
-        self.channel.send({"event": "request", "kind": kind, "seq": seq, **body})
-        while True:
-            frame = self.channel.recv()
-            if frame is None:
-                raise SeamError("seam_closed", f"the worker closed during {kind!r}")
-            if frame.get("event") == "answer" and int(frame.get("seq", -1)) == seq:
-                if frame.get("descriptor") is True:
-                    if not descriptor:
-                        self.channel.close()
-                        raise SeamError("seam_descriptor", "unexpected capability in control reply")
-                    frame["descriptor"] = self.channel.recv_descriptor()
-                elif descriptor and frame.get("ok") is True:
-                    raise SeamError("seam_descriptor", "successful reply omitted its capability")
-                return frame
+        exchange = f"{body['kind']}#{self._exchange}"
+        self.channel.send({"event": "request", "seq": self._exchange, **body})
+        frame = self.channel.recv()
+        if frame is None:
+            raise SeamError("seam_closed", f"the worker closed during {exchange}")
+        if frame.get("event") != "answer" or frame.get("seq") != self._exchange:
             raise SeamError(
                 "seam_out_of_order",
-                f"expected the answer to {kind}#{seq}, got {frame.get('event')!r}",
+                f"expected the answer to {exchange}, got {frame.get('event')!r}",
             )
+        handoff = issubclass(into, Handoff)
+        if frame.get("descriptor") is True:
+            if not handoff:
+                self.channel.close()
+                raise SeamError("seam_descriptor", "unexpected capability in control reply")
+            frame["descriptor"] = self.channel.recv_descriptor()
+        elif handoff and frame.get("ok") is True:
+            raise SeamError("seam_descriptor", "successful reply omitted its capability")
+        try:
+            return msgspec.convert(frame, into)
+        except msgspec.ValidationError as exc:
+            raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
 
     def _progress_sink(self, request_id: str) -> Any:
         """The lossy lane's sink for one attempt — the same one `invoke` installs."""

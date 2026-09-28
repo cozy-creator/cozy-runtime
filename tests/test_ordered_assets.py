@@ -46,6 +46,7 @@ from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.internal import interface_wheel, package_interface
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.worker import grants
+from durable_seam import wire
 
 Pictures = Annotated[
     Assets[Annotated[ImageAsset, AssetBound(max_bytes=1024, max_decoded_bytes=1024)]],
@@ -263,7 +264,7 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
                 "sha256:" + "b" * 64, __name__, "child", surface.payload_type, Result
             )
         },
-        no_exchange,
+        wire(no_exchange),
     )
     broker.bind(fake_context(request_id="parent"))
     photo = ImageAsset(
@@ -468,7 +469,7 @@ def test_decoded_selection_forwards_custody_without_decoding(tmp_path: Path) -> 
                 "sha256:" + "b" * 64, __name__, "decoded_child", surface.payload_type, Result
             )
         },
-        lambda _operation, _payload: {},
+        wire(lambda _operation, _payload: {}),
     )
     broker.bind(fake_context(request_id="parent"))
     call = broker.reserve(__name__, "decoded_child", {"assets": forwarded})

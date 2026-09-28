@@ -7,7 +7,6 @@ no supervisor ACK authority and no fallback execution lane.
 from __future__ import annotations
 
 import io
-import socket
 import threading
 from collections.abc import Iterator
 from concurrent import futures
@@ -22,6 +21,7 @@ import pytest
 import tensorfs
 from tensorfs.derived import Derivation, Part, Target, Tensor
 
+from cozy_runtime.author._executor_requests import Reply, Request, WriterOutput
 from cozy_runtime.internal.weights_sink import (
     receipt_from_native,
     weights_transaction_id,
@@ -37,7 +37,8 @@ from cozy_runtime.internal.worker.workspace import WeightsRow, Workspace
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
-from weights_channel import exchange as channel_exchange
+from durable_seam import seam
+from weights_channel import broker_lane
 
 OWNER = "owner-scope"
 OUTPUT_SLOT = "model"
@@ -132,14 +133,13 @@ class Rig:
             ),
         )
 
-    def intent(self, attempt: Any, *, transaction: str = TRANSACTION, requested: int = 0) -> Any:
+    def intent(self, attempt: Any, *, transaction: str = TRANSACTION) -> int:
         return self.exchange.intent(
             attempt,
             transaction_id=transaction,
             output_slot=OUTPUT_SLOT,
             declaration_digest=sha256(self.declaration).digest(),
             declaration=self.declaration,
-            requested_writer_epoch=requested,
         )
 
 
@@ -254,7 +254,7 @@ def ready(rig: Rig, checkpoint: pb.CheckpointRef | None = None) -> pb.WeightsInt
 def test_intent_uses_durable_epoch_and_ordered_control_without_host_ack(rig: Rig) -> None:
     attempt = rig.accept()
     first = rig.intent(attempt)
-    assert first["writer_epoch"] == 1
+    assert first == 1
     assert [frame.WhichOneof("msg") for frame in rig.control.frames] == [
         "weights_intent",
         "weights_transaction",
@@ -276,7 +276,6 @@ def test_worker_binds_native_output_replay_and_adoption_without_executor_store(
     from cozy_runtime import canonical_json
     from cozy_runtime.author import CapabilityError
     from cozy_runtime.internal.weights_writer import ExecutionStorage
-    from weights_channel import exchange as channel_exchange
 
     attempt = rig.accept()
     attempt.state = "running"
@@ -287,7 +286,7 @@ def test_worker_binds_native_output_replay_and_adoption_without_executor_store(
     maximum = attempt.spec["outputs"][0]["max_bytes"]
     client = ExecutionStorage(
         attempt.spool,
-        channel_exchange(lambda frame: rig.exchange.writer_broker.handle(attempt, frame)),
+        seam(broker_lane(rig.exchange.writer_broker, attempt)),
         {"model": maximum},
     )
     plain = dict(tensorfs.seed_digests())["plain/1"]
@@ -342,7 +341,7 @@ def test_new_attempt_fences_prior_epoch_and_cannot_change_transaction(rig: Rig) 
     terminal(rig, first)
     rig.exchange.writer_broker.close_attempt(first)
     resumed = rig.accept(2)
-    assert rig.intent(resumed)["writer_epoch"] == 2
+    assert rig.intent(resumed) == 2
     with pytest.raises(weights.WeightsExchangeError):
         rig.intent(first)
     assert rig.workspace.weights_row(OWNER, TRANSACTION)["epoch"] == 2
@@ -361,7 +360,7 @@ def test_native_receipt_is_durable_before_control_observation(rig: Rig) -> None:
     maximum = attempt.spec["outputs"][0]["max_bytes"]
     client = ExecutionStorage(
         attempt.spool,
-        channel_exchange(lambda frame: rig.exchange.writer_broker.handle(attempt, frame)),
+        seam(broker_lane(rig.exchange.writer_broker, attempt)),
         {OUTPUT_SLOT: maximum},
     )
     definition = Derivation(
@@ -567,7 +566,6 @@ def test_scoped_native_commit_records_workspace_before_return_and_has_no_tensor_
     rig: Rig, tmp_path: Path
 ) -> None:
     from cozy_runtime import canonical_json
-    from cozy_runtime.internal.seam import Channel, DescriptorReply
 
     spec = canonical_json.decode(rig.invocation)
     maximum = spec["outputs"][0]["max_bytes"]
@@ -582,29 +580,14 @@ def test_scoped_native_commit_records_workspace_before_return_and_has_no_tensor_
     attempt.spool.mkdir()
     attempt.spec = spec
     attempt.weights_work_fingerprint = fingerprint
-    control_requests: list[str] = []
+    control_requests: list[Request] = []
+    handle = broker_lane(rig.exchange.writer_broker, attempt)
 
-    def exchange(kind: str, frame: dict[str, Any], *, descriptor: bool = False) -> dict[str, Any]:
-        assert kind == "weights_writer"
-        control_requests.append(frame["operation"])
-        reply = rig.exchange.writer_broker.handle(attempt, frame)
-        if not isinstance(reply, DescriptorReply):
-            return reply
-        assert descriptor
-        left, right = socket.socketpair()
-        try:
-            with left, right:
-                sender, recipient = Channel(left), Channel(right)
-                sender.send(dict(reply))
-                sender.send_descriptor(reply.descriptor)
-                received = recipient.recv()
-                assert received is not None
-                received["descriptor"] = recipient.recv_descriptor()
-                return received
-        finally:
-            reply.descriptor.close()
+    def record(request: Request) -> Reply:
+        control_requests.append(request)
+        return handle(request)
 
-    client = ExecutionStorage(attempt.spool, exchange, {"model": maximum})
+    client = ExecutionStorage(attempt.spool, seam(record), {"model": maximum})
     plain = dict(tensorfs.seed_digests())["plain/1"]
     definition = Derivation(
         {},
@@ -626,7 +609,9 @@ def test_scoped_native_commit_records_workspace_before_return_and_has_no_tensor_
     assert body["tensorfs_receipt_digest"] == (
         "sha256:" + sha256(canonical_json.encode(receipt)).hexdigest()
     )
-    assert control_requests == ["output"], "per-role traffic still crossed Runtime control"
+    assert [type(request) for request in control_requests] == [WriterOutput], (
+        "per-role traffic still crossed Runtime control"
+    )
     assert not list(attempt.spool.glob("*-input"))
     assert not list(attempt.spool.glob("*-output"))
     assert not list(attempt.spool.glob("*-receipt.canonical"))

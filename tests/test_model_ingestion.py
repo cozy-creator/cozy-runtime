@@ -32,6 +32,7 @@ from cozy_runtime.author.sources import ingest_huggingface
 from cozy_runtime.derive.operations import QuantizationSource, app
 from cozy_runtime.internal import source_interfaces
 from cozy_runtime.models.qwen_image21.ingestion import REPOSITORY, REVISION, configuration
+from durable_seam import wire
 from native_weights import NativeExecution
 from test_quantize_artifact_native import _source
 
@@ -150,7 +151,7 @@ def test_metadata_download_overlaps_the_conversion(tmp_path: Path) -> None:
         script.get("ingest"),
         {},
         Invocation(
-            "parent", tmp_path, time.monotonic() + 60, calls=_Broker("parent", bindings, host)
+            "parent", tmp_path, time.monotonic() + 60, calls=_Broker("parent", bindings, wire(host))
         ),
     )
     assert outcome.code == "conversion_stopped"

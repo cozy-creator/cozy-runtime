@@ -15,14 +15,14 @@ from cozy_runtime.author._assets import (
     bind,
     file_state,
 )
+from cozy_runtime.author._calls import _current
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, RuntimeFailure
+from cozy_runtime.author._executor_requests import Member, TreeMember
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._media import admits, normalize
 
 
 def project[A: Asset](tree: Tree, path: str, asset_type: type[A], *, bound: AssetBound) -> A:
-    from cozy_runtime.author._calls import _current
-
     broker = _current.get()
     if (
         broker is None
@@ -73,45 +73,35 @@ def project[A: Asset](tree: Tree, path: str, asset_type: type[A], *, bound: Asse
 
     guard()
     reply = broker.exchange(
-        "tree_member",
-        {
-            "tree": tree.digest,
-            "path": path,
-            "asset_kind": asset_type.kind,
-            "max_bytes": bound.max_bytes,
-            "media_types": list(bound.media_types),
-        },
+        TreeMember(
+            tree=tree.digest,
+            path=path,
+            asset_kind=asset_type.kind,
+            max_bytes=bound.max_bytes,
+            media_types=tuple(bound.media_types),
+        ),
+        Member,
     )
-    if not reply.get("ok"):
-        raise RuntimeFailure(
-            str(reply.get("detail", "native Tree member projection refused")),
-            code=str(reply.get("code", "tree_member_refused")),
-        )
-    digest, length, media = reply.get("digest"), reply.get("length"), reply.get("media_type")
-    local, state = reply.get("local"), reply.get("file_state")
+    if not reply.ok:
+        raise RuntimeFailure(reply.detail, code=reply.code)
+    digest, length, media, local = reply.digest, reply.length, reply.media_type, reply.local
     if (
-        reply.get("tree") != tree.digest
-        or reply.get("path") != path
-        or not isinstance(digest, str)
+        reply.tree != tree.digest
+        or reply.path != path
         or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
-        or type(length) is not int
         or not 0 <= length <= bound.max_bytes
-        or not isinstance(media, str)
         or normalize(media) != media
         or not admits(asset_type.kind, media)
         or (bound.media_types and media not in bound.media_types)
-        or not isinstance(local, str)
         or not Path(local).is_absolute()
-        or not isinstance(state, list)
-        or len(state) != 5
-        or any(type(item) is not int for item in state)
+        or reply.file_state is None
     ):
         raise RuntimeFailure(
             "Tree member differs from Runtime's verified projection", code="tree_member_invalid"
         )
     guard()
     actual = file_state(Path(local))
-    if list(actual) != state:
+    if actual != reply.file_state:
         raise RuntimeFailure("Tree member changed before binding", code="input_changed")
     asset = asset_type(digest)
     bind(
