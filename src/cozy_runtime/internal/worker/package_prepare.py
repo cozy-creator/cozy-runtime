@@ -1133,7 +1133,6 @@ def _stage_job_plans(
             "emits_media": False,
             "gpu_rate_micro_usd_per_hour": 0,
             "cap_micro_usd": 0,
-            "reclaim_on_terminal": True,
         }
         if call_interfaces:
             record["call_interfaces"] = call_interfaces

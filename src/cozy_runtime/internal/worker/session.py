@@ -557,7 +557,7 @@ def _capability_unavailable(operation: str, minor: int) -> str:
 
 def _same_parent(left: pb.JobDirective, right: pb.JobDirective) -> bool:
     """One CPU orchestration parent: the prepared job it runs. Policy fields (limits,
-    publication, reclaim) may change without replacing a parent, which keeps the contract
+    publication) may change without replacing a parent, which keeps the contract
     it captured when it started."""
     return (left.installation_id, left.job_descriptor_id, left.orchestration) == (
         right.installation_id,

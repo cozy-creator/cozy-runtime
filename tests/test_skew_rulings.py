@@ -117,6 +117,7 @@ def test_orchestration_parent_is_its_prepared_job_not_its_policy() -> None:
     )
     changed = pb.JobDirective()
     changed.CopyFrom(running)
+    changed.publication_contract.grant_id = "owner/_job-a"
     changed.resource_caps.max_rss_bytes = 1 << 30
     assert _same_parent(running, changed)
     changed.job_descriptor_id = "sha256:" + "d" * 64

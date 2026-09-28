@@ -134,9 +134,7 @@ def settle(worker: Worker, request: str) -> None:
         time.sleep(0.01)
 
 
-def test_managed_child_waits_for_its_new_placement_despite_old_capacity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_managed_child_waits_for_its_new_placement_despite_old_capacity() -> None:
     """A warm previous package is not readiness for the package being switched in."""
     with _workspace() as root:
         worker = Worker(
@@ -165,7 +163,6 @@ def test_managed_child_waits_for_its_new_placement_despite_old_capacity(
             old.materialization = pb.MATERIALIZATION_STATE_STAGED
             worker.placement = old
             worker.accepted.mode = "serving"
-            monkeypatch.setattr(worker, "_lane_slots", lambda *_args, **_kwargs: 1)
             raw, digest = documents.identity(
                 pb.InvocationSpec(
                     installation_id="local-new",

@@ -260,7 +260,6 @@ class JobBinding(msgspec.Struct, frozen=True, kw_only=True):
     cost fact that cannot be canonicalized cannot be recorded. It arrives on the typed
     config channel and never from environment (§2)."""
     cap_micro_usd: int = 0
-    reclaim_on_terminal: bool = True
     call_interfaces: tuple[Mapping[str, object], ...] = ()
     """Observed from the installed environment on every read, never taken from the record."""
 

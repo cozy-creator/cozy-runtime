@@ -25,7 +25,6 @@ def _record(**changes: object) -> dict[str, object]:
         "emits_media": False,
         "gpu_rate_micro_usd_per_hour": 0,
         "cap_micro_usd": 0,
-        "reclaim_on_terminal": True,
         **changes,
     }
 
