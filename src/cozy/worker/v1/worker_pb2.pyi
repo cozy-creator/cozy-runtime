@@ -724,7 +724,7 @@ class MachineExecutionSubmit(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., release_root: _Optional[_Union[ReleaseRoot, _Mapping]] = ..., owner_memo: bool = ...) -> None: ...
 
 class ReleaseRoot(_message.Message):
-    __slots__ = ("package", "release", "entrypoint", "models", "inputs", "input_access", "deadline_unix_ms", "attention_kernel", "capture", "job", "weights_destination", "publication_grant")
+    __slots__ = ("package", "release", "entrypoint", "models", "inputs", "input_access", "deadline_unix_ms", "attention_kernel", "capture", "job", "weights_destination", "publication_grant", "installation_id")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
     ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
@@ -737,6 +737,7 @@ class ReleaseRoot(_message.Message):
     JOB_FIELD_NUMBER: _ClassVar[int]
     WEIGHTS_DESTINATION_FIELD_NUMBER: _ClassVar[int]
     PUBLICATION_GRANT_FIELD_NUMBER: _ClassVar[int]
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
     entrypoint: str
@@ -749,7 +750,8 @@ class ReleaseRoot(_message.Message):
     job: bool
     weights_destination: str
     publication_grant: str
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., entrypoint: _Optional[str] = ..., models: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., input_access: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., attention_kernel: _Optional[str] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., job: bool = ..., weights_destination: _Optional[str] = ..., publication_grant: _Optional[str] = ...) -> None: ...
+    installation_id: str
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., entrypoint: _Optional[str] = ..., models: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., input_access: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., attention_kernel: _Optional[str] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., job: bool = ..., weights_destination: _Optional[str] = ..., publication_grant: _Optional[str] = ..., installation_id: _Optional[str] = ...) -> None: ...
 
 class ModelChoice(_message.Message):
     __slots__ = ("parameter", "repository", "release", "lane", "manifest", "source", "profiles")

@@ -1,8 +1,8 @@
-"""A root named by its published release: this machine installs its closure when it holds no
-installation, reading install facts and callees at its catalog, resolves every Model slot for
-its own devices, prepares the placement, and mints the capture and offer a controller used to
-build. Nothing is journaled before the receipt, so an interrupted preparation restarts on the
-next identical submission."""
+"""A root named by its published release, or by an unpublished installation this machine
+already holds: this machine installs the published closure it lacks, reading install facts and
+callees at its catalog, resolves every Model slot for its own devices, prepares the placement,
+and mints the capture and offer a controller used to build. Nothing is journaled before the
+receipt, so an interrupted preparation restarts on the next identical submission."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from .machine_child_target import Target
 from .plan import JobBinding
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
-from .workspace_executions import Receipt
+from .workspace_executions import ExecutionWorkspaceRefusal, Receipt
 
 if TYPE_CHECKING:
     from .session import Worker
@@ -71,6 +71,7 @@ class Preparing(Exception):
 
 @dataclass
 class _Prepared:
+    key: str  # package@release of the root's code
     target: Target
     placement: dict[str, Any]
     models: list[dict[str, Any]]
@@ -184,8 +185,39 @@ class ReleaseRoots:
         return {"placement": dict(selected.document), "installation_id": selected.installation_id}
 
     def _plan(self, root: pb.ReleaseRoot) -> None:
-        if not root.package or not root.release or not root.entrypoint.isidentifier():
-            raise WorkspaceRefusal("release root names no package release and entrypoint")
+        if (
+            not root.package
+            or not root.entrypoint.isidentifier()
+            or bool(root.release) == bool(root.installation_id)
+        ):
+            raise WorkspaceRefusal(
+                "release root names no package, entrypoint and one release or installation"
+            )
+
+    def _root(self, root: pb.ReleaseRoot) -> tuple[str, _Held | None]:
+        """The root's package@release, and the unpublished installation it names, which this
+        machine must already hold: the controller prepares it and asks again."""
+        if not root.installation_id:
+            return _key(root.package, root.release), None
+        with self.worker.control_lock:
+            held = next(
+                (
+                    placement
+                    for placement in self.worker.prepared_installations.values()
+                    if placement.installation_id == root.installation_id
+                    and placement.development.get("package") == root.package
+                ),
+                None,
+            )
+        if held is None:
+            raise ExecutionWorkspaceRefusal(
+                "release_root_installation_absent",
+                f"this machine holds no installation {root.installation_id} of {root.package}",
+            )
+        return _key(root.package, str(held.development["release"])), {
+            "placement": dict(held.document),
+            "installation_id": held.installation_id,
+        }
 
     def _facts(self, key: str) -> pb.DeferredInstallation:
         """A release's install facts, read at this machine's catalog once."""
@@ -202,8 +234,9 @@ class ReleaseRoots:
                     del self.facts[old]
         return held
 
-    def _locked(self, key: str, held: _Held | None) -> bytes:
-        """A release's lock: its installation's here, else its install facts'."""
+    def _locked(self, key: str, held: _Held | None, captured: bool = False) -> bytes:
+        """A release's lock: its installation's here, else its install facts'. A captured
+        installation has no release at the Hub: only its own lock, if it has one."""
         if held is not None:
             path = (
                 Path(self.worker.options.install_root or "")
@@ -213,14 +246,16 @@ class ReleaseRoots:
             )
             if path.is_file():
                 return path.read_bytes()
-        return self._facts(key).preparation.locked_requirements
+        return b"" if captured else self._facts(key).preparation.locked_requirements
 
-    def _closure(self, root: pb.ReleaseRoot) -> tuple[dict[str, _Held], list[tuple[str, str]]]:
+    def _closure(
+        self, root: str, captured: _Held | None
+    ) -> tuple[dict[str, _Held], list[tuple[str, str]]]:
         """The releases of the root's closure this machine holds, and the closure's edges,
-        each release's callees read from its own lock."""
+        each release's callees read from its own lock (a captured root's from its own)."""
         installed: dict[str, _Held] = {}
         edges: set[tuple[str, str]] = set()
-        pending, seen = [_key(root.package, root.release)], set[str]()
+        pending, seen = [root], set[str]()
         while pending:
             key = pending.pop()
             if key in seen:
@@ -228,11 +263,12 @@ class ReleaseRoots:
             seen.add(key)
             if len(seen) > MAX_CLOSURE:
                 raise WorkspaceRefusal("published callable closure exceeds its bound")
-            held = self._installed(key)
+            own = key == root and captured is not None
+            held = captured if own else self._installed(key)
             if held is not None:
                 installed[key] = held
             package = key.partition("@")[0]
-            lock = self._locked(key, held)
+            lock = self._locked(key, held, own)
             for callee in machine_release_catalog.callees(package, lock):
                 edges.add((key, callee))
                 pending.append(callee)
@@ -283,8 +319,8 @@ class ReleaseRoots:
     def _prepare(self, owner: str, request: pb.MachineExecutionSubmit, job: _Job) -> _Prepared:
         root, worker = request.release_root, self.worker
         assert worker.machine_calls is not None
-        key = _key(root.package, root.release)
-        installed, edges = self._closure(root)
+        key, captured = self._root(root)
+        installed, edges = self._closure(key, captured)
         if key not in installed:
             self._note(job, f"installing {key}")
             installed[key] = self._install(self._facts(key))
@@ -334,7 +370,7 @@ class ReleaseRoots:
                     job, "downloading model weights", 100 * done // total if total else -1
                 ),
             )
-            return _Prepared(target, dict(prepared["placement"]), models, installed, edges)
+            return _Prepared(key, target, dict(prepared["placement"]), models, installed, edges)
         serving = worker.machine_calls.serving
         call = Call(
             request.offer.request_id,
@@ -366,7 +402,7 @@ class ReleaseRoots:
             serving.observers.pop(call.child_request, None)
             serving._release_preparation(owner, call.child_request)
         self._register(target, ready.placement)
-        return _Prepared(target, ready.placement, models, installed, edges)
+        return _Prepared(key, target, ready.placement, models, installed, edges)
 
     def _resolve(
         self,
@@ -468,16 +504,14 @@ class ReleaseRoots:
         with worker.control_lock:
             worker.prepared_installations[stored.prepared_key] = stored
 
-    def _capture(
-        self, root: pb.ReleaseRoot, prepared: _Prepared
-    ) -> tuple[bytes, bytes, dict[str, Any]]:
+    def _capture(self, prepared: _Prepared) -> tuple[bytes, bytes, dict[str, Any]]:
         """The callable inventory this machine would have been sent: installed and deferred."""
         installed = prepared.installed
         names: dict[str, tuple[str, str]] = {}  # key -> (field prefix, capture name)
         interfaces: dict[str, dict[str, Any]] = {}
         packages: list[pb.InstalledPackage] = []
         rows: list[pb.DeferredInstallation] = []
-        keys = {_key(root.package, root.release)}
+        keys = {prepared.key}
         keys.update(key for edge in prepared.edges for key in edge)
         for key in sorted(keys):
             held = installed.get(key)
@@ -516,8 +550,7 @@ class ReleaseRoots:
                 setattr(binding, "callee_" + names[callee][0], names[callee][1])
                 bindings.append(binding)
 
-        root_key = _key(root.package, root.release)
-        bind(root_key, root_key, True)
+        bind(prepared.key, prepared.key, True)
         for edge in prepared.edges:
             bind(*edge, False)
         bindings.sort(
@@ -602,7 +635,7 @@ class ReleaseRoots:
                 # `--upload-to`: Runtime sends this weights output to the named repository.
                 output.url = "model://" + root.weights_destination
         offer.grant.inputs.sort(key=lambda entry: entry.input_id)
-        capture, capture_digest, installed = self._capture(root, prepared)
+        capture, capture_digest, installed = self._capture(prepared)
         installations = {
             held["installation_id"]: {
                 "placement": placement
@@ -639,7 +672,7 @@ class ReleaseRoots:
             "resolved",
             {
                 "package": root.package,
-                "release": root.release,
+                "release": prepared.key.partition("@")[2],
                 "installation_id": prepared.target.installation_id,
                 "models": [
                     {

@@ -754,3 +754,72 @@ def test_the_owners_unpublished_checkpoint_resolves_with_the_worker_capability(
         assert catalog.presented == [("/v1/models/resolve", "worker", "ended")], catalog.presented
     finally:
         catalog.close()
+
+
+def test_a_root_names_an_unpublished_installation_the_machine_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same root message names a captured installation instead of a release: the machine
+    resolves its slots and mints the offer from the installation it holds, installs nothing
+    for the root itself, and refuses typed for an installation it does not hold."""
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    with tempfile.TemporaryDirectory(prefix="cz-root.", dir="/tmp") as directory:
+        machine = Machine(Path(directory), monkeypatch, "private")
+        try:
+            captured = machine.worker.prepare_local_package(
+                pb.PrepareLocalPackageRequest(
+                    operation_id="sync",
+                    package=pb.DevelopmentPackage(
+                        package=PACKAGE,
+                        release=RELEASE,
+                        installation_id=machine.installed.installation_id,
+                    ),
+                    files=[pb.LocalPackageFile(filename="tenant-1.0.0-py3-none-any.whl")],
+                    install_root=str(machine.install_root),
+                )
+            ).installed_package
+            raw = tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)[
+                "manifest"
+            ]
+            catalog = Catalog(
+                machine.manifest,
+                None,
+                [{"gpu": "H100", "lane": LANE}],
+                raw,
+                interface=machine.interface,
+            )
+            catalog.serve(machine)
+            try:
+                root = submission(machine, "captured")
+                root.release_root.ClearField("release")
+                root.release_root.installation_id = captured.installation_id
+                receipt, _ = submit(machine, root)
+                assert receipt.request_id == "captured"
+                (resolved,) = [
+                    canonical_json.decode(event.body)
+                    for event in machine.executions.events(OWNER, "captured").events
+                    if event.kind == "resolved"
+                ]
+                assert resolved["installation_id"] == captured.installation_id
+                assert resolved["release"] == RELEASE
+                assert f"/v1/packages/{PACKAGE}/releases/{RELEASE}" not in {
+                    urlsplit(path).path for path in catalog.reads
+                }
+
+                absent = submission(machine, "absent")
+                absent.release_root.ClearField("release")
+                absent.release_root.installation_id = "0" * 24
+                with pytest.raises(Refused) as refused:
+                    machine.rpc.SubmitMachineExecution(absent, Context())
+                assert (
+                    refused.value.trailers.get("cozy-error-code")
+                    == "release_root_installation_absent"
+                )
+            finally:
+                catalog.close()
+        finally:
+            machine.worker.shutdown()
