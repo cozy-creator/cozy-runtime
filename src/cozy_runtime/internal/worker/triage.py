@@ -40,31 +40,17 @@ import hashlib
 import os
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+
+import msgspec
 
 from cozy_runtime.internal import canonical
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.records import WorkerRecords
 
 #: `TriageBundleRef.length` is bounded at 1 MiB by the protocol. The assembler trims to it.
 MAX_BUNDLE_BYTES = 1 << 20
-
-#: The document's CLOSED top-level key set. A reader may check it exactly; a writer that
-#: wants a new section changes this line, which is a schema change and looks like one.
-SECTIONS = (
-    "subject_id",
-    "attempt",
-    "plan",
-    "posture",
-    "terminal",
-    "faults",
-    "measurements",
-    "confessions",
-    "liveness",
-    "events",
-    "caps",
-)
 
 
 class TriageError(Exception):
@@ -92,23 +78,27 @@ class Receipt:
     record_seq: int
 
 
-@dataclass(slots=True)
-class Assembly:
-    """Everything one terminal attempt contributes. Every field has exactly one producer."""
+class Assembly(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """Everything one terminal attempt contributes. Every field has exactly one producer.
+
+    The fields are the bundle's CLOSED section set: a reader decodes exactly these, and a
+    writer that wants a new section adds a field, which is a schema change and looks like
+    one. Each section is its producer's own observation document.
+    """
 
     subject_id: str
-    attempt: dict[str, Any] = field(default_factory=dict)
-    plan: dict[str, Any] = field(default_factory=dict)
-    posture: dict[str, Any] = field(default_factory=dict)
-    terminal: dict[str, Any] = field(default_factory=dict)
-    faults: list[dict[str, Any]] = field(default_factory=list)
-    measurements: dict[str, Any] = field(default_factory=dict)
-    confessions: list[dict[str, Any]] = field(default_factory=list)
-    liveness: list[dict[str, Any]] = field(default_factory=list)
-    events: list[dict[str, Any]] = field(default_factory=list)
-    caps: dict[str, Any] = field(default_factory=dict)
+    attempt: dict[str, Json]
+    plan: dict[str, Json]
+    posture: dict[str, Json]
+    terminal: dict[str, Json]
+    faults: list[dict[str, Json]]
+    measurements: dict[str, Json]
+    confessions: list[dict[str, Json]]
+    liveness: list[dict[str, Json]]
+    events: list[dict[str, Json]]
+    caps: dict[str, Json]
 
-    def build(self, limit: int = MAX_BUNDLE_BYTES) -> tuple[dict[str, Any], bytes]:
+    def build(self, limit: int = MAX_BUNDLE_BYTES) -> bytes:
         """Assemble and TRIM to the wire cap, shedding OLDEST observations first.
 
         The trim measures the real canonical bytes rather than estimating them: the cap is a
@@ -119,13 +109,19 @@ class Assembly:
         events = list(self.events)
         shed = 0
         while True:
-            document = self._document(events, shed)
+            caps = {
+                **self.caps,
+                "shed_to_fit": shed,
+                "max_bundle_bytes": MAX_BUNDLE_BYTES,
+                "truncated": bool(shed or self.caps.get("dropped", 0)),
+            }
+            document = msgspec.structs.replace(self, events=events, caps=caps)
             try:
-                data = canonical.write(document)
+                data = canonical.write(msgspec.to_builtins(document))
             except canonical.CanonicalError as exc:
                 raise TriageError("bundle_uncanonical", str(exc)) from exc
             if len(data) <= limit:
-                return document, data
+                return data
             if not events:
                 raise TriageError(
                     "bundle_irreducible",
@@ -137,24 +133,13 @@ class Assembly:
             del events[:drop]
             shed += drop
 
-    def _document(self, events: list[dict[str, Any]], shed: int) -> dict[str, Any]:
-        caps = dict(self.caps)
-        caps["shed_to_fit"] = shed
-        caps["max_bundle_bytes"] = MAX_BUNDLE_BYTES
-        caps["truncated"] = bool(shed or caps.get("dropped", 0))
-        return {
-            "subject_id": self.subject_id,
-            "attempt": self.attempt,
-            "plan": self.plan,
-            "posture": self.posture,
-            "terminal": self.terminal,
-            "faults": self.faults,
-            "measurements": self.measurements,
-            "confessions": self.confessions,
-            "liveness": self.liveness,
-            "events": events,
-            "caps": caps,
-        }
+
+class _Written(msgspec.Struct, frozen=True):
+    """A bundle's write receipt as the worker records it."""
+
+    subject_id: str
+    bundle_digest: str
+    length: int
 
 
 class BundleStore:
@@ -179,7 +164,7 @@ class BundleStore:
     def commit(self, assembly: Assembly) -> Receipt:
         """Write, fsync, hand over, then record the receipt."""
         self.root.mkdir(parents=True, exist_ok=True)
-        _, data = assembly.build()
+        data = assembly.build()
         path = self.root / f"{assembly.subject_id}.json"
         tmp = path.with_suffix(".part")
         handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -211,14 +196,7 @@ class BundleStore:
     # ------------------------------------------------------------------ reading
 
     @staticmethod
-    def receipts(source: WorkerRecords) -> dict[str, dict[str, Any]]:
-        """Every same-process write receipt by subject."""
-        return {str(record.body["subject_id"]): record.body for record in source.of_kind("triage")}
-
-    @staticmethod
-    def read(
-        root: Path, subject_id: str, receipt_source: WorkerRecords | None = None
-    ) -> dict[str, Any]:
+    def read(root: Path, subject_id: str, receipt_source: WorkerRecords | None = None) -> Assembly:
         """Read one bundle by opaque subject, optionally checked against its live receipt.
 
         This is the whole triage path: a directory, a key, and a digest. No process, no SSH,
@@ -229,25 +207,28 @@ class BundleStore:
         if not path.is_file():
             raise TriageError("bundle_absent", f"no triage bundle for subject {subject_id!r}")
         data = path.read_bytes()
-        document = canonical.parse_canonical(data)
-        if not isinstance(document, dict) or set(document) != set(SECTIONS):
-            raise TriageError("bundle_malformed", f"{subject_id}: wrong triage fields")
+        try:
+            bundle = msgspec.convert(canonical.parse_canonical(data), Assembly)
+        except msgspec.ValidationError as exc:
+            raise TriageError("bundle_malformed", f"{subject_id}: {exc}") from exc
         if receipt_source is not None:
-            receipt = BundleStore.receipts(receipt_source).get(subject_id)
+            written = [
+                msgspec.convert(row.body, _Written) for row in receipt_source.of_kind("triage")
+            ]
+            receipt = next((row for row in written if row.subject_id == subject_id), None)
             if receipt is None:
                 raise TriageError(
                     "receipt_absent",
                     f"{subject_id}: bytes exist but no write receipt was recorded",
                 )
             digest = "sha256:" + hashlib.sha256(data).hexdigest()
-            if digest != receipt["bundle_digest"] or len(data) != receipt["length"]:
+            if digest != receipt.bundle_digest or len(data) != receipt.length:
                 raise TriageError(
                     "bundle_corrupt",
                     f"{subject_id}: {len(data)} B hashing to {digest[:23]} does not match "
-                    f"the recorded receipt ({receipt['length']} B, "
-                    f"{str(receipt['bundle_digest'])[:23]})",
+                    f"the recorded receipt ({receipt.length} B, {receipt.bundle_digest[:23]})",
                 )
-        return document
+        return bundle
 
 
 SUBJECT = re.compile(r"trb-[0-9a-f]{24}")
@@ -268,61 +249,3 @@ def retained_bytes(root: Path, subject_id: str, digest: str, length: int) -> byt
             "bundle_corrupt", f"{subject_id}: bytes differ from the outcome's reference"
         )
     return data
-
-
-def explain(document: dict[str, Any]) -> list[str]:
-    """The bundle, as the lines a person reads first. A PROJECTION, never authority."""
-    attempt = document.get("attempt", {})
-    terminal = document.get("terminal", {})
-    measurements = document.get("measurements", {})
-    lines = [
-        f"attempt   {attempt.get('request_id')}#{attempt.get('attempt')} "
-        f"({document.get('subject_id')})",
-        f"spec      {str(attempt.get('invocation_spec_digest', ''))[:30]}",
-        f"outcome   {terminal.get('status')} / {terminal.get('cause_code')} "
-        f"from {terminal.get('cause_origin')}",
-        f"because   {terminal.get('safe_message', '')[:300]}",
-        f"executor  epoch {attempt.get('executor_epoch')} "
-        f"admission epoch {document.get('posture', {}).get('admission_epoch')}",
-    ]
-    trace = str(terminal.get("traceback") or "").rstrip().splitlines()
-    for row in trace[-4:]:
-        lines.append(f"trace     {row.strip()[:300]}")
-    for fault in document.get("faults", ()):
-        lines.append(f"fault     {fault.get('reason')}: {str(fault.get('detail', ''))[:200]}")
-    for row in document.get("confessions", ()):
-        lines.append(f"confessed {row.get('name')}: {row.get('value')}")
-    execution = document.get("plan", {}).get("execution") or {}
-    if execution:
-        lines.append(
-            f"execution {execution.get('scheme')}: {execution.get('entry')} "
-            f"x{execution.get('calls', '?')} of {execution.get('expected_calls', '?')} predicted "
-            f"via {execution.get('backend')}, kernel "
-            f"{execution.get('kernel_symbol') or 'unobserved'} "
-            f"{execution.get('kernel_self_ms', 0)} ms self"
-            + (f" — {execution['refusal']}" if execution.get("refusal") else "")
-        )
-    for row in document.get("liveness", ()):
-        if row.get("verdict"):
-            lines.append(
-                f"liveness  {row.get('subject')} [{row.get('step')}] {row.get('verdict')} "
-                f"at position {row.get('position')} after {row.get('samples')} observations"
-            )
-    for row in measurements.get("ledger", {}).get("classes", ()):
-        if row.get("verdict") in ("leak", "baseline_shift"):
-            lines.append(f"ledger    {row['class']}: {row['verdict']} {row.get('delta')} B")
-    attribution = measurements.get("attribution", {})
-    for name, track in sorted(attribution.get("stages", {}).items()):
-        lines.append(f"stage     {name}: {track['total_ms']} ms over {track['count']}")
-    for name, track in sorted(attribution.get("steps", {}).items()):
-        lines.append(
-            f"steps     {name}: {track['count']} x mean {track['mean_ms']} ms "
-            f"(min {track['min_ms']}, max {track['max_ms']})"
-        )
-    caps = document.get("caps", {})
-    lines.append(
-        f"tail      {len(document.get('events', ()))} kept, {caps.get('dropped', 0)} shed by "
-        f"the ring, {caps.get('shed_to_fit', 0)} shed to fit the {caps.get('max_bundle_bytes')} "
-        f"B cap, {caps.get('refused', 0)} refused at the emit boundary"
-    )
-    return lines

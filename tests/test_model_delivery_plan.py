@@ -9,11 +9,13 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import msgspec
 import pytest
 
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
+    ModelDelivery,
     PlanChooser,
     PlanRefusal,
     PreparedModel,
@@ -49,7 +51,9 @@ def choose(models: dict[str, dict[str, Any]], *, staged: bool = False) -> Any:
         binding,
         PreparedModel(
             constructed_model_digest="sha256:constructed",
-            model_deliveries=tuple(sorted(models.items())),
+            model_deliveries=tuple(
+                (name, msgspec.convert(models[name], ModelDelivery)) for name in sorted(models)
+            ),
         ),
         PreparedRequest.unresolved("generate", {}),
     )

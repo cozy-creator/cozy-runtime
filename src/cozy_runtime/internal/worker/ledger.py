@@ -29,9 +29,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+
+import msgspec
 
 from cozy_runtime.internal import proctree
+from cozy_runtime.internal.canonical import Json
 
 #: Every byte class this ledger carries, in report order. A class is added here only when a
 #: real producer exists for it; a row nothing writes is not a ledger entry, it is decoration.
@@ -129,29 +131,118 @@ def read_vmrss(pid: int) -> int:
     return proctree.rss_bytes(pid)
 
 
-@dataclass(frozen=True, slots=True)
-class Counter:
-    """One byte class, its number, and the method that produced it."""
+class Counter(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """One byte class, its number, and the method that produced it. -1 is unset."""
 
-    name: str
+    name: str = msgspec.field(name="class")
     bytes: int
     kind: str
     method: str
     budget: int = -1
     peak: int = -1
 
-    def document(self) -> dict[str, Any]:
-        row: dict[str, Any] = {
-            "class": self.name,
-            "bytes": self.bytes,
-            "kind": self.kind,
-            "method": self.method,
-        }
-        if self.budget >= 0:
-            row["budget"] = self.budget
-        if self.peak >= 0:
-            row["peak"] = self.peak
-        return row
+    def document(self) -> dict[str, Json]:
+        document: dict[str, Json] = msgspec.to_builtins(self)
+        return document
+
+
+class ReconciledClass(Counter, frozen=True, kw_only=True, omit_defaults=True):
+    """One class across an attempt: its snapshot before and after, and the verdict."""
+
+    before: int
+    after: int
+    reconciled: bool
+    delta: int | msgspec.UnsetType = msgspec.UNSET
+    verdict: str | msgspec.UnsetType = msgspec.UNSET
+    declared_transition: int | msgspec.UnsetType = msgspec.UNSET
+    residual: int | msgspec.UnsetType = msgspec.UNSET
+
+
+class Reconciliation(msgspec.Struct, frozen=True, kw_only=True):
+    """One attempt close: every class reconciled, and what did not reconcile."""
+
+    attempt: str
+    classes: tuple[ReconciledClass, ...]
+    leaks: tuple[str, ...]
+    baseline_shifts: tuple[str, ...]
+    declared_residency_delta: int
+    unreadable: tuple[str, ...]
+    closed: bool
+
+
+class Measurement(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """The ledger as a report: its classes and the conditions that qualify them."""
+
+    classes: tuple[Counter, ...]
+    unreadable: tuple[str, ...] = ()
+    unreconciled: str = ""
+    unsuitable_placements: dict[str, str] = {}
+    activation_scopes_by_cell: dict[str, dict[str, int]] = {}
+
+
+class _Pinned(msgspec.Struct, frozen=True):
+    registered_bytes: int = 0
+
+
+class ConstructionFacts(msgspec.Struct, frozen=True, kw_only=True):
+    """The prepare reply's `facts` as the ledger reads them; the executor sends more."""
+
+    filled_bytes: int = 0
+    filled: int = 0
+    allocator_bytes: int = -1
+    reserved_bytes: int = -1
+    device_free_bytes: int = -1
+    device_total_bytes: int = -1
+    resident: dict[str, int] = {}
+    constructed: dict[str, int] | msgspec.UnsetType = msgspec.UNSET
+    """Absent: the construction holds everything it built."""
+    parked: tuple[str, ...] = ()
+    evicted: dict[str, int] = {}
+    gpu_name: str = ""
+    declared_scopes: dict[str, tuple[str, ...]] = {}
+    paging: dict[str, dict[str, int]] = {}
+    pinned: _Pinned = msgspec.field(default_factory=_Pinned)
+
+
+class AttemptMetrics(msgspec.Struct, frozen=True, kw_only=True):
+    activation_peaks: dict[str, int] = {}
+    activation_peak_bytes: int = 0
+    peak_vram_bytes: int = 0
+
+
+class _Transition(msgspec.Struct, frozen=True):
+    allocator_delta_bytes: int = 0
+
+
+class _Resident(msgspec.Struct, frozen=True):
+    resident: dict[str, int] = {}
+    evicted: dict[str, int] = {}
+
+
+class Probe(msgspec.Struct, frozen=True, kw_only=True):
+    """The executor's device after-state. -1 is unreadable; no `residency`, no residency map."""
+
+    allocator_bytes: int = -1
+    reserved_bytes: int = -1
+    device_free_bytes: int = -1
+    device_total_bytes: int = -1
+    residency: _Resident | None = None
+
+
+class _Freed(msgspec.Struct, frozen=True):
+    freed_bytes: int = 0
+
+
+class _Refilled(msgspec.Struct, frozen=True):
+    restored_bytes: int = 0
+
+
+class VacateReply(Probe, frozen=True, kw_only=True):
+    vacated: _Freed = msgspec.field(default_factory=_Freed)
+
+
+class RestoreReply(Probe, frozen=True, kw_only=True):
+    restored: _Refilled = msgspec.field(default_factory=_Refilled)
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +261,7 @@ class DeviceFacts:
     total: int
     process: int = -1
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, Json]:
         return {
             "ordinal": self.ordinal,
             "entry": self.entry,
@@ -305,7 +396,7 @@ class Ledger:
     paging: dict[str, dict[str, int]] = field(default_factory=dict)
     #: every re-baselining and its size, so a moved line is visible rather than assumed
     baseline_notes: list[str] = field(default_factory=list)
-    reconciliations: list[dict[str, Any]] = field(default_factory=list)
+    reconciliations: list[Reconciliation] = field(default_factory=list)
     #: THE ATTEMPT'S DECLARED RESIDENCY TRANSITION, signed, in the same allocator bytes
     #: `device_allocated` is measured in. A staged rung moves gigabytes on purpose; that
     #: movement is a fact the attempt DECLARES, so the reconciliation subtracts it and holds
@@ -383,33 +474,29 @@ class Ledger:
         self.unreconciled = ""
         self.unsuitable_placements.clear()
 
-    def observe_construction(self, facts: dict[str, Any]) -> None:
+    def observe_construction(self, facts: Mapping[str, object]) -> None:
         """The generation's resident baseline, from the fill that just committed."""
-        self.weights_bytes = int(facts.get("filled_bytes", 0))
-        self.weights_destinations = int(facts.get("filled", 0))
-        self.device_baseline = int(facts.get("allocator_bytes", -1))
+        read = msgspec.convert(facts, ConstructionFacts)
+        self.weights_bytes = read.filled_bytes
+        self.weights_destinations = read.filled
+        self.device_baseline = read.allocator_bytes
         self.device_allocated = self.device_baseline
-        self.device_reserved = int(facts.get("reserved_bytes", -1))
-        self.resident = {k: int(v) for k, v in (facts.get("resident") or {}).items()}
-        self.constructed = {k: int(v) for k, v in facts.get("constructed", self.resident).items()}
-        self.parked = tuple(str(name) for name in (facts.get("parked") or ()))
+        self.device_reserved = read.reserved_bytes
+        self.resident = dict(read.resident)
+        self.constructed = dict(
+            read.resident if read.constructed is msgspec.UNSET else read.constructed
+        )
+        self.parked = read.parked
         # Parked components WITH their sizes, from the construction that parked them: what
         # the next attempt may have to stage in is priced from the first plan, not from
         # the first probe.
-        self.evicted = {k: int(v) for k, v in (facts.get("evicted") or {}).items()}
-        self.accelerator = str(facts.get("gpu_name", ""))
-        self.declared_scopes = {
-            str(method): tuple(str(name) for name in names)
-            for method, names in (facts.get("declared_scopes") or {}).items()
-        }
-        self.paging = {
-            str(name): {str(key): int(value) for key, value in layout.items()}
-            for name, layout in (facts.get("paging") or {}).items()
-        }
-        self.device_free = int(facts.get("device_free_bytes", -1))
-        self.device_total = int(facts.get("device_total_bytes", -1))
-        pinned = facts.get("pinned", {})
-        self.registered = int(pinned.get("registered_bytes", 0))
+        self.evicted = dict(read.evicted)
+        self.accelerator = read.gpu_name
+        self.declared_scopes = dict(read.declared_scopes)
+        self.paging = {name: dict(layout) for name, layout in read.paging.items()}
+        self.device_free = read.device_free_bytes
+        self.device_total = read.device_total_bytes
+        self.registered = read.pinned.registered_bytes
         # The ring is closed by the time facts cross the seam: nothing is DMA-live.
         self.pinned_in_flight = 0
         # A generation is the ONLY thing that re-establishes this ledger. §3.2's rule is that
@@ -419,7 +506,7 @@ class Ledger:
 
     def observe_attempt(
         self,
-        metrics: dict[str, Any],
+        metrics: Mapping[str, object],
         resident_moved: bool = False,
         cell: str = "",
         succeeded: bool = False,
@@ -439,12 +526,9 @@ class Ledger:
             previous = self.carried_resident_free_by_cell.get(cell)
             if previous is None or self.device_free < previous:
                 self.carried_resident_free_by_cell[cell] = self.device_free
-        scopes = {
-            str(method): int(value)
-            for method, value in (metrics.get("activation_peaks") or {}).items()
-            if int(value) > 0
-        }
-        direct = max(scopes.values(), default=int(metrics.get("activation_peak_bytes", 0)))
+        read = msgspec.convert(metrics, AttemptMetrics)
+        scopes = {method: value for method, value in read.activation_peaks.items() if value > 0}
+        direct = max(scopes.values(), default=read.activation_peak_bytes)
         if direct > 0:
             measured = direct
         elif resident_moved:
@@ -453,7 +537,7 @@ class Ledger:
                 self.unreadable.append("activations_scratch")
             return
         else:
-            peak = int(metrics.get("peak_vram_bytes", 0))
+            peak = read.peak_vram_bytes
             measured = peak - self.device_baseline if peak and self.device_baseline >= 0 else 0
         if measured > 0:
             self.activations_peak = max(self.activations_peak, measured)
@@ -654,22 +738,24 @@ class Ledger:
         exact = self.activation_scopes_by_cell.get(cell)
         return frozenset(exact or self.carried_activation_scopes_by_cell.get(cell) or ())
 
-    def observe_residency(self, residency: dict[str, Any]) -> None:
+    def observe_residency(self, residency: Mapping[str, object]) -> None:
         """The attempt's DECLARED residency transition, from the plane that performed it."""
-        self.residency_delta = int(residency.get("allocator_delta_bytes", 0))
+        self.residency_delta = msgspec.convert(residency, _Transition).allocator_delta_bytes
 
-    def observe_probe(self, probe: dict[str, Any]) -> None:
+    def observe_probe(self, probe: Mapping[str, object]) -> None:
         """The device's after-state, read through the executor that owns the context."""
-        self.device_allocated = int(probe.get("allocator_bytes", -1))
-        self.device_reserved = int(probe.get("reserved_bytes", -1))
-        self.device_free = int(probe.get("device_free_bytes", -1))
-        self.device_total = int(probe.get("device_total_bytes", -1))
-        residency = probe.get("residency")
-        if isinstance(residency, dict):
-            self.resident = {k: int(v) for k, v in (residency.get("resident") or {}).items()}
-            self.evicted = {k: int(v) for k, v in (residency.get("evicted") or {}).items()}
+        self._observe(msgspec.convert(probe, Probe))
 
-    def observe_vacate(self, reply: dict[str, Any], why: str) -> int:
+    def _observe(self, probe: Probe) -> None:
+        self.device_allocated = probe.allocator_bytes
+        self.device_reserved = probe.reserved_bytes
+        self.device_free = probe.device_free_bytes
+        self.device_total = probe.device_total_bytes
+        if probe.residency is not None:
+            self.resident = dict(probe.residency.resident)
+            self.evicted = dict(probe.residency.evicted)
+
+    def observe_vacate(self, reply: Mapping[str, object], why: str) -> int:
         """The lane took this generation's device bytes for another tenant (cr-022).
 
         The reply is the executor's probe after the eviction, so every device class is
@@ -679,18 +765,12 @@ class Ledger:
         that transition, so it reconciles against where the vacate left the device, not
         against the construction's fill. Returns the bytes the executor reports freed.
         """
-        before = self.device_allocated
-        self.observe_probe(reply)
-        vacated = reply.get("vacated") or {}
-        freed = int(vacated.get("freed_bytes", 0))
-        if self.device_allocated >= 0:
-            shift = self.device_allocated - before if before >= 0 else 0
-            self.device_baseline = self.device_allocated
-            self.baseline_notes.append(f"vacated ({why}): {shift:+d} B allocator, {freed} B freed")
-            del self.baseline_notes[:-8]
+        read = msgspec.convert(reply, VacateReply)
+        freed = read.vacated.freed_bytes
+        self._rebaseline(read, f"vacated ({why})", f"{freed} B freed")
         return freed
 
-    def observe_restore(self, reply: dict[str, Any], why: str) -> int:
+    def observe_restore(self, reply: Mapping[str, object], why: str) -> int:
         """This generation took back bytes the lane had vacated (cr-097).
 
         The mirror of `observe_vacate` and it moves the baseline the same way, for the same
@@ -698,18 +778,19 @@ class Ledger:
         construction's fill or against the hole the vacate left. Returns the bytes the
         executor reports restored.
         """
+        read = msgspec.convert(reply, RestoreReply)
+        gained = read.restored.restored_bytes
+        self._rebaseline(read, f"restored ({why})", f"{gained} B refilled")
+        return gained
+
+    def _rebaseline(self, probe: Probe, what: str, moved: str) -> None:
         before = self.device_allocated
-        self.observe_probe(reply)
-        restored = reply.get("restored") or {}
-        gained = int(restored.get("restored_bytes", 0))
+        self._observe(probe)
         if self.device_allocated >= 0:
             shift = self.device_allocated - before if before >= 0 else 0
             self.device_baseline = self.device_allocated
-            self.baseline_notes.append(
-                f"restored ({why}): {shift:+d} B allocator, {gained} B refilled"
-            )
+            self.baseline_notes.append(f"{what}: {shift:+d} B allocator, {moved}")
             del self.baseline_notes[:-8]
-        return gained
 
     def missing_resident(self) -> dict[str, int]:
         """What the construction filled and the device no longer holds (cr-097): the exact
@@ -797,21 +878,21 @@ class Ledger:
             )
         return out
 
-    def measurement(self) -> dict[str, Any]:
+    def measurement(self) -> Measurement:
         """Current typed ledger fields for records, triage, and local reporting."""
 
-        return {
-            "classes": [counter.document() for counter in self.counters()],
-            "unreadable": sorted(self.unreadable),
-            "unreconciled": self.unreconciled,
-            "unsuitable_placements": dict(self.unsuitable_placements),
-            "activation_scopes_by_cell": {
+        return Measurement(
+            classes=tuple(self.counters()),
+            unreadable=tuple(sorted(self.unreadable)),
+            unreconciled=self.unreconciled,
+            unsuitable_placements=dict(self.unsuitable_placements),
+            activation_scopes_by_cell={
                 cell: dict(scopes)
                 for cell, scopes in sorted(self.activation_scopes_by_cell.items())
             },
-        }
+        )
 
-    def rows(self) -> dict[str, Any]:
+    def rows(self) -> dict[str, Json]:
         """The compact projection carried by the worker summary and process records."""
         return {
             "pinned": {"registered": self.registered},
@@ -844,7 +925,7 @@ class Ledger:
         """Every class as one flat mapping — the before half of a reconciliation."""
         return {counter.name: counter.bytes for counter in self.counters()}
 
-    def close_attempt(self, key: str, before: dict[str, int]) -> dict[str, Any]:
+    def close_attempt(self, key: str, before: Mapping[str, int]) -> dict[str, Json]:
         """Reconcile EVERY class against the snapshot taken BEFORE the attempt was accepted.
 
         The claim, and the only one: an attempt that reached a terminal holds no byte it did
@@ -874,57 +955,69 @@ class Ledger:
         A transition is a reconciliation, never a leak — and never a silence either.
         """
         after = self.snapshot()
-        reconciled = ("device_allocated",)
-        classes: list[dict[str, Any]] = []
+        classes: list[ReconciledClass] = []
         leaks: list[str] = []
         shifts: list[str] = []
         moved = self.residency_delta
         for counter in self.counters():
             name = counter.name
-            row = counter.document()
-            row["before"] = before.get(name, -1)
-            row["after"] = after[name]
-            row["reconciled"] = name in reconciled
-            if name in reconciled and after[name] >= 0 and before.get(name, -1) >= 0:
-                delta = after[name] - before[name]
-                row["delta"] = delta
-                row["verdict"] = "reconciled"
-                declared = moved if name == "device_allocated" else 0
-                residual = delta - declared
-                if declared:
-                    row["declared_transition"] = declared
-                    row["residual"] = residual
-                    row["verdict"] = "residency_transition"
-                first = self.closed_since_baseline == 0
-                if residual < 0 and name == "device_allocated":
-                    # Returned MORE than the attempt took: the device has more free memory
-                    # than the ledger priced, which can only make choices conservative. The
-                    # baseline moves down to the truth; nothing is refused.
-                    row["verdict"] = "baseline_shift"
-                    shifts.append(
-                        f"device_allocated: {residual:+d} B released beyond the attempt's "
-                        "own allocation; the baseline moves down to the measured device"
+            was = before.get(name, -1)
+            fields = msgspec.structs.asdict(counter)
+            # Only `device_allocated` is reconciled; the declared transition is its own.
+            if name != "device_allocated" or after[name] < 0 or was < 0:
+                classes.append(
+                    ReconciledClass(
+                        **fields,
+                        before=was,
+                        after=after[name],
+                        reconciled=name == "device_allocated",
                     )
-                    self.device_baseline += residual
-                elif residual > 0 and name == "device_allocated" and first:
-                    row["verdict"] = "baseline_shift"
-                    shifts.append(
-                        f"device_allocated: +{residual} B on the first attempt of this "
-                        "executor generation - lazily allocated library workspace, held by "
-                        "the process rather than the attempt; the baseline moves and every "
-                        "later attempt is held to the new line"
-                    )
-                    self.device_baseline += residual
-                elif residual > 0:
-                    # KEPT: an unexplained growth means the chooser would price rungs against
-                    # memory the device no longer has, which is an OOM mid-attempt (cl-003).
-                    row["verdict"] = "leak"
-                    leaks.append(
-                        f"{name}: {residual:+d} B unaccounted across the attempt "
-                        f"({before[name]} -> {after[name]}, of which {declared:+d} B was a "
-                        f"declared residency transition), measured by {counter.kind}"
-                    )
-            classes.append(row)
+                )
+                continue
+            delta = after[name] - was
+            residual = delta - moved
+            verdict = "residency_transition" if moved else "reconciled"
+            first = self.closed_since_baseline == 0
+            if residual < 0:
+                # Returned MORE than the attempt took: the device has more free memory
+                # than the ledger priced, which can only make choices conservative. The
+                # baseline moves down to the truth; nothing is refused.
+                verdict = "baseline_shift"
+                shifts.append(
+                    f"device_allocated: {residual:+d} B released beyond the attempt's "
+                    "own allocation; the baseline moves down to the measured device"
+                )
+                self.device_baseline += residual
+            elif residual > 0 and first:
+                verdict = "baseline_shift"
+                shifts.append(
+                    f"device_allocated: +{residual} B on the first attempt of this "
+                    "executor generation - lazily allocated library workspace, held by "
+                    "the process rather than the attempt; the baseline moves and every "
+                    "later attempt is held to the new line"
+                )
+                self.device_baseline += residual
+            elif residual > 0:
+                # KEPT: an unexplained growth means the chooser would price rungs against
+                # memory the device no longer has, which is an OOM mid-attempt (cl-003).
+                verdict = "leak"
+                leaks.append(
+                    f"{name}: {residual:+d} B unaccounted across the attempt "
+                    f"({was} -> {after[name]}, of which {moved:+d} B was a "
+                    f"declared residency transition), measured by {counter.kind}"
+                )
+            classes.append(
+                ReconciledClass(
+                    **fields,
+                    before=was,
+                    after=after[name],
+                    reconciled=True,
+                    delta=delta,
+                    verdict=verdict,
+                    declared_transition=moved or msgspec.UNSET,
+                    residual=residual if moved else msgspec.UNSET,
+                )
+            )
         if moved and not leaks:
             # THE LINE MOVES WITH THE DEVICE. Leaving the baseline where the construction put
             # it is what made every later attempt measure against a residency that no longer
@@ -935,18 +1028,19 @@ class Ledger:
         self.closed_since_baseline += 1
         if leaks:
             self.unreconciled = "; ".join(leaks)
-        record = {
-            "attempt": key,
-            "classes": classes,
-            "leaks": leaks,
-            "baseline_shifts": shifts,
-            "declared_residency_delta": moved,
-            "unreadable": sorted(self.unreadable),
-            "closed": not leaks,
-        }
+        record = Reconciliation(
+            attempt=key,
+            classes=tuple(classes),
+            leaks=tuple(leaks),
+            baseline_shifts=tuple(shifts),
+            declared_residency_delta=moved,
+            unreadable=tuple(sorted(self.unreadable)),
+            closed=not leaks,
+        )
         self.reconciliations.append(record)
         del self.reconciliations[:-32]
         # The transition belonged to THIS attempt. Carrying it into the next one would
         # forgive that one's device delta by exactly the size of a move it never made.
         self.residency_delta = 0
-        return record
+        document: dict[str, Json] = msgspec.to_builtins(record)
+        return document

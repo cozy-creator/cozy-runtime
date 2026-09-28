@@ -27,8 +27,6 @@ The arithmetic arms below use the pod's own numbers and no device. The end-to-en
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from cozy_runtime.internal.worker.ledger import Ledger
@@ -38,6 +36,8 @@ from cozy_runtime.internal.worker.plan import (
     PlanChooser,
     PreparedModel,
     PreparedRequest,
+    Rung,
+    Walk,
 )
 
 GiB = 1 << 30
@@ -125,10 +125,9 @@ def _bank_solo_serve(
     ledger.device_free = was
 
 
-def _walk(ledger: Ledger) -> tuple[str, dict[str, Any]]:
-    chooser = PlanChooser(ledger)
-    _terms, _rows, chosen, walk = chooser._walk(_binding(), CELL)
-    return chosen, walk
+def _walk(ledger: Ledger) -> tuple[str, Walk]:
+    walk = PlanChooser(ledger)._walk(_binding(), CELL)
+    return walk.chosen, walk
 
 
 def test_staged_warm_does_not_become_a_permanent_construction_floor() -> None:
@@ -188,7 +187,7 @@ def test_initial_construction_parking_remains_a_capacity_floor_after_warm() -> N
     }
     chosen, walk = _walk(ledger)
     assert chosen == "component_staged"
-    assert walk["rungs"][0]["verdict"] == "construction_parked"
+    assert walk.rungs[0].verdict == "construction_parked"
 
 
 @pytest.mark.parametrize("free, grade", [(818_282_496, "measured"), (816_185_344, "bound")])
@@ -206,10 +205,10 @@ def test_staged_success_cannot_promote_restored_weights_after_driver_free_drift(
     ledger.observe_device_free(free, 8 * GiB)
     assert ledger.resident_sufficiency(CELL) == 0
     chosen, walk = _walk(ledger)
-    assert walk["coefficients"][1]["provenance"] == grade
+    assert walk.coefficients[1].provenance == grade
     assert chosen == "component_staged"
-    assert _row(walk, "all_resident")["needs_bytes"] == 2 * GiB
-    assert _row(walk, "all_resident")["verdict"] == "short"
+    assert _row(walk, "all_resident").needs_bytes == 2 * GiB
+    assert _row(walk, "all_resident").verdict == "short"
     # Several successful staged requests do not turn into evidence of a successful
     # fully resident request. A roomier device can still fit the measured demand.
     for _ in range(5):
@@ -271,8 +270,8 @@ def test_staged_only_history_skips_pointless_full_restore_until_it_fits() -> Non
     assert chooser.should_restore(_binding(), prepared)
 
 
-def _row(walk: dict[str, Any], rung: str) -> dict[str, Any]:
-    return next(row for row in walk["rungs"] if row["rung"] == rung)
+def _row(walk: Walk, rung: str) -> Rung:
+    return next(row for row in walk.rungs if row.rung == rung)
 
 
 # --------------------------------------------------------------- the defect, in arithmetic
@@ -292,14 +291,14 @@ def test_a_generation_holding_its_weights_is_not_demoted_by_an_envelope_it_outgr
     ledger = _resident_ledger()
     _bank_solo_serve(ledger)
     chosen, walk = _walk(ledger)
-    assert chosen == "all_resident", walk["rungs"]
+    assert chosen == "all_resident", walk.rungs
     resident = _row(walk, "all_resident")
-    assert resident["needs_bytes"] == 0, resident
-    assert resident["absent_bytes"] == 0 and resident["headroom_basis"] == "already_resident"
+    assert resident.needs_bytes == 0, resident
+    assert resident.absent_bytes == 0 and resident.headroom_basis == "already_resident"
     # the envelope is still REPORTED, and still says what it is
-    envelope = next(c for c in walk["coefficients"] if c["name"] == "activations")
-    assert envelope["bytes"] == SOLO_ACTIVATIONS and envelope["provenance"] == "bound"
-    assert not envelope["enforceable"] and "upper bound" in envelope["source"]
+    envelope = walk.activations
+    assert envelope.value == SOLO_ACTIVATIONS and envelope.provenance == "bound"
+    assert not envelope.enforceable and "upper bound" in envelope.source
 
 
 def test_what_the_executor_admits_against_is_what_the_walk_decided_with() -> None:
@@ -350,10 +349,10 @@ def test_a_measured_failure_at_no_more_room_than_this_denies_the_resident_rung()
     _bank_solo_serve(ledger)
     ledger.observe_device_shortfall(CELL, TIGHT_FREE)
     chosen, walk = _walk(ledger)
-    assert chosen == "component_staged", walk["rungs"]
+    assert chosen == "component_staged", walk.rungs
     resident = _row(walk, "all_resident")
-    assert resident["verdict"] == "refused_on_measured_shortfall"
-    assert resident["denied_at_free_bytes"] == TIGHT_FREE
+    assert resident.verdict == "refused_on_measured_shortfall"
+    assert resident.denied_at_free_bytes == TIGHT_FREE
     # and a picture with MORE room than the one that failed is not answered here
     ledger.device_free = TIGHT_FREE + GiB
     assert _walk(ledger)[0] == "all_resident"
@@ -368,11 +367,11 @@ def test_an_envelope_measured_on_a_card_this_tight_still_denies_the_rung() -> No
     # allocated, and nothing about whether the whole set can be resident beside them.
     _bank_solo_serve(ledger, free=TIGHT_FREE, moved=True)
     chosen, walk = _walk(ledger)
-    assert chosen == "component_staged", walk["rungs"]
+    assert chosen == "component_staged", walk.rungs
     resident = _row(walk, "all_resident")
-    assert resident["verdict"] == "short" and resident["needs_bytes"] == SOLO_ACTIVATIONS
-    envelope = next(c for c in walk["coefficients"] if c["name"] == "activations")
-    assert envelope["provenance"] == "measured" and envelope["enforceable"]
+    assert resident.verdict == "short" and resident.needs_bytes == SOLO_ACTIVATIONS
+    envelope = walk.activations
+    assert envelope.provenance == "measured" and envelope.enforceable
 
 
 def test_nothing_measured_at_all_still_deepens() -> None:
@@ -384,10 +383,10 @@ def test_nothing_measured_at_all_still_deepens() -> None:
     the staged rung serves)."""
     ledger = _resident_ledger(free=UNCALIBRATED_ACTIVATION_BYTES // 2)
     chosen, walk = _walk(ledger)
-    assert chosen == "component_staged", walk["rungs"]
-    envelope = next(c for c in walk["coefficients"] if c["name"] == "activations")
-    assert envelope["provenance"] == "uncalibrated"
-    assert _row(walk, "all_resident")["needs_bytes"] == UNCALIBRATED_ACTIVATION_BYTES
+    assert chosen == "component_staged", walk.rungs
+    envelope = walk.activations
+    assert envelope.provenance == "uncalibrated"
+    assert _row(walk, "all_resident").needs_bytes == UNCALIBRATED_ACTIVATION_BYTES
 
 
 def test_an_upper_bound_may_still_decline_to_acquire_weights() -> None:
@@ -401,8 +400,8 @@ def test_an_upper_bound_may_still_decline_to_acquire_weights() -> None:
     ledger.resident = {k: v for k, v in WEIGHTS.items() if k != "unet"}
     chosen, walk = _walk(ledger)
     resident = _row(walk, "all_resident")
-    assert resident["needs_bytes"] == SOLO_ACTIVATIONS + WEIGHTS["unet"], resident
-    assert chosen != "all_resident", walk["rungs"]
+    assert resident.needs_bytes == SOLO_ACTIVATIONS + WEIGHTS["unet"], resident
+    assert chosen != "all_resident", walk.rungs
     plan = PlanChooser(ledger).choose(
         _binding(),
         PreparedModel(delivery_rung="verbatim"),
@@ -434,8 +433,8 @@ def test_a_serve_that_finished_without_moving_a_byte_outranks_the_envelope() -> 
     )
     assert ledger.resident_sufficiency(CELL) == TIGHT_FREE
     chosen, walk = _walk(ledger)
-    assert chosen == "all_resident", walk["rungs"]
-    assert _row(walk, "all_resident")["headroom_basis"] == "completed_resident"
+    assert chosen == "all_resident", walk.rungs
+    assert _row(walk, "all_resident").headroom_basis == "completed_resident"
 
 
 def test_an_attempt_that_moved_components_proves_nothing_about_full_residency() -> None:
@@ -488,8 +487,8 @@ def test_uncalibrated_reserve_does_not_become_a_scope_requirement() -> None:
     assert dict(plan.scope_headroom_bytes) == {"forward": 0}
     # The guess still prices conservative placement; it is not lost or called measured.
     walk = chooser.walks[-1]
-    assert walk["scope_demand_bytes"] == {"forward": weights + UNCALIBRATED_ACTIVATION_BYTES}
-    assert _row(walk, "component_staged")["verdict"] == "short"
+    assert walk.scope_demand_bytes == {"forward": weights + UNCALIBRATED_ACTIVATION_BYTES}
+    assert _row(walk, "component_staged").verdict == "short"
     # Once a scope has been measured on this generation, that observed demand remains.
     ledger.activations_by_cell["-"] = 2 << 20
     ledger.activation_scopes_by_cell["-"] = {"forward": 2 << 20}

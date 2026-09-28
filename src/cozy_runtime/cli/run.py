@@ -40,6 +40,7 @@ from cozy_runtime.internal.local import (
     development_placement_documents,
     run_slice,
 )
+from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import WorkerOptions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -264,7 +265,7 @@ def run(
     outputs = payload_grammar.asset_paths(doc["result"])
     warnings: list[str] = []
 
-    job_records: list[dict[str, Any]] = []
+    job_records: list[JobBinding] = []
     trees: dict[str, str] = {}
     descriptor_id = ""
     if kind == "job":
@@ -284,19 +285,16 @@ def run(
         interface_path.parent.mkdir()
         interface_path.write_bytes(package_interface.canonical_bytes(body))
         job_records.append(
-            {
-                "job_descriptor_id": descriptor_id,
-                "installation_id": package_installation_id,
-                "application": str(body["application"]),
-                "package_interface": str(interface_path),
-                "python": sys.executable,
-                "job": function,
-                "publishes": bool(surface.publishes),
-                "emits_media": bool(surface.emits_media),
-                "gpu_rate_micro_usd_per_hour": 0,
-                "cap_micro_usd": 0,
-                "reclaim_on_terminal": True,
-            }
+            JobBinding(
+                job_descriptor_id=descriptor_id,
+                installation_id=package_installation_id,
+                application=str(body["application"]),
+                package_interface=str(interface_path),
+                python=sys.executable,
+                job=function,
+                publishes=bool(surface.publishes),
+                emits_media=bool(surface.emits_media),
+            )
         )
 
     request = LocalRequest(
@@ -618,7 +616,7 @@ def _render(
             "document": documents.document(outcome.invocation),
         },
         "accepted": documents.body(outcome.accepted),
-        "ledger": outcome.ledger,
+        "ledger": msgspec.to_builtins(outcome.ledger),
         "timings": outcome.timings,
         "warnings": warnings,
     }
@@ -627,14 +625,14 @@ def _render(
     # facts that carry it — a producer could not read its own publication from the CLI that
     # made it (job-001). The scope and the durable checkpoints ride with it: they are what
     # a producer promotes out of, and what it resumes from.
-    if outcome.publication:
-        document["publication"] = outcome.publication
+    if outcome.publication is not None:
+        document["publication"] = msgspec.to_builtins(outcome.publication)
         rows.append(
             (
                 "publication",
-                f"{len(outcome.publication.get('outputs') or [])} output(s), "
-                f"{outcome.publication.get('total_bytes', 0)} B under "
-                f"{outcome.publication.get('grant_id') or 'no scope'}",
+                f"{len(outcome.publication.outputs)} output(s), "
+                f"{outcome.publication.total_bytes} B under "
+                f"{outcome.publication.grant_id or 'no scope'}",
             )
         )
     if outcome.publication_scope:
@@ -671,8 +669,8 @@ def _split(value: Any) -> list[str]:
 
 def _bind_facts(outcome: SliceOutcome) -> dict[str, Any]:
     """The `load` boot step's own record — where the bind's confession is recorded."""
-    posture = (outcome.triage or {}).get("posture") or {}
-    for step in posture.get("boot_steps", ()):
+    steps = outcome.triage.posture.get("boot_steps") if outcome.triage is not None else None
+    for step in steps if isinstance(steps, list) else ():
         if isinstance(step, dict) and step.get("step") == "load":
             return dict(step)
     return {}

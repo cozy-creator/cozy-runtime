@@ -2898,7 +2898,7 @@ class AttemptEngine:
         key = f"{attempt.request_id}#{attempt.attempt}"
         plan = attempt.plan
         plan_document = plan.document() if plan is not None else {}
-        pinned = attempt.prepared_model.attention if attempt.prepared_model else {}
+        pinned = attempt.prepared_model.attention if attempt.prepared_model else None
         if pinned:
             # `plan.attention` (cr-124): what the prepare pinned, uncapped, for triage. The
             # boot note carries the one-line version; this is where the full map lives.

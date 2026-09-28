@@ -56,14 +56,19 @@ import re
 import stat
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sized
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, cast
+from typing import TYPE_CHECKING, BinaryIO, cast
 from urllib.parse import ParseResult, unquote, urlparse
 
-from cozy_runtime.author._assets import file_state
+import msgspec
+
+from cozy_runtime.author._assets import GrantedInput, file_state
 from cozy_runtime.author._errors import RuntimeFailure
+from cozy_runtime.author._media import SNIFF_BYTES, extension, normalize, sniff
+from cozy_runtime.internal import canonical, egress
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
@@ -164,7 +169,7 @@ class Authorizer:
     subtree — so the lanes that HAVE a boundary all carry one.
     """
 
-    def authorize(self, name: str, method: str, url: str, params: dict[str, Any]) -> None:
+    def authorize(self, name: str, method: str, url: str, params: Mapping[str, str | int]) -> None:
         row = CALLS.get(name)
         if row is None:
             self._refuse(name, method, url, f"{name!r} is not in the closed hub-call table")
@@ -276,7 +281,36 @@ class BoundGrant:
     outputs: dict[str, BoundOutput] = field(default_factory=dict)
 
 
-def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: bytes) -> BoundGrant:
+class _SpecInput(msgspec.Struct, frozen=True, kw_only=True):
+    input_id: str = ""
+    digest: str = ""
+    length: int = 0
+    kind_mime: str = ""
+    order: int = 0
+
+
+class _SpecOutput(msgspec.Struct, frozen=True, kw_only=True):
+    output_id: str = ""
+    mime_type: str = ""
+    max_bytes: int = 0
+
+
+class _Present(msgspec.Struct, frozen=True):
+    """A section whose presence is the fact read here."""
+
+
+class _SpecBindings(msgspec.Struct, frozen=True, kw_only=True):
+    """The InvocationSpec document's binding identities; absent fields are proto3 defaults."""
+
+    inputs: tuple[_SpecInput, ...] = ()
+    outputs: tuple[_SpecOutput, ...] = ()
+    serving: _Present | None = None
+    job: _Present | None = None
+
+
+def bind(
+    spec: Mapping[str, object], grant: pb.DeliveryGrant, invocation_digest: bytes
+) -> BoundGrant:
     """JOIN the InvocationSpec document's identities to the grant's access, typed refusals.
 
     The grant serves exactly one invocation: its `invocation_spec_digest` must name this
@@ -296,8 +330,18 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             "invocation_spec_digest; a grant serves exactly one invocation and a refresh "
             "can change access only",
         )
-    spec_inputs = _index_spec_bindings(spec.get("inputs", ()), "input_id", "spec inputs")
-    grant_inputs = _index_access(grant.inputs, "input_id", "grant inputs")
+    try:
+        declared = msgspec.convert(spec, _SpecBindings)
+    except msgspec.ValidationError as exc:
+        raise GrantRefusal(
+            "grant_spec_malformed", f"the invocation spec's bindings: {exc}"
+        ) from exc
+    spec_inputs = _unique(
+        {row.input_id: row for row in declared.inputs}, declared.inputs, "input_id", "spec inputs"
+    )
+    grant_inputs = _unique(
+        {row.input_id: row.url for row in grant.inputs}, grant.inputs, "input_id", "grant inputs"
+    )
     if set(spec_inputs) != set(grant_inputs):
         raise GrantRefusal(
             "grant_binding_mismatch",
@@ -305,8 +349,18 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             f"carries access for {sorted(grant_inputs) or 'none'}; the sets must agree "
             "exactly",
         )
-    spec_outputs = _index_spec_bindings(spec.get("outputs", ()), "output_id", "spec outputs")
-    grant_outputs = _index_access(grant.outputs, "output_id", "grant outputs")
+    spec_outputs = _unique(
+        {row.output_id: row for row in declared.outputs},
+        declared.outputs,
+        "output_id",
+        "spec outputs",
+    )
+    grant_outputs = _unique(
+        {row.output_id: row.url for row in grant.outputs},
+        grant.outputs,
+        "output_id",
+        "grant outputs",
+    )
     if set(spec_outputs) != set(grant_outputs):
         raise GrantRefusal(
             "grant_binding_mismatch",
@@ -328,19 +382,12 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
         if row.HasField("catalog_model")
     }
     for input_id, row in spec_inputs.items():
-        spelled = str(row.get("digest", ""))
-        try:
-            carried_order = int(row.get("order", 0))
-            carried_length = int(row.get("length", 0))
-        except (TypeError, ValueError) as exc:
-            raise GrantRefusal(
-                "grant_input_identity", f"input {input_id!r} has malformed numeric facts"
-            ) from exc
+        spelled, carried_order, carried_length = row.digest, row.order, row.length
         from cozy_runtime.internal.worker.workspace_byte_outputs import TREE_MIME
 
         native = native_inputs.get(input_id)
         is_tree = input_id.startswith(TREE_PREFIX) or (
-            native is not None and row.get("kind_mime") == TREE_MIME
+            native is not None and row.kind_mime == TREE_MIME
         )
         is_model = input_id.startswith(MODEL_PREFIX)
         catalog_repository = catalog_inputs.get(input_id, "")
@@ -375,14 +422,14 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             ) from exc
         if is_model:
             parameter = input_id[len(MODEL_PREFIX) :]
-            if spec.get("job") is None and not (spec.get("serving") and catalog_repository):
+            if declared.job is None and not (declared.serving is not None and catalog_repository):
                 raise GrantRefusal(
                     "grant_model_serving_refused",
                     f"serving InvocationSpec cannot carry job Model input {input_id!r}",
                 )
             if (
                 _MODEL_PARAM.fullmatch(parameter) is None
-                or str(row.get("kind_mime", "")) != MODEL_MIME
+                or row.kind_mime != MODEL_MIME
                 or carried_order != 0
                 or carried_length <= 0
                 or spelled != "sha256:" + digest.hex()
@@ -426,15 +473,15 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             catalog_repository=catalog_repository,
             digest=digest,
             length=carried_length,
-            kind_mime=str(row.get("kind_mime", "")),
+            kind_mime=row.kind_mime,
             order=carried_order,
         )
-    for output_id, row in spec_outputs.items():
+    for output_id, contract in spec_outputs.items():
         bound.outputs[output_id] = BoundOutput(
             output_id=output_id,
             url=grant_outputs[output_id],
-            max_bytes=int(row.get("max_bytes", 0)),
-            mime_type=str(row.get("mime_type", "")),
+            max_bytes=contract.max_bytes,
+            mime_type=contract.mime_type,
         )
     return bound
 
@@ -448,39 +495,15 @@ def model_inputs(grant: BoundGrant) -> dict[str, BoundInput]:
     }
 
 
-def _index_spec_bindings(rows: Any, field_name: str, what: str) -> dict[str, Mapping[str, Any]]:
-    """Index one canonical binding set without allowing a last-wins interpretation."""
-    indexed: dict[str, Mapping[str, Any]] = {}
-    for position, row in enumerate(rows):
-        if not isinstance(row, Mapping):
-            raise GrantRefusal(
-                "grant_binding_ambiguous", f"{what}[{position}] is not a binding object"
-            )
-        identity = str(row.get(field_name, ""))
-        if not identity or identity in indexed:
-            problem = "empty" if not identity else "repeated"
-            raise GrantRefusal(
-                "grant_binding_ambiguous",
-                f"{what} carry an {problem} {field_name} at position {position}; every "
-                "binding identity must be non-empty and unique",
-            )
-        indexed[identity] = row
-    return indexed
-
-
-def _index_access(rows: Any, field_name: str, what: str) -> dict[str, str]:
-    """Index one protobuf access set without silently collapsing duplicate authority."""
-    indexed: dict[str, str] = {}
-    for position, row in enumerate(rows):
-        identity = str(getattr(row, field_name, ""))
-        if not identity or identity in indexed:
-            problem = "empty" if not identity else "repeated"
-            raise GrantRefusal(
-                "grant_binding_ambiguous",
-                f"{what} carry an {problem} {field_name} at position {position}; every "
-                "access identity must be non-empty and unique",
-            )
-        indexed[identity] = str(row.url)
+def _unique[T](indexed: dict[str, T], rows: Sized, field_name: str, what: str) -> dict[str, T]:
+    """One binding set, refused when an identity is empty or repeated: never last-wins."""
+    if "" in indexed or len(indexed) != len(rows):
+        problem = "empty" if "" in indexed else "repeated"
+        raise GrantRefusal(
+            "grant_binding_ambiguous",
+            f"{what} carry an {problem} {field_name}; every binding identity must be "
+            "non-empty and unique",
+        )
     return indexed
 
 
@@ -566,19 +589,17 @@ def _transfer_granted(
     grant: BoundGrant,
     entry: BoundInput,
     auth: Authorizer,
-    sink: Any,
+    sink: BinaryIO | None,
     *,
     cap: int,
     prefix_bytes: int,
-) -> Any:
+) -> egress.StreamReceipt:
     """Authorize, stream, measure and verify one exact bound input.
 
     The payload may ride the grant inline (`data:`); every other input is `file://`, and
     `_local` refuses any other scheme before this reads a byte, which is the whole transport
     decision: the worker's grant table has no network row (cr-042).
     """
-    from cozy_runtime.internal import egress
-
     if expired(grant):
         raise GrantRefusal(
             "grant_expired",
@@ -623,13 +644,11 @@ def _transfer_granted(
 
 
 def _transfer_inline(
-    entry: BoundInput, auth: Authorizer, sink: Any, *, cap: int, prefix_bytes: int
-) -> Any:
+    entry: BoundInput, auth: Authorizer, sink: BinaryIO | None, *, cap: int, prefix_bytes: int
+) -> egress.StreamReceipt:
     """The payload as the grant carries it: decoded, bounded and digest-checked exactly as a
     file would be. Only the payload is admitted inline — an asset is bytes the record owner
     holds in its own store and grants by address."""
-    from cozy_runtime.internal import egress
-
     if entry.input_id != PAYLOAD_INPUT:
         raise GrantRefusal(
             "grant_transport",
@@ -707,7 +726,7 @@ def hydrate_inputs(
     max_total_bytes: int = 256 << 20,
     workspace: Workspace | None = None,
     owner: str = "",
-) -> dict[str, Any]:
+) -> dict[str, GrantedInput]:
     """Verify every local input in place; materialize only native retained bytes.
 
     THE LAUNCH CONTRACT IS EAGER (§1.3), and this is where the eagerness lives: the whole
@@ -719,8 +738,6 @@ def hydrate_inputs(
     Every size check happens on the grant's DECLARED length first — so an oversized input
     refuses before a byte moves — and again on the bytes, because a declaration is a claim.
     """
-    from cozy_runtime.author._assets import GrantedInput
-    from cozy_runtime.author._media import SNIFF_BYTES, normalize, sniff
 
     if expired(grant):
         raise GrantRefusal("grant_expired", "the delivery grant expired before hydration")
@@ -742,7 +759,7 @@ def hydrate_inputs(
             f"this attempt's {len(entries)} input asset(s) declare {declared_total} B and "
             f"this deployment admits {max_total_bytes} B per attempt",
         )
-    out: dict[str, Any] = {}
+    out: dict[str, GrantedInput] = {}
     root = spool / "inputs"
     published: list[Path] = []
     complete = False
@@ -797,9 +814,7 @@ def hydrate_inputs(
                                         "input_digest_mismatch",
                                         "native input differs from its binding",
                                     )
-                                from cozy_runtime.internal.egress import copy_bounded
-
-                                receipt = copy_bounded(
+                                receipt = egress.copy_bounded(
                                     byte_inputs.chunks(
                                         lease, "sha256:" + blob.sha256, entry.length
                                     ),
@@ -940,6 +955,26 @@ def read_trees(
     return out
 
 
+class PublishedOutput(msgspec.Struct, frozen=True, kw_only=True):
+    output_id: str
+    digest: str
+    length: int
+    media_type: str
+
+
+class Publication(msgspec.Struct, frozen=True, kw_only=True):
+    """A publication receipt's document, as written to and read back from the records."""
+
+    mode: str
+    grant_id: str
+    installation_id: str
+    subject_id: str
+    request_id: str
+    attempt: int
+    outputs: tuple[PublishedOutput, ...]
+    total_bytes: int
+
+
 @dataclass(frozen=True, slots=True)
 class PublicationReceipt:
     """One typed process record per publication (cr-009).
@@ -969,30 +1004,32 @@ class PublicationReceipt:
     attempt: int
     outputs: tuple[pb.OutputEntry, ...]
 
-    def document(self) -> dict[str, Any]:
+    def record(self) -> Publication:
         rows = sorted(self.outputs, key=lambda entry: entry.output_id)
-        return {
-            "mode": self.mode,
-            "grant_id": self.grant_id,
-            "installation_id": self.installation_id,
-            "subject_id": self.subject_id,
-            "request_id": self.request_id,
-            "attempt": self.attempt,
-            "outputs": [
-                {
-                    "output_id": entry.output_id,
-                    "digest": "sha256:" + entry.digest.hex(),
-                    "length": int(entry.length),
-                    "media_type": entry.mime_type,
-                }
+        return Publication(
+            mode=self.mode,
+            grant_id=self.grant_id,
+            installation_id=self.installation_id,
+            subject_id=self.subject_id,
+            request_id=self.request_id,
+            attempt=self.attempt,
+            outputs=tuple(
+                PublishedOutput(
+                    output_id=entry.output_id,
+                    digest="sha256:" + entry.digest.hex(),
+                    length=entry.length,
+                    media_type=entry.mime_type,
+                )
                 for entry in rows
-            ],
-            "total_bytes": sum(int(entry.length) for entry in rows),
-        }
+            ),
+            total_bytes=sum(entry.length for entry in rows),
+        )
+
+    def document(self) -> dict[str, Json]:
+        document: dict[str, Json] = msgspec.to_builtins(self.record())
+        return document
 
     def digest(self) -> str:
-        from cozy_runtime.internal import canonical
-
         encoded = canonical.write(self.document())
         return (
             "sha256:" + hashlib.sha256(b"cozy.runtime.publication-receipt\0" + encoded).hexdigest()
@@ -1018,8 +1055,6 @@ def write_output(
     on the same name and an existing identical file is a replay, not a conflict. The record
     owner recomputes that name from the manifest entry and reads exactly it.
     """
-    from cozy_runtime.internal import egress
-
     if expired(grant):
         raise GrantRefusal("grant_expired", "the output grant expired before the write")
     destination = grant.outputs.get(output_id)
@@ -1082,8 +1117,6 @@ def write_output(
             length=receipt.length,
             mime_type=selected_media_type,
         )
-
-    from cozy_runtime.author._media import extension
 
     named_by_digest = url.endswith("/")
     path = _local(destination.url, grant.file_base_url)
@@ -1162,8 +1195,6 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _sha256_of(path: Path) -> bytes:
-    from cozy_runtime.internal import egress
-
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(egress.CHUNK), b""):
@@ -1173,8 +1204,6 @@ def _sha256_of(path: Path) -> bytes:
 
 def _output_media_type(output_id: str, bound: str, produced: str) -> str:
     """Join the invocation's MIME contract to the type observed from the author result."""
-    from cozy_runtime.author._media import normalize
-
     exact = normalize(bound)
     observed = normalize(produced)
     if exact and observed != exact:

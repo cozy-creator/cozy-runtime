@@ -41,10 +41,10 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import msgspec
 
@@ -61,13 +61,16 @@ from cozy_runtime.internal import (
     package_interface,
     proctree,
 )
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import byte_inputs, triage, workspace_byte_outputs
 from cozy_runtime.internal.worker import grants as grants_module
 from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.ledger import Measurement, Reconciliation
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
+    JobBinding,
     ModelBinding,
 )
 from cozy_runtime.internal.worker.records import Record
@@ -223,7 +226,7 @@ class SliceOutcome:
     accepted: pb.AttemptAccepted = field(default_factory=pb.AttemptAccepted)
     #: cr-009's typed publication receipt — ONE canonical bundle snapshot per publication,
     #: recorded before the terminal named it. `manifest_id` on the terminal IS its digest.
-    publication: dict[str, Any] = field(default_factory=dict)
+    publication: grants_module.Publication | None = None
     outputs: dict[str, str] = field(default_factory=dict)
     terminal_digest: str = ""
     terminal_canonical_bytes: bytes = b""
@@ -233,8 +236,8 @@ class SliceOutcome:
     accelerator_qualification: pb.AcceleratorQualification = field(
         default_factory=pb.AcceleratorQualification
     )
-    ledger: dict[str, Any] = field(default_factory=dict)
-    reconciliation: dict[str, Any] = field(default_factory=dict)
+    ledger: Measurement | None = None
+    reconciliation: Reconciliation | None = None
     attempt_records: list[Record] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
     faults: list[dict[str, str]] = field(default_factory=list)
@@ -243,8 +246,7 @@ class SliceOutcome:
     #: cr-011: the OPAQUE triage handle from the terminal, and the bundle read back by it.
     #: The subject is the ONLY way in — there is no path anywhere in this outcome.
     triage_subject: str = ""
-    triage: dict[str, Any] = field(default_factory=dict)
-    triage_explained: list[str] = field(default_factory=list)
+    triage: triage.Assembly | None = None
     exit_code: int = 0
     workspace_deleted: bool = False
     #: JOB mode: the durable checkpoint requests this run received, in arrival order, and
@@ -1077,7 +1079,7 @@ class LocalRecordOwner:
 
 def stage_development_placement(
     cozy_home: Path,
-    interface: Mapping[str, Any],
+    interface: Mapping[str, Json],
     *,
     package: str,
     release: str,
@@ -1124,7 +1126,7 @@ def stage_development_placement(
 
 
 def development_placement_documents(
-    interface: Mapping[str, Any],
+    document: Mapping[str, Json],
     *,
     package: str,
     release: str,
@@ -1137,21 +1139,15 @@ def development_placement_documents(
 ) -> DevelopmentPlacementDocuments:
     """Construct exact source and local-TensorFS selection facts through existing owners."""
 
-    entries = interface.get("entrypoints")
-    if not isinstance(entries, list):
-        raise RuntimeError("a local serving closure requires an PackageInterface entrypoint set")
-    visible: list[Mapping[str, Any]] = [entry for entry in entries if isinstance(entry, Mapping)]
-    jobs = interface.get("jobs", [])
-    if not visible and not (
-        isinstance(jobs, list) and any(isinstance(job, Mapping) for job in jobs)
-    ):
+    interface_bytes = package_interface.canonical_bytes(document)
+    interface = package_interface.parse(interface_bytes, "development package interface")
+    if not interface.entrypoints and not interface.jobs:
         raise RuntimeError("a local package requires at least one visible entrypoint or job")
     if package.count("/") != 1 or not all(package.split("/")) or not release:
         raise RuntimeError("development package identity or release is invalid")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", installation_id) is None:
         raise RuntimeError("development installation ID is invalid")
 
-    interface_bytes = package_interface.canonical_bytes(interface)
     interface_path = ""
     if artifact_cache is not None:
         staged_interface = (
@@ -1159,12 +1155,7 @@ def development_placement_documents(
         )
         package_interface.publish(staged_interface, interface_bytes)
         interface_path = str(staged_interface)
-    modeled_paths = sorted(
-        str(model.get("path", ""))
-        for entry in visible
-        for model in entry.get("models", [])
-        if isinstance(model, Mapping)
-    )
+    modeled_paths = sorted(slot.path for entry in interface.entrypoints for slot in entry.models)
     resolved_models: Mapping[str, _DevelopmentModel] = {}
     if modeled_paths:
         if project is None or cozy_home is None or tensorfs_root is None:
@@ -1194,13 +1185,9 @@ def development_placement_documents(
     ]
     entrypoints: list[pb.Entrypoint] = []
     declared_bindings: dict[str, DeclaredBinding] = {}
-    for entry in sorted(visible, key=lambda row: str(row.get("name", ""))):
-        name = str(entry["name"])
-        selected_paths = sorted(
-            str(model.get("path", ""))
-            for model in entry.get("models", [])
-            if isinstance(model, Mapping)
-        )
+    for entry in sorted(interface.entrypoints, key=lambda row: row.name):
+        name = entry.name
+        selected_paths = sorted(slot.path for slot in entry.models)
         slots: list[pb.Slot] = []
         members: list[ModelBinding] = []
         for selected_path in selected_paths:
@@ -1254,9 +1241,9 @@ def development_placement_documents(
             release=release,
             installation_id=installation_id,
             models=model_set,
-            application=str(interface.get("application", "")),
+            application=interface.application,
             interface_path=interface_path,
-            internal=bool(entry.get("internal", False)),
+            internal=entry.internal,
             development_project=str(project) if project is not None else "",
             store=first.store if first is not None else "",
             variant=first.variant if first is not None else "",
@@ -1307,21 +1294,23 @@ class _InterfaceSlot:
         return self.path.rpartition(".")[2]
 
 
-def _interface_slots(interface: Mapping[str, Any], kind: str) -> list[_InterfaceSlot]:
+def _interface_slots(docs: Sequence[package_interface.CallableDoc]) -> list[_InterfaceSlot]:
     """A hidden callable is already absent from the document, so nothing is filtered here."""
     return [
         _InterfaceSlot(
-            str(slot["path"]),
-            str(slot["class"]),
-            tuple((slot.get("sequence_parallel") or {}).get("degrees", ())),
+            slot.path,
+            slot.class_name,
+            ()
+            if slot.sequence_parallel is msgspec.UNSET
+            else tuple(slot.sequence_parallel.degrees),
         )
-        for doc in interface.get(kind) or ()
-        for slot in doc.get("models") or ()
+        for doc in docs
+        for slot in doc.models
     ]
 
 
 def _resolve_development_models(
-    interface: Mapping[str, Any],
+    interface: package_interface.PackageInterface,
     project: Path,
     tensorfs_root: Path,
     binding_overrides: Mapping[str, str] | None = None,
@@ -1330,8 +1319,8 @@ def _resolve_development_models(
     # package.toml default for a job source (`<job>.models.<param>`) is a declared slot,
     # not `unknown_binding`. Only entrypoint slots stage models here: a serving closure
     # holds serving models, and a job's source binds per invocation (JobDirective).
-    slots = _interface_slots(interface, "entrypoints")
-    job_slots = _interface_slots(interface, "jobs")
+    slots = _interface_slots(interface.entrypoints)
+    job_slots = _interface_slots(interface.jobs)
     job_paths = frozenset(slot.path for slot in job_slots)
     declared = slots + job_slots
     try:
@@ -1494,7 +1483,7 @@ def _input_facts(path: Path) -> tuple[str, int, str]:
     )
 
 
-def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str, str]:
+def stage_job_plans(cozy_home: Path, records: Sequence[JobBinding]) -> dict[str, str]:
     """Write the local JOB plan records the worker resolves job descriptor ids against.
 
     On the network path th-004 ships the build and the JobDescriptor and tfs-003 the
@@ -1506,9 +1495,8 @@ def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str,
     directory.mkdir(parents=True, exist_ok=True)
     plans: dict[str, str] = {}
     for record in records:
-        descriptor_id = str(record["job_descriptor_id"])
-        job_plan.write(directory, record)
-        plans[str(record["job"])] = descriptor_id
+        job_plan.write(directory, msgspec.to_builtins(record))
+        plans[record.job] = record.job_descriptor_id
     return plans
 
 
@@ -1518,11 +1506,11 @@ def run_slice(
     *,
     workspace: Path,
     package_installation_id: str,
-    package_interface_document: Mapping[str, Any] | None = None,
+    package_interface_document: Mapping[str, Json] | None = None,
     project: Path | None = None,
     development_tensorfs_root: Path | None = None,
     development_binding_overrides: Mapping[str, str] | None = None,
-    job_records: list[dict[str, Any]] | None = None,
+    job_records: Sequence[JobBinding] = (),
     options: WorkerOptions | None = None,
     delete_workspace: bool = True,
     auto_ack: bool = True,
@@ -1553,7 +1541,7 @@ def run_slice(
             binding_overrides=development_binding_overrides,
         )
         bindings.update(staged.bindings)
-    stage_job_plans(config.cozy_home, job_records or [])
+    stage_job_plans(config.cozy_home, job_records)
     record_owner = LocalRecordOwner(
         request,
         bindings,
@@ -1603,14 +1591,14 @@ def _collect(
     outcome = SliceOutcome(exit_code=exit_code, ended=record_owner.ended, error=record_owner.error)
     outcome.attempt_records = list(worker.records.records)
     ledger = worker.primary_ledger()
-    outcome.reconciliation = ledger.reconciliations[-1] if ledger.reconciliations else {}
+    outcome.reconciliation = ledger.reconciliations[-1] if ledger.reconciliations else None
     # The ledger as it stood AT ATTEMPT CLOSE, not after shutdown. Reading it here would
     # report the executor's RSS as unreadable and its device classes as stale, because by
     # now the process that owned them is gone — true, and useless. The reconciliation record
     # is the measurement; this is only where it is published.
     outcome.ledger = (
-        {"classes": outcome.reconciliation["classes"]}
-        if outcome.reconciliation
+        Measurement(classes=outcome.reconciliation.classes)
+        if outcome.reconciliation is not None
         else ledger.measurement()
     )
     outcome.faults = [
@@ -1644,7 +1632,6 @@ def _collect(
                     outcome.triage_subject,
                     worker.records,
                 )
-                outcome.triage_explained = triage.explain(outcome.triage)
         outcome.status = pb.OutcomeStatus.Name(body.status)
         outcome.redispatchable = redispatchable(body)
         if body.result.inline_result:
@@ -1654,7 +1641,12 @@ def _collect(
             decoded = canonical.parse(body.result.inline_result)
             outcome.result = decoded if isinstance(decoded, dict) else {"value": decoded}
         outcome.publication = next(
-            (row.body for row in outcome.attempt_records if row.kind == "publication"), {}
+            (
+                msgspec.convert(row.body, grants_module.Publication)
+                for row in outcome.attempt_records
+                if row.kind == "publication"
+            ),
+            None,
         )
         for row in body.output_manifest.outputs:
             path = record_owner.destination(row.output_id)

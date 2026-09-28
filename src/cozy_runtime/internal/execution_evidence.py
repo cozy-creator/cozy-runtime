@@ -26,9 +26,24 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 import msgspec
+
+
+class Boot(TypedDict):
+    """`Applied.document()`, the boot record as it crosses the executor seam (cr-124). A
+    group's `merge` keys `admission` and `artifacts` by model parameter, then kernel."""
+
+    kernels: dict[str, int]
+    hosts: dict[str, dict[str, int]]
+    offered: list[str]
+    locations: dict[str, str]
+    pin: str
+    admission: NotRequired[dict[str, object]]
+    artifacts: NotRequired[dict[str, object]]
+    skipped: NotRequired[dict[str, str]]
+    line: str
 
 
 class ProbeRow(msgspec.Struct, frozen=True):

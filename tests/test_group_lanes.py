@@ -280,7 +280,7 @@ def test_one_common_plan_deepens_under_group_pressure(degree: int, measured: boo
     plan = chooser.choose(declared, PreparedModel(delivery_rung="verbatim"), prepared)
     assert plan.placement == "component_staged"
     assert plan.headroom_bytes == (512 << 20 if measured else 0)
-    assert chooser.walks[-1]["deepened_to"] == "component_staged"
+    assert chooser.walks[-1].deepened_to == "component_staged"
 
 
 def test_deepening_does_not_repeat_a_falsified_strategy() -> None:

@@ -1263,21 +1263,6 @@ def _context_parallel(member: Any) -> bool:
     return bool(_AttentionBackendRegistry._is_context_parallel_available(member))
 
 
-class Boot(TypedDict):
-    """`Applied.document()`, the boot record as it crosses the executor seam (cr-124). A
-    group's `merge` keys `admission` and `artifacts` by model parameter, then kernel."""
-
-    kernels: dict[str, int]
-    hosts: dict[str, dict[str, int]]
-    offered: list[str]
-    locations: dict[str, str]
-    pin: str
-    admission: NotRequired[dict[str, object]]
-    artifacts: NotRequired[dict[str, object]]
-    skipped: NotRequired[dict[str, str]]
-    line: str
-
-
 @dataclass(frozen=True, slots=True)
 class Applied:
     """What the runtime pinned, per component and per kernel. The BOOT record, and all of it."""
@@ -1302,7 +1287,7 @@ class Applied:
                 out[name] = out.get(name, 0) + sites
         return out
 
-    def document(self) -> Boot:
+    def document(self) -> execution_evidence.Boot:
         return _boot(
             self.totals(),
             {name: dict(kernels) for name, kernels in self.hosts.items()},
@@ -1349,10 +1334,10 @@ def _boot(
     admission: Mapping[str, object],
     artifacts: Mapping[str, object],
     skipped: dict[str, str],
-) -> Boot:
+) -> execution_evidence.Boot:
     # RENDERED HERE, not by the worker: one renderer for the one line, in the module that
     # knows what it means.
-    boot = Boot(
+    boot = execution_evidence.Boot(
         kernels=kernels,
         hosts=hosts,
         offered=offered,
@@ -1369,7 +1354,7 @@ def _boot(
     return boot
 
 
-def merge(documents: Mapping[str, object]) -> Boot | None:
+def merge(documents: Mapping[str, object]) -> execution_evidence.Boot | None:
     """A GROUP prepare's one attention fact, from its models' own `Applied.document()`s,
     each decoded here once; a model holding no attention site sends none."""
     hosts: dict[str, dict[str, int]] = {}
@@ -1384,7 +1369,7 @@ def merge(documents: Mapping[str, object]) -> Boot | None:
         if not document:
             continue
         try:
-            row = msgspec.convert(document, Boot, strict=True)
+            row = msgspec.convert(document, execution_evidence.Boot, strict=True)
         except msgspec.ValidationError as exc:
             raise AttentionRefusal(
                 "attention_fact_malformed", f"{parameter}'s attention fact: {exc}"

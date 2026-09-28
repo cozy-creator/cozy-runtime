@@ -42,16 +42,16 @@ def test_h3_encoder_block_floor_reaches_the_attempt_planner(degree: int) -> None
         model_weight_bytes=nominal,
     )
     chooser = lane.row("fixture").chooser
-    _, rows, chosen, _ = chooser._walk(binding, "fixture")
-    assert chosen == "component_staged", rows
-    assert rows[0]["verdict"] == "construction_parked"
-    staged = next(row for row in rows if row["rung"] == "component_staged")
-    assert working <= staged["needs_bytes"] < nominal
-    assert staged["absent_bytes"] == nominal
+    walk = chooser._walk(binding, "fixture")
+    assert walk.chosen == "component_staged", walk.rungs
+    assert walk.rungs[0].verdict == "construction_parked"
+    staged = next(row for row in walk.rungs if row.rung == "component_staged")
+    assert isinstance(staged.needs_bytes, int) and working <= staged.needs_bytes < nominal
+    assert staged.absent_bytes == nominal
     ledger.device_free = working - 1
-    _, rows, chosen, _ = chooser._walk(binding, "fixture")
-    assert not chosen, rows
-    assert next(row for row in rows if row["rung"] == "component_staged")["verdict"] == "short"
+    walk = chooser._walk(binding, "fixture")
+    assert not walk.chosen, walk.rungs
+    assert next(row for row in walk.rungs if row.rung == "component_staged").verdict == "short"
 
 
 def test_declared_blocks_with_shared_storage_are_not_independently_pageable() -> None:

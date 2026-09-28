@@ -69,11 +69,12 @@ def compute(payload:Input)->Output:
     old_record = json.loads(old_bytes)
     new_record = json.loads(new_bytes)
     old_record["python"] = new_record["python"] = "/nonexistent/not-a-venv/python"
-    assert JobBinding.read(old_record).installation_id == first
-    assert JobBinding.read(new_record).installation_id == second
+    old_binding, new_binding = JobBinding.read(old_record), JobBinding.read(new_record)
+    assert old_binding.installation_id == first
+    assert new_binding.installation_id == second
     local = tmp_path / "local"
-    stage_job_plans(local, [old_record])
-    stage_job_plans(local, [new_record])
+    stage_job_plans(local, [old_binding])
+    stage_job_plans(local, [new_binding])
     assert job_plan.path(local / "job-plans", first, descriptor).exists()
     assert job_plan.path(local / "job-plans", second, descriptor).exists()
     _stage_job_plans(

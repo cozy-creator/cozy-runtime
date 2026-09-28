@@ -216,7 +216,7 @@ def _ranks(worker: Worker, outcome: dict[str, Any]) -> dict[int, dict[str, Any]]
     subject = outcome["triage_bundle"]["subject_id"]
     bundle = triage.BundleStore.read(worker.root / "triage", subject, worker.records)
     observed: dict[int, dict[str, Any]] = ranks(
-        bundle["measurements"].get("execution") or {"ranks": []}
+        bundle.measurements.get("execution") or {"ranks": []}
     )
     return observed
 

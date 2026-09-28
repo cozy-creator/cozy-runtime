@@ -42,6 +42,7 @@ from cozy_runtime.internal.local import (
 from cozy_runtime.internal.worker import lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import (
     HostedPlacement,
     Placement,
@@ -91,7 +92,7 @@ def _slice(
     workspace = root / "run"
     workspace.mkdir(parents=True, exist_ok=True)
     installation_id = "local-" + uuid.uuid4().hex
-    job_records: list[dict[str, Any]] = []
+    job_records: list[JobBinding] = []
     descriptor_id = ""
     if kind == "job":
         descriptor_id = package_interface.job_descriptor_id(body, "marco_job")
@@ -99,19 +100,14 @@ def _slice(
         interface_path.parent.mkdir()
         interface_path.write_bytes(package_interface.canonical_bytes(body))
         job_records.append(
-            {
-                "job_descriptor_id": descriptor_id,
-                "installation_id": installation_id,
-                "application": str(body["application"]),
-                "package_interface": str(interface_path),
-                "python": str(sample_python()),
-                "job": "marco_job",
-                "publishes": False,
-                "emits_media": False,
-                "gpu_rate_micro_usd_per_hour": 0,
-                "cap_micro_usd": 0,
-                "reclaim_on_terminal": True,
-            }
+            JobBinding(
+                job_descriptor_id=descriptor_id,
+                installation_id=installation_id,
+                application=str(body["application"]),
+                package_interface=str(interface_path),
+                python=str(sample_python()),
+                job="marco_job",
+            )
         )
     request = LocalRequest(
         entrypoint="marco_job" if kind == "job" else "marco",

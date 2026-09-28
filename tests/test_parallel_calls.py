@@ -239,7 +239,7 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                 PreparedRequest.unresolved("sample", {}),
             )
             assert plan.placement == "component_staged"
-            assert row.chooser.walks[-1]["deepened_to"] == "component_staged"
+            assert row.chooser.walks[-1].deepened_to == "component_staged"
         for attempt in ("attempt-a", "attempt-b"):
             spool = tmp_path / attempt
             leader._attempt_spool = spool

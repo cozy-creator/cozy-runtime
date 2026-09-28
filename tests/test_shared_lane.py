@@ -40,6 +40,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 
 from cozy_runtime.internal import accel, canonical, child_env, package_interface
@@ -485,7 +486,7 @@ class TwoTenantOwner(LocalRecordOwner):
                     # THE LADDER WALK THIS ATTEMPT WAS PRICED BY, as the chooser kept it.
                     # `rows` already reads the worker's own ledger; the walk is the other
                     # half of the same picture and is what says WHICH RUNG ran.
-                    "walk": dict(row.chooser.walks[-1]) if row.chooser.walks else {},
+                    "walk": msgspec.to_builtins(row.chooser.walks[-1]) if row.chooser.walks else {},
                     "activations_by_cell": dict(row.ledger.activations_by_cell),
                 }
         self.turns.append(turn)

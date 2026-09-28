@@ -242,10 +242,10 @@ def test_the_triage_bundle_keeps_the_record_and_each_row_once() -> None:
             )
     sys.modules.pop(MODULE, None)
     assert outcome.result == {"steps": 4}, (outcome.error, outcome.faults)
-    assert outcome.triage, (outcome.triage_subject, outcome.terminal.triage_bundle)
-    measurements = outcome.triage["measurements"]
+    assert outcome.triage is not None, (outcome.triage_subject, outcome.terminal.triage_bundle)
+    measurements = outcome.triage.measurements
     [rank] = measurements["execution"]["ranks"]
     assert measurements["execution"]["degree"] == 1 and rank["pid"] not in (0, os.getpid())
     assert len(measurements["attribution"]["steps"]["denoise"]["series"]) == 4
-    rows = [row for row in outcome.triage["events"] if row["name"] == "evidence row"]
+    rows = [row for row in outcome.triage.events if row["name"] == "evidence row"]
     assert [row["fields"]["index"] for row in rows] == [0, 1, 2], rows

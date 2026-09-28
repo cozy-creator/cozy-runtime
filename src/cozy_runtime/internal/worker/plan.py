@@ -24,12 +24,16 @@ import dataclasses
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+
+import msgspec
 
 from cozy_runtime.internal import canonical, installed_interfaces
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.delivery import RUNGS_BY_NAME, DeliveryRefusal, cost_class
+from cozy_runtime.internal.execution_evidence import Boot
 from cozy_runtime.internal.resolution import ROUTE_KERNEL
 from cozy_runtime.internal.worker.ledger import Ledger
+from cozy_runtime.protocol import worker_pb2 as pb
 
 UNCALIBRATED_ACTIVATION_BYTES = 1 << 30
 
@@ -41,11 +45,47 @@ def shape_cell(features: Mapping[str, int]) -> str:
 class PlanRefusal(Exception):
     """A typed pre-acceptance refusal, carrying the structured shortfall when it has one."""
 
-    def __init__(self, code: str, detail: str, shortfall: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, code: str, detail: str, shortfall: pb.ResourceShortfall | None = None
+    ) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
         self.shortfall = shortfall
+
+
+class ModelDelivery(msgspec.Struct, frozen=True, kw_only=True):
+    """One model's delivery as its prepare resolved it; the executor's row carries more."""
+
+    rung: str = ""
+    variant: str = ""
+    plan_digest: str = ""
+    routes: dict[str, int] = {}
+    kernels: dict[str, int] = {}
+
+
+class CrossedDelivery(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """One model's delivery under this attempt's placement, as `plan_digest` covers it."""
+
+    plan_digest: str = ""
+    routes: dict[str, int] = {}
+    kernels: dict[str, int] = {}
+    delivery: str
+    materialization: str
+    cost_class: str
+    route_costs: dict[str, str]
+
+
+class Delivery(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """The prepare-time delivery crossed with a placement; several models carry `models`."""
+
+    variant: str
+    rung: str = ""
+    delivery: str
+    materialization: str
+    cost_class: str
+    kernel: str
+    models: dict[str, CrossedDelivery] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +168,7 @@ class AttemptPlan:
     """WHICH stored bytes served (cr-008c). Inside the document because `plan_digest` is an
     identity a RecordOwner holds, and two plans that read different artifacts of one model
     are not the same plan however identical their placement."""
-    model_deliveries: tuple[tuple[str, dict[str, Any]], ...] = ()
+    model_deliveries: tuple[tuple[str, CrossedDelivery], ...] = ()
     """Each model's resolved delivery and its cost under this attempt's placement."""
     scope_headroom_bytes: tuple[tuple[str, int], ...] = ()
     """Measured activation scratch by component-use method. The scalar headroom is its max;
@@ -145,8 +185,8 @@ class AttemptPlan:
     outside `document()` because it decides nothing, and a plan's identity is its
     decisions."""
 
-    def document(self) -> dict[str, Any]:
-        return {
+    def document(self) -> dict[str, Json]:
+        document: dict[str, Json] = {
             "delivery": self.delivery,
             "materialization": self.materialization,
             "delivery_variant": self.delivery_variant,
@@ -164,29 +204,12 @@ class AttemptPlan:
             "shape_cell": self.shape_cell,
             "model_weight_bytes": self.model_weight_bytes,
             "resident_bytes": self.resident_bytes,
-            **(
-                {
-                    "model_deliveries": {
-                        name: {
-                            key: row[key]
-                            for key in (
-                                "plan_digest",
-                                "routes",
-                                "kernels",
-                                "delivery",
-                                "materialization",
-                                "cost_class",
-                                "route_costs",
-                            )
-                            if key in row
-                        }
-                        for name, row in self.model_deliveries
-                    }
-                }
-                if self.model_deliveries
-                else {}
-            ),
         }
+        if self.model_deliveries:
+            document["model_deliveries"] = {
+                name: msgspec.to_builtins(row) for name, row in self.model_deliveries
+            }
+        return document
 
     def digest(self) -> str:
         encoded = canonical.write(self.document())
@@ -219,8 +242,7 @@ class AttemptPlan:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class JobBinding:
+class JobBinding(msgspec.Struct, frozen=True, kw_only=True):
     """The local resolution of one `job_descriptor_id` — the JOB lane's `BindingPlan`.
 
     Same seam, one lane over: the RecordOwner names the job by DIGEST and never ships a
@@ -249,31 +271,39 @@ class JobBinding:
     config channel and never from environment (§2)."""
     cap_micro_usd: int = 0
     reclaim_on_terminal: bool = True
-    call_interfaces: tuple[dict[str, Any], ...] = ()
+    call_interfaces: tuple[Mapping[str, object], ...] = ()
+    """Observed from the installed environment on every read, never taken from the record."""
 
     @classmethod
-    def read(cls, record: dict[str, Any]) -> JobBinding:
+    def read(cls, record: object) -> JobBinding:
         """Unknown members are ignored and absent optional ones take their defaults."""
-        fields = dataclasses.fields(cls)
-        absent = [
-            field.name
-            for field in fields
-            if field.default is dataclasses.MISSING and field.name not in record
-        ]
-        if absent:
+        try:
+            plan = msgspec.convert(record, cls)
+        except msgspec.ValidationError as exc:
             raise PlanRefusal(
-                "job_plan_incomplete",
-                f"job plan lacks {', '.join(absent)}; re-prepare the package",
-            )
-        captured = {
-            field.name: record[field.name]
-            for field in fields
-            if field.name in record and field.name != "call_interfaces"
-        }
-        observed = installed_interfaces.for_job(
-            str(record["python"]), str(record["installation_id"])
-        )
-        return cls(**captured, call_interfaces=tuple(observed))
+                "job_plan_incomplete", f"job plan: {exc}; re-prepare the package"
+            ) from exc
+        observed = installed_interfaces.for_job(plan.python, plan.installation_id)
+        return msgspec.structs.replace(plan, call_interfaces=tuple(observed))
+
+
+class _PreparedFacts(msgspec.Struct, frozen=True):
+    filled_bytes: int
+    attention: Boot | None = None
+
+
+class _PreparedDelivery(msgspec.Struct, frozen=True):
+    rung: str = ""
+    variant: str = ""
+    models: dict[str, ModelDelivery] = {}
+
+
+class _PrepareReply(msgspec.Struct, frozen=True):
+    """The prepare reply as a PreparedModel reads it; the executor sends more."""
+
+    constructed_model_digest: str
+    facts: _PreparedFacts
+    delivery: _PreparedDelivery = msgspec.field(default_factory=_PreparedDelivery)
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,30 +323,29 @@ class PreparedModel:
     `verbatim`."""
     delivery_variant: str = ""
     """Which offered variant this generation actually read."""
-    model_deliveries: tuple[tuple[str, dict[str, Any]], ...] = ()
-    """Named child delivery documents when this prepare constructed several models."""
+    model_deliveries: tuple[tuple[str, ModelDelivery], ...] = ()
+    """Named child deliveries when this prepare constructed several models."""
     weight_bytes: int = 0
     """What the fill COMMITTED, measured. Distinct from the deployment's declared
     `model_weight_bytes` and from the ledger's live resident map — three different facts
     that were all called some form of "vram bytes"."""
-    attention: dict[str, Any] = dataclasses.field(default_factory=dict)
+    attention: Boot | None = None
     """WHAT THE RUNTIME PINNED on this generation's attention sites (cr-124): kernel per
     component, and what this device and image offered. A construction fact, read once at
     boot — the choice cannot vary between attempts of one generation."""
 
     @classmethod
-    def from_reply(cls, reply: Mapping[str, Any]) -> PreparedModel:
+    def from_reply(cls, reply: Mapping[str, object]) -> PreparedModel:
         """Read exactly the executor's prepared generation, including each model's routes."""
-        delivery, facts = reply.get("delivery") or {}, reply["facts"]
+        read = msgspec.convert(reply, _PrepareReply)
+        models = read.delivery.models
         return cls(
-            constructed_model_digest=str(reply["constructed_model_digest"]),
-            delivery_rung=str(delivery.get("rung", "")),
-            delivery_variant=str(delivery.get("variant", "")),
-            model_deliveries=tuple(
-                (name, dict(row)) for name, row in sorted((delivery.get("models") or {}).items())
-            ),
-            weight_bytes=int(facts["filled_bytes"]),
-            attention=dict(facts.get("attention") or {}),
+            constructed_model_digest=read.constructed_model_digest,
+            delivery_rung=read.delivery.rung,
+            delivery_variant=read.delivery.variant,
+            model_deliveries=tuple((name, models[name]) for name in sorted(models)),
+            weight_bytes=read.facts.filled_bytes,
+            attention=read.facts.attention,
         )
 
 
@@ -342,12 +371,12 @@ class ModelBinding:
     model: str = ""
     """`org/name@release/lane` — the checkpoint's catalog name, for the one line a person
     reads when the code does not fit it (model-code-fit §3). Resolution, never identity."""
-    adapters: tuple[Mapping[str, Any], ...] = ()
+    adapters: tuple[Mapping[str, str], ...] = ()
 
     def snapshot_for(self, component: str) -> str:
         return self.snapshots.get(component, self.reference_snapshot)
 
-    def key_document(self) -> dict[str, Any]:
+    def key_document(self) -> dict[str, Json]:
         return {
             "store": self.store,
             "snapshot": self.reference_snapshot,
@@ -590,14 +619,55 @@ class Coefficient:
         """Only a MEASURED-basis number may refuse or select a worse rung."""
         return self.provenance in ("measured", "ledger")
 
-    def document(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "bytes": self.value,
-            "provenance": self.provenance,
-            "source": self.source,
-            "enforceable": self.enforceable,
-        }
+
+class Rung(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """One placement rung as a walk judged it; a priced rung carries its arithmetic."""
+
+    rung: str
+    verdict: str
+    why: str
+    needs_bytes: int | msgspec.UnsetType = msgspec.UNSET
+    capacity_bytes: int | msgspec.UnsetType = msgspec.UNSET
+    allocatable_bytes: int | msgspec.UnsetType = msgspec.UNSET
+    absent_bytes: int | msgspec.UnsetType = msgspec.UNSET
+    headroom_basis: str | msgspec.UnsetType = msgspec.UNSET
+    denied_at_free_bytes: int | msgspec.UnsetType = msgspec.UNSET
+
+
+class Walk(msgspec.Struct, kw_only=True):
+    """One ladder walk over the live ledger: the demand terms, every rung, the first fit."""
+
+    coefficients: tuple[Coefficient, ...]
+    rungs: tuple[Rung, ...]
+    chosen: str
+    """The first proven rung that fits, or "" when none does."""
+    allocatable_bytes: int
+    resident: dict[str, int]
+    absent: dict[str, int]
+    declared_bytes: int
+    parked: tuple[str, ...]
+    declared_scopes: dict[str, tuple[str, ...]]
+    largest_declared_set_bytes: int
+    scope_headroom_bytes: dict[str, int]
+    measured_scopes: tuple[str, ...]
+    scope_demand_bytes: dict[str, int]
+    shape_cell: str
+    enforceable_headroom_bytes: int
+    """WHAT THIS ATTEMPT IS ADMITTED AGAINST, beside the envelope it was described with. They
+    are the same number whenever the envelope may be enforced, and they part company
+    exactly when it may not."""
+    resident_headroom_bytes: int
+    headroom_basis: str
+    device_free_bytes: int
+    resident_sufficiency_free_bytes: int
+    measured_shortfall_free_bytes: int
+    delivery: Delivery | None = None
+    deepened_to: str = ""
+    deepened_on: str = ""
+
+    @property
+    def activations(self) -> Coefficient:
+        return next(term for term in self.coefficients if term.name == "activations")
 
 
 class PlanChooser:
@@ -620,7 +690,7 @@ class PlanChooser:
         self.ledger = ledger
         self.choices = 0
         #: every choice's ladder walk, for the envelope and the triage bundle
-        self.walks: list[dict[str, Any]] = []
+        self.walks: list[Walk] = []
 
     # ------------------------------------------------------------------ demand
 
@@ -705,13 +775,10 @@ class PlanChooser:
 
     # ------------------------------------------------------------------ the walk
 
-    def _walk(
-        self, declared: DeclaredBinding, cell: str
-    ) -> tuple[dict[str, Coefficient], list[dict[str, Any]], str, dict[str, Any]]:
-        """The ladder walk over the LIVE ledger: demand terms, one row per rung, the first
-        rung that fits (or ""), and the walk document (the rows ride it as `rungs`).
-        `choose` turns the result into a plan; `fits` asks only whether a rung exists
-        (cr-022's lane arbitration)."""
+    def _walk(self, declared: DeclaredBinding, cell: str) -> Walk:
+        """The ladder walk over the LIVE ledger: demand terms, one row per rung and the first
+        rung that fits (or ""). `choose` turns it into a plan; `fits` asks only whether a
+        rung exists (cr-022's lane arbitration)."""
         terms = {c.name: c for c in self._demand(declared, cell)}
         resident = self.ledger.resident or {}
         # THE COMPONENTS THIS GENERATION DECLARES BUT IS NOT HOLDING. They are not free: a
@@ -795,7 +862,7 @@ class PlanChooser:
             resident_headroom = 0
             headroom_basis = "completed_resident"
         shortfall = self.ledger.insufficient_for(cell, free) if free >= 0 else 0
-        rows: list[dict[str, Any]] = []
+        rows: list[Rung] = []
         chosen = ""
         # THE CONSTRUCTION FLOOR. A generation whose deployment ceiling PARKED components
         # is staged as a FACT — the components are on `meta` and `stage()` moves them in on
@@ -806,28 +873,22 @@ class PlanChooser:
         parked = tuple(self.ledger.parked)
         for placement, why, status in RUNGS:
             if status != "proven":
-                rows.append({"rung": placement, "verdict": "unproven", "why": why})
+                rows.append(Rung(rung=placement, verdict="unproven", why=why))
                 continue
             if parked and placement == "all_resident":
                 rows.append(
-                    {
-                        "rung": placement,
-                        "verdict": "construction_parked",
-                        "why": f"construction parked {list(parked)} under this deployment's "
+                    Rung(
+                        rung=placement,
+                        verdict="construction_parked",
+                        why=f"construction parked {list(parked)} under this deployment's "
                         "resident ceiling: the components are not held, so no plan over "
                         "this generation is all-resident",
-                    }
+                    )
                 )
                 continue
             unsuitable = self.ledger.placement_refusal(placement)
             if unsuitable:
-                rows.append(
-                    {
-                        "rung": placement,
-                        "verdict": "observed_unsuitable",
-                        "why": unsuitable,
-                    }
-                )
+                rows.append(Rung(rung=placement, verdict="observed_unsuitable", why=unsuitable))
                 continue
             # The rungs differ in the WEIGHTS they must bring back and in what they are
             # allowed to free: `all_resident` needs every absent component and can free
@@ -837,70 +898,65 @@ class PlanChooser:
             # priced on what it must raise, while the shallow rung — when it has nothing
             # to bring back — is priced on the activations alone, and only on a figure
             # that may be enforced under the conditions that hold right now.
-            denied = 0
-            if placement == "all_resident":
+            resident_rung = placement == "all_resident"
+            if resident_rung:
                 headroom = resident_headroom + absent_bytes
                 capacity = allocatable
                 denied = shortfall
             else:
                 headroom = max(scope_demands.values(), default=planning_headroom + largest)
                 capacity = allocatable + sum(resident.values())
+                denied = 0
             fits = (allocatable < 0 or capacity >= headroom) and not denied
-            row = {
-                "rung": placement,
-                "verdict": "fits" if fits else "short",
-                "needs_bytes": headroom,
-                "capacity_bytes": capacity,
-                "allocatable_bytes": allocatable,
-                "absent_bytes": absent_bytes,
-                "why": why,
-            }
-            if placement == "all_resident":
-                row["headroom_basis"] = headroom_basis
-                if denied:
-                    row["verdict"] = "refused_on_measured_shortfall"
-                    row["denied_at_free_bytes"] = denied
-            rows.append(row)
+            verdict = "refused_on_measured_shortfall" if denied else "fits" if fits else "short"
             if fits and not chosen:
                 chosen = placement
-                row["verdict"] = "chosen"
+                verdict = "chosen"
+            rows.append(
+                Rung(
+                    rung=placement,
+                    verdict=verdict,
+                    needs_bytes=headroom,
+                    capacity_bytes=capacity,
+                    allocatable_bytes=allocatable,
+                    absent_bytes=absent_bytes,
+                    why=why,
+                    headroom_basis=headroom_basis if resident_rung else msgspec.UNSET,
+                    denied_at_free_bytes=denied or msgspec.UNSET,
+                )
+            )
 
         # Estimates can select a conservative strategy without becoming a required
         # allocation. In particular, the uncalibrated 1 GiB reserve must not refuse
         # a small staged model. Actual component/block checks still run in the executor.
         admitted_headroom = activations.value if activations.enforceable else 0
-        scope_headrooms = {
-            method: measured_scopes.get(method, admitted_headroom)
-            for method in self.ledger.declared_scopes
-        }
-        walk = {
-            "coefficients": [c.document() for c in terms.values()],
-            "allocatable_bytes": allocatable,
-            "resident": dict(resident),
-            "absent": dict(absent),
-            "declared_bytes": declared_bytes,
-            "parked": list(parked),
-            "declared_scopes": {m: list(n) for m, n in self.ledger.declared_scopes.items()},
-            "largest_declared_set_bytes": largest,
-            "scope_headroom_bytes": dict(scope_headrooms),
-            "measured_scopes": sorted(
-                set(self.ledger.measured_scopes(cell)) & set(self.ledger.declared_scopes)
+        return Walk(
+            coefficients=tuple(terms.values()),
+            rungs=tuple(rows),
+            chosen=chosen,
+            allocatable_bytes=allocatable,
+            resident=dict(resident),
+            absent=dict(absent),
+            declared_bytes=declared_bytes,
+            parked=parked,
+            declared_scopes=dict(self.ledger.declared_scopes),
+            largest_declared_set_bytes=largest,
+            scope_headroom_bytes={
+                method: measured_scopes.get(method, admitted_headroom)
+                for method in self.ledger.declared_scopes
+            },
+            measured_scopes=tuple(
+                sorted(set(self.ledger.measured_scopes(cell)) & set(self.ledger.declared_scopes))
             ),
-            "scope_demand_bytes": dict(scope_demands),
-            "rungs": rows,
-            "shape_cell": cell,
-            # WHAT THIS ATTEMPT IS ADMITTED AGAINST, beside the envelope it was described
-            # with. They are the same number whenever the envelope may be enforced, and
-            # they part company exactly when it may not — which is the fact a reader needs
-            # in front of them rather than one they have to reconstruct.
-            "enforceable_headroom_bytes": admitted_headroom,
-            "resident_headroom_bytes": resident_headroom,
-            "headroom_basis": headroom_basis,
-            "device_free_bytes": free,
-            "resident_sufficiency_free_bytes": sufficiency,
-            "measured_shortfall_free_bytes": shortfall,
-        }
-        return terms, rows, chosen, walk
+            scope_demand_bytes=scope_demands,
+            shape_cell=cell,
+            enforceable_headroom_bytes=admitted_headroom,
+            resident_headroom_bytes=resident_headroom,
+            headroom_basis=headroom_basis,
+            device_free_bytes=free,
+            resident_sufficiency_free_bytes=sufficiency,
+            measured_shortfall_free_bytes=shortfall,
+        )
 
     def fits(self, declared: DeclaredBinding, cell: str = "") -> str:
         """The first proven rung that fits this generation on the ledger AS IT STANDS, or
@@ -910,8 +966,7 @@ class PlanChooser:
         typed and no arbitration should move bytes on its account."""
         if self.ledger.unreconciled:
             return ""
-        _terms, _rows, chosen, _walk = self._walk(declared, cell)
-        return chosen
+        return self._walk(declared, cell).chosen
 
     def should_restore(self, declared: DeclaredBinding, prepared: PreparedRequest) -> bool:
         """Do not refill weights that this request will immediately have to evict again.
@@ -948,24 +1003,22 @@ class PlanChooser:
                 "rebuilt, which re-establishes every number from a real construction; until "
                 "then a plan chosen here would be arithmetic over a residency the worker "
                 "already knows it cannot vouch for",
-                {
-                    "resource": "vram",
-                    "scope": "ledger",
-                    "needed_bytes": 0,
-                    "available_bytes": max(self.ledger.allocatable, 0),
-                    "evidence_class": "measured",
-                },
+                pb.ResourceShortfall(
+                    resource="vram",
+                    scope="ledger",
+                    available_bytes=max(self.ledger.allocatable, 0),
+                    evidence_class="measured",
+                ),
             )
-        terms, _rows, chosen, walk = self._walk(declared, prepared.cell())
+        walk = self._walk(declared, prepared.cell())
         self.walks.append(walk)
         del self.walks[:-16]
-        activations = terms["activations"]
+        activations = walk.activations
         allocatable = self.ledger.allocatable
-        resident = walk["resident"]
-        absent = walk["absent"]
+        resident, absent = walk.resident, walk.absent
         absent_bytes = sum(absent.values())
-        weights = walk["declared_bytes"] or declared.model_weight_bytes
-        scope_headrooms = walk["scope_headroom_bytes"]
+        weights = walk.declared_bytes or declared.model_weight_bytes
+        chosen = walk.chosen
         if not chosen:
             proven = tuple(placement for placement, _why, status in RUNGS if status == "proven")
             if proven and all(self.ledger.placement_refusal(placement) for placement in proven):
@@ -977,21 +1030,21 @@ class PlanChooser:
                     "placement_capacity_falsified",
                     f"every proven placement rung was falsified on this executor generation: "
                     f"{reasons}",
-                    {
-                        "resource": "vram",
-                        "scope": "placement",
-                        "needed_bytes": activations.value,
-                        "available_bytes": max(allocatable, 0),
-                        "evidence_class": "measured",
-                    },
+                    pb.ResourceShortfall(
+                        resource="vram",
+                        scope="placement",
+                        needed_bytes=activations.value,
+                        available_bytes=max(allocatable, 0),
+                        evidence_class="measured",
+                    ),
                 )
             chosen, confession = self._deepen(activations, allocatable, walk)
         else:
             confession = ""
-        rung = self._delivery(prepared_model, chosen, walk)
+        rung = walk.delivery = self._delivery(prepared_model, chosen)
         return AttemptPlan(
-            delivery=rung["delivery"],
-            materialization=rung["materialization"],
+            delivery=rung.delivery,
+            materialization=rung.materialization,
             compute_dtype="float16",
             placement=chosen,
             # THREE DIFFERENT FACTS, three names (codex audit, adopted 2026-08-25). The
@@ -1012,10 +1065,10 @@ class PlanChooser:
             # inapplicable would re-litigate the conditions rule one layer down, in the
             # one place no gate above can see — the exact reach cr-097 named for the
             # carried scopes and closed there.
-            headroom_bytes=int(walk["enforceable_headroom_bytes"]),
+            headroom_bytes=walk.enforceable_headroom_bytes,
             activation_envelope_bytes=activations.value,
-            scope_headroom_bytes=tuple(sorted(scope_headrooms.items())),
-            measured_scopes=tuple(walk["measured_scopes"]),
+            scope_headroom_bytes=tuple(sorted(walk.scope_headroom_bytes.items())),
+            measured_scopes=walk.measured_scopes,
             entrypoint_binding_digest=declared.entrypoint_binding_digest,
             constructed_model_digest=prepared_model.constructed_model_digest,
             request_features_digest=prepared.features_digest,
@@ -1023,24 +1076,22 @@ class PlanChooser:
             overlay_digest=prepared.overlay_digest,
             shape_cell=prepared.cell(),
             delivery_variant=prepared_model.delivery_variant,
-            model_deliveries=tuple(sorted((rung.get("models") or {}).items())),
+            model_deliveries=tuple((name, rung.models[name]) for name in sorted(rung.models)),
             decision_explanation=(
-                f"{rung['delivery']}/{rung['materialization'] or 'verbatim'} on variant "
+                f"{rung.delivery}/{rung.materialization or 'verbatim'} on variant "
                 f"{prepared_model.delivery_variant or declared.variant or 'default'!r} "
-                f"({rung['cost_class']} decode, {rung['kernel']} kernel) x "
+                f"({rung.cost_class} decode, {rung.kernel} kernel) x "
                 f"{chosen}: {len(resident) + len(absent) or 1} component(s) totalling "
                 f"{weights} B of which {absent_bytes} B is not resident, with "
                 f"{allocatable} B allocatable and {activations.value} B of activations "
                 f"({activations.provenance}), admitted against "
-                f"{walk['enforceable_headroom_bytes']} B "
-                f"({walk['headroom_basis']}); request {prepared.entrypoint} "
+                f"{walk.enforceable_headroom_bytes} B "
+                f"({walk.headroom_basis}); request {prepared.entrypoint} "
                 f"on shape cell {prepared.cell()}{confession}"
             ),
         )
 
-    def _delivery(
-        self, prepared_model: PreparedModel, placement: str, walk: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _delivery(self, prepared_model: PreparedModel, placement: str) -> Delivery:
         """THE CROSS (cr-008c): the resolved delivery rung, crossed with the placement one.
 
         Delivery was chosen ONCE, at prepare, against measured envelopes — this function
@@ -1059,58 +1110,49 @@ class PlanChooser:
         refusal instead of a silent reinterpretation of the request.
         """
         if prepared_model.model_deliveries:
-            models = {}
+            models: dict[str, CrossedDelivery] = {}
+            kernels: set[str] = set()
             for parameter, delivery in prepared_model.model_deliveries:
-                child = PreparedModel(
-                    delivery_rung=str(delivery.get("rung", "")),
-                    delivery_variant=str(delivery.get("variant", "")),
+                child = self._delivery(
+                    PreparedModel(delivery_rung=delivery.rung, delivery_variant=delivery.variant),
+                    placement,
                 )
-                child_crossed = self._delivery(child, placement, {})
                 try:
                     route_costs = {
                         route: cost_class(route, placement)
-                        for route, count in (delivery.get("routes") or {}).items()
+                        for route, count in delivery.routes.items()
                         if count
                     }
                 except DeliveryRefusal as exc:
                     raise PlanRefusal(exc.code, f"model {parameter!r}: {exc.detail}") from exc
                 # Keep the actual route/kernel census beside its placement-dependent cost.
-                models[parameter] = {
-                    **delivery,
-                    **child_crossed,
-                    "route_costs": route_costs,
-                    "kernel": "+".join(
-                        sorted(delivery.get("kernels") or {child_crossed["kernel"]: 1})
-                    ),
-                }
-            materializations = {row["materialization"] for row in models.values()}
-            summary = {
-                "variant": prepared_model.delivery_variant,
-                "delivery": "float"
-                if any(row["delivery"] == "float" for row in models.values())
+                models[parameter] = CrossedDelivery(
+                    plan_digest=delivery.plan_digest,
+                    routes=delivery.routes,
+                    kernels=delivery.kernels,
+                    delivery=child.delivery,
+                    materialization=child.materialization,
+                    cost_class=child.cost_class,
+                    route_costs=route_costs,
+                )
+                kernels.update(delivery.kernels or (child.kernel,))
+            materializations = {row.materialization for row in models.values()}
+            return Delivery(
+                variant=prepared_model.delivery_variant,
+                delivery="float"
+                if any(row.delivery == "float" for row in models.values())
                 else "native",
-                "materialization": (
+                materialization=(
                     "staged_decode"
                     if "staged_decode" in materializations
                     else "aot_decode"
                     if "aot_decode" in materializations
                     else ""
                 ),
-                "cost_class": "+".join(sorted({row["cost_class"] for row in models.values()})),
-                "kernel": "+".join(
-                    sorted(
-                        {
-                            kernel
-                            for row in models.values()
-                            for kernel in (row.get("kernels") or {row["kernel"]: 1})
-                        }
-                    )
-                ),
-                "chosen_at": "prepare",
-                "models": models,
-            }
-            walk["delivery"] = summary
-            return summary
+                cost_class="+".join(sorted({row.cost_class for row in models.values()})),
+                kernel="+".join(sorted(kernels)),
+                models=models,
+            )
         name = prepared_model.delivery_rung or "verbatim"
         rung = RUNGS_BY_NAME.get(name)
         if rung is None:
@@ -1132,31 +1174,24 @@ class PlanChooser:
                 "PLACEMENT only and never the compute kernel (§3.2); a delivery switch is "
                 "an explicit, separately authorized choice made once at prepare, never "
                 "something a capacity ladder does on the way past",
-                {
-                    "resource": "delivery",
-                    "scope": "plan",
-                    "needed_bytes": 0,
-                    "available_bytes": 0,
-                    "evidence_class": "structural",
-                },
+                pb.ResourceShortfall(
+                    resource="delivery", scope="plan", evidence_class="structural"
+                ),
             )
-        result = {
-            "variant": prepared_model.delivery_variant,
-            "rung": crossed.name,
-            "delivery": crossed.delivery,
-            "materialization": crossed.materialization,
-            "cost_class": crossed.cost_class,
-            "kernel": ROUTE_KERNEL[crossed.route],
-            "chosen_at": "prepare",
-        }
-        walk["delivery"] = result
-        return result
+        return Delivery(
+            variant=prepared_model.delivery_variant,
+            rung=crossed.name,
+            delivery=crossed.delivery,
+            materialization=crossed.materialization,
+            cost_class=crossed.cost_class,
+            kernel=ROUTE_KERNEL[crossed.route],
+        )
 
     def _deepen(
         self,
         activations: Coefficient,
         allocatable: int,
-        walk: dict[str, Any],
+        walk: Walk,
     ) -> tuple[str, str]:
         """Use the deepest supported residency plan before judging an active working set.
 
@@ -1181,8 +1216,8 @@ class PlanChooser:
             # can already afford; by the time the walk has run out of rungs, the shortfall
             # is in bytes that have to MOVE, and no relabelling of the envelope changes it.
             deepest = next(p for p, _, status in reversed(RUNGS) if status == "proven")
-            walk["deepened_to"] = deepest
-            walk["deepened_on"] = activations.provenance
+            walk.deepened_to = deepest
+            walk.deepened_on = activations.provenance
             grade = (
                 "no serve has ever been banked for this shape"
                 if activations.provenance == "uncalibrated"
@@ -1196,7 +1231,7 @@ class PlanChooser:
                 f"the next serve banks what this card actually needed"
             )
         deepest = next(p for p, _, status in reversed(RUNGS) if status == "proven")
-        walk["deepened_to"] = deepest
+        walk.deepened_to = deepest
         return deepest, (
             f" | DEGRADED: needed {activations.value} B of headroom, had "
             f"{max(allocatable, 0)} B, short by {max(activations.value - allocatable, 0)} B; "
