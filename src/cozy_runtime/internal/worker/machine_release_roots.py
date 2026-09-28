@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import msgspec
+from packaging.version import Version
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, job_plan, package_installation, package_interface
@@ -296,10 +297,30 @@ class ReleaseRoots:
                 installed[key] = held
             package = key.partition("@")[0]
             lock = self._locked(key, held, own)
-            for callee in machine_release_catalog.callees(package, lock):
+            for locked in machine_release_catalog.callees(package, lock):
+                callee = self._served(locked)
                 edges.add((key, callee))
                 pending.append(callee)
         return installed, sorted(edges)
+
+    def _served(self, locked: str) -> str:
+        """A callee release a caller's lock names is a floor, not a pin: the newest release
+        this machine's catalog publishes at or above it serves the call, read once per
+        package until the controller that publishes names it to `forget`."""
+        package, _, release = locked.partition("@")
+        newest = self.worker.resolutions.newest
+        if package not in newest:
+            try:
+                newest[package] = machine_release_catalog.newest(
+                    machine_model_resolve.own(self.worker), package
+                )
+            except WorkspaceRefusal:
+                return locked
+        return (
+            _key(package, newest[package])
+            if Version(newest[package]) > Version(release)
+            else locked
+        )
 
     def describe(self, selection: pb.PackageSelection) -> pb.DescribedRelease:
         """A published release as this machine reads it: the newest when none is named, read
