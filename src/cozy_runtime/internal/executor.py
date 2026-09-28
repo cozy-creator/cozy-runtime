@@ -42,6 +42,7 @@ import functools
 import gc
 import hashlib
 import importlib
+import importlib.metadata
 import json
 import math
 import os
@@ -4622,6 +4623,15 @@ _TRACED_COMMANDS = frozenset({"start", "load", "join"})
 _GROUP_CODES = frozenset({"rank_divergence", "context_parallel_unavailable", "group_broken"})
 
 
+def _remember_distributions() -> None:
+    """Diffusers and Transformers each map every package to its distribution at import by
+    walking every installed file's RECORD (~0.3 s apiece in the H3 environment, run 1516). A
+    sealed installation cannot change under a live executor, so the second walk reads the
+    first; each caller still gets its own copy."""
+    walk = functools.cache(importlib.metadata.packages_distributions)
+    importlib.metadata.packages_distributions = lambda: {k: list(v) for k, v in walk().items()}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
     parser.add_argument("--socket", default="")
@@ -4644,6 +4654,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--socket is required for rank 0")
 
     _capture_seal()
+    _remember_distributions()
     kernel_cache.configure(kernel_cache.from_sealed(_SEALED))
     # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
     # AF_UNIX exemption is exercised on every boot rather than asserted. It refuses
