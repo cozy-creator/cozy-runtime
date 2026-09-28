@@ -117,3 +117,14 @@ def test_unknown_model_route_is_a_typed_admission_refusal() -> None:
     with pytest.raises(PlanRefusal, match="model 'base'") as refused:
         choose(source)
     assert refused.value.code == "unknown_route"
+
+
+def test_unreadable_attention_narration_leaves_the_construction_it_describes() -> None:
+    """A prepare reply is read after a multi-GB fill; an attention boot fact another Runtime
+    shaped differently used to refuse it `construction_reply_incomplete`, refilling next time."""
+    digest = "sha256:" + "a" * 64
+    reply = {"constructed_model_digest": digest, "facts": {"filled_bytes": 1, "attention": [1]}}
+    prepared = PreparedModel.from_reply(reply)
+    assert prepared.constructed_model_digest == digest and prepared.attention is None
+    with pytest.raises(msgspec.ValidationError):
+        PreparedModel.from_reply({"facts": {"filled_bytes": 1}})
