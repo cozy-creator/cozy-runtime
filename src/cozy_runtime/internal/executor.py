@@ -104,7 +104,12 @@ from cozy_runtime.internal.parallel.plan import (
     RankDivergence,
     rank_invariant_digest,
 )
-from cozy_runtime.internal.residency import Construction, ConstructionArbiter, ResidencyRefusal
+from cozy_runtime.internal.residency import (
+    Construction,
+    ConstructionArbiter,
+    ResidencyRefusal,
+    RestoreReport,
+)
 from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
     RESULT_DOCUMENT,
@@ -1652,7 +1657,7 @@ class Executor:
             self.authorized = int(command["authorized_device_limit_bytes"])
         started = time.perf_counter()
         row = self.arbiter.rows[key]
-        restored: dict[str, Any] = {"restored": {}, "held": {}, "restored_bytes": 0}
+        restored: RestoreReport = {"restored": {}, "held": {}, "restored_bytes": 0}
         try:
             if self.rank == 0:
                 parked = self._make_room(key, self.arbiter.need(key)) if row.parked else []

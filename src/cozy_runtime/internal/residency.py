@@ -54,17 +54,99 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, NotRequired, Protocol, TypedDict
 
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.fill import FillRefusal, StreamingFillBackend, block_read_bytes
 from cozy_runtime.internal.paging import PageUnit
 
 
+class Shortfall(TypedDict):
+    """The structured capacity fact a refusal carries to the terminal."""
+
+    resource: str
+    scope: str
+    needed_bytes: int
+    available_bytes: int
+    evidence_class: str
+    request_shape: str
+
+
+class VacateReport(TypedDict):
+    freed: dict[str, int]
+    held: dict[str, str]
+    freed_bytes: int
+    allocator_delta_bytes: NotRequired[int]
+    vacate_ms: NotRequired[float]
+
+
+class RestoreReport(TypedDict):
+    restored: dict[str, int]
+    held: dict[str, str]
+    restored_bytes: int
+    allocator_delta_bytes: NotRequired[int]
+    restore_ms: NotRequired[float]
+    fill_ms: NotRequired[int]
+    legs: NotRequired[dict[str, int]]
+    read_bytes: NotRequired[int]
+
+
+class ActiveScope(TypedDict):
+    method: str
+    components: list[str]
+
+
+class FenceState(TypedDict):
+    passed: bool
+    last_used: int
+
+
+class ResidencyDocument(TypedDict):
+    """One construction's residency facts, as the executor reports them."""
+
+    placement: str
+    headroom_bytes: int
+    scope_headroom_bytes: dict[str, int]
+    measured_scopes: list[str]
+    admissions: int
+    stages: int
+    evictions: int
+    attempt_stages: int
+    attempt_evictions: int
+    attempt_staged_ms: float
+    attempt_evicted_ms: float
+    page_bytes: int
+    attempt_page_bytes: int
+    paging: dict[str, dict[str, int]]
+    attempt_activation_peak_bytes: int
+    attempt_activation_peaks: dict[str, int]
+    attempt_absolute_peak_bytes: int
+    allocator_delta_bytes: int
+    staged_ms: float
+    evicted_ms: float
+    resident: dict[str, int]
+    evicted: dict[str, int]
+    hosted: list[str]
+    active: ActiveScope | None
+    fences: dict[str, FenceState]
+    poisoned: str
+    log: list[dict[str, object]]
+    refusals: list[str]
+
+
+class ConstructionRow(TypedDict):
+    key: str
+    state: str
+    resident_bytes: int
+    last_used_ns: int
+    active: bool
+    parked: NotRequired[list[str]]
+
+
 class ResidencyRefusal(Exception):
     """The declared set cannot be admitted. Carries the structured shortfall."""
 
-    def __init__(self, code: str, detail: str, shortfall: dict[str, Any] | None = None) -> None:
+    def __init__(self, code: str, detail: str, shortfall: Shortfall | None = None) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
@@ -131,7 +213,7 @@ class ComponentResidency:
     #: the structured shortfall of the LAST refusal, so the terminal carries both numbers
     #: instead of an exception string (cr-008a finding 8: a Fault has no shortfall slot,
     #: a TerminalCause does, and this is what fills it).
-    last_shortfall: dict[str, Any] | None = None
+    last_shortfall: Shortfall | None = None
     #: THE ATTEMPT'S DECLARED RESIDENCY TRANSITION, signed, MEASURED on the same meter the
     #: ledger reconciles `device_allocated` with (`torch.cuda.memory_allocated()`, read
     #: either side of the move). The worker subtracts exactly this and holds the
@@ -384,9 +466,11 @@ class ComponentResidency:
                     f"{name}: common weights and one block exceed the assigned ceiling",
                     {
                         "resource": "vram",
+                        "scope": "component_use",
                         "needed_bytes": self._size(name),
                         "available_bytes": self.backend.resident_budget,
-                        "scope": method,
+                        "evidence_class": "structural",
+                        "request_shape": method,
                     },
                 )
             fence = self.fences.setdefault(name, Fence())
@@ -497,7 +581,7 @@ class ComponentResidency:
 
     # ------------------------------------------------------------------ the lane's call
 
-    def vacate(self) -> dict[str, Any]:
+    def vacate(self) -> VacateReport:
         """FREE every evictable component: the LANE handed the device to another tenant.
 
         Not an attempt's admission and not a rung's doing (cr-022's swap arm). A rung is
@@ -538,7 +622,7 @@ class ComponentResidency:
             "vacate_ms": round(took, 2),
         }
 
-    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]:
+    def restore(self, names: tuple[str, ...] = ()) -> RestoreReport:
         """RE-FILL what a vacate took, TAKING THE CARD FROM NOBODY (cr-097).
 
         `vacate` had no counterpart, and that asymmetry was the whole defect: a tenant the
@@ -959,7 +1043,7 @@ class ComponentResidency:
 
     # ------------------------------------------------------------------ facts
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> ResidencyDocument:
         return {
             "placement": self.placement,
             "headroom_bytes": self.headroom,
@@ -1006,11 +1090,11 @@ class ComponentResidency:
 
 
 class _Residency(Protocol):
-    def vacate(self) -> dict[str, Any]: ...
+    def vacate(self) -> VacateReport: ...
 
-    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]: ...
+    def restore(self, names: tuple[str, ...] = ()) -> RestoreReport: ...
 
-    def document(self) -> dict[str, Any]: ...
+    def document(self) -> ResidencyDocument: ...
 
 
 @dataclass(slots=True)
@@ -1028,7 +1112,7 @@ class Construction:
     def resident_bytes(self) -> int:
         if self.residency is None or self.parked is not None:
             return 0
-        return sum(int(size) for size in self.residency.document().get("resident", {}).values())
+        return sum(self.residency.document()["resident"].values())
 
 
 @dataclass(slots=True)
@@ -1067,12 +1151,12 @@ class ConstructionArbiter:
         ]
         return sorted(held, key=lambda key: self.rows[key].last_used)
 
-    def park(self, key: str) -> dict[str, Any]:
+    def park(self, key: str) -> VacateReport:
         row = self.rows[key]
         if row.residency is None or row.parked is not None:
             return {"freed": {}, "held": {}, "freed_bytes": 0}
         report = row.residency.vacate()
-        row.parked = tuple(sorted(report.get("freed", {})))
+        row.parked = tuple(sorted(report["freed"]))
         return report
 
     def make_room(self, exclude: str, fits: Callable[[], bool]) -> list[str]:
@@ -1086,7 +1170,7 @@ class ConstructionArbiter:
             parked.append(victims[0])
         return parked
 
-    def restore(self, key: str, names: tuple[str, ...] = ()) -> dict[str, Any]:
+    def restore(self, key: str, names: tuple[str, ...] = ()) -> RestoreReport:
         row = self.rows[key]
         wanted = names or row.parked or ()
         row.parked = None
@@ -1098,15 +1182,17 @@ class ConstructionArbiter:
         row = self.rows[key]
         return row.need(row.parked or ()) if row.parked is not None else 0
 
-    def document(self, active: str = "") -> list[dict[str, Any]]:
-        return [
-            {
+    def document(self, active: str = "") -> list[ConstructionRow]:
+        rows: list[ConstructionRow] = []
+        for key, row in sorted(self.rows.items(), key=lambda item: -item[1].last_used):
+            document: ConstructionRow = {
                 "key": key,
                 "state": "resident" if row.parked is None else "parked",
                 "resident_bytes": row.resident_bytes(),
                 "last_used_ns": row.last_used_ns,
                 "active": key == active,
-                **({"parked": list(row.parked)} if row.parked is not None else {}),
             }
-            for key, row in sorted(self.rows.items(), key=lambda item: -item[1].last_used)
-        ]
+            if row.parked is not None:
+                document["parked"] = list(row.parked)
+            rows.append(document)
+        return rows
