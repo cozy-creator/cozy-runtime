@@ -2882,8 +2882,8 @@ class Worker:
             and ack.attempt_ordinal == state.attempt_ordinal
             and state.state in workspace_executions.TERMINAL
         ):
-            # The owner holds the whole log: its products are the owner's now.
-            self.engine.products.release(owner, ack.request_id)
+            # The owner holds the whole log: delivered. Its products stay until GC.
+            self.engine.products.deliver(owner, ack.request_id)
         return state
 
     def prepare_model_source(

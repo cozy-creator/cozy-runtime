@@ -235,6 +235,7 @@ class _Handle:
                 "CREATE INDEX IF NOT EXISTS attempts_live ON attempts(owner,request,ordinal) "
                 "WHERE state IN ('accepted','running')"
             )
+            _number_runs(db)
             stat = os.stat(self.path)
             self.db, self.identity = db, (stat.st_dev, stat.st_ino)
         return self.db
@@ -367,6 +368,36 @@ def _migrate(db: Journal) -> None:
                 db.execute("ROLLBACK")
             raise
         db.converged = True
+
+
+#: Run numbers (wire 66): the journal's sequence of root executions in acceptance order, never
+#: reused. Like `attempts_live` it is not a schema version, so no Runtime is refused over it: one
+#: that predates it ignores it, and the roots such a Runtime accepted are numbered, in
+#: acceptance order, when this one next opens the journal.
+_RUN_NUMBERS = (
+    "CREATE TABLE IF NOT EXISTS execution_numbers ("
+    "number INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, request TEXT NOT NULL, "
+    "UNIQUE(owner,request)) STRICT"
+)
+#: Numbers go to roots, the executions no call made; a child call has none.
+NUMBER_ROOT = (
+    "INSERT INTO execution_numbers(owner,request) SELECT e.owner,e.request FROM executions e "
+    "WHERE {where} AND NOT EXISTS (SELECT 1 FROM execution_numbers n "
+    "WHERE n.owner=e.owner AND n.request=e.request) AND NOT EXISTS "
+    "(SELECT 1 FROM execution_calls c WHERE c.owner=e.owner AND c.child_request=e.request) "
+    "ORDER BY e.rowid"
+)
+
+
+def _number_runs(db: Journal) -> None:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute(_RUN_NUMBERS)
+        db.execute(NUMBER_ROOT.format(where="1"))
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
 
 
 _OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")

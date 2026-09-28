@@ -6,8 +6,9 @@ run's owner and journals one `product` entry on the root execution's log, in tha
 every entry the owner reads can be fetched. Returning the result publishes what the fold does
 not already show: the run's result is the fold of its products, whether it completes, fails or
 is canceled. The owner reads bytes with ReadByteTreeObject from each entry's own hold and
-acknowledges the terminal, which releases them. A single output's superseded product is
-released as soon as a newer one replaces it.
+acknowledges the terminal: delivered (wire 66). The products then stay until the store's GC
+evicts them under pressure, delivered first, so any authorized client can fetch them later. A
+single output's superseded product is released as soon as a newer one replaces it.
 """
 
 from __future__ import annotations
@@ -16,10 +17,12 @@ import hashlib
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from cozy_runtime.author._executor_requests import Answer, Publish, Published, refuse
+from cozy_runtime.internal import fill
 from cozy_runtime.internal.executor_replies import OutputRow
 from cozy_runtime.internal.worker import byte_outputs, machine_byte_results, machine_models
 from cozy_runtime.internal.worker.workspace import NativeHold, Workspace, WorkspaceRefusal
@@ -33,6 +36,14 @@ if TYPE_CHECKING:
 
 SET, APPEND = pb.RUN_PRODUCT_OP_SET, pb.RUN_PRODUCT_OP_APPEND
 MAX_PARTS = 128
+
+
+@runtime_checkable
+class DeliveringStore(Protocol):
+    """A TensorFS store that tells delivered tree roots from live ones (TensorFS 0.3.78):
+    its GC may evict a delivered one under pressure, oldest delivery first."""
+
+    def deliver_tree_root(self, owner: str) -> object: ...
 
 
 def recipient(request: str) -> str:
@@ -312,9 +323,26 @@ class Products:
 
     # ------------------------------------------------------------------ acknowledgement
 
-    def release(self, owner: str, request: str) -> None:
-        """The owner holds the whole log: release every product the run still holds."""
-        machine_models.release(self.workspace, owner, recipient(request))
+    def deliver(self, owner: str, request: str) -> None:
+        """The owner holds the whole log. Its products stay until the store's GC evicts them;
+        a store that cannot tell delivered bytes from live ones gets them released now."""
+        store = fill.store(self.workspace.store_root)
+        if not isinstance(store, DeliveringStore):
+            machine_models.release(self.workspace, owner, recipient(request))
+            return
+        with self.workspace.locked() as db:
+            rows = db.all(
+                machine_models.ModelHold,
+                "SELECT * FROM execution_model_holds WHERE owner=? AND recipient=?",
+                (owner, recipient(request)),
+            )
+            for row in rows:
+                root = pb.DerivedRetentionRequest.FromString(row.retention).retention_id
+                try:
+                    db.native(partial(store.deliver_tree_root, root))
+                except fill.tensorfs_module().errors.Refusal as exc:
+                    if exc.code != "ROOT_ABSENT":  # already evicted: a replayed ack
+                        raise
 
 
 def _spool_name(ref: str) -> str:

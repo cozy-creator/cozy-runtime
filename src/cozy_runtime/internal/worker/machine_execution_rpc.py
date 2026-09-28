@@ -14,7 +14,12 @@ import grpc
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, prepare_diagnostics
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
-from cozy_runtime.internal.worker import machine_capture, machine_release_roots, triage
+from cozy_runtime.internal.worker import (
+    machine_capture,
+    machine_reads,
+    machine_release_roots,
+    triage,
+)
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.servicer_context import ServicerContext
 from cozy_runtime.internal.worker.workspace import (
@@ -22,9 +27,11 @@ from cozy_runtime.internal.worker.workspace import (
     WorkspaceRefusal,
 )
 from cozy_runtime.internal.worker.workspace_executions import (
+    MAX_PAGE,
     TERMINAL,
     EventPage,
     ExecutionWorkspaceRefusal,
+    Run,
     StaleExecutionGeneration,
     State,
 )
@@ -116,21 +123,8 @@ class MachineExecutionRPC:
                 worker_id=options.worker_id,
                 worker_boot_id=self.worker.fence.worker_boot_id,
                 execution_workspace_id=self.worker.executions.workspace_id,
-                devices=[
-                    pb.MachineDevice(
-                        ordinal=ordinal,
-                        name=gpu["device_name"],
-                        uuid=gpu["device_uuid"],
-                        memory_bytes=gpu["memory_bytes"],
-                        pci_bus_id=gpu["pci_bus_id"],
-                        driver_version=gpu["driver_version"],
-                    )
-                    for ordinal, gpu in enumerate(options.gpus)
-                ],
-                # A backend without a measured inventory (a flag-launched `serve`) is unknown.
-                accelerator_backend=options.accelerator_backend
-                if options.gpus or options.accelerator_backend == "none"
-                else "",
+                devices=machine_reads.devices(self.worker),
+                accelerator_backend=machine_reads.accelerator_backend(self.worker),
                 executor_uid_isolation=options.executor_uid >= 0,
                 described_release=described,
                 run_output_log=True,
@@ -139,9 +133,12 @@ class MachineExecutionRPC:
 
         return self._call(request.claim, context, get)
 
-    def _state(self, state: State) -> pb.MachineExecutionState:
+    def _state(self, state: State, run: Run | None = None) -> pb.MachineExecutionState:
         assert self.worker.executions is not None
-        return pb.MachineExecutionState(
+        owner = self.worker.fence.record_owner_id
+        if run is None:
+            run = self.worker.executions.run(owner, state.request_id)
+        message = pb.MachineExecutionState(
             request_id=state.request_id,
             attempt_ordinal=state.attempt_ordinal,
             generation=state.generation,
@@ -154,10 +151,15 @@ class MachineExecutionRPC:
             gpu=self.worker.gpu_status(state.request_id),
             awaiting_source_credentials=[]
             if state.state in TERMINAL
-            else self.worker.machine_sources.awaiting(
-                self.worker.fence.record_owner_id, state.request_id
-            ),
+            else self.worker.machine_sources.awaiting(owner, state.request_id),
         )
+        if run is not None:
+            message.number = run.number
+            message.accepted_at_ms = run.accepted_ms
+            # A replayed command answers its journaled state, which may no longer be current.
+            message.finished_at_ms = run.finished_ms if run.status() == state else 0
+            message.target.CopyFrom(machine_reads.target(self.worker, run))
+        return message
 
     def SubmitMachineExecution(
         self, request: pb.MachineExecutionSubmit, context: ServicerContext
@@ -472,23 +474,70 @@ class MachineExecutionRPC:
 
         return self._call(request.execution.claim, context, read)
 
-    # Wire 66: registration names every WorkerControl method. Served in full by the change
-    # that follows this one; until then each answers UNIMPLEMENTED, as an older Runtime does.
     def ListMachineExecutions(
         self, request: pb.MachineExecutionListQuery, context: ServicerContext
     ) -> pb.MachineExecutionList:
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "update the Runtime to list its runs")
+        def listing() -> pb.MachineExecutionList:
+            executions = self.worker.executions
+            assert executions is not None
+            owner = self.worker.authorize_workspace(request.claim)
+            limit, states = min(request.limit or 64, MAX_PAGE), tuple(request.states)
+            if request.wait and not request.newest_first:
+                runs, head = self._wait_runs(owner, request.after_number, limit, states, context)
+            else:
+                runs, head = executions.runs(
+                    owner,
+                    after=request.after_number,
+                    before=request.before_number,
+                    newest_first=request.newest_first,
+                    limit=limit,
+                    states=states,
+                )
+            return pb.MachineExecutionList(
+                executions=[self._state(run.status(), run) for run in runs],
+                head_number=head,
+                execution_workspace_id=executions.workspace_id,
+            )
 
-    def ListPackages(self, request: pb.PackageListQuery, context: ServicerContext) -> pb.PackageList:
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "update the Runtime to list its packages")
+        return self._call(request.claim, context, listing)
+
+    def _wait_runs(
+        self, owner: str, after: int, limit: int, states: tuple[str, ...], context: ServicerContext
+    ) -> tuple[list[Run], int]:
+        executions = self.worker.executions
+        assert executions is not None
+        changes = executions.workspace.changes()
+        left = threading.Event()
+
+        def leave() -> None:
+            left.set()
+            changes.bump()
+
+        if not context.add_callback(leave):
+            leave()
+        return executions.wait_runs(
+            owner, after, limit, states, lambda: left.is_set() or self.worker.stop.is_set()
+        )
+
+    def ListPackages(
+        self, request: pb.PackageListQuery, context: ServicerContext
+    ) -> pb.PackageList:
+        return self._call(request.claim, context, lambda: machine_reads.packages(self.worker))
 
     def ListModels(self, request: pb.ModelListQuery, context: ServicerContext) -> pb.ModelList:
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "update the Runtime to list its models")
+        return self._call(request.claim, context, lambda: machine_reads.models(self.worker))
 
     def DescribeMachine(
         self, request: pb.DescribeMachineQuery, context: ServicerContext
     ) -> pb.MachineDescription:
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "update the Runtime to describe it")
+        def describe() -> pb.MachineDescription:
+            return pb.MachineDescription(
+                worker_id=self.worker.options.worker_id,
+                worker_boot_id=self.worker.fence.worker_boot_id,
+                runtime=machine_reads.runtime(self.worker),
+            )
+
+        return self._call(request.claim, context, describe)
 
     def AcknowledgeMachineExecutionCollection(
         self, request: pb.MachineExecutionCollectionAck, context: ServicerContext

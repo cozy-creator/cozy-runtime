@@ -10,7 +10,7 @@ import base64
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -20,7 +20,13 @@ import msgspec
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.machine_publication import PublicationRefusal, output_destination
-from cozy_runtime.internal.worker.workspace import Journal, Row, Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import (
+    NUMBER_ROOT,
+    Journal,
+    Row,
+    Workspace,
+    WorkspaceRefusal,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -92,6 +98,7 @@ class Receipt:
     worker_boot_id: str
     execution_workspace_id: str
     publication_authorization_id: str = ""
+    number: int = 0
 
 
 class State(msgspec.Struct, frozen=True):
@@ -164,6 +171,43 @@ class ExecutionRow(msgspec.Struct, frozen=True):
         offer = pb.AttemptOffer.FromString(self.offer)
         offer.attempt_ordinal = self.ordinal
         return offer
+
+
+class Run(msgspec.Struct, frozen=True):
+    """An execution as a listing shows it: its run number (0 for a child call), state and
+    times, and the offer and preparation that name what it runs."""
+
+    number: int
+    request: str
+    ordinal: int
+    generation: int
+    state: str
+    collected: int
+    sequence: int
+    accepted_ms: int
+    finished_ms: int
+    offer: bytes
+    preparation: bytes
+
+    def status(self) -> State:
+        return State(
+            self.request,
+            self.ordinal,
+            self.generation,
+            self.state,
+            bool(self.collected),
+            self.sequence,
+        )
+
+
+_RUN = (
+    "SELECT coalesce(n.number,0) AS number,e.request,e.ordinal,e.generation,e.state,e.collected,"
+    f"e.sequence,e.accepted_ms,CASE WHEN e.state IN {tuple(sorted(TERMINAL))} THEN "
+    "(SELECT coalesce(max(v.at_ms),0) FROM execution_events v WHERE v.owner=e.owner "
+    "AND v.request=e.request AND v.kind='outcome') ELSE 0 END AS finished_ms,e.offer,"
+    "e.preparation FROM executions e LEFT JOIN execution_numbers n "
+    "ON n.owner=e.owner AND n.request=e.request "
+)
 
 
 @dataclass(frozen=True)
@@ -289,7 +333,7 @@ class Executions:
                 return None
             if (row["submission"], row["request"]) != (submission_id, request):
                 raise WorkspaceRefusal("execution submission identity changed")
-            return self._receipt(row, workspace_id)
+            return self._receipt(db, row, workspace_id)
 
     def submission_absent(self, owner: str, request: str, expected: str) -> bool:
         """Only the pinned journal can establish that this submission was not accepted."""
@@ -325,8 +369,12 @@ class Executions:
         )
 
     @staticmethod
-    def _receipt(row: Row, workspace_id: str) -> Receipt:
+    def _receipt(db: Journal, row: Row, workspace_id: str) -> Receipt:
         offer = pb.AttemptOffer.FromString(row["offer"])
+        number = db.execute(
+            "SELECT number FROM execution_numbers WHERE owner=? AND request=?",
+            (row["owner"], row["request"]),
+        ).fetchone()
         return Receipt(
             row["request"],
             row["submission"],
@@ -337,6 +385,7 @@ class Executions:
             row["accepted_boot"],
             workspace_id,
             row["publication_authorization_id"],
+            number[0] if number else 0,
         )
 
     def _event(
@@ -447,7 +496,7 @@ class Executions:
                     publication_authorization_id,
                 ):
                     raise WorkspaceRefusal("execution submission identity changed")
-                return self._receipt(row, workspace_id)
+                return self._receipt(db, row, workspace_id)
             if db.execute(
                 "SELECT 1 FROM attempts WHERE owner=? AND request=?", (owner, offer.request_id)
             ).fetchone():
@@ -486,9 +535,12 @@ class Executions:
                     owner_memo,
                 ),
             )
+            db.execute(
+                NUMBER_ROOT.format(where="e.owner=? AND e.request=?"), (owner, offer.request_id)
+            )
             row = self._row(db, owner, offer.request_id)
             self._event(db, row, "accepted", canonical_json.encode({"generation": 1}))
-            return self._receipt(row, workspace_id)
+            return self._receipt(db, row, workspace_id)
 
     def destination(self, owner: str, request: str) -> str:
         with self.workspace.locked() as db:
@@ -888,6 +940,61 @@ class Executions:
     def status(self, owner: str, request: str) -> State:
         with self.workspace.locked() as db:
             return self._state(self._row(db, owner, request))
+
+    def run(self, owner: str, request: str) -> Run | None:
+        with self.workspace.locked() as db:
+            return db.one(Run, _RUN + "WHERE e.owner=? AND e.request=?", (owner, request))
+
+    def runs(
+        self,
+        owner: str,
+        *,
+        after: int = 0,
+        before: int = 0,
+        newest_first: bool = False,
+        limit: int = 64,
+        states: Sequence[str] = (),
+    ) -> tuple[list[Run], int]:
+        """One page of this owner's runs by number, and the newest number it holds."""
+        Workspace.owner(owner)
+        if not 1 <= limit <= MAX_PAGE or not 0 <= after < 1 << 63 or not 0 <= before < 1 << 63:
+            raise WorkspaceRefusal("run page cursor or bound is invalid")
+        where, parameters = ["n.number IS NOT NULL", "e.owner=?"], list[str | int]([owner])
+        if not newest_first:
+            where.append("n.number>?")
+            parameters.append(after)
+        elif before:
+            where.append("n.number<?")
+            parameters.append(before)
+        if states:
+            where.append("e.state IN (" + ",".join("?" * len(states)) + ")")
+            parameters.extend(states)
+        order = "DESC" if newest_first else "ASC"
+        with self.workspace.locked() as db:
+            page = db.all(
+                Run,
+                _RUN + "WHERE " + " AND ".join(where) + f" ORDER BY n.number {order} LIMIT ?",
+                (*parameters, limit),
+            )
+            head = db.execute(
+                "SELECT coalesce(max(number),0) FROM execution_numbers WHERE owner=?", (owner,)
+            ).fetchone()[0]
+        return page, head
+
+    def wait_runs(
+        self, owner: str, after: int, limit: int, states: Sequence[str], gone: Callable[[], bool]
+    ) -> tuple[list[Run], int]:
+        """The runs after `after`, waiting for one while the caller is here."""
+        changes = self.workspace.changes()
+        while True:
+            with changes.condition:
+                version = changes.version
+            page, head = self.runs(owner, after=after, limit=limit, states=states)
+            if page or gone():
+                return page, head
+            with changes.condition:
+                while changes.version == version and not gone():
+                    changes.condition.wait()
 
     def offer(self, owner: str, request: str) -> pb.AttemptOffer:
         """Return pinned work for Worker; this does not execute or pick a machine."""
