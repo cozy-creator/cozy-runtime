@@ -629,6 +629,24 @@ def test_upload_reports_held_bytes_then_publication_with_stage_timings(
     assert uploaded["rate_bytes_per_second"] > 0
     # The publication stage spans the finalization retries, not only the last attempt.
     assert published["completed"] and published["elapsed_ms"] >= 1500
+    # The settled upload is a call of its run, recorded on the root like a child call: its
+    # label, status, and each stage's time and bytes (`cozy run show` lists it).
+    (record,) = staged.notices("call")
+    assert record["label"].startswith("Upload checkpoint to ") and record["status"] == "succeeded"
+    assert record["module"] == effect_interfaces.MODULE and record["export"] == "upload_checkpoint"
+    assert record["index"] == call.call_index and record["called_unix_ms"] == call.created_ms
+    spans = record["stages"]
+    # A record is canonical JSON (sorted keys); its spans order by when they started.
+    assert sorted(spans, key=lambda name: spans[name]["started_unix_ms"]) == [
+        "Uploading checkpoint",
+        "Publishing checkpoint",
+    ]
+    assert spans["Uploading checkpoint"]["bytes"] == total
+    assert spans["Publishing checkpoint"]["total_ms"] >= 1500
+    assert (
+        spans["Uploading checkpoint"]["ended_unix_ms"]
+        <= spans["Publishing checkpoint"]["started_unix_ms"] + 1
+    )
 
 
 def test_asynchronous_finalization_is_pending_until_the_hub_commits(
@@ -707,6 +725,8 @@ def test_refused_publication_settles_before_commit_and_releases_its_hold(
     assert call.safe_detail == "publication was refused before its commit"
     assert not call.sent and not call.result
     assert not hub.bucket.puts and not hub.checkpoints
+    (record,) = staged.notices("call")
+    assert record["status"] == "failed" and record["error"] == call.safe_detail
     drive(effects, lambda: staged.hold_states() == ["released"])
     assert not staged.calls.has_unsettled_effects("owner", "parent")
 
