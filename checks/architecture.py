@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import json
 import pathlib
 import re
@@ -1095,6 +1096,54 @@ def fence_one_address_predicate() -> list[str]:
     return bad
 
 
+#: `Any` switches mypy strict off for everything it touches (the watchdog died on a
+#: `dict[str, Any]` record's missing key, 2026-09-28). Records are decoded once, at their
+#: boundary, into typed structs; this count under `internal/` may only fall. Lower it in
+#: the change that removes some.
+ANY_CEILING = 1931
+
+
+def any_references(tree: ast.AST) -> int:
+    """`Any` / `typing.Any` uses, including inside string annotations and `cast` targets."""
+
+    def count(node: ast.AST) -> int:
+        return sum(
+            (isinstance(n, ast.Name) and n.id == "Any")
+            or (isinstance(n, ast.Attribute) and n.attr == "Any")
+            for n in ast.walk(node)
+        )
+
+    spelled: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg) and node.annotation is not None:
+            spelled.append(node.annotation)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns:
+            spelled.append(node.returns)
+        elif isinstance(node, ast.AnnAssign):
+            spelled.append(node.annotation)
+        elif isinstance(node, ast.Call) and _dotted(node.func) in ("cast", "typing.cast"):
+            spelled.extend(node.args[:1])
+    total = count(tree)
+    for expr in spelled:
+        for n in ast.walk(expr):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                with contextlib.suppress(SyntaxError):  # a Literal's value, not a type
+                    total += count(ast.parse(n.value, mode="eval"))
+    return total
+
+
+def fence_any_ratchet() -> list[str]:
+    total = sum(any_references(ast.parse(p.read_text())) for p in (SRC / "internal").rglob("*.py"))
+    if total > ANY_CEILING:
+        return [
+            f"internal/ spells `Any` {total} times, over the ratchet's {ANY_CEILING}: decode "
+            "the record once into a typed struct (msgspec.Struct or the protobuf message)"
+        ]
+    if total < ANY_CEILING:
+        print(f"any-ratchet: {total} < {ANY_CEILING} — lower ANY_CEILING to {total}")
+    return []
+
+
 FENCES = {
     "one-address-predicate": fence_one_address_predicate,
     "forbidden-dependency": fence_forbidden_dependency,
@@ -1117,6 +1166,7 @@ FENCES = {
     "base-distributions": fence_base_distributions,
     "worker-derive-free": fence_worker_derive_free,
     "residency-sets-only": fence_residency_sets_only,
+    "any-ratchet": fence_any_ratchet,
 }
 
 
