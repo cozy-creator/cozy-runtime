@@ -284,7 +284,9 @@ def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Pa
         (PublicationAuthority("https://tensorhub.example", "w", "t"), False),
         (None, False),
     ):
-        worker = cast(Worker, SimpleNamespace(options=SimpleNamespace(publication_authority=grant)))
+        worker = cast(
+            Worker, SimpleNamespace(options=SimpleNamespace(publication_authority=grant, hubs=()))
+        )
         assert machine_model_defaults.local_development(worker) is private, grant
     call.claim.record_owner_id = "stranger"
     try:

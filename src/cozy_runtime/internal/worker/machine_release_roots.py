@@ -99,6 +99,7 @@ class _Prepared:
     installed: dict[str, Installation]
     edges: list[tuple[str, str]]
     placement_set: bytes = b""  # a served root's prepared placement, as its set's exact bytes
+    hub: str = ""  # the Hub the root's run came from, as `hub_key` spells it
 
 
 @dataclass
@@ -123,8 +124,8 @@ class ReleaseRoots:
         self.worker = worker
         self.changed = threading.Condition()
         self.jobs: dict[tuple[str, str], _Job] = {}
-        # Install facts by release, read at this machine's catalog: immutable, read once.
-        self.facts: dict[str, pb.DeferredInstallation] = {}
+        # Install facts by Hub and release, read at that catalog: immutable, read once.
+        self.facts: dict[tuple[str, str], pb.DeferredInstallation] = {}
 
     def submit(
         self, owner: str, request: pb.MachineExecutionSubmit, context: ServicerContext
@@ -196,8 +197,8 @@ class ReleaseRoots:
             job.version += 1
             self.changed.notify_all()
 
-    def _installed(self, key: str) -> Installation | None:
-        """The placement this machine holds for a release with the fewest bound Models."""
+    def _installed(self, key: str, hub: str) -> Installation | None:
+        """The placement this machine holds for a Hub's release with the fewest bound Models."""
         package, _, release = key.partition("@")
         with self.worker.control_lock:
             held = [
@@ -206,6 +207,7 @@ class ReleaseRoots:
                 if placement.document.HasField("package")
                 and placement.document.package.package == package
                 and placement.document.package.release == release
+                and placement.document.package.hub == hub
             ]
         if not held:
             return None
@@ -221,6 +223,7 @@ class ReleaseRoots:
             raise WorkspaceRefusal(
                 "release root names no package, entrypoint and one release or installation"
             )
+        machine_model_resolve.hub_key(self.worker, root.hub)  # a Hub it is registered at
 
     def _root(self, root: pb.ReleaseRoot) -> tuple[str, Installation | None]:
         """The root's package@release, and the unpublished installation it names, which this
@@ -247,22 +250,26 @@ class ReleaseRoots:
             documents.body(held.document), held.installation_id
         )
 
-    def _facts(self, key: str) -> pb.DeferredInstallation:
-        """A release's install facts, read at this machine's catalog once."""
+    def _facts(self, key: str, hub: str) -> pb.DeferredInstallation:
+        """A release's install facts, read at its Hub's catalog once; its preparation names
+        that Hub, so what it installs is held as that Hub's."""
         with self.changed:
-            held = self.facts.get(key)
+            held = self.facts.get((hub, key))
         if held is None:
             package, _, release = key.partition("@")
             held = machine_release_catalog.facts(
-                machine_model_resolve.own(self.worker), package, release
+                machine_model_resolve.own(self.worker, hub=hub), package, release
             )
+            held.preparation.hub = hub
             with self.changed:
-                self.facts[key] = held
+                self.facts[(hub, key)] = held
                 for old in list(self.facts)[: max(0, len(self.facts) - MAX_FACTS)]:
                     del self.facts[old]
         return held
 
-    def _locked(self, key: str, held: Installation | None, captured: bool = False) -> bytes:
+    def _locked(
+        self, key: str, hub: str, held: Installation | None, captured: bool = False
+    ) -> bytes:
         """A release's lock: its installation's here, else its install facts'. A captured
         installation has no release at the Hub: only its own lock, if it has one."""
         if held is not None:
@@ -274,10 +281,10 @@ class ReleaseRoots:
             )
             if path.is_file():
                 return path.read_bytes()
-        return b"" if captured else self._facts(key).preparation.locked_requirements
+        return b"" if captured else self._facts(key, hub).preparation.locked_requirements
 
     def _closure(
-        self, root: str, captured: Installation | None
+        self, root: str, hub: str, captured: Installation | None
     ) -> tuple[dict[str, Installation], list[tuple[str, str]]]:
         """The releases of the root's closure this machine holds, and the closure's edges,
         each release's callees read from its own lock (a captured root's from its own)."""
@@ -292,49 +299,51 @@ class ReleaseRoots:
             if len(seen) > MAX_CLOSURE:
                 raise WorkspaceRefusal("published callable closure exceeds its bound")
             own = key == root and captured is not None
-            held = captured if own else self._installed(key)
+            held = captured if own else self._installed(key, hub)
             if held is not None:
                 installed[key] = held
             package = key.partition("@")[0]
-            lock = self._locked(key, held, own)
+            lock = self._locked(key, hub, held, own)
             for locked in machine_release_catalog.callees(package, lock):
-                callee = self._served(locked)
+                callee = self._served(locked, hub)
                 edges.add((key, callee))
                 pending.append(callee)
         return installed, sorted(edges)
 
-    def _served(self, locked: str) -> str:
+    def _served(self, locked: str, hub: str) -> str:
         """A callee release a caller's lock names is a floor, not a pin: the newest release
-        this machine's catalog publishes at or above it serves the call, read once per
-        package until the controller that publishes names it to `forget`."""
+        its Hub's catalog publishes at or above it serves the call, read once per package
+        until the controller that publishes names it to `forget`."""
         package, _, release = locked.partition("@")
         newest = self.worker.resolutions.newest
-        if package not in newest:
+        if (hub, package) not in newest:
             try:
-                newest[package] = machine_release_catalog.newest(
-                    machine_model_resolve.own(self.worker), package
+                newest[(hub, package)] = machine_release_catalog.newest(
+                    machine_model_resolve.own(self.worker, hub=hub), package
                 )
             except WorkspaceRefusal:
                 return locked
-        return (
-            _key(package, newest[package])
-            if Version(newest[package]) > Version(release)
-            else locked
-        )
+        served = newest[(hub, package)]
+        return _key(package, served) if Version(served) > Version(release) else locked
 
     def describe(self, selection: pb.PackageSelection) -> pb.DescribedRelease:
         """A published release as this machine reads it: the newest when none is named, read
         once until the controller that publishes names the package to `forget`."""
         package, release = selection.package, selection.release
+        hub = machine_model_resolve.hub_key(self.worker, selection.hub)
         newest = self.worker.resolutions.newest
         if not release:
-            release = newest.get(package) or machine_release_catalog.newest(
-                machine_model_resolve.own(self.worker), package
+            release = newest.get((hub, package)) or machine_release_catalog.newest(
+                machine_model_resolve.own(self.worker, hub=hub), package
             )
-            newest[package] = release
+            newest[(hub, package)] = release
         key = _key(package, release)
-        held = self._installed(key)
-        raw = held.interface if held is not None else self._facts(key).preparation.package_interface
+        held = self._installed(key, hub)
+        raw = (
+            held.interface
+            if held is not None
+            else self._facts(key, hub).preparation.package_interface
+        )
         return pb.DescribedRelease(package=package, release=release, package_interface=raw)
 
     def _run(self, owner: str, request: pb.MachineExecutionSubmit, job: _Job) -> None:
@@ -366,11 +375,12 @@ class ReleaseRoots:
     def _prepare(self, owner: str, request: pb.MachineExecutionSubmit, job: _Job) -> _Prepared:
         root, worker = request.release_root, self.worker
         assert worker.machine_calls is not None
+        hub = machine_model_resolve.hub_key(worker, root.hub)
         key, captured = self._root(root)
-        installed, edges = self._closure(key, captured)
+        installed, edges = self._closure(key, hub, captured)
         if key not in installed:
             self._note(job, f"installing {key}")
-            installed[key] = self._install(self._facts(key))
+            installed[key] = self._install(self._facts(key, hub))
         prepared = installed[key]
         body = package_interface.read_bytes(prepared.interface, "release root")
         section, kind = ("jobs", "job") if root.job else ("entrypoints", "inference entrypoint")
@@ -416,7 +426,7 @@ class ReleaseRoots:
                 ),
             )
             return _Prepared(
-                key, target, declared, dict(prepared.placement), models, installed, edges
+                key, target, declared, dict(prepared.placement), models, installed, edges, hub=hub
             )
         serving = worker.machine_calls.serving
         call = Call(
@@ -453,7 +463,7 @@ class ReleaseRoots:
         )
         self._register(target, ready.placement, placement_set)
         return _Prepared(
-            key, target, declared, ready.placement, models, installed, edges, placement_set
+            key, target, declared, ready.placement, models, installed, edges, placement_set, hub
         )
 
     def _resolve(
@@ -484,9 +494,9 @@ class ReleaseRoots:
             for model, parameter in zip(slots, parameters, strict=True)
             if parameter not in sourced and not (parameter in pins and pins[parameter]["length"])
         ]
-        # Pinned and sourced slots read nothing; an open one reads this machine's own Hub.
+        # Pinned and sourced slots read nothing; an open one reads the run's Hub.
         catalog = (
-            machine_model_resolve.own(self.worker, root.package)
+            machine_model_resolve.own(self.worker, root.package, root.hub)
             if open_slots
             else machine_model_resolve.Catalog("")
         )
@@ -586,7 +596,7 @@ class ReleaseRoots:
                 names[key] = ("installation_id", held.installation_id)
                 interfaces[key] = package_interface.parse(raw, "installed release")
             else:
-                row = self._facts(key)
+                row = self._facts(key, prepared.hub)
                 rows.append(row)
                 names[key] = ("deferred_key", key)
                 interfaces[key] = package_interface.parse(
@@ -706,6 +716,7 @@ class ReleaseRoots:
             installations=installations,
             state=base64.b64encode(desired.SerializeToString(deterministic=True)).decode(),
             runtime_builtin=worker.machine_calls.builtins.capture(),
+            hub=prepared.hub,
         )
         worker.machine_sources.hold(owner, offer.request_id, request.source_credentials)
         receipt = worker.submit_execution(

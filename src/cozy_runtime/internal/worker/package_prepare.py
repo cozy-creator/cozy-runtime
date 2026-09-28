@@ -202,6 +202,7 @@ def prepare_package_set(
         base=base,
         dependency_cache=dependency_cache,
         materialized=materialized,
+        hub=request.hub,
     )
 
 
@@ -375,6 +376,7 @@ def _prepare_published(
     installed_environment: package_installation.InstalledEnvironment | None = None,
     dependency_cache: Path | None = None,
     materialized: Callable[[package_installation.InstalledEnvironment], None] | None = None,
+    hub: str = "",
 ) -> pb.PreparePackageSetResult:
     """Install from the exact export, read the interface, and author the PlacementSet.
 
@@ -458,7 +460,7 @@ def _prepare_published(
     )
     placement = pb.Placement(
         placement_id=placement_id(package_name, release),
-        package=pb.PackageSelection(package=package_name, release=release),
+        package=pb.PackageSelection(package=package_name, release=release, hub=hub),
         installation_id=installed.installation_id,
         package_interface=interface_raw,
         bindings_digest=bindings_digest,

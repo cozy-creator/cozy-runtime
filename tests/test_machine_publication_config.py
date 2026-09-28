@@ -14,6 +14,7 @@ from cozy_runtime.internal.worker.machine_publication import (
     MachinePublicationClient,
     PublicationAuthority,
     PublicationRefusal,
+    registrations,
 )
 
 
@@ -139,6 +140,53 @@ print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env)
         capture_output=True,
     )
     assert older_host.returncode == 0 and json.loads(older_host.stdout)["origin"] == ""
+
+
+def test_other_hub_registrations_are_read_tolerantly(tmp_path: Path) -> None:
+    """The Host's `machine-hubs.json` names each other Hub's grant, CA and object hosts. An
+    entry this Runtime cannot read, a member it does not know, or a newer document confers
+    only what it can and never stops the machine."""
+    path = tmp_path / "machine-hubs.json"
+    assert registrations(path) == ((), [])
+    (tmp_path / "hub-ca-1.crt").write_text("ca")
+    good = {
+        "origin": "https://hub.example.test",
+        "worker_id": "worker-2",
+        "worker_token": "A" * 43,
+        "ca": "hub-ca-1.crt",
+        "object_storage_hosts": ["storage.example", ".objects.example"],
+        "added_later": True,
+    }
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "hubs": [
+                    good,
+                    {**good, "origin": "http://hub.example.test"},
+                    {**good, "ca": "../escape.crt"},
+                    {**good, "worker_token": "short"},
+                    {"origin": 7},
+                ],
+                "next": {},
+            }
+        )
+    )
+    held, skipped = registrations(path)
+    assert held == (
+        PublicationAuthority(
+            "https://hub.example.test",
+            "worker-2",
+            "A" * 43,
+            tmp_path / "hub-ca-1.crt",
+            (".objects.example", "storage.example"),
+        ),
+    )
+    assert len(skipped) == 4
+    path.write_text(json.dumps({"version": 2, "hubs": [good]}))
+    assert registrations(path)[0] == ()
+    path.write_text("not json")
+    assert registrations(path)[0] == ()
 
 
 def test_object_storage_hosts_are_an_explicit_bounded_deployment_declaration() -> None:

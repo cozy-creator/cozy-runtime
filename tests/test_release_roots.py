@@ -79,6 +79,7 @@ class Catalog:
         # Private: the Models are the owner's unpublished checkpoints, read only with the
         # machine's worker capability (absent: 404, as if absent; another: 401).
         self.private = False
+        self.grant = ("worker", "token")  # the machine's registration at this Hub
         self.presented: list[tuple[str, str, str]] = []
         catalog = self
 
@@ -95,7 +96,7 @@ class Catalog:
                 )
                 if url.path.startswith("/v1/models/"):
                     catalog.presented.append((url.path, *presented))
-                    if catalog.private and presented != ("worker", "token"):
+                    if catalog.private and presented != catalog.grant:
                         error = b'{"error":{"code":"worker.ended","message":"worker ended"}}'
                         self.send_response(401 if presented[0] else 404)
                         self.send_header("Content-Length", str(len(error)))
@@ -391,6 +392,68 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
         catalog.close()
 
 
+def test_a_run_reads_the_hub_it_came_from(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A machine registered at two Hubs reads a run's release, callees and Models at the Hub
+    the run names, with its registration there; its default Hub reads nothing, and what it
+    installed for one Hub is not the other's. A Hub it is not registered at is refused."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    length = len(
+        tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+    )
+    ladder = [{"gpu": "H100", "lane": LANE}]
+    home = Catalog(machine.manifest, length, ladder, interface=machine.interface)
+    other = Catalog(machine.manifest, length, ladder, interface=machine.interface)
+    other.private, other.grant = True, ("other-worker", "other-token")
+    home.serve(machine)
+    worker = machine.worker
+    worker.options = dataclasses.replace(
+        worker.options, hubs=(PublicationAuthority(other.origin, *other.grant),)
+    )
+
+    def paths(catalog: Catalog) -> list[str]:
+        return [urlsplit(path).path for path in catalog.reads]
+
+    try:
+        there = submission(machine, "there")
+        there.release_root.hub = other.origin + "/"
+        assert submit(machine, there)[0].request_id == "there"
+        assert home.reads == [] and "/v1/models/resolve" in paths(other)
+        assert {(who, token) for _, who, token in other.presented} == {other.grant}
+        assert machine.executions.preparation(OWNER, "there")["hub"] == other.origin
+        # Warm at that Hub: nothing is read anywhere.
+        other.reads.clear()
+        again = submission(machine, "again")
+        again.release_root.hub = other.origin
+        assert submit(machine, again)[0].request_id == "again"
+        assert other.reads == [] and home.reads == []
+        query = pb.MachineExecutionWorkspaceQuery(
+            claim=machine.claim, describe=pb.PackageSelection(package=PACKAGE, hub=other.origin)
+        )
+        described = machine.rpc.GetMachineExecutionWorkspace(query, Context()).described_release
+        assert described.release == RELEASE and home.reads == []
+
+        # The same release from the default Hub is that Hub's: read and installed there.
+        assert submit(machine, submission(machine, "home"))[0].request_id == "home"
+        assert f"/v1/packages/{PACKAGE}/releases/{RELEASE}" in paths(home)
+        assert "hub" not in machine.executions.preparation(OWNER, "home")
+
+        elsewhere = submission(machine, "elsewhere")
+        elsewhere.release_root.hub = "https://elsewhere.example"
+        with pytest.raises(Refused, match="not registered at") as refused:
+            submit(machine, elsewhere)
+        assert refused.value.trailers.get("cozy-error-code") == "hub_unregistered"
+    finally:
+        home.close()
+        other.close()
+
+
 def test_an_unstated_manifest_length_is_measured_from_the_bytes_its_digest_names(
     published: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -487,11 +550,13 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
                 options=SimpleNamespace(
                     accelerator_backend="none",
                     publication_authority=PublicationAuthority(catalog.origin, "worker", "token"),
+                    hubs=(),
                 ),
                 host_facts=lambda: hostfacts.measure("none"),
                 executions=SimpleNamespace(
                     capture_root=lambda *_: "root",
                     capture=lambda *_: {"model_defaults": []},
+                    prepared=lambda *_: SimpleNamespace(hub=""),
                 ),
                 lanes=SimpleNamespace(entries=()),
                 resolutions=machine_model_resolve.Resolutions(),
