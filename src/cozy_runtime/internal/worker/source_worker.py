@@ -14,18 +14,21 @@ import msgspec
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef, SourceArtifact
 from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import fill, upload_child
 from cozy_runtime.internal.worker import commit_files
 from cozy_runtime.internal.worker.source_steps import (
     Answer,
+    Composition,
     Convert,
     Download,
     Launch,
+    Member,
+    Prepared,
     Produced,
+    Resolve,
     Resolved,
     ResolveSource,
     Selection,
-    SourceRefusal,
     SourceStep,
     View,
     report,
@@ -89,7 +92,7 @@ def convert(store: fill.Store, step: Convert) -> Produced:
     receipt: Receipt = (
         observed["receipt"]
         if observed.get("state") == "committed"
-        else _compose(store, step, observed.get("writer_session_id"))
+        else _compose(store, step)
     )
     native_receipt = canonical_json.encode(receipt)
     manifest = ObjectRef("sha256:" + receipt["manifest"]["sha256"], receipt["manifest"]["length"])
@@ -100,7 +103,49 @@ def convert(store: fill.Store, step: Convert) -> Produced:
     return Produced(result=msgspec.to_builtins(artifact), native_receipt=native_receipt)
 
 
-def _compose(store: fill.Store, step: Convert, epoch: int | None) -> Receipt:
+def references(store: fill.Store, step: Convert) -> list[Member]:
+    """The converters' pinned reference files (index, configs, tokenizers) for a source that
+    carries no pipeline index, retained once per Store under the reference's own identity."""
+    source = store.tree_root(step.source_owner)
+    if source is None:
+        raise ValueError("conversion lost its retained source")
+    entries = msgspec.json.decode(store.manifest(source["manifest_digest"])["manifest"])
+    if {row.get("path") for row in entries["entries"]} & set(upload_child.DIFFUSERS_INDEXES):
+        return []
+    rows: list[Member] = []
+    profiles = [profile for _, profile in step.slots]
+    converters = fill.tensorfs_module().source_profile_converters(
+        store, profiles, registry=step.registry
+    )
+    for _, reference in converters:
+        if not reference:
+            continue
+        resolve = Resolve(
+            uri=reference,
+            carriers=[],
+            profiles=[],
+            metadata=[],
+            diffusers=True,
+            registry=step.registry,
+            access=step.access,
+        )
+        pinned = upload_child.reference_members(store, resolve, reference)
+        owner = (
+            "sha256:" + hashlib.sha256(b"converter-reference\0" + reference.encode()).hexdigest()
+        )
+        store.materialize_source(
+            owner,
+            pinned.members,
+            allowed_hosts=pinned.allowed_hosts,
+            credential_hosts=pinned.credential_hosts,
+            credential=step.access["credential"],
+            allow_local=step.access["allow_local"],
+        )
+        rows.extend(pinned.members)
+    return rows
+
+
+def _compose(store: fill.Store, step: Convert) -> Receipt:
     """One reviewed profile per slot; several profiles compose one model whose components
     are the union of theirs."""
     retained = store.tree_root(step.source_owner)
@@ -130,59 +175,15 @@ def _compose(store: fill.Store, step: Convert, epoch: int | None) -> Receipt:
         checkpoints = [
             (row["slot"], row["head"], row["head_length"]) for row in prepared["checkpoints"]
         ]
-    converted = {row["slot"]: row for row in prepared["sources"]}
-    if epoch:
-        store.derived_fence(step.native_owner, epoch)
-    sources: dict[str, tuple[str, int]] = {}
-    targets: dict[str, dict[str, object]] = {}
-    configs: dict[str, dict[str, str]] = {}
-    order: list[tuple[str, str]] = []
-    assets: dict[str, list[str]] = {}
-    for slot, _ in step.slots:
-        part = converted[slot]
-        sources[slot] = (part["manifest_digest"], part["manifest_length"])
-        header = fill.tensorfs_module().parse_header(
-            store.manifest(part["manifest_digest"])["header"]
-        )
-        for name, tensors in header["components"].items():
-            if name in targets:
-                raise SourceRefusal(
-                    "model_source_components_overlap",
-                    f"source profiles both produce component {name}",
-                )
-            targets[name] = {"source": slot, "source_component": name, "drop": [], "add": {}}
-            order.extend((name, key) for key in tensors)
-        for name in header["configs"]:
-            if name in configs:
-                raise SourceRefusal(
-                    "model_source_configs_overlap", f"source profiles both carry config {name}"
-                )
-            configs[name] = {"kind": "copy", "source": slot, "source_config": name}
-        if header["assets"]:
-            assets[slot] = sorted(header["assets"])
-    writer = store.begin_derived(
-        step.native_owner,
-        step.writer_epoch,
-        sources,
-        targets,
-        configs,
-        order,
-        0,
-        work_fingerprint=step.computation_digest,
+    composition = Composition(
+        native_owner=step.native_owner,
+        writer_epoch=step.writer_epoch,
+        computation_digest=step.computation_digest,
+        metadata=references(store, step),
+        recipe="",
     )
-    receipt: Receipt = writer.commit()
-    for slot, names in assets.items():
-        inherited = store.inherit_model_assets(
-            receipt["manifest"]["sha256"],
-            receipt["manifest"]["length"],
-            sources[slot][0],
-            sources[slot][1],
-            names,
-        )
-        receipt["manifest"] = {
-            "sha256": str(inherited["manifest_id"]).removeprefix("sha256:"),
-            "length": int(inherited["manifest_length"]),
-        }
+    upload_child.compose(store, composition, msgspec.convert(prepared["sources"], list[Prepared]))
+    receipt: Receipt = store.derived_lookup(step.native_owner)["receipt"]
     return receipt
 
 

@@ -1,8 +1,9 @@
-"""A generic Hugging Face Diffusers upload carries each component's construction config.
+"""A generic Hugging Face Diffusers upload carries everything its pipeline needs to run.
 
 A reviewed profile converts tensors only. The pipeline's own index names its components;
-each model's ``config.json`` and each scheduler's ``scheduler_config.json`` at the same
-pinned revision ride as the checkpoint's inline configs, so a package can construct it.
+the index, each model's ``config.json`` and each scheduler's ``scheduler_config.json`` at
+the same pinned revision ride as the checkpoint's inline configs, and every tokenizer or
+processor file as a model asset, so a package constructs and runs it with nothing fetched.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from pathlib import Path
 from weakref import WeakValueDictionary
 
 import pytest
+import tensorfs
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._loader import Config
@@ -179,7 +181,7 @@ def test_a_diffusers_upload_carries_each_components_config_and_prepares(
         assert resolved.state == pb.NATIVE_SOURCE_STATE_RESOLVED, resolved.safe_detail
         selected = {row.member for row in resolved.selection.members}
         assert {"encoder/config.json", "scheduler/scheduler_config.json"} <= selected
-        assert not any(member.startswith("tokenizer/") for member in selected)
+        assert {"tokenizer/tokenizer_config.json", "tokenizer/vocab.json"} <= selected
         assert {m for m in selected if m.endswith(".safetensors")} == set(NAMED["carriers"])
         command.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
         command.selection.CopyFrom(resolved.selection)
@@ -204,5 +206,13 @@ def test_a_diffusers_upload_carries_each_components_config_and_prepares(
         construction_slots={SLOT},
     )
     constructor = json.loads(models[SLOT]["config_bytes"])
-    assert constructor == CONFIGS
+    index = next(name for name in files if name.endswith("model_index.json"))
+    assert constructor == {**CONFIGS, index.removesuffix(".json"): json.loads(files[index])}
+    store = tensorfs.Store.open(str(workspace.store_root))
+    header = tensorfs.parse_header(store.manifest(manifest["digest"])["header"])
+    assets = {name: row["logical_sha256"] for name, row in header["assets"].items()}
+    assert assets == {
+        name: hashlib.sha256(files[name]).hexdigest()
+        for name in ("tokenizer/tokenizer_config.json", "tokenizer/vocab.json")
+    }
     Config(constructor)  # carries no source carrier a factory could read

@@ -13,7 +13,7 @@ import re
 import signal
 import subprocess
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import get_args, get_type_hints
@@ -523,6 +523,13 @@ class SourceCalls:
             )
         return _answer(output, stderr, command.credential, answer)
 
+    def _converters(self, profiles: Sequence[str]) -> list[list[str]]:
+        """The versioned converters the profiles bind, each with its pinned reference."""
+        rows = fill.tensorfs_module().source_profile_converters(
+            fill.store(self.workspace.store_root), list(profiles), registry=self.native_registry
+        )
+        return [[name, reference or ""] for name, reference in rows]
+
     def _upload(
         self,
         owner: str,
@@ -548,7 +555,6 @@ class SourceCalls:
         phase: str,
         finish: Callable[[], None],
     ) -> None:
-        upload_plan.require_bindings(fill.tensorfs_module(), row.operation)
         if self.publication is None:
             raise NativeSourceFailure("publication_authority_absent")
         call = command.parent_call
@@ -610,6 +616,7 @@ class SourceCalls:
             effective: dict[str, object] = {
                 "source": content["content_manifest"],
                 "slots": upload.slots,
+                "converters": self._converters([profile for _, profile in upload.slots]),
                 "recipe": upload.recipe.name if upload.recipe is not None else "",
                 "destination": request.destination,
             }
@@ -801,6 +808,8 @@ class SourceCalls:
                     )
                     if self.native_registry is not None:
                         effective["registry"] = hashlib.sha256(self.native_registry).hexdigest()
+                    # The versioned converters (and their pinned references) are the meaning.
+                    effective["converters"] = self._converters(profiles)
                 else:
                     content = workspace_sources.selection_content(command.selection)
                     effective = {"source": content["content_manifest"]}
@@ -831,6 +840,7 @@ class SourceCalls:
                         ),
                         writer_epoch=call.parent_attempt_ordinal,
                         computation_digest=documents.spell(computation),
+                        access=access,
                     )
                 else:
                     workspace_sources.adopt_download_progress(

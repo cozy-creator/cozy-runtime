@@ -239,7 +239,7 @@ def test_an_unrecognized_repository_uploads_one_default_file_per_folder_as_is(
     assert json.loads(header["configs"]["normalization"]) == RAW
     # The record is TensorFS metadata, never construction input.
     constructor = json.loads(_prepare(root, "example/unknown-model", digest)[SLOT]["config_bytes"])
-    assert constructor == CONFIGS
+    assert constructor == {**CONFIGS, "model_index": json.loads(files["model_index.json"])}
 
 
 def test_a_malformed_carrier_still_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,4 +1,4 @@
-"""Loopback stand-ins for an upload's three peers: a HuggingFace origin, Tensorhub's
+"""Loopback stand-ins for an upload's peers: HuggingFace and Civitai origins, Tensorhub's
 publication API with its object store, and the pod supervisor's disk admission.
 
 Each keeps the byte accounting a test asserts on. The Hub stand-in implements the frozen
@@ -134,6 +134,60 @@ class HuggingFace:
                             origin.watch(origin.total())
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+
+        with serve(Handler) as url:
+            yield url
+
+
+class Civitai:
+    """Serves one model version whose primary SafeTensors file is ``body``, ranged."""
+
+    def __init__(self, version: int, file_id: int, body: bytes) -> None:
+        self.version, self.file_id, self.body = version, file_id, body
+        self.requests = 0
+
+    @contextmanager
+    def running(self) -> Iterator[str]:
+        origin = self
+        listing = json.dumps(
+            {
+                "id": self.version,
+                "files": [
+                    {
+                        "id": self.file_id,
+                        "name": "model.safetensors",
+                        "primary": True,
+                        "hashes": {"SHA256": hashlib.sha256(self.body).hexdigest().upper()},
+                    }
+                ],
+            }
+        ).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                origin.requests += 1
+                if self.path == f"/api/v1/model-versions/{origin.version}":
+                    data = listing
+                    self.send_response(200)
+                else:
+                    assert self.path == (
+                        f"/api/download/models/{origin.version}?fileId={origin.file_id}"
+                    ), self.path
+                    start, end = 0, len(origin.body) - 1
+                    if spec := self.headers.get("Range"):
+                        first, _, last = spec.removeprefix("bytes=").partition("-")
+                        start, end = int(first), min(int(last or end), end)
+                        self.send_response(206)
+                        self.send_header("Content-Range", f"bytes {start}-{end}/{len(origin.body)}")
+                    else:
+                        self.send_response(200)
+                    data = origin.body[start : end + 1]
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
 
         with serve(Handler) as url:
             yield url
