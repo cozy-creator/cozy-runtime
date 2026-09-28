@@ -7,7 +7,7 @@ import dataclasses
 import threading
 from collections.abc import Callable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import grpc
 
@@ -21,11 +21,14 @@ from cozy_runtime.internal.worker import (
     triage,
 )
 from cozy_runtime.internal.worker.plan import PlanRefusal
+from cozy_runtime.internal.worker.servicer_context import ServicerContext
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import (
     TERMINAL,
+    EventPage,
     ExecutionWorkspaceRefusal,
     StaleExecutionGeneration,
+    State,
 )
 from cozy_runtime.protocol import (
     MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR,
@@ -46,7 +49,7 @@ class MachineExecutionRPC:
     def __init__(self, worker: Worker):
         self.worker = worker
 
-    def _call(self, claim: pb.Claim, context: Any, operation: Callable[[], Any]) -> Any:
+    def _call[T](self, claim: pb.Claim, context: ServicerContext, operation: Callable[[], T]) -> T:
         try:
             if claim.wire_minor < WORKSPACE_FENCED_EXECUTION_WIRE_MINOR:
                 raise WorkspaceRefusal("workspace-fenced machine execution requires wire59")
@@ -55,10 +58,10 @@ class MachineExecutionRPC:
             self.worker.authorize_workspace(claim)
             return operation()
         except _ExecutionNotFound as exc:
-            return context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+            context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
         except machine_release_roots.Preparing as exc:
             context.set_trailing_metadata((("cozy-error-code", "release_root_preparing"),))
-            return context.abort(grpc.StatusCode.UNAVAILABLE, str(exc)[:512])
+            context.abort(grpc.StatusCode.UNAVAILABLE, str(exc)[:512])
         except machine_release_roots.InstallationsAbsent as exc:
             context.set_trailing_metadata(
                 (
@@ -66,13 +69,13 @@ class MachineExecutionRPC:
                     *(("cozy-absent-release", key) for key in exc.keys),
                 )
             )
-            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
         except ExecutionWorkspaceRefusal as exc:
             context.set_trailing_metadata((("cozy-error-code", exc.code),))
-            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
         except StaleExecutionGeneration as exc:
             context.set_trailing_metadata((("cozy-error-code", exc.code),))
-            return context.abort(grpc.StatusCode.ABORTED, str(exc))
+            context.abort(grpc.StatusCode.ABORTED, str(exc))
         except (
             ValueError,
             canonical.CanonicalError,
@@ -82,11 +85,11 @@ class MachineExecutionRPC:
             ConformanceError,
             PlanRefusal,
         ) as exc:
-            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
         except Exception as exc:
             code = getattr(exc, "code", None)
             if code in {"ROOT_ABSENT", "OBJECT_ABSENT", "OBJECT_CORRUPT", "LENGTH_MISMATCH"}:
-                return context.abort(
+                context.abort(
                     grpc.StatusCode.FAILED_PRECONDITION,
                     f"retained execution output is unavailable: {code}",
                 )
@@ -97,7 +100,7 @@ class MachineExecutionRPC:
             trace = prepare_diagnostics.exception_trace(exc)
             for line in prepare_diagnostics.activity_lines(trace):
                 self.worker.note("machine_execution", f"traceback: {line}")
-            return context.abort(
+            context.abort(
                 grpc.StatusCode.UNAVAILABLE, f"machine execution operation failed ({name})"
             )
 
@@ -108,8 +111,8 @@ class MachineExecutionRPC:
         executions.require_workspace(query.expected_execution_workspace_id)
 
     def GetMachineExecutionWorkspace(
-        self, request: pb.MachineExecutionWorkspaceQuery, context: Any
-    ) -> Any:
+        self, request: pb.MachineExecutionWorkspaceQuery, context: ServicerContext
+    ) -> pb.MachineExecutionWorkspace:
         def get() -> pb.MachineExecutionWorkspace:
             assert self.worker.executions is not None
             options = self.worker.options
@@ -149,10 +152,15 @@ class MachineExecutionRPC:
 
         return self._call(request.claim, context, get)
 
-    def _state(self, state: Any) -> pb.MachineExecutionState:
+    def _state(self, state: State) -> pb.MachineExecutionState:
         assert self.worker.executions is not None
         return pb.MachineExecutionState(
-            **state.document(),
+            request_id=state.request_id,
+            attempt_ordinal=state.attempt_ordinal,
+            generation=state.generation,
+            state=state.state,
+            collected=state.collected,
+            sequence=state.sequence,
             worker_id=self.worker.options.worker_id,
             worker_boot_id=self.worker.fence.worker_boot_id,
             execution_workspace_id=self.worker.executions.workspace_id,
@@ -164,7 +172,9 @@ class MachineExecutionRPC:
             ),
         )
 
-    def SubmitMachineExecution(self, request: pb.MachineExecutionSubmit, context: Any) -> Any:
+    def SubmitMachineExecution(
+        self, request: pb.MachineExecutionSubmit, context: ServicerContext
+    ) -> pb.MachineExecutionReceipt:
         if request.HasField("release_root"):
             return self._submit_release_root(request, context)
 
@@ -261,7 +271,9 @@ class MachineExecutionRPC:
 
         return self._call(request.claim, context, checked_submit)
 
-    def _submit_release_root(self, request: pb.MachineExecutionSubmit, context: Any) -> Any:
+    def _submit_release_root(
+        self, request: pb.MachineExecutionSubmit, context: ServicerContext
+    ) -> pb.MachineExecutionReceipt:
         """Answer a receipt, the preparation's progress, or the releases lacking facts."""
 
         def submit() -> pb.MachineExecutionReceipt:
@@ -295,7 +307,9 @@ class MachineExecutionRPC:
 
         return self._call(request.claim, context, submit)
 
-    def GetMachineExecution(self, request: pb.MachineExecutionQuery, context: Any) -> Any:
+    def GetMachineExecution(
+        self, request: pb.MachineExecutionQuery, context: ServicerContext
+    ) -> pb.MachineExecutionState:
         def get() -> pb.MachineExecutionState:
             self._query(request)
             assert self.worker.executions is not None
@@ -306,8 +320,8 @@ class MachineExecutionRPC:
         return self._call(request.claim, context, get)
 
     def ListMachineExecutionEvents(
-        self, request: pb.MachineExecutionEventsQuery, context: Any
-    ) -> Any:
+        self, request: pb.MachineExecutionEventsQuery, context: ServicerContext
+    ) -> pb.MachineExecutionEventPage:
         def events() -> pb.MachineExecutionEventPage:
             self._query(request.execution)
             if self.worker.owner_memo is not None:
@@ -343,7 +357,9 @@ class MachineExecutionRPC:
 
         return self._call(request.execution.claim, context, events)
 
-    def _wait_events(self, request: pb.MachineExecutionEventsQuery, context: Any) -> Any:
+    def _wait_events(
+        self, request: pb.MachineExecutionEventsQuery, context: ServicerContext
+    ) -> EventPage:
         executions = self.worker.executions
         assert executions is not None
         owner = self.worker.authorize_workspace(request.execution.claim)
@@ -354,8 +370,8 @@ class MachineExecutionRPC:
             left.set()
             changes.bump()
 
-        if hasattr(context, "add_callback"):
-            context.add_callback(leave)
+        if not context.add_callback(leave):
+            leave()
         memo = self.worker.owner_memo
         with (
             memo.wait_read(owner, request.execution.request_id, left.is_set)
@@ -370,7 +386,9 @@ class MachineExecutionRPC:
                 lambda: left.is_set() or self.worker.stop.is_set(),
             )
 
-    def ControlMachineExecution(self, request: pb.MachineExecutionControl, context: Any) -> Any:
+    def ControlMachineExecution(
+        self, request: pb.MachineExecutionControl, context: ServicerContext
+    ) -> pb.MachineExecutionState:
         def control() -> pb.MachineExecutionState:
             self._query(request.execution)
             if request.action == pb.MACHINE_EXECUTION_ACTION_RECONCILE_PUBLICATION:
@@ -399,7 +417,7 @@ class MachineExecutionRPC:
 
         return self._call(request.execution.claim, context, control)
 
-    def _answer_memo(self, request: pb.MachineExecutionControl) -> Any:
+    def _answer_memo(self, request: pb.MachineExecutionControl) -> State:
         memo, executions = self.worker.owner_memo, self.worker.executions
         claim, request_id = request.execution.claim, request.execution.request_id
         if memo is None or executions is None:
@@ -409,7 +427,9 @@ class MachineExecutionRPC:
         memo.answer(claim.record_owner_id, request_id, request.memo)
         return self.worker.execution_status(claim, request_id)
 
-    def CollectMachineExecution(self, request: pb.MachineExecutionCollect, context: Any) -> Any:
+    def CollectMachineExecution(
+        self, request: pb.MachineExecutionCollect, context: ServicerContext
+    ) -> pb.AttemptOutcome:
         def collect() -> pb.AttemptOutcome:
             self._query(request.execution)
             return self.worker.collect_execution(
@@ -421,8 +441,8 @@ class MachineExecutionRPC:
         return self._call(request.execution.claim, context, collect)
 
     def ReadMachineExecutionTriage(
-        self, request: pb.MachineExecutionTriageQuery, context: Any
-    ) -> Any:
+        self, request: pb.MachineExecutionTriageQuery, context: ServicerContext
+    ) -> pb.MachineExecutionTriage:
         def read() -> pb.MachineExecutionTriage:
             self._query(request.execution)
             executions = self.worker.executions
@@ -461,8 +481,8 @@ class MachineExecutionRPC:
         return self._call(request.execution.claim, context, read)
 
     def AcknowledgeMachineExecutionCollection(
-        self, request: pb.MachineExecutionCollectionAck, context: Any
-    ) -> Any:
+        self, request: pb.MachineExecutionCollectionAck, context: ServicerContext
+    ) -> pb.MachineExecutionState:
         def acknowledge() -> pb.MachineExecutionState:
             self._query(request.execution)
             if request.outcome.request_id != request.execution.request_id:

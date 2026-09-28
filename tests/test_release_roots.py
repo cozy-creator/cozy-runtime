@@ -31,28 +31,19 @@ from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_diffusers_upload_configs import PROFILE, _registry, _repository
-from test_same_release_placements import LANE, LOCKED, OWNER, PACKAGE, RELEASE, Machine
+from test_same_release_placements import (
+    LANE,
+    LOCKED,
+    OWNER,
+    PACKAGE,
+    RELEASE,
+    Context,
+    Machine,
+    Refused,
+)
 from upload_standins import HuggingFace, Supervisor
 
 SLOT = "touch.models.model"
-
-
-class Refused(Exception):
-    def __init__(self, code: Any, detail: str, trailers: tuple[tuple[str, str], ...]) -> None:
-        super().__init__(detail)
-        self.code, self.trailers = code, dict(trailers)
-        self.absent = [value for key, value in trailers if key == "cozy-absent-release"]
-
-
-class Context:
-    def __init__(self) -> None:
-        self.trailers: tuple[tuple[str, str], ...] = ()
-
-    def abort(self, code: Any, detail: str) -> None:
-        raise Refused(code, detail, self.trailers)
-
-    def set_trailing_metadata(self, metadata: tuple[tuple[str, str], ...]) -> None:
-        self.trailers = metadata
 
 
 class Catalog:

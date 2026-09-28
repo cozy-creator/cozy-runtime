@@ -34,7 +34,7 @@ import threading
 from collections.abc import Callable, Iterator
 from concurrent import futures
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 import grpc
 
@@ -42,6 +42,8 @@ from cozy_runtime.internal.numerical_environment import NumericalEnvironmentRefu
 from cozy_runtime.internal.worker.derived_retention import RetentionRefusal
 from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
 from cozy_runtime.internal.worker.model_source_prepare import ModelSourceRefusal
+from cozy_runtime.internal.worker.package_prepare import PreparationRefusal
+from cozy_runtime.internal.worker.servicer_context import ServicerContext
 from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
 from cozy_runtime.internal.worker.workspace_rpc import WorkspaceRPC
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
@@ -111,7 +113,9 @@ class _Servicer(MachineExecutionRPC):
         for reader in readers:
             reader.join()
 
-    def Control(self, request_iterator: Any, context: Any) -> Any:
+    def Control(
+        self, request_iterator: Iterator[pb.RecordOwnerFrame], context: ServicerContext
+    ) -> Iterator[pb.WorkerFrame]:
         out: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
 
         def conversation() -> None:
@@ -134,7 +138,9 @@ class _Servicer(MachineExecutionRPC):
                 return
             yield frame
 
-    def WatchProgress(self, request: pb.ProgressOpen, context: Any) -> Any:
+    def WatchProgress(
+        self, request: pb.ProgressOpen, context: ServicerContext
+    ) -> Iterator[pb.AttemptProgress]:
         yield from self.plane.watch(request, on_cancel=context.add_callback)
 
 
@@ -149,13 +155,16 @@ class _RuntimeWeightsServicer:
     def __init__(self, weights: RuntimeWeightsHost) -> None:
         self.weights = weights
 
-    def Exchange(self, request_iterator: Any, context: Any) -> Any:
-
-        return context.abort(
+    def Exchange(
+        self, request_iterator: Iterator[pb.WeightsHostAck], context: ServicerContext
+    ) -> Iterator[pb.WeightsHostEvent]:
+        context.abort(
             grpc.StatusCode.UNIMPLEMENTED, "Host writer acknowledgments were retired in wire 41"
         )
 
-    def Upload(self, request: pb.WeightsUploadRequest, context: Any) -> Any:
+    def Upload(
+        self, request: pb.WeightsUploadRequest, context: ServicerContext
+    ) -> pb.WeightsUploadResult:
         # `upload` answers as a WorkerFrame for the pre-21 control lane; the unary RPC wants
         # its inner result.
         return self.weights.upload(request).weights_upload_result
@@ -233,7 +242,8 @@ class GrpcControlHost:
         #: The loopback weights seam (proto-025), served only when a pod supervisor is the
         #: peer. Absent on a local run, where there is no supervisor to open `Exchange`.
         self.weights = weights
-        self.server: Any = None
+        # grpcio is untyped in the check venv, so mypy sees this as Any.
+        self.server: grpc.Server | None = None
         self.stopped = threading.Event()
 
     def serve(self, plane: ControlPlane) -> None:
@@ -242,8 +252,8 @@ class GrpcControlHost:
 
         executor = futures.ThreadPoolExecutor(max_workers=8)
         control = _Servicer(plane)
-        self.server = grpc.server(executor)
-        pb_grpc.add_WorkerControlServicer_to_server(control, self.server)
+        self.server = server = grpc.server(executor)
+        pb_grpc.add_WorkerControlServicer_to_server(control, server)
         loopback_services = (
             self.workspace_service is not None
             or self.preparer is not None
@@ -280,16 +290,16 @@ class GrpcControlHost:
                 self.store_collector,
                 self.workspace_service,
             ),
-            self.server,
+            server,
         )
         if self.weights is not None:
             # Loopback-only, exactly like RuntimePreparation: the supervisor dials it on the
             # same 127.0.0.1 listener and it is never reachable from the external leg.
             pb_grpc.add_RuntimeWeightsServicer_to_server(
-                _RuntimeWeightsServicer(self.weights), self.server
+                _RuntimeWeightsServicer(self.weights), server
             )
         if self.listen.startswith("unix:"):
-            self.server.add_insecure_port(self.listen)
+            server.add_insecure_port(self.listen)
             address = self.listen
         elif self.tls_cert is not None and self.tls_key is not None:
             # THE REMOTE LEG (cl-015 / #445): one-way TLS with the worker's own cert —
@@ -298,21 +308,21 @@ class GrpcControlHost:
             credentials = grpc.ssl_server_credentials(
                 [(self.tls_key.read_bytes(), self.tls_cert.read_bytes())]
             )
-            port = self.server.add_secure_port(self.listen, credentials)
+            port = server.add_secure_port(self.listen, credentials)
             host = self.listen.rsplit(":", 1)[0]
             address = f"{host}:{port}"
         else:
-            port = self.server.add_insecure_port(self.listen)
+            port = server.add_insecure_port(self.listen)
             host = self.listen.rsplit(":", 1)[0]
             address = f"{host}:{port}"
         try:
-            self.server.start()
+            server.start()
             write_addr(self.addr_file, address)
             if self.on_bound is not None:
                 self.on_bound(address)
             self.stopped.wait()
         finally:
-            self.server.stop(grace=0).wait()
+            server.stop(grace=0).wait()
             executor.shutdown(wait=True)
             control.wait_closed()
             self.stopped.set()
@@ -343,8 +353,8 @@ _TRANSIENT_STORE_CODES = frozenset(
 
 
 def _custody_failure(
-    context: Any, exc: BaseException, what: str, *permanent: type[BaseException]
-) -> Any:
+    context: ServicerContext, exc: BaseException, what: str, *permanent: type[BaseException]
+) -> NoReturn:
     """Refuse only what retrying cannot change; everything else is UNAVAILABLE (retry).
 
     A typed Runtime refusal and a TensorFS refusal about the request's data are verdicts. A
@@ -359,14 +369,14 @@ def _custody_failure(
     if isinstance(exc, permanent) or (
         store_code is not None and store_code not in _TRANSIENT_STORE_CODES
     ):
-        return context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"{what} was refused")
-    return context.abort(
+        context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"{what} was refused")
+    context.abort(
         grpc.StatusCode.UNAVAILABLE,
         f"{what} is temporarily unavailable ({store_code or type(exc).__name__}); retry",
     )
 
 
-def _refuse(context: Any, exc: BaseException) -> Any:
+def _refuse(context: ServicerContext, exc: BaseException) -> NoReturn:
     """Answer one failed preparation call, saying WHICH KIND of failure it was.
 
     The host on the other end of this loopback journals a refusal as the permanent answer
@@ -395,18 +405,15 @@ def _refuse(context: Any, exc: BaseException) -> Any:
     opposite default from a retry classifier and correct for the same reason: the safe
     default is the one whose mistake is recoverable.
     """
-
-    from . import package_prepare
-
-    if isinstance(exc, package_prepare.PreparationRefusal):
-        return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
+    if isinstance(exc, PreparationRefusal):
+        context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
     # The type is part of the diagnosis and was being discarded: `PermissionError` and
     # `FileNotFoundError` send an operator to two different places, and `str(exc)` alone
     # frequently names neither. A typed failure's own stable code rides beside it.
     code = getattr(exc, "code", None)
     if isinstance(code, str) and _ERROR_CODE.fullmatch(code):
         context.set_trailing_metadata((("cozy-error-code", code),))
-    return context.abort(grpc.StatusCode.INTERNAL, f"{type(exc).__name__}: {exc}"[:1024])
+    context.abort(grpc.StatusCode.INTERNAL, f"{type(exc).__name__}: {exc}"[:1024])
 
 
 class _PreparationServicer(WorkspaceRPC):
@@ -460,7 +467,7 @@ class _PreparationServicer(WorkspaceRPC):
         self.workspace_service = workspace_service
 
     def ProtocolInfo(
-        self, _request: pb.ProtocolInfoRequest, _context: Any
+        self, _request: pb.ProtocolInfoRequest, _context: ServicerContext
     ) -> pb.ProtocolInfoResult:
         return pb.ProtocolInfoResult(
             wire_minor=WIRE_MINOR,
@@ -473,56 +480,51 @@ class _PreparationServicer(WorkspaceRPC):
             supports_prepare_while_landing=self.package_handler is not None,
         )
 
-    def NumericalEnvironment(self, _request: pb.NumericalEnvironmentRequest, context: Any) -> Any:
-
+    def NumericalEnvironment(
+        self, _request: pb.NumericalEnvironmentRequest, context: ServicerContext
+    ) -> pb.NumericalEnvironmentResult:
         if self.numerical_environment is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "numerical environment is unavailable"
-            )
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "numerical environment is unavailable")
         try:
             digest = self.numerical_environment()
             if len(digest) != 32:
                 raise NumericalEnvironmentRefusal("invalid numerical identity")
             return pb.NumericalEnvironmentResult(digest=digest)
         except Exception as exc:
-            return _custody_failure(
+            _custody_failure(
                 context, exc, "numerical environment identity", NumericalEnvironmentRefusal
             )
 
     def ValidateWeightsCheckpoint(
-        self, request: pb.ValidateWeightsCheckpointRequest, context: Any
-    ) -> Any:
+        self, request: pb.ValidateWeightsCheckpointRequest, context: ServicerContext
+    ) -> pb.ValidateWeightsCheckpointResult:
         if self.weights_checkpoint_validator is None:
-            return context.abort(
+            context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "weights checkpoint validation unavailable"
             )
         return self.weights_checkpoint_validator(request)
 
-    def CheckpointPage(self, request: pb.CheckpointPageRequest, context: Any) -> Any:
+    def CheckpointPage(
+        self, request: pb.CheckpointPageRequest, context: ServicerContext
+    ) -> pb.CheckpointPageResult:
         if self.checkpoint_pager is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "source checkpoint page unavailable"
-            )
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "source checkpoint page unavailable")
         return self.checkpoint_pager(request)
 
-    def CheckpointTransfer(self, request: pb.CheckpointTransferRequest, context: Any) -> Any:
+    def CheckpointTransfer(
+        self, request: pb.CheckpointTransferRequest, context: ServicerContext
+    ) -> pb.CheckpointTransferStatus:
         if self.checkpoint_transfer is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "source checkpoint transfer unavailable"
-            )
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "source checkpoint transfer unavailable")
         return self.checkpoint_transfer(request)
 
     def CheckPackageSetCompatibility(
-        self, request: pb.PreparePackageSetRequest, context: Any
-    ) -> Any:
+        self, request: pb.PreparePackageSetRequest, context: ServicerContext
+    ) -> pb.CheckPackageSetCompatibilityResult:
         """Minor 60's pre-check runs the same cached preparation as the following call."""
-        from .package_prepare import PreparationRefusal
-
         handler = self.package_handler
         if handler is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "package preparation is unavailable"
-            )
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "package preparation is unavailable")
         try:
             handler(request)
         except PreparationRefusal as exc:
@@ -533,102 +535,95 @@ class _PreparationServicer(WorkspaceRPC):
                 )[:1024],
             )
         except Exception as exc:
-            return _refuse(context, exc)
+            _refuse(context, exc)
         return pb.CheckPackageSetCompatibilityResult()
 
-    def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
-        handler = self.package_handler
-        if handler is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "package preparation is unavailable"
-            )
-        try:
-            return handler(request)
-        except Exception as exc:
-            return _refuse(context, exc)
+    def PreparePackageSet(
+        self, request: pb.PreparePackageSetRequest, context: ServicerContext
+    ) -> pb.PreparePackageSetResult:
+        return _prepared(context, self.package_handler, request, "package preparation")
 
-    def PrepareModelSource(self, request: pb.PrepareModelSourceRequest, context: Any) -> Any:
-        handler = self.model_source_handler
-        if handler is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "model source preparation is unavailable"
-            )
-        try:
-            return handler(request)
-        except Exception as exc:
-            return _refuse(context, exc)
+    def PrepareModelSource(
+        self, request: pb.PrepareModelSourceRequest, context: ServicerContext
+    ) -> pb.PrepareModelSourceResult:
+        return _prepared(context, self.model_source_handler, request, "model source preparation")
 
-    def ReleaseModelSource(self, request: pb.ReleaseModelSourceRequest, context: Any) -> Any:
-
+    def ReleaseModelSource(
+        self, request: pb.ReleaseModelSourceRequest, context: ServicerContext
+    ) -> pb.ReleaseModelSourceResult:
         if self.model_source_releaser is None:
-            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "source release is unavailable")
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "source release is unavailable")
         try:
             self.model_source_releaser(request.operation_id)
         except Exception as exc:
-            return _custody_failure(context, exc, "source release", ModelSourceRefusal)
+            _custody_failure(context, exc, "source release", ModelSourceRefusal)
         return pb.ReleaseModelSourceResult(operation_id=request.operation_id, released=True)
 
-    def RetainDerivedResult(self, request: pb.DerivedRetentionRequest, context: Any) -> Any:
+    def RetainDerivedResult(
+        self, request: pb.DerivedRetentionRequest, context: ServicerContext
+    ) -> pb.DerivedRetentionResult:
         return self._derived_retention(request, context, False)
 
-    def CollectStoreGarbage(self, _request: pb.CollectStoreGarbageRequest, context: Any) -> Any:
-
+    def CollectStoreGarbage(
+        self, _request: pb.CollectStoreGarbageRequest, context: ServicerContext
+    ) -> pb.CollectStoreGarbageResult:
         if self.store_collector is None:
-            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "store collection is unavailable")
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "store collection is unavailable")
         try:
             return self.store_collector()
         except Exception as exc:
-            return _custody_failure(context, exc, "store collection")
+            _custody_failure(context, exc, "store collection")
 
-    def ReleaseDerivedResult(self, request: pb.DerivedResultReleaseRequest, context: Any) -> Any:
-
+    def ReleaseDerivedResult(
+        self, request: pb.DerivedResultReleaseRequest, context: ServicerContext
+    ) -> pb.DerivedResultReleaseResult:
         if self.derived_result_releaser is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "derived result release is unavailable"
-            )
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "derived result release is unavailable")
         try:
             return self.derived_result_releaser(request)
         except Exception as exc:
-            return _custody_failure(context, exc, "derived result release", RetentionRefusal)
+            _custody_failure(context, exc, "derived result release", RetentionRefusal)
 
-    def ReleaseDerivedRetention(self, request: pb.DerivedRetentionRequest, context: Any) -> Any:
+    def ReleaseDerivedRetention(
+        self, request: pb.DerivedRetentionRequest, context: ServicerContext
+    ) -> pb.DerivedRetentionResult:
         return self._derived_retention(request, context, True)
 
     def _derived_retention(
-        self, request: pb.DerivedRetentionRequest, context: Any, release: bool
-    ) -> Any:
-
+        self, request: pb.DerivedRetentionRequest, context: ServicerContext, release: bool
+    ) -> pb.DerivedRetentionResult:
         if self.derived_retainer is None:
-            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "derived retention is unavailable")
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "derived retention is unavailable")
         try:
             return self.derived_retainer(request, release)
         except Exception as exc:
-            return _custody_failure(context, exc, "derived retention", RetentionRefusal)
+            _custody_failure(context, exc, "derived retention", RetentionRefusal)
 
-    def PrepareLocalPackage(self, request: pb.PrepareLocalPackageRequest, context: Any) -> Any:
-        handler = self.local_package_handler
-        if handler is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "local package preparation is unavailable"
-            )
-        try:
-            return handler(request)
-        except Exception as exc:
-            return _refuse(context, exc)
+    def PrepareLocalPackage(
+        self, request: pb.PrepareLocalPackageRequest, context: ServicerContext
+    ) -> pb.PreparePackageSetResult:
+        return _prepared(context, self.local_package_handler, request, "local package preparation")
 
     def PreparePrivatePlacement(
-        self, request: pb.PreparePrivatePlacementRequest, context: Any
-    ) -> Any:
-        handler = self.unpublished_placement_handler
-        if handler is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED,
-                "unpublished package placement preparation is unavailable",
-            )
-        try:
-            return handler(request)
-        except Exception as exc:
-            return _refuse(context, exc)
+        self, request: pb.PreparePrivatePlacementRequest, context: ServicerContext
+    ) -> pb.PreparePackageSetResult:
+        return _prepared(
+            context,
+            self.unpublished_placement_handler,
+            request,
+            "unpublished package placement preparation",
+        )
+
+
+def _prepared[Q, R](
+    context: ServicerContext, handler: Callable[[Q], R] | None, request: Q, what: str
+) -> R:
+    if handler is None:
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, f"{what} is unavailable")
+    try:
+        return handler(request)
+    except Exception as exc:
+        _refuse(context, exc)
 
 
 def _loopback_preparation_listener(listen: str) -> bool:

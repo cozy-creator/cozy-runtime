@@ -2,8 +2,6 @@
 
 from collections.abc import Iterator
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 
 import grpc
 import pytest
@@ -19,11 +17,7 @@ from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_machine_execution import offer
-
-
-class Aborted(Exception):
-    pass
-
+from test_same_release_placements import Context, Refused
 
 CLAIM = pb.Claim(
     record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b"offline"
@@ -47,27 +41,18 @@ def owned(tmp_path: Path) -> Iterator[Worker]:
         worker.shutdown()
 
 
-def _context(observed: list[Any]) -> Any:
-    def abort(code: Any, detail: str) -> None:
-        observed.append((code, detail))
-        raise Aborted
-
-    return SimpleNamespace(abort=abort, set_trailing_metadata=lambda _: None)
-
-
 def test_noncanonical_execution_payload_is_a_known_refusal(owned: Worker) -> None:
     rpc = MachineExecutionRPC(owned)
-    observed: list[Any] = []
-    with pytest.raises(Aborted):
-        rpc._call(CLAIM, _context(observed), lambda: canonical.parse_canonical(b'{ "value": 7 }'))
-    assert observed[0][0] == grpc.StatusCode.FAILED_PRECONDITION
+    with pytest.raises(Refused) as refused:
+        rpc._call(CLAIM, Context(), lambda: canonical.parse_canonical(b'{ "value": 7 }'))
+    assert refused.value.code == grpc.StatusCode.FAILED_PRECONDITION
 
     def unexpected() -> None:
         raise RuntimeError("private error contents")
 
-    with pytest.raises(Aborted):
-        rpc._call(CLAIM, _context(observed), unexpected)
-    assert observed[1] == (
+    with pytest.raises(Refused) as refused:
+        rpc._call(CLAIM, Context(), unexpected)
+    assert (refused.value.code, str(refused.value)) == (
         grpc.StatusCode.UNAVAILABLE,
         "machine execution operation failed (RuntimeError)",
     )
@@ -83,23 +68,22 @@ def test_lookup_distinguishes_absence_from_authority_workspace_and_storage_failu
     executions = owned.executions
     assert executions is not None
     rpc = MachineExecutionRPC(owned)
-    observed: list[Any] = []
-    context = _context(observed)
+    context = Context()
     query = pb.MachineExecutionQuery(
         claim=CLAIM, request_id="request", expected_execution_workspace_id=executions.workspace_id
     )
-    with pytest.raises(Aborted):
+    with pytest.raises(Refused) as refused:
         rpc.GetMachineExecution(query, context)
-    assert observed.pop()[0] == grpc.StatusCode.NOT_FOUND
+    assert refused.value.code == grpc.StatusCode.NOT_FOUND
     query.expected_execution_workspace_id = "wrong-workspace"
-    with pytest.raises(Aborted):
+    with pytest.raises(Refused) as refused:
         rpc.GetMachineExecution(query, context)
-    assert observed.pop()[0] == grpc.StatusCode.FAILED_PRECONDITION
+    assert refused.value.code == grpc.StatusCode.FAILED_PRECONDITION
     query.expected_execution_workspace_id = executions.workspace_id
     query.claim.record_owner_id = "other"
-    with pytest.raises(Aborted):
+    with pytest.raises(Refused) as refused:
         rpc.GetMachineExecution(query, context)
-    assert observed.pop()[0] == grpc.StatusCode.FAILED_PRECONDITION
+    assert refused.value.code == grpc.StatusCode.FAILED_PRECONDITION
     query.claim.record_owner_id = "owner"
     executions.submit(
         "owner",
@@ -109,14 +93,13 @@ def test_lookup_distinguishes_absence_from_authority_workspace_and_storage_failu
         expected_execution_workspace_id=executions.workspace_id,
     )
     assert rpc.GetMachineExecution(query, context).state == "queued"
-    assert not observed
     # A failed read must never be interpreted as permission to submit fresh work.
     for sidecar in ("-wal", "-shm", ""):
         (executions.workspace.directory / f"journal.sqlite3{sidecar}").unlink()
     (executions.workspace.directory / "journal.sqlite3").write_bytes(b"corrupt database")
-    with pytest.raises(Aborted):
+    with pytest.raises(Refused) as refused:
         rpc.GetMachineExecution(query, context)
-    assert observed.pop()[0] != grpc.StatusCode.NOT_FOUND
+    assert refused.value.code != grpc.StatusCode.NOT_FOUND
 
 
 def test_a_verified_proof_stands_for_its_epoch_and_a_changed_one_is_verified(

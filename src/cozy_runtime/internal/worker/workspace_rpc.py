@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from typing import Any
+from collections.abc import Callable, Iterable, Iterator
 
-from cozy_runtime.internal.worker import workspace_byte_outputs, workspace_memo
+import grpc
+
+from cozy_runtime.internal.worker import (
+    workspace_byte_outputs,
+    workspace_import,
+    workspace_input_trees,
+    workspace_memo,
+)
+from cozy_runtime.internal.worker.servicer_context import ServicerContext
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceBusy, WorkspaceRefusal
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 _INTEGRITY_CODES = (
@@ -31,76 +38,90 @@ class Service:
 class WorkspaceRPC:
     workspace_service: Service | None
 
-    def _workspace_call(
-        self, request: Any, context: Any, operation: Callable[[Service, str], Any]
-    ) -> Any:
-        import grpc
-
+    def _workspace_call[T](
+        self, claim: pb.Claim, context: ServicerContext, operation: Callable[[Service, str], T]
+    ) -> T:
         service = self.workspace_service
         if service is None:
-            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "workspace custody is unavailable")
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "workspace custody is unavailable")
         try:
 
             def guard() -> None:
                 if not context.is_active():
                     raise WorkspaceRefusal("workspace call was canceled")
-                service.authorize(request.claim)
+                service.authorize(claim)
 
             with service.workspace.authorized(guard):
-                return operation(service, service.authorize(request.claim))
+                return operation(service, service.authorize(claim))
         except WorkspaceBusy as exc:
-            return context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc)[:512])
+            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc)[:512])
         except WorkspaceRefusal as exc:
-            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
         except Exception as exc:
             # Retrying a corrupt object cannot establish custody. Keep native
             # paths/details private; the owner needs only the permanent code.
             code = getattr(exc, "code", None)
             if code in _INTEGRITY_CODES:
-                return context.abort(
+                context.abort(
                     grpc.StatusCode.FAILED_PRECONDITION, f"workspace integrity refused: {code}"
                 )
-            return context.abort(grpc.StatusCode.UNAVAILABLE, "workspace custody operation failed")
+            context.abort(grpc.StatusCode.UNAVAILABLE, "workspace custody operation failed")
 
-    def RecordOperationResult(self, request: pb.RecordOperationResultCall, context: Any) -> Any:
+    def RecordOperationResult(
+        self, request: pb.RecordOperationResultCall, context: ServicerContext
+    ) -> pb.RecordOperationResultResult:
         return self._workspace_call(
-            request, context, lambda s, owner: workspace_memo.record(s.workspace, owner, request)
+            request.claim,
+            context,
+            lambda s, owner: workspace_memo.record(s.workspace, owner, request),
         )
 
-    def LookupOperation(self, request: pb.LookupOperationCall, context: Any) -> Any:
+    def LookupOperation(
+        self, request: pb.LookupOperationCall, context: ServicerContext
+    ) -> pb.LookupOperationResult:
         return self._workspace_call(
-            request, context, lambda s, owner: workspace_memo.lookup(s.workspace, owner, request)
+            request.claim,
+            context,
+            lambda s, owner: workspace_memo.lookup(s.workspace, owner, request),
         )
 
-    def PruneOperationCache(self, request: pb.PruneOperationCacheCall, context: Any) -> Any:
+    def PruneOperationCache(
+        self, request: pb.PruneOperationCacheCall, context: ServicerContext
+    ) -> pb.PruneOperationCacheResult:
         return self._workspace_call(
-            request, context, lambda s, owner: workspace_memo.prune(s.workspace, owner)
+            request.claim, context, lambda s, owner: workspace_memo.prune(s.workspace, owner)
         )
 
-    def WorkspaceRetainDerivedResult(self, request: pb.DerivedRetentionCall, context: Any) -> Any:
+    def WorkspaceRetainDerivedResult(
+        self, request: pb.DerivedRetentionCall, context: ServicerContext
+    ) -> pb.DerivedRetentionResult:
         return self._workspace_call(
-            request, context, lambda s, owner: s.workspace.retain(owner, request.request)
+            request.claim, context, lambda s, owner: s.workspace.retain(owner, request.request)
         )
 
     def WorkspaceReleaseDerivedRetention(
-        self, request: pb.DerivedRetentionCall, context: Any
-    ) -> Any:
+        self, request: pb.DerivedRetentionCall, context: ServicerContext
+    ) -> pb.DerivedRetentionResult:
         return self._workspace_call(
-            request,
+            request.claim,
             context,
             lambda s, owner: s.workspace.retain(owner, request.request, release=True),
         )
 
     def WorkspaceReleaseDerivedResult(
-        self, request: pb.DerivedResultReleaseCall, context: Any
-    ) -> Any:
+        self, request: pb.DerivedResultReleaseCall, context: ServicerContext
+    ) -> pb.DerivedResultReleaseResult:
         return self._workspace_call(
-            request, context, lambda s, owner: s.workspace.release_result(owner, request.request)
+            request.claim,
+            context,
+            lambda s, owner: s.workspace.release_result(owner, request.request),
         )
 
-    def WorkspaceRetainByteTree(self, request: pb.NativeByteRetentionCall, context: Any) -> Any:
+    def WorkspaceRetainByteTree(
+        self, request: pb.NativeByteRetentionCall, context: ServicerContext
+    ) -> pb.NativeByteRetentionResult:
         return self._workspace_call(
-            request,
+            request.claim,
             context,
             lambda s, owner: workspace_byte_outputs.change_hold(
                 s.workspace,
@@ -110,9 +131,11 @@ class WorkspaceRPC:
             ),
         )
 
-    def WorkspaceReleaseByteTree(self, request: pb.NativeByteRetentionCall, context: Any) -> Any:
+    def WorkspaceReleaseByteTree(
+        self, request: pb.NativeByteRetentionCall, context: ServicerContext
+    ) -> pb.NativeByteRetentionResult:
         return self._workspace_call(
-            request,
+            request.claim,
             context,
             lambda s, owner: workspace_byte_outputs.change_hold(
                 s.workspace,
@@ -123,14 +146,11 @@ class WorkspaceRPC:
         )
 
     def WorkspaceReadByteTreeObject(
-        self, request: pb.NativeByteReadCall, context: Any
-    ) -> Iterable[pb.NativeByteReadChunk]:
-        import grpc
-
+        self, request: pb.NativeByteReadCall, context: ServicerContext
+    ) -> Iterator[pb.NativeByteReadChunk]:
         service = self.workspace_service
         if service is None:
             context.abort(grpc.StatusCode.UNIMPLEMENTED, "workspace custody is unavailable")
-            return
         try:
 
             def guard() -> None:
@@ -183,54 +203,49 @@ class WorkspaceRPC:
             else:
                 context.abort(grpc.StatusCode.UNAVAILABLE, "ordinary artifact read failed")
 
-    def WorkspaceWeightsIntentReady(self, request: pb.WeightsIntentReadyCall, context: Any) -> Any:
-        return self._workspace_call(request, context, lambda s, _: s.ready(request))
+    def WorkspaceWeightsIntentReady(
+        self, request: pb.WeightsIntentReadyCall, context: ServicerContext
+    ) -> pb.WeightsHostAck:
+        return self._workspace_call(request.claim, context, lambda s, _: s.ready(request))
 
-    def ImportInputTree(self, requests: Iterable[pb.InputTreeImportFrame], context: Any) -> Any:
-        import grpc
-
-        from cozy_runtime.internal.worker import workspace_input_trees
-        from cozy_runtime.protocol import weights_limits
-
+    def ImportInputTree(
+        self, requests: Iterable[pb.InputTreeImportFrame], context: ServicerContext
+    ) -> pb.NativeByteRetentionResult:
         iterator = iter(requests)
         first = next(iterator, None)
         if first is None or first.WhichOneof("body") != "header":
-            return context.abort(
+            context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT, "input tree needs its exact first header"
             )
         header = first.header
         if header.claim.wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
-            return context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION, "native root input requires wire55"
-            )
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "native root input requires wire55")
         return self._workspace_call(
-            header,
+            header.claim,
             context,
             lambda service, owner: workspace_input_trees.receive(
                 service.workspace, owner, header, iterator
             ),
         )
 
-    def ImportWorkspace(self, requests: Iterable[pb.WorkspaceImportFrame], context: Any) -> Any:
-        import grpc
-
+    def ImportWorkspace(
+        self, requests: Iterable[pb.WorkspaceImportFrame], context: ServicerContext
+    ) -> pb.WorkspaceImportResult:
         service = self.workspace_service
         if service is None:
-            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "workspace custody is unavailable")
-        from cozy_runtime.internal.worker import workspace_import
-
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "workspace custody is unavailable")
         try:
             return workspace_import.receive(service.workspace, requests, service.authorize)
         except WorkspaceRefusal as exc:
-            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
         except Exception:
-            return context.abort(grpc.StatusCode.UNAVAILABLE, "workspace import failed")
+            context.abort(grpc.StatusCode.UNAVAILABLE, "workspace import failed")
 
-    def ActivateWorkspaceImport(self, request: pb.WorkspaceActivationCall, context: Any) -> Any:
-        from cozy_runtime.internal.worker import workspace_import
-
+    def ActivateWorkspaceImport(
+        self, request: pb.WorkspaceActivationCall, context: ServicerContext
+    ) -> pb.WorkspaceImportResult:
         return self._workspace_call(
-            request,
+            request.claim,
             context,
             lambda s, _: workspace_import.activate(s.workspace, request, s.authorize),
         )

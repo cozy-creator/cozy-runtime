@@ -20,10 +20,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 import tensorfs
@@ -75,15 +75,27 @@ LOCKED = b"--index-url https://pypi.org/simple\ntenant==1.0.0 --hash=sha256:" + 
 
 
 class Refused(Exception):
-    pass
+    def __init__(self, code: object, detail: str, trailers: tuple[tuple[str, str], ...]) -> None:
+        super().__init__(detail)
+        self.code, self.trailers = code, dict(trailers)
+        self.absent = [value for key, value in trailers if key == "cozy-absent-release"]
 
 
 class Context:
-    def abort(self, _code: Any, detail: str) -> None:
-        raise Refused(detail)
+    def __init__(self) -> None:
+        self.trailers: tuple[tuple[str, str], ...] = ()
 
-    def set_trailing_metadata(self, _metadata: Any) -> None:
-        pass
+    def abort(self, code: object, detail: str) -> NoReturn:
+        raise Refused(code, detail, self.trailers)
+
+    def is_active(self) -> bool:
+        return True
+
+    def set_trailing_metadata(self, metadata: tuple[tuple[str, str], ...]) -> None:
+        self.trailers = metadata
+
+    def add_callback(self, _callback: Callable[[], None]) -> bool:
+        return True
 
 
 class Machine:
