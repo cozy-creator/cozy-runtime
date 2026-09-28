@@ -12,7 +12,9 @@ import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Annotated
+
+import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
@@ -23,22 +25,68 @@ from cozy_runtime.author._weights import (
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+if TYPE_CHECKING:
+    import tensorfs
+
 _OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 _EXCHANGE_KINDS = frozenset({"declaration", "receipt", "derivation", "native-receipt"})
 
 
-def declaration_digest(facts: Mapping[str, Any]) -> bytes:
+class ManifestRef(msgspec.Struct, frozen=True):
+    sha256: Annotated[str, msgspec.Meta(pattern="^[0-9a-f]{64}$")]
+    length: int
+
+    @property
+    def digest(self) -> str:
+        return "sha256:" + self.sha256
+
+
+class NativeReceipt(msgspec.Struct, frozen=True):
+    """The TensorFS derived-writer receipt facts Runtime reads; the rest is TensorFS's."""
+
+    transaction_id: str
+    declaration_digest: str
+    manifest: ManifestRef
+
+
+def native_receipt(facts: Mapping[str, object]) -> NativeReceipt:
+    """Decode a native receipt once; a receipt missing a fact Runtime reads is refused."""
+    try:
+        return msgspec.convert(facts, NativeReceipt)
+    except msgspec.ValidationError as exc:
+        raise CapabilityError(
+            f"native receipt is malformed: {exc}", code="weights_receipt_mismatch"
+        ) from exc
+
+
+class Disposition(msgspec.Struct, frozen=True):
+    kind: str
+
+
+class DerivedLookup(msgspec.Struct, frozen=True):
+    """`Store.derived_lookup`: only a committed transaction carries a receipt and disposition."""
+
+    state: str
+    receipt: dict[str, object] = {}
+    disposition: Disposition = Disposition("")
+
+
+def lookup(store: tensorfs.Store, transaction_id: str) -> DerivedLookup:
+    return msgspec.convert(store.derived_lookup(transaction_id), DerivedLookup)
+
+
+def declaration_digest(facts: Mapping[str, object]) -> bytes:
     """The declaration a native receipt names by digest."""
-    return documents.raw(str(facts["declaration_digest"]))
+    return documents.raw(native_receipt(facts).declaration_digest)
 
 
-def same_receipt(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+def same_receipt(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
     """Whether two native receipts state the same facts."""
     return dict(left) == dict(right)
 
 
 def work_fingerprint(
-    spec: Mapping[str, Any],
+    spec: Mapping[str, object],
     numerical: bytes,
     *,
     operation_identity: str = "",
@@ -98,11 +146,12 @@ def write_exchange_file(spool: Path, output_slot: str, kind: str, data: bytes) -
 def receipt_from_native(
     output_slot: str,
     transaction_id: str,
-    facts: dict[str, Any],
+    facts: Mapping[str, object],
     *,
     replayed: bool,
     request_id: str,
 ) -> WeightsReceipt:
+    manifest = native_receipt(facts).manifest
     raw = canonical_json.encode(facts)
     receipt_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     return WeightsReceipt(
@@ -114,7 +163,7 @@ def receipt_from_native(
         _artifact=ModelArtifact(
             request_id,
             output_slot,
-            ObjectRef("sha256:" + facts["manifest"]["sha256"], facts["manifest"]["length"]),
+            ObjectRef(manifest.digest, manifest.length),
             receipt_digest,
         ),
     )

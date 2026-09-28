@@ -7,7 +7,7 @@ import io
 import json
 import socket
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -42,7 +42,7 @@ def _rig(
         weights_work_fingerprint=fingerprint,
         spec={"inputs": [], "outputs": [{"output_id": "model", "max_bytes": maximum}]},
     )
-    recorded: list[dict[str, Any]] = []
+    recorded: list[Mapping[str, object]] = []
     broker = WriterBroker(
         lambda: store,
         store_root=Path(store.root),

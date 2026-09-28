@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,8 +31,8 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
     order = [("model", "weight")]
     maximum = (4 << 20) + 2048
     fingerprint = "sha256:" + "71" * 32
-    observed: list[dict[str, Any]] = []
-    committed: list[dict[str, Any]] = []
+    observed: list[Mapping[str, object]] = []
+    committed: list[Mapping[str, object]] = []
     broker = WriterBroker(
         lambda: store,
         checkpoint=lambda _a, _t, _b, facts: observed.append(facts),
@@ -171,7 +172,7 @@ def test_parent_broker_spends_zero_protobuf_output_grant_on_native_graft(tmp_pat
         weights_work_fingerprint=fingerprint,
         spec=spec,
     )
-    recorded: list[dict[str, Any]] = []
+    recorded: list[Mapping[str, object]] = []
     broker = WriterBroker(
         lambda: store,
         checkpoint=lambda _a, _t, _b, facts: recorded.append(facts),

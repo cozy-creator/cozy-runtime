@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import socket
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -49,7 +50,7 @@ def test_native_channel_admission_releases_on_completion_cancel_or_producer_loss
         weights_work_fingerprint=fingerprint,
         spec={"inputs": [], "outputs": [{"output_id": "model", "max_bytes": 4}]},
     )
-    recorded: list[dict[str, Any]] = []
+    recorded: list[Mapping[str, object]] = []
     broker = WriterBroker(
         lambda: store,
         store_root=Path(store.root),

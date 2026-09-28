@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NoReturn
+from typing import NoReturn
 
 import pytest
 import tensorfs
@@ -89,7 +90,7 @@ def test_parent_writer_checks_admission_before_creating_native_writer(
         weights_work_fingerprint=fingerprint,
         spec={"inputs": [], "outputs": [{"output_id": "model", "max_bytes": maximum}]},
     )
-    recorded: list[dict[str, Any]] = []
+    recorded: list[Mapping[str, object]] = []
     broker = WriterBroker(
         lambda: store,
         store_root=tmp_path / "store",

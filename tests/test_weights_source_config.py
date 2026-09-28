@@ -1,30 +1,30 @@
 """Inline config reads preserve exact source authorization and native custody."""
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tensorfs.derived import SourceCapability
 
 from cozy_runtime.author import CapabilityError
-from cozy_runtime.internal.weights_writer import WriterBroker
+from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterBroker, _Opened, _Source
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from test_derived_config_runtime import _released_source
 from test_model_runtime_closure import _CONFIG
+from weights_channel import exchange as channel_exchange
 
 
 def test_native_source_fd_uses_exact_grant_and_is_fenced_with_attempt(tmp_path: Path) -> None:
-    from tensorfs.derived import SourceCapability
-
-    from cozy_runtime.internal.weights_writer import ExecutionStorage
-    from weights_channel import exchange as channel_exchange
-
     store, manifest, length = _released_source(tmp_path)
     spool = tmp_path / "spool"
     spool.mkdir()
     attempt = SimpleNamespace(
         request_id="native-source",
         attempt=1,
+        digest=b"\x00" * 32,
         state="running",
         canceling="",
         spool=spool,
@@ -53,8 +53,8 @@ def test_native_source_fd_uses_exact_grant_and_is_fenced_with_attempt(tmp_path: 
             client.source("sha256:" + "ff" * 32)
         assert refused.value.code == "weights_source_ungranted"
 
-        answer = client._call("source", manifest=manifest, descriptor=True)
-        with SourceCapability.from_fd(manifest, length + 1, answer["descriptor"]) as forged:
+        answer = client._call(_Source(manifest), _Opened, descriptor=True)
+        with SourceCapability.from_fd(manifest, length + 1, answer.descriptor) as forged:
             with pytest.raises(Exception) as refused_native:
                 forged.inspect()
             assert getattr(refused_native.value, "code", "") == "TRANSACTION_CONFLICT"
@@ -81,12 +81,6 @@ def test_native_source_fd_uses_exact_grant_and_is_fenced_with_attempt(tmp_path: 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="separate executor UID requires root/container")
 def test_native_source_fd_preserves_repository_permissions(tmp_path: Path) -> None:
-    import subprocess
-    import sys
-
-    from cozy_runtime.internal.weights_writer import ExecutionStorage
-    from weights_channel import exchange as channel_exchange
-
     store, manifest, length = _released_source(tmp_path)
     for path in (tmp_path, *tmp_path.parents):
         if path == Path("/tmp"):
@@ -100,6 +94,7 @@ def test_native_source_fd_preserves_repository_permissions(tmp_path: Path) -> No
     attempt = SimpleNamespace(
         request_id="uid-source",
         attempt=1,
+        digest=b"\x00" * 32,
         state="running",
         canceling="",
         spool=spool,
@@ -111,8 +106,7 @@ def test_native_source_fd_preserves_repository_permissions(tmp_path: Path) -> No
     client = ExecutionStorage(
         spool, channel_exchange(lambda frame: broker.handle(attempt, frame)), {}
     )
-    answer = client._call("source", manifest=manifest, descriptor=True)
-    fd = answer["descriptor"]
+    fd = client._call(_Source(manifest), _Opened, descriptor=True).descriptor
     code = """
 import os, sys
 from pathlib import Path

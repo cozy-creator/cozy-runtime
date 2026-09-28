@@ -11,18 +11,21 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import BinaryIO, cast
 from urllib.parse import urlparse
 
-from cozy_runtime.internal import egress, fill
-from cozy_runtime.internal.weights_writer import WriterBroker
+import msgspec
+
+from cozy_runtime import canonical_json
+from cozy_runtime.internal import egress, fill, weights_sink
+from cozy_runtime.internal.weights_writer import WriterAttempt, WriterBinding, WriterBroker
 from cozy_runtime.internal.worker.workspace import WeightsTransaction, Workspace
+from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -37,7 +40,7 @@ class _LeaseReader:
 
     __slots__ = ("closed", "lease", "length", "object_id", "offset")
 
-    def __init__(self, lease: Any, object_id: str, length: int) -> None:
+    def __init__(self, lease: fill.ReadLease, object_id: str, length: int) -> None:
         self.lease = lease
         self.object_id = object_id
         self.length = length
@@ -80,6 +83,16 @@ class WeightsExchangeError(Exception):
         self.detail = detail
 
 
+class _CheckpointFacts(msgspec.Struct, frozen=True):
+    """The native writer's checkpoint observation, as TensorFS reports it."""
+
+    head: str
+    head_length: int
+    plan_digest: str
+    index: int
+    bytes: int
+
+
 @dataclass(slots=True)
 class _Held:
     transaction_id: str
@@ -117,7 +130,7 @@ class WeightsExchange:
         send: Callable[[pb.WorkerFrame], None],
         stop: threading.Event,
         owner_scope: Callable[[], str],
-        stamp: Callable[[Any], Any] | None = None,
+        stamp: Callable[[pb.WeightsIntentFrame], pb.WeightsIntentFrame] | None = None,
         note: Callable[[str, str], None] | None = None,
         allow_private_egress: bool = False,
         workspace: Workspace | None = None,
@@ -136,7 +149,7 @@ class WeightsExchange:
         # `allowPrivateWeightsUploads` does. It widens nothing but the address classes an
         # upload may reach, and only for a caller that constructed this object saying so.
         self.allow_private_egress = allow_private_egress
-        self.store: Any = None
+        self.store: fill.Store | None = None
         self._lock = threading.Lock()
         self._bindings: dict[str, tuple[int, bytes]] = {}
         self._held: dict[str, _Held] = {}
@@ -149,14 +162,14 @@ class WeightsExchange:
             bind_output=self.bind_output,
         )
 
-    def bind_output(self, attempt: Any, output_slot: str, declaration: bytes) -> tuple[str, int]:
+    def bind_output(
+        self, attempt: WriterAttempt, output_slot: str, declaration: bytes
+    ) -> tuple[str, int]:
         """Assign the execution identity after TensorFS canonicalizes the declaration."""
-        from cozy_runtime.internal.weights_sink import weights_transaction_id
-
-        transaction = weights_transaction_id(
+        transaction = weights_sink.weights_transaction_id(
             self.owner_scope(), attempt.request_id, documents.spell(attempt.digest), output_slot
         )
-        result = self.intent(
+        self.intent(
             attempt,
             output_slot=output_slot,
             transaction_id=transaction,
@@ -164,29 +177,28 @@ class WeightsExchange:
             declaration=declaration,
             requested_writer_epoch=0,
         )
-        return transaction, int(result["writer_epoch"])
+        return transaction, self._writer_epoch(transaction)
 
     def record_native_receipt(
-        self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
+        self,
+        attempt: WriterAttempt,
+        transaction: str,
+        binding: WriterBinding,
+        facts: Mapping[str, object],
     ) -> None:
         """Record the native winner before acknowledging the scoped TensorFS commit."""
-        from cozy_runtime.internal.weights_sink import (
-            declaration_digest,
-            protocol_receipt,
-            receipt_from_native,
-        )
-
+        native = weights_sink.native_receipt(facts)
         if (
-            facts.get("transaction_id") != transaction
-            or declaration_digest(facts) != binding.declaration_digest
+            native.transaction_id != transaction
+            or documents.raw(native.declaration_digest) != binding.declaration_digest
         ):
             raise WeightsExchangeError(
                 "weights_receipt_identity_mismatch", "native commit differs from intent"
             )
-        wrapped = receipt_from_native(
+        wrapped = weights_sink.receipt_from_native(
             binding.slot, transaction, facts, replayed=False, request_id=attempt.request_id
         )
-        _, canonical_receipt, digest = protocol_receipt(
+        _, canonical_receipt, digest = weights_sink.protocol_receipt(
             wrapped,
             owner_scope=self.owner_scope(),
             request_id=attempt.request_id,
@@ -201,15 +213,20 @@ class WeightsExchange:
         )
 
     def record_checkpoint(
-        self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
+        self,
+        attempt: WriterAttempt,
+        transaction: str,
+        binding: WriterBinding,
+        facts: Mapping[str, object],
     ) -> None:
         """Publish the parent native writer's own observation, never child-authored refs."""
         self._require_open(transaction)
+        observed = msgspec.convert(facts, _CheckpointFacts)
         checkpoint = pb.CheckpointRef(
-            head=pb.Ref(digest=documents.raw(facts["head"]), length=facts["head_length"]),
-            plan_digest=documents.raw(facts["plan_digest"]),
-            index=facts["index"],
-            bytes=facts["bytes"],
+            head=pb.Ref(digest=documents.raw(observed.head), length=observed.head_length),
+            plan_digest=documents.raw(observed.plan_digest),
+            index=observed.index,
+            bytes=observed.bytes,
         )
         frame = pb.WorkerFrame(
             weights_checkpoint=pb.WeightsCheckpointFrame(
@@ -329,14 +346,14 @@ class WeightsExchange:
 
     def intent(
         self,
-        attempt: Any,
+        attempt: WriterAttempt,
         *,
         output_slot: str,
         transaction_id: str,
         declaration_digest: bytes,
         declaration: bytes,
         requested_writer_epoch: int,
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         if self.workspace is None:
             raise WeightsExchangeError("workspace_unavailable", "worker has no workspace custody")
         self._require_open(transaction_id)
@@ -382,8 +399,6 @@ class WeightsExchange:
                     "OBJECT_ABSENT",
                 }:
                     raise
-                from cozy_runtime.internal.worker.workspace_executions import Executions
-
                 if Executions(self.workspace).owns(self.owner_scope(), attempt.request_id):
                     raise WeightsExchangeError(
                         "weights_checkpoint_unavailable",
@@ -438,13 +453,13 @@ class WeightsExchange:
 
     def receipt(
         self,
-        attempt: Any,
+        attempt: WriterAttempt,
         *,
         output_slot: str,
         transaction_id: str,
         receipt_digest: bytes,
         canonical_receipt: bytes,
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         if (
             len(receipt_digest) != 32
             or not canonical_receipt
@@ -580,7 +595,9 @@ class WeightsExchange:
             result.checksum_sha256 = "sha256:" + receipt.sha256.hex()
         return result
 
-    def _upload_source(self, request: pb.WeightsUploadRequest) -> tuple[Any, int]:
+    def _upload_source(
+        self, request: pb.WeightsUploadRequest
+    ) -> tuple[io.BytesIO | _LeaseReader, int]:
         """Bind the requested object to what this Runtime actually holds, or refuse."""
         with self._lock:
             held = self._held.get(request.weights_transaction_id)
@@ -638,12 +655,12 @@ class WeightsExchange:
     ) -> _Held:
         self._receipt_ref(reference)
         store = self._store()
-        lifecycle = store.derived_lookup(transaction_id)
-        if lifecycle.get("state") != "committed":
+        lifecycle = weights_sink.lookup(store, transaction_id)
+        if lifecycle.state != "committed":
             raise WeightsExchangeError(
                 "weights_transaction_uncommitted", "receipt has no committed TensorFS transaction"
             )
-        if lifecycle["disposition"]["kind"] == "released":
+        if lifecycle.disposition.kind == "released":
             self.abandon(transaction_id)
             raise WeightsExchangeError(
                 "weights_transaction_abandoned", "committed output was already released"
@@ -664,17 +681,17 @@ class WeightsExchange:
                 "weights_receipt_identity_mismatch", "receipt names another transaction"
             )
         inner = value.tensorfs_receipt_canonical_bytes
+        if documents.spell(hashlib.sha256(inner).digest()) != value.tensorfs_receipt_digest:
+            raise WeightsExchangeError(
+                "weights_tensorfs_receipt_invalid", "TensorFS receipt digest mismatch"
+            )
         try:
-            if documents.spell(hashlib.sha256(inner).digest()) != value.tensorfs_receipt_digest:
-                raise ValueError("nested digest mismatch")
-            facts = json.loads(inner)
-            manifest = facts["manifest"]
-            manifest_id = "sha256:" + str(manifest["sha256"])
-            manifest_length = int(manifest["length"])
-        except (KeyError, TypeError, ValueError) as exc:
+            manifest = canonical_json.decode_as(inner, weights_sink.NativeReceipt).manifest
+        except (ValueError, msgspec.ValidationError) as exc:
             raise WeightsExchangeError(
                 "weights_tensorfs_receipt_invalid", f"TensorFS receipt is invalid: {exc}"
             ) from exc
+        manifest_id, manifest_length = manifest.digest, manifest.length
         manifest_value = store.manifest(manifest_id)
         manifest_bytes = bytes(manifest_value["manifest"])
         if (
@@ -738,7 +755,7 @@ class WeightsExchange:
         with self._lock:
             self._held.pop(transaction_id, None)
 
-    def _store(self) -> Any:
+    def _store(self) -> fill.Store:
         if self.store is None:
             if self.store_root is None:
                 raise WeightsExchangeError(

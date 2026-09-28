@@ -6,7 +6,7 @@ import hashlib
 import math
 import socket
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -15,7 +15,7 @@ from tensorfs.derived import OutputCapability
 
 from cozy_runtime.author import Context, ModelArtifact, canonical_json
 from cozy_runtime.internal.seam import Channel, DescriptorReply
-from cozy_runtime.internal.weights_writer import ExecutionStorage
+from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterAttempt, WriterBinding
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.internal.worker.workspace import Workspace
@@ -94,7 +94,10 @@ class NativeExecution:
         if after_checkpoint is not None:
 
             def checkpoint(
-                attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
+                attempt: WriterAttempt,
+                transaction: str,
+                binding: WriterBinding,
+                facts: Mapping[str, object],
             ) -> None:
                 self.owner.record_checkpoint(attempt, transaction, binding, facts)
                 after_checkpoint(facts)
