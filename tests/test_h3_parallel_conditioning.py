@@ -179,7 +179,7 @@ class Group:
         self.group.spawn()
         self.group.form(torch, {})
         self.leader.pg = self.group.pg
-        assert self.leader._install_group(torch, self.model, h3.BUDGET) is None
+        assert self.leader._install_group(torch, self.model, h3.HOSTED_CAPACITY) is None
         self.leader._attempt_spool = self.tmp_path / "attempt"
         return self
 

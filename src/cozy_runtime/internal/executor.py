@@ -273,6 +273,18 @@ def residence_ceiling(*, destinations: int, authorized: int, allocatable: int) -
     return min(int(destinations), max(int(authorized), 0), max(int(allocatable), 0))
 
 
+def settled_capacity(*, resident_budget: int, fill_overhead: int) -> int:
+    """What a rank holds for this construction once its fill has settled.
+
+    `resident_budget` is the FILL ceiling: the card less the widest component's fill
+    transient, which for H3's fp8 DiT (float destinations beside the encoded payload) is
+    ~20 GB. Placing a component on a rank is a steady-state question, so that transient
+    is given back; priced against the fill ceiling, H3's text encoder was never hosted on
+    an H100 (runs 1435-1441).
+    """
+    return int(resident_budget) + int(fill_overhead)
+
+
 # --------------------------------------------------------------------------- state
 
 
@@ -986,9 +998,10 @@ class Executor:
             self.group.close()
         return {"ok": False, "code": exc.code, "detail": exc.message[:900]}
 
-    def _install_group(self, torch: Any, model: Any, budget: int = 0) -> dict[str, Any] | None:
+    def _install_group(self, torch: Any, model: Any, capacity: int = 0) -> dict[str, Any] | None:
         """Every rank shards its replica, takes its side of the mirror, and agrees which
-        follower keeps each placeable component that rank 0 has no room for."""
+        follower keeps each placeable component that rank 0 has no room for. `capacity` is
+        the group's agreed settled capacity (`settled_capacity`)."""
         if self.world <= 1:
             return None
         owner = self.host
@@ -1034,7 +1047,7 @@ class Executor:
             },
             sharded={name[1] for name in owner.group_sharded if name[0] == self._group_model_key},
             scopes=component_use(type(model)),
-            budget=budget,
+            capacity=capacity,
             world=self.world,
         )
         for component_name, home in hosted.items():
@@ -2515,7 +2528,11 @@ class Executor:
             if refused is not None:
                 return refused
         self.facts = {}
-        refused = self._install_group(torch, model, resident_budget)
+        refused = self._install_group(
+            torch,
+            model,
+            settled_capacity(resident_budget=resident_budget, fill_overhead=overhead),
+        )
         if refused is not None:
             return refused
         stage("install")

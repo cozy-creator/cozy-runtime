@@ -27,7 +27,12 @@ from cozy_runtime.internal import (  # noqa: E402
     execution_evidence,
     spawn,
 )
-from cozy_runtime.internal.executor import Executor  # noqa: E402
+from cozy_runtime.internal.executor import (  # noqa: E402
+    Executor,
+    residence_ceiling,
+    settled_capacity,
+)
+from cozy_runtime.internal.fill import complete_device_envelope, price_envelope  # noqa: E402
 from cozy_runtime.internal.parallel import cp, mirror, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
@@ -39,7 +44,7 @@ from cozy_runtime.internal.worker.plan import (  # noqa: E402
     PreparedRequest,
 )
 from testdata.parallel_calls import (  # noqa: E402
-    HOSTED_BUDGET,
+    HOSTED_CAPACITY,
     collective_model,
     h3_batch,
     h3_model,
@@ -370,7 +375,7 @@ def test_a_placeable_component_runs_on_its_follower(tmp_path: Path, degree: int)
         group.spawn()
         group.form(torch, {})
         leader.pg = group.pg
-        assert leader._install_group(torch, model, HOSTED_BUDGET) is None
+        assert leader._install_group(torch, model, HOSTED_CAPACITY) is None
         assert leader.facts["sequence_parallel"]["hosted"] == {"text_encoder": 1}
         for attempt in ("attempt-a", "attempt-b"):
             leader._attempt_spool = tmp_path / attempt
@@ -427,7 +432,7 @@ def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degre
         group.spawn()
         group.form(torch, {})
         leader.pg = group.pg
-        assert leader._install_group(torch, model, HOSTED_BUDGET) is None
+        assert leader._install_group(torch, model, HOSTED_CAPACITY) is None
         assert leader.facts["sequence_parallel"]["spread_ranks"] == list(range(degree))
         leader._attempt_spool = tmp_path / "attempt"
         assert torch.equal(model.encode(x), moments)
@@ -465,12 +470,59 @@ def test_hosting_plan_keeps_h3s_text_encoder_on_a_follower_only_when_rank_0_cann
         sharded={"ref2va_dit", "fl2va_dit"},
         scopes=scopes,
     )
-    assert plan(budget=85_017_493_504, world=4) == {"text_encoder": 1}
-    assert plan(budget=85_017_493_504, world=1) == {}
+    assert plan(capacity=85_017_493_504, world=4) == {"text_encoder": 1}
+    assert plan(capacity=85_017_493_504, world=1) == {}
     # An H200 holds everything on rank 0; nothing moves.
-    assert plan(budget=140_000_000_000, world=2) == {}
+    assert plan(capacity=140_000_000_000, world=2) == {}
     # A card too small for the conditioner beside a DiT shard keeps staging it on rank 0.
-    assert plan(budget=70_000_000_000, world=4) == {}
+    assert plan(capacity=70_000_000_000, world=4) == {}
+
+
+def test_an_h100_hosts_h3s_text_encoder_once_the_fp8_dit_fill_has_settled() -> None:
+    """Runs 1435-1441 (4xH100, fp8-pruned): `residency.hosted` stayed empty and rank 0
+    staged the text encoder on every request. Each fp8 DiT fills as 41.2 GB of float
+    destinations beside its 20.1 GB encoded payload, then settles to 21.1 GB. That transient
+    comes off the fill ceiling, so the ceiling cannot hold the 51.5 GB encoder beside a DiT.
+    The settled card can."""
+    encoded, payload = 40_106_235_904, 20_053_117_952
+    rows = [
+        (dit, logical, stored, route, stored if route == "encoded_gemm" else 0, 0)
+        for dit in ("ref2va_dit", "fl2va_dit")
+        for logical, stored, route in (
+            (encoded, payload, "encoded_gemm"),
+            (1_052_879_308, 1_052_879_308, "verbatim"),
+        )
+    ]
+    sizes = {"ref2va_dit": 21_105_997_260, "fl2va_dit": 21_105_997_260}
+    for name, size in (
+        ("text_encoder", 51_506_192_496),
+        ("video_vae", 5_570_955_392),
+        ("audio_vae", 605_306_340),
+    ):
+        rows.append((name, size, size, "verbatim", 0, 0))
+        sizes[name] = size
+    envelope = complete_device_envelope(price_envelope(rows, 0), 0)
+    overhead = envelope["fill_overhead_bytes"]
+    assert overhead == payload
+    card = 84_000_000_000
+    fill_ceiling = residence_ceiling(
+        destinations=envelope["base_bytes"], authorized=card - overhead, allocatable=card - overhead
+    )
+    plan = functools.partial(
+        mirror.hosting_plan,
+        placeable=("text_encoder",),
+        sizes=sizes,
+        sharded={"ref2va_dit", "fl2va_dit"},
+        scopes={"condition_text": ("text_encoder",), "sample_ref2va": ("ref2va_dit",)},
+        world=4,
+    )
+    assert plan(capacity=fill_ceiling) == {}
+    capacity = settled_capacity(resident_budget=fill_ceiling, fill_overhead=overhead)
+    assert capacity == card
+    assert plan(capacity=capacity) == {"text_encoder": 1}
+    # A card that holds the whole construction keeps it on rank 0.
+    roomy = envelope["base_bytes"]
+    assert plan(capacity=settled_capacity(resident_budget=roomy, fill_overhead=overhead)) == {}
 
 
 def test_a_model_output_crosses_the_rank_seam(tmp_path: Path) -> None:

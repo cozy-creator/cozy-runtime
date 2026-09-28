@@ -230,10 +230,10 @@ def h3_model() -> H3Calls:
     return H3Calls.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4))
 
 
-#: component bytes for the hosting plan: rank 0's ceiling holds the DiT and one of the
+#: settled component bytes for the hosting plan: rank 0's capacity holds the DiT and one of the
 #: other two, a follower holds the conditioner beside its DiT shard
 HOSTED_SIZES = {"dit": 100, "text_encoder": 60, "vae": 30}
-HOSTED_BUDGET = 170
+HOSTED_CAPACITY = 170
 
 
 class Conditioner(torch.nn.Module):  # type: ignore[misc]
@@ -390,7 +390,7 @@ def main() -> None:
         if name == "join":
             reply = executor.join(command)
             if args.h3 and reply.get("ok"):
-                refused = executor._install_group(torch, model, HOSTED_BUDGET)
+                refused = executor._install_group(torch, model, HOSTED_CAPACITY)
                 assert refused is None, refused
         elif name == "run":
             reply = executor.run(command)

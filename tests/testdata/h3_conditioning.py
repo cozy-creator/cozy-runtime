@@ -48,10 +48,10 @@ from cozy_runtime.models.minimax_h3.vae_tiles import TileBatchedVideoVAE  # noqa
 from test_staged_demand_pull import Backend, Device  # type: ignore[import-not-found]  # noqa: E402
 
 TASK: official.Task = "ref2va"
-#: component bytes for the hosting plan: rank 0's ceiling holds the DiT and the VAEs, a
+#: settled component bytes for the hosting plan: rank 0's capacity holds the DiT and the VAEs, a
 #: follower holds the conditioner beside its DiT shard
 SIZES = {"ref2va_dit": 100, "text_encoder": 60, "video_vae": 30, "audio_vae": 5}
-BUDGET = 170
+HOSTED_CAPACITY = 170
 
 
 def conditioner() -> Any:
@@ -247,7 +247,7 @@ def main() -> None:
         if name == "join":
             reply = executor.join(command)
             if reply.get("ok"):
-                refused = executor._install_group(torch, built, BUDGET)
+                refused = executor._install_group(torch, built, HOSTED_CAPACITY)
                 assert refused is None, refused
         elif name == "run":
             reply = executor.run(command)

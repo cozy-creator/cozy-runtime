@@ -1,0 +1,1 @@
+A sequence-parallel group now hosts a `@placeable` component when a follower can hold it after the fill has settled. The limit used to be the fill ceiling, which is the card less the widest component's fill transient. For H3's fp8 DiT that transient is ~20 GB, so on 4xH100 the 51.5 GB text encoder was never hosted and rank 0 staged it on every request (runs 1435-1441).

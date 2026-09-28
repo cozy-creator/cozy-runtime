@@ -284,23 +284,24 @@ def hosting_plan(
     sizes: Mapping[str, int],
     sharded: set[str],
     scopes: Mapping[str, tuple[str, ...]],
-    budget: int,
+    capacity: int,
     world: int,
 ) -> dict[str, int]:
     """Placeable component -> the follower that keeps it resident, largest first.
 
     Only when rank 0 cannot hold every component: a follower hosts one if it fits beside
-    that rank's largest sharded scope. Every rank derives the same answer from the same
-    agreed sizes and ceiling, so no command carries it. H3 on an H100: the 51.5 GB text
-    encoder beside a 21 GB DiT shard, where rank 0 re-staged it for every request.
+    that rank's largest sharded scope. `sizes` are settled bytes, so `capacity` is what a
+    rank holds after its fill, not the fill ceiling. Every rank derives the same answer from
+    the same agreed sizes and capacity, so no command carries it. H3 on an H100: the 51.5 GB
+    text encoder beside a 21 GB DiT shard, where rank 0 re-staged it for every request.
     """
-    if world < 2 or sum(sizes.values()) <= budget:
+    if world < 2 or sum(sizes.values()) <= capacity:
         return {}
     shard = max(
         (sum(sizes.get(n, 0) for n in names if n in sharded) for names in scopes.values()),
         default=0,
     )
-    room = {follower: budget - shard for follower in range(1, world)}
+    room = {follower: capacity - shard for follower in range(1, world)}
     hosted: dict[str, int] = {}
     for name in sorted(placeable, key=lambda n: (-sizes.get(n, 0), n)):
         follower = max(room, key=lambda r: (room[r], -r))
