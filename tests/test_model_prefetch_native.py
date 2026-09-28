@@ -12,11 +12,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import msgspec
 import tensorfs
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._observations import MAX_EVENTS, EventRing
 from cozy_runtime.internal import hostfacts
-from cozy_runtime.internal.worker import store_gc
+from cozy_runtime.internal.executor_replies import ObservationRow
+from cozy_runtime.internal.worker import store_gc, triage
+from cozy_runtime.internal.worker.attempts import AttemptEngine
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.machine_serving import Serving, arguments
 from cozy_runtime.internal.worker.session import Worker
@@ -216,3 +220,52 @@ def test_a_prefetch_narrates_each_tenth_of_its_download_once() -> None:
     assert {row["name"] for row in hinted} == {"model-prefetch"}
     assert [row["position"] for row in demanded] == list(range(1001))
     assert serving.narrated == {}
+
+
+def test_narrated_positions_never_shed_a_record() -> None:
+    """Run 1510's prefetch narrated every position: 242 of its 256 triage rows, and its nine
+    segments' records were shed. A row carrying a position samples one stream whose latest
+    sample supersedes the last, in the attempt's ring and in its triage bundle, whatever
+    its rate."""
+    rows: list[dict[str, Any]] = []
+    worker = cast(
+        Worker,
+        SimpleNamespace(workspace=None, emit_progress=lambda _p, _o, frame: rows.append(frame)),
+    )
+    serving = Serving(worker)
+    call = Call("parent", (1 << 32) - 1, 1, 0, b"", b"", "hint", b"", False, b"", "", "")
+    frame = {"kind": "progress", "stage": "turbo / Downloading model weights", "total": 4065}
+    try:
+        serving._progress(call, pb.ChildCallRequest(parent_attempt_ordinal=1), frame)
+    finally:
+        serving.close()
+    (narrated,) = rows
+    ring = EventRing()
+    for index in range(MAX_EVENTS):
+        ring.emit("stage", f"segment {index}", 1.0)
+    for position in range(4065):
+        # `AttemptEngine.forward`: each narrated row the worker emits reaches the ring.
+        sample = {**narrated, "fields": {**narrated["fields"], "position": position}}
+        ring.admit(AttemptEngine._row(msgspec.convert(sample, ObservationRow)))
+    assert [row["name"] for row in ring.rows()] == [f"segment {i}" for i in range(MAX_EVENTS)]
+    (latest,) = (msgspec.convert(row, ObservationRow) for row in ring.stream_rows())
+    assert latest.name == "model-prefetch" and latest.fields["position"] == 4064
+    caps = ring.caps()
+    assert (caps["dropped"], caps["coalesced"], caps["streams"]) == (0, 4064, 1)
+    bundle = triage.Assembly(
+        subject_id="trb-" + "0" * 24,
+        attempt={},
+        plan={},
+        posture={},
+        terminal={},
+        faults=[],
+        measurements={},
+        confessions=[],
+        liveness=[],
+        events=cast(Any, ring.rows()),
+        streams=cast(Any, ring.stream_rows()),
+        caps=cast(Any, caps),
+    )
+    # A bundle over its cap sheds the narration before any record.
+    kept = msgspec.json.decode(bundle.build(len(bundle.build()) - 1), type=triage.Assembly)
+    assert (kept.streams, len(kept.events), kept.caps["shed_to_fit"]) == ([], MAX_EVENTS, 1)

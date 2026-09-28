@@ -2854,6 +2854,7 @@ class AttemptEngine:
             liveness=[row for row in self.monitor.document() if str(row["subject"]).endswith(key)]
             or self.monitor.document(),
             events=attempt.ring.rows(),
+            streams=attempt.ring.stream_rows(),
             caps=attempt.caps or attempt.ring.caps(),
         )
         try:

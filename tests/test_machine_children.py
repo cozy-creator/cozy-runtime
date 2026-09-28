@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import grpc
+import msgspec
 import pytest
 
 import signed_claims
@@ -23,6 +24,7 @@ from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker import activity
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import GrpcControlHost
+from cozy_runtime.internal.worker.machine_calls import CallRecord
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import documents
@@ -442,6 +444,27 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     "    call = leaf(n=n)\n"
                     "    first = await call\n"
                     "    assert call.observation.environment.worker_boot_id\n",
+                )
+            )
+        if case == "serving":
+            # Each leaf times a stage and two steps; compose calls them under author labels.
+            source = (
+                source.replace("App, Context, invocable", "App, Context, Telemetry, invocable")
+                .replace(
+                    "async def leaf(ctx: Context, *, n: int) -> Result:\n",
+                    "async def leaf(ctx: Context, tel: Telemetry, *, n: int) -> Result:\n"
+                    "    with tel.stage('condition'):\n        pass\n"
+                    "    on_step = tel.step_callback(2, stage='denoise')\n"
+                    "    on_step(0)\n    on_step(1)\n",
+                )
+                .replace(
+                    "async def compose(ctx: Context, *, n: int) -> Result:\n    call = leaf(n=n)\n",
+                    "async def compose(ctx: Context, tel: Telemetry, *, n: int) -> Result:\n"
+                    "    with tel.scope('Leaf 1'):\n        call = leaf(n=n)\n",
+                )
+                .replace(
+                    "    second = await leaf(n=n)",
+                    "    with tel.scope('Leaf 2'):\n        second = await leaf(n=n)",
                 )
             )
         if case == "serving_model":
@@ -891,6 +914,36 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     assert all(row["pid"] > 0 and row["started_ticks"] > 0 for row in invoked)
                     assert all(row["ranks"] and row["reusable"] for row in released)
                     assert all(not row["reuse_miss_reason"] for row in released)
+                if case == "serving":
+                    # Every settled call is on the root's journal, grandchildren included:
+                    # its function, the author's label, its status and where its time went.
+                    records = [
+                        msgspec.json.decode(row["body"], type=CallRecord)
+                        for row in db.execute(
+                            "SELECT body FROM execution_events WHERE request='root' "
+                            "AND kind='call' ORDER BY sequence"
+                        )
+                    ]
+                    compose, *leaves = sorted(records, key=lambda record: record.export)
+                    assert (compose.export, compose.parent, compose.label) == (
+                        "compose",
+                        "root",
+                        "",
+                    )
+                    assert [(leaf.label, leaf.index) for leaf in leaves] == [
+                        ("Leaf 1", 0),
+                        ("Leaf 2", 1),
+                    ]
+                    for leaf in leaves:
+                        assert (leaf.export, leaf.parent, leaf.status, leaf.attempt) == (
+                            "leaf",
+                            compose.request,
+                            "succeeded",
+                            1,
+                        )
+                        assert leaf.stages["condition"].count == 1
+                        assert leaf.steps["denoise"].count == len(leaf.steps["denoise"].series) == 2
+                        assert 0 < leaf.called_unix_ms <= leaf.steps["denoise"].ended_unix_ms
                 if case == "source":
                     # Native source work reports on the root's own journaled lane: byte
                     # samples per stage, then each stage's durable timing record.

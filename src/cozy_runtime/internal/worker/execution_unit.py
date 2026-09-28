@@ -50,6 +50,8 @@ class Execution:
         self.is_root: bool | None = None
         self.shape: machine_lanes.Shape | None = None
         self.shaped = 0
+        #: the attempt whose call record this unit journaled on its root
+        self.recorded = 0
 
     def run(self, unit: Unit) -> None:
         try:
@@ -174,6 +176,7 @@ class Execution:
         """A terminal execution delivers to its parent, stops its children and releases what
         it retains. The row is already terminal: a failed step is noted, never the worker's."""
         steps: tuple[tuple[str, Callable[[], None]], ...] = (
+            ("record", lambda: self._record(row)),
             ("custody", lambda: self.calls.deliver(unit, self.owner, self.request, row)),
             ("children", lambda: self._stop_children(row)),
             ("retention", lambda: self._release_retention(row)),
@@ -189,6 +192,13 @@ class Execution:
                 fault = {"step": name, "fault": why[:1024]}
                 with contextlib.suppress(Exception):
                     self.executions.record(self.owner, self.request, "settle_fault", fault)
+
+    def _record(self, row: ExecutionRow) -> None:
+        """Once per attempt, before custody wakes its parent (the call's label is the
+        parent's until then)."""
+        if self.recorded != row.ordinal:
+            self.recorded = row.ordinal
+            self.calls.record(self.owner, self.request, row)
 
     def _stop_children(self, row: ExecutionRow) -> None:
         """Open children follow their terminal parent: cancelled with it, else paused. A

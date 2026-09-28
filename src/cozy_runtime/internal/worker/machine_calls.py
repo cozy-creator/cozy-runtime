@@ -12,6 +12,8 @@ import hashlib
 import threading
 from typing import TYPE_CHECKING, Any
 
+import msgspec
+
 from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
 from cozy_runtime.internal import effect_interfaces, source_interfaces
@@ -21,6 +23,7 @@ from cozy_runtime.internal.worker import (
     machine_child_target,
     machine_lanes,
     machine_models,
+    triage,
     workspace_memo,
 )
 from cozy_runtime.internal.worker.machine_builtin import Builtins
@@ -31,13 +34,76 @@ from cozy_runtime.internal.worker.supervisor import Unit, fault_text
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call, CallFenced
 from cozy_runtime.internal.worker.workspace_calls import Calls as JournalCalls
-from cozy_runtime.internal.worker.workspace_executions import ExecutionRow
+from cozy_runtime.internal.worker.workspace_executions import MAX_EVENT_BYTES, ExecutionRow
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
     from .attempts import AttemptRecord
     from .session import Worker
+
+
+class CallTrack(msgspec.Struct, frozen=True, kw_only=True):
+    """One attribution span, as `author._observations.Track.document` spells it."""
+
+    count: int = 0
+    total_ms: float = 0.0
+    first_ms: float = 0.0
+    min_ms: float = 0.0
+    max_ms: float = 0.0
+    started_unix_ms: int = 0
+    ended_unix_ms: int = 0
+    series: tuple[tuple[int, float], ...] = ()
+    series_dropped: int = 0
+
+
+class _Attribution(msgspec.Struct, frozen=True):
+    stages: dict[str, CallTrack] = {}
+    steps: dict[str, CallTrack] = {}
+
+
+class _Measurements(msgspec.Struct, frozen=True):
+    attribution: _Attribution = _Attribution()
+
+
+class _Bundle(msgspec.Struct, frozen=True):
+    """The one section of a triage bundle a call record carries."""
+
+    measurements: _Measurements = _Measurements()
+
+
+class CallRecord(msgspec.Struct, frozen=True, kw_only=True):
+    """A settled child call on its root's journal (kind `call`): what it ran, under which
+    author label, how its attempt ended and where that attempt's time went. Its GPU grant
+    and release are the root's `gpu.*` events keyed `request#attempt`."""
+
+    request: str
+    parent: str
+    index: int
+    attempt: int
+    module: str
+    export: str
+    label: str
+    status: str
+    error: str
+    called_unix_ms: int
+    stages: dict[str, CallTrack]
+    steps: dict[str, CallTrack]
+
+    def bounded(self) -> CallRecord:
+        """This record within one event's bound: the longest step series go first."""
+        record = self
+        while len(canonical_json.encode(msgspec.to_builtins(record))) > MAX_EVENT_BYTES:
+            steps = dict(record.steps)
+            name = max(steps, key=lambda name: len(steps[name].series), default="")
+            if not name or not steps[name].series:
+                return msgspec.structs.replace(record, stages={}, steps={})
+            track = steps[name]
+            steps[name] = msgspec.structs.replace(
+                track, series=(), series_dropped=track.series_dropped + len(track.series)
+            )
+            record = msgspec.structs.replace(record, steps=steps)
+        return record
 
 
 class Calls:
@@ -153,6 +219,46 @@ class Calls:
             message = self._terminal(owner, call.child_request).safe_message
             result.safe_detail = (message or "child operation stopped")[:1024]
         return result
+
+    def record(self, owner: str, request: str, row: ExecutionRow) -> None:
+        """Journal a settled child call on its root, where the root's owner reads it."""
+        call = self.journal.child(owner, request)
+        if call is None:
+            return
+        body = self._terminal(owner, request)
+        attribution = _Attribution()
+        if body.HasField("triage_bundle"):
+            ref = body.triage_bundle
+            try:
+                data = triage.retained_bytes(
+                    self.worker.bundles.root,
+                    ref.subject_id,
+                    documents.spell(ref.write_receipt_digest),
+                    ref.length,
+                )
+            except triage.TriageError as exc:
+                self.worker.note("call", f"{request} records no attribution: {exc}"[:400])
+            else:
+                attribution = msgspec.json.decode(data, type=_Bundle).measurements.attribution
+        target = call.target()
+        record = CallRecord(
+            request=request,
+            parent=call.parent_request,
+            index=call.call_index,
+            attempt=row.ordinal,
+            module=target.module,
+            export=target.export,
+            label=self.worker.calls.progress_label(
+                call.parent_request, call.parent_ordinal, call.call_index
+            ),
+            status=row.state,
+            error=body.safe_message if row.state != "succeeded" else "",
+            called_unix_ms=call.created_ms,
+            stages=attribution.stages,
+            steps=attribution.steps,
+        )
+        root, _ = self.executions.scheduling_root(owner, request)
+        self.executions.record(owner, root, "call", msgspec.to_builtins(record.bounded()))
 
     def _terminal(self, owner: str, request: str) -> pb.AttemptOutcomeBody:
         outcome = self.executions.outcome(owner, request)
