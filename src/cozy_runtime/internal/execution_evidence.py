@@ -32,6 +32,8 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, NotRequired, TypedDict
 
+from cozy_runtime.internal.readiness import RuntimeGPU
+
 
 class Boot(TypedDict):
     """`Applied.document()`, the boot record as it crosses the executor seam (cr-124). A
@@ -165,27 +167,37 @@ def gpu_names(devices: Sequence[str]) -> str:
     return "GPUs " + ", ".join(name.removeprefix("GPU ") for name in names)
 
 
-def identify(entry: str, inventory: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+class GpuIdentity(TypedDict):
+    gpu: int
+    uuid: str
+
+
+def identify(entry: str, inventory: Sequence[RuntimeGPU] = ()) -> GpuIdentity:
     """One envelope entry (an index or a `GPU-…` UUID) as `{"gpu": n, "uuid": u}`: the number
     nvidia-smi shows (-1 when unknown) and the NVML identity ("" when unknown)."""
     for row in inventory:
-        if entry in (str(row.get("device_index")), row.get("device_uuid")):
-            return {"gpu": int(row["device_index"]), "uuid": str(row.get("device_uuid", ""))}
+        if entry in (str(row["device_index"]), row["device_uuid"]):
+            return {"gpu": row["device_index"], "uuid": row["device_uuid"]}
     if entry.isdigit():
         return {"gpu": int(entry), "uuid": ""}
     return {"gpu": -1, "uuid": entry}
 
 
+def _ordinal(row: Mapping[str, object]) -> int:
+    ordinal = row.get("ordinal", -1)
+    return ordinal if isinstance(ordinal, int) else -1
+
+
 def by_gpu(
-    ranks: Sequence[Mapping[str, Any]], inventory: Sequence[Mapping[str, Any]] = ()
-) -> list[dict[str, Any]]:
+    ranks: Sequence[Mapping[str, object]], inventory: Sequence[RuntimeGPU] = ()
+) -> list[dict[str, object]]:
     """The executor's per-process records as the wire's `gpus`: each under `gpu`, the number
     nvidia-smi shows. The UUID decides it where the inventory knows the card, so a CUDA order
     that differs from nvidia-smi's never mislabels one; else the seal entry does."""
-    numbers = {str(row["device_uuid"]): int(row["device_index"]) for row in inventory}
+    numbers = {row["device_uuid"]: row["device_index"] for row in inventory}
     return [
         {
-            "gpu": numbers.get(str(row.get("uuid", "")), int(row.get("ordinal", -1))),
+            "gpu": numbers.get(str(row.get("uuid", "")), _ordinal(row)),
             **{key: value for key, value in row.items() if key not in ("rank", "ordinal")},
         }
         for row in ranks

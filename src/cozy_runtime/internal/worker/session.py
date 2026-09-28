@@ -2398,7 +2398,7 @@ class Worker:
             if event == "gpu.wait":
                 self._gpu_waiting(owner, root, body, view)
 
-    def gpu_identity(self, ordinal: int) -> dict[str, Any]:
+    def gpu_identity(self, ordinal: int) -> execution_evidence.GpuIdentity:
         """Envelope ordinal `ordinal` as the GPU a person names (`execution_evidence.identify`)."""
         entries = self.lanes.entries
         entry = entries[ordinal] if 0 <= ordinal < len(entries) else ""

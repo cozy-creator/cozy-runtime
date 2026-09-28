@@ -74,6 +74,7 @@ from cozy_runtime.internal import (
     liveness,
     output_budget,
     package_interface,
+    readiness,
     seam,
 )
 from cozy_runtime.internal.executor_commands import (
@@ -554,7 +555,7 @@ class AttemptEngine:
         tensorfs_root: Path | None = None,
         work_fingerprint: Callable[[AttemptRecord], str] | None = None,
         room: Callable[[AttemptRecord], Handler] | None = None,
-        inventory: Sequence[Mapping[str, Any]] = (),
+        inventory: Sequence[readiness.RuntimeGPU] = (),
     ) -> None:
         self.records = records
         self.authorizer = authorizer
