@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import importlib.util
 import os
 import signal
 import subprocess
@@ -1064,7 +1065,11 @@ def _card_rows(*pids: int) -> dict[int, str]:
 
 
 @needs_executor
-@pytest.mark.skipif(_card_rows(os.getpid())[os.getpid()] == "unreadable", reason="no card 0")
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None
+    or _card_rows(os.getpid())[os.getpid()] == "unreadable",
+    reason="a rank holding card 0 needs torch and a driver-readable card",
+)
 def test_a_broken_group_is_reaped_before_its_cards_are_granted_again(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
