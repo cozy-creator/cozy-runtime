@@ -12,8 +12,6 @@ corpus/pipeline/imports/
 corpus/pipeline/tokenizer/
 corpus/pipeline/tokenizer_2/
 outputs/
-# the fused-kernel artifact is BUILT (fusion_build), never committed
-src/cozy_runtime/_kernels/fusion/
 
 # Agent task and ownership notes stay out of history
 .task/

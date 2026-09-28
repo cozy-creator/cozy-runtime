@@ -49,8 +49,6 @@ jobs:
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$b"
           cmp "$a"/*.whl "$b"/*.whl
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
-        run: uv run --with "triton==3.8.0" python -m cozy_runtime.internal.fusion_build --check --arch 90
-      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run pytest
       - name: Primary handoff under real supervised processes
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}

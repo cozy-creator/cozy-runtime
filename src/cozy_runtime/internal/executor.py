@@ -1412,7 +1412,7 @@ class Executor:
         took = (time.perf_counter() - started) * 1000
         if "started_unix_ms" in self.boot:
             # The boot record spans the warm too: `cozy run show` reads one executor boot.
-            for name in ("fusion_load", "attention_compile"):
+            for name in ("fusion_compile", "attention_compile"):
                 self.boot["legs_ms"][name] = max(r.get("legs_ms", {}).get(name, 0.0) for r in rows)
             self.boot["ms"] = round(time.time() * 1000 - self.boot["started_unix_ms"], 1)
         return {"ok": True, "ranks": rows, "ms": round(took, 1)}
@@ -1427,11 +1427,8 @@ class Executor:
         fused = ""
         classes = self._model_classes()
         if any(getattr(cls, "__fusion__", "refuse") in ("accept", "require") for cls in classes):
-            try:
-                fusion.load(self._rank_device(self.torch))
-            except Exception as exc:
-                fused = f"{type(exc).__name__}: {exc}"[:200]
-            legs["fusion_load"] = round((time.perf_counter() - mark) * 1000, 1)
+            fused = fusion.expect(self._rank_device(self.torch))[:200]
+            legs["fusion_compile"] = round((time.perf_counter() - mark) * 1000, 1)
         mark = time.perf_counter()
         kernels = attention.expect(device, self._preferred_attention(classes, device))
         # Launch checks' scratch goes back to the driver: the card may be another call's.

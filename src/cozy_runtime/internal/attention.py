@@ -421,14 +421,17 @@ def expect(device: DeviceFacts, preferred: Sequence[str] = ()) -> list[dict[str,
             rows.append({**_unsupported(name, unsupported).document(), "status": "unsupported"})
             continue
         started = time.perf_counter()
+        why = ""
         try:
             _resolve(candidate, device)
             status = "ready"
         except Exception as exc:
             status = exc.code if isinstance(exc, AttentionRefusal) else type(exc).__name__
+            why = str(exc)[:300]
         state = _STATES.get(name)
         rows.append(
             {
+                **({"detail": why} if why else {}),
                 **(state.document() if state is not None else {}),
                 "kernel": name,
                 "status": status,

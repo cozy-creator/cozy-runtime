@@ -13,20 +13,14 @@ modulate, gate-add, SwiGLU and RoPE chains are bit-identical; the RMSNorm itself
 from torch's fused kernel by one bf16 ulp on ~4e-6 of elements (fp32 reduction order of
 the row variance), and those elements are the whole distance between fused and eager.
 
-NOTHING COMPILES AT RUNTIME. The `@triton.jit` functions below are the kernel SOURCES;
-`fusion_build.py` compiles every (kernel, constexpr signature) x architecture ahead of
-time — in the worker image's build stage, or once on a developer's box — into a plain
-directory of Triton cache entries plus a manifest. `load()` resolves each spec to its cubin
-by recomputing Triton's own cache key from the sources, the pinned Triton and the device
-architecture. Three typed codes, and the difference is what a consenting package does with
-them (`fusion_install.py`): `fusion_kernels_absent` and `fusion_kernels_stale` mean this
-image was never given kernels for this runtime and device, so `fusion="accept"` records
-them and serves eager; `fusion_kernels_corrupt` means the artifact IS keyed to this runtime
-and still does not work — a bad bake, which refuses under either consent rather than hiding.
-
-The key covers kernel source (including the kernel's line position in this file), signature
-and architecture only: a LoRA, a component swap, a step count or a reference count cannot
-invalidate it, because none of them enters the kernel.
+The `@triton.jit` functions below are the kernel SOURCES. They compile on the machine that runs
+them, at worker boot, in the compile manager's niced background builder (`build`), into
+Triton's own keyed cache (`TRITON_CACHE_DIR`, inside the machine's kernel store); the store's
+entry for `job(arch)` marks that cache filled. `load` serves a READY build or raises typed:
+`fusion_kernels_compiling`, `fusion_kernels_failed`, `fusion_kernels_absent` (no store). A
+request never compiles. The key is Triton's own hash of every entry (sources, signature,
+architecture, options, Triton) plus its launcher module's and the cache location, so a LoRA,
+a component swap or a step count cannot invalidate it.
 
 Adapted from NVlabs/Sana `sol-engine` `models/minimax_h3/{GB200,GB10}/fusions.py`
 (Apache-2.0): the per-row program shape, the table-row gather inside the kernel, the
@@ -41,14 +35,13 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import json
-import shutil
-import sysconfig
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.internal import kernel_cache, kernel_compile
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
 try:
@@ -70,22 +63,14 @@ try:
         make_backend,
     )
     from triton.language.extra import libdevice
-    from triton.runtime.build import _get_cache_manager, platform_key
-    from triton.runtime.cache import get_cache_key
+    from triton.runtime.build import _get_cache_manager
+    from triton.runtime.cache import get_cache_key, get_cache_manager
 except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal arm
     TRITON_ABSENT = f"triton does not import ({_absent})"
 else:
     TRITON_ABSENT = ""
 
-#: Where the built artifact lives, two fixed locations and no path configuration: a
-#: developer builds into the installed package (beside `_C.abi3.so`); the worker image's
-#: build stage writes the profile-owned artifact under `/opt/cozy/fusion`, the same shape
-#: as its other non-wheel artifacts. Neither is committed; `fusion_build.py` writes them.
-KERNELS_DIR = Path(__file__).resolve().parent.parent / "_kernels" / "fusion"
-IMAGE_KERNELS_DIR = Path("/opt/cozy/fusion")
-TRITON_VERSION = "3.8.0"
 WARP_SIZE = 32
-MANIFEST = "manifest.json"
 
 _ROW_WARPS = 16
 _ROPE_HEADS = 8
@@ -93,15 +78,15 @@ _ROPE_WARPS = 4
 _SWIGLU_BLOCK = 1024
 _SWIGLU_WARPS = 8
 
-#: The width profiles the artifact is built for. The constexprs in a spec are the served
-#: widths, so a model with other widths needs its own row here and a rebuilt artifact.
+#: The width profiles compiled. The constexprs in a spec are the served widths, so a model
+#: with other widths needs its own row here.
 PROFILES: dict[str, dict[str, int]] = {
     "minimax-h3": {"hidden": 5376, "ffn": 14336, "head_dim": 128, "rotary": 96},
 }
 
 
 class FusionUnavailable(RuntimeError):
-    """Triton or the built kernels are absent/stale for this device. Typed, never a fallback."""
+    """Triton or this device's compiled kernels are not ready. Typed, never a fallback."""
 
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
@@ -445,17 +430,21 @@ else:  # pragma: no cover
 
 
 def source_digest() -> str:
-    """The kernel sources' identity, as the manifest and the artifact key record it."""
+    """The kernel sources' identity, as the fusion plan's identity records it."""
     _require_triton()
     text = "\n".join(inspect.getsource(fn.fn) for fn in _SOURCES)
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-# ------------------------------------------------------------------ artifact keys
+# ------------------------------------------------------------------------ compile
+
+
+def _all_specs() -> tuple[Spec, ...]:
+    return tuple(spec for profile in PROFILES.values() for spec in specs(**profile))
 
 
 def ast_source(spec: Spec) -> Any:
-    """The exact Triton `ASTSource` a spec compiles from — builder and loader share it."""
+    """The exact Triton `ASTSource` a spec compiles from: builder and loader share it."""
     _require_triton()
     fn = _KERNELS[spec.kernel]
     attrs = {(fn.arg_names.index(name),): [["tt.divisibility", 16]] for name in spec.aligned}
@@ -479,54 +468,56 @@ def cache_key(spec: Spec, arch: int) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-def utils_key() -> str:
-    """Portable artifact identity of the launcher source and target platform.
-
-    This is not Triton's cache key: that also includes compiler options and the
-    machine's library/include paths, which differ between image build and use.
-    """
-    _require_triton()
-    source = (Path(_cuda_driver.__file__).parent / "driver.c").read_text()
-    return hashlib.sha256((source + platform_key()).encode("utf-8")).hexdigest()
-
-
-def _utils_options() -> dict[str, Any]:
-    """The options CudaUtils passes to Triton's native extension builder."""
-    return {
+def _launcher_key() -> str:
+    """Triton's cache key for its launcher module (`CudaUtils`) on this host, its own way."""
+    source = (Path(_cuda_driver.__file__).parent / "driver.c").read_bytes()
+    options = {
+        "language": ["c"],
         "library_dirs": _cuda_driver.library_dirs(),
         "include_dirs": _cuda_driver.include_dirs,
         "libraries": _cuda_driver.libraries,
+        "ccflags": None,
     }
+    return str(_get_cache_manager(source, config=options).key)
 
 
-def build_utils() -> Path:
-    """Build the launcher with Triton and return its actual cache directory."""
+def job(arch: int) -> kernel_compile.Job:
+    """Every profile's kernels for `arch`, compiled into this process's Triton cache."""
     _require_triton()
-    module = _cuda_driver.compile_module_from_file(
-        src_path=str(Path(_cuda_driver.__file__).parent / "driver.c"),
-        name="cuda_utils",
-        **_utils_options(),
-    )
-    return Path(module.__file__).parent
+    entries = {spec.key: cache_key(spec, arch) for spec in _all_specs()}
+    inputs = {
+        "arch": arch,
+        "triton": triton.__version__,
+        "entries": entries,
+        "launcher": _launcher_key(),
+        "cache": triton.knobs.cache.dir,
+    }
+    key = kernel_cache.Key.of("fusion", inputs)
+    return kernel_compile.Job("fusion", key, {"arch": arch, "entries": entries})
 
 
-def utils_cache_dir() -> Path:
-    """Ask Triton where this host's CudaUtils call will look for the module."""
+def build(
+    spec: dict[str, Any], staging: Path, report: Callable[[float], None]
+) -> dict[str, object]:
+    """The compile manager's builder (`BUILDERS["fusion"]`): every entry into Triton's own
+    cache, then Triton's launcher module, so a launch compiles nothing. `staging` stays empty:
+    the published entry marks the cache filled."""
     _require_triton()
-    source = (Path(_cuda_driver.__file__).parent / "driver.c").read_bytes()
-    options = {"language": ["c"], **_utils_options(), "ccflags": None}
-    return Path(_get_cache_manager(source, config=options).cache_dir)
-
-
-def _utils_artifact(directory: Path, key: str) -> Path:
-    """Require the ABI-specific launcher that the compiler actually emits."""
-    module = directory / "utils" / key / f"cuda_utils{sysconfig.get_config_var('EXT_SUFFIX')}"
-    if not module.is_file() or module.stat().st_size == 0:
-        raise FusionUnavailable(
-            "fusion_kernels_corrupt",
-            f"the artifact names launcher module {key[:12]} but {module} is missing or empty",
+    arch, entries, todo = int(spec["arch"]), spec["entries"], _all_specs()
+    for done, one in enumerate(todo, 1):
+        compiled = triton.compile(
+            ast_source(one),
+            target=GPUTarget("cuda", arch, WARP_SIZE),
+            options={"num_warps": one.num_warps},
         )
-    return module
+        if compiled.hash != entries[one.key]:
+            raise kernel_compile.CompileFailed(
+                "compile_key_mismatch",
+                f"{one.key} compiled under {compiled.hash[:12]}, keyed {entries[one.key][:12]}",
+            )
+        report(done / (len(todo) + 1))
+    _cuda_driver.CudaUtils()
+    return {"entries": len(todo)}
 
 
 # ------------------------------------------------------------------------- loader
@@ -544,138 +535,77 @@ class _Loaded:
         except KeyError:
             raise FusionUnavailable(
                 "fusion_kernels_absent",
-                f"{key} is not in the built artifact for sm{self.arch}; rebuild "
-                f"`python -m cozy_runtime.internal.fusion_build` with a profile that "
-                "covers these widths",
+                f"{key} is not compiled for sm{self.arch}: no width profile covers these widths",
             ) from None
 
 
-def artifact_dir() -> Path:
-    """The first fixed location holding a manifest, or a typed absence naming both."""
-    for directory in (KERNELS_DIR, IMAGE_KERNELS_DIR):
-        if (directory / MANIFEST).is_file():
-            return directory
-    raise FusionUnavailable(
-        "fusion_kernels_absent",
-        f"no fused-kernel artifact at {KERNELS_DIR} or {IMAGE_KERNELS_DIR}: the worker "
-        "image's build stage (or a developer, once per box) runs "
-        "`python -m cozy_runtime.internal.fusion_build`",
-    )
+#: Loaded kernels by device index.
+_LOADED: dict[int, _Loaded] = {}
 
 
-def check_artifact(directory: Path, arch: int) -> dict[str, Any]:
-    """The manifest, proven against THIS runtime's sources, Triton and `arch` — no device.
-
-    Every spec's key is recomputed and must equal the artifact's; the image build asserts
-    this after copying the artifact in, and `load` runs it before touching the device.
-    """
-    _require_triton()
-    path = directory / MANIFEST
-    if not path.is_file():
-        raise FusionUnavailable("fusion_kernels_absent", f"no fused-kernel artifact at {directory}")
-    manifest = json.loads(path.read_text())
-    if not isinstance(manifest, dict):
-        raise FusionUnavailable("fusion_kernels_corrupt", f"{path} is not a manifest object")
-    if triton.__version__ != TRITON_VERSION:
-        raise FusionUnavailable(
-            "fusion_kernels_stale",
-            f"the fused kernels are built for triton {TRITON_VERSION}; found {triton.__version__}",
-        )
-    if manifest.get("triton") != TRITON_VERSION or manifest.get("kernels") != source_digest():
-        raise FusionUnavailable(
-            "fusion_kernels_stale",
-            f"the artifact at {directory} was built for triton {manifest.get('triton')} and "
-            f"kernel sources {str(manifest.get('kernels'))[:12]}; this runtime carries triton "
-            f"{TRITON_VERSION} and sources {source_digest()[:12]} — rebuild it",
-        )
-    if manifest.get("utils") != utils_key():
-        raise FusionUnavailable(
-            "fusion_kernels_stale",
-            "the artifact's Triton launcher module was built for another platform or Triton",
-        )
-    targets = manifest.get("targets") or {}
-    entries = targets.get(f"sm{arch}")
-    if not isinstance(entries, dict):
-        raise FusionUnavailable(
-            "fusion_kernels_absent",
-            f"the artifact at {directory} holds {sorted(targets)} and this device is sm{arch}",
-        )
-    _utils_artifact(directory, str(manifest["utils"]))
-    for profile in PROFILES.values():
-        for spec in specs(**profile):
-            expected = cache_key(spec, arch)
-            if entries.get(spec.key) != expected:
-                raise FusionUnavailable(
-                    "fusion_kernels_stale",
-                    f"{spec.key} for sm{arch}: artifact holds {str(entries.get(spec.key))[:12]}, "
-                    f"this runtime's key is {expected[:12]} — the artifact was built from other "
-                    "sources",
-                )
-            entry_file = f"{_KERNELS[spec.kernel].__name__}.json"
-            if not (directory / f"sm{arch}" / expected / entry_file).is_file():
-                # THE MANIFEST NAMES THIS RUNTIME'S OWN KEY and the files are not there:
-                # a bad bake, not an image that was never given the kernels.
-                raise FusionUnavailable(
-                    "fusion_kernels_corrupt",
-                    f"{spec.key} for sm{arch}: the manifest names key {expected[:12]} and "
-                    f"{directory / f'sm{arch}' / expected / entry_file} is missing",
-                )
-    return manifest
-
-
-def load(device: Any, directory: Path | None = None) -> _Loaded:
-    """Resolve every spec of every profile to its cubin for `device`, from the artifact.
-
-    Idempotent per (process, device). Copies Triton's launcher module into the imposed
-    Triton cache scope so Triton itself never compiles it either, then constructs each
-    `CompiledKernel` from the artifact's files and loads its cubin onto the device.
-    """
+def _job(device: Any) -> tuple[kernel_cache.Store, kernel_compile.Job]:
     _require_triton()
     _require_torch()
-    loaded: dict[int, _Loaded] = getattr(load, "_cached", {})
-    index = torch.device(device).index or 0
-    if index in loaded:
-        return loaded[index]
-    directory = artifact_dir() if directory is None else directory
-    major, minor = torch.cuda.get_device_capability(index)
-    arch = major * 10 + minor
-    manifest = check_artifact(directory, arch)
-    _place_utils(directory, manifest)
-    compiled: dict[str, Any] = {}
-    for profile in PROFILES.values():
-        for spec in specs(**profile):
-            expected = cache_key(spec, arch)
-            files = directory / f"sm{arch}" / expected
-            group = {path.name: str(path) for path in files.iterdir() if path.is_file()}
-            kernel = CompiledKernel(ast_source(spec), group, expected)
-            try:
-                kernel._init_handles()
-            except Exception as exc:
-                raise FusionUnavailable(
-                    "fusion_kernels_corrupt", f"{spec.key} does not load on sm{arch}: {exc}"
-                ) from exc
-            compiled[spec.key] = kernel
-    result = _Loaded(arch, compiled)
-    loaded[index] = result
-    load._cached = loaded  # type: ignore[attr-defined]
-    return result
+    store = kernel_cache.configured()
+    if store is None:
+        raise FusionUnavailable(
+            "fusion_kernels_absent", "no machine kernel store: this executor has no rooted worker"
+        )
+    major, minor = torch.cuda.get_device_capability(device)
+    return store, job(major * 10 + minor)
 
 
-def _place_utils(directory: Path, manifest: dict[str, Any]) -> None:
-    """Triton's launcher module goes into the imposed cache scope before the driver wakes."""
-    source = _utils_artifact(directory, str(manifest["utils"]))
-    target = utils_cache_dir() / source.name
-    if not target.exists():
-        shutil.copy2(source, target)
-
-
-def available(device: Any) -> str:
-    """Why the fused path cannot serve `device`, or "" when it can."""
+def expect(device: Any) -> str:
+    """Worker boot: submit this device's compile without waiting; the state's line."""
     try:
-        load(device)
+        store, found = _job(device)
     except FusionUnavailable as exc:
         return f"{exc.code}: {exc}"
-    return ""
+    return kernel_compile.submit(store, found).line()
+
+
+def load(device: Any, *, wait: bool = False) -> _Loaded:
+    """This device's compiled kernels, loaded onto it from Triton's cache; never a compile.
+
+    Not ready is typed. `wait` is construction under `fusion="require"`, never a request: it
+    first waits on the live build of the key. Idempotent per (process, device)."""
+    _require_triton()
+    _require_torch()
+    index = torch.device(device).index or 0
+    if index in _LOADED:
+        return _LOADED[index]
+    store, found = _job(index)
+    state = kernel_compile.submit(store, found)
+    if wait and state.state == "compiling":
+        with store.building(found.key):
+            pass
+        state = kernel_compile.status(store, found)
+    arch = int(found.spec["arch"])
+    if state.state != "ready":
+        # After the wait, anything but ready is a build that ended without publishing.
+        failed = wait or state.state == "failed"
+        code = "fusion_kernels_failed" if failed else "fusion_kernels_compiling"
+        raise FusionUnavailable(code, f"sm{arch} fused kernels: {state.line()}")
+    compiled: dict[str, Any] = {}
+    for spec in _all_specs():
+        digest = found.spec["entries"][spec.key]
+        name = f"{_KERNELS[spec.kernel].__name__}.json"
+        group = get_cache_manager(digest).get_group(name) or {}
+        if name not in group:
+            raise FusionUnavailable(
+                "fusion_kernels_corrupt",
+                f"{spec.key}: the store marks sm{arch} built, Triton's cache lacks {digest[:12]}",
+            )
+        kernel = CompiledKernel(ast_source(spec), group, digest)
+        try:
+            kernel._init_handles()
+        except Exception as exc:
+            raise FusionUnavailable(
+                "fusion_kernels_corrupt", f"{spec.key} does not load on sm{arch}: {exc}"
+            ) from exc
+        compiled[spec.key] = kernel
+    loaded = _LOADED[index] = _Loaded(arch, compiled)
+    return loaded
 
 
 # ---------------------------------------------------------------------- wrappers
@@ -872,11 +802,8 @@ def warm(
     rotary: int,
     fp8: bool,
 ) -> float:
-    """Load the artifact and launch every entry the served widths need, on two rows.
-
-    Nothing compiles: `load` refuses typed before this runs anything. Returns the
-    milliseconds the loads and first launches took — the cold-pod cost the artifact buys.
-    """
+    """Load and launch every entry the served widths need, on two rows; nothing compiles.
+    Returns the milliseconds the loads and first launches took."""
     started = time.perf_counter()
     load(device)
     rows, table = 2, 3

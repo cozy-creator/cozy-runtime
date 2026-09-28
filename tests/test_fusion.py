@@ -11,9 +11,10 @@ the bound is over the tensor's range, not per element: `|fused - eager| <= 2^-6 
 partner channel or a dropped rounding differs on ~50% of elements, not 1e-5.
 
 Imports are at the top and guarded (torch/triton/diffusers absent skips every card arm).
-The kernels are never compiled here: a session fixture builds the artifact for this card
-with `fusion_build` (the same command the worker image's build stage runs) and the loader
-resolves cubins from it; one arm proves `triton.compile` is never reached.
+The kernels compile once per session the way a worker boot compiles them: `fusion.expect`
+submits the build to the machine's compile manager, whose niced background process fills
+the session store's Triton cache; one arm proves a fresh process then loads and launches
+without compiling anything.
 
 The block arm runs a one-block real-width MiniMax-H3 transformer through the runtime's
 installer — the same `apply_fusion_plan` the executor calls — twice: as decoded bf16
@@ -25,7 +26,10 @@ from __future__ import annotations
 
 import gc
 import json
-import shutil
+import os
+import subprocess
+import sys
+import textwrap
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -33,18 +37,17 @@ from typing import Any
 import pytest
 
 from cozy_runtime.author import ConformanceError, Model
-from cozy_runtime.internal import fusion, fusion_build, fusion_install
+from cozy_runtime.internal import fusion, fusion_install, kernel_cache, kernel_compile
 from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf, quantize_activation_rowwise
 
 try:
     import torch
-    import triton
     from diffusers import MiniMaxH3Transformer3DModel
     from diffusers.models.transformers.transformer_minimax_h3 import (
         MiniMaxH3RotaryPosEmbed,
         _apply_rotary_emb,
     )
-    from triton.compiler import compiler
+    from triton.runtime.cache import get_cache_manager
 except ImportError as _absent:
     CARD_ABSENT = f"torch, triton and diffusers must be importable: {_absent}"
 else:
@@ -75,31 +78,35 @@ def _arch() -> int:
     return int(major) * 10 + int(minor)
 
 
-def _point_loader_at(directory: Path) -> None:
-    fusion.KERNELS_DIR = directory
-    fusion.load._cached = {}  # type: ignore[attr-defined]
-
-
 @pytest.fixture(scope="session")
-def artifact(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
-    """The built kernels for this card, exactly as `fusion_build` writes them for an image."""
+def machine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[kernel_cache.Store | None]:
+    """This card's kernels in a machine store, built exactly as a worker boot builds them."""
     if NO_CARD:
-        yield Path()
+        yield None
         return
-    directory = tmp_path_factory.mktemp("fusion-kernels")
-    fusion_build.build(directory, (_arch(),))
-    original = fusion.KERNELS_DIR
-    _point_loader_at(directory)
-    yield directory
-    _point_loader_at(original)
+    root = tmp_path_factory.mktemp("machine")
+    (root / "boot").mkdir()
+    store = kernel_cache.Store(root / "u")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("TRITON_CACHE_DIR", str(store.own / "triton"))
+        patch.setenv("TMPDIR", str(root / "boot"))  # the worker boot's failure scope
+        patch.setattr("tempfile.tempdir", None)
+        patch.setattr(kernel_cache, "_MACHINE_STORE", [store])
+        device = torch.device("cuda")
+        assert fusion.expect(device) == "compiling"
+        job = fusion.job(_arch())
+        with store.building(job.key):  # waits on the live builder, never a clock
+            pass
+        state = kernel_compile.status(store, job)
+        assert state.state == "ready", state
+        yield store
 
 
 @pytest.fixture(autouse=True)
-def _no_grad(artifact: Path) -> Iterator[None]:
+def _no_grad(machine: kernel_cache.Store | None) -> Iterator[None]:
     if NO_CARD:
         yield
         return
-    _point_loader_at(artifact)
     with torch.no_grad():
         yield
     # Each arm builds a real-width transformer; a development card is 8 GiB, so the
@@ -120,6 +127,51 @@ def _assert_bf16_close(reference: Any, actual: Any, *, exact: bool = False) -> N
 def _tables(torch: Any, rows: int, device: Any) -> tuple[Any, ...]:
     table = (0.5 * torch.randn(rows, 6 * HIDDEN, device=device)).to(torch.bfloat16)
     return tuple(table.chunk(6, dim=-1))
+
+
+def _tree(root: Path) -> dict[str, int]:
+    return {str(p.relative_to(root)): p.stat().st_size for p in sorted(root.rglob("*"))}
+
+
+@needs_card
+def test_a_fresh_process_loads_the_boot_build_and_launches_without_compiling(
+    machine: kernel_cache.Store,
+) -> None:
+    """The session's build went through `kernel_compile.submit` to the niced background
+    builder. A fresh process with `triton.compile` and the C compiler disarmed loads it from
+    the store and launches; Triton's cache is afterwards exactly what the build left."""
+    job = fusion.job(_arch())
+    entry = machine.entry(job.key)
+    assert entry is not None and [p.name for p in entry.iterdir()] == ["entry.json"]
+    producer = json.loads((entry / "entry.json").read_text())["producer"]
+    assert producer["entries"] == len(job.spec["entries"]) == 8
+    print(f"sm{_arch()} fused kernels compiled in {producer['compile_ms'] / 1000:.1f} s")
+    cache = Path(os.environ["TRITON_CACHE_DIR"])
+    before = _tree(cache)
+    code = textwrap.dedent(
+        f"""
+        from pathlib import Path
+        import torch, triton
+        from triton.compiler import compiler
+        from cozy_runtime.internal import fusion, kernel_cache
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("the loader reached triton.compile")
+
+        triton.compile = compiler.compile = refuse
+        kernel_cache.configure(kernel_cache.Store(Path({str(machine.own)!r})))
+        torch.manual_seed(0)
+        x, branch = torch.randn(2, 3, 512, {HIDDEN}, device="cuda").to(torch.bfloat16)
+        gate = torch.randn(9, {HIDDEN}, device="cuda").to(torch.bfloat16)
+        index = torch.randint(0, 9, (512,), device="cuda")
+        eager = x + gate.index_select(0, index) * branch
+        assert torch.equal(fusion.gate_add(x, gate, branch, index), eager)
+        """
+    )
+    env = {**os.environ, "CC": "/the-c-compiler-must-not-run"}
+    ran = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert ran.returncode == 0, ran.stderr[-3000:]
+    assert _tree(cache) == before
 
 
 @needs_card
@@ -194,8 +246,8 @@ class _Holder:
         self.pipe = type("Pipe", (), {"components": {"fl2va_dit": transformer}})()
 
 
-def _one_block_transformer(torch: Any, device: Any) -> Any:
-    transformer = MiniMaxH3Transformer3DModel(num_layers=1, num_refiner_layers=1)
+def _one_block_transformer(torch: Any, device: Any, **config: int) -> Any:
+    transformer = MiniMaxH3Transformer3DModel(num_layers=1, num_refiner_layers=1, **config)
     with torch.no_grad():
         for parameter in transformer.parameters():
             parameter.normal_(std=0.02)
@@ -309,156 +361,82 @@ def test_installed_block_matches_eager_transformer(encoded: bool, hooked: bool) 
 
 
 @needs_card
-def test_loader_never_compiles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """A fresh cache scope, `triton.compile` armed to fail: load and launch every entry."""
-
-    def refuse(*args: object, **kwargs: object) -> object:
-        raise AssertionError("the runtime reached triton.compile")
-
-    monkeypatch.setattr(triton, "compile", refuse)
-    monkeypatch.setattr(compiler, "compile", refuse)
-    monkeypatch.setattr(triton.knobs.cache, "dir", str(tmp_path))
-    fusion.load._cached = {}  # type: ignore[attr-defined]
+def test_a_build_not_ready_serves_eager_under_accept_and_is_awaited_under_require(
+    machine: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`accept` is CONSENT: absent, compiling or failed, the plan records the typed code and
+    the eager forward serves bit for bit. `require` waits for the build, then refuses. No
+    kernel launches, so the transformer is narrow."""
     device = torch.device("cuda")
-    fusion.warm(
-        device, hidden=HIDDEN, ffn=FFN, heads=HEADS, head_dim=HEAD_DIM, rotary=ROTARY, fp8=True
+    transformer = _one_block_transformer(
+        torch,
+        device,
+        num_attention_heads=2,
+        hidden_size=256,
+        ffn_dim=512,
+        time_embed_hidden_dim=256,
+        time_embed_dim=128,
     )
-    utils = fusion.utils_cache_dir().name
-    entries = sorted(path.name for path in tmp_path.iterdir())
-    assert entries == [utils], "only Triton's launcher module was placed; no kernel compiled"
-
-
-@needs_card
-def test_artifact_absent_or_stale_is_typed_at_the_loader(tmp_path: Path, artifact: Path) -> None:
-    device = torch.device("cuda")
-    _point_loader_at(tmp_path)
-    with pytest.raises(fusion.FusionUnavailable) as absent:
-        fusion.load(device)
-    assert absent.value.code == "fusion_kernels_absent"
-
-    other = tmp_path / "other-arch"
-    other.mkdir()
-    manifest = json.loads((artifact / fusion.MANIFEST).read_text())
-    manifest["targets"] = {"sm999": manifest["targets"][f"sm{_arch()}"]}
-    (other / fusion.MANIFEST).write_text(json.dumps(manifest))
-    _point_loader_at(other)
-    with pytest.raises(fusion.FusionUnavailable) as wrong_arch:
-        fusion.load(device)
-    assert wrong_arch.value.code == "fusion_kernels_absent"
-    assert f"sm{_arch()}" in str(wrong_arch.value)
-
-    stale = tmp_path / "stale"
-    stale.mkdir()
-    manifest = json.loads((artifact / fusion.MANIFEST).read_text())
-    manifest["kernels"] = "0" * 64
-    (stale / fusion.MANIFEST).write_text(json.dumps(manifest))
-    _point_loader_at(stale)
-    with pytest.raises(fusion.FusionUnavailable) as stale_sources:
-        fusion.load(device)
-    assert stale_sources.value.code == "fusion_kernels_stale"
-
-    # A CONSENTING PACKAGE STILL SERVES on a stale artifact: recorded, not refused.
-    stale_record = fusion_install.apply_fusion_plan(
-        _Holder(_one_block_transformer(torch, device)), torch=torch, device=device
-    )
-    assert not stale_record.applied and stale_record.code == "fusion_kernels_stale"
-    with pytest.raises(fusion_install.FusionRefusal) as through_plan:
-        fusion_install.apply_fusion_plan(
-            _Holder(_one_block_transformer(torch, device)),
-            torch=torch,
-            device=device,
-            required=True,
-        )
-    assert through_plan.value.code == "fusion_kernels_stale"
-
-
-@needs_card
-def test_absent_artifact_serves_eager_and_records_the_fact(tmp_path: Path) -> None:
-    """`fusion="accept"` is CONSENT: an image with no artifact serves the eager forward.
-
-    The whole path the executor calls, on a real transformer: the plan does not install,
-    the record carries the typed code and both fixed paths the loader looked in, no
-    module's class changed, and the next forward is bit-for-bit the eager one. The
-    `fusion="require"` spelling is what turns the same condition into a refusal.
-    """
-    device = torch.device("cuda")
-    transformer = _one_block_transformer(torch, device)
     inputs = _packed_inputs(torch, device, seq=1536)
     video_eager, audio_eager = transformer(**inputs)
     was = type(transformer.transformer_blocks[0])
+    monkeypatch.setattr(fusion, "_LOADED", {})
 
-    nowhere = tmp_path / "an-image-baked-without-the-stage"
-    _point_loader_at(nowhere)
-    record = fusion_install.apply_fusion_plan(_Holder(transformer), torch=torch, device=device)
+    def outcome(required: bool = False) -> str:
+        try:
+            record = fusion_install.apply_fusion_plan(
+                _Holder(transformer), torch=torch, device=device, required=required
+            )
+        except fusion_install.FusionRefusal as exc:
+            return f"refused {exc.code}"
+        assert not record.applied and record.substitutions == () and record.fp8_sites == 0
+        assert record.document()["code"] == record.code
+        return record.code
 
-    assert not record.applied and record.code == "fusion_kernels_absent"
-    assert str(nowhere) in record.reason and str(fusion.IMAGE_KERNELS_DIR) in record.reason
-    assert record.document()["code"] == "fusion_kernels_absent"
-    assert record.substitutions == () and record.fp8_sites == 0
+    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [None])  # no rooted worker
+    assert outcome() == "fusion_kernels_absent"
+    assert outcome(required=True) == "refused fusion_kernels_absent"
+
+    store = kernel_cache.Store(tmp_path / "u")
+    cache = store.own / "triton"
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(cache))
+    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [store])
+    job = fusion.job(_arch())
+    held = store.claim(job.key)  # a live builder holds the key
+    assert held is not None
+    assert outcome() == "fusion_kernels_compiling"
+    os.close(held)
+
+    cache.chmod(0o500)  # the builder cannot write Triton's cache
+    try:
+        assert outcome(required=True) == "refused fusion_kernels_failed"
+        assert outcome() == "fusion_kernels_failed"
+    finally:
+        cache.chmod(0o700)
+    assert kernel_compile.status(store, job).state == "failed"
     assert type(transformer.transformer_blocks[0]) is was
     video, audio = transformer(**inputs)
     assert torch.equal(video, video_eager) and torch.equal(audio, audio_eager)
 
-    with pytest.raises(fusion_install.FusionRefusal) as required:
-        fusion_install.apply_fusion_plan(
-            _Holder(transformer), torch=torch, device=device, required=True
-        )
-    assert required.value.code == "fusion_kernels_absent"
-
 
 @needs_card
-def test_build_is_deterministic() -> None:
-    fusion_build.check((_arch(),))
-
-
-@needs_card
-def test_the_built_artifact_carries_the_launcher_module(artifact: Path) -> None:
-    """The NON-`--check` build path, which CI never runs: `utils=True`.
-
-    `fusion_build.check` passes `utils=False` and so never calls `build_utils()` — which
-    has Triton link AND dlopen `cuda_utils`, whose own `libcuda.so.1` NEEDED entry has to
-    resolve. Every arm in this file loads through the fixture's `build(...)` (utils on),
-    so the module is built, carried and placed; this names the invariant.
-    """
-    manifest = json.loads((artifact / fusion.MANIFEST).read_text())
-    assert manifest["utils"] and manifest["utils"] == fusion.utils_key()
-    carried = sorted(path.name for path in (artifact / "utils" / manifest["utils"]).iterdir())
-    assert any(name.endswith(".so") for name in carried), carried
-
-
-@needs_card
-def test_corrupt_artifact_refuses_even_under_accept(tmp_path: Path, artifact: Path) -> None:
-    """An artifact keyed to THIS runtime that does not work is a BAD BAKE, not an absence.
-
-    `accept` serves eager past an image that was never given kernels; it must not serve
-    eager past one that was given broken ones, or nobody would ever find the bake bug.
-    """
+def test_a_ready_build_that_does_not_load_refuses_even_under_accept(
+    machine: kernel_cache.Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store marks the build ready and Triton's cache lost an entry: breakage, which
+    `accept` must not hide behind eager."""
     device = torch.device("cuda")
-    manifest = json.loads((artifact / fusion.MANIFEST).read_text())
-
-    # (a) the launcher module the manifest names, not carried.
-    no_utils = tmp_path / "no-launcher-module"
-    shutil.copytree(artifact, no_utils)
-    shutil.rmtree(no_utils / "utils" / manifest["utils"])
-    _point_loader_at(no_utils)
-    with pytest.raises(fusion.FusionUnavailable) as broken:
-        fusion.load(device)
-    assert broken.value.code == "fusion_kernels_corrupt"
-    with pytest.raises(fusion_install.FusionRefusal) as refused:
-        fusion_install.apply_fusion_plan(
-            _Holder(_one_block_transformer(torch, device)), torch=torch, device=device
-        )
-    assert refused.value.code == "fusion_kernels_corrupt"
-
-    # (b) the cubin entries the manifest names, not carried.
-    gutted = tmp_path / "no-entry-files"
-    shutil.copytree(artifact, gutted)
-    for digest in manifest["targets"][f"sm{_arch()}"].values():
-        shutil.rmtree(gutted / f"sm{_arch()}" / digest)
-    _point_loader_at(gutted)
-    with pytest.raises(fusion.FusionUnavailable) as gone:
-        fusion.load(device)
-    assert gone.value.code == "fusion_kernels_corrupt"
+    monkeypatch.setattr(fusion, "_LOADED", {})
+    job = fusion.job(_arch())
+    group = Path(get_cache_manager(next(iter(job.spec["entries"].values()))).cache_dir)
+    away = group.rename(group.with_name(f"{group.name}.away"))
+    try:
+        with pytest.raises(fusion_install.FusionRefusal) as refused:
+            fusion_install.apply_fusion_plan(object(), torch=torch, device=device)
+        assert refused.value.code == "fusion_kernels_corrupt"
+    finally:
+        group.rmdir()  # the lookup's own empty directory
+        away.rename(group)
 
 
 @needs_card
@@ -483,19 +461,12 @@ def test_source_drift_serves_eager_before_any_substitution(
 @needs_card
 def test_absent_triton_is_recorded_and_eager_serves(monkeypatch: pytest.MonkeyPatch) -> None:
     device = torch.device("cuda")
-    monkeypatch.setattr(fusion.load, "_cached", {}, raising=False)
+    monkeypatch.setattr(fusion, "_LOADED", {})
     monkeypatch.setattr(fusion, "TRITON_ABSENT", "triton does not import (planted)")
-    record = fusion_install.apply_fusion_plan(
-        _Holder(_one_block_transformer(torch, device)), torch=torch, device=device
-    )
+    record = fusion_install.apply_fusion_plan(object(), torch=torch, device=device)
     assert not record.applied and record.code == "fusion_triton_absent"
     with pytest.raises(fusion_install.FusionRefusal) as refused:
-        fusion_install.apply_fusion_plan(
-            _Holder(_one_block_transformer(torch, device)),
-            torch=torch,
-            device=device,
-            required=True,
-        )
+        fusion_install.apply_fusion_plan(object(), torch=torch, device=device, required=True)
     assert refused.value.code == "fusion_triton_absent"
 
 
