@@ -1,0 +1,1 @@
+An observation field may be a bool. The worker used to reject the whole executor reply over one (run 1566: `complete=True` failed a finished 10-minute attempt `executor_reply_malformed`). Now it reads each observation row on its own, so a row it cannot read is dropped with one warning and counted as `unreadable_rows`, and the attempt's result stands.

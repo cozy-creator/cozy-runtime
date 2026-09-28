@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import sys
@@ -13,11 +14,16 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._observations import MAX_SERIES, Attribution, EventRing
-from cozy_runtime.internal import execution_evidence, package_interface
+from cozy_runtime.internal import execution_evidence, executor_replies, package_interface
+from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
+from cozy_runtime.internal.executor_replies import AttemptReply
 from cozy_runtime.internal.seam import Channel
+from cozy_runtime.internal.worker.attempts import AttemptRecord
+from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 
 MODULE = "execution_evidence_fixture"
 SOURCE = """
@@ -40,6 +46,8 @@ class Result(msgspec.Struct):
 def generate(ctx: Context, payload: Request, tel: Telemetry) -> Result:
     for index in range(3):
         tel.log("evidence row", index=index)
+    tel.log("delivery", complete=True, delivered=payload.steps)
+    tel.log("unreadable", shape=[1, 2])
     with tel.stage("condition"):
         time.sleep(0.01)
     on_step = tel.step_callback(payload.steps, stage="denoise")
@@ -135,6 +143,34 @@ def test_an_attempt_records_its_rank_setup_and_every_step(executor: Executor) ->
     assert len(ends) == 4 and ends == sorted(ends)
     assert condition["ended_unix_ms"] <= ends[0] <= rank["end_us"] // 1000
     assert sum(ms for _end, ms in denoise["series"]) == pytest.approx(denoise["total_ms"], abs=0.01)
+
+
+def test_a_bool_field_reaches_the_worker_and_an_unreadable_row_costs_only_itself(
+    executor: Executor, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Run 1566: one `complete=True` field failed a finished attempt `executor_reply_malformed`.
+    A bool is a scalar end to end; a row the worker cannot read is dropped with one warning,
+    and the attempt's result stands."""
+    reply = executor_replies.decode(_invoke(executor, "scalars"), AttemptReply)
+    assert reply.ok and reply.outcome is not None, reply
+    assert reply.outcome.terminal == "succeeded", reply.outcome
+    worker = Worker(
+        RuntimeConfig(cozy_home=tmp_path / "home", credentials=Credentials()),
+        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
+        InMemoryControlHost(),
+    )
+    attempt = AttemptRecord("scalars", 1, b"digest", {})
+    try:
+        with caplog.at_level(logging.WARNING):
+            worker.engine.absorb(attempt, reply, apply_ledger=False)
+    finally:
+        worker.shutdown()
+    rows = {row["name"]: row for row in attempt.ring.rows()}
+    fields: Any = rows["delivery"]["fields"]
+    assert fields["complete"] is True and fields["delivered"] == 4
+    assert "unreadable" not in rows and attempt.caps["unreadable_rows"] == 1
+    (warning,) = [row.getMessage() for row in caplog.records if "cannot read" in row.getMessage()]
+    assert "'unreadable'" in warning and "got `array`" in warning, warning
 
 
 def test_the_request_pin_is_what_every_rank_reports_as_requested() -> None:

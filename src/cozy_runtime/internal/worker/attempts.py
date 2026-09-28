@@ -30,6 +30,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import re
 import stat
 import threading
@@ -117,6 +118,8 @@ from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+
+_LOG = logging.getLogger(__name__)
 
 #: `safe_message` and `cause.detail` are bounded and SANITIZED (01 §3): printable ASCII
 #: only, no secrets, no local paths, no signed URLs. The document profile is integer-only
@@ -2160,9 +2163,25 @@ class AttemptEngine:
         """
         caps = dict(reply.observation_caps)
         attempt.attribution = dict(reply.attribution)
-        rows = reply.observations
+        rows: list[ObservationRow] = []
+        unreadable: list[str] = []
+        for frame in reply.observations[-attempt.ring.max_events :]:
+            try:
+                rows.append(msgspec.convert(frame, ObservationRow))
+            except msgspec.ValidationError as exc:
+                name = frame.get("name") if isinstance(frame, dict) else None
+                unreadable.append(f"{name!r}: {exc}")
+        if unreadable:
+            # Telemetry never fails the attempt it observes: the row goes, the result stays.
+            _LOG.warning(
+                "%s#%d: dropped %d executor observation(s) this worker cannot read; first %s",
+                attempt.request_id,
+                attempt.attempt,
+                len(unreadable),
+                unreadable[0],
+            )
         kept = 0
-        for row in rows[-attempt.ring.max_events :]:
+        for row in rows:
             # Anything the lossy lane already delivered is skipped by the EXECUTOR's own
             # sequence. Both sides shed oldest first, so this fills the gap after the last
             # forwarded row and can never double-count one.
@@ -2202,7 +2221,8 @@ class AttemptEngine:
                 f"{shortfall.needed_bytes} B, {shortfall.available_bytes} B available, "
                 f"short by {shortfall.needed_bytes - shortfall.available_bytes} B",
             )
-        caps["executor_rows"] = len(rows)
+        caps["executor_rows"] = len(reply.observations)
+        caps["unreadable_rows"] = len(unreadable)
         caps["forwarded_live"] = attempt.forwarded_seq
         caps["absorbed_from_reply"] = kept
         caps.update(attempt.ring.caps())

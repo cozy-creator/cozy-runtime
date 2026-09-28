@@ -116,7 +116,9 @@ class AttemptReply(msgspec.Struct, frozen=True, kw_only=True):
     #: Sealed environment names the package changed; the executor restored them.
     env_changed: tuple[str, ...] = ()
     residency: dict[str, Json] = {}
-    observations: tuple[ObservationRow, ...] = ()
+    #: Undecoded here: the worker reads each row alone, so an unreadable row costs itself,
+    #: never the reply and its result.
+    observations: tuple[object, ...] = ()
     observation_caps: dict[str, int] = {}
     attribution: dict[str, Json] = {}
     position: int = 0
