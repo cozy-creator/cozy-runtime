@@ -18,10 +18,7 @@ def prepare_boot(
 ) -> Path:
     """Bring the pod to READY-BUT-EMPTY by opening its local TensorFS Store.
 
-    No lease check (xs-007 row 18). This used to refuse `worker_lease_elapsed` against
-    `COZY_WORKER_LEASE_EXPIRY_UNIX`, the rental cap tensorhub has since deleted; the
-    supervisor still sends the name with a far-future sentinel and the runtime decides
-    nothing on it. A boot ends when the supervisor cancels it or the leg exits.
+    A boot ends when the supervisor cancels it or the leg exits.
 
     THE POD MEASURES NOTHING ABOUT ITS OWN IMAGE. cr-048 measured the control-Runtime wheel
     baked into the base worker image and reported the digest so "the hub learns a value".
