@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from cozy_runtime.internal import package_interface, static_interface
+from cozy_runtime.internal.discovery import discover
 from test_end_to_end import NO_EXECUTOR
 
 PACKAGE = """\
@@ -80,3 +82,18 @@ def test_package_with_a_memoized_job_runs_locally(tmp_path: Path) -> None:
     body = json.loads(done.stdout)
     assert body["status"] == "OUTCOME_STATUS_SUCCEEDED", body
     assert body["result"] == {"value": 4}
+
+
+def test_conformance_compares_what_a_source_reading_can_know(tmp_path: Path) -> None:
+    """The import states a memoized job's installed operation identity; source never can."""
+    (tmp_path / "package.toml").write_text('[application]\nobject = "memo_conformance:app"\n')
+    (tmp_path / "memo_conformance.py").write_text(PACKAGE)
+    static = static_interface.build(tmp_path)
+    imported = package_interface.build(discover(tmp_path))
+    job = imported["jobs"][0]["invocable"]
+    assert job["memoize"] and job["operation_identity"].startswith("sha256:")
+    with pytest.raises(package_interface.StalePackageInterface, match="operation_identity"):
+        package_interface.compare(static, imported, ("source", "import"))
+    package_interface.compare(
+        static, package_interface.source_facts(imported), ("source", "import")
+    )

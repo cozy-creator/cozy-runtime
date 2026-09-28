@@ -74,7 +74,7 @@ def _conformance(project: Path, static: Mapping[str, Json]) -> str:
     from cozy_runtime.internal.discovery import assert_locked_environment, discover
 
     environment = assert_locked_environment(project)
-    imported = package_interface.build(discover(project))
+    imported = package_interface.source_facts(package_interface.build(discover(project)))
     package_interface.compare(static, imported, ("the source reading", "the imported app"))
     return f"equal: imported {static['application']} ({environment})"
 

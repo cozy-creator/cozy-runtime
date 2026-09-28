@@ -366,6 +366,28 @@ def job_descriptor_id(body: Mapping[str, Json], name: str) -> str:
     )
 
 
+#: Facts only the installed environment can state: a memoized callable's operation identity
+#: hashes its installed helpers, so a source reading never carries it.
+INSTALLED_FACTS = frozenset({"operation_identity", "operation_identity_unavailable"})
+
+
+def source_facts(doc: Mapping[str, Json]) -> dict[str, Json]:
+    """The document as a source reading knows it: installed-environment facts removed."""
+
+    def callable_facts(entry: Json) -> Json:
+        if not isinstance(entry, dict) or not isinstance(entry.get("invocable"), dict):
+            return entry
+        invocable = {k: v for k, v in entry["invocable"].items() if k not in INSTALLED_FACTS}
+        return {**entry, "invocable": invocable}
+
+    return {
+        key: [callable_facts(entry) for entry in value]
+        if key in ("entrypoints", "jobs") and isinstance(value, list)
+        else value
+        for key, value in doc.items()
+    }
+
+
 def compare(left: Mapping[str, Json], right: Mapping[str, Json], names: tuple[str, str]) -> None:
     """Refuse unless two package interfaces have the same content."""
     if canonical_bytes(left) == canonical_bytes(right):
