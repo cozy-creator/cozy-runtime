@@ -194,7 +194,7 @@ READ: frozenset[str] = frozenset(
 
 #: Module attributes reached by name that are not themselves called or read as values —
 #: the types cozy-runtime names to get at the members above.
-NAMED: frozenset[str] = frozenset({"Store", "ReadLease", "Header", "errors"})
+NAMED: frozenset[str] = frozenset({"Store", "ReadLease", "Header", "Tensor", "errors"})
 
 
 def _resolve(dotted: str) -> object:
@@ -353,7 +353,12 @@ def test_prepare_model_source_refuses_a_relative_store_before_touching_tensorfs(
     assert result.safe_code == "model_source_store_invalid"
 
 
-def test_prepare_model_source_refuses_an_unsorted_profile_set(tmp_path: Path) -> None:
+def test_a_source_in_any_order_with_any_safe_member_name_reaches_tensorfs(tmp_path: Path) -> None:
+    """Profiles and files arrive in the sender's order, a repeated file is one file, and a
+    Hugging Face member such as `model (1)+ema.safetensors` is a safe relative member. Each
+    used to refuse here, after the download, before TensorFS saw the source."""
+    root = tmp_path / "tensorfs"
+    tensorfs.Store.ensure(str(root))
     request = _request(tmp_path, operation_id="op-contract-3")
     del request.profiles[:]
     request.profiles.extend(
@@ -362,10 +367,22 @@ def test_prepare_model_source_refuses_an_unsorted_profile_set(tmp_path: Path) ->
             pb.ModelSourceProfile(slot="unet", profile="sdxl/unet"),
         ]
     )
+    (row,) = request.files
+    row.member = "model (1)+ema.safetensors"
+    other = pb.LocalModelSourceFile()
+    other.CopyFrom(row)
+    other.member = "a/earlier.safetensors"
+    request.files.extend([row, other])
 
-    result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=root)
 
-    assert result.safe_code == "model_source_profile_order"
+    assert result.safe_code.startswith("model_source_tensorfs_"), result.safe_code
+    conflicting = pb.LocalModelSourceFile()
+    conflicting.CopyFrom(other)
+    conflicting.length += 1
+    request.files.append(conflicting)
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=root)
+    assert result.safe_code == "model_source_file_order"
 
 
 def test_two_members_carrying_one_object_share_one_path_and_are_admitted(
