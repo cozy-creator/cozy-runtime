@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import re
 import ssl
 import threading
@@ -22,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
+
+import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ObjectRef
@@ -80,14 +81,122 @@ class PublicationAuthority:
         )
 
 
-def _object(raw: bytes) -> dict[str, Any]:
+class _Token(msgspec.Struct, frozen=True):
+    token: str
+    expires_at: str
+
+
+class _Lane(msgspec.Struct, frozen=True):
+    lane: str
+    manifest_id: str = ""
+    checkpoint_id: str = ""
+
+
+class _Release(msgspec.Struct, frozen=True):
+    """A model card's release row, and Hub's answer to a release update."""
+
+    release: str
+    revision: int = 0
+    yanked: bool = False
+    lanes: tuple[_Lane, ...] = ()
+
+
+class _Card(msgspec.Struct, frozen=True):
+    releases: tuple[_Release, ...]
+
+
+class _Intent(msgspec.Struct, frozen=True):
+    """The release intent a durable call row freezes before any write."""
+
+    destination: str
+    release: str
+    set_lanes: dict[str, str]
+    baseline_revision: int
+    baseline: dict[str, str]
+    desired: dict[str, str]
+
+
+class _Member(msgspec.Struct, frozen=True):
+    object_id: str
+    length: int
+    state: str
+
+
+class _Publication(msgspec.Struct, frozen=True):
+    objects: tuple[_Member, ...]
+    operation: str = ""
+    state: str = ""
+
+
+class _Opened(msgspec.Struct, frozen=True):
+    publication: _Publication
+
+
+class _Grant(msgspec.Struct, frozen=True):
+    object_id: str
+    length: int
+    url: str
+    expires_at_unix: int
+    required_headers: dict[str, str] = {}
+
+
+class _Grants(msgspec.Struct, frozen=True):
+    server_time_unix: int
+    # Go's empty slices may be JSON null; they still represent zero rows.
+    grants: tuple[_Grant, ...] | None = None
+    held: tuple[_Member, ...] | None = None
+
+
+class _Manifest(msgspec.Struct, frozen=True):
+    sha256: str
+    length: int
+
+
+class _Checkpointed(msgspec.Struct, frozen=True):
+    publish_id: str
+    checkpoint_id: str
+    manifest: _Manifest
+    state: str
+    objects: int
+    bytes: int
+
+
+class _Failure(msgspec.Struct, frozen=True):
+    code: str = ""
+
+
+class _Finalization(msgspec.Struct, frozen=True):
+    """Hub's durable finalization job for one publication."""
+
+    operation: str
+    status_url: str
+    state: str
+    result: _Checkpointed | None = None
+    error: _Failure | None = None
+
+
+class _Report(msgspec.Struct, frozen=True):
+    digest: str
+    length: int
+
+
+class _Assessment(msgspec.Struct, frozen=True):
+    checkpoint_id: str
+    scope: str
+    report: _Report
+    verdict: str = ""
+
+
+class _Acknowledgement(msgspec.Struct, frozen=True):
+    assessment: _Assessment
+    publisher_reported_verdict: str = ""
+
+
+def _decode[T](raw: bytes, into: type[T], code: str = "publication.response_invalid") -> T:
     try:
-        value = json.loads(raw)
-    except (ValueError, UnicodeError) as exc:
-        raise PublicationRefusal("publication.response_invalid") from exc
-    if not isinstance(value, dict):
-        raise PublicationRefusal("publication.response_invalid")
-    return value
+        return msgspec.json.decode(raw, type=into)
+    except msgspec.DecodeError as exc:
+        raise PublicationRefusal(code) from exc
 
 
 def _require(condition: bool, code: str = "publication.response_changed") -> None:
@@ -193,19 +302,16 @@ class MachinePublicationClient:
         )
         if status != 200:
             raise PublicationRefusal("publication.authority_refused", status=status)
-        value = _object(raw)
-        token, expires = value.get("token"), value.get("expires_at")
-        if not isinstance(token, str) or not isinstance(expires, str):
-            raise PublicationRefusal("publication.authority_response_invalid")
-        _require(0 < len(token) <= 16 << 10)
+        value = _decode(raw, _Token, "publication.authority_response_invalid")
+        _require(0 < len(value.token) <= 16 << 10)
         try:
-            stamp = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-            _require(stamp.tzinfo is not None, "publication.authority_response_invalid")
-            deadline = stamp.timestamp()
-        except (ValueError, TypeError) as exc:
+            stamp = datetime.fromisoformat(value.expires_at.replace("Z", "+00:00"))
+        except ValueError as exc:
             raise PublicationRefusal("publication.authority_response_invalid") from exc
+        _require(stamp.tzinfo is not None, "publication.authority_response_invalid")
+        deadline = stamp.timestamp()
         _require(deadline > self.clock(), "publication.authority_expired")
-        self._token, self._expires = token, deadline
+        self._token, self._expires = value.token, deadline
 
     def request(self, method: str, path: str, body: bytes | None = None) -> bytes:
         _require(
@@ -233,30 +339,25 @@ def _read_release(
     client: PublicationClient, destination: str, release: str
 ) -> tuple[int, dict[str, str]]:
     # The model card is the existing public read surface, including all lanes.
-    card = _object(client.request("GET", destination_path(destination)))
-    rows = card.get("releases")
-    if not isinstance(rows, list):
-        raise PublicationRefusal("publication.response_invalid")
-    matches = [row for row in rows if isinstance(row, dict) and row.get("release") == release]
+    card = _decode(client.request("GET", destination_path(destination)), _Card)
+    matches = [row for row in card.releases if row.release == release]
     _require(len(matches) <= 1)
     if not matches:
         return 0, {}
-    row = matches[0]
-    revision = row.get("revision")
-    if type(revision) is not int or not 1 <= revision < (1 << 53) - 1:
+    (row,) = matches
+    if not 1 <= row.revision < (1 << 53) - 1:
         raise PublicationRefusal("publication.response_invalid")
-    _require(not row.get("yanked", False))
+    _require(not row.yanked)
     lanes: dict[str, str] = {}
-    _require(isinstance(row.get("lanes"), list))
-    for lane in row["lanes"]:
-        _require(isinstance(lane, dict))
-        name, manifest = lane.get("lane"), lane.get("manifest_id")
-        _require(isinstance(name, str) and _LABEL.fullmatch(name) is not None)
-        _require(isinstance(manifest, str) and _DIGEST.fullmatch(manifest) is not None)
-        _require(name not in lanes)
-        lanes[name] = manifest
+    for lane in row.lanes:
+        _require(
+            _LABEL.fullmatch(lane.lane) is not None
+            and _DIGEST.fullmatch(lane.manifest_id) is not None
+            and lane.lane not in lanes
+        )
+        lanes[lane.lane] = lane.manifest_id
     _require(bool(lanes))
-    return revision, lanes
+    return row.revision, lanes
 
 
 def prepare_release(
@@ -271,7 +372,7 @@ def prepare_release(
     destination_path(destination)
     _require(_LABEL.fullmatch(release) is not None and 1 <= len(lanes) <= 32)
     if expected_revision is not None:
-        _require(type(expected_revision) is int and 0 <= expected_revision < (1 << 53) - 1)
+        _require(0 <= expected_revision < (1 << 53) - 1)
     requested: dict[str, str] = {}
     for name, checkpoint in lanes.items():
         _require(_LABEL.fullmatch(name) is not None)
@@ -287,26 +388,18 @@ def prepare_release(
     _require(
         expected_revision is None or expected_revision == revision, "publication.release_conflict"
     )
-    return canonical_json.encode(
-        {
-            "destination": destination,
-            "release": release,
-            "set_lanes": requested,
-            "baseline_revision": revision,
-            "baseline": baseline,
-            "desired": baseline | requested,
-        }
-    )
+    intent = _Intent(destination, release, requested, revision, baseline, baseline | requested)
+    return canonical_json.encode(msgspec.to_builtins(intent))
 
 
 def apply_release(
     client: PublicationClient, frozen: bytes, *, sent: bool, before_write: Callable[[], None]
 ) -> ReleaseReceipt:
-    intent = _object(frozen)
-    destination, release = intent["destination"], intent["release"]
-    baseline, desired = intent["baseline"], intent["desired"]
-    expected = intent["baseline_revision"]
-    _require(baseline | intent["set_lanes"] == desired, "publication.intent_changed")
+    intent = _decode(frozen, _Intent, "publication.intent_changed")
+    destination, release = intent.destination, intent.release
+    baseline, desired = intent.baseline, intent.desired
+    expected = intent.baseline_revision
+    _require(baseline | intent.set_lanes == desired, "publication.intent_changed")
     revision, current = _read_release(client, destination, release)
 
     def receipt(observation: str) -> ReleaseReceipt:
@@ -321,30 +414,26 @@ def apply_release(
     if current == desired:
         return receipt("observed_noop")
     before_write()
-    updated = _object(
+    updated = _decode(
         client.request(
             "POST",
             destination_path(destination) + "/releases/" + quote(release, safe=""),
             canonical_json.encode(
-                {
-                    "expected_revision": expected,
-                    "set_lanes": intent["set_lanes"],
-                    "remove_lanes": [],
-                }
+                {"expected_revision": expected, "set_lanes": intent.set_lanes, "remove_lanes": []}
             ),
-        )
-    )
-    _require(
-        updated.get("release") == release
-        and updated.get("revision") == expected + 1
-        and not updated.get("yanked", False),
+        ),
+        _Release,
         "publication.outcome_unknown",
     )
-    lane_rows = updated.get("lanes")
-    if not isinstance(lane_rows, list) or not all(isinstance(row, dict) for row in lane_rows):
-        raise PublicationRefusal("publication.outcome_unknown")
-    actual = {row.get("lane"): row.get("checkpoint_id") for row in lane_rows}
-    _require(len(actual) == len(lane_rows) and actual == desired, "publication.outcome_unknown")
+    actual = {row.lane: row.checkpoint_id for row in updated.lanes}
+    _require(
+        updated.release == release
+        and updated.revision == expected + 1
+        and not updated.yanked
+        and len(actual) == len(updated.lanes)
+        and actual == desired,
+        "publication.outcome_unknown",
+    )
     return ReleaseReceipt(destination, release, expected + 1, desired, "acknowledged")
 
 
@@ -356,28 +445,26 @@ def _checkpoint_inputs(
         checkpoint.checkpoint == manifest.digest and objects.get(manifest.digest) == manifest.length
     )
     _require(0 < len(objects) <= 65536 and bool(operation))
-    _require(
-        all(
-            _DIGEST.fullmatch(key) and type(size) is int and size > 0
-            for key, size in objects.items()
-        )
-    )
+    _require(all(_DIGEST.fullmatch(key) and size > 0 for key, size in objects.items()))
     path = destination_path(checkpoint.destination) + "/publications/" + quote(operation, safe="")
     return path, manifest
 
 
 def _checkpointed(
-    result: object, operation: str, checkpoint: CheckpointRef, objects: Mapping[str, int]
+    result: _Checkpointed | None,
+    operation: str,
+    checkpoint: CheckpointRef,
+    objects: Mapping[str, int],
 ) -> CheckpointRef:
     manifest = checkpoint.manifest
     _require(
-        isinstance(result, dict)
-        and result.get("publish_id") == operation
-        and result.get("checkpoint_id") == manifest.digest
-        and result.get("manifest") == {"sha256": manifest.digest[7:], "length": manifest.length}
-        and result.get("state") == "checkpointed"
-        and result.get("objects") == len(objects) - 1
-        and result.get("bytes") == sum(objects.values()) - manifest.length,
+        result is not None
+        and result.publish_id == operation
+        and result.checkpoint_id == manifest.digest
+        and result.manifest == _Manifest(manifest.digest[7:], manifest.length)
+        and result.state == "checkpointed"
+        and result.objects == len(objects) - 1
+        and result.bytes == sum(objects.values()) - manifest.length,
         "publication.checkpoint_changed",
     )
     return CheckpointRef(
@@ -386,7 +473,7 @@ def _checkpointed(
 
 
 def _settle(
-    view: dict[str, Any],
+    view: _Finalization,
     path: str,
     operation: str,
     checkpoint: CheckpointRef,
@@ -394,22 +481,18 @@ def _settle(
 ) -> CheckpointRef:
     """Hub's durable finalization job is the commit's only authority."""
     _require(
-        view.get("operation") == operation and view.get("status_url") == path + "/finalization",
+        view.operation == operation and view.status_url == path + "/finalization",
         "publication.checkpoint_changed",
     )
-    state = view.get("state")
-    if state in {"queued", "running"}:
+    if view.state in {"queued", "running"}:
         raise PublicationRefusal("publication.finalization_pending", status=503)
-    if state == "failed":
-        error = view.get("error")
-        code = error.get("code") if isinstance(error, dict) else None
+    if view.state == "failed":
+        code = view.error.code if view.error is not None else ""
         raise PublicationUncommitted(
-            code
-            if isinstance(code, str) and _LABEL.fullmatch(code)
-            else "publication.finalization_failed"
+            code if _LABEL.fullmatch(code) else "publication.finalization_failed"
         )
-    _require(state == "completed", "publication.checkpoint_changed")
-    return _checkpointed(view.get("result"), operation, checkpoint, objects)
+    _require(view.state == "completed", "publication.checkpoint_changed")
+    return _checkpointed(view.result, operation, checkpoint, objects)
 
 
 #: Hub codes of the owner's finalization read meaning no finalize ever reached it.
@@ -417,7 +500,7 @@ FINALIZATION_ABSENT = frozenset({"publication.not_found", "publication.finalizat
 
 
 def settle_checkpoint(
-    view: Mapping[str, Any],
+    view: Mapping[str, object],
     *,
     operation: str,
     checkpoint: CheckpointRef,
@@ -425,7 +508,11 @@ def settle_checkpoint(
 ) -> CheckpointRef:
     """Settle a sent finalize from a finalization document another reader fetched."""
     path, _ = _checkpoint_inputs(operation, checkpoint, objects)
-    return _settle(dict(view), path, operation, checkpoint, objects)
+    try:
+        finalization = msgspec.convert(dict(view), _Finalization)
+    except msgspec.ValidationError as exc:
+        raise PublicationRefusal("publication.response_invalid") from exc
+    return _settle(finalization, path, operation, checkpoint, objects)
 
 
 def reconcile_checkpoint(
@@ -442,7 +529,7 @@ def reconcile_checkpoint(
     """
     path, _ = _checkpoint_inputs(operation, checkpoint, objects)
     try:
-        view = _object(client.request("GET", path + "/finalization"))
+        view = _decode(client.request("GET", path + "/finalization"), _Finalization)
     except PublicationRefusal as exc:
         if exc.status != 404:
             raise
@@ -491,7 +578,7 @@ def upload_checkpoint(
         )
     before_stage()
     try:
-        opened = _object(
+        opened = _decode(
             client.request(
                 "PUT",
                 path,
@@ -503,8 +590,9 @@ def upload_checkpoint(
                         ]
                     }
                 ),
-            )
-        )
+            ),
+            _Opened,
+        ).publication
     except PublicationRefusal as exc:
         # A finalize this operation sent may have closed the publication.
         if exc.status == 409:
@@ -514,36 +602,30 @@ def upload_checkpoint(
             if settled is not None:
                 return settled
         raise
-    publication = opened.get("publication")
-    if not isinstance(publication, dict):
+    _require(opened.operation == operation and opened.state in {"open", "checkpointed"})
+    if len(opened.objects) != len(objects):
         raise PublicationRefusal("publication.response_invalid")
-    _require(
-        publication.get("operation") == operation
-        and publication.get("state") in {"open", "checkpointed"}
-    )
-    rows = publication.get("objects")
-    if not isinstance(rows, list) or len(rows) != len(objects):
-        raise PublicationRefusal("publication.response_invalid")
-    observed: dict[str, int] = {}
+    observed: set[str] = set()
     pending: list[str] = []
-    for row in rows:
-        key, length, state = row.get("object_id"), row.get("length"), row.get("state")
-        _require(key in objects and key not in observed and length == objects[key])
-        _require(state in {"accepted", "verifying", "claimed", "transferring"})
-        observed[key] = length
-        if state not in {"accepted", "verifying"}:
+    for row in opened.objects:
+        key = row.object_id
+        _require(key in objects and key not in observed and row.length == objects[key])
+        _require(row.state in {"accepted", "verifying", "claimed", "transferring"})
+        observed.add(key)
+        if row.state not in {"accepted", "verifying"}:
             pending.append(key)
     stage_objects(client, path, objects, pending, before_stage, push, landed, streams)
     before_write()
     try:
-        answer = _object(
+        answer = _decode(
             client.request(
                 "POST",
                 path + "/finalize",
                 canonical_json.encode(
                     {"manifest_id": manifest.digest, "manifest_length": manifest.length}
                 ),
-            )
+            ),
+            _Finalization,
         )
     except PublicationRefusal as exc:
         if exc.status in _RETRYABLE or exc.status >= 500:
@@ -555,9 +637,7 @@ def upload_checkpoint(
         if settled is None:
             raise PublicationUncommitted(exc.code, status=exc.status) from exc
         return settled
-    if "operation" in answer:
-        return _settle(answer, path, operation, checkpoint, objects)
-    return _checkpointed(answer, operation, checkpoint, objects)
+    return _settle(answer, path, operation, checkpoint, objects)
 
 
 class _Pace:
@@ -651,41 +731,32 @@ def stage_objects(
         before_stage()
         asked = time.monotonic()
         body = canonical_json.encode({"object_ids": selected})
-        answer = _object(client.request("POST", path + "/grants", body))
-        grants, held = answer.get("grants"), answer.get("held")
-        # Go's empty slices may be JSON null; they still represent zero rows.
-        grants = [] if grants is None else grants
-        held = [] if held is None else held
-        if not isinstance(grants, list) or not isinstance(held, list):
-            raise PublicationRefusal("publication.response_invalid")
-        seen: set[str] = set()
-        for item in grants + held:
-            _require(isinstance(item, dict))
-            key = item.get("object_id")
-            _require(isinstance(key, str) and key in selected and key not in seen)
-            _require(item.get("length") == objects[key])
-            seen.add(key)
-        _require(seen == set(selected))
-        for item in held:
-            _require(item.get("state") in {"accepted", "verifying"})
+        answer = _decode(client.request("POST", path + "/grants", body), _Grants)
+        grants, held = answer.grants or (), answer.held or ()
+        rows = [(row.object_id, row.length) for row in grants]
+        rows += [(row.object_id, row.length) for row in held]
+        _require(
+            len(rows) == len(selected)
+            and {key for key, _ in rows} == set(selected)
+            and all(length == objects[key] for key, length in rows)
+        )
+        _require(all(member.state in {"accepted", "verifying"} for member in held))
         uploads: list[tuple[str, int, str, float]] = []
-        for item in grants:
-            key = item["object_id"]
+        for grant in grants:
+            key = grant.object_id
             required = {
                 "if-none-match": "*",
                 "x-amz-checksum-sha256": base64.b64encode(bytes.fromhex(key[7:])).decode("ascii"),
             }
-            _require(item.get("required_headers") == required and isinstance(item.get("url"), str))
-            now, expires = answer.get("server_time_unix"), item.get("expires_at_unix")
-            _require(type(now) is int and type(expires) is int)
-            expiry = asked + expires - now - 1
+            _require(grant.required_headers == required)
+            expiry = asked + grant.expires_at_unix - answer.server_time_unix - 1
             _require(expiry > time.monotonic(), "publication.grant_expired")
             headers = (f"{name}: {value}" for name, value in required.items())
-            uploads.append((key, objects[key], "\n".join([item["url"], *headers]), expiry))
+            uploads.append((key, objects[key], "\n".join([grant.url, *headers]), expiry))
         if held:
             with count_lock:
                 held_count += len(held)
-                held_bytes += sum(objects[item["object_id"]] for item in held)
+                held_bytes += sum(objects[member.object_id] for member in held)
                 landed(held_count, held_bytes)
         return uploads
 
@@ -693,9 +764,7 @@ def stage_objects(
         """Hub verifies landed objects while pushes run, so its commit need not."""
         before_stage()
         body = canonical_json.encode({"object_ids": selected})
-        answer = _object(client.request("POST", path + "/verify", body)).get("publication")
-        if not isinstance(answer, dict):
-            raise PublicationRefusal("publication.response_invalid")
+        _decode(client.request("POST", path + "/verify", body), _Opened)
         return []
 
     # A sliding window of pushes. One Hub thread fetches grants two windows ahead and
@@ -741,6 +810,7 @@ def stage_objects(
                     before_stage()
                     running[pool.submit(pushed, key, length, grant)] = key, length, pace.level
                     pace.started()
+            # `Future` is invariant, so one wait set over pushes and Hub calls needs `Any`.
             waiting: set[Future[Any]] = set(running)
             if asking is not None:
                 waiting.add(asking)
@@ -782,15 +852,10 @@ def retain_objects(
     without their bytes; ``abandon_publication`` releases this hold after it commits.
     """
     _require(0 < len(objects) <= _PUBLICATION_OBJECTS and bool(operation))
-    _require(
-        all(
-            _DIGEST.fullmatch(key) and type(size) is int and size > 0
-            for key, size in objects.items()
-        )
-    )
+    _require(all(_DIGEST.fullmatch(key) and size > 0 for key, size in objects.items()))
     path = destination_path(destination) + "/publications/" + quote(operation, safe="")
     before_stage()
-    opened = _object(
+    opened = _decode(
         client.request(
             "PUT",
             path,
@@ -801,42 +866,33 @@ def retain_objects(
                     ]
                 }
             ),
-        )
-    )
-    publication = opened.get("publication")
-    if not isinstance(publication, dict) or not isinstance(publication.get("objects"), list):
-        raise PublicationRefusal("publication.response_invalid")
+        ),
+        _Opened,
+    ).publication
     _require(
-        publication.get("operation") == operation
-        and publication.get("state") == "open"
-        and len(publication["objects"]) == len(objects),
+        opened.operation == operation
+        and opened.state == "open"
+        and len(opened.objects) == len(objects),
         "publication.response_invalid",
     )
     pending: list[str] = []
-    for row in publication["objects"]:
-        _require(isinstance(row, dict), "publication.response_invalid")
-        key, state = row.get("object_id"), row.get("state")
-        _require(key in objects and row.get("length") == objects[key])
-        _require(state in {"accepted", "verifying", "claimed", "transferring"})
-        if state not in {"accepted", "verifying"}:
-            pending.append(key)
+    for row in opened.objects:
+        _require(row.object_id in objects and row.length == objects[row.object_id])
+        _require(row.state in {"accepted", "verifying", "claimed", "transferring"})
+        if row.state not in {"accepted", "verifying"}:
+            pending.append(row.object_id)
     stage_objects(client, path, objects, pending, before_stage, push, lambda _n, _b: None, streams)
     keys = sorted(objects)
     for offset in range(0, len(keys), _PUBLICATION_WINDOW):
         selected = keys[offset : offset + _PUBLICATION_WINDOW]
         before_stage()
-        verified = _object(
+        verified = _decode(
             client.request(
                 "POST", path + "/verify", canonical_json.encode({"object_ids": selected})
-            )
-        ).get("publication")
-        if not isinstance(verified, dict) or not isinstance(verified.get("objects"), list):
-            raise PublicationRefusal("publication.response_invalid")
-        accepted = {
-            row.get("object_id")
-            for row in verified["objects"]
-            if isinstance(row, dict) and row.get("state") == "accepted"
-        }
+            ),
+            _Opened,
+        ).publication
+        accepted = {row.object_id for row in verified.objects if row.state == "accepted"}
         _require(accepted >= set(selected), "publication.custody_unverified")
 
 
@@ -888,14 +944,16 @@ def attach_assessment(
         _require(existing == report, "assessment.readback_changed")
         return result("observed_convergence")
     before_write()
-    acknowledgement = _object(client.request("PUT", path, report))
-    value = acknowledgement.get("assessment", {})
+    acknowledgement = _decode(
+        client.request("PUT", path, report), _Acknowledgement, "assessment.acknowledgement_changed"
+    )
+    value = acknowledgement.assessment
     _require(
-        value.get("checkpoint_id") == checkpoint.checkpoint
-        and value.get("scope") == "publisher_assessment"
-        and value.get("report") == {"digest": digest, "length": len(report)}
-        and value.get("verdict") == verdict
-        and acknowledgement.get("publisher_reported_verdict") == verdict,
+        value.checkpoint_id == checkpoint.checkpoint
+        and value.scope == "publisher_assessment"
+        and value.report == _Report(digest, len(report))
+        and value.verdict == verdict
+        and acknowledgement.publisher_reported_verdict == verdict,
         "assessment.acknowledgement_changed",
     )
     _require(client.request("GET", path) == report, "assessment.readback_changed")

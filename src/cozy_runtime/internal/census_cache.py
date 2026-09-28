@@ -97,7 +97,9 @@ def ensure(
             python,
             derive_child.DeriveRequest(
                 tuple(
-                    derive_child.SlotRequest(row.slot, row.config, row.assets(), row.tensor_dtypes)
+                    derive_child.SlotRequest(
+                        row.slot, row.config, dict(row.assets()), dict(row.tensor_dtypes)
+                    )
                     for _name, row in missing
                 ),
                 application=application,

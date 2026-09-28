@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import msgspec
 import pytest
 
 from cozy_runtime.internal import derive_child
@@ -141,5 +142,6 @@ def test_source_response_partition_is_exact() -> None:
         [{"slot": "produce.models.source", "source": True}] * 2,
         [{"slot": "produce.models.source", "components": [], "tensors": []}],
     ):
+        response = msgspec.convert({"requirements": rows}, derive_child.DeriveResponse)
         with pytest.raises(derive_child.DeriveRefusal):
-            derive_child.read_response({"requirements": rows}, request)
+            derive_child.read_response(response, request)

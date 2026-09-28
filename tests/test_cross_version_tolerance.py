@@ -133,23 +133,22 @@ def test_derive_child_rows_from_another_runtime_ignore_additive_fields() -> None
         (derive_child.SlotRequest("model", b"{}"), derive_child.SlotRequest("source", b"{}")),
         application="package:app",
     )
-    rows = derive_child.read_response(
-        {
-            "requirements": [
-                {
-                    "slot": "model",
-                    "components": ["unet"],
-                    "tensors": [
-                        {"component": "unet", "key": "w", "dtype": None, "shape": [2], "x": 1}
-                    ],
-                    "future": True,
-                },
-                {"slot": "source", "source": True, "future": True},
-            ],
-            "future": {},
-        },
-        request,
+    newer = {
+        "requirements": [
+            {
+                "slot": "model",
+                "components": ["unet"],
+                "tensors": [{"component": "unet", "key": "w", "dtype": None, "shape": [2], "x": 1}],
+                "future": True,
+            },
+            {"slot": "source", "source": True, "future": True},
+        ],
+        "future": {},
+    }
+    response = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(newer), type=derive_child.DeriveResponse
     )
+    rows = derive_child.read_response(response, request)
     assert isinstance(rows[0], derive_child.TensorRequirements)
     assert rows[0].rows == (("unet", "w", None, (2,)),)
     assert rows[1] == derive_child.SourceSlot("source")

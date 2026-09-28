@@ -12,9 +12,9 @@ import importlib.util
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated
 
 import msgspec
 
@@ -31,6 +31,7 @@ WALL_CAP_SECONDS = 900
 PIPE_CAP_BYTES = 512 << 20
 
 RequirementRow = tuple[str, str, str | None, tuple[int, ...]]
+_Name = Annotated[str, msgspec.Meta(min_length=1)]
 
 
 class DeriveRefusal(Exception):
@@ -42,12 +43,23 @@ class DeriveRefusal(Exception):
         self.detail = detail
 
 
-@dataclass(frozen=True, slots=True)
-class SlotRequest:
-    slot: str
+class SlotRequest(msgspec.Struct, frozen=True):
+    """One slot's wire row; both sides of the pipe encode and decode this struct."""
+
+    slot: _Name
     config: bytes
-    assets: Mapping[str, bytes] = field(default_factory=dict)
-    tensor_dtypes: Mapping[str, str] | None = None
+    assets: dict[_Name, bytes] = {}
+    tensor_dtypes: dict[_Name, _Name] | None = None
+
+
+class _Package(msgspec.Struct, frozen=True, omit_defaults=True):
+    project: str = ""
+    application: str = ""
+
+
+class _Request(msgspec.Struct, frozen=True):
+    package: _Package
+    slots: Annotated[tuple[SlotRequest, ...], msgspec.Meta(min_length=1)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,24 +70,32 @@ class DeriveRequest:
     project: Path | None = None
     application: str = ""
 
-    def render(self) -> dict[str, Any]:
-        package: dict[str, Any] = (
-            {"application": self.application}
-            if self.application
-            else {"project": str(self.project)}
-        )
-        return {
-            "package": package,
-            "slots": [
-                {
-                    "slot": row.slot,
-                    "config": row.config,
-                    "assets": dict(sorted(row.assets.items())),
-                    "tensor_dtypes": None if row.tensor_dtypes is None else dict(row.tensor_dtypes),
-                }
-                for row in self.slots
-            ],
-        }
+    def render(self) -> _Request:
+        if self.application:
+            return _Request(_Package(application=self.application), self.slots)
+        return _Request(_Package(project=str(self.project)), self.slots)
+
+
+class _Tensor(msgspec.Struct, frozen=True):
+    component: str
+    key: _Name
+    dtype: str | None
+    shape: tuple[Annotated[int, msgspec.Meta(ge=0)], ...]
+
+
+class _Answer(msgspec.Struct, frozen=True):
+    slot: str
+    source: bool = False
+    components: tuple[_Name, ...] = ()
+    tensors: tuple[_Tensor, ...] = ()
+
+
+class DeriveResponse(msgspec.Struct, frozen=True):
+    """The child's one result line: requirements, or a refusal's code and detail."""
+
+    requirements: tuple[_Answer, ...] = ()
+    error: str | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,71 +116,35 @@ class SourceSlot:
 
 def read_request(raw: bytes) -> DeriveRequest:
     try:
-        value = msgspec.msgpack.decode(raw)
+        wire = msgspec.msgpack.decode(raw, type=_Request)
     except msgspec.DecodeError as err:
         raise DeriveRefusal("derive_request_invalid", str(err)) from err
-    if not isinstance(value, dict) or not {"package", "slots"} <= set(value):
-        raise DeriveRefusal("derive_request_invalid", "request field set")
-    package = value["package"]
-    if not isinstance(package, dict) or len(package) != 1:
+    project, application = wire.package.project, wire.package.application
+    if bool(project) == bool(application):
         raise DeriveRefusal("derive_request_invalid", "package names a project or an application")
-    project: Path | None = None
-    application = ""
-    if "project" in package:
-        spelled = package["project"]
-        if not isinstance(spelled, str) or not Path(spelled).is_absolute():
-            raise DeriveRefusal("derive_request_invalid", "project is an absolute path")
-        project = Path(spelled)
-    elif "application" in package:
-        application = str(package["application"])
-        if application.count(":") != 1 or not all(p.strip() for p in application.split(":")):
-            raise DeriveRefusal("derive_request_invalid", "application is <module>:<attribute>")
-    else:
-        raise DeriveRefusal("derive_request_invalid", "package names a project or an application")
-    encoded_rows = value["slots"]
-    if not isinstance(encoded_rows, list) or not encoded_rows:
-        raise DeriveRefusal("derive_request_invalid", "slots is a non-empty array")
-    slots: list[SlotRequest] = []
-    for row in encoded_rows:
-        if not isinstance(row, dict) or not {"slot", "config", "assets", "tensor_dtypes"} <= set(
-            row
-        ):
-            raise DeriveRefusal("derive_request_invalid", "slot row field set")
-        slot = row["slot"]
-        config = row["config"]
-        encoded_assets = row["assets"]
-        if (
-            not isinstance(slot, str)
-            or not slot
-            or not isinstance(config, bytes)
-            or not isinstance(encoded_assets, dict)
-        ):
-            raise DeriveRefusal("derive_request_invalid", f"slot {slot!r}")
+    if project and not Path(project).is_absolute():
+        raise DeriveRefusal("derive_request_invalid", "project is an absolute path")
+    if application and (
+        application.count(":") != 1 or not all(p.strip() for p in application.split(":"))
+    ):
+        raise DeriveRefusal("derive_request_invalid", "application is <module>:<attribute>")
+    for row in wire.slots:
         try:
-            document = canonical.parse_canonical(config)
+            document = canonical.parse_canonical(row.config)
         except canonical.CanonicalError as err:
-            raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} config: {err}") from err
+            raise DeriveRefusal(
+                "derive_request_invalid", f"slot {row.slot!r} config: {err}"
+            ) from err
         if not isinstance(document, dict):
-            raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} config is not an object")
-        assets: dict[str, bytes] = {}
-        for name, value in encoded_assets.items():
-            if not isinstance(name, str) or not name or not isinstance(value, bytes):
-                raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} asset")
-            assets[name] = value
-        dtypes = row["tensor_dtypes"]
-        if dtypes is not None and (
-            not isinstance(dtypes, dict)
-            or any(
-                not isinstance(k, str) or not k or not isinstance(v, str) or not v
-                for k, v in dtypes.items()
+            raise DeriveRefusal(
+                "derive_request_invalid", f"slot {row.slot!r} config is not an object"
             )
-        ):
-            raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} tensor dtypes")
-        slots.append(SlotRequest(slot, config, assets, dtypes))
-    names = [row.slot for row in slots]
+    names = [row.slot for row in wire.slots]
     if names != sorted(set(names)):
         raise DeriveRefusal("derive_request_invalid", "slots are sorted unique by path")
-    return DeriveRequest(tuple(slots), project=project, application=application)
+    return DeriveRequest(
+        wire.slots, project=Path(project) if project else None, application=application
+    )
 
 
 def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements | SourceSlot, ...]:
@@ -175,7 +159,7 @@ def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements 
             [str(python), "-I", "-B", "-m", "cozy_runtime.internal.derive_child"],
             cwd="/",
             env=child_env,
-            input=msgspec.msgpack.encode(request.render()),
+            input=msgspec.msgpack.encode(request.render(), order="deterministic"),
             capture_output=True,
             timeout=WALL_CAP_SECONDS,
             check=False,
@@ -203,75 +187,39 @@ def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements 
             stderr[-1200:] or f"child exited {result.returncode} without a result",
         )
     try:
-        response = msgspec.msgpack.decode(base64.b64decode(encoded, validate=True))
-    except (ValueError, msgspec.DecodeError) as err:
-        raise DeriveRefusal("derive_child_invalid", str(err)) from err
-    if not isinstance(response, dict):
-        raise DeriveRefusal("derive_child_invalid", "child result is not an object")
-    if "error" in response:
-        raise DeriveRefusal(
-            str(response.get("error") or "derive_child_failed"),
-            str(response.get("detail") or "refused"),
+        response = msgspec.msgpack.decode(
+            base64.b64decode(encoded, validate=True), type=DeriveResponse
         )
+    except ValueError as err:  # binascii.Error or msgspec.DecodeError
+        raise DeriveRefusal("derive_child_invalid", str(err)) from err
+    if response.error is not None:
+        raise DeriveRefusal(response.error or "derive_child_failed", response.detail or "refused")
     if result.returncode != 0:
         raise DeriveRefusal("derive_child_failed", f"child exited {result.returncode}")
     return read_response(response, request)
 
 
 def read_response(
-    response: Mapping[str, Any], request: DeriveRequest
+    response: DeriveResponse, request: DeriveRequest
 ) -> tuple[TensorRequirements | SourceSlot, ...]:
-    if not isinstance(response.get("requirements"), list):
-        raise DeriveRefusal("derive_child_invalid", "requirements field")
     out: list[TensorRequirements | SourceSlot] = []
-    for answer in response["requirements"]:
-        if isinstance(answer, dict) and "source" in answer:
-            if not isinstance(answer.get("slot"), str) or answer["source"] is not True:
-                raise DeriveRefusal("derive_child_invalid", "source slot field value")
-            out.append(SourceSlot(answer["slot"]))
+    for answer in response.requirements:
+        if answer.source:
+            out.append(SourceSlot(answer.slot))
             continue
-        if not isinstance(answer, dict) or not {"slot", "components", "tensors"} <= set(answer):
-            raise DeriveRefusal("derive_child_invalid", "requirements row field set")
-        components = answer["components"]
-        tensors = answer["tensors"]
-        if (
-            not isinstance(components, list)
-            or not components
-            or not all(isinstance(component, str) and component for component in components)
-            or len(set(components)) != len(components)
-            or not isinstance(tensors, list)
-        ):
+        components = answer.components
+        if not components or len(set(components)) != len(components):
             raise DeriveRefusal("derive_child_invalid", "requirements shape")
-        rows: list[RequirementRow] = []
-        for tensor in tensors:
-            if not isinstance(tensor, dict) or not {"component", "key", "dtype", "shape"} <= set(
-                tensor
-            ):
-                raise DeriveRefusal("derive_child_invalid", "tensor row field set")
-            component, key, dtype, shape = (
-                tensor["component"],
-                tensor["key"],
-                tensor["dtype"],
-                tensor["shape"],
-            )
-            if (
-                not isinstance(component, str)
-                or component not in components
-                or not isinstance(key, str)
-                or not key
-                or (dtype is not None and not isinstance(dtype, str))
-                or not isinstance(shape, list)
-                or not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in shape)
-            ):
-                raise DeriveRefusal("derive_child_invalid", "tensor row value")
-            rows.append((component, key, dtype, tuple(shape)))
-        out.append(TensorRequirements(str(answer["slot"]), tuple(rows), tuple(components)))
+        if any(tensor.component not in components for tensor in answer.tensors):
+            raise DeriveRefusal("derive_child_invalid", "tensor row value")
+        rows = tuple((t.component, t.key, t.dtype, t.shape) for t in answer.tensors)
+        out.append(TensorRequirements(answer.slot, rows, components))
     if [answer.slot for answer in out] != [row.slot for row in request.slots]:
         raise DeriveRefusal("derive_child_invalid", "rows do not answer the requested slots")
     return tuple(out)
 
 
-def _render(requirements: Sequence[TensorRequirements | SourceSlot]) -> dict[str, Any]:
+def _render(requirements: Sequence[TensorRequirements | SourceSlot]) -> dict[str, object]:
     return {
         "requirements": [
             {"slot": answer.slot, "source": True}
@@ -294,10 +242,8 @@ def _render(requirements: Sequence[TensorRequirements | SourceSlot]) -> dict[str
     }
 
 
-def _emit(value: Mapping[str, Any]) -> None:
-    sys.stdout.buffer.write(
-        RESULT_PREFIX + base64.b64encode(msgspec.msgpack.encode(dict(value))) + b"\n"
-    )
+def _emit(value: dict[str, object]) -> None:
+    sys.stdout.buffer.write(RESULT_PREFIX + base64.b64encode(msgspec.msgpack.encode(value)) + b"\n")
 
 
 def _derive_slot(
@@ -376,16 +322,17 @@ def main() -> int:
                     f"{row.slot!r} is no model slot of this package "
                     f"(have {', '.join(sorted(bindings)) or 'none'})",
                 )
-            document = canonical.parse_canonical(row.config)
-            if not isinstance(document, dict):
-                raise DeriveRefusal("derive_input_invalid", f"{row.slot}: config is not an object")
             if row.slot in sources:
                 requirements.append(SourceSlot(row.slot))
             else:
                 requirements.append(
                     _derive_slot(
                         binding,
-                        Config(document, "config", tensor_dtypes=row.tensor_dtypes),
+                        Config(
+                            canonical.parse_canonical(row.config),
+                            "config",
+                            tensor_dtypes=row.tensor_dtypes,
+                        ),
                         row.assets,
                     )
                 )
@@ -393,11 +340,11 @@ def main() -> int:
         _emit({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
     except ConformanceError as err:
-        _emit({"error": str(getattr(err, "code", "derive_conformance")), "detail": str(err)})
+        _emit({"error": err.code, "detail": str(err)})
         return int(Exit.structural)
     except (DeriveError, sandbox.FenceViolation) as err:
-        name = getattr(err, "construct", None) or getattr(err, "fence", None)
-        _emit({"error": str(name or "derive_refused"), "detail": str(err)})
+        name = err.construct if isinstance(err, DeriveError) else err.fence
+        _emit({"error": name or "derive_refused", "detail": str(err)})
         return int(Exit.structural)
     except Exception as err:
         _emit({"error": "derive_internal", "detail": f"{type(err).__name__}: {err}"})

@@ -1446,7 +1446,7 @@ def _derive_components(
     """What the private bounded child constructs for this config in this package venv."""
     try:
         request = derive_child.DeriveRequest(
-            (derive_child.SlotRequest(slot, config_bytes, assets, dtypes),),
+            (derive_child.SlotRequest(slot, config_bytes, dict(assets), dict(dtypes)),),
             project=Path(project).resolve(),
         )
         (held,) = derive_child.derive_in(Path(sys.executable), request)
