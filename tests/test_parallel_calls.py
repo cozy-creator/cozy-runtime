@@ -241,15 +241,16 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                         batch["encoder_hidden_states"].shape[1],
                         config.attention_head_dim,
                     ]
-                    distributed_packed = [
-                        1,
-                        config.num_attention_heads // degree,
-                        batch["position_ids"].shape[0],
-                        config.attention_head_dim,
-                    ]
-                    assert attention_shapes == (
-                        [local_text] * config.num_refiner_layers
-                        + [distributed_packed] * config.num_layers
+                    refiner = config.num_refiner_layers
+                    assert attention_shapes[:refiner] == [local_text] * refiner
+                    # Each rank attends over the WHOLE packed sequence for its head subset,
+                    # exchanged in head chunks: every layer's calls sum to heads / degree.
+                    packed = attention_shapes[refiner:]
+                    assert {(b, n, d) for b, _, n, d in packed} == {
+                        (1, batch["position_ids"].shape[0], config.attention_head_dim)
+                    }
+                    assert sum(heads for _, heads, _, _ in packed) == (
+                        config.num_layers * config.num_attention_heads // degree
                     )
             else:
                 state = SimpleNamespace(

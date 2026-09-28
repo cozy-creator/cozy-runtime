@@ -1,0 +1,1 @@
+The Ulysses exchange moves heads in chunks, so attention on one chunk overlaps the next chunk's Q/K/V all-to-all and the previous chunk's return (7 chunks for H3's 56 heads at degree 4), and gathers shard lengths once per exchange instead of once per tensor. Outputs are bitwise those of the single all-to-all; head counts the group does not divide keep Diffusers' padded exchange.

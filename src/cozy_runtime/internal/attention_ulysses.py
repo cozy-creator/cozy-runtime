@@ -145,8 +145,84 @@ def group(config: Any) -> Any:
 def exchange(
     query: Any, key: Any, value: Any, handle: Any, compute: Callable[[Any, Any, Any], Any]
 ) -> Any:
-    """Sequence shards -> full sequence per head subset -> `compute` -> back, using Diffusers'
-    unequal-length exchange in both directions (packed H3 lengths do not divide)."""
+    """Sequence shards -> full sequence per head subset -> `compute` -> back.
+
+    Heads travel in chunks, so attention on one chunk runs while the next chunk's Q/K/V and
+    the previous chunk's output cross the wire: on PCIe cards the exchange was ~6 s of a
+    17.8 s step, fully exposed (run 1516). Each chunk is a whole-sequence document of
+    whole heads, so a head-local kernel computes exactly what one GPU computes for it.
+    Shard lengths are gathered once per exchange, not once per tensor: each gather is a
+    host sync. Head counts the group does not divide keep Diffusers' padded exchange."""
+    import torch
+    import torch.distributed as dist
+    from torch.distributed import _functional_collectives as funcol
+
+    world = dist.get_world_size(handle)
+    batch, local, heads, dim = query.shape
+    if heads % world:
+        return _padded_exchange(query, key, value, handle, compute)
+    per_rank = heads // world
+    # As many chunks as leave each rank two heads per chunk: at H3's 56 heads, 7 at degree 4.
+    chunks = max(
+        (n for n in range(1, per_rank) if per_rank % n == 0 and per_rank >= 2 * n), default=1
+    )
+    width = heads // chunks
+    lengths = _lengths(local, handle, query.device)
+
+    def send(chunk: int) -> Any:
+        span = slice(chunk * width, (chunk + 1) * width)
+        packed = torch.stack([t[:, :, span] for t in (query, key, value)])
+        packed = packed.reshape(3, batch, local, world, width // world, dim)
+        rows = packed.permute(3, 2, 0, 1, 4, 5).contiguous().flatten(0, 1)
+        return funcol.all_to_all_single(rows, lengths, [local] * world, handle)
+
+    returned = []
+    pending = send(0)
+    for chunk in range(chunks):
+        following = send(chunk + 1) if chunk + 1 < chunks else None
+        rows = _wait(pending)  # (sequence, 3, batch, heads per rank, dim)
+        q, k, v = (rows[:, i].transpose(0, 1).contiguous() for i in range(3))
+        output = compute(q, k, v)
+        if output.shape != q.shape or output.dtype != query.dtype:
+            raise ValueError("Ulysses attention returned incompatible output")
+        back = output.transpose(0, 1).contiguous()
+        returned.append(funcol.all_to_all_single(back, [local] * world, lengths, handle))
+        pending = following
+    parts = [
+        _wait(rows)
+        .reshape(world, local, batch, width // world, dim)
+        .permute(2, 1, 0, 3, 4)
+        .reshape(batch, local, width, dim)
+        for rows in returned
+    ]
+    result = parts[0] if chunks == 1 else torch.cat(parts, dim=2)
+    if result.shape != query.shape:
+        raise ValueError("Ulysses attention returned incompatible output")
+    return result
+
+
+def _lengths(local: int, handle: Any, device: Any) -> list[int]:
+    """Every rank's shard length: Diffusers' `tensor_split` shards need not be equal."""
+    import torch
+    import torch.distributed as dist
+
+    gathered = torch.empty(dist.get_world_size(handle), dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(
+        gathered, torch.tensor([local], dtype=torch.int64, device=device), group=handle
+    )
+    return [int(n) for n in gathered.tolist()]
+
+
+def _wait(tensor: Any) -> Any:
+    from torch.distributed import _functional_collectives as funcol
+
+    return tensor.wait() if isinstance(tensor, funcol.AsyncCollectiveTensor) else tensor
+
+
+def _padded_exchange(
+    query: Any, key: Any, value: Any, handle: Any, compute: Callable[[Any, Any, Any], Any]
+) -> Any:
+    """Diffusers' unequal-length exchange, which pads heads the group does not divide."""
     from diffusers.models.attention_dispatch import (
         all_to_all_single_any_o_async,
         all_to_all_single_any_qkv_async,
