@@ -3559,7 +3559,13 @@ class Worker:
             # says what to do about it, and reducing it to `PlanRefusal` produced a log that
             # repeated forever and named nothing — the refusal had to be reproduced by hand
             # off the record to find out which key it was about.
-            self.note("session", f"the control stream ended: {type(exc).__name__}: {exc}")
+            # A peer cancelling the stream (the Host superseding it for a newer owner stream,
+            # or the owner hanging up) surfaces as an RpcError with no text of its own.
+            self.note(
+                "session",
+                f"the control stream ended: {type(exc).__name__}: "
+                f"{str(exc) or 'the peer closed the stream'}",
+            )
         finally:
             # Unconditional: a SUPERSEDED stream is gone too, and leaving its epoch here
             # would report an owner that has been fenced out as still holding the pod.
@@ -3580,7 +3586,13 @@ class Worker:
         """
 
         def reject(reason: pb.ClaimRejection, why: str) -> tuple[int, queue.Queue[Any]]:
-            self.note("claim", f"REFUSED ({pb.ClaimRejection.Name(reason)}): {why}")
+            # Naming the claimant tells the Runtime's own readiness proof (a foreign Claim it
+            # must refuse) apart from a real owner's refused Claim.
+            self.note(
+                "claim",
+                f"REFUSED ({pb.ClaimRejection.Name(reason)}) "
+                f"for {claim.record_owner_id or 'an unnamed claimant'}: {why}",
+            )
             ack = pb.ClaimAck(
                 accepted=False,
                 rejection=reason,

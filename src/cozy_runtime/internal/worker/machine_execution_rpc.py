@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import grpc
 
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.internal import canonical
+from cozy_runtime.internal import canonical, prepare_diagnostics
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
 from cozy_runtime.internal.worker import (
     machine_capture,
@@ -90,7 +90,16 @@ class MachineExecutionRPC:
                     grpc.StatusCode.FAILED_PRECONDITION,
                     f"retained execution output is unavailable: {code}",
                 )
-            return context.abort(grpc.StatusCode.UNAVAILABLE, "machine execution operation failed")
+            # Unexpected: its type and frame locations (never its message) go to the log,
+            # and its type to the caller, so the failure is diagnosable from either side.
+            name = type(exc).__name__
+            self.worker.note("machine_execution", f"operation failed unexpectedly: {name}")
+            trace = prepare_diagnostics.exception_trace(exc)
+            for line in prepare_diagnostics.activity_lines(trace):
+                self.worker.note("machine_execution", f"traceback: {line}")
+            return context.abort(
+                grpc.StatusCode.UNAVAILABLE, f"machine execution operation failed ({name})"
+            )
 
     def _query(self, query: pb.MachineExecutionQuery) -> None:
         executions = self.worker.executions

@@ -533,6 +533,11 @@ def test_restarted_worker_runs_its_owners_next_submission_without_another_claim(
             assert machine.restart() == 0, machine.output()
             _, outcome = _run_job(machine, scratch, staged, "after-restart", orchestration=True)
             assert outcome.request_id == "after-restart"
+            machine.log.flush()
+            log = (root / "worker.log").read_text(errors="replace")
+            # The boot's own readiness proof, named, and the owner hanging up after its Claim.
+            assert "REFUSED (CLAIM_REJECTION_UNAUTHENTICATED) for readiness-negative-arm" in log
+            assert "the control stream ended: RpcError: the peer closed the stream" in log
         finally:
             code = machine.close()
         assert code == 0, machine.output()
