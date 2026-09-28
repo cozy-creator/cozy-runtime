@@ -202,71 +202,40 @@ def _handle(directory: Path) -> _Handle:
         return handle
 
 
+#: The journal schema this Runtime writes; a journal at any other version refuses.
+SCHEMA_VERSION = 14
+
+
 def _migrate(db: Journal) -> None:
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version == 14:
+    if version == SCHEMA_VERSION:
         return
-    if version == 0:
-        db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=3;COMMIT;")
-    elif version in (1, 2):
-        process_column = (
-            "ALTER TABLE attempts ADD COLUMN process_owner BLOB NOT NULL DEFAULT x'';"
-            if version == 1
-            else ""
+    if version != 0:
+        raise WorkspaceRefusal(
+            f"workspace journal schema {version} is not {SCHEMA_VERSION}; "
+            "start this machine with an empty workspace"
         )
-        db.executescript(
-            "BEGIN IMMEDIATE;" + process_column + _MIGRATION_3 + "PRAGMA user_version=3; COMMIT;"
-        )
-    elif version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
-        raise WorkspaceRefusal("workspace journal schema is not supported")
-    if version <= 3:
-        from .workspace_sources import SCHEMA4
+    from .machine_checkpoint_inputs import SCHEMA11
+    from .machine_models import SCHEMA9
+    from .workspace_byte_outputs import SCHEMA5
+    from .workspace_calls import SCHEMA8
+    from .workspace_executions import SCHEMA7
+    from .workspace_input_trees import SCHEMA10
+    from .workspace_partial import SCHEMA12
+    from .workspace_sources import SCHEMA4
 
-        db.executescript("BEGIN IMMEDIATE;" + SCHEMA4 + "PRAGMA user_version=4; COMMIT;")
-    if version <= 4:
-        from .workspace_byte_outputs import SCHEMA5
-
-        db.executescript("BEGIN IMMEDIATE;" + SCHEMA5 + "PRAGMA user_version=5; COMMIT;")
-    if version <= 5:
-        from .workspace_byte_outputs import migrate6
-
-        migrate6(db)
-    if version <= 6:
-        from .workspace_executions import SCHEMA7
-
-        db.executescript("BEGIN IMMEDIATE;" + SCHEMA7 + "PRAGMA user_version=7; COMMIT;")
-    if version <= 7:
-        from .workspace_calls import SCHEMA8
-
-        db.executescript("BEGIN IMMEDIATE;" + SCHEMA8 + "PRAGMA user_version=8; COMMIT;")
-    if version <= 8:
-        from .machine_models import SCHEMA9
-
-        db.executescript("BEGIN IMMEDIATE;" + SCHEMA9 + "PRAGMA user_version=9; COMMIT;")
-    if version <= 9:
-        from .workspace_input_trees import SCHEMA10
-
-        db.executescript("BEGIN IMMEDIATE;" + SCHEMA10 + "PRAGMA user_version=10; COMMIT;")
-    if version <= 10:
-        from .machine_checkpoint_inputs import SCHEMA11
-
-        db.executescript("BEGIN IMMEDIATE;" + SCHEMA11 + "PRAGMA user_version=11; COMMIT;")
-    if version <= 11:
-        from .workspace_partial import SCHEMA12
-
-        db.executescript("BEGIN IMMEDIATE;" + SCHEMA12 + "PRAGMA user_version=12; COMMIT;")
-    if version <= 12:
+    db.executescript(
+        "BEGIN IMMEDIATE;"
+        + "".join((_SCHEMA, SCHEMA4, SCHEMA5, SCHEMA7, SCHEMA8, SCHEMA9, SCHEMA10))
+        + SCHEMA11
+        + SCHEMA12
         # Providers an execution was given a credential for; never a credential value.
-        db.executescript(
-            "BEGIN IMMEDIATE;ALTER TABLE executions ADD COLUMN source_providers TEXT "
-            "NOT NULL DEFAULT '';PRAGMA user_version=13; COMMIT;"
-        )
-    if version <= 13:
+        + "ALTER TABLE executions ADD COLUMN source_providers TEXT NOT NULL DEFAULT '';"
         # The record owner answers this execution's memo lookups (MachineExecutionSubmit).
-        db.executescript(
-            "BEGIN IMMEDIATE;ALTER TABLE executions ADD COLUMN owner_memo INTEGER "
-            "NOT NULL DEFAULT 0 CHECK(owner_memo IN (0,1));PRAGMA user_version=14; COMMIT;"
-        )
+        + "ALTER TABLE executions ADD COLUMN owner_memo INTEGER NOT NULL DEFAULT 0 "
+        + "CHECK(owner_memo IN (0,1));"
+        + f"PRAGMA user_version={SCHEMA_VERSION}; COMMIT;"
+    )
 
 
 _OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
@@ -336,13 +305,6 @@ CREATE TABLE operation_lookups (
  ('retaining','ready','missing','miss','released','acknowledged')),
  PRIMARY KEY(owner,consumer)
 ) STRICT;
-"""
-
-_MIGRATION_3 = """
-ALTER TABLE attempts ADD COLUMN memoize INTEGER NOT NULL DEFAULT 0 CHECK(memoize IN (0,1));
-ALTER TABLE weights ADD COLUMN adoption_source TEXT NOT NULL DEFAULT '';
-ALTER TABLE weights ADD COLUMN adoption_epoch INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE weights ADD COLUMN adoption_checkpoint BLOB NOT NULL DEFAULT x'';
 """
 
 

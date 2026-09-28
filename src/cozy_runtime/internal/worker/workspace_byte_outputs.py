@@ -53,45 +53,12 @@ CREATE TABLE byte_outputs (
  manifest_body BLOB NOT NULL, content_bytes INTEGER NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('intent','complete','releasing','released')),
  receipt BLOB NOT NULL DEFAULT x'', native_digest BLOB NOT NULL DEFAULT x'',
+ native_service_id TEXT NOT NULL DEFAULT '',
  UNIQUE(owner,request,ordinal,spec,slot)
 ) STRICT;
-"""
-
-SCHEMA6 = """
-ALTER TABLE byte_outputs ADD COLUMN native_service_id TEXT NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX byte_outputs_native_service ON byte_outputs(owner,native_service_id)
  WHERE native_service_id<>'';
 """
-
-
-def migrate6(db: Journal) -> None:
-    """Preserve only exactly correlated development source views during the upgrade."""
-    db.executescript("BEGIN IMMEDIATE;" + SCHEMA6)
-    try:
-        rows = db.execute(
-            "SELECT * FROM byte_outputs WHERE slot LIKE 'runtime.source_files.%'"
-        ).fetchall()
-        for row in rows:
-            calls = db.execute(
-                "SELECT service_id FROM native_calls WHERE owner=? AND parent_request=? "
-                "AND operation='source_files' AND 'runtime.source_files.'||call_index=?",
-                (row["owner"], row["request"], row["slot"]),
-            ).fetchall()
-            candidate = dict(row)
-            if len(calls) != 1:
-                raise WorkspaceRefusal("existing native byte output has no unique accepted call")
-            candidate["native_service_id"] = calls[0]["service_id"]
-            if not recorded_native(db, candidate, complete=False):
-                raise WorkspaceRefusal("existing native byte output changed its accepted call")
-            db.execute(
-                "UPDATE byte_outputs SET native_service_id=? WHERE id=?",
-                (candidate["native_service_id"], row["id"]),
-            )
-        db.execute("PRAGMA user_version=6")
-        db.commit()
-    except BaseException:
-        db.rollback()
-        raise
 
 
 def native_slot(operation: str, index: int) -> str:

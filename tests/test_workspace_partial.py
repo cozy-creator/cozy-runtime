@@ -277,34 +277,14 @@ def test_native_commit_before_journal_result_replays_original_adoption(tmp_path:
     )
 
 
-def test_schema_two_migrates_conservatively_and_future_schema_refuses(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [2, 13, 99])
+def test_a_journal_schema_other_than_this_runtimes_refuses(tmp_path: Path, version: int) -> None:
     workspace = Workspace(tmp_path / "store")
-    with workspace.locked() as db:
-        for table in (
-            "execution_checkpoint_inputs",
-            "input_tree_intakes",
-            "execution_model_holds",
-            "execution_calls",
-            "execution_commands",
-            "execution_events",
-            "executions",
-        ):
-            db.execute("DROP TABLE " + table)
-        db.execute("ALTER TABLE workspace_state DROP COLUMN execution_workspace_id")
-        db.execute("DROP TABLE byte_outputs")
-        db.execute("DROP TABLE native_calls")
-        db.execute("DROP TABLE source_access")
-        db.execute("ALTER TABLE holds DROP COLUMN kind")
-        db.execute("ALTER TABLE attempts DROP COLUMN memoize")
-        for column in ("adoption_source", "adoption_epoch", "adoption_checkpoint", "retired_ms"):
-            db.execute(f"ALTER TABLE weights DROP COLUMN {column}")
-        db.execute("PRAGMA user_version=2")
-    with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 14
-        assert "memoize" in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}
+    with workspace.locked():
+        pass
     with sqlite3.connect(workspace.directory / "journal.sqlite3") as db:
-        db.execute("PRAGMA user_version=99")
-    with pytest.raises(WorkspaceRefusal, match="schema"), workspace.locked():
+        db.execute(f"PRAGMA user_version={version}")
+    with pytest.raises(WorkspaceRefusal, match="schema"), Workspace(tmp_path / "store").locked():
         pass
 
 

@@ -544,38 +544,6 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         worker.shutdown()
 
 
-def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
-    workspace = Workspace(tmp_path / "store")
-    workspace.accept("owner", offer("legacy"))
-    with workspace.locked() as db:
-        for table in (
-            "execution_checkpoint_inputs",
-            "input_tree_intakes",
-            "execution_model_holds",
-            "execution_calls",
-            "execution_commands",
-            "execution_events",
-            "executions",
-        ):
-            db.execute("DROP TABLE " + table)
-        db.execute("ALTER TABLE workspace_state DROP COLUMN execution_workspace_id")
-        db.execute("ALTER TABLE native_calls DROP COLUMN retired_ms")
-        db.execute("ALTER TABLE weights DROP COLUMN retired_ms")
-        db.execute("PRAGMA user_version=6")
-    workspace = Workspace(tmp_path / "store")
-    assert workspace.contains("owner", "legacy", 1)
-    e = Executions(workspace)
-    assert len(e.workspace_id) == 32
-    assert Executions(Workspace(tmp_path / "store")).workspace_id == e.workspace_id
-    assert Executions(Workspace(tmp_path / "other-store")).workspace_id != e.workspace_id
-    e.submit(
-        "owner", "new", b"c" * 32, offer("new"), expected_execution_workspace_id=e.workspace_id
-    )
-    with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 14
-        assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
-
-
 def test_retry_policy_never_retries_authored_errors_or_user_cancellation(tmp_path: Path) -> None:
     now = [1000]
     e = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: now[0])
