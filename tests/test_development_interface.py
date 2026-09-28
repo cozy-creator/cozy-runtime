@@ -1,0 +1,82 @@
+"""A local run derives its development PackageInterface with the worker's one builder.
+
+The CLI once built the document by importing the app while the worker re-derived it from
+source; for a package with a memoized job only the import added `operation_identity`, so
+every local run of it was refused `development_source_changed`.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from test_end_to_end import NO_EXECUTOR
+
+PACKAGE = """\
+import msgspec
+from cozy_runtime.author import App, Context, invocable
+
+app = App()
+
+
+class Request(msgspec.Struct):
+    value: int
+
+
+class Result(msgspec.Struct):
+    value: int
+
+
+@app.entrypoint
+def serve(payload: Request) -> Result:
+    return Result(payload.value + 1)
+
+
+@invocable(memoize=True)
+async def twice(ctx: Context, *, value: int) -> Result:
+    return Result(value * 2)
+
+
+app.job(twice)
+"""
+
+
+@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+def test_package_with_a_memoized_job_runs_locally(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.toml").write_text('[application]\nobject = "memo_app:app"\n')
+    (project / "memo_app.py").write_text(PACKAGE)
+    # The executor's control socket lives under --out, and sun_path holds 108 bytes.
+    with tempfile.TemporaryDirectory(prefix="cz.", dir="/tmp") as out:
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "cozy_runtime.cli.main",
+                "--json",
+                "--dir",
+                str(project),
+                "run",
+                "serve",
+                "value=3",
+                "--out",
+                out,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd="/",
+            env={**os.environ, "COZY_HOME": str(tmp_path / "home")},
+            timeout=600,
+        )
+    assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-4000:]
+    body = json.loads(done.stdout)
+    assert body["status"] == "OUTCOME_STATUS_SUCCEEDED", body
+    assert body["result"] == {"value": 4}

@@ -191,7 +191,9 @@ def run(
 
     try:
         found = discover(project)
-        body = package_interface.build(found)
+        # The worker re-derives this document from source and refuses any difference, so
+        # both sides use its one builder; the import above only supplies Python types.
+        body = static_interface.build(project)
     except ConformanceError as exc:
         raise CliError(
             "validation",
