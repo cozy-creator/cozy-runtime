@@ -382,6 +382,9 @@ def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degre
 
     group = RankGroup(degree=degree, backend="cpu:gloo", root=str(tmp_path), launch=launch)
     model: Any = spread_model()
+    # Bitwise equality needs one reduction order: the followers run one thread, and so do we.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
     # 33 latent frames are 7 clips: rounds of `degree`, the last one partial.
     z = torch.randn(1, 4, 33, 2, 3, generator=torch.Generator().manual_seed(5))
     expected = model.decode(z)
@@ -410,6 +413,7 @@ def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degre
         assert sorted(group.rank_records) == list(range(1, degree))
         assert not list((tmp_path / "attempt").rglob("tensor-*.raw"))
     finally:
+        torch.set_num_threads(threads)
         group.close()
         ours.close()
         theirs.close()

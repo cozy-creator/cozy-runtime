@@ -28,13 +28,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import tensorfs
 
 import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.gpu_scheduler import Demand
+from cozy_runtime.internal.worker.gpu_scheduler import Want
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
@@ -165,6 +167,7 @@ class Warm(Machine):
     cache: what a machine preparing a serving child actually holds."""
 
     def __init__(self, root: Path, devices: str) -> None:
+        self.home = root
         self.worker = Worker(
             replace(
                 _config(root / "home"),
@@ -236,10 +239,12 @@ class Warm(Machine):
             worker_boot=self.worker.fence.worker_boot_id,
             capture_document=capture,
         )
-        accepted = pb.AttemptAccepted(
-            request_id=name, attempt_ordinal=1, invocation_spec_digest=digest
-        )
-        self.executions.dispatched(OWNER, accepted.request_id, accepted.attempt_ordinal)
+        self.executions.dispatched(OWNER, name, 1)
+        # A running root holds its GPU lease through its own execution unit.
+        attempt = AttemptRecord(name, 1, digest, {}, state="running")
+        self.worker.engine.history[attempt.key()] = attempt
+        self.worker.engine.live[name] = attempt
+        self.worker.execution(OWNER, name)
 
     def target(self, checkpoint: dict[str, Any], degrees: tuple[int, ...] = ()) -> Target:
         digest = "sha256:" + hashlib.sha256(b"warm-binding").hexdigest()
@@ -275,18 +280,11 @@ class Warm(Machine):
     def direct_root(self, name: str) -> None:
         """A serving root as Creator submits a rented direct root once the Host's preparation
         answers: its template names the installed fixture, and no call asked for it before."""
+        checkpoint = self.land()
         placement = {
-            **self.target({"digest": "sha256:" + "0" * 64, "length": 1}).prepared_installation[
-                "placement"
-            ],
+            **self.target(checkpoint).prepared_installation["placement"],
             "package": {"package": "t/m", "release": "1"},
-            "models": [
-                {
-                    "id": "model",
-                    "repo": "proof/model",
-                    "manifest": {"digest": "sha256:" + "0" * 64, "length": 1},
-                }
-            ],
+            "models": [{"id": "model", "repo": "proof/model", "manifest": checkpoint}],
         }
         raw = canonical_json.encode(
             {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
@@ -313,6 +311,20 @@ class Warm(Machine):
             {"installations": {}, "state": base64.b64encode(state.SerializeToString()).decode()},
             placement=placement["placement_id"],
         )
+
+    def land(self) -> dict[str, Any]:
+        """The model's checkpoint in this machine's store, as the Host's preparation lands it."""
+        store = tensorfs.Store.ensure(str(self.home / "store"))
+        for body in (_HEADER, _ASSET):
+            path = self.home / hashlib.sha256(body).hexdigest()
+            path.write_bytes(body)
+            store.put_file(str(path), "sha256:" + hashlib.sha256(body).hexdigest(), len(body))
+        header = {"length": len(_HEADER), "sha256": hashlib.sha256(_HEADER).hexdigest()}
+        entry = {"blob": header, "kind": "cozytensors", "path": "model.cozytensors"}
+        raw = json.dumps({"entries": [entry]}, sort_keys=True, separators=(",", ":")).encode()
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        store.put_manifest(raw, digest, len(raw))
+        return {"digest": digest, "length": len(raw)}
 
     def phases(self, root: str) -> dict[str, dict[str, Any]]:
         """The root's journaled phase records, by name: what `cozy run show` renders."""
@@ -524,13 +536,14 @@ def test_probes_wait_while_a_call_runs_on_the_card_and_follow_when_it_leaves(
 ) -> None:
     """The root's own call holds the card: its process may start there (the root holds it),
     but no probe runs beside a call on the device; the pass that sees the card released
-    starts them. The scheduler is driven directly, so the call's grant lasts exactly as
-    long as the test says."""
+    starts them. The call's card comes from the worker's broker, as every call's does, and
+    stays granted until the test releases it."""
     machine = warm()
     machine.submit_root("A")
     gpu, prespawns = machine.worker.gpu, machine.worker.prespawns
-    roots = {"A": 1}
-    assert gpu.sync(roots, [Demand("A-call#1", "A", 1)]) == {"A-call#1": (0,)}
+    roots = dict(gpu.roots)
+    gpu.want("A-call#1", Want("A", 1))
+    assert gpu.granted("A-call#1") == (0,)
     emitted: list[dict[str, Any]] = []
     target = machine.target({"digest": "sha256:" + "0" * 64, "length": 1})
     prespawns.request(OWNER, "A", target, emitted.append)
@@ -540,9 +553,8 @@ def test_probes_wait_while_a_call_runs_on_the_card_and_follow_when_it_leaves(
         prespawns.reconcile(roots, gpu.view())
         time.sleep(0.05)
     assert [frame["fields"]["phase"] for frame in emitted] == ["Starting model executor"]
-    gpu.release("A-call#1")
-    gpu.sync(roots, [])
     released = time.time()
+    gpu.release("A-call#1")
     prespawns.reconcile(roots, gpu.view())
     assert slot.finished.wait(120)
     probes = emitted[-1]["fields"]
