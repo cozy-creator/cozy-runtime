@@ -1,9 +1,12 @@
-"""The worker at HEAD serves the executors of the older Runtimes published packages pin.
+"""The worker at HEAD serves the executors of older Runtimes, and a package locked to an older
+Runtime runs the machine's own.
 
-An installed package's executor runs in the package's own environment, locked to the
-cozy-runtime it was published against, and speaks the seam to whatever worker the pod runs.
-Runtime 0.18.69 broke SDXL and Anima conversions because its worker refused a record an older
-peer wrote. Here the worker is this checkout and every executor is a real PyPI release.
+An installed package's executor runs in the package's own environment and speaks the seam to
+whatever worker the pod runs. Its lock freezes its dependencies, not its Runtime: a package
+that declares a lower bound gets the machine's Runtime, and one that pins a Runtime exactly
+(like every environment installed before this rule) keeps that executor. Runtime 0.18.69 broke
+SDXL and Anima conversions because its worker refused a record an older peer wrote. Here the
+worker is this checkout and every executor is a real PyPI release.
 
 Each Runtime is locked the way a package locked it on release day (`--exclude-newer` at its
 upload) and installed by the product installer into `CACHE`, with its lock and the package
@@ -17,6 +20,7 @@ from __future__ import annotations
 import base64
 import datetime
 import hashlib
+import importlib.metadata
 import json
 import os
 import shutil
@@ -34,6 +38,7 @@ from pathlib import Path
 import grpc
 import msgspec
 import pytest
+from packaging.version import Version
 
 import signed_claims
 from cozy_runtime import canonical_json
@@ -52,6 +57,10 @@ from test_end_to_end import NO_EXECUTOR, _development, _wheel_rows
 #: The executor floor (`child.require_executor_protocol`), the Runtime SDXL 2.3.23 pins, and the
 #: Runtime the owner's H3/Qwen environments pin.
 VERSIONS = ("0.18.51", "0.18.67", "0.18.69")
+
+#: (the Runtime a lock holds, the package's own requirement on it). An exact pin keeps that
+#: executor; the owner's H3/Qwen packages declare `>=0.18.67` and so run the machine's own.
+CASES = (*((version, f"=={version}") for version in VERSIONS), ("0.18.67", ">=0.18.67"))
 
 CACHE = (
     Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
@@ -169,6 +178,10 @@ class _Release(msgspec.Struct):
     urls: list[_File]
 
 
+class _Index(msgspec.Struct):
+    releases: dict[str, object]
+
+
 def _uv(*argv: str, cwd: Path) -> None:
     uv = shutil.which("uv")
     assert uv is not None
@@ -226,9 +239,9 @@ def _lock(version: str) -> bytes:
     return path.read_bytes()
 
 
-def _wheel() -> Path:
-    """The seam package's wheel, built once per SOURCE."""
-    wheels = CACHE / "wheels" / hashlib.sha256(SOURCE.encode()).hexdigest()[:16]
+def _wheel(requirement: str) -> Path:
+    """The seam package's wheel requiring `cozy-runtime<requirement>`, built once per SOURCE."""
+    wheels = CACHE / "wheels" / hashlib.sha256((SOURCE + requirement).encode()).hexdigest()[:16]
     for built in wheels.glob("*.whl"):
         return built
     with tempfile.TemporaryDirectory(prefix="cz-seam-wheel.") as raw:
@@ -237,7 +250,7 @@ def _wheel() -> Path:
         (project / f"{MODULE}.py").write_text(SOURCE)
         (project / "pyproject.toml").write_text(
             f'[project]\nname="{PACKAGE.split("/")[1]}"\nversion="{RELEASE}"\n'
-            'requires-python=">=3.12,<3.13"\ndependencies=["cozy-runtime>=0.18.51,<1"]\n'
+            f'requires-python=">=3.12,<3.13"\ndependencies=["cozy-runtime{requirement}"]\n'
             f'[project.entry-points."cozy.application"]\ndefault="{MODULE}:app"\n'
             '[build-system]\nrequires=["hatchling"]\nbuild-backend="hatchling.build"\n'
             f'[tool.hatch.build.targets.wheel]\nonly-include=["{MODULE}.py"]\n'
@@ -248,12 +261,13 @@ def _wheel() -> Path:
     return wheels / built.name
 
 
-def _installation(version: str) -> tuple[str, Path, bytes]:
-    """The cached package environment locked to cozy-runtime `version`, its wheel and lock."""
-    lock, wheel = _lock(version), _wheel()
+def _installation(version: str, requirement: str) -> tuple[str, Path, bytes, str]:
+    """The cached package environment locked to cozy-runtime `version`, its wheel and lock,
+    and the Runtime the installer chose for it."""
+    lock, wheel = _lock(version), _wheel(requirement)
     identity = b"\0".join((lock, wheel.read_bytes(), str(PYTHON).encode()))
     installation = f"seam-{version}-{hashlib.sha256(identity).hexdigest()[:16]}"
-    package_installation.install(
+    installed = package_installation.install(
         CACHE / "installs",
         package=PACKAGE,
         release=RELEASE,
@@ -262,7 +276,8 @@ def _installation(version: str) -> tuple[str, Path, bytes]:
         requirements=lock,
         wheels=(wheel,),
     )
-    return installation, wheel, lock
+    record = json.loads((installed.generation.parent / "installation.json").read_text())
+    return installation, wheel, lock, record["sdk"]["cozy-runtime"]
 
 
 @dataclass
@@ -270,6 +285,7 @@ class Harness:
     """One HEAD worker serving one installed package whose executors run `version`."""
 
     version: str
+    requirement: str
     root: Path
     worker: Worker
     thread: threading.Thread
@@ -401,10 +417,10 @@ class Harness:
         return self.settle(request_id)
 
 
-@pytest.fixture(scope="module", params=VERSIONS)
+@pytest.fixture(scope="module", params=CASES, ids=lambda case: case[1])
 def harness(request: pytest.FixtureRequest) -> Iterator[Harness]:
-    version = str(request.param)
-    installation, wheel, lock = _installation(version)
+    locked, requirement = request.param
+    installation, wheel, lock, version = _installation(locked, requirement)
     # Short: the executors' control sockets live under it and `sun_path` holds 108 bytes.
     with tempfile.TemporaryDirectory(prefix="cz-seam.") as raw:
         root = Path(raw)
@@ -482,6 +498,7 @@ def harness(request: pytest.FixtureRequest) -> Iterator[Harness]:
             channel = grpc.insecure_channel((root / "address").read_text().strip())
             yield Harness(
                 version,
+                requirement,
                 root,
                 worker,
                 thread,
@@ -524,10 +541,25 @@ def test_job_derives_adopts_and_reads_weights(harness: Harness) -> None:
     assert harness.run("derived", "derived", {"n": 4}) == {"value": 1, "runtime": harness.version}
 
 
+def test_an_exact_pin_keeps_its_runtime_and_a_bound_runs_the_machines(harness: Harness) -> None:
+    """The lock names 0.18.67 either way. A bound the machine's Runtime satisfies installs it
+    (the newest published one, while this checkout's version is unreleased)."""
+    if harness.requirement.startswith("=="):
+        assert harness.version == harness.requirement.removeprefix("==")
+        return
+    mine = importlib.metadata.version("cozy-runtime")
+    with urllib.request.urlopen("https://pypi.org/pypi/cozy-runtime/json", timeout=30) as reply:
+        published = sorted(msgspec.json.decode(reply.read(), type=_Index).releases, key=Version)
+    assert harness.version == (mine if mine in published else published[-1])
+    assert Version(harness.version) > Version("0.18.67")
+
+
 def test_the_warm_says_an_older_executor_reads_the_image_kernel_site(harness: Harness) -> None:
-    """Every Runtime here predates boot compile: it serves a compiled kernel only from the
-    image kernel site the machine fills (run 1525: H3 on 0.18.67 served SDPA on an image with
-    none). The kernel-compile phase says so from the executor's own hello."""
+    """Every pinned Runtime here predates boot compile: it serves a compiled kernel only from
+    the image kernel site the machine fills (run 1525: H3 on 0.18.67 served SDPA on an image
+    with none). The kernel-compile phase says so from the executor's own hello."""
+    if Version(harness.version) >= Version("0.18.70"):
+        pytest.skip("this executor compiles its kernels at boot")
     harness.serve("warm-note", "double", {"n": 1})
     [executor] = [
         hosted.supervision.current
