@@ -742,6 +742,10 @@ class ComponentResidency:
     windows: list[list[int]] = field(default_factory=list)
     #: host bytes holding paged units' weights
     kept_bytes: int = 0
+    #: the order paged blocks ran in: (component, block) -> the block after it
+    next_unit: dict[tuple[str, str], str] = field(default_factory=dict)
+    last_unit: dict[str, str] = field(default_factory=dict)
+    copy_stream: Any = None
 
     def __post_init__(self) -> None:
         for name, layout in self.backend.layouts.items():
@@ -1165,7 +1169,26 @@ class ComponentResidency:
         self.staged_ms += elapsed
         self.attempt_staged_ms += elapsed
         self._keep(name, unit)
+        self._ahead(name, unit)
         self._fold()
+
+    def _ahead(self, name: str, unit: PageUnit) -> None:
+        """Learn the order blocks run in, and start copying the next one while this one
+        computes, when it is kept in host memory and fits beside this one."""
+        previous = self.last_unit.get(name)
+        if previous is not None:
+            self.next_unit[(name, previous)] = unit.path
+        self.last_unit[name] = unit.path
+        following = self.next_unit.get((name, unit.path))
+        layout = self.backend.paging.get(name)
+        if following is None or layout is None or self.kind != "cuda":
+            return
+        block = next((b for b in layout.blocks if b.path == following), None)
+        if block is None or not self._fits(block.nbytes):
+            return
+        if self.copy_stream is None:
+            self.copy_stream = self.torch.cuda.Stream()
+        self.backend.prefetch(name, block, self.copy_stream)
 
     def _keep(self, name: str, unit: PageUnit) -> None:
         """Keep a paged unit in host memory while the host has room for it: the next
@@ -1214,7 +1237,7 @@ class ComponentResidency:
         self._fold()
         allocated = self._allocated()
         started = time.perf_counter()
-        accel.synchronize(self.torch, self.kind)
+        # Freed in stream order: the next block's copy waits for this block's kernels.
         self.backend.evict_page(name, unit)
         self.allocator_delta_bytes += self._allocated() - allocated
         self.evictions += 1

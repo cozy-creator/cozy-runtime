@@ -1317,6 +1317,8 @@ class StreamingFillBackend:
         self.page_resident: dict[str, memory.PageUnit] = {}
         #: paged units' weights kept in host memory: (component, unit path) -> key -> tensor
         self.mirror: dict[tuple[str, str], dict[str, Any]] = {}
+        #: the next unit of a paged component, copying ahead: component -> (unit, event)
+        self.prefetched: dict[str, tuple[memory.PageUnit, Any]] = {}
         self.stats: FillStats = {"windows": 0, "waits": 0}
         #: Why this generation was poisoned and what the allocator held at that instant.
         #: Empty until a failure lands; the refusal reply carries it as evidence. Nothing
@@ -2174,6 +2176,9 @@ class StreamingFillBackend:
                 )
             if name not in self.components:
                 return 0
+            ahead = self.prefetched.pop(name, None)
+            if ahead is not None:
+                self.abandon_page(name, ahead[0])
             self._park_page(name, self.paging[name].common)
             self.parked[name] = self.components.pop(name)
             return self.vram_charge.pop(name, 0)
@@ -2389,9 +2394,36 @@ class StreamingFillBackend:
             raise _refuse(
                 "leaf_schema", "paging requires one admitted component and no live block", [name]
             )
-        self._fill_page(name, unit)
+        ahead = self.prefetched.pop(name, None)
+        if ahead is not None and ahead[0] is unit:
+            self.torch.cuda.current_stream().wait_event(ahead[1])
+        else:
+            if ahead is not None:
+                self.abandon_page(name, ahead[0])
+                self.vram_charge[name] -= ahead[0].nbytes
+            self._fill_page(name, unit)
+            self.vram_charge[name] += unit.nbytes
         self.page_resident[name] = unit
+
+    def prefetch(self, name: str, unit: memory.PageUnit, stream: Any) -> bool:
+        """Start a kept unit's copy on `stream` while the current block computes. The copy is
+        ordered after everything queued so far, and its page-in waits on its event."""
+        kept = self.mirror.get((name, unit.path))
+        if kept is None or name in self.prefetched:
+            return False
+        torch = self.torch
+        with placing():
+            self._place(unit, self.device)
+            live = unit.live(name)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for key, tensor in live.items():
+                tensor.copy_(kept[key], non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+        self.prefetched[name] = (unit, event)
         self.vram_charge[name] += unit.nbytes
+        return True
 
     def evict_page(self, name: str, unit: memory.PageUnit) -> None:
         if self.page_resident.get(name) is not unit:
@@ -2418,9 +2450,10 @@ class StreamingFillBackend:
         self.enqueued.clear()
         self.leaf_sites.clear()
         self.state = "ready"
-        live = self.page_resident.pop(name, None)
-        if live is not None:
-            self.abandon_page(name, live)
+        ahead = self.prefetched.pop(name, None)
+        for live in (self.page_resident.pop(name, None), ahead[0] if ahead else None):
+            if live is not None:
+                self.abandon_page(name, live)
         if name in self.components:
             self.evict(name)
         member = self.parked.get(name)
