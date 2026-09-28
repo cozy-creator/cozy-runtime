@@ -381,7 +381,6 @@ class ReleaseRoots:
         models = self._resolve(
             root,
             declaration,
-            prepared.installation_id,
             machine_source_models.credentials(request.source_credentials),
             lambda stage, done, total: self._note(job, stage, done, total),
         )
@@ -440,13 +439,12 @@ class ReleaseRoots:
         self,
         root: pb.ReleaseRoot,
         declaration: Mapping[str, Json],
-        installation: str,
         credentials: Mapping[str, str],
         note: machine_source_models.Note,
     ) -> list[dict[str, Json]]:
         """Each slot for this machine. A manifest it already holds needs no catalog read; the
         package's bindings are read once and its catalog slots then resolve beside each other,
-        once per installation."""
+        once per package."""
         slots = declaration.get("models", [])
         if not slots:
             return []
@@ -467,7 +465,7 @@ class ReleaseRoots:
         ]
         # Pinned and sourced slots read nothing; an open one reads this machine's own Hub.
         catalog = (
-            machine_model_resolve.own(self.worker, installation, root.package)
+            machine_model_resolve.own(self.worker, root.package)
             if open_slots
             else machine_model_resolve.Catalog("")
         )

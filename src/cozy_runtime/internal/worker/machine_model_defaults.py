@@ -258,9 +258,7 @@ def select(
     )
     # A slot the capture left open is resolved here, at this machine's own Hub.
     open_slots = any(parameter not in defaults for parameter in missing)
-    catalog = (
-        machine_model_resolve.own(worker, target.installation_id, package) if open_slots else None
-    )
+    catalog = machine_model_resolve.own(worker, package) if open_slots else None
     fits = fitter(worker)
     selected: list[dict[str, Json]] = []
     for parameter in missing:

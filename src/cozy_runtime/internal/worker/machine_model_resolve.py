@@ -1,8 +1,9 @@
 """Model slots this machine resolves itself: the caller's explicit choice, else the owner's
 binding, else the callee's authored default. The rung is chosen for this machine's devices
 before anything is read, so a slot costs one public catalog resolution of that rung's lane,
-once per installation: a warm run reads nothing. The owner's rebinding, which this machine
-cannot see, reaches it as `Resolutions.forget` from the controller that made it."""
+once per package: a warm run reads nothing, whatever release or snapshot of the package it
+runs. The owner's rebinding, which this machine cannot see, reaches it as
+`Resolutions.forget` from the controller that made it."""
 
 from __future__ import annotations
 
@@ -35,37 +36,35 @@ type Row = dict[str, Any]
 
 @dataclass
 class Resolved:
-    """What one installation's slots read at the Hub: its packages' bindings, and each lane's
-    or digest's checkpoint."""
+    """What one package's slots read at the Hub: the owner's bindings, and each lane's or
+    digest's checkpoint. Every release and installation of the package shares it."""
 
-    package: str
     bindings: dict[str, Row] = field(default_factory=dict)
     checkpoints: dict[tuple[str, str, str], Row] = field(default_factory=dict)
 
 
 class Resolutions:
-    """What this machine read of each package at its Hub, for its lifetime: the newest
-    release, and each installation's resolutions."""
+    """What this machine read of each package at its Hub, for its lifetime: its newest
+    release, and its slots' resolutions."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.held: dict[str, Resolved] = {}
         self.newest: dict[str, str] = {}
 
-    def of(self, installation: str, package: str) -> Resolved:
+    def of(self, package: str) -> Resolved:
         with self.lock:
-            return self.held.setdefault(installation, Resolved(package))
+            return self.held.setdefault(package, Resolved())
 
     def forget(self, package: str) -> None:
         """Drop what was read of a package; its next run reads it once more."""
         with self.lock:
             self.newest.pop(package, None)
-            for key in [key for key, held in self.held.items() if held.package == package]:
-                del self.held[key]
+            self.held.pop(package, None)
 
 
 class Catalog:
-    """Reads at one catalog origin, each at most once for the installation it resolves for. At
+    """Reads at one catalog origin, each at most once for the package it resolves for. At
     the machine's own Hub each read presents its worker capability, which reads its owner's
     unpublished checkpoints; a refusal is never retried anonymously."""
 
@@ -81,7 +80,7 @@ class Catalog:
         self.host, self.port = parts.hostname or "", parts.port
         self.tls = (context or ssl.create_default_context()) if parts.scheme == "https" else None
         self.credential = dict(credential or {})
-        self.resolved = resolved or Resolved("")
+        self.resolved = resolved or Resolved()
         self.bindings = self.resolved.bindings
 
     def text(self, path: str, limit: int = MAX_METADATA) -> bytes | None:
@@ -170,9 +169,9 @@ class Catalog:
         return length
 
 
-def own(worker: Worker, installation: str = "", package: str = "") -> Catalog:
+def own(worker: Worker, package: str = "") -> Catalog:
     """This machine's own Hub, as its grant names it: where it reads packages and Models,
-    its owner's unpublished ones included. For an installation, what it already read."""
+    its owner's unpublished ones included. For a package, what it already read of it."""
     authority = worker.options.publication_authority
     if authority is None:
         raise WorkspaceRefusal("this machine has no Hub grant to read the catalog at")
@@ -180,7 +179,7 @@ def own(worker: Worker, installation: str = "", package: str = "") -> Catalog:
         authority.origin,
         authority.context(),
         {"X-Cozy-Worker-ID": authority.worker_id, "X-Cozy-Worker-Token": authority.worker_token},
-        worker.resolutions.of(installation, package) if installation else None,
+        worker.resolutions.of(package) if package else None,
     )
 
 

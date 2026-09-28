@@ -683,7 +683,7 @@ def test_a_roots_catalog_slots_resolve_beside_each_other(
     declaration = {"models": [{"path": SLOT}, {"path": "touch.models.second"}]}
     try:
         rows = machine_release_roots.ReleaseRoots(published.worker)._resolve(
-            root, declaration, "installation", {}, lambda *_: None
+            root, declaration, {}, lambda *_: None
         )
     finally:
         catalog.close()
