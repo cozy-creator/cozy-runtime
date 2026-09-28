@@ -164,22 +164,20 @@ class Loaded:
 
 
 def load(data: bytes) -> Loaded:
-    """Link verified bytes from an anonymous file: what was hashed is exactly what runs."""
+    """Link verified bytes from a file with no name, private to this process: what was hashed
+    is exactly what runs. `TemporaryFile` is O_TMPFILE, else unlinked at once; it needs no
+    `os.memfd_create`, which python-build-standalone's old glibc build lacks."""
     cute = import_module("cutlass.cute")
     for library in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
         if Path(library).exists():
             # As flash-attn-4's own disk cache does: a loaded object resolves the DSL
             # runtime's symbols globally.
             ctypes.CDLL(library, mode=ctypes.RTLD_GLOBAL)
-    descriptor = os.memfd_create("cozy-kernel", os.MFD_CLOEXEC)
-    try:
-        view = memoryview(data)
-        while view:
-            view = view[os.write(descriptor, view) :]
-        module = cute.runtime.load_module(f"/proc/self/fd/{descriptor}", enable_tvm_ffi=True)
-        return Loaded(getattr(module, FUNCTION))
-    finally:
-        os.close(descriptor)
+    with tempfile.TemporaryFile(prefix="cozy-kernel-") as anonymous:
+        anonymous.write(data)
+        anonymous.flush()
+        path = f"/proc/self/fd/{anonymous.fileno()}"
+        return Loaded(getattr(cute.runtime.load_module(path, enable_tvm_ffi=True), FUNCTION))
 
 
 def producer(started: float) -> dict[str, Any]:

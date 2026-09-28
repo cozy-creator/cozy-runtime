@@ -232,6 +232,35 @@ def test_sol_sm90_object_is_a_function_of_its_key_and_needs_no_gpu() -> None:
         assert _object(_LIVE, 4096, gpu=True)["sha"] == first["sha"]
 
 
+_NO_MEMFD = """
+    import json, os, sys, types
+    from pathlib import Path
+    import torch
+    from cozy_runtime.internal import attention_sol, kernel_cache
+    vars(os).pop("memfd_create", None)
+    torch.cuda.get_device_capability = lambda *_: (9, 0)
+    kernel_cache.configure(kernel_cache.Store(Path(sys.argv[1])))
+    rows = []
+    with attention_sol.observing(kernels=rows):
+        attention_sol._resolve(4096, 1, types.SimpleNamespace(type="cuda"))
+    print(json.dumps(rows))
+"""
+
+
+def test_sol_loads_where_os_has_no_memfd_create(tmp_path: Path) -> None:
+    """python-build-standalone's `os` has no `memfd_create`: Sol was skipped on every pod rank
+    (runs 1435-1441). A GPU-less SM90 resolve without it compiles, publishes and loads, and a
+    second process loads the object from the store."""
+    _site()
+    env = {"CUTE_DSL_ARCH": "sm_90a", "CUDA_VISIBLE_DEVICES": ""}
+    first, second = (
+        json.loads(_run(_NO_MEMFD, str(tmp_path / "u1"), env=env).stdout.splitlines()[-1])
+        for _ in range(2)
+    )
+    assert [row["source"] for row in first + second] == ["compiled", "store"]
+    assert first[0]["key"] == second[0]["key"]
+
+
 def test_second_sm90_process_loads_the_kernel_without_compiling(tmp_path: Path) -> None:
     """Process A resolves (compiles and publishes); process B resolves by loading only, and
     both produce bitwise-identical attention."""

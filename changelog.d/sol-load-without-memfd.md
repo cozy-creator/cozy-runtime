@@ -1,0 +1,1 @@
+Sol's SM90 kernel loads on Pythons without `os.memfd_create` (python-build-standalone, the pod executor's): the verified object is linked from an unnamed temporary file instead, so Sol serves as the H3 default instead of falling back to Sage2.
