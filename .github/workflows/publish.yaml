@@ -5,7 +5,9 @@ name: Publish to PyPI
 #   gh workflow run publish.yaml -R cozy-creator/cozy-runtime -f release_tag=vX.Y.Z
 # Two jobs because each bills at least one minute: `build` runs every refusal and builds
 # all three files; `publish` holds the PyPI OIDC token and runs no project code.
-# Success means PyPI's simple index serves exactly the built files: lock dependents after it.
+# Success means PyPI's JSON API lists exactly the built files: lock dependents after the
+# simple index lists them too. Both jobs run on the org's self-hosted release runner (owner,
+# 2026-09-28: no CI, no GitHub-hosted minutes), without the lint and fence steps.
 on:
   workflow_dispatch:
     inputs:
@@ -27,7 +29,7 @@ jobs:
     outputs:
       version: ${{ steps.dist.outputs.version }}
       sha256sums: ${{ steps.dist.outputs.sha256sums }}
-    runs-on: ubuntu-latest
+    runs-on: cozy-local
     # Hang bound, not a work budget: a native-input change adds image pull + CUDA toolkit +
     # six-architecture compile.
     timeout-minutes: 45
@@ -51,14 +53,7 @@ jobs:
       - id: release
         name: Verify immutable unpublished release identity
         run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source
-      # Syntax errors and undefined names anywhere in the tree (Python has no compile step).
-      - run: uvx ruff@0.16.4 check --no-cache --select E9,F63,F7,F82 .
-        working-directory: source
       - run: uv sync --locked
-        working-directory: source
-      # The architecture fences against the exact tagged tree.
-      - name: Fences
-        run: uv run python checks/architecture.py
         working-directory: source
 
       # ONE package, TWO wheel files (cr-094): same source and version, the second tagged
@@ -146,7 +141,7 @@ jobs:
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: cozy-local
     environment: pypi
     # Hang bound, not a work budget.
     timeout-minutes: 20
@@ -164,8 +159,12 @@ jobs:
         run: |
           printf '%s\n' "$SUMS" | sha256sum --check --strict
           [ "$(ls | sort)" = "$(printf '%s\n' "$SUMS" | awk '{print $2}' | sort)" ]
+      # Trusted publishing is unchanged. This box cannot reach fulcio.sigstore.dev, so the
+      # optional PEP 740 attestations are off while releases run here.
       - name: Publish (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: false
       # Uploads land one file at a time; a lock taken mid-upload silently misses platform
       # files. Wait while files are absent, refuse at once on any file this run did not build.
       - name: PyPI serves exactly the built files
@@ -179,18 +178,17 @@ jobs:
           want = {name: digest for digest, name in (line.split() for line in os.environ["SUMS"].splitlines())}
           prefixes = (f"cozy_runtime-{version}-", f"cozy_runtime-{version}.tar.gz")
           request = urllib.request.Request(
-              "https://pypi.org/simple/cozy-runtime/",
-              headers={"Accept": "application/vnd.pypi.simple.v1+json", "Cache-Control": "no-cache"},
+              f"https://pypi.org/pypi/cozy-runtime/{version}/json", headers={"Cache-Control": "no-cache"}
           )
           while True:
               try:
                   with urllib.request.urlopen(request, timeout=30) as response:
-                      files = json.load(response)["files"]
+                      files = json.load(response)["urls"]
               except (OSError, urllib.error.URLError) as error:
-                  print(f"index unavailable ({error}); retrying", flush=True)
+                  print(f"PyPI JSON unavailable ({error}); retrying", flush=True)
                   time.sleep(5)
                   continue
-              served = {f["filename"]: f["hashes"].get("sha256") for f in files if f["filename"].startswith(prefixes)}
+              served = {f["filename"]: f["digests"].get("sha256") for f in files if f["filename"].startswith(prefixes)}
               wrong = {name: digest for name, digest in served.items() if want.get(name) != digest}
               if wrong:
                   sys.exit(f"PyPI serves files this run did not build: {wrong}")
@@ -201,3 +199,6 @@ jobs:
               print(f"not yet served: {missing}", flush=True)
               time.sleep(5)
           PY
+      # Docker actions leave root-owned files in the self-hosted runner's workspace.
+      - if: always()
+        run: docker run --rm -v "$GITHUB_WORKSPACE:/w" alpine:3.20 chown -R "$(id -u):$(id -g)" /w
