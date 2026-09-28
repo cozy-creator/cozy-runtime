@@ -928,25 +928,27 @@ def executor_load_command(
                 budgets=Budgets(declared_weight_bytes=model.model_weight_bytes),
             )
         )
-    single = models[0] if len(models) == 1 else None
-    return Load(
+    command = Load(
         construction=construction,
         devices=devices,
         authorized_device_limit_bytes=int(authorized_device_limit_bytes),
         sequence_parallel_degree=sequence_parallel_degree,
         attention_pin=attention_pin,
-        binding=single.binding
-        if single is not None
-        else Binding(
-            application=binding.application,
-            package_interface=binding.interface_path,
-            development_project=binding.development_project,
-        )
-        if not models
-        else Binding(),
-        budgets=single.budgets if single is not None else Budgets(),
-        models=tuple(models) if len(models) > 1 else msgspec.UNSET,
     )
+    if len(models) > 1:
+        return msgspec.structs.replace(command, models=tuple(models))
+    single = (
+        models[0]
+        if models
+        else ModelLoad(
+            binding=Binding(
+                application=binding.application,
+                package_interface=binding.interface_path,
+                development_project=binding.development_project,
+            )
+        )
+    )
+    return msgspec.structs.replace(command, binding=single.binding, budgets=single.budgets)
 
 
 def _claim_descriptor_headroom() -> None:

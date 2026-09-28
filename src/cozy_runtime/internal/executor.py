@@ -1919,7 +1919,7 @@ class Executor:
                     ),
                     "rank": self.rank,
                 }
-        if degree > 1 and command.models is UNSET and not command.binding.model_class:
+        if degree > 1 and command.models is UNSET and not command.single().binding.model_class:
             self.poisoned = "sequence-parallel construction unsupported"
             return {
                 "ok": False,
@@ -1935,7 +1935,8 @@ class Executor:
             }
         if command.models is not UNSET:
             return self._prepare_many(command, command.models)
-        binding, budgets = command.binding, command.budgets
+        single = command.single()
+        binding, budgets = single.binding, single.budgets
         self._group_model_key = f"{self.construction}#{binding.model_binding_path}"
         started = time.perf_counter()
         # THE SEGMENT LEDGER (cr-102). A `prepare` that reports one total and one fill leg

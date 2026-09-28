@@ -184,17 +184,23 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     authorized_device_limit_bytes: int | UnsetType = UNSET
     sequence_parallel_degree: int = 1
     attention_pin: str = ""
-    binding: Binding = Binding()
-    budgets: Budgets = Budgets()
+    #: The one-model form. Executors before the typed commands index both keys directly, so a
+    #: worker always writes them for one model; a many-model load writes neither.
+    binding: Binding | UnsetType = UNSET
+    budgets: Budgets | UnsetType = UNSET
     models: tuple[ModelLoad, ...] | UnsetType = UNSET
     #: A follower's half: rank 0's hardware plan and, in a many-model load, which model.
     group: GroupHardware | UnsetType = UNSET
     model_key: str | UnsetType = UNSET
 
+    def single(self) -> ModelLoad:
+        return ModelLoad(
+            binding=Binding() if isinstance(self.binding, UnsetType) else self.binding,
+            budgets=Budgets() if isinstance(self.budgets, UnsetType) else self.budgets,
+        )
+
     def rows(self) -> tuple[ModelLoad, ...]:
-        if isinstance(self.models, UnsetType):
-            return (ModelLoad(binding=self.binding, budgets=self.budgets),)
-        return self.models
+        return (self.single(),) if isinstance(self.models, UnsetType) else self.models
 
 
 class InputFile(msgspec.Struct, frozen=True, kw_only=True):

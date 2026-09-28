@@ -333,6 +333,10 @@ def test_a_load_without_an_assigned_ceiling_is_a_worker_defect() -> None:
     )
     assert command.devices == "1" and executor_commands.encode(command)["cmd"] == "load"
     assert command.authorized_device_limit_bytes == 7
+    # Executors before the typed commands index `binding` and `budgets` in a one-model load,
+    # a weightless one included (0.18.70/0.18.71 omitted a default `budgets`).
+    wire = executor_commands.encode(command)
+    assert {"binding", "budgets"} <= set(wire) and "models" not in wire
 
 
 # --------------------------------------------------------------------------- step 3/4
