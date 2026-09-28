@@ -121,7 +121,7 @@ def fill_residency(root: Path, model: ModelCalls) -> None:
     from cozy_runtime.author._loader import census
     from cozy_runtime.internal.encoding import SPEC_PLAIN
     from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, _Holder
-    from cozy_runtime.internal.residency import ComponentResidency
+    from cozy_runtime.internal.memory import ComponentResidency
 
     root.mkdir(parents=True, exist_ok=True)
     store = tensorfs.Store.ensure(str(root / "store"))

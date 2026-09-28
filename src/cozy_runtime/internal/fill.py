@@ -94,7 +94,7 @@ from cozy_runtime.internal.encoding import (
     measure_runtime,
 )
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
-from cozy_runtime.internal.paging import BlockLayout, PageUnit, partition
+from cozy_runtime.internal import memory
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult, observed_capability_records, qualify
 from cozy_runtime.internal.resolution import (
@@ -1302,11 +1302,13 @@ class StreamingFillBackend:
         #: not a measurement: construction must be reproducible, and the attempt-time ladder
         #: is where measured free VRAM decides things (cr-008b).
         self.resident_budget = 0
-        self.paging: dict[str, BlockLayout] = {}
+        #: every component's block layout, and the components paging through it now
+        self.layouts: dict[str, memory.BlockLayout] = {}
+        self.paging: dict[str, memory.BlockLayout] = {}
         self.paging_hooks: list[Any] = []
         self.paging_specs: dict[str, TensorSpec] = {}
         self.paging_plans: dict[str, ReadPlan] = {}
-        self.page_resident: dict[str, PageUnit] = {}
+        self.page_resident: dict[str, memory.PageUnit] = {}
         self.stats: FillStats = {"windows": 0, "waits": 0}
         #: Why this generation was poisoned and what the allocator held at that instant.
         #: Empty until a failure lands; the refusal reply carries it as evidence. Nothing
@@ -1673,34 +1675,35 @@ class StreamingFillBackend:
                 if member is None or not hasattr(member, "to_empty"):
                     continue
                 size = sum(t.numel() * t.element_size() for _, t in _tensors(member))
-                memory = self.component_memory[name] = (
+                sized = self.component_memory[name] = (
                     _component_memory(header_memory[name])
                     if name in header_memory
                     else ComponentMemory()
                 )
-                memory.destinations = size
+                sized.destinations = size
                 # Captured BEFORE the park decision: a parked component is staged in later
                 # and its derived tables have to survive to be restored, which they cannot
                 # if the capture happens only on the resident branch.
                 derived = self.derived[name] = _derived_values(member)
-                if (
-                    self.resident_budget
-                    and size > self.resident_budget
-                    and not any(
-                        key.startswith(f"{name}.") and resolution.route != "verbatim"
-                        for key, resolution in self.resolved.items()
-                    )
+                oversized = bool(self.resident_budget) and size > self.resident_budget
+                if not any(
+                    key.startswith(f"{name}.") and resolution.route != "verbatim"
+                    for key, resolution in self.resolved.items()
                 ):
                     try:
-                        layout = partition(member)
+                        layout = memory.partition(member)
                     except ValueError as exc:
-                        raise _refuse(
-                            "leaf_schema", f"{name}: unsafe paging layout: {exc}", [name]
-                        ) from exc
+                        if oversized:
+                            raise _refuse(
+                                "leaf_schema", f"{name}: unsafe paging layout: {exc}", [name]
+                            ) from exc
+                        layout = None
                     if layout is not None:
-                        self.paging[name] = layout
-                        self.hold_lease = True
-                if self.resident_budget and held + memory.base > self.resident_budget:
+                        self.layouts[name] = layout
+                        if oversized:
+                            self.paging[name] = layout
+                            self.hold_lease = True
+                if self.resident_budget and held + sized.base > self.resident_budget:
                     # PARKED, not dropped. Its tensor schema is built and its destinations are
                     # known; what it does not have is device bytes, and `stage()` supplies
                     # those on first declared use. A construction that silently skipped it
@@ -1708,7 +1711,7 @@ class StreamingFillBackend:
                     self.parked[name] = member
                     self.stage_log.append({"component": name, "action": "park", "bytes": size})
                     continue
-                held += memory.base
+                held += sized.base
                 want = size
                 self.vram_charge[name] = want
                 # A `to_empty` that runs out of device memory halfway leaves the half it
@@ -1788,7 +1791,7 @@ class StreamingFillBackend:
 
     @property
     def component_bytes(self) -> dict[str, int]:
-        return {name: memory.settled for name, memory in self.component_memory.items()}
+        return {name: sized.settled for name, sized in self.component_memory.items()}
 
     def stage_bytes(self, name: str, headroom: int = 0) -> int:
         if name in self.paging:
@@ -2162,7 +2165,7 @@ class StreamingFillBackend:
                 )
             if name not in self.components:
                 return 0
-            self._park_page(self.paging[name].common)
+            self._park_page(name, self.paging[name].common)
             self.parked[name] = self.components.pop(name)
             return self.vram_charge.pop(name, 0)
         member = self.components.pop(name, None)
@@ -2212,14 +2215,13 @@ class StreamingFillBackend:
             )
         if name in self.paging:
             common = self.paging[name].common
-            self.parked.pop(name)
+            self.components[name] = self.parked.pop(name)
             self._fill_page(name, common)
-            self.components[name] = member
             self.vram_charge[name] = common.nbytes
             return None
         started = time.perf_counter_ns()
-        memory = self.component_memory[name]
-        want = memory.destinations
+        sized = self.component_memory[name]
+        want = sized.destinations
         # NO UNWIND PAST THIS LINE. A stage that fails after reserving, or after the first
         # batch lands, raises; the residency plane poisons the generation and the process
         # is replaced (#613). Freeing the half that arrived would be an in-process rollback
@@ -2277,7 +2279,7 @@ class StreamingFillBackend:
         row: StageRow = {
             "component": name,
             "action": "stage",
-            "bytes": memory.settled,
+            "bytes": sized.settled,
             "ms": took,
             "stream_ms": self.stats.get("stream_ms", 0),
             "reserve_ms": (reserved - started) // 1_000_000,
@@ -2298,22 +2300,20 @@ class StreamingFillBackend:
         del self.stage_log[:-64]
         return row
 
-    def _fill_page(self, name: str, unit: PageUnit) -> None:
+    def _fill_page(self, name: str, unit: memory.PageUnit) -> None:
         """Reserve only this unit, then use the ordinary validated TensorFS fill transaction."""
         if self.enqueued:
             raise _refuse("incomplete_fill", "another fill is already pending", [name])
+        common = unit is self.paging[name].common
         with placing():
-            owners = {id(module) for _, module in unit.owners}
-            for _, module in unit.owners:
-                module.to_empty(device=self.device, recurse=False)
-            _restore_derived(
-                self.components.get(name),
-                {
-                    key: value
-                    for key, value in self.derived.get(name, {}).items()
-                    if id(key[0]) in owners
-                },
-            )
+            self._place(unit, self.device)
+            if common:
+                root = self.components.get(name) or self.parked[name]
+                for module, local in _derived_sites(root):
+                    module._buffers[local] = self.torch.empty_like(
+                        module._buffers[local], device=self.device
+                    )
+                _restore_derived(root, self.derived.get(name, {}))
             live = unit.live(name)
         expected = {f"{name}.{key}" for key in unit.keys}
         if set(live) != expected or not expected <= self.expected.get(name, frozenset()):
@@ -2327,19 +2327,34 @@ class StreamingFillBackend:
             self._commit_enqueued()
         self.state = "ready"
 
-    def _park_page(self, unit: PageUnit) -> None:
-        with placing():
-            for _, module in unit.owners:
-                self._free_storages(
-                    tensor
-                    for _, tensor in (
-                        *module.named_parameters(recurse=False),
-                        *module.named_buffers(recurse=False),
-                    )
+    def _place(self, unit: memory.PageUnit, device: object) -> None:
+        """Give a unit's parameters and buffers empty storage on `device`; the tensors'
+        types and the parameters' gradient flags survive."""
+        torch = self.torch
+        for _, module, attribute in unit.sites:
+            if attribute in module._parameters:
+                current = module._parameters[attribute]
+                module._parameters[attribute] = torch.nn.Parameter(
+                    torch.empty_like(current, device=device), requires_grad=current.requires_grad
                 )
-                module.to_empty(device=self.torch.device("meta"), recurse=False)
+            else:
+                module._buffers[attribute] = torch.empty_like(
+                    module._buffers[attribute], device=device
+                )
 
-    def stage_page(self, name: str, unit: PageUnit) -> None:
+    def _park_page(self, name: str, unit: memory.PageUnit) -> None:
+        with placing():
+            self._free_storages(getattr(module, attribute) for _, module, attribute in unit.sites)
+            self._place(unit, self.torch.device("meta"))
+            if name in self.paging and unit is self.paging[name].common:
+                root = self.components.get(name) or self.parked.get(name)
+                for module, local in _derived_sites(root):
+                    self._free_storages((module._buffers[local],))
+                    module._buffers[local] = self.torch.empty_like(
+                        module._buffers[local], device="meta"
+                    )
+
+    def stage_page(self, name: str, unit: memory.PageUnit) -> None:
         if name not in self.components or name in self.page_resident:
             raise _refuse(
                 "leaf_schema", "paging requires one admitted component and no live block", [name]
@@ -2348,12 +2363,42 @@ class StreamingFillBackend:
         self.page_resident[name] = unit
         self.vram_charge[name] += unit.nbytes
 
-    def evict_page(self, name: str, unit: PageUnit) -> None:
+    def evict_page(self, name: str, unit: memory.PageUnit) -> None:
         if self.page_resident.get(name) is not unit:
             raise _refuse("leaf_schema", "paging eviction does not name the live block", [name])
-        self._park_page(unit)
+        self._park_page(name, unit)
         self.page_resident.pop(name)
         self.vram_charge[name] -= unit.nbytes
+
+    def abandon_page(self, name: str, unit: memory.PageUnit) -> None:
+        """A block whose fill or forward failed leaves; the component stays admitted."""
+        self.enqueued.clear()
+        self.leaf_sites.clear()
+        self.state = "ready"
+        if self.page_resident.get(name) is unit:
+            self.page_resident.pop(name)
+            self.vram_charge[name] -= unit.nbytes
+        with placing():
+            self._free_storages(getattr(module, attribute) for _, module, attribute in unit.sites)
+            self._place(unit, self.torch.device("meta"))
+
+    def abandon(self, name: str) -> None:
+        """A stage that ran out of memory: whatever arrived leaves and the component is
+        parked, schema intact, ready to stage again."""
+        self.enqueued.clear()
+        self.leaf_sites.clear()
+        self.state = "ready"
+        live = self.page_resident.pop(name, None)
+        if live is not None:
+            self.abandon_page(name, live)
+        if name in self.components:
+            self.evict(name)
+        member = self.parked.get(name)
+        if member is not None:
+            with placing():
+                self._free_storages(t for _, t in _tensors(member))
+                member.to_empty(device=self.torch.device("meta"), recurse=True)
+        self.vram_charge.pop(name, None)
 
     def poison(self, keys: Sequence[str]) -> None:
         """Abort the new generation: mark it poisoned and free NOTHING (#613).
@@ -2875,6 +2920,16 @@ def _derived_values(root: Any) -> dict[tuple[Any, str], Any]:
             if value is not None and str(value.device) != "meta":
                 held[(sub, local)] = value.detach().clone()
     return held
+
+
+def _derived_sites(root: Any) -> list[tuple[Any, str]]:
+    """Every non-persistent buffer: derived from config, never read from a checkpoint."""
+    return [
+        (module, local)
+        for _, module in root.named_modules()
+        for local in getattr(module, "_non_persistent_buffers_set", ())
+        if module._buffers.get(local) is not None
+    ]
 
 
 def _restore_derived(root: Any, held: Mapping[tuple[Any, str], Any]) -> int:

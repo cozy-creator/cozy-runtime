@@ -130,6 +130,8 @@ class WorkerHostConfig:
     """Worker-only Hub capability; never inherited by a job executor."""
     object_storage_hosts: tuple[str, ...] = ()
     layout: host_paths.Layout = field(default_factory=host_paths.Layout)
+    #: GPU index (or "*" for every GPU) -> the device bytes the Runtime may hold there
+    gpu_budget: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +482,7 @@ def read_worker_host_config(
         control_public_key_ed25519_b64url=public_key_text,
         media_token_sha256=tuple(str(item) for item in token_hashes),
         layout=layout,
+        gpu_budget=read_gpu_budget(layout.runtime_settings),
         child_base_env=tuple(
             sorted(
                 (name, value) for name, value in env.items() if name in WORKER_CHILD_PLATFORM_ENV
@@ -490,6 +493,74 @@ def read_worker_host_config(
         os.environ.pop("COZY_STORAGE_ADMISSION_FD", None)
     _worker_host_read = True
     return parsed
+
+
+def read_gpu_budget(path: Path) -> dict[str, int]:
+    """`gpu.budget` from the machine's Runtime settings (`etc/cozy/runtime.yaml`, written by
+    the daemon from the owner's `machine.gpu_budget`): one size for every GPU, or sizes by GPU
+    index. Absent: no cap."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    try:
+        gpu = _yaml_map(text).get("gpu", {})
+        budget = gpu.get("budget") if isinstance(gpu, dict) else None
+        if budget is None:
+            return {}
+        if isinstance(budget, dict):
+            return {str(gpu): _size(size) for gpu, size in budget.items()}
+        return {"*": _size(budget)}
+    except (AttributeError, ValueError) as exc:
+        raise ConfigError(
+            "runtime_settings",
+            f"{path}: gpu.budget is not a size or a map of GPU index to size: {exc}",
+            'write e.g. "gpu:\n  budget: 3GiB" or "gpu:\n  budget: {0: 3GiB}"',
+        ) from exc
+
+
+_SIZE_UNITS = {"": 1, "b": 1, "kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30, "tib": 1 << 40}
+
+
+def _size(value: object) -> int:
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([A-Za-z]*)", str(value).strip())
+    if match is None or match.group(2).lower() not in _SIZE_UNITS:
+        raise ValueError(f"{value!r} is not bytes or an IEC size such as 3GiB")
+    size = int(float(match.group(1)) * _SIZE_UNITS[match.group(2).lower()])
+    if size <= 0:
+        raise ValueError(f"{value!r} is not a positive size")
+    return size
+
+
+def _yaml_map(text: str) -> dict[str, object]:
+    """The block-mapping subset of YAML this file uses: `key: value`, nested by indent, with
+    scalar or `{k: v, ...}` values and `#` comments."""
+    root: dict[str, object] = {}
+    stack: list[tuple[int, dict[str, object]]] = [(-1, root)]
+    for raw in text.splitlines():
+        line = raw.split(" #", 1)[0].rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        key, sep, value = line.strip().partition(":")
+        if not sep:
+            raise ValueError(f"{raw!r} is not a key: value line")
+        while stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1]
+        value = value.strip().strip("'\"")
+        if not value:
+            child: dict[str, object] = {}
+            parent[key.strip().strip("'\"")] = child
+            stack.append((indent, child))
+        elif value.startswith("{") and value.endswith("}"):
+            parent[key.strip()] = {
+                k.strip().strip("'\""): v.strip().strip("'\"")
+                for k, _, v in (item.partition(":") for item in value[1:-1].split(",") if item.strip())
+            }
+        else:
+            parent[key.strip().strip("'\"")] = value
+    return root
 
 
 def _machine_publication_authority(path: Path, worker_id: str) -> tuple[str, str]:

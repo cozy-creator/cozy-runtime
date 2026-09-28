@@ -95,6 +95,7 @@ from cozy_runtime.internal.executor_replies import (
     PreparedReply,
     Shortfall,
 )
+from cozy_runtime.internal.memory import CAPACITY_CODES
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, machine_byte_results, observe, refusal, triage
 from cozy_runtime.internal.worker.calls import Calls
@@ -188,12 +189,7 @@ GROUP_FAULT_CODES = frozenset(
     }
 )
 
-#: The device-capacity codes a FAILED attempt can carry (cr-097). Their peak is a
-#: truncated lower bound and may never calibrate; the picture they died under is recorded
-#: instead, as a refusal-grade fact. `device_shortfall` is the runtime's own pre-mutation
-#: refusal and `device_out_of_memory` is the allocator's surprise past it — both say the
-#: same thing about the next attempt under the same picture.
-DEVICE_SHORTFALL_CODES = frozenset({"device_out_of_memory", "device_shortfall"})
+DEVICE_SHORTFALL_CODES = CAPACITY_CODES
 
 _TERMINAL = {
     "succeeded": (STATUS.OUTCOME_STATUS_SUCCEEDED, CAUSE.CAUSE_CODE_UNSPECIFIED),
@@ -323,6 +319,8 @@ class AttemptRecord:
     plan: AttemptPlan | None = None
     #: the memory manager made room for this call's measured need on every device
     room: bool = True
+    #: what the GPU budget leaves the executor to add on its device, or -1 without a budget
+    device_free: int = -1
     declared: DeclaredBinding | None = None
     #: what THIS worker's prepare resolved for that binding — never what it declared
     prepared_model: PreparedModel | None = None
@@ -1858,6 +1856,7 @@ class AttemptEngine:
             headroom_bytes=attempt.plan.headroom_bytes,
             scope_headroom_bytes=dict(attempt.plan.scope_headroom_bytes),
             measured_scopes=tuple(attempt.plan.measured_scopes),
+            device_free_bytes=attempt.device_free,
             # cr-012: the VERIFIED inputs, by their stable identity. Paths into this
             # attempt's own spool and nothing else — no URL, no credential and no fetch
             # reaches the executor. What the executor CAN still do is dial one of its own,

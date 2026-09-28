@@ -29,7 +29,7 @@ from cozy_runtime.author.fakes import fake_telemetry  # noqa: E402
 from cozy_runtime.internal import spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
-from cozy_runtime.internal.residency import ResidencyRefusal  # noqa: E402
+from cozy_runtime.internal.memory import ResidencyRefusal  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.models.minimax_h3.model import condition_references  # noqa: E402
 from cozy_runtime.models.minimax_h3.official import NumericalChecks  # noqa: E402

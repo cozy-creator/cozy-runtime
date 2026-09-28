@@ -92,6 +92,7 @@ from cozy_runtime.internal.executor_commands import (
     Restore,
     Start,
     Unload,
+    Vacate,
 )
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker import (
@@ -154,7 +155,7 @@ from cozy_runtime.internal.worker.lanes import (
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
-from cozy_runtime.internal.worker.memory import MemoryManager
+from cozy_runtime.internal.memory import MemoryManager
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,
@@ -353,6 +354,9 @@ class WorkerOptions:
     reports a typed fault rather than guessing a directory."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
+    #: GPU entry (or "*" for every GPU) -> the device bytes this Runtime may hold there;
+    #: empty: no cap, the budget is what the driver reports free
+    gpu_budget: Mapping[str, int] = field(default_factory=dict)
     threads: int = 4
     claim_ready: bool = True
     """False only for fixed product-host boot until listener/readiness proof commits."""
@@ -933,7 +937,9 @@ class Worker:
         #: resident executor generation — nothing device-scoped lives on the worker any more.
         self.lanes = LaneSet.from_envelope(options.devices, worker_pid=os.getpid())
         #: every device byte of this machine, across every executor, package and rank
-        self.memory = MemoryManager(self.lanes, self.note, self._end_tenant)
+        self.memory = MemoryManager(
+            self.lanes, self.note, self._end_tenant, self._vacate, options.gpu_budget
+        )
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         # Before any executor starts: an older executor reads the image kernel site once.
         self.machine_kernels = machine_kernels.boot(
@@ -5548,7 +5554,7 @@ class Worker:
         """What a load or activation may hold: the whole device. The device lock is the
         reservation (`memory.py`); the executor verifies against its own allocator. A lane
         with an unreadable device refuses typed."""
-        measured = lane.measure(accel.host_backend_family())
+        measured = self.memory.measure(lane)
         unreadable = [
             repr(entry)
             for entry, ordinal in zip(lane.entries, lane.ordinals, strict=True)
@@ -5560,7 +5566,11 @@ class Worker:
                 f"{lane.lane_id}: the driver could not report free bytes for "
                 f"{', '.join(unreadable)} (NVML nvmlDeviceGetMemoryInfo, else nvidia-smi)",
             )
-        lane.row(slot).ledger.observe_devices(lane.device_facts(measured))
+        row = lane.row(slot)
+        row.ledger.observe_devices(lane.device_facts(measured))
+        if self.memory.budget:
+            # Under a budget the tenant may hold what it has plus what the budget leaves.
+            return min(memory.free_bytes + row.held.get(o, 0) for o, memory in measured.items())
         return min(memory.total_bytes for memory in measured.values())
 
     def _load_construction(
@@ -6040,7 +6050,9 @@ class Worker:
         attempt.room = self.memory.admit(lane, tenant, shape, why)
         row = lane.row(tenant)
         self._restore_residency(lane, tenant, row, why)
-        row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
+        measured = self.memory.measure(lane)
+        row.ledger.observe_devices(lane.device_facts(measured))
+        attempt.device_free = self._budget_free(lane, measured)
 
     def _restore_residency(self, lane: DeviceLane, slot: str, row: LaneRow, why: str) -> None:
         """Refill what an eviction took from `slot`, now that room was made for it. What
@@ -6141,13 +6153,34 @@ class Worker:
                 return refuse("no_durable_exchange", "device_room only")
             need = request.free_bytes
             why = f"its executor needs {need} B free"
-            self.memory.make_room(lane, slot, {ordinal: need for ordinal in lane.ordinals}, why)
+            measured = self.memory.make_room(
+                lane, slot, {ordinal: need for ordinal in lane.ordinals}, why
+            )
             try:
-                return Room(ok=True, authorized_device_limit_bytes=self._ceiling(lane, slot))
+                return Room(
+                    ok=True,
+                    authorized_device_limit_bytes=self._ceiling(lane, slot),
+                    free_bytes=self._budget_free(lane, measured),
+                )
             except LaneRefusal as exc:
                 return refuse(exc.code, exc.detail)
 
         return answer
+
+    def _budget_free(self, lane: DeviceLane, measured: Mapping[int, accel.DeviceMemory]) -> int:
+        """What the GPU budget leaves a one-GPU tenant to add, or -1 without a budget."""
+        if not self.memory.budget or lane.group:
+            return -1
+        memory = measured[lane.ordinals[0]]
+        return memory.free_bytes if memory.state == "measured" else -1
+
+    def _vacate(self, executor: child.Executor, ranks: tuple[int, ...]) -> dict[str, object]:
+        """One Vacate round trip; an executor that died answers `executor_gone`."""
+        try:
+            with executor.watched("vacate"):
+                return executor.call(Vacate(ranks=ranks), timeout=None)
+        except ExecutorGone as exc:
+            return {"ok": False, "code": "executor_gone", "detail": str(exc)}
 
     def _end_tenant(self, placement_id: str, executor: child.Executor, why: str) -> bool:
         """End a dead tenant for the memory manager: reclaimed now, so no byte it held is

@@ -18,7 +18,7 @@ from cozy_runtime.author._loader import census
 from cozy_runtime.derive.microscale import encode_fp8_rowwise
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE
 from cozy_runtime.internal.fill import Checkpoint, FillRefusal, StreamingFillBackend, _Holder
-from cozy_runtime.internal.residency import ComponentResidency, ResidencyRefusal
+from cozy_runtime.internal.memory import ComponentResidency, ResidencyRefusal
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 
 

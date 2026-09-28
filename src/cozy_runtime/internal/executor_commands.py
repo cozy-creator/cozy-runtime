@@ -253,6 +253,8 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     placement: str = "all_resident"
     headroom_bytes: int = 0
     scope_headroom_bytes: dict[str, int] = {}
+    #: what the worker's GPU budget leaves this process to add, or -1 without a budget
+    device_free_bytes: int = -1
     measured_scopes: tuple[str, ...] = ()
 
 
