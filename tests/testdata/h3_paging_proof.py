@@ -56,8 +56,7 @@ def main() -> None:
     from cozy_runtime.internal.derive import Observations, serving_substrate
     from cozy_runtime.internal.encoding import SPEC_PLAIN
     from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, _Holder
-    from cozy_runtime.internal.paging import partition
-    from cozy_runtime.internal.residency import ComponentResidency, ResidencyRefusal
+    from cozy_runtime.internal.memory import ComponentResidency, ResidencyRefusal, partition
 
     sections = parse_production_config(
         (

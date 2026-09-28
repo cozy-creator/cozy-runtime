@@ -21,7 +21,7 @@ import pytest
 
 from cozy_runtime.internal import accel, proctree
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
-from cozy_runtime.internal.worker.memory import Watch
+from cozy_runtime.internal.memory import Watch
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
 from test_gpu_scheduler import Machine
@@ -199,7 +199,7 @@ def test_a_calls_peak_is_what_the_driver_saw_and_a_device_failure_forgets_it(
 
 
 def test_an_unmeasured_shape_is_bounded_only_by_a_larger_measured_one() -> None:
-    from cozy_runtime.internal.worker.memory import bound
+    from cozy_runtime.internal.memory import bound
 
     peaks = {("s", "frames=242,width=512"): {0: 30}, ("s", "frames=362,width=768"): {0: 50}}
     assert bound(("s", "frames=121,width=512"), peaks) == {0: 30}

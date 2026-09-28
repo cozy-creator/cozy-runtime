@@ -37,6 +37,11 @@ class Layout:
         return self.tensorfs or self._at("var/lib/tensorfs")
 
     @property
+    def runtime_settings(self) -> Path:
+        """The Runtime's machine settings (`gpu.budget`), written by the daemon."""
+        return self._at("etc/cozy/runtime.yaml")
+
+    @property
     def boot_data(self) -> Path:
         return self._at("var/lib/cozy/boot")
 

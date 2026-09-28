@@ -148,7 +148,9 @@ from cozy_runtime.internal.parallel.plan import (
     GroupRefusal,
     rank_invariant_digest,
 )
-from cozy_runtime.internal.residency import (
+from cozy_runtime.internal.memory import (
+    CAPACITY_CODES,
+    ComponentResidency,
     Construction,
     ConstructionArbiter,
     ResidencyRefusal,
@@ -349,6 +351,10 @@ class _CompositeResidency:
     def poisoned(self) -> str:
         return next((str(row.poisoned) for row in self.rows.values() if row.poisoned), "")
 
+    def set_limit(self, limit: int) -> None:
+        for row in self.rows.values():
+            row.set_limit(limit)
+
     @property
     def last_shortfall(self) -> Any:
         return next(
@@ -538,7 +544,7 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.planfacts",
     "cozy_runtime.internal.warm",
     "cozy_runtime.internal.probe",
-    "cozy_runtime.internal.residency",
+    "cozy_runtime.internal.memory",
     "cozy_runtime.internal.resolution",
 )
 
@@ -1696,6 +1702,20 @@ class Executor:
         answer = host._durable(DeviceRoom(free_bytes=need - slack), Room)
         if answer.ok and not isinstance(answer.authorized_device_limit_bytes, UnsetType):
             host.authorized = answer.authorized_device_limit_bytes
+        if answer.ok and not isinstance(answer.free_bytes, UnsetType):
+            host._cap(answer.free_bytes)
+
+    def _cap(self, free_bytes: int) -> None:
+        """The worker's budget: what this process may add to what it reserves now (-1: no
+        budget). One allocator per process, so every construction's plane hears it."""
+        if self.torch is None:
+            return
+        limit = int(self.torch.cuda.memory_reserved()) + free_bytes if free_bytes >= 0 else 0
+        host = self.host
+        planes = [row.residency for row in host.arbiter.rows.values()] or [self.residency]
+        for plane in planes:
+            if plane is not None:
+                plane.set_limit(limit)
 
     def _synchronize(self) -> None:
         if self.torch is not None:
@@ -2036,7 +2056,6 @@ class Executor:
         from cozy_runtime.internal.fusion_install import FusionRefusal, apply_fusion_plan
         from cozy_runtime.internal.planfacts import PlanFacts
         from cozy_runtime.internal.probe import qualified
-        from cozy_runtime.internal.residency import ComponentResidency
         from cozy_runtime.internal.resolution import (
             ConstructionFacts,
             PlanRefusal,
@@ -2577,8 +2596,13 @@ class Executor:
         # generation. From here on, entering a declared scope admits and materializes its
         # set before the body runs; the package cannot observe that it happened.
         self.residency = ComponentResidency(
-            backend=backend, torch=torch, placement="all_resident", room=self._room
+            backend=backend,
+            torch=torch,
+            placement="all_resident",
+            room=self._room,
+            recoverable=self.world == 1,
         )
+        self.residency.set_limit(host.authorized)
         object.__setattr__(model, "_cozy_residency", self.residency)
         record = registry.generations()[0].record
         # THE CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
@@ -3301,6 +3325,7 @@ class Executor:
                 command.scope_headroom_bytes,
                 command.measured_scopes,
             )
+            self._cap(command.device_free_bytes)
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
@@ -3424,7 +3449,12 @@ class Executor:
         # Only a failure inside the handler leaves package state unknown. A request refusal,
         # a cooperative cancel/deadline or a failed package call stops at a safe point and
         # keeps the generation Ready.
-        if outcome.terminal == "failed" and record.entered and not record.failed_at_call:
+        if (
+            outcome.terminal == "failed"
+            and record.entered
+            and not record.failed_at_call
+            and outcome.code not in CAPACITY_CODES
+        ):
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         terminal = {
             "terminal": outcome.terminal,
@@ -3993,7 +4023,12 @@ class Executor:
             peak_vram = accel.peak_allocated(self.torch, self.device_kind)
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        if outcome.terminal == "failed" and record.entered and not record.failed_at_call:
+        if (
+            outcome.terminal == "failed"
+            and record.entered
+            and not record.failed_at_call
+            and outcome.code not in CAPACITY_CODES
+        ):
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         return {
             "ok": True,

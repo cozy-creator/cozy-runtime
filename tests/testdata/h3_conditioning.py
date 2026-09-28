@@ -37,7 +37,7 @@ from cozy_runtime.author._decode import DecodedAudio  # noqa: E402
 from cozy_runtime.internal import accel  # noqa: E402
 from cozy_runtime.internal.executor import Executor, _capture_seal  # noqa: E402
 from cozy_runtime.internal.executor_commands import decode  # noqa: E402
-from cozy_runtime.internal.residency import ComponentResidency  # noqa: E402
+from cozy_runtime.internal.memory import ComponentResidency  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.models.minimax_h3 import official  # noqa: E402
 from cozy_runtime.models.minimax_h3.conditioner import (  # noqa: E402

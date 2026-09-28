@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from cozy_runtime.internal.paging import partition
+from cozy_runtime.internal.memory import partition
 from cozy_runtime.internal.worker.lanes import LaneSet
 from cozy_runtime.internal.worker.plan import DeclaredBinding, PreparedModel, PreparedRequest
 

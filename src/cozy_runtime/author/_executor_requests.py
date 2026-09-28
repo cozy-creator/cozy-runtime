@@ -174,6 +174,8 @@ class Handoff(Answer, frozen=True, kw_only=True):
 
 class Room(Answer, frozen=True, kw_only=True):
     authorized_device_limit_bytes: int | UnsetType = UNSET
+    #: what the GPU budget leaves the process to add, or -1 without a budget
+    free_bytes: int | UnsetType = UNSET
 
 
 class CheckpointReceipt(Answer, frozen=True, kw_only=True):

@@ -18,7 +18,7 @@ import pytest
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.executor_replies import Metrics
 from cozy_runtime.internal.fill import StreamingFillBackend
-from cozy_runtime.internal.residency import ComponentResidency
+from cozy_runtime.internal.memory import ComponentResidency
 from cozy_runtime.internal.worker.ledger import Ledger
 
 #: rank 0 of 4xH100 in run 1268: allocatable + allocated at close, and the turbo LoRA's
@@ -81,6 +81,7 @@ class Backend:
     vram_charge: dict[str, int] = field(default_factory=dict)
     component_bytes: dict[str, int] = field(default_factory=lambda: dict(SIZES))
     paging: dict[str, Any] = field(default_factory=dict)
+    layouts: dict[str, Any] = field(default_factory=dict)
     paging_hooks: list[Any] = field(default_factory=list)
     stage_log: list[dict[str, Any]] = field(default_factory=list)
     plan: dict[str, Any] = field(default_factory=dict)
@@ -125,8 +126,13 @@ def plane(device: Device, resident: tuple[str, ...]) -> tuple[ComponentResidency
     for name in resident:
         backend.stage(name)
     backend.staged.clear()
+    # Rank 0 of a group: a sharded forward cannot run again alone, so an unmeasured scope
+    # still frees everything else before it runs.
     residency = ComponentResidency(
-        backend=cast(StreamingFillBackend, backend), torch=None, placement="component_staged"
+        backend=cast(StreamingFillBackend, backend),
+        torch=None,
+        placement="component_staged",
+        recoverable=False,
     )
     return residency, backend
 

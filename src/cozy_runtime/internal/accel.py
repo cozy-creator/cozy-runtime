@@ -180,6 +180,16 @@ def _nvml_device_compute_table(
     return table
 
 
+def device_processes(device: str) -> dict[int, int] | None:
+    """One device's compute processes: pid -> used bytes (-1 unaccounted); None when the
+    driver will not say. Pids are the driver's, which in a PID namespace are the host's."""
+    library = _nvml_library()
+    handle = _nvml_handle(library, device) if library is not None else None
+    if library is None or handle is None:
+        return None
+    return _nvml_device_compute_table(library, handle)
+
+
 def _nvml_compute_table() -> dict[int, int] | None:
     """Every compute process on every device: pid -> used bytes (-1 when the driver does
     not account it). None when NVML is unavailable, so the caller falls back."""
