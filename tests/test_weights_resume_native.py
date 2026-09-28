@@ -16,7 +16,7 @@ from cozy_runtime.author import WeightsReceipt
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal.hostfacts import HostFacts
 from cozy_runtime.internal.numerical_environment import fingerprint
-from cozy_runtime.internal.weights_sink import receipt_from_native, work_fingerprint
+from cozy_runtime.internal.weights_sink import receipt_from_native, same_receipt, work_fingerprint
 from native_weights import NativeExecution
 
 
@@ -59,7 +59,7 @@ def test_pending_and_adopted_results_replay_but_disposed_metadata_refuses(tmp_pa
     store.derived_dispose(receipt.weights_transaction_id)
     retained_metadata = store.derived_lookup(receipt.weights_transaction_id)
     assert retained_metadata["state"] == "committed"
-    assert retained_metadata["receipt"] == json.loads(receipt.tensorfs_receipt)
+    assert same_receipt(retained_metadata["receipt"], json.loads(receipt.tensorfs_receipt))
     with pytest.raises(CapabilityError) as error:
         host.client.open_output("result", request)
     assert error.value.code == "weights_transaction_abandoned"

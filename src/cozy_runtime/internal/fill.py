@@ -333,6 +333,11 @@ _stores: dict[tuple[int, str], Any] = {}
 _stores_lock = threading.Lock()
 
 
+#: Native receipts name their declaration by digest: a whole-model declaration grows with
+#: its tensors, and a receipt carrying it would outgrow every control-frame bound.
+RECEIPTS = "digest"
+
+
 def store(root: str | Path) -> Any:
     """The process's ONE TensorFS Store handle for `root`.
 
@@ -344,7 +349,7 @@ def store(root: str | Path) -> Any:
     with _stores_lock:
         held = _stores.get(key)
         if held is None:
-            held = _stores[key] = tensorfs_module().Store.open(key[1])
+            held = _stores[key] = tensorfs_module().Store.open(key[1], receipts=RECEIPTS)
         return held
 
 
@@ -352,7 +357,7 @@ def ensure_store(root: str | Path) -> Any:
     """`store(root)`, first creating the Store when its catalog is absent."""
     path = os.path.abspath(root)
     if not os.path.isfile(os.path.join(path, "tensorfs.sqlite")):
-        created = tensorfs_module().Store.ensure(path)
+        created = tensorfs_module().Store.ensure(path, receipts=RECEIPTS)
         with _stores_lock:
             _stores[(os.getpid(), path)] = created
         return created

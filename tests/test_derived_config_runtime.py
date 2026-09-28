@@ -83,7 +83,8 @@ def test_add_and_derive_configs_land_as_inline_jcs(tmp_path: Path) -> None:
             transaction.add_config("derived", derived_stream)
             transaction.add_part("unet", "bias", "value", struct.pack("<2f", 1.0, 2.0))
             facts = transaction.commit()
-    assert facts["declaration"]["configs"] == {
+        declared = owner.declaration(facts)
+    assert declared["configs"] == {
         "added": {"kind": "add"},
         "copied": {"kind": "copy", "source": "source", "source_config": "unet"},
         "derived": {"kind": "derive", "source": "source", "source_config": "unet"},

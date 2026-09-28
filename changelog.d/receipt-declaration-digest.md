@@ -1,0 +1,1 @@
+Native TensorFS receipts name their declaration by digest (TensorFS 0.3.69 `receipts="digest"`), so a whole-model receipt stays a few KiB instead of carrying a 1 MB+ declaration past every receipt bound. Every comparison of a live receipt with a recorded one accepts either form, so receipts journaled by an older Runtime keep replaying, retaining and finalizing after an upgrade.

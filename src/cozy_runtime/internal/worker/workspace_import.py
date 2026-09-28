@@ -12,7 +12,7 @@ from functools import partial
 from typing import Any, NoReturn, cast
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import fill, weights_sink
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -515,9 +515,11 @@ def _native(workspace: Workspace, kind: str, row: dict[str, Any]) -> dict[str, A
                 _refuse("native writer advanced beyond frozen Host epoch")
             store.derived_fence(transaction, writer)
         if row["state"] == "intent":
-            if state == "committed" and canonical_json.encode(
-                found["receipt"]["declaration"]
-            ) != _bytes(row["declaration_canonical_bytes"]):
+            if (
+                state == "committed"
+                and weights_sink.declaration_digest(found["receipt"])
+                != hashlib.sha256(_bytes(row["declaration_canonical_bytes"])).digest()
+            ):
                 _refuse("committed native declaration differs from frozen writer intent")
             for name in ("restore_checkpoint", "checkpoint"):
                 if data := _bytes(row[name]):
@@ -537,12 +539,13 @@ def _native(workspace: Workspace, kind: str, row: dict[str, Any]) -> dict[str, A
             }
         outer = documents.read(_bytes(row["receipt_canonical_bytes"]), pb.WeightsReceipt)
         native = _bytes(outer["tensorfs_receipt_canonical_bytes"])
-        if state != "committed" or canonical_json.encode(found.get("receipt")) != native:
+        if state != "committed" or not weights_sink.same_receipt(
+            found["receipt"], canonical_json.decode(native)
+        ):
             _refuse("recorded weights have no exact native receipt")
         facts = found["receipt"]
-        if canonical_json.encode(facts["declaration"]) != _bytes(
-            row["declaration_canonical_bytes"]
-        ):
+        declared = _bytes(row["declaration_canonical_bytes"])
+        if weights_sink.declaration_digest(facts) != hashlib.sha256(declared).digest():
             _refuse("native declaration differs from frozen writer intent")
         manifest = facts["manifest"]
         if (row["manifest_digest"], row["manifest_length"]) != (
@@ -555,7 +558,7 @@ def _native(workspace: Workspace, kind: str, row: dict[str, Any]) -> dict[str, A
             store.inspect_derived_source(
                 row["manifest_digest"],
                 row["manifest_length"],
-                sorted(facts["declaration"]["components"]),
+                sorted(canonical_json.decode(declared)["components"]),
                 [],
             )
             held = store.acquire_cozytensors(row["manifest_digest"])

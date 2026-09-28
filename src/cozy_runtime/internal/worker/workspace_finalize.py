@@ -72,7 +72,16 @@ def finalize(
         if request.disposition != pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED:
             if observed.get("state") != "committed":
                 raise weights_finalize.FinalizationRefusal("finalization requires a native receipt")
-            weights_finalize._receipt(request, transaction, observed.get("receipt"))
+            weights_finalize._receipt(
+                request,
+                transaction,
+                observed.get("receipt"),
+                db.native(
+                    lambda: weights_finalize.inline_receipt(
+                        request, workspace.store_root, transaction
+                    )
+                ),
+            )
         current_attempts = attempts()
         weights_finalize._authorize(
             request, current_attempts, bool(observed.get("writer_session_id"))

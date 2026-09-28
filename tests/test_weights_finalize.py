@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from threading import Event
@@ -210,13 +211,18 @@ def test_bad_receipt_is_not_journaled_as_an_accepted_decision(tmp_path: Path) ->
 
 def test_commit_first_abandon_uncommitted_returns_the_released_receipt(tmp_path: Path) -> None:
     request, root, store = _committed(tmp_path)
-    receipt_digest = request.weights_receipt_digest
+    committed = store.derived_lookup(_transaction(request))["receipt"]
     request.disposition = pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED
     request.weights_receipt_digest = b""
     request.scratch_root_id = ""
     result = _finish(request, root, [_attempt(request)])
     assert result.outcome == pb.WEIGHTS_FINALIZE_OUTCOME_ABANDONED
-    assert result.weights_receipt.weights_receipt_digest == receipt_digest
+    # With no recorded receipt to match, the worker returns its own custody's form.
+    returned = documents.read(
+        result.weights_receipt.weights_receipt_canonical_bytes, pb.WeightsReceipt
+    )
+    native = json.loads(base64.b64decode(returned["tensorfs_receipt_canonical_bytes"]))
+    assert weights_sink.same_receipt(native, committed)
     with pytest.raises(tensorfs.errors.Refusal):
         store.derived_adopt(_transaction(request), "released-root")
 

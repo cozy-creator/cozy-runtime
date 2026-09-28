@@ -9,7 +9,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from tensorfs.derived import OutputCapability
 
@@ -102,6 +102,13 @@ class NativeExecution:
             self.owner.writer_broker.record_checkpoint = checkpoint
         self.client = ExecutionStorage(self.spool, self.exchange, outputs)
         self.replayed_outputs: set[str] = set()
+
+    def declaration(self, facts: dict[str, Any]) -> dict[str, Any]:
+        """The journaled declaration a native receipt names by digest."""
+        assert self.owner.workspace is not None
+        row = self.owner.workspace.weights_row("package-proof", facts["transaction_id"])
+        assert hashlib.sha256(row["declaration"]).hexdigest() == facts["declaration_digest"][7:]
+        return cast(dict[str, Any], canonical_json.decode(row["declaration"]))
 
     @property
     def checkpointed(self) -> bool:

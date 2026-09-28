@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import fill, proctree
+from cozy_runtime.internal import fill, proctree, weights_sink
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -76,11 +76,17 @@ def native_result(workspace: Workspace, row: dict[str, Any]) -> pb.WeightsReceip
         return None
     native = found["receipt"]
     admitted = canonical_json.decode(row["declaration"])
-    declared = native["declaration"]
-    # Another TensorFS version may add declaration facts; only a changed shared fact counts.
-    if not isinstance(admitted, dict) or any(
-        declared.get(key) != value for key, value in admitted.items() if key in declared
-    ):
+    declared = native.get("declaration")
+    if declared is None:
+        changed = (
+            weights_sink.declaration_digest(native) != hashlib.sha256(row["declaration"]).digest()
+        )
+    else:
+        # Another TensorFS version may add declaration facts; only a changed shared fact counts.
+        changed = not isinstance(admitted, dict) or any(
+            declared.get(key) != value for key, value in admitted.items() if key in declared
+        )
+    if changed:
         raise WorkspaceRefusal("interrupted native result changed its admitted declaration")
     raw = canonical_json.encode(native)
     outer, digest = documents.identity(
@@ -97,7 +103,7 @@ def native_result(workspace: Workspace, row: dict[str, Any]) -> pb.WeightsReceip
     manifest = native["manifest"]
     manifest_id = "sha256:" + manifest["sha256"]
     store.inspect_derived_source(
-        manifest_id, manifest["length"], sorted(native["declaration"]["components"]), []
+        manifest_id, manifest["length"], sorted(admitted["components"]), []
     )
     lease = store.acquire_cozytensors(manifest_id)
     try:

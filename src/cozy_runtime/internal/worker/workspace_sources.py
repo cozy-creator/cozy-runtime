@@ -12,7 +12,7 @@ from functools import partial
 from typing import Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import fill, source_interfaces
+from cozy_runtime.internal import fill, source_interfaces, weights_sink
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.worker import source_upload
 from cozy_runtime.internal.worker.workspace import (
@@ -238,9 +238,8 @@ def record_complete(
                     )
             else:
                 observed = store.derived_lookup(row["native_owner"])
-                if (
-                    observed.get("state") != "committed"
-                    or canonical_json.encode(observed.get("receipt")) != native_receipt
+                if observed.get("state") != "committed" or not weights_sink.same_receipt(
+                    observed["receipt"], canonical_json.decode(native_receipt)
                 ):
                     raise WorkspaceRefusal(
                         "converted model completion lacks its exact native derive receipt"
