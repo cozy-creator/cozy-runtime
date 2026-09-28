@@ -2537,8 +2537,9 @@ class Worker:
                 },
             )
 
-    def _defer_rebuild(self, placement_id: str) -> bool:
-        """A dead GPU replica rebuilds on its next grant, never on devices it no longer holds."""
+    def _defer_rebuild(self, placement_id: str) -> child.Executor | None:
+        """A dead GPU replica rebuilds on its next grant, never on devices it no longer holds.
+        Returns the dead executor to reclaim now, or None when the rebuild is not deferred."""
         placement = self._placement_by_id(placement_id)
         if (
             placement is None
@@ -2549,12 +2550,42 @@ class Worker:
                 for attempt in self.engine.history.values()
             )
         ):
-            return False
+            return None
         hosted = self.hosted.get(placement_id)
-        current = (hosted.supervision if hosted is not None else self.supervision).current
+        supervision = hosted.supervision if hosted is not None else self.supervision
+        # An already reclaimed generation stays deferred: only a grant rebuilds it.
+        current = supervision.current or self._dead_replicas.get(placement_id)
         if current is not None:
             self._dead_replicas[placement_id] = current
-        return current is not None
+        return current
+
+    def _reclaim_dead(self, placement_id: str, dead: child.Executor) -> None:
+        """Kill, reap and prove absent a deferred replica's dead generation NOW, under its
+        lane's device hold: only its successor waits for the next grant. A poisoned process
+        left alive kept 62 GB of a card another tenant was then granted (darkness 1514), and
+        exited ranks stayed unreaped zombies."""
+        hosted = self.hosted.get(placement_id)
+        supervision = hosted.supervision if hosted is not None else self.supervision
+        try:
+            evidence = supervision.retire_current(dead, dead.poisoned or "executor exited")
+        except ExecutorGone as exc:
+            if hosted is not None:
+                hosted.latched = f"executor_reclaim_failed: {exc}"[:200]
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_LOCAL_SAFETY_REFUSAL,
+                    subject=placement_id,
+                    reason="executor_reclaim_failed",
+                    detail=safe(str(exc)),
+                )
+            )
+            return
+        if evidence is not None:
+            self.note(
+                "recovery",
+                f"{placement_id!r}: reclaimed dead executor epoch {dead.epoch} pid {dead.pid} "
+                f"(members {list(evidence.members)}) before its devices return",
+            )
 
     def _revive(self, placement_id: str) -> None:
         """Rebuild a deferred dead replica now that a grant holds its devices, here."""
@@ -6134,12 +6165,13 @@ class Worker:
         cr-022's swap arm, the owner's "one gets to use it first, then the next gets to use
         it for a different request". The tenant's row is refreshed with the driver's free
         bytes as they stand now — the ledger's own number is the executor's last probe,
-        and co-tenants move gigabytes between probes — and the chooser is asked whether any
-        proven rung fits. If none does, co-tenants vacate LRU-first until one does (or
-        nobody holds anything, in which case the chooser refuses or deepens exactly as it
-        would alone). The lane seat is held by this attempt throughout, so no co-tenant
-        is mid-attempt; the device lock is held by this lane thread, so no co-tenant's
-        prepare is either. Both fitting means nothing moves, ever.
+        and co-tenants move gigabytes between probes — and the chooser is asked whether
+        `all_resident` fits. If it does not, idle co-tenants vacate LRU-first until it does
+        (or nobody holds anything, in which case the chooser deepens or refuses exactly as
+        it would alone): the executing tenant never self-stages or runs short beside an
+        idle one (darkness 1513/1514). The lane seat is held by this attempt throughout, so
+        no co-tenant is mid-attempt; the device lock is held by this lane thread, so no
+        co-tenant's prepare is either. Both fitting means nothing moves, ever.
         """
         serving = attempt.spec.get("serving")
         if serving is None or self.accepted.mode != "serving":
@@ -6156,7 +6188,7 @@ class Worker:
 
         def fits(memory: accel.DeviceMemory) -> bool:
             row.ledger.observe_device_free(memory.free_bytes, memory.total_bytes)
-            return bool(row.chooser.fits(declared, cell))
+            return row.chooser.fits(declared, cell) == "all_resident"
 
         # FIRST, TAKE BACK WHAT WAS TAKEN (cr-097). A tenant a co-tenant's prepare emptied
         # is priced, otherwise, against a hole nobody put back — which is how a placement
@@ -6351,14 +6383,16 @@ class Worker:
         fits: Callable[[accel.DeviceMemory], bool],
         why: str,
     ) -> None:
-        """RESIDENCY ARBITRATION on a lane's devices: vacate co-tenants of its TIGHTEST
-        device, LRU-first, until `fits`.
+        """RESIDENCY ARBITRATION on a lane's devices: vacate co-tenants, tightest device
+        first and LRU-first on each, until `fits`.
 
         `fits` reads the lane as the driver measures it NOW (cr-066's NVML reading, the
         same meter ceilings are assigned from) and says whether `slot`'s demand holds. It is
         asked before anything moves and again after each vacate. Co-tenants come from every
-        lane over that device (a group's ranks, other singletons), and only from the
-        tightest one: freeing another device cannot raise the lane's MIN. A lane the driver
+        lane over each device (a group's ranks, other singletons), and from EVERY device of
+        the lane once the tighter ones have none left: each rank of a group admits on its
+        own card and a follower cannot ask for room, so an idle neighbour on rank 3's card
+        must go even when rank 0's is the tightest (darkness 1513). A lane the driver
         cannot read is left alone: the prepare or the plan refuses typed on the same fact.
         A victim's process stays — only its residency changes, so its executor epoch and
         its placement's serving state do not move; its next attempt re-stages on demand.
@@ -6372,16 +6406,16 @@ class Worker:
             memory = fold_memory(measured)
             if memory.state != "measured" or fits(memory):
                 return
-            tightest = min(measured, key=lambda ordinal: measured[ordinal].free_bytes)
             found = [
-                (victim, row, residents)
+                (ordinal, victim, row, residents)
+                for ordinal in sorted(measured, key=lambda ordinal: measured[ordinal].free_bytes)
                 for residents in (False, True)
-                for victim, row in self.lanes.victims(lane, slot, tightest)
+                for victim, row in self.lanes.victims(lane, slot, ordinal)
                 if (victim, residents) not in tried and (not residents or row.resident_bytes())
             ]
             if not found:
                 break
-            victim, row, residents = found[0]
+            device, victim, row, residents = found[0]
             tried.add((victim, residents))
             executor = row.executor()
             if executor is None:
@@ -6392,8 +6426,8 @@ class Worker:
                 "residency",
                 f"{lane.lane_id}: {victim!r} (epoch {executor.epoch} pid {executor.pid}) "
                 f"{moved} for {slot!r} on {why}; the driver reports "
-                f"{measured[tightest].free_bytes} -> {lane.measure(kind)[tightest].free_bytes} "
-                f"B free on device {tightest}",
+                f"{measured[device].free_bytes} -> {lane.measure(kind)[device].free_bytes} "
+                f"B free on device {device}",
             )
         self.note(
             "residency",
@@ -7110,9 +7144,12 @@ class Worker:
             else:
                 current = self.supervision.current
                 rebuild = current is None or not current.alive() or bool(current.poisoned)
-            if not rebuild or self._defer_rebuild(placement_id):
+            if not rebuild:
                 return
-        if hosted is not None:
+            dead = self._defer_rebuild(placement_id)
+        if dead is not None:
+            self._reclaim_dead(placement_id, dead)
+        elif hosted is not None:
             self._prepare_hosted_executor(hosted, fresh=False)
         elif current is None or not current.alive():
             self._rebuild("the executor is gone")
@@ -7122,16 +7159,22 @@ class Worker:
     def rebuild_exited(
         self, executor: child.Executor, placement_id: str = "", *, granted: bool = False
     ) -> None:
-        """Rebuild only if the queued death still names the owned dead epoch."""
+        """Rebuild only if the queued death still names the owned dead epoch, or its grant
+        found that epoch already reclaimed (`_reclaim_dead`)."""
 
         with self.control_lock:
             hosted = self.hosted.get(placement_id)
             supervision = hosted.supervision if hosted is not None else self.supervision
-            if supervision.current is not executor or (executor.alive() and not executor.poisoned):
+            reclaimed = granted and supervision.current is None
+            if not reclaimed and (
+                supervision.current is not executor or (executor.alive() and not executor.poisoned)
+            ):
                 return
             primary = self.placement.placement_id if self.placement is not None else ""
-            if not granted and self._defer_rebuild(placement_id or primary):
-                return
+            dead = None if granted else self._defer_rebuild(placement_id or primary)
+        if dead is not None:
+            self._reclaim_dead(placement_id or primary, dead)
+            return
         if hosted is not None:
             self._prepare_hosted_executor(hosted, fresh=False)
             return

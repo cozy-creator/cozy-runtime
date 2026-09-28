@@ -16,6 +16,9 @@ import base64
 import copy
 import hashlib
 import os
+import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -29,12 +32,12 @@ import pytest
 import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.internal import accel, child_env, package_interface
+from cozy_runtime.internal import accel, child_env, package_interface, proctree
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.worker import lanes, machine_model_defaults
-from cozy_runtime.internal.worker.attempts import AttemptRecord
+from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.gpu_scheduler import (
     Demand,
@@ -899,48 +902,174 @@ def test_consecutive_roots_of_different_widths_reuse_every_warm_executor(
     assert machine.worker.admission_epoch == epoch
 
 
-@needs_executor
-def test_memory_pressure_vacates_idle_co_tenants_and_kills_none(
-    machine: Machine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The arbiter frees the tightest device of the tenant that needs room, LRU-first:
-    only co-tenants on that device are asked, their processes stay, and the caller is
-    never its own victim."""
+def _warm_shot(machine: Machine, monkeypatch: pytest.MonkeyPatch) -> tuple[str, dict[str, str]]:
+    """Darkness 1513's shape: idle Qwen replicas on lanes 0-2 beside a warm 4-rank H3 group,
+    each holding weights. Returns the shot and the placement on each lane."""
     machine.activate_warm(monkeypatch)
     machine.root("A")
     references = [machine.child("A", "qwen") for _ in range(3)]
     machine.tick()
     machine.warm()
-    worker = machine.worker
     for reference in references:
         machine.finish(reference)
     shot = machine.child("A", "h3")
     machine.tick()
-    before = machine.warm()
-    by_lane = {worker._lane_of(p).lane_id: p for p in worker.hosted}
-    h3, q0, q1 = by_lane["lane-0+1+2+3"], by_lane["lane-0"], by_lane["lane-1"]
+    machine.warm()
+    worker = machine.worker
     for placement_id in worker.hosted:
         lane = worker._lane_of(placement_id)
-        lane.row(placement_id).ledger.observe_construction({"resident": {"unet": 20 * GiB}})
+        lane.row(placement_id).ledger.observe_construction(
+            {
+                "resident": {"text_encoder": 10 * GiB, "unet": 10 * GiB},
+                "declared_scopes": {"encode": ["text_encoder"], "denoise": ["unet"]},
+                "allocator_bytes": 20 * GiB,
+                "reserved_bytes": 20 * GiB,
+            }
+        )
         lane.touch(placement_id)
-    worker._lane_of(q0).touch(q0)  # q0 is now the most recently used
+    return shot, {worker._lane_of(p).lane_id: p for p in worker.hosted}
+
+
+@needs_executor
+def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_none(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Darkness 1513: the group's attempt freed only its lead card, and rank 3 refused
+    `device_shortfall` beside an idle Qwen on card 3. A group short of room takes idle
+    co-tenants off EVERY rank's card, tightest first and LRU-first on each; it arbitrates
+    for `all_resident`, never stopping at a staged rung it would fit by evicting itself.
+    Their processes stay, and the caller is never its own victim."""
+    shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    before = machine.executors()
+    h3, q0, q1, q2 = (by_lane[k] for k in ("lane-0+1+2+3", "lane-0", "lane-1", "lane-2"))
+    worker._lane_of(q2).touch(q2)  # q2 is now the most recently used
 
     def vacated() -> list[str]:
-        return [e.step for e in worker.activity if " vacated " in e.step]
+        return [e.step.split("'")[1] for e in worker.activity if " vacated " in e.step]
 
-    # H3 needs room and device 0 is the tight one: only device 0's tenants are asked
-    machine.free["0"] = GiB  # type: ignore[attr-defined]
+    # Card 0 is the tight one. The shot's plan fits staged (it may evict its own weights),
+    # not all-resident, so every rank's idle neighbour goes: card 0's first.
+    machine.free["0"] = GiB // 2  # type: ignore[attr-defined]
+    hosted = worker.hosted[h3]
     group = worker._lane_of(h3)
-    worker._make_room(group, h3, lambda memory: False, "the shot")
-    assert [step.split("'")[1] for step in vacated()] == [q0]
-    # Qwen on device 1 needs room: the idle H3 group is its only co-tenant there
+    row = group.row(h3)
+    digest = next(iter(hosted.bindings))
+    row.ledger.observe_device_free(GiB // 2, 80 * GiB)
+    assert row.chooser.fits(hosted.bindings[digest]) == "component_staged"
+    slot = AttemptSlot(
+        supervision=hosted.supervision,
+        ledger=row.ledger,
+        chooser=row.chooser,
+        bindings=hosted.bindings,
+        failed_bindings={},
+        lane_id=group.lane_id,
+    )
+    attempt = AttemptRecord(
+        shot, 2, b"", {"serving": {"entrypoint_binding_digest": digest}}, placement_id=h3
+    )
+    with group.device:
+        worker._arbitrate_residency(attempt, slot)
+    assert vacated() == [q0, q1, q2]
+    # Qwen on card 1 needs room: the idle H3 group is its only co-tenant there
     machine.free.pop("0")  # type: ignore[attr-defined]
     machine.free["1"] = GiB  # type: ignore[attr-defined]
     worker._make_room(worker._lane_of(q1), q1, lambda memory: False, "a reference")
-    assert [step.split("'")[1] for step in vacated()] == [q0, h3]
+    assert vacated() == [q0, q1, q2, h3]
     assert machine.executors() == before, "vacated, not killed: every process is the same"
     assert all(
         h.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
         for h in worker.hosted.values()
     )
     assert machine.granted(shot) == [0, 1, 2, 3]
+
+
+_RANK = """
+import signal, sys, torch
+from cozy_runtime.internal import proctree
+if sys.argv[1]:
+    proctree.join_executor_cgroup(proctree.CgroupScope(sys.argv[1], int(sys.argv[2])))
+signal.signal(signal.SIGTERM, lambda *_: print("ignored SIGTERM", flush=True))
+held = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+torch.cuda.synchronize()
+print("held", flush=True)
+sys.stdin.read()
+"""
+
+
+def _rank(executor: Any) -> subprocess.Popen[str]:
+    """A follower rank in `executor`'s scope, as the worker's launcher starts one: the
+    worker's own child, holding device memory, ignoring SIGTERM (darkness: every executor
+    rode out SIGTERM for 15 s)."""
+    scope = executor.scope
+    cgroup = isinstance(scope, proctree.CgroupScope)
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
+    if not cgroup:
+        env[child_env.EXECUTOR_SCOPE_ENV] = scope.token
+    rank = subprocess.Popen(
+        [sys.executable, "-c", _RANK]
+        + ([scope.relative_path, str(scope.inode)] if cgroup else ["", ""]),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    assert rank.stdout is not None
+    assert rank.stdout.readline().strip() == "held"
+    rank.send_signal(signal.SIGTERM)
+    assert rank.stdout.readline().strip() == "ignored SIGTERM"
+    return rank
+
+
+def _card_rows(*pids: int) -> dict[int, str]:
+    rows = accel.process_memories_by_device(set(pids), accel.host_backend_family(), ("0",))
+    return {pid: rows["0"][pid].state for pid in pids}
+
+
+@needs_executor
+@pytest.mark.skipif(_card_rows(os.getpid())[os.getpid()] == "unreadable", reason="no card 0")
+def test_a_broken_group_is_reaped_before_its_cards_are_granted_again(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Darkness 1514: the 1513 group failed `group_broken` and was invalidated, but its
+    rank 0 lived on holding 62 GB of card 0 with its ranks unreaped zombies, and the next
+    Qwen call there OOMed. The lane's post-attempt pass, still holding the cards the
+    failed attempt ran on, now kills the whole generation (SIGKILL: it ignores SIGTERM),
+    reaps every process and has the driver agree before the cards go back; only the
+    successor waits for the next grant."""
+    shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    h3 = by_lane["lane-0+1+2+3"]
+    hosted, group = worker.hosted[h3], worker._lane_of(h3)
+    broken = hosted.supervision.current
+    assert broken is not None
+    rank = _rank(broken)
+    assert _card_rows(rank.pid)[rank.pid] == "present"
+    others = {p: e for p, e in machine.executors().items() if p != h3}
+    # The failed handler's reply poisons the generation; run_attempt then rebuilds its
+    # lane under the device hold it took for the attempt.
+    hosted.supervision.invalidate(broken, "failed/group_broken")
+    with group.device:
+        worker._rebuild_lane(group, h3)
+        for pid in (broken.pid, rank.pid):
+            assert not Path(f"/proc/{pid}").exists(), f"pid {pid} is alive or unreaped"
+        assert _card_rows(rank.pid)[rank.pid] == "absent"
+        assert hosted.supervision.current is None
+        assert group.row(h3).resident_bytes() == 0
+    assert worker._dead_replicas[h3] is broken
+    assert {p: e for p, e in machine.executors().items() if p != h3} == others
+    machine.finish(shot, pb.OUTCOME_STATUS_FAILED)
+    machine.finish("A")
+    # The next shot revives the replica on a fresh generation, on its grant.
+    monkeypatch.setattr(
+        Worker,
+        "_prepare_hosted_executor",
+        lambda worker, hosted, fresh=True: machine.start(hosted),
+    )
+    machine.root("B")
+    again = machine.child("B", "h3")
+    machine.tick()
+    assert machine.granted(again) == [0, 1, 2, 3]
+    epoch, pid = machine.executors()[h3]
+    assert epoch > broken.epoch and pid != broken.pid, (epoch, pid)
+    assert h3 not in worker._dead_replicas
