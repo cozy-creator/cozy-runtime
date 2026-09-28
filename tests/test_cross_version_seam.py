@@ -79,7 +79,9 @@ import msgspec
 import tensorfs
 from tensorfs.derived import Config, Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import App, Context, Model, ModelArtifact, WeightsOutput, invocable
+from cozy_runtime.author import (
+    App, Context, Model, ModelArtifact, Telemetry, WeightsOutput, invocable,
+)
 
 app = App()
 PLAIN = dict(tensorfs.seed_digests())["plain/1"]
@@ -100,7 +102,9 @@ class Source(Model[object], encoded_leaves="accept"):
 
 
 @invocable
-async def double(ctx: Context, *, n: int) -> Result:
+async def double(ctx: Context, tel: Telemetry, *, n: int) -> Result:
+    # Older executors forward these fields raw; the worker's lossy lane must not fail on them.
+    tel.log("noisy", loss=float("nan"), seed=2**60)
     return Result(n * 2, cozy_runtime.__version__)
 
 
@@ -519,7 +523,8 @@ def harness(request: pytest.FixtureRequest) -> Iterator[Harness]:
 
 
 def test_serving_invoke(harness: Harness) -> None:
-    """A root inference: `prepare_request`, then `invoke` and its reply."""
+    """A root inference: `prepare_request`, then `invoke` and its reply. Its NaN and 2^60 log
+    fields, which no JSON journal holds exactly, cost only their live frame."""
     assert harness.serve("inference", "double", {"n": 21}) == {
         "value": 42,
         "runtime": harness.version,

@@ -17,10 +17,10 @@ from cozy_runtime.author._observations import MAX_SERIES, Attribution, EventRing
 from cozy_runtime.internal import execution_evidence, executor_replies, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.executor import _SEALED, Executor
+from cozy_runtime.internal.executor import _SEALED, Executor, _send_reply
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
 from cozy_runtime.internal.executor_replies import AttemptReply
-from cozy_runtime.internal.seam import Channel
+from cozy_runtime.internal.seam import MAX_FRAME, Channel
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -29,6 +29,7 @@ MODULE = "execution_evidence_fixture"
 SOURCE = """
 import time
 import msgspec
+import numpy
 from cozy_runtime.author import App, Context, Telemetry
 
 app = App()
@@ -48,6 +49,9 @@ def generate(ctx: Context, payload: Request, tel: Telemetry) -> Result:
         tel.log("evidence row", index=index)
     tel.log("delivery", complete=True, delivered=payload.steps)
     tel.log("unreadable", shape=[1, 2])
+    fields = {f"k{i}": i for i in range(10)}
+    tel.log("m" * 300, seed=2**60, loss=float("nan"), scale=numpy.float32(0.5), **fields)
+    tel.metric("loss", float("inf"))
     with tel.stage("condition"):
         time.sleep(0.01)
     on_step = tel.step_callback(payload.steps, stage="denoise")
@@ -145,13 +149,16 @@ def test_an_attempt_records_its_rank_setup_and_every_step(executor: Executor) ->
     assert sum(ms for _end, ms in denoise["series"]) == pytest.approx(denoise["total_ms"], abs=0.01)
 
 
-def test_a_bool_field_reaches_the_worker_and_an_unreadable_row_costs_only_itself(
+def test_telemetry_of_any_shape_reaches_the_worker_and_never_fails_the_attempt(
     executor: Executor, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Run 1566: one `complete=True` field failed a finished attempt `executor_reply_malformed`.
-    A bool is a scalar end to end; a row the worker cannot read is dropped with one warning,
-    and the attempt's result stands."""
-    reply = executor_replies.decode(_invoke(executor, "scalars"), AttemptReply)
+    A 300-character log message, a 2^60 seed, NaN, a numpy scalar and ten fields each raised
+    into the handler or broke the seam. All arrive bounded, as scalars JSON holds exactly; a
+    row an older executor sends that the worker cannot read costs itself, with one warning."""
+    frame = _invoke(executor, "scalars")
+    frame["observations"].append({"kind": "log", "name": "older", "fields": {"shape": [1, 2]}})
+    reply = executor_replies.decode(frame, AttemptReply)
     assert reply.ok and reply.outcome is not None, reply
     assert reply.outcome.terminal == "succeeded", reply.outcome
     worker = Worker(
@@ -168,9 +175,38 @@ def test_a_bool_field_reaches_the_worker_and_an_unreadable_row_costs_only_itself
     rows = {row["name"]: row for row in attempt.ring.rows()}
     fields: Any = rows["delivery"]["fields"]
     assert fields["complete"] is True and fields["delivered"] == 4
-    assert "unreadable" not in rows and attempt.caps["unreadable_rows"] == 1
+    assert rows["unreadable"]["fields"] == {"shape": "[1, 2]"}
+    (long,) = [row for name, row in rows.items() if str(name).startswith("mmm")]
+    assert len(str(long["name"])) == 200 and "~" in str(long["name"])
+    assert long["fields"] == {
+        "seed": str(2**60), "loss": "nan", "scale": 0.5, "k0": 0, "k1": 1, "k2": 2, "k3": 3, "k4": 4
+    }
+    assert rows["loss"]["value"] == "inf"
+    assert "older" not in rows and attempt.caps["unreadable_rows"] == 1
     (warning,) = [row.getMessage() for row in caplog.records if "cannot read" in row.getMessage()]
-    assert "'unreadable'" in warning and "got `array`" in warning, warning
+    assert "'older'" in warning and "got `array`" in warning, warning
+
+
+def test_a_reply_too_large_for_one_frame_sheds_telemetry_and_keeps_its_result(
+    executor: Executor,
+) -> None:
+    """A reply over one frame looped forever once one observation row was left, and its
+    fallback wrote nulls and `minimal_reply: True` into members the worker typed str/bool/int,
+    so the worker read `executor_reply_malformed` and lost the outcome. Through the real seam,
+    telemetry is shed and the result arrives; an irreducible reply arrives as its own refusal."""
+    reply = _invoke(executor, "oversize")
+    reply["attribution"] = {"padding": "x" * (MAX_FRAME + 1)}
+    irreducible = {**reply, "frames": [{"handle": "x" * (MAX_FRAME + 1)}]}
+    left, right = socket.socketpair()
+    with left, right:
+        _send_reply(Channel(left), reply)
+        kept = executor_replies.decode(Channel(right).recv(), AttemptReply)
+        _send_reply(Channel(left), irreducible)
+        refused = executor_replies.decode(Channel(right).recv(), AttemptReply)
+    assert kept.ok and kept.outcome is not None and kept.outcome.terminal == "succeeded", kept
+    assert kept.observation_caps["dropped_attribution_for_frame"] == 1 and not kept.attribution
+    assert (refused.ok, refused.code) == (False, "reply_too_large"), refused
+    assert refused.observation_caps["minimal_reply"] == 1
 
 
 def test_the_request_pin_is_what_every_rank_reports_as_requested() -> None:

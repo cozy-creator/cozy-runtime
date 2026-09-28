@@ -288,7 +288,10 @@ class Calls:
             ).fetchone()
         if row is None:
             return None
-        event = msgspec.json.decode(row["body"], type=_ProgressEvent)
+        try:
+            event = msgspec.json.decode(row["body"], type=_ProgressEvent)
+        except msgspec.ValidationError:
+            return None  # progress is narration; the child's answer stands without it
         return CallProgress(sequence=row["sequence"], payload=event.payload)
 
     def progress_label(self, parent: str, ordinal: int, index: int) -> str:
