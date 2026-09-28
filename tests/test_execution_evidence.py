@@ -150,7 +150,7 @@ def test_the_request_pin_is_what_every_rank_reports_as_requested() -> None:
     assert execution_evidence.observed(hosts) == "sdpa"
     hosts["base_model/ref2va_dit"] = {"flash-attn3": 50, "sdpa": 2}
     assert execution_evidence.observed(hosts) == "ref2va_dit=flash-attn3+sdpa,video_vae=sdpa"
-    held: dict[int, dict[str, Any]] = {}
+    held: dict[int, execution_evidence.RankEvidence] = {}
     for start, end in ((5, 9), (2, 4), (10, 12)):
         execution_evidence.widen(held, execution_evidence.record(1, {"pid": 7}, start, end))
     assert (held[1]["start_us"], held[1]["end_us"], held[1]["pid"]) == (2, 12, 7)

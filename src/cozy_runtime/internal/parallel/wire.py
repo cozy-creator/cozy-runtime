@@ -15,21 +15,95 @@ import sys
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import msgspec
+
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
+from cozy_runtime.internal import execution_evidence
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 
 _TAG = "__sp__"
-_VAL = "v"
 
 
 class UncrossableArgument(GroupRefusal):
     """A model-call argument outside the wire's value vocabulary."""
 
     default_code = "uncrossable_argument"
+
+
+class _Tensor(msgspec.Struct, frozen=True, tag_field=_TAG, tag="tensor"):
+    """A tensor's bytes in the spool file `v`, with the exact dtype and shape."""
+
+    v: str
+    dtype: str
+    shape: list[int]
+
+
+class _Component(msgspec.Struct, frozen=True, tag_field=_TAG, tag="component"):
+    """A prepared component root, by (model, component)."""
+
+    v: tuple[str, str]
+
+
+class _Tuple(msgspec.Struct, frozen=True, tag_field=_TAG, tag="tuple"):
+    v: list[Json]
+
+
+class _Output(msgspec.Struct, frozen=True, tag_field=_TAG, tag="output"):
+    """A model output (transformers' `ModelOutput`): rebuilt only from a class the
+    receiving rank has already imported."""
+
+    v: dict[str, Json]
+    kind: str = msgspec.field(name="class")
+
+
+_Envelope = _Tensor | _Component | _Tuple | _Output
+
+
+class Scope(msgspec.Struct, frozen=True):
+    """One component scope active on the leader, as a follower re-enters it. The residency
+    facts are present exactly when the leader's model has a residency plane."""
+
+    model: str
+    method: str
+    components: tuple[str, ...]
+    placement: str | msgspec.UnsetType = msgspec.UNSET
+    headroom_bytes: int | msgspec.UnsetType = msgspec.UNSET
+    scope_headroom_bytes: dict[str, int] | msgspec.UnsetType = msgspec.UNSET
+    measured_scopes: list[str] | msgspec.UnsetType = msgspec.UNSET
+
+
+class RunCommand(msgspec.Struct, frozen=True, tag_field="cmd", tag="run"):
+    """One component call as every follower receives it: a sharded forward, a hosted module
+    call (`module`, `results`) or a spread method call (`method`, `p2p`, `spare`)."""
+
+    component: tuple[str, str]
+    spool: str
+    payloads: str
+    scopes: tuple[Scope, ...]
+    grad_enabled: bool
+    inference_mode: bool
+    #: device kind -> autocast dtype name
+    autocast: dict[str, str]
+    #: the leader's closed attention layout, never ambient Python context
+    attention_layout: AttentionLayout | None
+    args: list[Json]
+    kwargs: dict[str, Json]
+    module: str | msgspec.UnsetType = msgspec.UNSET
+    results: str | msgspec.UnsetType = msgspec.UNSET
+    method: str | msgspec.UnsetType = msgspec.UNSET
+    p2p: bool | msgspec.UnsetType = msgspec.UNSET
+    spare: bool | msgspec.UnsetType = msgspec.UNSET
+
+    @classmethod
+    def read(cls, command: Mapping[str, object]) -> RunCommand:
+        try:
+            return msgspec.convert(command, cls)
+        except msgspec.ValidationError as exc:
+            raise UncrossableArgument(f"malformed mirrored call: {exc}") from exc
 
 
 class TensorSpool:
@@ -82,44 +156,33 @@ class TensorSpool:
         self.written = 0
 
 
-def marshal(value: Any, spool: TensorSpool, *, path: str = "") -> Any:
+def marshal(value: object, spool: TensorSpool, *, path: str = "") -> Json:
     """One call argument -> JSON-native tagged data, or refuse by name."""
     import torch
 
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, torch.Tensor):
-        return {
-            _TAG: "tensor",
-            _VAL: spool.write(value),
-            "dtype": str(value.dtype).removeprefix("torch."),
-            "shape": list(value.shape),
-        }
+        dtype = str(value.dtype).removeprefix("torch.")
+        return msgspec.to_builtins(_Tensor(spool.write(value), dtype, list(value.shape)))
     if isinstance(value, torch.nn.Module):
         key = spool.component_names.get(id(value))
         if key is None:
             raise UncrossableArgument(
                 f"{path or 'argument'} is not a prepared component in an active model scope"
             )
-        return {_TAG: "component", _VAL: list(key)}
+        return msgspec.to_builtins(_Component(key))
     if isinstance(value, OrderedDict) and dataclasses.is_dataclass(type(value)):
-        # A model output (transformers' `ModelOutput`): its class crosses by name and is
-        # rebuilt only from a module the receiving rank has already imported.
         kind = type(value)
-        return {
-            _TAG: "output",
-            "class": f"{kind.__module__}:{kind.__qualname__}",
-            _VAL: {k: marshal(v, spool, path=f"{path}.{k}") for k, v in value.items()},
-        }
+        items = {k: marshal(v, spool, path=f"{path}.{k}") for k, v in value.items()}
+        return msgspec.to_builtins(_Output(items, f"{kind.__module__}:{kind.__qualname__}"))
     if isinstance(value, tuple):
-        return {
-            _TAG: "tuple",
-            _VAL: [marshal(v, spool, path=f"{path}[{i}]") for i, v in enumerate(value)],
-        }
+        members = [marshal(v, spool, path=f"{path}[{i}]") for i, v in enumerate(value)]
+        return msgspec.to_builtins(_Tuple(members))
     if isinstance(value, list):
         return [marshal(v, spool, path=f"{path}[{i}]") for i, v in enumerate(value)]
     if isinstance(value, dict):
-        out: dict[str, Any] = {}
+        out: dict[str, Json] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise UncrossableArgument(
@@ -141,48 +204,33 @@ def marshal(value: Any, spool: TensorSpool, *, path: str = "") -> Any:
     )
 
 
-def unmarshal(value: Any, spool: TensorSpool, *, device: Any) -> Any:
+def unmarshal(value: Json, spool: TensorSpool, *, device: Any) -> object:
     """Wire data -> the argument, on THIS rank's device."""
-
-    if isinstance(value, dict):
-        tag = value.get(_TAG)
-        if tag is None:
-            return {k: unmarshal(v, spool, device=device) for k, v in value.items()}
-        payload = value.get(_VAL)
-        if tag == "tensor" and isinstance(payload, str):
-            return spool.read(
-                payload, str(value.get("dtype")), [int(n) for n in value.get("shape") or []], device
-            )
-        if tag == "component":
-            if (
-                set(value) != {_TAG, _VAL}
-                or not isinstance(payload, list)
-                or len(payload) != 2
-                or not all(isinstance(part, str) for part in payload)
-                or (payload[0], payload[1]) not in spool.components
-            ):
-                raise UncrossableArgument("component reference has no prepared active owner")
-            return spool.components[(payload[0], payload[1])]
-        if tag == "tuple" and isinstance(payload, list):
-            return tuple(unmarshal(v, spool, device=device) for v in payload)
-        if tag == "output" and isinstance(payload, dict):
-            module, _, qualname = str(value.get("class", "")).partition(":")
-            kind = getattr(sys.modules.get(module), qualname, None)
-            if not (
-                isinstance(kind, type)
-                and dataclasses.is_dataclass(kind)
-                and issubclass(kind, OrderedDict)
-            ):
-                raise UncrossableArgument(
-                    f"model output class {value.get('class')!r} is not loaded"
-                )
-            return kind(**{k: unmarshal(v, spool, device=device) for k, v in payload.items()})
-        raise UncrossableArgument(
-            f"malformed wire envelope: tag={tag!r} payload={type(payload).__name__}"
-        )
     if isinstance(value, list):
         return [unmarshal(v, spool, device=device) for v in value]
-    return value
+    if not isinstance(value, dict):
+        return value
+    if _TAG not in value:
+        return {k: unmarshal(v, spool, device=device) for k, v in value.items()}
+    try:
+        envelope = msgspec.convert(value, _Envelope)
+    except msgspec.ValidationError as exc:
+        raise UncrossableArgument(f"malformed wire envelope: {exc}") from exc
+    if isinstance(envelope, _Tensor):
+        return spool.read(envelope.v, envelope.dtype, envelope.shape, device)
+    if isinstance(envelope, _Component):
+        if envelope.v not in spool.components:
+            raise UncrossableArgument("component reference has no prepared active owner")
+        return spool.components[envelope.v]
+    if isinstance(envelope, _Tuple):
+        return tuple(unmarshal(v, spool, device=device) for v in envelope.v)
+    module, _, qualname = envelope.kind.partition(":")
+    kind = getattr(sys.modules.get(module), qualname, None)
+    if not (
+        isinstance(kind, type) and dataclasses.is_dataclass(kind) and issubclass(kind, OrderedDict)
+    ):
+        raise UncrossableArgument(f"model output class {envelope.kind!r} is not loaded")
+    return kind(**{k: unmarshal(v, spool, device=device) for k, v in envelope.v.items()})
 
 
 #: dtypes a point-to-point result may carry, by position in its header
@@ -231,51 +279,35 @@ def recv_tensor(src: int, pg: Any, device: Any) -> Any:
     return out
 
 
-def run_command(
-    args: tuple[Any, ...], kwargs: Mapping[str, Any], spool: TensorSpool
-) -> dict[str, Any]:
-    """Marshal one component call as the `run` command every follower receives."""
-    return {
-        "cmd": "run",
-        "attention_layout": asdict(layout) if (layout := _ACTIVE_LAYOUT.get()) else None,
-        "args": [marshal(a, spool, path=f"args[{i}]") for i, a in enumerate(args)],
-        "kwargs": {k: marshal(v, spool, path=k) for k, v in kwargs.items()},
-    }
+class RunReply(msgspec.Struct, frozen=True):
+    """A follower's answer to one `RunCommand`."""
+
+    ok: bool
+    code: str = ""
+    detail: str = ""
+    #: Sol attention calls by kind, on a sharded forward
+    sol_calls: dict[str, int] = {}
+    working_peak_bytes: int = 0
+    evidence: execution_evidence.RankEvidence | None = None
+    #: a hosted call's marshalled result
+    result: Json = None
+    #: why a spread call was declined; "" when it ran
+    declined: str = ""
 
 
 def run_call(
-    command: Mapping[str, Any], spool: TensorSpool, *, device: Any
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """A follower's side of `run_command`."""
-    args = tuple(unmarshal(a, spool, device=device) for a in command.get("args") or [])
-    kwargs = {
-        str(k): unmarshal(v, spool, device=device) for k, v in (command.get("kwargs") or {}).items()
-    }
-    return args, kwargs
+    command: Mapping[str, object], spool: TensorSpool, *, device: Any
+) -> tuple[tuple[object, ...], dict[str, object]]:
+    """A follower's side of a `RunCommand`: its arguments on THIS rank's device."""
+    run = RunCommand.read(command)
+    args = tuple(unmarshal(a, spool, device=device) for a in run.args)
+    return args, {k: unmarshal(v, spool, device=device) for k, v in run.kwargs.items()}
 
 
 @contextmanager
-def attention_context(command: Mapping[str, Any]) -> Iterator[None]:
+def attention_context(command: Mapping[str, object]) -> Iterator[None]:
     """Recreate only the leader's closed attention layout, never ambient Python context."""
-    value = command.get("attention_layout")
-    layout = None
-    if value is not None:
-        if not isinstance(value, dict) or set(value) != {
-            "live_tokens",
-            "protected_prefix",
-            "step",
-            "dense_until_step",
-            "dense_paths",
-        }:
-            raise UncrossableArgument("malformed mirrored attention layout")
-        paths = value["dense_paths"]
-        if not isinstance(paths, (list, tuple)):
-            raise UncrossableArgument("mirrored attention dense_paths must be a sequence")
-        try:
-            layout = AttentionLayout(**{**value, "dense_paths": tuple(paths)})
-        except (TypeError, ValueError) as exc:
-            raise UncrossableArgument(f"malformed mirrored attention layout: {exc}") from exc
-    token = _ACTIVE_LAYOUT.set(layout)
+    token = _ACTIVE_LAYOUT.set(RunCommand.read(command).attention_layout)
     try:
         yield
     finally:

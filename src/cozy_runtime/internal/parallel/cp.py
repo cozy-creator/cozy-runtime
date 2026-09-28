@@ -12,7 +12,7 @@ import contextlib
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 
@@ -82,7 +82,7 @@ class _GroupMesh:
     def _flatten(self) -> _GroupMesh:
         return _GroupMesh(self._pg, self._size, self._local_rank)
 
-    def __getitem__(self, key: Any) -> _GroupMesh:
+    def __getitem__(self, key: str | tuple[str, ...]) -> _GroupMesh:
         if isinstance(key, tuple) or key == "ulysses":
             return _GroupMesh(self._pg, self._size, self._local_rank)
         if key == "ring":
@@ -226,7 +226,7 @@ def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> Non
         comms.device if isinstance(comms.device, torch.device) else torch.device(str(comms.device))
     )
     mesh = _GroupMesh(comms.pg, int(degree), int(comms.rank))
-    config.setup(int(comms.rank), int(degree), device, mesh=cast(Any, mesh))
+    config.setup(int(comms.rank), int(degree), device, mesh=mesh)
     component._parallel_config = config
     for module in attention_root.modules():
         if not isinstance(module, attention_classes):

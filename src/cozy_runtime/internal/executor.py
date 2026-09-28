@@ -1900,7 +1900,12 @@ class Executor:
                     "ok": False,
                     "code": "rank_divergence",
                     "detail": f"rank {self.rank} is sealed to {list(_sealed_entries())} in a "
-                    f"world of {self.world}; rank 0 broadcast {hardware}",
+                    f"world of {self.world}; rank 0 broadcast "
+                    + (
+                        "no hardware plan"
+                        if hardware is UNSET
+                        else f"degree {hardware.degree} over {list(hardware.devices)}"
+                    ),
                     "rank": self.rank,
                 }
         if degree > 1 and command.models is UNSET and not command.binding.model_class:

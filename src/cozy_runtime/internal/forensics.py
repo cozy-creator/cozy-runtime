@@ -108,10 +108,10 @@ class FillForensics:
 
     # ------------------------------------------------------------------ the boundaries
 
-    def mark(self, boundary: str, **fields: Any) -> None:
+    def mark(self, boundary: str, **fields: object) -> None:
         """One boundary: the allocator, the driver, the ledger, and the caller's facts."""
         try:
-            row: dict[str, Any] = {
+            row: dict[str, object] = {
                 "boundary": boundary,
                 "t_ms": int((time.perf_counter() - self.started) * 1000),
             }

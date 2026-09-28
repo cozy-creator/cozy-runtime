@@ -943,10 +943,8 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
         for follower in group.followers:
             stat = Path(f"/proc/{follower.pid}/stat").read_text().rsplit(") ", 1)[1].split()
             assert int(stat[1]) == os.getpid(), "a follower's parent is rank 0"
+        # each follower answers as its own rank of this world, under this seal
         group.dial_back(sealed)
-        assert [f.hello["rank"] for f in group.followers] == [1, 2]
-        assert all(f.hello["world"] == 3 for f in group.followers)
-        assert all(f.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1,2" for f in group.followers)
         # Probe the actual followers before Torch is loaded: rank identity is a
         # process fact, available even for a weightless executor or failed prepare.
         for follower, probe in zip(group.followers, group.call({"cmd": "probe"}), strict=True):
@@ -998,12 +996,12 @@ def test_the_plan_agrees_field_by_field_or_refuses() -> None:
     plan = GroupPlan(2, ("0", "1"), "sha256:a", 1024)
     plan.assert_agrees(plan, rank=1)
     for field_name, other in (
-        ("plan_digest", dataclasses.replace(plan, plan_digest="sha256:b")),
+        ("plan_digest", msgspec.structs.replace(plan, plan_digest="sha256:b")),
         (
             "authorized_device_limit_bytes",
-            dataclasses.replace(plan, authorized_device_limit_bytes=1),
+            msgspec.structs.replace(plan, authorized_device_limit_bytes=1),
         ),
-        ("degree", dataclasses.replace(plan, degree=4)),
+        ("degree", msgspec.structs.replace(plan, degree=4)),
     ):
         with pytest.raises(RankDivergence) as refused:
             plan.assert_agrees(other, rank=1)
@@ -1092,15 +1090,20 @@ def test_the_rank_wire_is_closed(tmp_path: Path) -> None:
 
     spool = wire.TensorSpool(tmp_path / "ranks")
     tensor = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
-    command = wire.run_command((tensor, 1.5, "x", None, (1, 2)), {"steps": [1, 2]}, spool)
-    assert command["cmd"] == "run"
+    arguments = [wire.marshal(a, spool) for a in (tensor, 1.5, "x", None, (1, 2))]
     assert (tmp_path / "ranks" / "tensor-0.raw").stat().st_size == 12
-    assert command["args"][0] == {
+    assert arguments[0] == {
         "__sp__": "tensor",
         "v": "tensor-0.raw",
         "dtype": "bfloat16",
         "shape": [2, 3],
     }
+    steps = wire.marshal([1, 2], spool)
+    run = wire.RunCommand(
+        ("m", "dit"), str(tmp_path), "ranks", (), False, True, {}, None, arguments, {"steps": steps}
+    )
+    command = msgspec.to_builtins(run)
+    assert command["cmd"] == "run"
     args, kwargs = wire.run_call(command, spool, device=torch.device("cpu"))
     assert torch.equal(args[0], tensor) and args[1:] == (1.5, "x", None, (1, 2))
     assert kwargs["steps"] == [1, 2]

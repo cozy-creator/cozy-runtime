@@ -13,7 +13,7 @@ import os
 import socket
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -207,7 +207,7 @@ def test_text_and_reference_conditioning_overlap_across_the_group(
         encoding, calling = threading.Event(), threading.Event()
         call_one = group.call_one
 
-        def hosted(rank: int, command: dict[str, Any]) -> dict[str, Any]:
+        def hosted(rank: int, command: Mapping[str, object]) -> dict[str, Any]:
             assert encoding.wait(60), "the conditioner call ran before any reference encode"
             calling.set()
             return call_one(rank, command)

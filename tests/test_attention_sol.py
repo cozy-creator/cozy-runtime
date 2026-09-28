@@ -8,10 +8,12 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
 from cozy_runtime.internal import attention, attention_sol, attention_ulysses
+from cozy_runtime.internal.parallel import wire
 
 
 def test_layout_is_explicit_immutable_and_nested_scopes_restore() -> None:
@@ -174,29 +176,23 @@ def test_native_sol_preserves_protected_queries_and_input_bytes() -> None:
 
 
 def test_mirrored_attention_layout_is_closed_and_restores_on_failure(tmp_path: Path) -> None:
-    from cozy_runtime.internal.parallel import wire
-
     outer = AttentionLayout(40, 12, 3, 4, ("transformer_blocks.0",))
-    with attention_scope(outer):
-        command = json.loads(json.dumps(wire.run_command((), {}, wire.TensorSpool(tmp_path))))
+    run = wire.RunCommand(("m", "dit"), str(tmp_path), "ranks", (), False, True, {}, outer, [], {})
+    command = json.loads(json.dumps(msgspec.to_builtins(run)))
     assert _ACTIVE_LAYOUT.get() is None
     with pytest.raises(RuntimeError), wire.attention_context(command):
         assert _ACTIVE_LAYOUT.get() == outer
         raise RuntimeError("follower failed")
     assert _ACTIVE_LAYOUT.get() is None
     with attention_scope(outer):
-        with wire.attention_context({"attention_layout": None}):
+        with wire.attention_context({**command, "attention_layout": None}):
             assert _ACTIVE_LAYOUT.get() is None
         assert _ACTIVE_LAYOUT.get() is outer
-    for value in (
-        {},
-        {**command["attention_layout"], "extra": 1},
-        {**command["attention_layout"], "step": True},
-        {**command["attention_layout"], "dense_paths": "blocks.0"},
-    ):
+    layout = command["attention_layout"]
+    for value in ({}, {**layout, "step": True}, {**layout, "dense_paths": "blocks.0"}):
         with (
             pytest.raises(wire.UncrossableArgument),
-            wire.attention_context({"attention_layout": value}),
+            wire.attention_context({**command, "attention_layout": value}),
         ):
             pytest.fail("invalid layout must be refused before executing")
     assert _ACTIVE_LAYOUT.get() is None

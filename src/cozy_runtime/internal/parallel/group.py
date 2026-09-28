@@ -19,9 +19,11 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol, TypedDict
 
-from cozy_runtime.internal import liveness, spawn
+import msgspec
+
+from cozy_runtime.internal import execution_evidence, liveness, spawn
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDivergence
 from cozy_runtime.internal.seam import Channel, SeamError
@@ -57,6 +59,70 @@ class ChildProcess(Protocol):
     def send_signal(self, number: int) -> None: ...
 
 
+class Frame(msgspec.Struct, frozen=True):
+    """What rank 0 reads of every follower frame to route it: a progress event is
+    forwarded, anything else is the reply to the command in flight."""
+
+    event: str = ""
+    name: str = ""
+    reply: str = ""
+    #: None: the frame states no verdict
+    ok: bool | None = None
+    code: str | None = None
+    detail: str = ""
+
+
+class _Hello(msgspec.Struct, frozen=True):
+    """A follower's `hello`, as far as rank 0 checks it: who it is and under which seal."""
+
+    rank: int
+    world: int
+    sealed: dict[str, str]
+
+
+_Bytes = Annotated[int, msgspec.Meta(ge=0)]
+
+
+class _Offer(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_budget"):
+    """A follower's plan and the bytes it needs, for `agree_residence`."""
+
+    rank: int
+    model: str
+    plan: GroupPlan
+    required: _Bytes
+
+
+class _Parking(msgspec.Struct, frozen=True, tag_field="cmd", tag="resident_budget"):
+    """Rank 0's answer to the offers: the constructions every rank parks."""
+
+    model: str
+    park: list[str]
+
+
+class _Measured(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_ceiling"):
+    """A follower's ceiling, measured after it parked."""
+
+    rank: int
+    model: str
+    ceiling: _Bytes
+
+
+class _Ceiling(msgspec.Struct, frozen=True, tag_field="cmd", tag="resident_ceiling"):
+    """The group's ceiling: the smallest any rank measured."""
+
+    model: str
+    ceiling: _Bytes
+
+
+class SpreadLog(TypedDict):
+    """One spread method this attempt: the calls each rank ran, why a rank declined, and
+    whether the spread was optional. Keys are rank numbers as strings: it crosses as JSON."""
+
+    calls: dict[str, int]
+    declined: dict[str, str]
+    spare: bool
+
+
 @dataclass(slots=True)
 class Follower:
     """One follower rank as rank 0 holds it: the process and its command seam."""
@@ -64,8 +130,8 @@ class Follower:
     rank: int
     process: ChildProcess
     channel: Channel
-    hello: dict[str, Any] = field(default_factory=dict)
-    replies: queue.Queue[dict[str, Any] | None] = field(default_factory=queue.Queue)
+    #: routed replies; the body stays a mapping because its readers index it by key
+    replies: queue.Queue[tuple[Frame, dict[str, Any]] | None] = field(default_factory=queue.Queue)
     #: the seam-closed verdict once the reader saw EOF or a torn frame; "" while live
     gone: str = ""
 
@@ -122,12 +188,22 @@ def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     return dist.group.WORLD
 
 
+def _decode[T](
+    frame: Mapping[str, object] | None, kind: type[T], rank: int, field_name: str, what: str
+) -> T:
+    """One residence message, or a divergence naming the rank and the field it broke."""
+    try:
+        return msgspec.convert(frame, kind)
+    except msgspec.ValidationError as exc:
+        raise RankDivergence(rank, field_name, f"{what}: {exc}") from exc
+
+
 def receive_residence(
     channel: Channel,
     *,
     rank: int,
     model: str,
-    plan: dict[str, Any],
+    plan: Mapping[str, object],
     required: int,
     park: Callable[[list[str]], None],
     ceiling: Callable[[], int],
@@ -137,41 +213,20 @@ def receive_residence(
     Offer this rank's plan and need, park what rank 0 parked, offer the ceiling measured
     after that, and accept only a matching, no-larger group ceiling.
     """
-    channel.send(
-        {
-            "reply": "resident_budget",
-            "rank": rank,
-            "model": model,
-            "plan": plan,
-            "required": required,
-        }
-    )
-    decision = channel.recv(timeout=None)
-    parked = (decision or {}).get("park")
-    if (
-        decision is None
-        or set(decision) != {"cmd", "model", "park"}
-        or decision.get("cmd") != "resident_budget"
-        or decision.get("model") != model
-        or not isinstance(parked, list)
-        or not all(isinstance(key, str) for key in parked)
-    ):
-        raise RankDivergence(rank, "parked_constructions", "invalid group parking decision")
-    park(parked)
+    offer = _Offer(rank, model, GroupPlan.read(plan), required)
+    channel.send(msgspec.to_builtins(offer))
+    what = "invalid group parking decision"
+    parking = _decode(channel.recv(timeout=None), _Parking, rank, "parked_constructions", what)
+    if parking.model != model:
+        raise RankDivergence(rank, "parked_constructions", f"{what} for {parking.model!r}")
+    park(parking.park)
     local = ceiling()
-    channel.send({"reply": "resident_ceiling", "rank": rank, "model": model, "ceiling": local})
-    decision = channel.recv(timeout=None)
-    shared = (decision or {}).get("ceiling")
-    if (
-        decision is None
-        or set(decision) != {"cmd", "model", "ceiling"}
-        or decision.get("cmd") != "resident_ceiling"
-        or decision.get("model") != model
-        or type(shared) is not int
-        or not 0 <= shared <= local
-    ):
-        raise RankDivergence(rank, "resident_budget_bytes", "invalid group residence ceiling")
-    return shared
+    channel.send(msgspec.to_builtins(_Measured(rank, model, local)))
+    what = "invalid group residence ceiling"
+    shared = _decode(channel.recv(timeout=None), _Ceiling, rank, "resident_budget_bytes", what)
+    if shared.model != model or shared.ceiling > local:
+        raise RankDivergence(rank, "resident_budget_bytes", what)
+    return shared.ceiling
 
 
 class RankGroup:
@@ -185,7 +240,7 @@ class RankGroup:
         python: str = sys.executable,
         root: str = "",
         sample_seconds: float = liveness.SAMPLE_SECONDS,
-        forward: Callable[[dict[str, Any]], None] | None = None,
+        forward: Callable[[dict[str, object]], None] | None = None,
         launch: Callable[[list[str], int], ChildProcess] | None = None,
     ) -> None:
         if degree < 2:
@@ -211,9 +266,9 @@ class RankGroup:
         #: per follower rank, the largest working peak its mirrored calls reported this attempt
         self.working_peaks: dict[int, int] = {}
         #: per follower rank, its `execution_evidence` record folded over this attempt's calls
-        self.rank_records: dict[int, dict[str, Any]] = {}
-        #: per spread method this attempt, the calls each rank ran and why a rank declined
-        self.spread_log: dict[str, dict[str, Any]] = {}
+        self.rank_records: dict[int, execution_evidence.RankEvidence] = {}
+        #: per spread method this attempt
+        self.spread_log: dict[str, SpreadLog] = {}
         self._readers: list[threading.Thread] = []
         #: Followers with a command in flight. A follower answers one command at a time, so
         #: every caller that sends one holds its rank until the reply is read: calls made
@@ -264,17 +319,22 @@ class RankGroup:
             if frame is None:
                 follower.gone = f"rank {follower.rank} closed its seam"
                 break
-            if frame.get("event") == "progress":
+            try:
+                head = msgspec.convert(frame, Frame)
+            except msgspec.ValidationError as exc:
+                follower.gone = f"rank {follower.rank} sent a malformed frame: {exc}"
+                break
+            if head.event == "progress":
                 if self.forward is not None:
-                    frame = {**frame, "name": f"rank{follower.rank}:{frame.get('name', '')}"}
                     with contextlib.suppress(SeamError):
-                        self.forward(frame)
+                        self.forward({**frame, "name": f"rank{follower.rank}:{head.name}"})
                 continue
-            follower.replies.put(frame)
-            if frame.get("reply") == "run" and not frame.get("ok"):
+            follower.replies.put((head, frame))
+            if head.reply == "run" and not head.ok:
                 self._break(
-                    f"rank {follower.rank} failed its mirrored call: "
-                    f"{frame.get('code')}: {frame.get('detail', '')}"[:600]
+                    f"rank {follower.rank} failed its mirrored call: {head.code}: {head.detail}"[
+                        :600
+                    ]
                 )
         follower.replies.put(None)
         self._break(follower.gone)
@@ -307,14 +367,25 @@ class RankGroup:
             return
 
     def dial_back(self, sealed: Mapping[str, str]) -> None:
-        """Every follower answers `hello` under EXACTLY this rank's seal."""
+        """Every follower answers `hello` as its own rank of this world, under EXACTLY this
+        rank's seal."""
         self.broadcast({"cmd": "hello"})
         for follower, reply in zip(self.followers, self.collect("hello"), strict=True):
-            follower.hello = reply
-            if dict(reply.get("sealed") or {}) != dict(sealed):
+            try:
+                hello = msgspec.convert(reply, _Hello)
+            except msgspec.ValidationError as exc:
+                raise GroupRefusal(
+                    f"rank {follower.rank} answered hello malformed: {exc}", code="group_unformed"
+                ) from exc
+            if (hello.rank, hello.world) != (follower.rank, self.degree):
+                raise GroupRefusal(
+                    f"rank {follower.rank} dialled back as rank {hello.rank} of {hello.world}",
+                    code="group_unformed",
+                )
+            if hello.sealed != dict(sealed):
                 raise GroupRefusal(
                     f"rank {follower.rank} dialled back under a different seal "
-                    f"({reply.get('sealed')!r} vs {dict(sealed)!r})",
+                    f"({hello.sealed!r} vs {dict(sealed)!r})",
                     code="group_unformed",
                 )
 
@@ -345,12 +416,12 @@ class RankGroup:
 
     # ------------------------------------------------------------------ commands
 
-    def broadcast(self, command: dict[str, Any]) -> None:
+    def broadcast(self, command: Mapping[str, object]) -> None:
         """Deliver one command to every follower, or refuse with the group still whole."""
         self.check_alive()
         for follower in self.followers:
             try:
-                follower.channel.send(command)
+                follower.channel.send(dict(command))
             except SeamError as exc:
                 raise GroupRefusal(
                     f"rank {follower.rank} cannot be commanded: {exc}", code="group_broken"
@@ -365,7 +436,7 @@ class RankGroup:
         """
         return [self._reply(follower, name) for follower in self.followers]
 
-    def call_one(self, rank: int, command: dict[str, Any]) -> dict[str, Any]:
+    def call_one(self, rank: int, command: Mapping[str, object]) -> dict[str, Any]:
         """One command to ONE follower and its reply: a hosted component's call."""
         with self.hold((rank,)):
             self.send_one(rank, command)
@@ -405,10 +476,10 @@ class RankGroup:
         with self._leases:
             self._reserved.subtract(ranks)
 
-    def send_one(self, rank: int, command: dict[str, Any]) -> None:
+    def send_one(self, rank: int, command: Mapping[str, object]) -> None:
         self.check_alive()
         try:
-            self.followers[rank - 1].channel.send(command)
+            self.followers[rank - 1].channel.send(dict(command))
         except SeamError as exc:
             raise GroupRefusal(
                 f"rank {rank} cannot be commanded: {exc}", code="group_broken"
@@ -433,23 +504,18 @@ class RankGroup:
                 continue
             if frame is None:
                 raise GroupRefusal(f"{self.verdict()} during {name!r}", code="group_broken")
-            if frame.get("reply") != name:
-                refused = (
-                    f": {frame.get('code')}: {frame.get('detail', '')}"[:600]
-                    if frame.get("ok") is False
-                    else ""
-                )
-                self._break(
-                    f"rank {follower.rank} answered {frame.get('reply')!r} to {name!r}{refused}"
-                )
+            head, body = frame
+            if head.reply != name:
+                refused = f": {head.code}: {head.detail}"[:600] if head.ok is False else ""
+                self._break(f"rank {follower.rank} answered {head.reply!r} to {name!r}{refused}")
                 raise GroupRefusal(self.broken, code="group_broken")
-            return frame
+            return body
 
     def agree_residence(
         self,
         *,
         model: str,
-        plan: dict[str, Any],
+        plan: Mapping[str, object],
         required: int,
         park: Callable[[int], list[str]],
         ceiling: Callable[[], int],
@@ -465,42 +531,32 @@ class RankGroup:
         """
         need = int(required)
         mine = GroupPlan.read(plan)
-        for follower, offer in zip(self.followers, self.collect("resident_budget"), strict=True):
-            offered = offer.get("required")
-            if (
-                set(offer) != {"reply", "rank", "model", "plan", "required"}
-                or offer.get("rank") != follower.rank
-                or offer.get("model") != model
-                or type(offered) is not int
-                or offered < 0
-            ):
+        for follower, reply in zip(self.followers, self.collect("resident_budget"), strict=True):
+            offer = _decode(reply, _Offer, follower.rank, "resident_budget", "invalid rank offer")
+            if (offer.rank, offer.model) != (follower.rank, model):
                 raise RankDivergence(follower.rank, "resident_budget", "invalid rank offer")
-            try:
-                theirs = GroupPlan.read(dict(offer["plan"]))
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RankDivergence(follower.rank, "plan", f"unreadable plan: {exc}") from exc
-            theirs.assert_agrees(mine, rank=follower.rank)
-            need = max(need, offered)
+            offer.plan.assert_agrees(mine, rank=follower.rank)
+            need = max(need, offer.required)
         parked = park(need)
-        self.broadcast({"cmd": "resident_budget", "model": model, "park": parked})
+        self.broadcast(msgspec.to_builtins(_Parking(model, parked)))
         shared = ceiling()
         for follower, reply in zip(self.followers, self.collect("resident_ceiling"), strict=True):
-            offered = reply.get("ceiling")
-            if (
-                set(reply) != {"reply", "rank", "model", "ceiling"}
-                or reply.get("rank") != follower.rank
-                or reply.get("model") != model
-                or type(offered) is not int
-                or offered < 0
-            ):
+            measured = _decode(
+                reply,
+                _Measured,
+                follower.rank,
+                "resident_budget_bytes",
+                "invalid rank residence ceiling",
+            )
+            if (measured.rank, measured.model) != (follower.rank, model):
                 raise RankDivergence(
                     follower.rank, "resident_budget_bytes", "invalid rank residence ceiling"
                 )
-            shared = min(shared, offered)
-        self.broadcast({"cmd": "resident_ceiling", "model": model, "ceiling": shared})
+            shared = min(shared, measured.ceiling)
+        self.broadcast(msgspec.to_builtins(_Ceiling(model, shared)))
         return shared, parked
 
-    def call(self, command: dict[str, Any]) -> list[dict[str, Any]]:
+    def call(self, command: Mapping[str, object]) -> list[dict[str, Any]]:
         self.broadcast(command)
         return self.collect(str(command["cmd"]))
 

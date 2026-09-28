@@ -21,6 +21,7 @@ from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.internal import attention
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor import Executor, _capture_seal
+from cozy_runtime.internal.executor_commands import decode
 from cozy_runtime.internal.parallel.cp import in_gated_call
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.weights_sink import weights_transaction_id
@@ -388,7 +389,7 @@ def main() -> None:
         if name == "shutdown":
             return
         if name == "join":
-            reply = executor.join(command)
+            reply = executor.join(decode(command))
             if args.h3 and reply.get("ok"):
                 refused = executor._install_group(torch, model, HOSTED_CAPACITY)
                 assert refused is None, refused

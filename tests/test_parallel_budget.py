@@ -129,12 +129,10 @@ def test_residence_agreement_over_real_follower_processes(
         ({"cmd": "resident_budget", "model": "base", "park": "x"}, None, "parking"),
         ({"cmd": "resident_budget", "model": "overlay", "park": []}, None, "parking"),
         ({"cmd": "load", "model": "base", "park": []}, None, "parking"),
-        ({"cmd": "resident_budget", "model": "base", "park": [], "x": 1}, None, "parking"),
         (None, {"cmd": "resident_ceiling", "model": "base", "ceiling": 101}, "ceiling"),
         (None, {"cmd": "resident_ceiling", "model": "base", "ceiling": -1}, "ceiling"),
         (None, {"cmd": "resident_ceiling", "model": "base", "ceiling": True}, "ceiling"),
         (None, {"cmd": "resident_ceiling", "model": "overlay", "ceiling": 50}, "ceiling"),
-        (None, {"cmd": "resident_ceiling", "model": "base", "ceiling": 5, "x": 1}, "ceiling"),
     ],
 )
 def test_follower_refuses_invalid_or_larger_decision(

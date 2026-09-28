@@ -28,43 +28,54 @@ of this record is that it does not guess.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Literal
+
+import msgspec
 
 #: `statfs.f_type` values for memory-backed filesystems. A boot record on one of these dies
 #: with the machine event it exists to explain.
 TMPFS_MAGIC = frozenset({0x01021994, 0x858458F6, 0x9041934})  # tmpfs, ramfs, older ramfs
 
-_EVENT_FIELDS = {
-    "boot": {
-        "event",
-        "witness_pid",
-        "child_pid",
-        "argv",
-        "started_unix_ms",
-        "record_filesystem",
-        "cgroup_oom_kill_at_boot",
-    },
-    "death": {
-        "event",
-        "child_pid",
-        "ran_ms",
-        "ended_unix_ms",
-        "how",
-        "exit_code",
-        "signal",
-        "signal_name",
-        "oom_killed",
-        "cgroup_oom_kill_before",
-        "cgroup_oom_kill_after",
-        "method",
-    },
-}
+_METHOD = (
+    "wait status observed by the PARENT, plus the cgroup memory.events oom_kill "
+    "counter read before and after the child's life; an unreadable counter is named "
+    "unreadable and never reported as 'not OOM-killed'"
+)
+
+
+class Boot(msgspec.Struct, frozen=True, tag_field="event", tag="boot"):
+    """Appended before the child starts."""
+
+    witness_pid: int
+    child_pid: int
+    argv: list[str]
+    started_unix_ms: int
+    record_filesystem: str
+    cgroup_oom_kill_at_boot: int
+
+
+class Death(msgspec.Struct, frozen=True, tag_field="event", tag="death"):
+    """How the child died, as seen from outside it."""
+
+    child_pid: int
+    ran_ms: float
+    ended_unix_ms: int
+    how: str
+    exit_code: int
+    signal: int
+    signal_name: str
+    oom_killed: Literal["true", "false", "unreadable"]
+    cgroup_oom_kill_before: int
+    cgroup_oom_kill_after: int
+    method: str = _METHOD
+
+
+Event = Boot | Death
 
 
 class WitnessRefusal(Exception):
@@ -132,10 +143,10 @@ def oom_kills() -> int:
     return -1
 
 
-def _write(path: Path, event: dict[str, Any]) -> None:
+def _write(path: Path, event: Event) -> None:
     """Write and fsync — a witness record that is only in the page cache witnessed nothing."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(event, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    data = msgspec.json.encode(event, order="sorted") + b"\n"
     handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(handle, data)
@@ -144,11 +155,12 @@ def _write(path: Path, event: dict[str, Any]) -> None:
         os.close(handle)
 
 
-def name_death(status: int, before: int, after: int) -> dict[str, Any]:
+def name_death(status: int, before: int, after: int, *, child: int, started: float) -> Death:
     """Turn a wait status into a NAMED death. Tri-state on the OOM question."""
     signalled = os.WIFSIGNALED(status)
     number = os.WTERMSIG(status) if signalled else 0
     code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+    oom: Literal["true", "false", "unreadable"]
     if before < 0 or after < 0:
         oom = "unreadable"
     elif after > before:
@@ -165,20 +177,18 @@ def name_death(status: int, before: int, after: int) -> dict[str, Any]:
         how = "exited_clean"
     else:
         how = f"exited_{code}"
-    return {
-        "how": how,
-        "exit_code": code,
-        "signal": number,
-        "signal_name": signal.Signals(number).name if number else "",
-        "oom_killed": oom,
-        "cgroup_oom_kill_before": before,
-        "cgroup_oom_kill_after": after,
-        "method": (
-            "wait status observed by the PARENT, plus the cgroup memory.events oom_kill "
-            "counter read before and after the child's life; an unreadable counter is named "
-            "unreadable and never reported as 'not OOM-killed'"
-        ),
-    }
+    return Death(
+        child_pid=child,
+        ran_ms=round((time.time() - started) * 1000, 1),
+        ended_unix_ms=int(time.time() * 1000),
+        how=how,
+        exit_code=code,
+        signal=number,
+        signal_name=signal.Signals(number).name if number else "",
+        oom_killed=oom,
+        cgroup_oom_kill_before=before,
+        cgroup_oom_kill_after=after,
+    )
 
 
 def witness(root: Path, argv: list[str]) -> int:
@@ -192,60 +202,39 @@ def witness(root: Path, argv: list[str]) -> int:
         os.setpgid(0, 0)
         os.execv(argv[0], argv)
         os._exit(127)
-    _write(
-        directory / "events.jsonl",
-        {
-            "event": "boot",
-            "witness_pid": os.getpid(),
-            "child_pid": child,
-            "argv": argv,
-            "started_unix_ms": int(started * 1000),
-            "record_filesystem": filesystem,
-            "cgroup_oom_kill_at_boot": before,
-        },
-    )
+    boot = Boot(os.getpid(), child, argv, int(started * 1000), filesystem, before)
+    _write(directory / "events.jsonl", boot)
     _, status = os.waitpid(child, 0)
-    death = name_death(status, before, oom_kills())
-    death.update(
-        event="death",
-        child_pid=child,
-        ran_ms=round((time.time() - started) * 1000, 1),
-        ended_unix_ms=int(time.time() * 1000),
-    )
+    death = name_death(status, before, oom_kills(), child=child, started=started)
     _write(directory / "events.jsonl", death)
-    print(f"[witness] {death['how']} (oom_killed={death['oom_killed']})", flush=True)
-    return death["exit_code"] if death["exit_code"] >= 0 else 128 + int(death["signal"])
+    print(f"[witness] {death.how} (oom_killed={death.oom_killed})", flush=True)
+    return death.exit_code if death.exit_code >= 0 else 128 + death.signal
 
 
-def read_events(root: Path) -> list[dict[str, Any]]:
+def read_events(root: Path) -> list[Event]:
     """Read the surviving event rows with no live process anywhere.
 
-    Witnesses of other Runtime versions append to the same log: rows of unknown kinds,
-    additive fields and a torn final line are skipped, never a reason to lose the rest.
+    Witnesses of other Runtime versions append to the same log: additive fields are ignored,
+    and rows of unknown kinds and a torn final line are skipped, never a reason to lose the
+    rest.
     """
 
     path = root / "witness" / "events.jsonl"
     if not path.is_file():
         return []
-    events: list[dict[str, Any]] = []
-    for line in path.read_text().splitlines():
+    events: list[Event] = []
+    for line in path.read_bytes().splitlines():
         try:
-            event = json.loads(line)
-        except ValueError:
+            events.append(msgspec.json.decode(line, type=Event))
+        except msgspec.DecodeError:
             continue
-        kind = event.get("event") if isinstance(event, dict) else None
-        required = _EVENT_FIELDS.get(kind) if isinstance(kind, str) else None
-        if required is not None and required <= set(event):
-            events.append(event)
     return events
 
 
-def read_death(root: Path) -> dict[str, Any]:
+def read_death(root: Path) -> Death:
     """Return the last durable death event."""
 
-    death = next(
-        (event for event in reversed(read_events(root)) if event["event"] == "death"), None
-    )
+    death = next((event for event in reversed(read_events(root)) if isinstance(event, Death)), None)
     if death is None:
         raise WitnessRefusal("death_unrecorded", f"no witness death record under {root}")
     return death

@@ -33,7 +33,13 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE
 from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.executor import main as executor_main
-from cozy_runtime.internal.executor_commands import Activate, ModelLoad, Start
+from cozy_runtime.internal.executor_commands import (
+    Activate,
+    Invoke,
+    ModelLoad,
+    PrepareRequest,
+    Start,
+)
 from cozy_runtime.internal.local import stage_development_placement
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
@@ -392,23 +398,23 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         if degree > 1:
             for changed_pin in ("base/dit=flash-attn3", "absent/dit=sdpa"):
                 refused = host.serve_request(
-                    {
-                        "request_id": "changed-pin",
-                        "entrypoint": "generate",
-                        "payload": {"value": 9},
-                        "attention_kernel": changed_pin,
-                    }
+                    PrepareRequest(
+                        request_id="changed-pin",
+                        entrypoint="generate",
+                        payload={"value": 9},
+                        attention_kernel=changed_pin,
+                    )
                 )
                 assert refused["code"] == "attention_kernel_unsupported", refused
                 assert "changed-pin" not in executor.prepared
                 assert not executor.poisoned
         request = host.serve_request(
-            {
-                "request_id": request_id,
-                "entrypoint": "generate",
-                "payload": {"value": 9},
-                "attention_kernel": "base/dit=sdpa",
-            }
+            PrepareRequest(
+                request_id=request_id,
+                entrypoint="generate",
+                payload={"value": 9},
+                attention_kernel="base/dit=sdpa",
+            )
         )
         assert request["ok"], request
         prepared = PreparedRequest(
@@ -428,16 +434,16 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
             name: row["delivery"]["routes"] for name, row in reply["facts"]["models"].items()
         }
         served = host.serve_invoke(
-            {
-                "request_id": request_id,
-                "entrypoint": "generate",
-                "attention_kernel": "base/dit=sdpa",
-                "deadline_s": None,
-                "spool": str(root / "invocation"),
-                "placement": attempt_plan.placement,
-                "headroom_bytes": attempt_plan.headroom_bytes,
-                "scope_headroom_bytes": dict(attempt_plan.scope_headroom_bytes),
-            }
+            Invoke(
+                request_id=request_id,
+                entrypoint="generate",
+                attention_kernel="base/dit=sdpa",
+                deadline_s=None,
+                spool=str(root / "invocation"),
+                placement=attempt_plan.placement,
+                headroom_bytes=attempt_plan.headroom_bytes,
+                scope_headroom_bytes=dict(attempt_plan.scope_headroom_bytes),
+            )
         )
         assert served["ok"] and served["outcome"]["terminal"] == "succeeded", served
         assert not executor.poisoned

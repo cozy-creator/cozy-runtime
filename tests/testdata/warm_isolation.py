@@ -19,6 +19,7 @@ import torch
 from cozy_runtime.author import Context, Model, uses_components
 from cozy_runtime.internal import spawn
 from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.executor_commands import decode
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.mirror import mirror_component
 from cozy_runtime.internal.seam import Channel
@@ -60,7 +61,7 @@ def follower(args: argparse.Namespace) -> None:
         if name == "shutdown":
             return
         if name == "join":
-            reply = executor.join(command)
+            reply = executor.join(decode(command))
         elif name == "run":
             reply = executor.run(command)
         elif name == "probe":

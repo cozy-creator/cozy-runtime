@@ -164,10 +164,10 @@ def test_a_torn_census_entry_is_a_miss(tmp_path: Path) -> None:
 def test_witness_logs_from_other_versions_keep_their_known_rows(tmp_path: Path) -> None:
     log = tmp_path / "witness" / "events.jsonl"
     log.parent.mkdir()
-    death = dict.fromkeys(witness._EVENT_FIELDS["death"], 0) | {"event": "death", "future": 1}
-    rows = [json.dumps({"event": "future_kind"}), json.dumps(death), '{"event": "de']
-    log.write_text("\n".join(rows))
-    assert witness.read_death(tmp_path)["future"] == 1
+    death = witness.name_death(0, 0, 0, child=7, started=0.0)
+    rows = [{"event": "future_kind"}, {**msgspec.to_builtins(death), "future": 1}]
+    log.write_text("\n".join(json.dumps(row) for row in rows) + '\n{"event": "de')
+    assert witness.read_death(tmp_path) == death
 
 
 def test_h3_table_labels_from_other_writers_ignore_extras_and_default_optionals() -> None:

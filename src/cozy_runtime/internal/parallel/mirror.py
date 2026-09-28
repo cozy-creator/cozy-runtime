@@ -12,11 +12,14 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+import msgspec
+
+from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._errors import Cancelled
 from cozy_runtime.author._model import remote_scope
 from cozy_runtime.internal import attention_sol, execution_evidence
 from cozy_runtime.internal.parallel import cp, wire
-from cozy_runtime.internal.parallel.group import RankGroup
+from cozy_runtime.internal.parallel.group import RankGroup, SpreadLog
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 
 
@@ -53,12 +56,12 @@ def mirror_component(
             # Every follower joins the collective: none may be answering an overlapped call.
             with group.hold(range(1, group.degree)):
                 try:
-                    group.broadcast(command)
+                    group.broadcast(msgspec.to_builtins(command))
                     with cp.gated_call():
                         result = call(*args, **kwargs)
-                    for reply in group.collect("run"):
-                        _accept(name, group, reply)
-                        attention_sol.record_rank(reply["rank"], reply["sol_calls"])
+                    for follower, frame in zip(group.followers, group.collect("run"), strict=True):
+                        reply = _accept(name, group, follower.rank, frame)
+                        attention_sol.record_rank(follower.rank, reply.sol_calls)
                     return result
                 except BaseException:
                     group._break(f"mirrored component {name!r} failed")
@@ -104,21 +107,20 @@ def _hosted(
             name, prepared, group, spool, args, kwargs, cancelled, f"ranks-{rank}", only=True
         )
         # Per-rank directories: calls to different ranks may be in flight at once.
-        results = wire.TensorSpool(Path(command["spool"]) / f"hosted-{rank}")
+        results = wire.TensorSpool(Path(command.spool) / f"hosted-{rank}")
+        hosted = msgspec.structs.replace(command, module=path, results=f"hosted-{rank}")
         try:
             try:
-                reply = group.call_one(
-                    rank, {**command, "module": path, "results": f"hosted-{rank}"}
-                )
-                _accept(name, group, reply)
+                frame = group.call_one(rank, msgspec.to_builtins(hosted))
+                reply = _accept(name, group, rank, frame)
             except BaseException:
                 group._break(f"hosted component {name!r} failed")
                 raise
             residency = prepared[name][0]._cozy_residency
             if residency is not None:
-                (scope,) = command["scopes"]
-                residency.observe_remote(scope["method"], int(reply.get("working_peak_bytes", 0)))
-            return wire.unmarshal(reply["result"], results, device=device)
+                (scope,) = command.scopes
+                residency.observe_remote(scope.method, reply.working_peak_bytes)
+            return wire.unmarshal(reply.result, results, device=device)
         finally:
             payloads.clear()
             results.clear()
@@ -190,7 +192,7 @@ def install_spread(
         finished: dict[int, Any],
         queue: deque[tuple[int, tuple[Any, ...]]],
         declined: dict[str, str],
-        log: dict[str, Any],
+        log: SpreadLog,
         method: str,
         spare: bool,
     ) -> None:
@@ -202,16 +204,16 @@ def install_spread(
                     name, prepared, group, spool, args, {}, cancelled, f"ranks-{rank}", only=True
                 )
                 sent.append((rank, index, args, payloads))
-                group.send_one(rank, {**command, "method": method, "p2p": True, "spare": spare})
+                spread = msgspec.structs.replace(command, method=method, p2p=True, spare=spare)
+                group.send_one(rank, msgspec.to_builtins(spread))
             index, args = batch[0]
             finished[index] = getattr(component, method)(*args)
             calls["0"] = calls.get("0", 0) + 1
             for rank, index, args, _payloads in sent:
                 result = wire.recv_tensor(rank, group.pg, device)
-                reply = group.reply_one(rank, "run")
-                _accept(name, group, reply)
+                reply = _accept(name, group, rank, group.reply_one(rank, "run"))
                 if result is None:
-                    declined[str(rank)] = str(reply.get("declined") or "declined")[:300]
+                    declined[str(rank)] = (reply.declined or "declined")[:300]
                     log["declined"][str(rank)] = declined[str(rank)]
                     queue.append((index, args))
                 else:
@@ -316,13 +318,13 @@ def _command(
     prepared: Mapping[tuple[str, str], tuple[Any, Any]],
     group: RankGroup,
     spool: Callable[[], Path | None],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
+    args: tuple[object, ...],
+    kwargs: Mapping[str, object],
     cancelled: Callable[[], bool],
     payloads_dir: str = "ranks",
     *,
     only: bool = False,
-) -> tuple[dict[str, Any], wire.TensorSpool]:
+) -> tuple[wire.RunCommand, wire.TensorSpool]:
     """The `run` command for one component call under the leader's active scopes.
 
     Scope admission has already happened on the leader. Followers receive that same
@@ -358,44 +360,55 @@ def _command(
     }
     scopes = []
     for key, (method, components) in active.items():
-        scope = {"model": key, "method": method, "components": list(components)}
         residency = models[key]._cozy_residency
-        if residency is not None:
-            scope.update(
+        scopes.append(
+            wire.Scope(key, method, components)
+            if residency is None
+            else wire.Scope(
+                key,
+                method,
+                components,
                 placement=residency.placement,
                 headroom_bytes=residency.headroom,
                 scope_headroom_bytes=residency.scope_headrooms,
                 measured_scopes=sorted(residency.measured),
             )
-        scopes.append(scope)
+        )
     payloads = wire.TensorSpool(directory / payloads_dir, references)
-    command = {
-        **wire.run_command(args, kwargs, payloads),
-        "component": list(name),
-        "spool": str(directory),
-        "payloads": payloads_dir,
-        "scopes": scopes,
-        "grad_enabled": torch.is_grad_enabled(),
-        "inference_mode": torch.is_inference_mode_enabled(),
-        "autocast": {
+    command = wire.RunCommand(
+        component=name,
+        spool=str(directory),
+        payloads=payloads_dir,
+        scopes=tuple(scopes),
+        grad_enabled=torch.is_grad_enabled(),
+        inference_mode=torch.is_inference_mode_enabled(),
+        autocast={
             kind: str(torch.get_autocast_dtype(kind)).removeprefix("torch.")
             for kind in ("cuda", "cpu")
             if torch.is_autocast_enabled(kind)
         },
-    }
+        attention_layout=_ACTIVE_LAYOUT.get(),
+        args=[wire.marshal(a, payloads, path=f"args[{i}]") for i, a in enumerate(args)],
+        kwargs={k: wire.marshal(v, payloads, path=k) for k, v in kwargs.items()},
+    )
     return command, payloads
 
 
-def _accept(name: tuple[str, str], group: RankGroup, reply: Mapping[str, Any]) -> None:
-    if not reply.get("ok"):
+def _accept(
+    name: tuple[str, str], group: RankGroup, rank: int, frame: Mapping[str, object]
+) -> wire.RunReply:
+    """Rank `rank`'s answer to one call: its failure raised by name, its peak and evidence
+    folded into the attempt's."""
+    try:
+        reply = msgspec.convert(frame, wire.RunReply)
+    except msgspec.ValidationError as exc:
+        raise GroupRefusal(f"{name}: rank {rank} answered malformed: {exc}"[:600]) from exc
+    if not reply.ok:
         raise GroupRefusal(
-            f"{name}: rank {reply.get('rank')} failed: {reply.get('code')}: "
-            f"{reply.get('detail', '')}"[:600],
-            code=str(reply.get("code") or "group_broken"),
+            f"{name}: rank {rank} failed: {reply.code}: {reply.detail}"[:600],
+            code=reply.code or "group_broken",
         )
-    rank = int(reply["rank"])
-    group.working_peaks[rank] = max(
-        group.working_peaks.get(rank, 0), int(reply.get("working_peak_bytes", 0))
-    )
-    if reply.get("evidence"):
-        execution_evidence.widen(group.rank_records, reply["evidence"])
+    group.working_peaks[rank] = max(group.working_peaks.get(rank, 0), reply.working_peak_bytes)
+    if reply.evidence is not None:
+        execution_evidence.widen(group.rank_records, reply.evidence)
+    return reply

@@ -40,6 +40,29 @@ class Boot(TypedDict):
     line: str
 
 
+class RankAttention(TypedDict):
+    """A rank's `attention` (the shape above)."""
+
+    requested: str
+    observed: str
+    impl: str
+    kernels: NotRequired[list[dict[str, object]]]
+
+
+class RankEvidence(TypedDict):
+    """One rank's record (the shape above). Mappings, not structs: the executor extends them
+    by key and they land in the attempt's measurements as JSON."""
+
+    rank: int
+    pid: int
+    ordinal: int
+    uuid: str
+    arch: str
+    start_us: int
+    end_us: int
+    attention: RankAttention
+
+
 def identity(torch: Any, cuda: bool, local: int, sealed: Sequence[str]) -> dict[str, Any]:
     """This process's `pid`, host `ordinal`, `uuid` and `arch` for device `local` of its seal."""
     if not cuda:
@@ -59,13 +82,11 @@ def attention(
     observed: str = "",
     impl: str = "",
     kernels: Sequence[Mapping[str, Any]] = (),
-) -> dict[str, Any]:
-    return {
-        "requested": requested,
-        "observed": observed,
-        "impl": impl,
-        **({"kernels": [dict(row) for row in kernels]} if kernels else {}),
-    }
+) -> RankAttention:
+    row = RankAttention(requested=requested, observed=observed, impl=impl)
+    if kernels:
+        row["kernels"] = [dict(kernel) for kernel in kernels]
+    return row
 
 
 def observed(hosts: Mapping[str, Mapping[str, int]]) -> str:
@@ -95,8 +116,8 @@ def record(
     who: Mapping[str, Any],
     start_us: int,
     end_us: int,
-    seen: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+    seen: RankAttention | None = None,
+) -> RankEvidence:
     return {
         "rank": rank,
         "pid": int(who.get("pid", 0)),
@@ -105,16 +126,15 @@ def record(
         "arch": str(who.get("arch", "")),
         "start_us": start_us,
         "end_us": end_us,
-        "attention": dict(seen or attention()),
+        "attention": (seen or attention()).copy(),
     }
 
 
-def widen(held: dict[int, dict[str, Any]], row: Mapping[str, Any]) -> None:
+def widen(held: dict[int, RankEvidence], row: RankEvidence) -> None:
     """Fold one mirrored call's record into its rank's: earliest start, latest end."""
-    rank = int(row["rank"])
-    current = held.get(rank)
+    current = held.get(row["rank"])
     if current is None:
-        held[rank] = dict(row)
+        held[row["rank"]] = row.copy()
         return
-    current["start_us"] = min(current["start_us"], int(row["start_us"]))
-    current["end_us"] = max(current["end_us"], int(row["end_us"]))
+    current["start_us"] = min(current["start_us"], row["start_us"])
+    current["end_us"] = max(current["end_us"], row["end_us"])
