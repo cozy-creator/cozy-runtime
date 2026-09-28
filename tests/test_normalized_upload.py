@@ -282,7 +282,7 @@ def test_convert_cozytensors_of_a_civitai_sdxl_file_is_the_same_self_contained_c
         assert source.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, source.safe_detail
         request = {
             "source": canonical_json.decode(source.result_canonical_bytes),
-            "profile": "civitai/sdxl/single-file/1",
+            "profiles": ["civitai/sdxl/single-file/1"],
         }
         convert = command(
             workspace,
