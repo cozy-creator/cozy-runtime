@@ -138,7 +138,10 @@ def test_a_released_root_lets_the_next_root_start_while_its_python_runs(
 ) -> None:
     machine.root("A")
     machine.root("B")
+    # Each call asks for its GPUs on its own unit; A's is granted before B's call exists, or
+    # whichever unit asks first would hold the cards.
     a1 = machine.child("A", "h3")
+    machine.await_granted(a1)
     b1 = machine.child("B", "h3")
     machine.tick()
     machine.finish(a1)
