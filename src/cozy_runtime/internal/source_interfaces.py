@@ -30,7 +30,6 @@ class Civitai(msgspec.Struct, frozen=True):
 
 class Convert(msgspec.Struct, frozen=True):
     source: SourceArtifact
-    profile: str = ""
     profiles: tuple[str, ...] = ()
 
 

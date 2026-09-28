@@ -68,21 +68,18 @@ def download_civitai(version: int, *, file: str = "") -> Awaitable[SourceArtifac
 
 
 def convert_cozytensors(
-    source: SourceArtifact, *, profile: str = "", profiles: tuple[str, ...] = ()
+    source: SourceArtifact, *, profiles: tuple[str, ...]
 ) -> Awaitable[ModelArtifact]:
-    """Convert retained source bytes with one reviewed native TensorFS profile, or with
-    several whose disjoint components compose one model."""
-    if bool(profile) == bool(profiles) or len(set(profiles)) != len(profiles):
+    """Convert retained source bytes with reviewed native TensorFS profiles whose disjoint
+    components compose one model."""
+    if not profiles or len(set(profiles)) != len(profiles):
         raise UnsupportedInput(
-            "convert_cozytensors takes one profile or distinct profiles",
-            code="model_source_profiles_invalid",
+            "convert_cozytensors takes distinct profiles", code="model_source_profiles_invalid"
         )
-    arguments: dict[str, object] = {"source": source}
-    if profile:
-        arguments["profile"] = profile
-    else:
-        arguments["profiles"] = profiles
-    return cast(Awaitable[ModelArtifact], _call("convert_cozytensors", arguments))
+    return cast(
+        Awaitable[ModelArtifact],
+        _call("convert_cozytensors", {"source": source, "profiles": profiles}),
+    )
 
 
 async def source_files(source: SourceArtifact) -> Tree:
@@ -107,7 +104,7 @@ async def ingest_huggingface(repository: str, *, revision: str) -> ModelArtifact
     # The metadata never depends on the conversion, so both run at once. They are
     # reserved in the same order as before, so their call indices are unchanged.
     model, metadata = await asyncio.gather(
-        convert_cozytensors(source, profile=recipe.profile),
+        convert_cozytensors(source, profiles=(recipe.profile,)),
         download_huggingface(
             recipe.repository, revision=recipe.revision, files=tuple(recipe.metadata)
         ),

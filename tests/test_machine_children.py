@@ -469,7 +469,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 * 40
                 + "', carriers=('provider/first.safetensors',))\n"
                 "    await source_files(source)\n"
-                "    model = await convert_cozytensors(source, profile='fixture/first/1')\n"
+                "    model = await convert_cozytensors(source, profiles=('fixture/first/1',))\n"
                 "    return await consume(model=model)",
             )
         if case == "pause":

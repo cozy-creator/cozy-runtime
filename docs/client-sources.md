@@ -23,10 +23,9 @@ Both return a `SourceArtifact`: an exact retained ordinary-file tree. Downloads 
 with the bytes verified and retained. Credentials come from the private deployment's
 configured provider credentials; scripts do not pass tokens, delivery URLs, or Store paths.
 
-`convert_cozytensors(source, *, profile)` converts one reviewed source profile and returns
-a normal `ModelArtifact`. `convert_cozytensors(source, *, profiles=(...))` converts several
-reviewed profiles of one source into one model whose components are the union of theirs
-(overlapping component or config names refuse). The native converter owns source-header
+`convert_cozytensors(source, *, profiles=(...))` converts reviewed profiles of one source
+into one normal `ModelArtifact` whose components are the union of theirs (overlapping
+component or config names refuse). The native converter owns source-header
 validation, tensor transformations, and partial journals. Model results use a real native
 metadata inheritance transaction and receipt without copying tensor payloads.
 

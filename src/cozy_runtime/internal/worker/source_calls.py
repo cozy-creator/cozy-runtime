@@ -188,11 +188,9 @@ def _resolution(request: object, access: source_steps.Access) -> source_steps.Re
 
 def _profiles(request: source_interfaces.Convert) -> tuple[str, ...]:
     """The reviewed profiles one conversion composes, in their declared order."""
-    if bool(request.profile) == bool(request.profiles):
-        raise SourceRefusal(
-            "model_source_profiles_invalid", "name one profile or distinct profiles"
-        )
-    return (request.profile,) if request.profile else request.profiles
+    if not request.profiles or len(set(request.profiles)) != len(request.profiles):
+        raise SourceRefusal("model_source_profiles_invalid", "name distinct profiles")
+    return request.profiles
 
 
 # The CozyTensors format this TensorFS writes, as its typed header declares it.

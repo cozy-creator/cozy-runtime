@@ -50,7 +50,7 @@ async def JOB(ctx: Context, payload: Request) -> Result:
     source = await download_huggingface(
         'example/model', revision='a' * 40, carriers=('provider/first.safetensors',))
     tree = await source_files(source)
-    model = await convert_cozytensors(source, profile='fixture/first/1')
+    model = await convert_cozytensors(source, profiles=('fixture/first/1',))
     try:
         await download_civitai(123)
         refused = ''

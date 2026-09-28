@@ -99,7 +99,7 @@ def conversion(source: pb.NativeSourceCommand, result: bytes) -> pb.NativeSource
     command.ClearField("selection")
     command.parent_call.call_index = 1
     command.parent_call.export = "convert_cozytensors"
-    args = {"source": canonical_json.decode(result), "profile": "fixture/first/1"}
+    args = {"source": canonical_json.decode(result), "profiles": ["fixture/first/1"]}
     command.parent_call.request_canonical_bytes = canonical_json.encode(args)
     intent = {"module": source_interfaces.MODULE, "export": "convert_cozytensors", "request": args}
     command.parent_call.intent_digest = hashlib.sha256(canonical_json.encode(intent)).digest()

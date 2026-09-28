@@ -123,7 +123,7 @@ def _converted(tmp_path: Path) -> tuple[Workspace, ModelArtifact, str]:
         command.parent_call.export = "convert_cozytensors"
         args = {
             "source": canonical_json.decode(downloaded.result_canonical_bytes),
-            "profile": "fixture/first/1",
+            "profiles": ["fixture/first/1"],
         }
         command.parent_call.request_canonical_bytes = canonical_json.encode(args)
         command.parent_call.intent_digest = hashlib.sha256(

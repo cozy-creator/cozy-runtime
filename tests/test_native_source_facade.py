@@ -25,7 +25,7 @@ def test_public_source_facades_use_the_admitted_broker(tmp_path: Path) -> None:
     async def script(ctx: Context, payload: Empty) -> Empty:
         download_huggingface("example/model", revision="a" * 40)
         download_civitai(123)
-        convert_cozytensors(source, profile="reviewed/model/1")
+        convert_cozytensors(source, profiles=("reviewed/model/1",))
         return Empty()
 
     def exchange(*_: object) -> dict[str, object]:

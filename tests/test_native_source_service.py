@@ -189,7 +189,7 @@ def test_real_retained_source_conversion_reuses_and_registry_edit_invalidates(
             command.parent_call.export = "convert_cozytensors"
             args = {
                 "source": canonical_json.decode(downloaded.result_canonical_bytes),
-                "profile": "fixture/first/1",
+                "profiles": ["fixture/first/1"],
             }
             command.parent_call.request_canonical_bytes = canonical_json.encode(args)
             command.parent_call.intent_digest = hashlib.sha256(
@@ -736,11 +736,6 @@ def test_several_reviewed_profiles_compose_one_model_and_memoize(tmp_path: Path)
         assert again.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, again.safe_code
         assert again.memo_hit
         assert canonical_json.decode(again.result_canonical_bytes)["manifest"] == manifest
-
-        single = convert("single", {"profile": "fixture/first/1"})
-        as_tuple = convert("single-as-tuple", {"profiles": ["fixture/first/1"]})
-        assert single.state == as_tuple.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED
-        assert as_tuple.memo_hit, "one profile names one conversion however it is spelled"
     finally:
         origin.shutdown()
         origin.server_close()
