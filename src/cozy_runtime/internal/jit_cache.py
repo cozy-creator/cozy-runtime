@@ -58,17 +58,9 @@ def scope(
         boundary.mkdir(parents=True, exist_ok=True, mode=0o711)
         _require_boundary(boundary)
         boundary.chmod(0o711)
-    content.mkdir(mode=0o700, exist_ok=True)
-    info = content.lstat()
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise JITCacheRefusal(f"JIT cache content scope is not a real directory: {content}")
-    wanted_uid = uid if uid >= 0 else os.geteuid()
     wanted_gid = gid if gid >= 0 else os.getegid()
-    if info.st_uid != wanted_uid or info.st_gid != wanted_gid:
-        if os.geteuid() != 0:
-            raise JITCacheRefusal(f"JIT cache content scope has the wrong owner: {content}")
-        os.chown(content, wanted_uid, wanted_gid)
-    content.chmod(0o700)
+    _owned_directory(content, uid, wanted_gid)
+    _owned_directory(content / "torch-kernels", uid, wanted_gid)
     environment = {name: str(content / directory) for name, directory in JIT_CACHE_ENV}
     return Scope(content, {**environment, "TMPDIR": str(content)})
 
@@ -95,9 +87,9 @@ def remove_pod(cozy_home: Path, pod_scope: str) -> None:
     shutil.rmtree(pod)
 
 
-def machine(root: Path, *, uid: int = -1, gid: int = -1) -> dict[str, str]:
-    """The executor's namespaces of the persistent kernel store, and FA4's and Triton's caches
-    inside its own.
+def machine(root: Path, *, uid: int = -1, gid: int = -1, installation: str = "") -> dict[str, str]:
+    """The executor's namespaces of the persistent kernel store, and FA4's, Triton's and, for
+    an installed environment, PyTorch's NVRTC caches inside its own.
 
     Unlike the boot scope above, nothing here is deleted: entries are keyed by every compile
     input, so a worker restart, a new package version or a Runtime update reads them as it
@@ -117,13 +109,7 @@ def machine(root: Path, *, uid: int = -1, gid: int = -1) -> dict[str, str]:
     own = worker
     if uid >= 0 and uid != os.geteuid():
         own = kernel_cache.namespace(root, uid)
-        own.mkdir(exist_ok=True, mode=0o700)
-        info = own.lstat()
-        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            raise JITCacheRefusal(f"kernel cache namespace is not a real directory: {own}")
-        if info.st_uid != uid or (gid >= 0 and info.st_gid != gid):
-            os.chown(own, uid, gid)
-        own.chmod(0o700)
+        _owned_directory(own, uid, gid)
     environment = {
         kernel_cache.OWN_ENV: str(own),
         "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": str(own / "flash-attn4"),
@@ -132,9 +118,33 @@ def machine(root: Path, *, uid: int = -1, gid: int = -1) -> dict[str, str]:
         # machine's later executors and boots too (owner, 2026-09-27).
         "TRITON_CACHE_DIR": str(own / "triton"),
     }
+    if installation:
+        if _INSTALLATION.fullmatch(installation) is None:
+            raise JITCacheRefusal("invalid installation identity for the kernel cache")
+        # PyTorch keys an entry by kernel name, arch, NVRTC version and source hash but not by
+        # its own build, so one installation's Torch never reads another's. PyTorch never
+        # creates the directory it is named.
+        torch_kernels = own / f"torch-kernels.{installation}"
+        _owned_directory(torch_kernels, uid, gid)
+        environment["PYTORCH_KERNEL_CACHE_PATH"] = str(torch_kernels)
     if own != worker:
         environment[kernel_cache.TRUSTED_ENV] = str(worker)
     return environment
+
+
+def _owned_directory(path: Path, uid: int, gid: int) -> None:
+    """A private real directory owned by `uid`/`gid`; -1 keeps this process's uid and the
+    directory's group."""
+    path.mkdir(mode=0o700, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise JITCacheRefusal(f"JIT cache directory is not a real directory: {path}")
+    wanted = (uid if uid >= 0 else os.geteuid(), gid if gid >= 0 else info.st_gid)
+    if (info.st_uid, info.st_gid) != wanted:
+        if os.geteuid() != 0:
+            raise JITCacheRefusal(f"JIT cache directory has the wrong owner: {path}")
+        os.chown(path, *wanted)
+    path.chmod(0o700)
 
 
 def _require_boundary(path: Path) -> None:

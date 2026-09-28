@@ -75,6 +75,9 @@ JIT_CACHE_ENV: tuple[tuple[str, str], ...] = (
     ("TORCH_EXTENSIONS_DIR", "extensions"),
     ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
     ("TRITON_CACHE_DIR", "triton"),
+    # PyTorch's NVRTC kernels (jiterator ops, Qwen3-VL's `prod` in H3's conditioner). Unset,
+    # an executor with no HOME compiles them again on every start and warns it cannot cache.
+    ("PYTORCH_KERNEL_CACHE_PATH", "torch-kernels"),
     # FlashAttention-4 is CuTe-DSL source and compiles for the card it finds (h3a-024). Its
     # OWN cache, deliberately, and not CUTLASS's `CUTE_DSL_CACHE_DIR`: FA4 keys on
     # `sha256(pickle(compile_key))` under a fingerprint of its own sources and carries no

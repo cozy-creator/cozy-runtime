@@ -169,6 +169,11 @@ def test_machine_namespaces_under_one_uid(tmp_path: Path) -> None:
     store = kernel_cache.from_sealed(environment)
     assert store is not None and store.own == own and store.trusted is None
     assert jit_cache.machine(root) == environment
+    installed = jit_cache.machine(root, installation="release-45299ff1")
+    assert installed == {
+        **environment,
+        "PYTORCH_KERNEL_CACHE_PATH": str(own / "torch-kernels.release-45299ff1"),
+    }
 
 
 def _site() -> None:
@@ -326,3 +331,35 @@ def test_a_triton_kernel_compiles_once_per_machine(tmp_path: Path) -> None:
     second = run()
     assert first == second == {"sum": 999000.0}
     assert entries and sorted(path.name for path in cache.iterdir()) == entries
+
+
+def test_a_torch_nvrtc_kernel_compiles_once_per_installation(tmp_path: Path) -> None:
+    """PyTorch's NVRTC cache (jiterator ops) lives in the machine store under the executor's
+    installation, so a later executor of that environment reads what an earlier one built."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    env = jit_cache.machine(tmp_path / "var/lib/cozy/kernels", installation="release-x")
+    cache = Path(env["PYTORCH_KERNEL_CACHE_PATH"])
+    code = (
+        "import json, torch\n"
+        "x = torch.linspace(0.5, 4.0, 64, device='cuda')\n"
+        "print(json.dumps({'sum': round(float(torch.special.bessel_j0(x).sum()), 4)}))\n"
+    )
+
+    def run() -> Any:
+        done = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+        )
+        assert done.returncode == 0, done.stderr[-2000:]
+        assert "disables kernel caching" not in done.stderr
+        return json.loads(done.stdout.splitlines()[-1])
+
+    first = run()
+    entries = sorted(path.name for path in cache.iterdir())
+    assert entries, "the first process compiled nothing into the cache"
+    assert run() == first
+    assert sorted(path.name for path in cache.iterdir()) == entries

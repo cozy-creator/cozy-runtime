@@ -807,7 +807,10 @@ class ExecutorSupervision:
             return {
                 **prepared.environment,
                 **jit_cache.machine(
-                    self.kernel_cache, uid=self.executor_uid, gid=self.executor_gid
+                    self.kernel_cache,
+                    uid=self.executor_uid,
+                    gid=self.executor_gid,
+                    installation=self.environment_installation_id,
                 ),
             }
         except jit_cache.JITCacheRefusal as exc:
