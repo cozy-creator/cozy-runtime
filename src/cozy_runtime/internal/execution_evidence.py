@@ -1,7 +1,6 @@
-"""The per-rank execution record: which process on which GPU ran an attempt, when, with what.
+"""The per-GPU execution record: which process on which GPU ran an attempt, when, with what.
 
-ONE shape, shared by the attempt's triage `measurements.execution.ranks`, the attention
-observation and the GPU scheduler's enter/exit events. Fields are added, never changed:
+The executor reports one record per process of its group, in process order, as `ranks`:
 
     {"rank": int, "pid": int, "ordinal": int, "uuid": str, "arch": str,
      "start_us": int, "end_us": int,
@@ -9,14 +8,21 @@ observation and the GPU scheduler's enter/exit events. Fields are added, never c
     kernel = {"kernel": str, "state": str, "line": str, "served": bool,
               "progress"?: float, "compile_ms"?: float, "detail"?: str}
 
-`ordinal` is the host CUDA ordinal (-1 without one), `uuid` the NVML `GPU-…` identity and
-`arch` its `sm_XY` ("" off CUDA). `start_us`/`end_us` are wall-clock unix MICROseconds bounding
-the rank's work for the attempt, 0 for a rank that did none: nanoseconds since the epoch exceed
-the ±2^53 integer range canonical JSON (and every JSON reader) admits. `attention.requested` is
-the request's pin ("" = automatic), `observed` what the rank's processors held, in the pin
-grammar, and `impl` the kernel implementation under that backend when one was observed.
-`kernels` is every compiled kernel this rank knows of: `state` ready, compiling (with its
-`progress`), failed or absent, whether it `served` this attempt, and how long its compile took.
+The worker publishes them as `gpus` (`by_gpu`) in the attempt's triage
+`measurements.execution`, the attention observation and the GPU scheduler's grant and release
+events: the same record under `gpu`, the number nvidia-smi shows, without the process-group
+rank. `ranks` rides beside `gpus` until no deployed reader needs it, then goes. Fields are
+added, never changed.
+
+`ordinal` is the process's seal entry as a number (-1 without one), `uuid` the NVML `GPU-…`
+identity and `arch` its `sm_XY` ("" off CUDA). `start_us`/`end_us` are wall-clock unix
+MICROseconds bounding the GPU's work for the attempt, 0 for one that did none: nanoseconds
+since the epoch exceed the ±2^53 integer range canonical JSON (and every JSON reader) admits.
+`attention.requested` is the request's pin ("" = automatic), `observed` what the process's
+processors held, in the pin grammar, and `impl` the kernel implementation under that backend
+when one was observed. `kernels` is every compiled kernel this GPU knows of: `state` ready,
+compiling (with its `progress`), failed or absent, whether it `served` this attempt, and how
+long its compile took.
 """
 
 from __future__ import annotations
@@ -41,7 +47,7 @@ class Boot(TypedDict):
 
 
 class RankAttention(TypedDict):
-    """A rank's `attention` (the shape above)."""
+    """A process's `attention` (the shape above)."""
 
     requested: str
     observed: str
@@ -50,8 +56,8 @@ class RankAttention(TypedDict):
 
 
 class RankEvidence(TypedDict):
-    """One rank's record (the shape above). Mappings, not structs: the executor extends them
-    by key and they land in the attempt's measurements as JSON."""
+    """One process's record (the shape above). Mappings, not structs: the executor extends
+    them by key and they land in the attempt's measurements as JSON."""
 
     rank: int
     pid: int
@@ -131,10 +137,56 @@ def record(
 
 
 def widen(held: dict[int, RankEvidence], row: RankEvidence) -> None:
-    """Fold one mirrored call's record into its rank's: earliest start, latest end."""
+    """Fold one mirrored call's record into its process's: earliest start, latest end."""
     current = held.get(row["rank"])
     if current is None:
         held[row["rank"]] = row.copy()
         return
     current["start_us"] = min(current["start_us"], row["start_us"])
     current["end_us"] = max(current["end_us"], row["end_us"])
+
+
+def gpu_name(devices: Sequence[str], rank: int) -> str:
+    """How a person names the GPU group process `rank` drives: `GPU 3`, nvidia-smi's number,
+    from the seal's `CUDA_VISIBLE_DEVICES` entries (process r drives entry r). A `GPU-…`
+    UUID entry is its own name."""
+    entry = devices[rank] if 0 <= rank < len(devices) else str(rank)
+    return f"GPU {entry}" if entry.isdigit() else entry
+
+
+def gpu_names(devices: Sequence[str]) -> str:
+    """Several seal entries as a person reads them: `GPU 2`, `GPUs 0-3`, `GPUs 1, 3`."""
+    names = [gpu_name(devices, rank) for rank in range(len(devices))]
+    if len(names) == 1:
+        return names[0]
+    numbers = [int(entry) for entry in devices if entry.isdigit()]
+    if len(numbers) == len(devices) > 2 and numbers == list(range(numbers[0], numbers[-1] + 1)):
+        return f"GPUs {numbers[0]}-{numbers[-1]}"
+    return "GPUs " + ", ".join(name.removeprefix("GPU ") for name in names)
+
+
+def identify(entry: str, inventory: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+    """One envelope entry (an index or a `GPU-…` UUID) as `{"gpu": n, "uuid": u}`: the number
+    nvidia-smi shows (-1 when unknown) and the NVML identity ("" when unknown)."""
+    for row in inventory:
+        if entry in (str(row.get("device_index")), row.get("device_uuid")):
+            return {"gpu": int(row["device_index"]), "uuid": str(row.get("device_uuid", ""))}
+    if entry.isdigit():
+        return {"gpu": int(entry), "uuid": ""}
+    return {"gpu": -1, "uuid": entry}
+
+
+def by_gpu(
+    ranks: Sequence[Mapping[str, Any]], inventory: Sequence[Mapping[str, Any]] = ()
+) -> list[dict[str, Any]]:
+    """The executor's per-process records as the wire's `gpus`: each under `gpu`, the number
+    nvidia-smi shows. The UUID decides it where the inventory knows the card, so a CUDA order
+    that differs from nvidia-smi's never mislabels one; else the seal entry does."""
+    numbers = {str(row["device_uuid"]): int(row["device_index"]) for row in inventory}
+    return [
+        {
+            "gpu": numbers.get(str(row.get("uuid", "")), int(row.get("ordinal", -1))),
+            **{key: value for key, value in row.items() if key not in ("rank", "ordinal")},
+        }
+        for row in ranks
+    ]

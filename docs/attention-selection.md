@@ -118,11 +118,11 @@ submits that object, and a sparse step whose object is not ready runs dense.
 Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) that
 `attention_ulysses` registers with Diffusers. Without a parallel config it calls the
 kernel; under Runtime's Ulysses config it runs Diffusers' unequal-length all-to-all,
-the kernel over the full sequence of this rank's heads, and the exchange back. A kernel
+the kernel over the full sequence of this GPU's heads, and the exchange back. A kernel
 whose reductions stay within a head therefore matches one GPU; FlashInfer's global V
 amax does not, so it is registered without context parallelism. Ring is refused.
 
-Each rank's execution record lists every kernel of its chains: `ready` (served or not),
+Each GPU's execution record lists every kernel of its chains: `ready` (served or not),
 `compiling` with progress, `failed`, `absent` or `unsupported`, each with why and its
 compile time.
 
@@ -135,6 +135,6 @@ that backend before warm-up; the request refuses a frozen change and does not
 silently rebuild it.
 
 Preparation facts and request `attention.artifact` observations identify the compiled
-artifact by its store key. Each rank's execution record carries `attention.impl`: the
+artifact by its store key. Each GPU's execution record carries `attention.impl`: the
 implementation that actually served, such as the SDPA backend torch dispatched (`cudnn`
 on H100) or Sol's `cute_sm90` route.

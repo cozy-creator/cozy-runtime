@@ -35,7 +35,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclasses_field
 from dataclasses import replace as dataclasses_replace
@@ -68,6 +68,7 @@ from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.author._observations import Kind as ObservationKind
 from cozy_runtime.internal import (
     canonical,
+    execution_evidence,
     executor_replies,
     fill,
     liveness,
@@ -178,6 +179,8 @@ GROUP_FAULT_CODES = frozenset(
     {
         "group_broken",
         "group_unformed",
+        "gpu_divergence",
+        # an older executor's name for it: drop once no package locks a Runtime that says it
         "rank_divergence",
         "uncrossable_argument",
         "ungated_sharded_forward",
@@ -411,7 +414,7 @@ class AttemptRecord:
     #: what the component-use plane actually did: stages, evictions, leases, resident set
     residency: dict[str, Any] = dataclasses_field(default_factory=dict)
     execution_observation: dict[str, Any] = dataclasses_field(default_factory=dict)
-    #: the executor's `execution` record: degree, per-rank rows, executor and construction
+    #: the executor's `execution` record: degree, per-GPU rows, executor and construction
     execution: dict[str, Any] = dataclasses_field(default_factory=dict)
     attention_applied: bool = False
     capture_result: CaptureWritten | None = None
@@ -551,6 +554,7 @@ class AttemptEngine:
         tensorfs_root: Path | None = None,
         work_fingerprint: Callable[[AttemptRecord], str] | None = None,
         room: Callable[[AttemptRecord], Handler] | None = None,
+        inventory: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         self.records = records
         self.authorizer = authorizer
@@ -584,6 +588,8 @@ class AttemptEngine:
         self.work_fingerprint = work_fingerprint
         #: a serving attempt's answer to its executor asking for device room mid-call
         self.room = room
+        #: the GPUs nvidia-smi listed (`readiness.RuntimeGPU`): names each record's GPU
+        self.inventory = tuple(inventory)
         #: the run output log: `Outputs.publish` mid-run and the returned result at post
         self.products: Products | None = None
         #: the demand falsifier. It ships first, it counts, and it decides nothing — the
@@ -1881,6 +1887,10 @@ class AttemptEngine:
         self.monitor.end(key, "returned")
         attempt.execution_observation = dict(reply.execution_observation)
         attempt.execution = dict(reply.execution)
+        if isinstance(attempt.execution.get("ranks"), list):
+            attempt.execution["gpus"] = execution_evidence.by_gpu(
+                attempt.execution["ranks"], self.inventory
+            )
         attempt.attention_applied = reply.attention_applied
         attempt.capture_result = reply.capture
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from

@@ -259,7 +259,7 @@ def test_a_group_that_can_name_its_ranks_gives_back_only_the_cards_a_call_needs(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A reference on card 3 needs H3's bytes there, not on cards 0-2: an executor that
-    says it can vacate ranks gives back rank 3 alone, and restores it before it next runs."""
+    says it can vacate ranks gives back GPU 3 alone, and restores it before it next runs."""
     h3, qwen = long_form(machine, monkeypatch)
     worker = machine.worker
     group = worker._lane_of(h3)
@@ -270,7 +270,7 @@ def test_a_group_that_can_name_its_ranks_gives_back_only_the_cards_a_call_needs(
     lane.row(qwen[3]).peak[SHAPE] = {3: 70 * GiB}
     assert worker.memory.admit(lane, qwen[3], SHAPE, "a reference")
     steps = [e.step for e in worker.activity if " vacated " in e.step]
-    assert len(steps) == 1 and f"{h3!r}" in steps[0] and "vacated ranks [3] " in steps[0], steps
+    assert len(steps) == 1 and f"{h3!r}" in steps[0] and "vacated GPU 3 for " in steps[0], steps
     assert group.row(h3).held == dict.fromkeys(range(3), 20 * GiB)
     assert group.row(h3).emptied == {3}
 

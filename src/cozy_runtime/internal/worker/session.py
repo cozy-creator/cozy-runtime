@@ -67,6 +67,7 @@ from cozy_runtime.internal import (
     accel,
     canonical,
     child_env,
+    execution_evidence,
     fill,
     hostfacts,
     job_plan,
@@ -1109,6 +1110,7 @@ class Worker:
             weights=self.weights,
             owner_scope=lambda: self.fence.record_owner_id,
             tensorfs_root=options.tensorfs_root,
+            inventory=options.gpus,
             room=lambda attempt: self._room(
                 self.lanes.by_id[self.engine.slot_of(attempt).lane_id], attempt.placement_id
             ),
@@ -2387,10 +2389,20 @@ class Worker:
         for root, event, body in events:
             if event == "gpu.wait":
                 body = {**body, **self._waiting_call(owner, str(body["key"]))}
+            if event in ("gpu.grant", "gpu.release") and not body.get("gpus"):
+                # `ordinals` index this worker's envelope; people name a GPU by nvidia-smi's
+                # number. `ordinals` stays for readers that predate `gpus`.
+                body = {**body, "gpus": [self.gpu_identity(o) for o in body["ordinals"]]}
             with contextlib.suppress(WorkspaceRefusal):
                 self.executions.record(owner, root, event, body)
             if event == "gpu.wait":
                 self._gpu_waiting(owner, root, body, view)
+
+    def gpu_identity(self, ordinal: int) -> dict[str, Any]:
+        """Envelope ordinal `ordinal` as the GPU a person names (`execution_evidence.identify`)."""
+        entries = self.lanes.entries
+        entry = entries[ordinal] if 0 <= ordinal < len(entries) else ""
+        return execution_evidence.identify(entry, self.options.gpus)
 
     def readable_gpus(self) -> tuple[int, ...]:
         """Ordinals whose memory the driver answers; an unreadable GPU cannot fit anything."""
@@ -6315,9 +6327,11 @@ class Worker:
         except Exception as exc:
             self._attempt_faulted(attempt, exc)
         finally:
-            # Per-rank pid, GPU and interval (execution_evidence) prove where it ran.
+            # Per-GPU pid, card and interval (execution_evidence) prove where it ran.
             self.gpu.release(
-                f"{attempt.request_id}#{attempt.attempt}", ranks=attempt.execution.get("ranks", [])
+                f"{attempt.request_id}#{attempt.attempt}",
+                ranks=attempt.execution.get("ranks", []),
+                gpus=attempt.execution.get("gpus", []),
             )
             self._capacity_changed()
         if released is not None:

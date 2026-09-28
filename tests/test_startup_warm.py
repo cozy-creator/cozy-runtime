@@ -382,7 +382,7 @@ def test_a_slow_download_overlaps_the_executor_start_and_its_probes(
         probes = phases["Starting kernel compiles"]
         assert started["completed"] and probes["completed"], phases
         assert started["ordinals"] == [0] and "torch_import" in started["detail"]
-        assert "sdpa ready" in probes["detail"], probes
+        assert "GPU 0: " in probes["detail"] and "sdpa ready" in probes["detail"], probes
         # The download still holds; now it lands, after the start and the probes.
         origin.release.set()
         prepared = future.result(120)

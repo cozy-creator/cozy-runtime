@@ -402,10 +402,12 @@ def _accept(
     try:
         reply = msgspec.convert(frame, wire.RunReply)
     except msgspec.ValidationError as exc:
-        raise GroupRefusal(f"{name}: rank {rank} answered malformed: {exc}"[:600]) from exc
+        raise GroupRefusal(f"{name}: {group.gpu(rank)} answered malformed: {exc}"[:600]) from exc
     if not reply.ok:
         raise GroupRefusal(
-            f"{name}: rank {rank} failed: {reply.code}: {reply.detail}"[:600],
+            f"{name}: {group.gpu(rank)} failed its part of the call: {reply.code}: {reply.detail}"[
+                :600
+            ],
             code=reply.code or "group_broken",
         )
     group.working_peaks[rank] = max(group.working_peaks.get(rank, 0), reply.working_peak_bytes)

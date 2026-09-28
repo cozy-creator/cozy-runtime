@@ -37,6 +37,7 @@ from cozy_runtime.internal import accel, child_env, package_interface, proctree
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.readiness import RuntimeGPU
 from cozy_runtime.internal.worker import lanes, machine_model_defaults
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -273,7 +274,9 @@ _BASE = package_interface.build(discover(MARCO))
 class Machine:
     """One worker, its durable journal and the calls a test submits through it."""
 
-    def __init__(self, root: Path, devices: str, boot: str) -> None:
+    def __init__(
+        self, root: Path, devices: str, boot: str, gpus: tuple[RuntimeGPU, ...] = ()
+    ) -> None:
         base = {
             k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"
         }
@@ -290,6 +293,7 @@ class Machine:
                 root=root / "worker",
                 tensorfs_root=root / "store",
                 devices=devices,
+                gpus=gpus,
                 worker_boot_id=boot,
             ),
             InMemoryControlHost(),
@@ -619,6 +623,44 @@ def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
             yield made
         finally:
             made.close()
+
+
+def test_grants_name_each_gpu_as_nvidia_smi_does(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker launched on cards 4 and 6 schedules its envelope's ordinals 0 and 1. Its
+    grant and release name each GPU by nvidia-smi's number and UUID in `gpus`, beside the
+    `ordinals` older readers still take."""
+    measured = accel.DeviceMemory("measured", 80 * GiB, 80 * GiB)
+    monkeypatch.setattr(accel, "device_memory", lambda entry, kind: measured)
+    inventory = tuple(
+        RuntimeGPU(
+            device_index=index,
+            device_name="NVIDIA H100 80GB HBM3",
+            device_uuid=f"GPU-{index}",
+            driver_version="580.0",
+            memory_bytes=80 * GiB,
+            pci_bus_id=f"00000000:0{index}:00.0",
+        )
+        for index in (4, 6)
+    )
+    with tempfile.TemporaryDirectory(prefix="cz-gpu.", dir="/tmp") as root:
+        machine = Machine(Path(root), "4,6", "boot-one", gpus=inventory)
+        try:
+            machine.root("A")
+            call = machine.child("A", "h3")
+            machine.tick()
+            machine.finish(call)
+            machine.tick()
+            events = {
+                kind: body
+                for _, kind, body in machine.journal("A")
+                if kind in ("gpu.grant", "gpu.release")
+            }
+        finally:
+            machine.close()
+    named = [{"gpu": 4, "uuid": "GPU-4"}, {"gpu": 6, "uuid": "GPU-6"}]
+    assert events["gpu.grant"] == {"key": call + "#1", "ordinals": [0, 1], "gpus": named}
+    assert events["gpu.release"]["ordinals"] == [0, 1]
+    assert events["gpu.release"]["gpus"] == named
 
 
 def test_an_older_root_holds_all_four_gpus_through_its_gap_and_b_starts_after(

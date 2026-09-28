@@ -19,7 +19,7 @@ messages, notes, source lines, local variables and absolute directories. The
 existing short refusal detail remains separate. These bounds deliberately favor
 the innermost call site, without retaining live frame or tensor objects.
 
-At the actual executor device boundary, every rank also logs one startup record
+At the actual executor device boundary, every GPU's process also logs one startup record
 before initializing CUDA. It includes declared rank/world, process credentials,
 observed no_new_privs/dumpability when supported, and only CUDA_VISIBLE_DEVICES,
 PYTORCH_ALLOC_CONF, PYTORCH_CUDA_ALLOC_CONF and NCCL_NVLS_ENABLE. Logging does not

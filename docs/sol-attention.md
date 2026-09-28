@@ -16,8 +16,8 @@ Mirrored component calls carry this closed layout to each follower and restore
 its context afterward. Diffusers' unequal-length Ulysses exchange assembles the
 complete token sequence on each head shard before the same sparse/dense policy
 runs. The prefix and trailing padding always describe the global document;
-they are never reinterpreted as rank-local token offsets. Output exchange restores
-each rank's original local sequence length. The upstream Sol kernel is unchanged.
+they are never reinterpreted as GPU-local token offsets. Output exchange restores
+each GPU's original local sequence length. The upstream Sol kernel is unchanged.
 
 The v1 sparse call uses tau1.0, exact threshold statistics, one KV split and a
 prefix sink. The protected query prefix is recomputed with a resolved dense
@@ -78,7 +78,7 @@ main transformer blocks. There is one DiT forward per evaluation, with no CFG
 pass multiplier.
 
 For H3's 50 main blocks and two refiner blocks, expected successful wrapper call
-counts per rank (excluding construction/warmup) are:
+counts per GPU (excluding construction/warmup) are:
 
 | Initial dense evaluations | sparse | dense_prefix | dense_step | dense_path |
 |---|---:|---:|---:|---:|
@@ -87,7 +87,7 @@ counts per rank (excluding construction/warmup) are:
 | 8 or 10 | 0 | 0 | 384 | 32 |
 
 `dense_prefix` is additional work within each sparse call, not a second complete
-DiT attention. Report each rank separately when evaluating context parallelism.
+DiT attention. Report each GPU separately when evaluating context parallelism.
 
 This starts from the zero-based dense-step/layer gates in the
 [qualified NVIDIA H3 integration](https://github.com/NVlabs/Sana/blob/8e0db4fa562d727ea28b8d63015c196db7d97cae/models/minimax_h3/GB200/sol_attn_h3.py).

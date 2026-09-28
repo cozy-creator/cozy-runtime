@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.accel import DeviceMemory
+from cozy_runtime.internal.execution_evidence import gpu_name, gpu_names
 from cozy_runtime.internal.executor_commands import Vacate
 from cozy_runtime.internal.worker import child
 from cozy_runtime.internal.worker.child import ExecutorGone
@@ -253,11 +254,12 @@ class MemoryManager:
         self.note(
             "residency",
             f"{lane.lane_id}: {victim!r} (epoch {executor.epoch} pid {executor.pid}) vacated "
-            + (f"ranks {list(ranks)} " if ranks else "")
+            + (f"{gpu_names([lane.entries[r] for r in ranks])} " if ranks else "")
             + f"for {slot!r} on {why}: "
             + ", ".join(
-                f"device {o} {before[o].free_bytes} -> {after[o].free_bytes} B free"
-                for o in lane.ordinals
+                f"{gpu_name(lane.entries, i)} "
+                f"{before[o].free_bytes} -> {after[o].free_bytes} B free"
+                for i, o in enumerate(lane.ordinals)
                 if o in before and after[o].state == "measured"
             ),
         )

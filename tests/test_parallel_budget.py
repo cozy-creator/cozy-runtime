@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from cozy_runtime.internal.parallel.group import RankGroup, receive_residence
-from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDivergence
+from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 from cozy_runtime.internal.seam import Channel
 
 PLAN = GroupPlan(2, ("0", "1"), "sha256:" + "a" * 64, 98091614208).document()
@@ -95,7 +95,7 @@ def test_residence_agreement_over_real_follower_processes(
             if mode == "early_failure":
                 assert "device_shortfall" in str(refused.value)
             if mode == "divergent":
-                assert isinstance(refused.value, RankDivergence)
+                assert isinstance(refused.value, GpuDivergence)
                 assert "plan_digest" in str(refused.value)
             assert not needs, "nothing parks before every plan agrees"
             return
@@ -144,7 +144,8 @@ def test_follower_refuses_invalid_or_larger_decision(
         leader.send(park or {"cmd": "resident_budget", "model": "base", "park": []})
         if ceiling is not None:
             leader.send(ceiling)
-        with pytest.raises(RankDivergence, match=f"invalid group .*{match}"):
+        refusal = f"^gpu_divergence: GPU 1 disagrees .*invalid group .*{match}"
+        with pytest.raises(GpuDivergence, match=refusal):
             receive_residence(
                 follower,
                 rank=1,

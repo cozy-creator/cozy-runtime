@@ -113,7 +113,7 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "multicast by default on NVSwitch hosts, binding it needs a privilege our containers "
         "lack, and the first all-to-all then dies with CUDA error 401. Ulysses never uses "
         "it. Erased then imposed, so no image or operator export can turn it back on; the "
-        "executor's every rank refuses to form a communicator under any other value",
+        "executor's process on every GPU refuses to form a communicator under any other value",
     ),
     ProjectedVar(
         "PYTORCH_CUDA_ALLOC_CONF",

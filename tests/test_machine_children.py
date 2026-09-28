@@ -914,6 +914,14 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     assert all(row["pid"] > 0 and row["started_ticks"] > 0 for row in invoked)
                     assert all(row["ranks"] and row["reusable"] for row in released)
                     assert all(not row["reuse_miss_reason"] for row in released)
+                    # Each attempt's execution record names its processes by GPU (`gpus`,
+                    # what triage and the GPU release carry), beside the older `ranks`.
+                    executed = [a.execution for a in worker.engine.history.values() if a.execution]
+                    assert executed and all(
+                        [g["pid"] for g in e["gpus"]] == [r["pid"] for r in e["ranks"]]
+                        and all(g["gpu"] == -1 and "rank" not in g for g in e["gpus"])
+                        for e in executed
+                    ), executed
                 if case == "serving":
                     # Every settled call is on the root's journal, grandchildren included:
                     # its function, the author's label, its status and where its time went.

@@ -143,9 +143,9 @@ from cozy_runtime.internal.parallel.group import (
 )
 from cozy_runtime.internal.parallel.mirror import mirror_component
 from cozy_runtime.internal.parallel.plan import (
+    GpuDivergence,
     GroupPlan,
     GroupRefusal,
-    RankDivergence,
     rank_invariant_digest,
 )
 from cozy_runtime.internal.residency import (
@@ -201,6 +201,11 @@ def _sealed_entries() -> tuple[str, ...]:
         for entry in _SEALED.get("CUDA_VISIBLE_DEVICES", "").split(",")
         if entry.strip()
     )
+
+
+def _gpu(rank: int) -> str:
+    """How people name the GPU group process `rank` drives: `GPU 3`, nvidia-smi's number."""
+    return execution_evidence.gpu_name(_sealed_entries(), rank)
 
 
 def _qualification_cache() -> str:
@@ -850,7 +855,7 @@ class Executor:
     def join(self, command: Join) -> dict[str, Any]:
         """A FOLLOWER joins rank 0's store and forms its half of the process group."""
         if self.rank == 0:
-            return {"ok": False, "code": "not_a_follower", "detail": "rank 0 forms the group"}
+            return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         _restore_seal()
@@ -878,7 +883,8 @@ class Executor:
             return {
                 "ok": False,
                 "code": "group_unformed",
-                "detail": f"rank {self.rank} could not join: {type(exc).__name__}: {exc}"[:900],
+                "detail": f"{_gpu(self.rank)} could not join the group: "
+                f"{type(exc).__name__}: {exc}"[:900],
                 "traceback": prepare_diagnostics.exception_trace(exc),
             }
         return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
@@ -890,7 +896,7 @@ class Executor:
             return {
                 "ok": False,
                 "code": "not_a_follower",
-                "detail": "rank 0 mirrors, it is not mirrored",
+                "detail": f"{_gpu(0)} leads the group's calls; it is not sent them",
             }
         if not self.ready or self.torch is None:
             return {"ok": False, "code": "executor_not_ready", "detail": "no generation is Ready"}
@@ -904,7 +910,7 @@ class Executor:
         ):
             return {
                 "ok": False,
-                "code": "rank_divergence",
+                "code": "gpu_divergence",
                 "detail": "component identity is not a model/root pair",
             }
         name = (named[0], named[1])
@@ -915,8 +921,8 @@ class Executor:
             self.poisoned = "mirrored call names no prepared sharded component"
             return {
                 "ok": False,
-                "code": "rank_divergence",
-                "detail": f"rank {self.rank} holds no sharded component {name!r}",
+                "code": "gpu_divergence",
+                "detail": f"{_gpu(self.rank)} holds no sharded component {name!r}",
                 "rank": self.rank,
             }
         _model, component = target
@@ -1278,8 +1284,8 @@ class Executor:
             return {
                 "ok": False,
                 "code": "sequence_parallel_degree_mismatch",
-                "detail": f"the start names degree {degree}; this process is rank "
-                f"{self.rank} of a world of {self.world} sealed to "
+                "detail": f"the start names {degree} GPU(s); this process drives "
+                f"{_gpu(self.rank)} of a {self.world}-GPU group sealed to "
                 f"{len(_sealed_entries())} device(s) ({sealed_devices!r})",
             }
         _restore_seal()
@@ -1326,6 +1332,7 @@ class Executor:
                         python=sys.executable,
                         root=str(self.root),
                         forward=self.channel.send,
+                        devices=_sealed_entries(),
                     )
                 if not self.group.followers:
                     self.group.spawn()
@@ -1364,7 +1371,7 @@ class Executor:
                 for follower, reply in zip(self.group.followers, replies, strict=True):
                     if not reply.get("ok"):
                         raise GroupRefusal(
-                            f"rank {follower.rank} refused the start: {reply.get('code')}: "
+                            f"{follower.gpu} refused the start: {reply.get('code')}: "
                             f"{reply.get('detail', '')}"[:800],
                             code="group_unformed",
                         )
@@ -1606,8 +1613,8 @@ class Executor:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         key, model_key = command.construction, command.model_key
         if not key or (model_key is UNSET and key in self.constructions):
-            self.poisoned = "rank divergence"
-            return self._refusal("rank_divergence", "rank 0 loaded an unnamed or loaded key")
+            self.poisoned = "GPU divergence"
+            return self._refusal("gpu_divergence", f"{_gpu(0)} loaded an unnamed or loaded key")
         if model_key is UNSET:
             child = self._construction_child(key)
             reply = child._prepare_first(command)
@@ -1621,7 +1628,7 @@ class Executor:
             container = self._construction_child(key)
         if any(member._group_model_key == model_key for member in container.model_executors):
             self.poisoned = "group model identity changed or was prepared twice"
-            return self._refusal("rank_divergence", self.poisoned)
+            return self._refusal("gpu_divergence", self.poisoned)
         member = container._construction_child(key)
         member._group_parent = container
         container.model_executors.append(member)
@@ -1648,7 +1655,9 @@ class Executor:
         """Park exactly these constructions (a follower obeying rank 0's decision)."""
         for key in keys:
             if key not in self.arbiter.rows:
-                raise GroupRefusal(f"rank 0 parked {key!r}, which this rank never loaded")
+                raise GroupRefusal(
+                    f"{_gpu(0)} parked {key!r}, which {_gpu(self.rank)} never loaded"
+                )
             self._synchronize()
             self.arbiter.park(key)
 
@@ -1902,8 +1911,8 @@ class Executor:
             return {
                 "ok": False,
                 "code": "sequence_parallel_degree_mismatch",
-                "detail": f"the load names degree {degree}; this process is rank "
-                f"{self.rank} of a world of {self.world} sealed to "
+                "detail": f"the load names {degree} GPU(s); this process drives "
+                f"{_gpu(self.rank)} of a {self.world}-GPU group sealed to "
                 f"{len(_sealed_entries())} device(s) ({sealed_devices!r})",
             }
         if self.rank > 0:
@@ -1915,16 +1924,16 @@ class Executor:
                 self.world,
                 _sealed_entries(),
             ):
-                self.poisoned = "rank divergence"
+                self.poisoned = "GPU divergence"
                 return {
                     "ok": False,
-                    "code": "rank_divergence",
-                    "detail": f"rank {self.rank} is sealed to {list(_sealed_entries())} in a "
-                    f"world of {self.world}; rank 0 broadcast "
+                    "code": "gpu_divergence",
+                    "detail": f"{_gpu(self.rank)} is sealed to {list(_sealed_entries())} in a "
+                    f"{self.world}-GPU group; {_gpu(0)} broadcast "
                     + (
                         "no hardware plan"
                         if hardware is UNSET
-                        else f"degree {hardware.degree} over {list(hardware.devices)}"
+                        else f"{hardware.degree} GPUs over {list(hardware.devices)}"
                     ),
                     "rank": self.rank,
                 }
@@ -1940,7 +1949,7 @@ class Executor:
             return {
                 "ok": False,
                 "code": "group_unformed",
-                "detail": "a group load needs a started process whose ranks have joined",
+                "detail": "a group load needs a started process whose GPUs have joined",
             }
         if command.models is not UNSET:
             return self._prepare_many(command, command.models)
@@ -2609,7 +2618,7 @@ class Executor:
                     code = str(reply.get("code") or "group_unformed")
                     return self._group_refusal(
                         GroupRefusal(
-                            f"rank {follower.rank} refused the prepare: {code}: "
+                            f"{follower.gpu} refused the prepare: {code}: "
                             f"{reply.get('detail', '')}"[:800],
                             code=code if code in _GROUP_CODES else "group_unformed",
                         )
@@ -2629,10 +2638,10 @@ class Executor:
                 for key, ours, other in agreed:
                     if other != ours:
                         return self._group_refusal(
-                            RankDivergence(
-                                follower.rank,
+                            GpuDivergence(
+                                follower.gpu,
                                 key,
-                                f"rank 0 built {ours!r}, rank {follower.rank} built {other!r}",
+                                f"{_gpu(0)} built {ours!r}, {follower.gpu} built {other!r}",
                             )
                         )
             refused = self._agree_attention(applied)
@@ -3619,10 +3628,10 @@ class Executor:
         for follower, reply in zip(self.group.followers, replies, strict=True):
             if not reply.get("ok") or reply.get("hosts") != applied.hosts:
                 return self._group_refusal(
-                    RankDivergence(
-                        follower.rank,
+                    GpuDivergence(
+                        follower.gpu,
                         "attention",
-                        f"rank 0 prepared {applied.hosts}, rank {follower.rank} holds "
+                        f"{_gpu(0)} prepared {applied.hosts}, {follower.gpu} holds "
                         f"{reply.get('hosts')} {reply.get('code', '')} {reply.get('detail', '')}",
                     )
                 )
@@ -3635,7 +3644,7 @@ class Executor:
         members = (container.model_executors or [container]) if container is not None else []
         target = next((m for m in members if m._group_model_key == command.model_key), None)
         if self.rank == 0 or target is None or target.backend is None:
-            return {"ok": False, "code": "rank_divergence", "detail": "no such construction"}
+            return {"ok": False, "code": "gpu_divergence", "detail": "no such construction"}
         roots = {**target.backend.components, **target.backend.parked}
         held = attention.observed(roots).hosts
         try:
@@ -3644,13 +3653,13 @@ class Executor:
                     continue
                 if component not in roots or target.device_facts is None:
                     raise attention.AttentionRefusal(
-                        "attention_kernel_unsupported", f"rank {self.rank} holds no {component}"
+                        "attention_kernel_unsupported", f"{_gpu(self.rank)} holds no {component}"
                     )
                 attention.plan(
                     target.device_facts, {component: roots[component]}, name, self.world
                 ).apply()
                 print(
-                    f"[attention] rank {self.rank} {component}: took rank 0's {name} over "
+                    f"[attention] {_gpu(self.rank)} {component}: took {_gpu(0)}'s {name} over "
                     f"its own {sorted(held.get(component) or ())}",
                     file=sys.stderr,
                     flush=True,
@@ -3673,7 +3682,7 @@ class Executor:
             return {"ok": True, "rank": self.rank}
         target = self.constructions.get(command.construction)
         if self.rank == 0 or target is None:
-            return {"ok": False, "code": "rank_divergence", "detail": "no such construction"}
+            return {"ok": False, "code": "gpu_divergence", "detail": "no such construction"}
         pin = command.pin
         try:
             swap = target._attention_plan(pin) if pin else None
@@ -3693,7 +3702,7 @@ class Executor:
         )
         replies = self.group.collect("attention")
         for reply in (reply for reply in replies if not reply.get("ok")):
-            detail = f"rank {reply.get('rank')}: {reply.get('detail', '')}"[:900]
+            detail = f"{_gpu(int(reply.get('rank', -1)))}: {reply.get('detail', '')}"[:900]
             raise InvalidRequest(detail, code=str(reply.get("code")))
         return replies
 
@@ -3709,8 +3718,9 @@ class Executor:
         try:
             held = {r["rank"]: r["hosts"] for r in self._followers_attention(pin=pin)}
             if diverged := sorted(r for r, hosts in held.items() if hosts != applied.hosts):
-                detail = f"ranks {diverged} do not hold rank 0's {applied.hosts}"[:900]
-                raise InvalidRequest(detail, code="attention_rank_divergence")
+                gpus = ", ".join(_gpu(rank) for rank in diverged)
+                detail = f"{gpus} do not hold {_gpu(0)}'s {applied.hosts}"[:900]
+                raise InvalidRequest(detail, code="attention_gpu_divergence")
             yield
         finally:
             self._followers_attention()
@@ -4327,7 +4337,7 @@ class Executor:
                     reply = self.group.reply_one(rank, "vacate")
                     if not reply.get("ok"):
                         raise GroupRefusal(
-                            f"rank {rank} refused to vacate: {reply.get('code')}: "
+                            f"{_gpu(rank)} refused to vacate: {reply.get('code')}: "
                             f"{reply.get('detail', '')}"[:600],
                             code="group_broken",
                         )
@@ -4633,7 +4643,7 @@ _TRACED_COMMANDS = frozenset({"start", "load", "join"})
 
 #: A follower's refusal codes rank 0 relays as-is; any other refusal is the group not
 #: forming, named with the follower's own detail.
-_GROUP_CODES = frozenset({"rank_divergence", "context_parallel_unavailable", "group_broken"})
+_GROUP_CODES = frozenset({"gpu_divergence", "context_parallel_unavailable", "group_broken"})
 
 
 def _remember_distributions() -> None:
@@ -4709,7 +4719,7 @@ def main(argv: list[str] | None = None) -> int:
                 reply = {
                     "ok": False,
                     "code": "follower_command_unsupported",
-                    "detail": f"rank {executor.rank} answers {sorted(_FOLLOWER_COMMANDS)}, "
+                    "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, "
                     f"not {name!r}",
                 }
             elif name == "run":
