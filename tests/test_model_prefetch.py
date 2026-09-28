@@ -176,12 +176,15 @@ def test_a_queued_hint_holds_nothing_and_work_under_way_is_named() -> None:
     queue = Preparations[bytes]()
     go = threading.Event()
     worker = idle_worker(queue)
+
+    def prepare(_cancelled: Callable[[], bool]) -> bytes:
+        go.wait(5)
+        return b""
+
     try:
-        demanded = queue.request(
-            "model-a", "caller", lambda _: go.wait(5) and b"", speculative=False
-        )
-        queue.request("model-c", "caller", lambda _: go.wait(5) and b"", speculative=False)
-        queue.request("model-b", "parent", lambda _: go.wait(5) and b"", speculative=True)
+        demanded = queue.request("model-a", "caller", prepare, speculative=False)
+        queue.request("model-c", "caller", prepare, speculative=False)
+        queue.request("model-b", "parent", prepare, speculative=True)
         deadline = time.monotonic() + 5
         while len(queue.started()) < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
