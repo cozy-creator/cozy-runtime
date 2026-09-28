@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -80,6 +81,82 @@ class Prepared:
     defaults: list[dict[str, Any]]
     access: contextlib.ExitStack
     generation: int = 0  # `store_gc.generation` when its bytes were verified
+
+
+class _Compatibility:
+    """The model compatibility check of a fresh preparation (run 1510). It needs each
+    checkpoint's head (manifest, header and asset segments) and the installation, never the
+    weight bytes, so it runs as soon as the heads are held, beside the rest of the download."""
+
+    def __init__(
+        self,
+        check: Callable[[], pb.PreparePackageSetResult],
+        heads: list[str],
+        store_root: Path,
+        cancel: Callable[[], None],
+    ) -> None:
+        self.check, self.heads, self.store_root, self.cancel = check, heads, store_root, cancel
+        self.changed = threading.Condition()
+        self.landed = self.stopped = False
+        self.result: pb.PreparePackageSetResult | None = None
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(target=self._run, name="model-compatibility", daemon=True)
+        self.thread.start()
+
+    def poke(self, landed: bool = False) -> None:
+        """New bytes landed (or all of them): look at the heads again."""
+        with self.changed:
+            self.landed = self.landed or landed
+            self.changed.notify_all()
+
+    def _held(self) -> bool:
+        tensorfs, store = fill.tensorfs_module(), fill.store(self.store_root)
+        for digest in self.heads:
+            try:
+                header = store.manifest(digest)["header"]
+                if header is None:
+                    return False
+                segments = sorted(
+                    {
+                        ("sha256:" + str(row["sha256"]), int(row["length"]))
+                        for asset in tensorfs.parse_header(header).get("assets", {}).values()
+                        for row in asset.get("segments", [])
+                    }
+                )
+                if segments:
+                    store.acquire(digest, segments).release()
+            except Exception:  # not landed yet
+                return False
+        return True
+
+    def _run(self) -> None:
+        try:
+            with self.changed:
+                while not (self.stopped or self.landed or self._held()):
+                    self.changed.wait()
+                if self.stopped:
+                    return
+            self.result = self.check()
+        except BaseException as exc:
+            self.error = exc
+            self.cancel()  # the download cannot be used: stop it
+
+    def stop(self) -> BaseException | None:
+        """End a check the download did not complete for: a waiting one never runs, a running
+        one finishes. Its own refusal, if it failed, is why the download stopped."""
+        with self.changed:
+            self.stopped = True
+            self.changed.notify_all()
+        self.thread.join()
+        return self.error
+
+    def join(self) -> pb.PreparePackageSetResult:
+        self.poke(landed=True)
+        self.thread.join()
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
 
 
 class Serving:
@@ -595,13 +672,54 @@ class Serving:
                 } == expected:
                     matched = candidate
                     break
-            machine_model_defaults.materialize(
-                worker,
-                defaults,
-                access if matched is None else None,
-                downloading=lambda: self.phase(call, request, "Downloading model weights"),
-                cancellation=cancellation,
-                progress=lambda available, total: self._progress(
+            check: _Compatibility | None = None
+            if matched is None:
+                installed = package_installation.open_installation(
+                    Path(worker.options.install_root or ""),
+                    target.installation_id,
+                )
+                if cancellation is None:
+                    cancellation = fill.tensorfs_module().PullCancellation()
+
+                def verified(digest: str, length: int, path: Path) -> None:
+                    worker.verified_artifacts.record(digest, length, path)
+
+                def compatible() -> pb.PreparePackageSetResult:
+                    with (
+                        worker.preparation_lock,
+                        self.phase(call, request, "Checking model compatibility"),
+                    ):
+                        native.sort(key=lambda model: model.slot)
+                        return package_prepare.prepare_model_placement(
+                            native_models=native,
+                            models=[
+                                {
+                                    "package": (prepared.get("package") or prepared["development"])[
+                                        "package"
+                                    ],
+                                    "slot": target.entrypoint + ".models." + row["parameter"],
+                                    "model": row["repository"],
+                                    "manifest": row["manifest"]["digest"],
+                                    "manifest_length": row["manifest"]["length"],
+                                }
+                                for row in defaults
+                            ],
+                            prepared=prepared,
+                            installed=installed,
+                            artifact_cache=Path(worker.options.artifact_cache or ""),
+                            tensorfs_root=workspace.store_root,
+                            verified=verified,
+                        )
+
+                check = _Compatibility(
+                    compatible,
+                    [row["manifest"]["digest"] for row in defaults],
+                    workspace.store_root,
+                    cancellation.cancel,
+                )
+
+            def progress(available: int, total: int) -> None:
+                self._progress(
                     call,
                     request,
                     {
@@ -610,44 +728,29 @@ class Serving:
                         "position": available,
                         "total": total,
                     },
-                ),
-            )
-            if cancellation is not None and cancellation.cancelled:
-                raise WorkspaceRefusal("model preparation canceled")
-            if matched is not None:
-                return Prepared(matched, defaults, access)
-            installed = package_installation.open_installation(
-                Path(worker.options.install_root or ""),
-                target.installation_id,
-            )
-            with worker.preparation_lock, self.phase(call, request, "Checking model compatibility"):
+                )
+                if check is not None:
+                    check.poke()
+
+            try:
+                machine_model_defaults.materialize(
+                    worker,
+                    defaults,
+                    access if matched is None else None,
+                    downloading=lambda: self.phase(call, request, "Downloading model weights"),
+                    cancellation=cancellation,
+                    progress=progress,
+                )
                 if cancellation is not None and cancellation.cancelled:
                     raise WorkspaceRefusal("model preparation canceled")
-
-                def verified(digest: str, length: int, path: Path) -> None:
-                    worker.verified_artifacts.record(digest, length, path)
-
-                native.sort(key=lambda model: model.slot)
-                result = package_prepare.prepare_model_placement(
-                    native_models=native,
-                    models=[
-                        {
-                            "package": (prepared.get("package") or prepared["development"])[
-                                "package"
-                            ],
-                            "slot": target.entrypoint + ".models." + row["parameter"],
-                            "model": row["repository"],
-                            "manifest": row["manifest"]["digest"],
-                            "manifest_length": row["manifest"]["length"],
-                        }
-                        for row in defaults
-                    ],
-                    prepared=prepared,
-                    installed=installed,
-                    artifact_cache=Path(worker.options.artifact_cache or ""),
-                    tensorfs_root=workspace.store_root,
-                    verified=verified,
-                )
+            except BaseException:
+                if check is not None and (failed := check.stop()) is not None:
+                    raise failed from None
+                raise
+            if check is None:
+                assert matched is not None
+                return Prepared(matched, defaults, access)
+            result = check.join()
             return Prepared(
                 dict(
                     documents.read(

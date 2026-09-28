@@ -14,6 +14,7 @@ import dataclasses
 import json
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +35,7 @@ from cozy_runtime.internal.worker import (
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
 from cozy_runtime.internal.worker.session import Worker
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -843,3 +845,76 @@ def test_a_roots_download_progress_reaches_its_submitter(
         catalog.close()
     assert receipt.request_id == "downloading"
     assert ("downloading model weights", f"{1 << 30} {4 << 30}") in answers, answers
+
+
+def test_the_compatibility_check_overlaps_the_weight_download(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The model compatibility check needs the checkpoint heads and the installation, never
+    the weight bytes: it runs beside the download, so preparing takes about the longer of the
+    two, not their sum (run 1510). A check that fails stops the download and is the answer."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    raw = tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+    catalog = Catalog(
+        machine.manifest, None, [{"gpu": "H100", "lane": LANE}], raw, interface=machine.interface
+    )
+    catalog.serve(machine)
+    spans: dict[str, tuple[float, float]] = {}
+    refuse = threading.Event()
+    check = package_prepare.prepare_model_placement
+
+    def slow_check(**kwargs: Any) -> Any:
+        began = time.monotonic()
+        time.sleep(1.5)  # the package environment's placement check
+        if refuse.is_set():
+            spans["check"] = (began, time.monotonic())
+            raise package_prepare.PreparationRefusal("model_placement_incompatible", "no fit")
+        answer = check(**kwargs)
+        spans["check"] = (began, time.monotonic())
+        return answer
+
+    def slow_download(
+        worker: Any,
+        rows: Any,
+        access: Any,
+        *,
+        cancellation: Any = None,
+        progress: Any = None,
+        downloading: Any = None,
+    ) -> None:
+        began = time.monotonic()
+        for step in range(15):  # 1.5 s of weights, reported as they land
+            if cancellation is not None and cancellation.cancelled:
+                spans["download"] = (began, time.monotonic())
+                raise WorkspaceRefusal("captured Model default materialization refused: CANCELLED")
+            if progress is not None:
+                progress(step, 15)
+            time.sleep(0.1)
+        spans["download"] = (began, time.monotonic())
+
+    monkeypatch.setattr(package_prepare, "prepare_model_placement", slow_check)
+    monkeypatch.setattr(machine_model_defaults, "materialize", slow_download)
+    try:
+        # First, while no placement is prepared: a check that refuses stops the download.
+        refuse.set()
+        with pytest.raises(Refused, match="model_placement_incompatible"):
+            submit(machine, submission(machine, "incompatible"))
+        assert spans["download"][1] < spans["check"][1] + 0.5, "the download ran past the refusal"
+        spans.clear()
+        refuse.clear()
+        receipt, _ = submit(machine, submission(machine, "overlapped"))
+        assert receipt.request_id == "overlapped"
+        (check_began, check_ended), (download_began, download_ended) = (
+            spans["check"],
+            spans["download"],
+        )
+        # Together they take about the longer one: 1.5 s each, never back to back.
+        window = max(check_ended, download_ended) - min(check_began, download_began)
+        assert window < 2.4, f"the check and the download took {window:.2f} s: one after the other"
+    finally:
+        catalog.close()
