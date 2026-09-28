@@ -1,0 +1,1 @@
+A settled child call is a `call` entry on its root execution's log: its function, the author's label, status, and its attempt's stages and step timings. A triage row carrying a `position` coalesces per stream and never sheds a record; bundles carry those samples as `streams`.

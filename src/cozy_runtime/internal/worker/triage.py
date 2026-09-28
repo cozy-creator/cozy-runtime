@@ -97,16 +97,19 @@ class Assembly(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     liveness: list[dict[str, Json]]
     events: list[dict[str, Json]]
     caps: dict[str, Json]
+    #: the latest sample of each narrated stream (`EventRing.streams`), never a record
+    streams: list[dict[str, Json]] = []
 
     def build(self, limit: int = MAX_BUNDLE_BYTES) -> bytes:
-        """Assemble and TRIM to the wire cap, shedding OLDEST observations first.
+        """Assemble and TRIM to the wire cap, shedding stream samples and then the OLDEST
+        observations first.
 
         The trim measures the real canonical bytes rather than estimating them: the cap is a
         protocol fact and an estimate that is wrong by one byte produces a terminal nobody
         can accept. What is shed is recorded in `caps`, because a bundle that quietly lost
         its tail is worse than one that says how much it lost.
         """
-        events = list(self.events)
+        streams, events = list(self.streams), list(self.events)
         shed = 0
         while True:
             caps = {
@@ -115,13 +118,17 @@ class Assembly(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
                 "max_bundle_bytes": MAX_BUNDLE_BYTES,
                 "truncated": bool(shed or self.caps.get("dropped", 0)),
             }
-            document = msgspec.structs.replace(self, events=events, caps=caps)
+            document = msgspec.structs.replace(self, streams=streams, events=events, caps=caps)
             try:
                 data = canonical.write(msgspec.to_builtins(document))
             except canonical.CanonicalError as exc:
                 raise TriageError("bundle_uncanonical", str(exc)) from exc
             if len(data) <= limit:
                 return data
+            if streams:
+                shed += len(streams)
+                streams = []
+                continue
             if not events:
                 raise TriageError(
                     "bundle_irreducible",

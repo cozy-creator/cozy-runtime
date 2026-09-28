@@ -64,6 +64,8 @@ class Call:
     result: bytes
     safe_code: str
     safe_detail: str
+    #: when the parent called: the call's start on its root's timeline
+    created_ms: int = 0
 
     def plan(self) -> CallPlan:
         return canonical_json.decode_as(self.prepared, CallPlan)

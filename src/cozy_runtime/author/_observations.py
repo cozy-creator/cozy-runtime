@@ -10,7 +10,9 @@ second event type anywhere; a new kind is a line in `KINDS`, not a new class.
 
 **One ring.** `EventRing` is bounded by COUNT and by BYTES, sheds oldest first, and counts
 what it shed. A flood cannot evict the cap itself, and the drop count is on the record — a
-bundle that silently lost half its tail would be worse than one that says it did.
+bundle that silently lost half its tail would be worse than one that says it did. A row that
+carries a `position` samples a narrated stream (a prefetch's download): it replaces that
+stream's previous sample in a lane of its own, so no rate of narration sheds a record.
 
 **One accumulator, and progress is NOT in the ring.** Progress frames are the lossy live
 lane; ringing 4,096 of them would evict every log an operator needs. Their bounded durable
@@ -72,6 +74,8 @@ MAX_TRACKS = 32
 ROW_OVERHEAD = 96
 #: Per-step points a step track keeps, first come; a longer schedule counts the rest.
 MAX_SERIES = 512
+#: Narrated streams the ring keeps a latest sample of; the least recent one sheds first.
+MAX_STREAMS = 32
 
 #: Value shapes that carry credentials — signed URLs and the common bearer/key spellings.
 _SECRET_VALUE = re.compile(
@@ -115,6 +119,14 @@ class Observation:
     at_unix_ms: int = 0
     seq: int = 0
 
+    @property
+    def stream(self) -> str:
+        """The narrated stream a row carrying a `position` samples, else "". A later
+        sample of its stream supersedes it."""
+        if "position" not in self.fields:
+            return ""
+        return f"{self.name} {self.fields.get('stage') or ''}"
+
     def held_bytes(self) -> int:
         """This row's memory footprint, by its own text lengths plus fixed overhead."""
         total = ROW_OVERHEAD + len(self.kind) + len(self.name)
@@ -146,16 +158,19 @@ class Observation:
 
 @dataclass(slots=True)
 class EventRing:
-    """A bounded, oldest-first-shedding record of one attempt's observations."""
+    """A bounded, oldest-first-shedding record of one attempt's observations, beside the
+    latest sample of each narrated stream."""
 
     #: the opaque attempt correlation every row is stamped with
     subject: str = ""
     max_events: int = MAX_EVENTS
     max_bytes: int = MAX_RING_BYTES
     events: deque[Observation] = field(default_factory=deque)
+    streams: dict[str, Observation] = field(default_factory=dict)
     held: int = 0
     admitted: int = 0
     dropped: int = 0
+    coalesced: int = 0
     refused: int = 0
     redactions: int = 0
     truncated: int = 0
@@ -223,8 +238,9 @@ class EventRing:
         return redacted
 
     def admit(self, observation: Observation) -> Observation:
-        """Admit a built record, shedding OLDEST first until both caps hold. The stamped
-        row is returned: its `seq` is what the worker de-duplicates the live lane by."""
+        """Admit a built record, shedding OLDEST first until both caps hold; a stream sample
+        replaces its stream's last one instead. The stamped row is returned: its `seq` is
+        what the worker de-duplicates the live lane by."""
         stamped = Observation(
             observation.kind,
             observation.name,
@@ -234,6 +250,13 @@ class EventRing:
             self.admitted + 1,
         )
         self.admitted += 1
+        if stamped.stream:
+            self.coalesced += self.streams.pop(stamped.stream, None) is not None
+            self.streams[stamped.stream] = stamped
+            if len(self.streams) > MAX_STREAMS:
+                del self.streams[next(iter(self.streams))]
+                self.dropped += 1
+            return stamped
         self.events.append(stamped)
         self.held += stamped.held_bytes()
         while self.events and (len(self.events) > self.max_events or self.held > self.max_bytes):
@@ -244,12 +267,17 @@ class EventRing:
     def rows(self) -> list[dict[str, Scalar | dict[str, Scalar]]]:
         return [event.document(self.subject) for event in self.events]
 
+    def stream_rows(self) -> list[dict[str, Scalar | dict[str, Scalar]]]:
+        return [event.document(self.subject) for event in self.streams.values()]
+
     def caps(self) -> dict[str, int]:
         """What the ring HELD and what it SHED — a lost tail is a fact, never a silence."""
         return {
             "kept": len(self.events),
             "admitted": self.admitted,
             "dropped": self.dropped,
+            "streams": len(self.streams),
+            "coalesced": self.coalesced,
             "refused": self.refused,
             "truncated": self.truncated,
             "redactions": self.redactions,
