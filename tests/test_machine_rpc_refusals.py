@@ -67,7 +67,14 @@ def test_noncanonical_execution_payload_is_a_known_refusal(owned: Worker) -> Non
 
     with pytest.raises(Aborted):
         rpc._call(CLAIM, _context(observed), unexpected)
-    assert observed[1] == (grpc.StatusCode.UNAVAILABLE, "machine execution operation failed")
+    assert observed[1] == (
+        grpc.StatusCode.UNAVAILABLE,
+        "machine execution operation failed (RuntimeError)",
+    )
+    notes = [event.step for event in owned.activity if event.kind == "machine_execution"]
+    assert notes[0] == "operation failed unexpectedly: RuntimeError"
+    assert any("in unexpected" in note for note in notes[1:]), notes
+    assert not any("private error contents" in note for note in notes), notes
 
 
 def test_lookup_distinguishes_absence_from_authority_workspace_and_storage_failure(
