@@ -39,7 +39,7 @@ import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env, package_installation
 from cozy_runtime.internal.config import Credentials, RuntimeConfig, package_install_environment
-from cozy_runtime.internal.worker import activity
+from cozy_runtime.internal.worker import activity, prespawn
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -522,3 +522,19 @@ def test_job_polls_a_finished_job_child(harness: Harness) -> None:
 def test_job_derives_adopts_and_reads_weights(harness: Harness) -> None:
     """ExecutionStorage's `weights_writer`: output and adopt in one child, source in another."""
     assert harness.run("derived", "derived", {"n": 4}) == {"value": 1, "runtime": harness.version}
+
+
+def test_the_warm_says_an_older_executor_reads_the_image_kernel_site(harness: Harness) -> None:
+    """Every Runtime here predates boot compile: it serves a compiled kernel only from the
+    image kernel site the machine fills (run 1525: H3 on 0.18.67 served SDPA on an image with
+    none). The kernel-compile phase says so from the executor's own hello."""
+    harness.serve("warm-note", "double", {"n": 1})
+    [executor] = [
+        hosted.supervision.current
+        for hosted in harness.worker.hosted.values()
+        if hosted.supervision.current is not None
+    ]
+    assert executor.hello["runtime_version"] == harness.version
+    note = prespawn._before_boot_compile(executor)
+    assert f"executor cozy-runtime {harness.version} (before 0.18.70)" in note, note
+    assert "from the image kernel site at its next construction" in note, note

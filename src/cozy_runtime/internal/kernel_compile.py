@@ -47,9 +47,9 @@ BUILDERS = {
     "sol": "cozy_runtime.internal.attention_sol:build",
     "fusion": "cozy_runtime.internal.fusion:build",
 }
-#: Compiler jobs one extension build runs, and so the cores one build slot stands for.
-#: Upstream's own `MAX_JOBS`, when the operator sets it, wins.
-JOBS = 4
+#: Kinds that run many compiler processes: one at a time on the machine, each as wide as the
+#: machine measures (`width`). The others are one Python process each and run at once.
+WIDE = frozenset({"setup"})
 _BOOT = (
     "import json, sys; boot = json.loads(sys.argv.pop(1)); sys.path[:] = boot['path']; "
     "sys.pycache_prefix = boot['pycache_prefix']; "
@@ -123,7 +123,8 @@ def status(store: kernel_cache.Store, job: Job) -> State:
     free = store.claim(key)
     if free is not None:
         os.close(free)
-        return State(key.kernel, "pending")
+        if not store.built_by_worker(key):
+            return State(key.kernel, "pending")
     live = live or {}
     progress, started = live.get("progress"), live.get("started_unix_ms")
     return State(
@@ -152,6 +153,46 @@ def submit(store: kernel_cache.Store, job: Job) -> State:
                 os.close(lock)
     current = status(store, job)
     return current if current.state != "pending" else State(job.key.kernel, "compiling")
+
+
+def in_order(
+    store: kernel_cache.Store,
+    jobs: Sequence[Job],
+    environment: Mapping[str, str],
+    done: Callable[[Job, State], None],
+) -> threading.Thread:
+    """The machine's own compiles, one after another in `jobs`' order (its priority), each
+    as wide as the machine. Every key nobody builds yet is claimed at once, so no executor
+    on this machine starts a second build of it while it waits its turn; `done` sees each
+    one ready or failed, and at once one another process already built or builds."""
+    queued: list[tuple[Job, int]] = []
+    for job in jobs:
+        lock = store.claim(job.key) if store.entry(job.key) is None else None
+        if lock is None:
+            continue
+        store.set_state(job.key, {"pid": os.getpid(), "progress": 0.0, "phase": "queued"})
+        queued.append((job, lock))
+
+    def run() -> None:
+        for job in jobs:
+            held = next((lock for queued_job, lock in queued if queued_job is job), None)
+            if held is not None:
+                try:
+                    with _GUARD:
+                        _STARTED[job.key.digest] = _spawn(store, job, held, environment)
+                except OSError as exc:
+                    store.set_state(job.key, None)
+                    done(job, State(job.key.kernel, "failed", detail=f"compile_unstarted: {exc}"))
+                    continue
+                finally:
+                    os.close(held)
+            with store.building(job.key):
+                pass
+            done(job, status(store, job))
+
+    thread = threading.Thread(target=run, name="machine-kernels", daemon=True)
+    thread.start()
+    return thread
 
 
 def learn(store: kernel_cache.Store, scope: str, job: Job) -> None:
@@ -190,7 +231,12 @@ def learned(store: kernel_cache.Store, scope: str) -> list[Job]:
     return jobs
 
 
-def _spawn(store: kernel_cache.Store, job: Job, lock: int) -> subprocess.Popen[bytes]:
+def _spawn(
+    store: kernel_cache.Store,
+    job: Job,
+    lock: int,
+    environment: Mapping[str, str] | None = None,
+) -> subprocess.Popen[bytes]:
     argv = [
         sys.executable,
         "-I",
@@ -214,7 +260,7 @@ def _spawn(store: kernel_cache.Store, job: Job, lock: int) -> subprocess.Popen[b
     ]
     process = subprocess.Popen(
         argv,
-        env={**config.inherited_environment(), **job.env},
+        env={**(config.inherited_environment() if environment is None else environment), **job.env},
         pass_fds=(lock,),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -273,35 +319,60 @@ def _record_failure(
 # --------------------------------------------------------------------- the builder process
 
 
-def jobs() -> int:
-    named = config.inherited_environment().get("MAX_JOBS", "")
-    return int(named) if named.isdigit() and int(named) > 0 else JOBS
+def width(unit_bytes: int) -> int:
+    """How many compiler processes one wide build runs: every CPU this process may use (its
+    affinity and its cgroup's quota), as far as the memory it may still take holds one
+    `unit_bytes` process each. Measured each build; the machine is the pod's."""
+    cpus = len(os.sched_getaffinity(0))
+    quota = _read("/sys/fs/cgroup/cpu.max").split()
+    if len(quota) == 2 and quota[0].isdigit() and quota[1].isdigit() and int(quota[1]):
+        cpus = min(cpus, -(-int(quota[0]) // int(quota[1])))
+    memory = [_meminfo("MemAvailable")]
+    limit, used = _read("/sys/fs/cgroup/memory.max"), _read("/sys/fs/cgroup/memory.current")
+    if limit.isdigit() and used.isdigit():
+        memory.append(int(limit) - int(used))
+    return max(1, min(cpus, min(memory) // unit_bytes))
+
+
+def _read(path: str) -> str:
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def _meminfo(field: str) -> int:
+    found = re.search(rf"^{field}:\s+(\d+) kB", _read("/proc/meminfo"), re.MULTILINE)
+    return int(found.group(1)) * 1024 if found else 0
+
+
+def machine_slot(namespace: Path, *, create: bool = False) -> Path:
+    """The build slot's lock file; the worker creates its own at boot for its executors."""
+    path = namespace / ".slots" / "0.lock"
+    if create:
+        path.parent.mkdir(mode=0o755, exist_ok=True)
+        os.close(os.open(path, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o644))
+    return path
 
 
 @contextlib.contextmanager
-def _slot(own: Path) -> Iterator[None]:
-    """One of the machine's `cores // jobs` build slots, waiting on a live builder if all are
-    taken. A slot is an flock, so a builder that dies frees it."""
-    directory = own / ".slots"
-    directory.mkdir(mode=0o755, exist_ok=True)
-    count = max(1, (os.cpu_count() or 1) // jobs())
-    fds = [
-        os.open(directory / f"{index}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
-        for index in range(count)
-    ]
+def _slot(store: kernel_cache.Store, kind: str) -> Iterator[None]:
+    """A wide build holds the machine's one build slot, waiting on a live builder that has
+    it; others need none. The slot lives in the worker's namespace when this process reads
+    one (an executor under uid isolation), so the machine has one; it is an flock, so a
+    builder that dies frees it."""
+    if kind not in WIDE:
+        yield
+        return
     try:
-        for fd in fds:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                continue
-            yield
-            return
-        fcntl.flock(fds[os.getpid() % count], fcntl.LOCK_EX)
+        fd = os.open(machine_slot(store.trusted or store.own), os.O_RDONLY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        fd = os.open(machine_slot(store.own, create=True), os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        for fd in fds:
-            os.close(fd)
+        os.close(fd)
 
 
 def run(
@@ -329,9 +400,10 @@ def run(
     tail: list[bytes] = []
     errors: list[bytes] = []  # a compiler's first errors, which a traceback tail buries
     written = [0]
-    # Units of every ninja run so far: a project that builds one extension after another
-    # starts a new `[1/N]` each time, so progress counts over all the units announced.
-    finished, current = [0], [0]
+    # Units of every ninja run so far: a project that builds several extensions, one after
+    # another or at once, starts a new `[1/N]` for each, so progress is the units done over
+    # all the units announced.
+    done, announced = [0], [0]
 
     def drain() -> None:
         assert process.stdout is not None
@@ -343,11 +415,10 @@ def run(
                 errors.append(line)
             found = _PROGRESS.match(line)
             if found and int(found.group(2)):
-                done, total = int(found.group(1)), int(found.group(2))
-                if done == 1 and current[0]:
-                    finished[0], current[0] = finished[0] + current[0], 0
-                current[0] = total
-                report((finished[0] + done) / (finished[0] + total))
+                done[0] += 1
+                if int(found.group(1)) == 1:
+                    announced[0] += int(found.group(2))
+                report(min(1.0, done[0] / max(announced[0], 1)))
 
     reader = threading.Thread(target=drain, daemon=True)
     reader.start()
@@ -387,17 +458,18 @@ def main(argv: list[str] | None = None) -> int:
     store = kernel_cache.Store(options.store, options.trusted)
     key = kernel_cache.Key.of(raw["kernel"], raw["inputs"])
     started, started_unix_ms = time.perf_counter(), round(time.time() * 1000)
-    last = [-1.0]
+    last = [(-1.0, "")]
 
     def report(progress: float, phase: str = "compiling") -> None:
-        if abs(progress - last[0]) >= 0.01 or phase != "compiling":
-            last[0] = progress
+        # A new phase is always written: the slot's taker must stop reading as queued.
+        if abs(progress - last[0][0]) >= 0.01 or phase != last[0][1]:
+            last[0] = (progress, phase)
             live = {"pid": os.getpid(), "started_unix_ms": started_unix_ms}
             store.set_state(key, {**live, "progress": progress, "phase": phase})
 
     report(0.0, "queued for a build slot")
     try:
-        with _slot(store.own):
+        with _slot(store, raw["kind"]):
             report(0.0)
             module, name = BUILDERS[raw["kind"]].split(":")
             build = getattr(import_module(module), name)

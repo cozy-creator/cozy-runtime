@@ -205,6 +205,26 @@ class Store:
             return None
         return fd
 
+    def built_by_worker(self, key: Key) -> bool:
+        """The worker's live builder holds this key: an executor under uid isolation reads
+        its lock without writing there, so it waits on the machine's build, never duplicates
+        it."""
+        if self.trusted is None:
+            return False
+        try:
+            fd = os.open(
+                self.trusted / key.kernel / f"{key.digest}.lock", os.O_RDONLY | os.O_CLOEXEC
+            )
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+        return False
+
     def _kernel_dir(self, key: Key) -> Path:
         kernel = self.own / key.kernel
         kernel.mkdir(mode=0o755, parents=True, exist_ok=True)

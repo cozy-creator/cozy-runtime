@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import msgspec
+from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import accel, package_installation, package_interface
 from cozy_runtime.internal.canonical import Json
@@ -275,6 +276,9 @@ class Prespawns:
                 for row in ranks
             ) or str(reply.get("skipped") or reply.get("detail") or "")
             ok = bool(reply.get("ok"))
+            detail = "; ".join(
+                part for part in (_before_boot_compile(executor) + detail, _machine(worker)) if part
+            )
         except ExecutorGone as exc:
             detail, ok = f"executor gone: {exc}"[:300], False
         self._phase("Starting kernel compiles", started, began, ok, slot, detail)
@@ -448,6 +452,31 @@ def _lane(worker: Worker, ordinals: Ordinals) -> DeviceLane:
 
 #: The priority an adopted process returns to: the worker's own.
 _WORKER = os.getpriority(os.PRIO_PROCESS, 0)
+
+
+#: The first Runtime whose executor compiles its kernels on the machine (e345e63c).
+BOOT_COMPILE = Version("0.18.70")
+
+
+def _before_boot_compile(executor: Executor) -> str:
+    """An older executor compiles nothing and reads only the image kernel site: its rows
+    say absent until the machine's build of a kernel lands there, and it takes one at its
+    next construction. The package's lock picks it."""
+    found = str(executor.hello.get("runtime_version", ""))
+    try:
+        if Version(found) >= BOOT_COMPILE:
+            return ""
+    except InvalidVersion:
+        return ""
+    return (
+        f"executor cozy-runtime {found} (before {BOOT_COMPILE}) takes each machine kernel "
+        "from the image kernel site at its next construction after it is ready; "
+    )
+
+
+def _machine(worker: Worker) -> str:
+    machine = worker.machine_kernels
+    return machine.line() if machine is not None else ""
 
 
 def _nice(executor: Executor, value: int) -> None:

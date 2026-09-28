@@ -89,14 +89,23 @@ Runtime never creates an unused processor attribute to claim partial coverage.
 
 Nothing is compiled on a builder. The worker image carries every kernel as pinned source
 (`python -m cozy_runtime.internal.kernel_sources fetch /opt/cozy/kernel-sources`: sources
-by commit or version and sha256, plus `index.json`) and the CUDA toolkit. At boot the
-prespawned executor's warm submits, for its card, every kernel of the model's preference
-and the ranked table to the compile manager (`internal/kernel_compile.py`): one niced
-background build per exact key (sources, arch, torch, CUDA, Python, compiler) per
-machine, published whole into `<root>/var/lib/cozy/kernels`, reused by every later
-executor and boot. Upstream's own `setup.py` detects the card; no source is patched.
-A build is ended only when its whole process tree stops burning CPU and writing output;
-a failure is recorded for that worker boot and retried at the next.
+by commit or version and sha256, plus `index.json`) and the CUDA toolkit. At worker boot,
+before any executor starts, the worker compiles the installed models' ladder for each card
+(`internal/machine_kernels.py`: Sol's Python sources, SageAttention2, FA3 on sm90), best
+first, through the compile manager (`internal/kernel_compile.py`): one niced build per exact
+key (sources, arch, torch, CUDA, Python, compiler) per machine, into the worker's store
+namespace that every executor reads. An extension build runs as many compiler processes as
+the machine's CPUs (affinity, cgroup quota) and memory (4 GiB each) allow, one such build at
+a time. An executor's warm submits what its model prefers too; a key the worker holds is
+compiling, never built twice. Upstream's own `setup.py` detects the card; no source is
+patched. A build is ended only when its whole process tree stops burning CPU and writing
+output; a failure is recorded for that worker boot and retried at the next.
+
+An executor is the Runtime its package locked. One before 0.18.70 compiles nothing and reads
+only the image kernel site, `/opt/cozy/kernels` (`internal/kernel_site.py`): the worker
+writes its manifest at boot and links each ready tree into it, and such an executor takes a
+kernel at its next construction after it lands, through its own probe. It never gets Sol off
+SM90 or the fused glue; relock the package for those.
 
 Selection serves a kernel only once it is compiled, imports and launches. One still
 compiling is skipped with its progress (`sageattention: compiling (42%)`), and the chain
