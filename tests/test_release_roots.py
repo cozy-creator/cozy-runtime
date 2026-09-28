@@ -29,6 +29,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal import canonical, hostfacts, storage_admission
 from cozy_runtime.internal.worker import (
     machine_model_defaults,
+    machine_model_resolve,
     machine_release_roots,
     package_prepare,
 )
@@ -37,6 +38,7 @@ from cozy_runtime.internal.worker.machine_publication import PublicationAuthorit
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
+from cozy_runtime.internal.worker.workspace_rpc import WorkspaceRPC
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_diffusers_upload_configs import PROFILE, _registry, _repository
@@ -303,13 +305,39 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
         desired = pb.DesiredWorkerState.FromString(base64.b64decode(preparation["state"]))
         assert desired.placement_set.execution_gpus == 0
 
-        # The identical warm root: no release read (each is immutable), no install, one call.
+        # The identical warm root reads nothing: its release, the owner's binding and the
+        # lane were read once for this installation. No install, one call.
         catalog.reads.clear()
         receipt = machine.rpc.SubmitMachineExecution(submission(machine, "second"), Context())
         assert receipt.request_id == "second" and len(installs) == 1
-        assert len(catalog.reads) == 2
+        assert catalog.reads == []
         replay = machine.rpc.SubmitMachineExecution(submission(machine, "second"), Context())
         assert replay == receipt
+
+        # The owner rebinds: the controller that did names the package, and the next root
+        # reads the binding and its lane once more. An explicit choice reads no binding.
+        class Forget(WorkspaceRPC):
+            workspace_service = machine.worker.workspace_service
+
+        def forget() -> int:
+            call = pb.ForgetPackageBindingsCall(claim=machine.claim, package=PACKAGE)
+            return Forget().WorkspaceForgetPackageBindings(call, Context()).forgotten  # type: ignore[arg-type]
+
+        assert forget() == 1
+        catalog.reads.clear()
+        submit(machine, submission(machine, "rebound"))
+        assert [urlsplit(path).path for path in catalog.reads] == [
+            "/v1/packages/cozytest/tenant/bindings",
+            "/v1/models/resolve",
+        ]
+        assert forget() == 1
+        catalog.reads.clear()
+        chosen = submission(machine, "chosen")
+        chosen.release_root.models.add(
+            parameter="model", repository=PACKAGE, release=RELEASE, lane=LANE
+        )
+        submit(machine, chosen)
+        assert [urlsplit(path).path for path in catalog.reads] == ["/v1/models/resolve"]
         # A checkpoint named by digest alone that this machine holds costs no catalog read.
         catalog.reads.clear()
         pinned = submission(machine, "pinned")
@@ -396,7 +424,9 @@ def test_an_unstated_manifest_length_is_measured_from_the_bytes_its_digest_names
         machine.tick()
         assert machine.executions.status(OWNER, "first").state in ("queued", "running")
 
+        # Measured afresh (a rebinding), bytes the digest does not name refuse the root.
         catalog.served = raw + b" "
+        machine.worker.resolutions.forget(PACKAGE)
         with pytest.raises(Refused, match="manifest bytes do not match"):
             submit(machine, submission(machine, "forged"))
     finally:
@@ -426,6 +456,7 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
                     capture=lambda *_: {"model_defaults": []},
                 ),
                 lanes=SimpleNamespace(entries=()),
+                resolutions=machine_model_resolve.Resolutions(),
             ),
         )
         call = cast(Call, SimpleNamespace(parent_request="root"))
@@ -436,7 +467,7 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
                 "default_ladder": [{"gpu": "*", "lane": f"tenant@{RELEASE}/{LANE}"}],
             }
             return Target(
-                "installation",
+                "installation-" + package.replace("/", "-"),
                 "touch",
                 {"models": [model]},
                 {"placement": {"package": {"package": package, "release": RELEASE}}},
@@ -467,6 +498,12 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
             "/v1/packages/cozytest/other/bindings",
             "/v1/models/resolve",
         ]
+        # The same installation's slot again reads nothing.
+        catalog.reads.clear()
+        assert machine_model_defaults.select(worker, "owner", call, child(PACKAGE), {}) == [
+            expected
+        ]
+        assert catalog.reads == []
         # A supplied Model is never resolved.
         catalog.reads.clear()
         assert (
@@ -588,7 +625,7 @@ def test_a_published_job_is_a_release_root_the_machine_mints(published: Machine)
 def test_a_roots_catalog_slots_resolve_beside_each_other(
     published: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The package's bindings are read once; its slots' lanes are then read at once."""
+    """Explicit choices read no binding; their lanes are read at once."""
     monkeypatch.setattr(
         hostfacts,
         "measure",
@@ -609,13 +646,12 @@ def test_a_roots_catalog_slots_resolve_beside_each_other(
     declaration = {"models": [{"path": SLOT}, {"path": "touch.models.second"}]}
     try:
         rows = machine_release_roots.ReleaseRoots(published.worker)._resolve(
-            root, declaration, {}, lambda *_: None
+            root, declaration, "installation", {}, lambda *_: None
         )
     finally:
         catalog.close()
     assert [row["parameter"] for row in rows] == ["model", "second"]
     assert [urlsplit(path).path for path in catalog.reads] == [
-        "/v1/packages/cozytest/tenant/bindings",
         "/v1/models/resolve",
         "/v1/models/resolve",
     ]
@@ -724,8 +760,10 @@ def test_the_owners_unpublished_checkpoint_resolves_with_the_worker_capability(
         ]
         assert all((who, token) == ("worker", "token") for _, who, token in catalog.presented)
 
+        # Resolved afresh (a rebinding), an ended grant is refused.
         catalog.presented.clear()
         catalog.serve(machine, token="ended")
+        machine.worker.resolutions.forget(PACKAGE)
         with pytest.raises(Refused, match=r"catalog answered 401 worker\.ended"):
             submit(machine, submission(machine, "ended"))
         assert catalog.presented == [("/v1/models/resolve", "worker", "ended")], catalog.presented

@@ -8,6 +8,7 @@ import grpc
 
 from cozy_runtime.internal.worker import (
     artifact_transfer,
+    machine_model_resolve,
     workspace_byte_outputs,
     workspace_input_trees,
     workspace_memo,
@@ -31,10 +32,12 @@ class Service:
         workspace: Workspace,
         authorize: Callable[[pb.Claim], str],
         ready: Callable[[pb.WeightsIntentReadyCall], pb.WeightsHostAck],
+        resolutions: machine_model_resolve.Resolutions,
         *,
         allow_private_egress: bool = False,
     ):
         self.workspace, self.authorize, self.ready = workspace, authorize, ready
+        self.resolutions = resolutions
         #: Uploads may reach private addresses only for a machine whose own Hub is local.
         self.allow_private_egress = allow_private_egress
         self._transfers: dict[str, artifact_transfer.NativeArtifactTransfers] = {}
@@ -169,6 +172,17 @@ class WorkspaceRPC:
     ) -> pb.NativeArtifactTransferStatus:
         return self._workspace_call(
             request.claim, context, lambda s, owner: s.transfers(owner).execute(request.request)
+        )
+
+    def WorkspaceForgetPackageBindings(
+        self, request: pb.ForgetPackageBindingsCall, context: ServicerContext
+    ) -> pb.ForgetPackageBindingsResult:
+        return self._workspace_call(
+            request.claim,
+            context,
+            lambda s, _owner: pb.ForgetPackageBindingsResult(
+                forgotten=s.resolutions.forget(request.package)
+            ),
         )
 
     def WorkspaceReadByteTreeObject(

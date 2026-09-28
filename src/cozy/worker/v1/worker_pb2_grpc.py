@@ -579,6 +579,11 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.FromString,
                 _registered_method=True)
+        self.WorkspaceForgetPackageBindings = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/WorkspaceForgetPackageBindings',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.FromString,
+                _registered_method=True)
         self.ImportInputTree = channel.stream_unary(
                 '/cozy.worker.v1.RuntimePreparation/ImportInputTree',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.SerializeToString,
@@ -738,6 +743,13 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def WorkspaceForgetPackageBindings(self, request, context):
+        """The package's owner bindings changed: drop the Model resolutions this machine keeps for it.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ImportInputTree(self, request_iterator, context):
         """Authenticated root input intake; native bytes commit before a receipt.
         """
@@ -885,6 +897,11 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.WorkspaceNativeArtifactTransfer,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.SerializeToString,
+            ),
+            'WorkspaceForgetPackageBindings': grpc.unary_unary_rpc_method_handler(
+                    servicer.WorkspaceForgetPackageBindings,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.SerializeToString,
             ),
             'ImportInputTree': grpc.stream_unary_rpc_method_handler(
                     servicer.ImportInputTree,
@@ -1288,6 +1305,33 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/WorkspaceNativeArtifactTransfer',
             cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WorkspaceForgetPackageBindings(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/WorkspaceForgetPackageBindings',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1918,6 +1962,11 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.FromString,
                 _registered_method=True)
+        self.ForgetPackageBindings = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ForgetPackageBindings',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.FromString,
+                _registered_method=True)
         self.ImportInputTree = channel.stream_unary(
                 '/cozy.worker.v1.PodHost/ImportInputTree',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.SerializeToString,
@@ -2159,6 +2208,13 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ForgetPackageBindings(self, request, context):
+        """`cozy package bind`/`unbind` moved a slot: the machine re-resolves the package's Models once.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ImportInputTree(self, request_iterator, context):
         """Proxies the bounded stream to Runtime without owning its byte custody.
         """
@@ -2353,6 +2409,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.NativeArtifactTransfer,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.SerializeToString,
+            ),
+            'ForgetPackageBindings': grpc.unary_unary_rpc_method_handler(
+                    servicer.ForgetPackageBindings,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.SerializeToString,
             ),
             'ImportInputTree': grpc.stream_unary_rpc_method_handler(
                     servicer.ImportInputTree,
@@ -3110,6 +3171,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/NativeArtifactTransfer',
             cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.NativeArtifactTransferStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ForgetPackageBindings(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ForgetPackageBindings',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ForgetPackageBindingsResult.FromString,
             options,
             channel_credentials,
             insecure,

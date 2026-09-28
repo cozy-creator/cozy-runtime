@@ -3809,6 +3809,20 @@ class TriageBundleRef(_message.Message):
     length: int
     def __init__(self, subject_id: _Optional[str] = ..., write_receipt_digest: _Optional[bytes] = ..., length: _Optional[int] = ...) -> None: ...
 
+class ForgetPackageBindingsCall(_message.Message):
+    __slots__ = ("claim", "package")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    package: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package: _Optional[str] = ...) -> None: ...
+
+class ForgetPackageBindingsResult(_message.Message):
+    __slots__ = ("forgotten",)
+    FORGOTTEN_FIELD_NUMBER: _ClassVar[int]
+    forgotten: int
+    def __init__(self, forgotten: _Optional[int] = ...) -> None: ...
+
 class NativeArtifactTransferCall(_message.Message):
     __slots__ = ("claim", "request")
     CLAIM_FIELD_NUMBER: _ClassVar[int]

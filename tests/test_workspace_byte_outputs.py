@@ -19,6 +19,7 @@ from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker import workspace_memo
 from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
 from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord
+from cozy_runtime.internal.worker.machine_model_resolve import Resolutions
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_rpc import Service, WorkspaceRPC
 from cozy_runtime.protocol import documents
@@ -273,7 +274,9 @@ def test_real_native_tree_rpc_stream_is_membership_checked(tmp_path: Path) -> No
         return "owner"
 
     handler = Handler()
-    handler.workspace_service = Service(workspace, authorize, lambda _: pb.WeightsHostAck())
+    handler.workspace_service = Service(
+        workspace, authorize, lambda _: pb.WeightsHostAck(), Resolutions()
+    )
     pool = ThreadPoolExecutor(max_workers=2)
     server = grpc.server(pool)
     rpc.add_RuntimePreparationServicer_to_server(handler, server)
@@ -352,7 +355,9 @@ def test_native_integrity_fault_is_permanent_rpc_refusal(tmp_path: Path, fault: 
         pass
 
     handler = Handler()
-    handler.workspace_service = Service(workspace, lambda _: "owner", lambda _: pb.WeightsHostAck())
+    handler.workspace_service = Service(
+        workspace, lambda _: "owner", lambda _: pb.WeightsHostAck(), Resolutions()
+    )
     pool = ThreadPoolExecutor(max_workers=2)
     server = grpc.server(pool)
     rpc.add_RuntimePreparationServicer_to_server(handler, server)

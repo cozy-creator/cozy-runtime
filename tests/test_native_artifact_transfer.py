@@ -9,6 +9,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import machine_model_defaults
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
+from cozy_runtime.internal.worker.machine_model_resolve import Resolutions
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
@@ -333,7 +334,11 @@ def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Pa
 
     class Machine(WorkspaceRPC):
         workspace_service = Service(
-            workspace, authorize, lambda _ready: pb.WeightsHostAck(), allow_private_egress=True
+            workspace,
+            authorize,
+            lambda _ready: pb.WeightsHostAck(),
+            Resolutions(),
+            allow_private_egress=True,
         )
 
     class Context:
@@ -366,7 +371,9 @@ def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Pa
 
     # A machine whose own Hub is not local never uploads to a private address.
     class Production(WorkspaceRPC):
-        workspace_service = Service(workspace, authorize, lambda _ready: pb.WeightsHostAck())
+        workspace_service = Service(
+            workspace, authorize, lambda _ready: pb.WeightsHostAck(), Resolutions()
+        )
 
     with serving(ObjectStore()) as url:
         call.request.command_id, call.request.grant.url = 3, url

@@ -107,6 +107,7 @@ from cozy_runtime.internal.worker import (
     machine_capture,
     machine_lanes,
     machine_model_defaults,
+    machine_model_resolve,
     machine_release_catalog,
     machine_slots,
     model_source_prepare,
@@ -1138,11 +1139,13 @@ class Worker:
                 workspace.store_root,
                 lambda target: workspace_memo.reclaim_unused(workspace, target_bytes=target),
             )
+        self.resolutions = machine_model_resolve.Resolutions()
         self.workspace_service = (
             WorkspaceService(
                 self.workspace,
                 self.authorize_workspace,
                 self.workspace_weights_ready,
+                self.resolutions,
                 allow_private_egress=machine_model_defaults.local_development(self),
             )
             if self.workspace is not None
