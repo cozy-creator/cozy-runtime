@@ -87,7 +87,7 @@ class Supervisor:
     def spawn(
         self,
         key: str,
-        body: Callable[[Unit], None],
+        body: Callable[[Unit], object],
         crashed: Callable[[BaseException], bool] = lambda exc: False,
     ) -> bool:
         """Start unit `key` unless it is live (then poke it). `crashed(exc)` records the
@@ -107,7 +107,7 @@ class Supervisor:
         return True
 
     def _run(
-        self, unit: Unit, body: Callable[[Unit], None], crashed: Callable[[BaseException], bool]
+        self, unit: Unit, body: Callable[[Unit], object], crashed: Callable[[BaseException], bool]
     ) -> None:
         try:
             while True:
