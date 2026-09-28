@@ -23,16 +23,19 @@ of asserted.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import stat
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 
 from cozy_runtime.internal import probe
 from cozy_runtime.internal.encoding import DeviceFacts, RuntimeIdentity, launch_providers
+from cozy_runtime.internal.probe import QualificationResult
 
 OBSERVATION = Path(__file__).resolve().parent / "observations" / "probe-cuda-sm89.json"
 
@@ -42,23 +45,20 @@ OBSERVATION = Path(__file__).resolve().parent / "observations" / "probe-cuda-sm8
 NO_TORCH = object()
 
 
-def recorded() -> dict[str, Any]:
-    result: dict[str, Any] = json.loads(OBSERVATION.read_bytes())
-    return result
+def recorded() -> QualificationResult:
+    return msgspec.convert(json.loads(OBSERVATION.read_bytes()), QualificationResult)
 
 
-def device_of(result: dict[str, Any], **moved: Any) -> DeviceFacts:
+def device_of(result: QualificationResult, **moved: Any) -> DeviceFacts:
     """The card the recording was taken on, optionally with one fact moved."""
-    facts = {**result["device"], **moved}
-    facts.pop("predicate", None)
-    return DeviceFacts(**facts)
+    return dataclasses.replace(result.device, **moved)
 
 
-def runtime_of(result: dict[str, Any], **moved: Any) -> RuntimeIdentity:
-    return RuntimeIdentity(**{**result["runtime"], **moved})
+def runtime_of(result: QualificationResult, **moved: Any) -> RuntimeIdentity:
+    return dataclasses.replace(result.runtime, **moved)
 
 
-def key_of(result: dict[str, Any], **moved: Any) -> str:
+def key_of(result: QualificationResult, **moved: Any) -> str:
     return probe.qualification_key(
         moved.get("providers", launch_providers()),
         moved.get("device", device_of(result)),
@@ -82,10 +82,15 @@ def _swapped(providers: dict[str, Any]) -> dict[str, Any]:
     return {**providers, first: theirs, last: mine}
 
 
-def seed(cache: Path, key: str, result: dict[str, Any]) -> Path:
+def stored(key: str) -> str:
+    """A cache file filed under `key` whose result is the recording's own bytes."""
+    return json.dumps({"key": key, "result": json.loads(OBSERVATION.read_bytes())})
+
+
+def seed(cache: Path, key: str) -> Path:
     cache.mkdir(parents=True, exist_ok=True)
     path = cache / f"{key}.json"
-    path.write_text(json.dumps({"key": key, "result": result}))
+    path.write_text(stored(key))
     return path
 
 
@@ -147,7 +152,7 @@ def test_nothing_that_cannot_change_the_answer_is_in_the_key() -> None:
     """
     result = recorded()
     base = key_of(result)
-    noisy = {**result, "suite_ms": result["suite_ms"] + 5000, "observations": []}
+    noisy = msgspec.structs.replace(result, suite_ms=result.suite_ms + 5000, observations=[])
     assert key_of(noisy) == base
     assert key_of(result) == base
 
@@ -164,14 +169,14 @@ def test_a_kept_qualification_is_reused_without_running_the_suite(tmp_path: Path
     result = recorded()
     cache = tmp_path / "qualification"
     key = key_of(result)
-    seed(cache, key, result)
+    seed(cache, key)
 
     answer = probe.qualified(
         NO_TORCH,
         launch_providers(),
         device_of(result),
         ("bfloat16",),
-        release=result["runtime_release"],
+        release=result.runtime_release,
         runtime=runtime_of(result),
         cache=str(cache),
     )
@@ -181,7 +186,7 @@ def test_a_kept_qualification_is_reused_without_running_the_suite(tmp_path: Path
     assert answer.document()["source"] == "reused"
     # The table is the one the recording earns, counted off the RECORDED EVIDENCE rather
     # than off the code that builds it: a failed observation mints no record.
-    passed = sum(1 for one in result["observations"] if one["evidence"]["passed"])
+    passed = sum(1 for one in result.observations if one.evidence.passed)
     assert len(answer.capabilities.records) == passed
     assert answer.result == result
 
@@ -190,7 +195,7 @@ def test_a_key_that_does_not_match_falls_through_to_the_suite(tmp_path: Path) ->
     """A miss MEASURES. The stored document for another card is not evidence about this one."""
     result = recorded()
     cache = tmp_path / "qualification"
-    seed(cache, key_of(result), result)
+    seed(cache, key_of(result))
 
     with pytest.raises(AttributeError):
         probe.qualified(
@@ -198,7 +203,7 @@ def test_a_key_that_does_not_match_falls_through_to_the_suite(tmp_path: Path) ->
             launch_providers(),
             device_of(result, name="NVIDIA L40S"),
             ("bfloat16",),
-            release=result["runtime_release"],
+            release=result.runtime_release,
             runtime=runtime_of(result),
             cache=str(cache),
         )
@@ -214,10 +219,10 @@ def test_a_document_that_does_not_carry_its_own_key_is_not_used(tmp_path: Path) 
     cache = tmp_path / "qualification"
     key = key_of(result)
     cache.mkdir(parents=True)
-    (cache / f"{key}.json").write_text(json.dumps({"key": "sha256:" + "f" * 64, "result": result}))
+    (cache / f"{key}.json").write_text(stored("sha256:" + "f" * 64))
 
-    stored, why = probe._read_qualification(str(cache), key)
-    assert stored is None
+    kept, why = probe._read_qualification(str(cache), key)
+    assert kept is None
     assert "does not carry its own key" in why
 
     with pytest.raises(AttributeError):
@@ -226,25 +231,24 @@ def test_a_document_that_does_not_carry_its_own_key_is_not_used(tmp_path: Path) 
             launch_providers(),
             device_of(result),
             ("bfloat16",),
-            release=result["runtime_release"],
+            release=result.runtime_release,
             runtime=runtime_of(result),
             cache=str(cache),
         )
 
 
 def test_a_truncated_or_unparsable_document_is_not_used(tmp_path: Path) -> None:
-    """Half a document is not a measurement, and neither is a directory."""
-    result = recorded()
+    """Half a document is not a measurement, and neither is one of the wrong shape."""
+    key = key_of(recorded())
     cache = tmp_path / "qualification"
-    key = key_of(result)
     cache.mkdir(parents=True)
-    (cache / f"{key}.json").write_text(json.dumps({"key": key, "result": result})[:400])
-    stored, why = probe._read_qualification(str(cache), key)
-    assert stored is None and "unreadable" in why
+    (cache / f"{key}.json").write_text(stored(key)[:400])
+    kept, why = probe._read_qualification(str(cache), key)
+    assert kept is None and why.startswith("unreadable: JSONDecodeError"), why
 
     (cache / f"{key}.json").write_text(json.dumps({"key": key, "result": {"observations": {}}}))
-    stored, why = probe._read_qualification(str(cache), key)
-    assert stored is None and "no observations" in why
+    kept, why = probe._read_qualification(str(cache), key)
+    assert kept is None and why.startswith("unreadable: ValidationError"), why
 
 
 # --------------------------------------------------------------------------- keeping it
@@ -261,12 +265,12 @@ def test_a_document_that_could_not_be_used_is_replaced_rather_than_left(tmp_path
     cache = tmp_path / "qualification"
     key = key_of(result)
     cache.mkdir(parents=True)
-    (cache / f"{key}.json").write_text(json.dumps({"key": "sha256:" + "f" * 64, "result": result}))
+    (cache / f"{key}.json").write_text(stored("sha256:" + "f" * 64))
     assert probe._read_qualification(str(cache), key)[0] is None
 
     assert probe._write_qualification(str(cache), key, result) == ""
-    stored, why = probe._read_qualification(str(cache), key)
-    assert why == "" and stored == result
+    kept, why = probe._read_qualification(str(cache), key)
+    assert why == "" and kept == result
 
 
 def test_what_is_written_is_what_is_read_back(tmp_path: Path) -> None:
@@ -276,9 +280,9 @@ def test_what_is_written_is_what_is_read_back(tmp_path: Path) -> None:
     key = key_of(result)
 
     assert probe._write_qualification(str(cache), key, result) == ""
-    stored, why = probe._read_qualification(str(cache), key)
+    kept, why = probe._read_qualification(str(cache), key)
     assert why == ""
-    assert stored == result
+    assert kept == result
     assert stat.S_IMODE((cache / f"{key}.json").stat().st_mode) == 0o600
 
 
@@ -289,10 +293,11 @@ def test_an_unwritable_cache_directory_is_not_a_refusal(tmp_path: Path) -> None:
     sealed = tmp_path / "sealed"
     sealed.mkdir(mode=0o500)
     try:
-        why = probe._write_qualification(str(sealed / "qualification"), key_of(recorded()), {})
+        result = recorded()
+        why = probe._write_qualification(str(sealed / "qualification"), key_of(result), result)
         assert why.startswith("not kept:"), why
-        stored, missing = probe._read_qualification(str(sealed / "qualification"), "whatever")
-        assert stored is None
+        kept, missing = probe._read_qualification(str(sealed / "qualification"), "whatever")
+        assert kept is None
         assert missing == ""
     finally:
         sealed.chmod(0o700)
@@ -301,8 +306,8 @@ def test_an_unwritable_cache_directory_is_not_a_refusal(tmp_path: Path) -> None:
 def test_no_cache_directory_means_measure_and_keep_nothing(tmp_path: Path) -> None:
     """A path, not a switch: unset is the pre-cr-103 behaviour exactly."""
     result = recorded()
-    stored, why = probe._read_qualification("", key_of(result))
-    assert stored is None and why == "no cache directory"
+    kept, why = probe._read_qualification("", key_of(result))
+    assert kept is None and why == "no cache directory"
     assert probe._write_qualification("", key_of(result), result) == "no cache directory"
     assert not list(tmp_path.iterdir())
 

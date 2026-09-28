@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import numpy as np
 import pytest
 import tensorfs
@@ -43,6 +44,10 @@ from cozy_runtime.internal.encoding import (
     launch_providers,
 )
 from cozy_runtime.internal.probe import (
+    DecodeEvidence,
+    Observation,
+    QualificationResult,
+    VerbatimEvidence,
     case_dtype,
     observed_capability_records,
     qualify,
@@ -58,25 +63,24 @@ RECORD_KEYS = {"device", "encoding", "implementation", "note"}
 OBSERVATION = Path(__file__).resolve().parent / "observations" / "probe-cuda-sm89.json"
 
 
-def probe_result() -> dict[str, Any]:
-    result: dict[str, Any] = json.loads(OBSERVATION.read_text())
-    return result
+def probe_result() -> QualificationResult:
+    return msgspec.convert(json.loads(OBSERVATION.read_bytes()), QualificationResult)
 
 
 def test_the_recorded_observation_is_a_real_measured_probe() -> None:
     """The input is evidence, so it has to carry what it was measured on."""
     result = probe_result()
-    assert result["device_predicate"] == "cuda.sm89"
-    assert result["device"]["sm"] == 89
-    assert result["device"]["kind"] == "cuda"
+    assert result.device_predicate == "cuda.sm89"
+    assert result.device.sm == 89
+    assert result.device.kind == "cuda"
     # Both halves of a capability claim have an identity: the card, and the build that ran on
     # it. A digest here proves the recording came out of `runtime_source_digest`, which is
     # computed from installed bytes -- it is NOT compared to this build's, because the
     # recording is of the build that measured, not of the one replaying it.
-    assert result["runtime"]["source_digest"].startswith("sha256:")
-    assert result["runtime"]["torch_build"].startswith("2.")
-    assert len(result["observations"]) == 27
-    assert sum(1 for o in result["observations"] if o["evidence"]["passed"]) == 19
+    assert result.runtime.source_digest.startswith("sha256:")
+    assert result.runtime.torch_build.startswith("2.")
+    assert len(result.observations) == 27
+    assert sum(1 for o in result.observations if o.evidence.passed) == 19
 
 
 def test_every_record_carries_exactly_the_four_keys() -> None:
@@ -108,9 +112,7 @@ def test_one_record_per_encoding_and_device() -> None:
     assert len(pairs) == len(set(pairs))
     assert pairs == sorted(pairs), "records are ordered by the pair, not by probe order"
     minted = {
-        (o["encoding_spec_id"], o["device_predicate"])
-        for o in result["observations"]
-        if o["evidence"]["passed"]
+        (o.encoding_spec_id, o.device_predicate) for o in result.observations if o.evidence.passed
     }
     # Every collapsed pair traces back to a passing observation, and every implementation
     # named in a record is one that actually minted for that pair.
@@ -118,14 +120,11 @@ def test_one_record_per_encoding_and_device() -> None:
     for record in document["records"]:
         for named in record["implementation"].split(" "):
             assert named.split("@")[-1] in {
-                o["implementation_digest"]
-                for o in result["observations"]
-                if (o["encoding_spec_id"], o["device_predicate"])
-                == (
-                    record["encoding"],
-                    record["device"],
-                )
-                and o["evidence"]["passed"]
+                o.implementation_digest
+                for o in result.observations
+                if (o.encoding_spec_id, o.device_predicate)
+                == (record["encoding"], record["device"])
+                and o.evidence.passed
             }
 
 
@@ -136,15 +135,15 @@ def test_a_failed_observation_is_never_reported() -> None:
     dtype set a record names is exactly the reportable passing set, never the attempted one.
     """
     result = probe_result()
-    assert [o for o in result["observations"] if not o["evidence"]["passed"]], (
+    assert [o for o in result.observations if not o.evidence.passed], (
         "the recording includes failures on purpose"
     )
     for record in observed_capability_records(result)["records"]:
         pair = (record["encoding"], record["device"])
         assert _note_dtypes(record) == {
-            str(o["output_dtype"])
-            for o in result["observations"]
-            if (o["encoding_spec_id"], o["device_predicate"]) == pair and _reportable(o)
+            o.output_dtype
+            for o in result.observations
+            if (o.encoding_spec_id, o.device_predicate) == pair and _reportable(o)
         }
     mxfp8 = _mxfp8(result)
     reported = {r["encoding"]: r for r in observed_capability_records(result)["records"]}
@@ -162,11 +161,10 @@ def test_only_evidence_that_actually_ran_crosses_the_boundary() -> None:
     reported = {
         (r["encoding"], r["device"]) for r in observed_capability_records(result)["records"]
     }
-    for observation in result["observations"]:
-        evidence = observation["evidence"]
-        if not evidence["passed"]:
+    for observation in result.observations:
+        if not observation.evidence.passed:
             continue
-        pair = (observation["encoding_spec_id"], observation["device_predicate"])
+        pair = (observation.encoding_spec_id, observation.device_predicate)
         if not _reportable(observation):
             assert pair not in reported or _also_ran(result, pair), (
                 f"{pair} was reported on evidence that did not run"
@@ -192,27 +190,28 @@ def _note_dtypes(record: dict[str, Any]) -> set[str]:
     return {token.strip() for token in body.split(",") if token.strip()}
 
 
-def _reportable(observation: dict[str, Any]) -> bool:
-    evidence = observation["evidence"]
-    if not evidence["passed"]:
+def _reportable(observation: Observation) -> bool:
+    evidence = observation.evidence
+    if not evidence.passed:
         return False
-    vectors = evidence.get("spec_vectors") or {}
-    return evidence.get("kind") == "verbatim" or bool(vectors and not vectors.get("skipped"))
+    if isinstance(evidence, VerbatimEvidence):
+        return True
+    return isinstance(evidence, DecodeEvidence) and not evidence.spec_vectors.skipped
 
 
-def _mxfp8(result: dict[str, Any]) -> str:
-    for observation in result["observations"]:
-        if "mxfp8" in observation["implementation"]:
-            return str(observation["encoding_spec_id"])
+def _mxfp8(result: QualificationResult) -> str:
+    for observation in result.observations:
+        if "mxfp8" in observation.implementation:
+            return observation.encoding_spec_id
     raise AssertionError("the recording carries an mxfp8 observation")
 
 
-def _also_ran(result: dict[str, Any], pair: tuple[str, str]) -> bool:
+def _also_ran(result: QualificationResult, pair: tuple[str, str]) -> bool:
     """Another observation for the same pair whose evidence DID run. One dtype skipping its
     vectors does not unqualify a pair another dtype measured."""
     return any(
-        (o["encoding_spec_id"], o["device_predicate"]) == pair and _reportable(o)
-        for o in result["observations"]
+        (o.encoding_spec_id, o.device_predicate) == pair and _reportable(o)
+        for o in result.observations
     )
 
 
@@ -227,7 +226,7 @@ def test_the_document_carries_no_per_run_measurement() -> None:
     result = probe_result()
     document = observed_capability_records(result)
     stable = {r["encoding"] for r in document["records"]} | {
-        str(o["implementation_digest"]) for o in result["observations"]
+        o.implementation_digest for o in result.observations
     }
     found = set(re.findall(r"sha256:[0-9a-f]{64}", canonical.write(document).decode()))
     assert found and found <= stable, f"a per-run digest reached the document: {found - stable}"
@@ -259,7 +258,7 @@ def test_every_vendored_document_is_readable_by_the_reader_that_runs_it() -> Non
     for digest in SPEC_VECTORS:
         document = spec_vector_document(digest)
         assert document is not None, f"{digest} is pinned and its bytes must verify"
-        dtypes = {case_dtype(case) for case in document["cases"]}
+        dtypes = {case_dtype(case) for case in document.cases}
         assert dtypes and None not in dtypes, (
             f"{digest}: the mined cases declare {dtypes} — the reader read no dtype out of "
             "bytes that carry one"
@@ -281,9 +280,9 @@ def test_the_mined_cases_actually_run_against_the_shipped_decoder() -> None:
 
     provider = RowwiseDequant(SPEC_ROWWISE)
     report = _spec_vectors(torch, provider, torch.device("cpu"))
-    assert not report.get("skipped"), report
-    assert report["passed"], report
-    assert report["cases"], "the bf16 case the mined document carries has to have run"
+    assert not report.skipped, report
+    assert report.passed, report
+    assert report.cases, "the bf16 case the mined document carries has to have run"
 
 
 @needs_torch
@@ -302,10 +301,14 @@ def test_a_float16_fp8_lane_fits_the_card_its_decode_qualified_on(tmp_path: Path
     header = store.manifest(lane.manifest.digest)["header"]
 
     cpu = DeviceFacts("cpu", "cpu", 0, "", "default")
-    _, result = qualify(torch, launch_providers(), cpu, ["float16"], release="test")
-    result["device_predicate"] = "cuda.sm86"
-    for observation in result["observations"]:
-        observation["device_predicate"] = "cuda.sm86"
+    _, measured = qualify(torch, launch_providers(), cpu, ["float16"], release="test")
+    result = msgspec.structs.replace(
+        measured,
+        device_predicate="cuda.sm86",
+        observations=[
+            msgspec.structs.replace(o, device_predicate="cuda.sm86") for o in measured.observations
+        ],
+    )
     document = observed_capability_records(result)
     reported = {r["encoding"] for r in document["records"]}
     assert {SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM, SPEC_MXFP8} <= reported

@@ -47,18 +47,25 @@ the two-chooser split could not do without an artifact-wide rung to fall back to
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Protocol
+
+import msgspec
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.encoding import (
+    Capabilities,
     DeviceFacts,
+    Encoded,
     EncodingRefusal,
+    Provider,
     RuntimeIdentity,
     Selection,
     Selector,
+    TensorCandidates,
     device_line,
     geometry_class,
 )
@@ -116,14 +123,35 @@ def route_label(census: Mapping[str, int]) -> str:
     return "mixed(" + ", ".join(f"{r} x{present[r]}" for r in sorted(present)) + ")"
 
 
-class PlanRefusal(Exception):
-    """A typed pre-construction refusal on the plan axis."""
+class Step(msgspec.Struct, omit_defaults=True):
+    """One line of the resolution walk: a (variant, policy) candidate and its verdict.
 
-    def __init__(self, code: str, detail: str, walk: Sequence[Mapping[str, Any]] = ()) -> None:
+    Mutable: the chosen plan's step is promoted to `chosen` once every candidate is scored.
+    """
+
+    variant: str
+    verdict: str
+    why: str = ""
+    policy: str = ""
+    plan: str = ""
+    label: str = ""
+    routes: dict[str, int] | None = None
+    samples: int | None = None
+    leaf_speedup_x: float | None = None
+    score: float | None = None
+    provenance: str = ""
+
+
+class PlanRefusal(Exception):
+    """A typed pre-construction refusal on the plan axis. `walk` is the JSON document of
+    `steps`, for the executor's reply."""
+
+    def __init__(self, code: str, detail: str, steps: Sequence[Step] = ()) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
-        self.walk = [dict(row) for row in walk]
+        self.steps = tuple(steps)
+        self.walk: list[dict[str, object]] = msgspec.to_builtins(self.steps)
 
 
 # ------------------------------------------------------------------------ the variants
@@ -150,18 +178,6 @@ class Variant:
     def snapshot_map(self) -> dict[str, str]:
         return dict(self.snapshots)
 
-    @classmethod
-    def read(cls, record: Mapping[str, Any]) -> Variant:
-        known = {f for f in cls.__dataclass_fields__}
-        unknown = sorted(set(record) - known)
-        if unknown:
-            raise PlanRefusal(
-                "variant_unknown_field",
-                f"a variant record carries {', '.join(unknown)}: the key set is closed, "
-                "exactly like the documents it stands in for",
-            )
-        return cls(**record)
-
 
 @dataclass(frozen=True, slots=True)
 class ConstructionFacts:
@@ -176,7 +192,7 @@ class ConstructionFacts:
     components: tuple[str, ...]
     custody: str = "canonical"
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, str | list[str]]:
         return {
             "release": self.release,
             "model_class": self.model_class,
@@ -221,7 +237,7 @@ class TensorResolution:
     leaf_speedup_x: float = -1.0
     """`CapabilityRecord.leaf_speedup_x` of the implementation this row resolved to."""
 
-    def identity(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, str | list[int]]:
         """What the plan DIGEST takes from this row. Measurements are excluded on purpose:
         the fact store is keyed BY the digest, so hashing a measurement into it would make
         every re-measure a different plan."""
@@ -235,7 +251,7 @@ class TensorResolution:
             "output_dtype": self.output_dtype,
         }
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, str | int | float | list[int]]:
         return {
             **self.identity(),
             "component": self.component,
@@ -278,7 +294,7 @@ class ResolvedModelPlan:
     steps_basis: int = 20
     measurements: PlanFact | None = None
     confession: str = ""
-    walk: tuple[dict[str, Any], ...] = ()
+    walk: tuple[Step, ...] = ()
 
     # ------------------------------------------------------------------ derived facts
 
@@ -346,7 +362,7 @@ class ResolvedModelPlan:
                 return rung.name
         return "verbatim"
 
-    def wire_document(self) -> dict[str, Any]:
+    def wire_document(self) -> dict[str, object]:
         """The `delivery` document the worker reads off a prepare reply.
 
         Its KEY SET is the worker's, not this module's: `session.py` reads `rung` and
@@ -416,7 +432,7 @@ class ResolvedModelPlan:
 
     # --------------------------------------------------------------------- identity
 
-    def identity(self) -> dict[str, Any]:
+    def identity(self) -> dict[str, object]:
         return {
             "store": self.store,
             "snapshots": dict(sorted(self.snapshots.items())),
@@ -455,7 +471,7 @@ class ResolvedModelPlan:
             "sha256:" + hashlib.sha256(b"cozy.runtime.resolved-model-plan\0" + encoded).hexdigest()
         )
 
-    def seam_document(self) -> dict[str, Any]:
+    def seam_document(self) -> dict[str, object]:
         """The plan as ONE CONTROL FRAME — everything but the per-destination census.
 
         `document()` carries a row per destination because a plan's identity is per-tensor
@@ -468,18 +484,17 @@ class ResolvedModelPlan:
         identity is weakened by not shipping the body of it down a control seam.
         """
         whole = self.document()
-        rows = whole.pop("tensors", [])
-        walk = whole.pop("walk", [])
-        whole["tensors_count"] = len(rows)
-        whole["walk_count"] = len(walk)
+        del whole["tensors"], whole["walk"]
+        whole["tensors_count"] = len(self.tensors)
+        whole["walk_count"] = len(self.walk)
         whole["census_elided"] = (
             "the per-destination rows and the resolution walk are not on this seam: a "
             "control frame is 64 KiB and this plan resolves "
-            f"{len(rows)} destinations. `plan_digest` is over the WHOLE document"
+            f"{len(self.tensors)} destinations. `plan_digest` is over the WHOLE document"
         )
         return whole
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, object]:
         return {
             "plan_digest": self.digest(),
             "label": self.label(),
@@ -508,7 +523,7 @@ class ResolvedModelPlan:
             "measured": self.measurements.document() if self.measurements else None,
             "confession": self.confession,
             "tensors": [row.document() for row in self.tensors],
-            "walk": list(self.walk),
+            "walk": msgspec.to_builtins(self.walk),
         }
 
     def summary(self) -> str:
@@ -577,25 +592,28 @@ def score(plan: ResolvedModelPlan, objective: str) -> tuple[float, str]:
 # ------------------------------------------------------------------------ resolution
 
 
-@dataclass(frozen=True, slots=True)
-class PlanRow:
-    """The header facts one destination contributes. Structurally what `fill.PlanRow` is;
-    named here as a Protocol-shaped duck so `resolution.py` need not import the fill plane
-    (which imports torch machinery) to resolve a plan from a header."""
+class PlanRow(Protocol):
+    """The header facts one destination contributes: what `fill.PlanRow` is, named here so
+    `resolution.py` need not import the fill plane to resolve a plan from a header."""
 
-    key: str
-    component: str
-    dtype_name: str
-    shape: tuple[int, ...]
-    encoded: Any
+    @property
+    def key(self) -> str: ...
+    @property
+    def component(self) -> str: ...
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+    @property
+    def encoded(self) -> Encoded: ...
 
 
 def resolve(
     *,
     variants: Sequence[Variant],
-    rows_for: Mapping[str, Sequence[Any]],
-    providers: Mapping[str, Any],
-    capabilities: Any,
+    rows_for: Mapping[str, Sequence[PlanRow]],
+    providers: Mapping[str, tuple[Provider, ...]],
+    capabilities: Capabilities,
     device: DeviceFacts,
     runtime: RuntimeIdentity,
     construction: ConstructionFacts,
@@ -604,12 +622,11 @@ def resolve(
     placement: str = "all_resident",
     encoded_leaves: str = "refuse",
     steps_basis: int = 20,
-    dtype_name: Any,
+    dtype_name: Callable[[str], str],
 ) -> ResolvedModelPlan:
     """Offered variants + header rows + capability records + banked facts -> ONE plan.
 
-    `rows_for` is variant name -> that variant's header rows (`fill.PlanRow`-shaped:
-    `.key`, `.component`, `.dtype`, `.shape`, `.encoded`). `dtype_name` maps a TensorFS dtype
+    `rows_for` is variant name -> that variant's header rows. `dtype_name` maps a TensorFS dtype
     name to the torch dtype NAME a capability record is keyed by — handed in rather than
     imported, so this module stays free of the fill plane.
 
@@ -638,7 +655,7 @@ def resolve(
             "set without one puts every encoded route on no scale at all",
         )
 
-    walk: list[dict[str, Any]] = []
+    walk: list[Step] = []
     candidates: list[tuple[ResolvedModelPlan, float, str]] = []
     floors: dict[str, ResolvedModelPlan] = {}
     leaved: dict[str, ResolvedModelPlan] = {}
@@ -646,37 +663,23 @@ def resolve(
     for variant in variants:
         rows = list(rows_for.get(variant.name, ()))
         if not rows:
-            walk.append({"variant": variant.name, "verdict": "no_rows", "why": "no tensor rows"})
+            walk.append(Step(variant.name, "no_rows", "no tensor rows"))
             continue
         selector = Selector(providers, capabilities, device, objective)
         try:
             resolved_candidates = [
                 (
                     row,
-                    selector.candidates(
-                        row.key, row.encoded, dtype_name(row.dtype), tuple(row.shape)
-                    ),
+                    selector.candidates(row.key, row.encoded, dtype_name(row.dtype), row.shape),
                 )
                 for row in rows
             ]
         except EncodingRefusal as exc:
-            walk.append(
-                {
-                    "variant": variant.name,
-                    "verdict": exc.code,
-                    "why": str(exc)[:600],
-                }
-            )
+            walk.append(Step(variant.name, exc.code, str(exc)[:600]))
             continue
         unqualified = next((c for _, c in resolved_candidates if not c.by_route), None)
         if unqualified is not None:
-            walk.append(
-                {
-                    "variant": variant.name,
-                    "verdict": "unqualified",
-                    "why": unqualified.unqualified[:600],
-                }
-            )
+            walk.append(Step(variant.name, "unqualified", unqualified.unqualified[:600]))
             continue
         seen: set[str] = set()
         for policy in POLICIES:
@@ -685,14 +688,14 @@ def resolve(
                 # with the plan already chosen and the package already imported; a plan the
                 # package cannot consent to is not a candidate, so it is never built.
                 walk.append(
-                    {
-                        "variant": variant.name,
-                        "policy": policy,
-                        "verdict": "unconsented",
-                        "why": f"the package declares encoded_leaves={encoded_leaves!r}; a "
-                        "route that REPLACES the module that computes needs the package to "
-                        "say so, because code that reads `.weight` finds nothing there",
-                    }
+                    Step(
+                        variant.name,
+                        "unconsented",
+                        f"the package declares encoded_leaves={encoded_leaves!r}; a route that "
+                        "REPLACES the module that computes needs the package to say so, "
+                        "because code that reads `.weight` finds nothing there",
+                        policy=policy,
+                    )
                 )
                 continue
             plan = _build(
@@ -722,32 +725,32 @@ def resolve(
             elif policy == "encoded_gemm":
                 leaved.setdefault(variant.name, plan)
             value, provenance = score(plan, objective)
-            row: dict[str, Any] = {
-                "variant": variant.name,
-                "policy": policy,
-                "plan": digest,
-                "label": plan.label(),
-                "routes": plan.route_census(),
-                "samples": plan.measurements.samples if plan.measurements else 0,
-            }
-            if plan.replaces_leaves():
-                row["leaf_speedup_x"] = plan.derived_leaf_speedup_x()
-            if value < 0.0:
-                row["verdict"] = "unscored"
-                row["why"] = provenance
-                walk.append(row)
-                continue
-            row["verdict"] = "eligible"
-            row["score"] = value
-            row["provenance"] = provenance
-            walk.append(row)
-            candidates.append((plan, value, provenance))
+            scored = value >= 0.0
+            walk.append(
+                Step(
+                    variant.name,
+                    "eligible" if scored else "unscored",
+                    "" if scored else provenance,
+                    policy=policy,
+                    plan=digest,
+                    label=plan.label(),
+                    routes=plan.route_census(),
+                    samples=plan.measurements.samples if plan.measurements else 0,
+                    leaf_speedup_x=plan.derived_leaf_speedup_x()
+                    if plan.replaces_leaves()
+                    else None,
+                    score=value if scored else None,
+                    provenance=provenance if scored else "",
+                )
+            )
+            if scored:
+                candidates.append((plan, value, provenance))
 
     if candidates:
         best, value, provenance = min(candidates, key=lambda e: (e[1], e[0].digest()))
-        for row in walk:
-            if row.get("plan") == best.digest():
-                row["verdict"] = "chosen"
+        for step in walk:
+            if step.plan == best.digest():
+                step.verdict = "chosen"
         confession = ""
         if best.variant != reference[0].name:
             deviation = best.measurements.reference_deviation_rel_l2 if best.measurements else -1.0
@@ -761,7 +764,7 @@ def resolve(
                     else "NOT MEASURED"
                 )
             )
-        return _replace(best, confession=confession, walk=tuple(walk))
+        return dataclasses.replace(best, confession=confession, walk=tuple(walk))
 
     # NOTHING SCORED. This is the path the old design REFUSED on (`objective_unranked`) and
     # it is the ordinary state of a rig that has never run this plan: the deployment still
@@ -777,10 +780,10 @@ def resolve(
     if encoded_leaves == "accept":
         preferred = leaved.get(reference[0].name)
         if preferred is not None:
-            for row in walk:
-                if row.get("plan") == preferred.digest():
-                    row["verdict"] = "chosen_uncalibrated"
-            return _replace(
+            for step in walk:
+                if step.plan == preferred.digest():
+                    step.verdict = "chosen_uncalibrated"
+            return dataclasses.replace(
                 preferred,
                 confession=(
                     f"UNCALIBRATED: no offered plan has a banked {objective} measurement on "
@@ -796,10 +799,10 @@ def resolve(
             )
     floor = floors.get(reference[0].name)
     if floor is not None:
-        for row in walk:
-            if row.get("plan") == floor.digest():
-                row["verdict"] = "chosen_uncalibrated"
-        return _replace(
+        for step in walk:
+            if step.plan == floor.digest():
+                step.verdict = "chosen_uncalibrated"
+        return dataclasses.replace(
             floor,
             confession=(
                 f"UNCALIBRATED: no offered plan has a banked {objective} measurement on "
@@ -818,9 +821,8 @@ def resolve(
         f"{device_line(device)}. The tensor schema is known; what is missing is a "
         "route from these stored bytes to a kernel this device has. "
         + " | ".join(
-            f"{r.get('variant', '-')}/{r.get('policy', '-')}: {r.get('verdict')} — "
-            f"{str(r.get('why', ''))[:200]}"
-            for r in walk
+            f"{step.variant}/{step.policy or '-'}: {step.verdict} — {step.why[:200]}"
+            for step in walk
         ),
         walk,
     )
@@ -828,17 +830,17 @@ def resolve(
 
 def script_plan(
     *,
-    rows: Sequence[Any],
+    rows: Sequence[PlanRow],
     components: Sequence[str],
     release: str,
     store: str,
     snapshot: str,
-    providers: Mapping[str, Any],
-    capabilities: Any,
+    providers: Mapping[str, tuple[Provider, ...]],
+    capabilities: Capabilities,
     device: DeviceFacts,
     runtime: RuntimeIdentity,
     facts: PlanFacts,
-    dtype_name: Any,
+    dtype_name: Callable[[str], str],
     snapshots: Mapping[str, str] | None = None,
     objective: str = "latency",
     placement: str = "all_resident",
@@ -886,7 +888,7 @@ def _build(
     variant: Variant,
     reference: Variant,
     policy: str,
-    resolved: Sequence[tuple[Any, Any]],
+    resolved: Sequence[tuple[PlanRow, TensorCandidates]],
     device: DeviceFacts,
     runtime: RuntimeIdentity,
     construction: ConstructionFacts,
@@ -894,13 +896,13 @@ def _build(
     placement: str,
     encoded_leaves: str,
     steps_basis: int,
-    dtype_name: Any,
+    dtype_name: Callable[[str], str],
 ) -> ResolvedModelPlan:
     """One (variant, policy) -> its plan. Pure: no I/O, no device, no allocation."""
     tensors: list[TensorResolution] = []
     for row, found in resolved:
         selection = _prefer(found.by_route, policy)
-        shape = tuple(int(n) for n in row.shape)
+        shape = row.shape
         numel = 1
         for extent in shape:
             numel *= extent
@@ -910,10 +912,10 @@ def _build(
                 component=row.component,
                 encoding=row.encoded.encoding,
                 alias=row.encoded.alias,
-                implementation=str(selection.provider.name),
+                implementation=selection.provider.name,
                 implementation_digest=selection.record.implementation_digest,
-                implementation_revision=str(selection.provider.code_revision),
-                route=str(selection.provider.route),
+                implementation_revision=selection.provider.code_revision,
+                route=selection.provider.route,
                 geometry=shape,
                 geometry_class=geometry_class(shape),
                 output_dtype=dtype_name(row.dtype),
@@ -954,7 +956,7 @@ def _prefer(by_route: Mapping[str, Selection], policy: str) -> Selection:
     return next(iter(by_route.values()))
 
 
-def _reason(selection: Selection, found: Any, policy: str) -> str:
+def _reason(selection: Selection, found: TensorCandidates, policy: str) -> str:
     """WHY this tensor got this route, in one sentence, recorded IN the plan.
 
     #549.5's ragged-K case is the one that made this mandatory: a plan that quietly resolves
@@ -999,10 +1001,4 @@ def _leaf_speed_confession(speedup: float) -> str:
 
 def _with_facts(plan: ResolvedModelPlan, facts: PlanFacts) -> ResolvedModelPlan:
     fact = facts.get(plan.digest())
-    return _replace(plan, measurements=fact if fact.samples else None)
-
-
-def _replace(plan: ResolvedModelPlan, **changes: Any) -> ResolvedModelPlan:
-    import dataclasses
-
-    return dataclasses.replace(plan, **changes)
+    return dataclasses.replace(plan, measurements=fact if fact.samples else None)

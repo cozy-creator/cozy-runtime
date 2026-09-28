@@ -71,6 +71,8 @@ from cozy_runtime.internal.encoding import (
     Capabilities,
     DeviceFacts,
     Encoded,
+    LeafProvider,
+    Provider,
     RolePart,
     Selection,
     device_line,
@@ -80,6 +82,7 @@ from cozy_runtime.internal.encoding import (
 )
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
 from cozy_runtime.internal.paging import BlockLayout, PageUnit, partition
+from cozy_runtime.internal.probe import QualificationResult, observed_capability_records, qualify
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan, TensorResolution
 
 if TYPE_CHECKING:
@@ -740,13 +743,12 @@ def servability(rows: Sequence[PlanRow], answer: ResolvedModelPlan | PlanRefusal
     if isinstance(answer, ResolvedModelPlan):
         return Servability(True, by_alias, answer.route_census(), "", "")
     summary = {"no_rows", "unconsented", "unscored", "eligible", "chosen", "chosen_uncalibrated"}
-    for step in answer.walk:
-        verdict = str(step.get("verdict", ""))
-        if verdict in summary:
+    for step in answer.steps:
+        if step.verdict in summary:
             continue
-        code = "encoding_unqualified" if verdict == "unqualified" else verdict
+        code = "encoding_unqualified" if step.verdict == "unqualified" else step.verdict
         if code in REFUSALS:
-            return Servability(False, by_alias, {}, str(step.get("why", "")), code)
+            return Servability(False, by_alias, {}, step.why, code)
     return Servability(False, by_alias, {}, answer.detail, "plan_unresolved")
 
 
@@ -754,7 +756,7 @@ def servability_for_script(
     rows: Sequence[PlanRow],
     *,
     release: str,
-    providers: Mapping[str, Any],
+    providers: Mapping[str, tuple[Provider, ...]],
     capabilities: Capabilities,
     device: DeviceFacts,
     store: str = "synthetic",
@@ -1092,7 +1094,7 @@ class StreamingFillBackend:
         on_position: Callable[[int], None] | None = None,
         decode_scratch_bytes: int = 512 << 20,
         release: str = "cozy-runtime/0.0.2",
-        qualified: tuple[Capabilities, dict[str, Any]] | None = None,
+        qualified: tuple[Capabilities, QualificationResult] | None = None,
         forensics_dir: str = "",
         custody: str = "canonical",
     ) -> None:
@@ -1194,8 +1196,6 @@ class StreamingFillBackend:
         )
         # cr-006. The device is measured and the qualification suite runs at PREPARE time;
         # the request path runs neither. Selection is an O(1) lookup per key inside `fill`.
-        from cozy_runtime.internal.probe import qualify
-
         self.device_facts: DeviceFacts = measure_device(self.torch, self.device.index or 0)
         self.providers = launch_providers()
         self.capabilities: Capabilities
@@ -1367,7 +1367,6 @@ class StreamingFillBackend:
         from cozy_runtime.internal.derive import torch_module
         from cozy_runtime.internal.encoding import measure_runtime
         from cozy_runtime.internal.planfacts import PlanFacts
-        from cozy_runtime.internal.probe import qualify
         from cozy_runtime.internal.resolution import script_plan
 
         torch = torch_module()
@@ -1451,7 +1450,6 @@ class StreamingFillBackend:
         leave the fill's completeness set so the commit does not miss them.
         """
         from cozy_runtime.internal import canonical
-        from cozy_runtime.internal.probe import observed_capability_records
 
         tensorfs = tensorfs_module()
         by_checkpoint: dict[str, tuple[Checkpoint, list[str]]] = {}
@@ -1705,8 +1703,8 @@ class StreamingFillBackend:
         for row in self.plan.values():
             route = self.resolved[row.key].route
             resident = scratch = 0
-            if route == "encoded_gemm":
-                provider = self.selected[row.key].provider
+            provider = self.selected[row.key].provider
+            if isinstance(provider, LeafProvider):
                 parts = {part.role: part for part in row.encoded.parts}
                 resident = provider.resident_bytes(parts)
                 scratch = provider.fill_scratch_bytes(parts)
@@ -2335,26 +2333,26 @@ class StreamingFillBackend:
         #: hold more live scratch than the envelope priced.
         retired: list[Any] = []
         for row in pending:
-            selection = self.selected[row.key]
+            provider = self.selected[row.key].provider
             parts = self.scratch.pop(row.key, {})
-            missing = sorted(selection.provider.required - set(parts))
+            missing = sorted(provider.required - set(parts))
             if missing:
                 raise _refuse(
                     "incomplete_fill",
-                    f"{row.key}: role(s) {missing} never arrived, so the {selection.provider.route}"
+                    f"{row.key}: role(s) {missing} never arrived, so the {provider.route}"
                     " provider has no complete role set — a partially delivered encoded tensor "
                     "is rolled back, never served from what happened to land",
                     missing[:6],
                 )
-            if selection.provider.route == "encoded_gemm":
+            if isinstance(provider, LeafProvider):
                 # THE ROLES DO NOT DECODE, THEY STAY. `spent` is deliberately not extended:
                 # these buffers are the resident weight from here on, and freeing them is
                 # what the whole rung exists not to do.
-                retired.append(self._install_leaf(row, selection, parts))
+                retired.append(self._install_leaf(row, provider, parts))
                 self.decoded["leaves"] += 1
                 self.decoded["resident_bytes"] += row.stored_nbytes
                 continue
-            selection.provider.decode(self.torch, parts, self.enqueued[row.key])
+            provider.decode(self.torch, parts, self.enqueued[row.key])
             spent.append(parts)
             self.decoded["tensors"] += 1
             self.decoded["bytes"] += row.stored_nbytes
@@ -2378,7 +2376,7 @@ class StreamingFillBackend:
         return freed
 
     def _install_leaf(
-        self, row: PlanRow, selection: Selection, parts: Mapping[str, Any]
+        self, row: PlanRow, provider: LeafProvider, parts: Mapping[str, Any]
     ) -> dict[str, Any]:
         """Replace one module with the leaf that holds its encoded weight.
 
@@ -2395,7 +2393,7 @@ class StreamingFillBackend:
         """
         destination = self.enqueued[row.key]
         owner, replaced, attribute = self._leaf_site(row.key, row, destination)
-        leaf = selection.provider.leaf(self.torch, parts, replaced, destination.dtype)
+        leaf = provider.leaf(self.torch, parts, replaced, destination.dtype)
         # Hooks are authored computation. Share their registries so existing handles
         # still remove them after replacement and after a component is staged again.
         for name in (

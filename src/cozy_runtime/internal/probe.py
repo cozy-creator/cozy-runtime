@@ -55,29 +55,39 @@ match its own key is discarded.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
 import math
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import msgspec
+
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding import (
+    MX_BLOCK,
     SPEC_VECTORS,
     TORCH_DTYPES,
     Capabilities,
     CapabilityRecord,
     DeviceFacts,
+    LeafProvider,
+    Provider,
+    RolePart,
     RuntimeIdentity,
     geometry_class,
     implementation_digest,
     measure_runtime,
 )
+from cozy_runtime.internal.instruments import quantize_rowwise
+
+# `torch`, `device`, `dtype` and tensor values are `Any`: the check venv carries no torch.
 
 #: One decode of this many elements is the micro-benchmark's unit — a realistic attention
 #: projection, not a toy and not a search space.
@@ -89,6 +99,158 @@ BENCH_REPS = 8
 #: qualification suite that spent a second per (provider, dtype) on a matmul nobody reads
 #: would be paying §3.2's prepare-time budget for nothing.
 FIDELITY_TOKENS = 256
+
+#: Where a native route's GEMM stops being lossy and starts being wrong. #515a measured the
+#: real thing at 0.0421 relative (27.5 dB) and #517d at 0.146 (16.7 dB) on a harder subject;
+#: a mis-strided scale or an unswizzled grid measures past 0.5. The line is drawn in the gap
+#: and it is a SANITY bound, not a quality one — quality is the ranked axis, not the gate.
+NATIVE_DEVIATION_BOUND = 0.30
+
+# ----------------------------------------------------------------- the result records
+
+
+class RouteAxes(msgspec.Struct, frozen=True):
+    """The two MEASURED axes `Capabilities.admit` ranks on (#517e). -1.0 is NOT MEASURED,
+    which makes a record UNRANKABLE rather than plausible: a zero would win every comparison
+    it was never entitled to enter."""
+
+    deviation_rel: float = -1.0
+    resident_bits_per_element: float = -1.0
+
+
+class Sweep(msgspec.Struct, frozen=True, omit_defaults=True):
+    """A decode oracle's verdict: `patterns` for the one-scale sweep; `pairs`, per-band counts
+    and the first wrong pair for a whole-domain one."""
+
+    max_abs_error: float
+    max_rel_error: float
+    tolerance: float
+    nan_preserved: bool
+    passed: bool
+    patterns: int = 0
+    pairs: int = 0
+    subnormal_tolerance: float = 0.0
+    domain: dict[str, int] | None = None
+    wrong: dict[str, int] | None = None
+    first_wrong: str | None = None
+
+
+class NativeAgreement(
+    msgspec.Struct, frozen=True, omit_defaults=True, tag_field="kind", tag="native"
+):
+    """A native leaf's GEMM against the f64 reference, or its kernel's refusal verbatim."""
+
+    passed: bool
+    shape: list[int] = []
+    deviation_rel: float = -1.0
+    tolerance: float | None = None
+    finite: bool | None = None
+    out_dtype: str = ""
+    out_dtype_is_contract: bool | None = None
+    kernel: str = ""
+    note: str = ""
+
+
+class DecodeBench(msgspec.Struct, frozen=True):
+    shape: list[int]
+    reps: int
+    decode_ns: int
+    gb_per_s: float
+
+
+class LeafBench(msgspec.Struct, frozen=True):
+    shape: list[int]
+    reps: int
+    leaf_ns: int
+    float_gemm_ns: int
+    speedup_x: float
+
+
+class VectorRef(msgspec.Struct, frozen=True):
+    filename: str
+    sha256: str
+
+
+class VectorCheck(msgspec.Struct, frozen=True, omit_defaults=True):
+    """One mined case: its bytes compared, skipped for geometry, or refused for its roles."""
+
+    name: str
+    passed: bool
+    skipped: bool = False
+    why: str = ""
+    elements: int | None = None
+    differing_bytes: int | None = None
+
+
+class SpecVectors(
+    msgspec.Struct, frozen=True, omit_defaults=True, tag_field="kind", tag="spec-vectors"
+):
+    """The reviewed spec's own vectors (#549.4). SKIPPED neither passes nor fails a record."""
+
+    passed: bool
+    skipped: bool = False
+    note: str = ""
+    document: VectorRef | None = None
+    cases: list[VectorCheck] = []
+
+
+class VerbatimEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="verbatim"):
+    note: str
+    passed: bool = True
+    route_axes: RouteAxes = RouteAxes()
+
+
+class UnmeasuredEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="unmeasured"):
+    note: str
+    passed: bool = False
+    route_axes: RouteAxes = RouteAxes()
+
+
+class NativeEvidence(
+    msgspec.Struct, frozen=True, omit_defaults=True, tag_field="kind", tag="native"
+):
+    numerics: NativeAgreement
+    passed: bool
+    route_axes: RouteAxes
+    micro_bench: LeafBench | None = None
+
+
+class DecodeEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="decode"):
+    numerics: Sweep
+    spec_vectors: SpecVectors
+    micro_bench: DecodeBench
+    passed: bool
+    route_axes: RouteAxes = RouteAxes()
+
+
+Evidence = VerbatimEvidence | UnmeasuredEvidence | NativeEvidence | DecodeEvidence
+
+
+class Observation(msgspec.Struct, frozen=True):
+    encoding_spec_id: str
+    implementation: str
+    implementation_digest: str
+    implementation_revision: str
+    device_predicate: str
+    output_dtype: str
+    geometry_class: str
+    """WHAT SHAPE THIS WAS MEASURED AT (#549.9). Evidence, not a filter: `Provider.supports`
+    gates a tensor's geometry, and filtering admission on this string too would refuse the
+    decode floor for the ragged tensor it is the only route for."""
+    delivery_route: str
+    evidence: Evidence
+
+
+class QualificationResult(msgspec.Struct, frozen=True):
+    """One suite run: what it ran on and everything it observed. What `qualified` keeps."""
+
+    tuple_key: str = msgspec.field(name="tuple")
+    device: DeviceFacts
+    device_predicate: str
+    runtime_release: str
+    runtime: RuntimeIdentity
+    suite_ms: int
+    observations: list[Observation]
 
 
 def e4m3_value(bits: int) -> float:
@@ -125,7 +287,7 @@ def _eps(torch: Any, dtype: Any) -> float:
     return float(torch.finfo(dtype).eps)
 
 
-def _numerics_mx(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str, Any]:
+def _numerics_mx(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
     """Decode the WHOLE (e4m3 element x e8m0 block scale) cross product — 65,536 pairs.
 
     The fp8 suite below checks 256 element patterns at ONE scale, which is the whole domain
@@ -165,18 +327,96 @@ def _numerics_mx(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
     provider.decode(torch, {"data": data, "scale": scale}, destination)
     got = destination.double().cpu().reshape(-1).tolist()
+    return _domain_sweep(
+        torch, dtype, got, [(e8m0_value(r), f"scale {r:#04x}") for r in range(rows)]
+    )
 
+
+def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
+    """Decode all 256 e4m3 patterns at a known scale and compare to the oracle.
+
+    The tolerance is DERIVED, not chosen: the route casts the element to the destination
+    dtype and multiplies by the scale in that dtype, so two roundings are the whole error
+    budget. A decoder that adds anything of its own fails here.
+    """
+    scale_value = 0.013671875  # exactly representable in f16/bf16/f32: 7 * 2^-9
+    patterns = bytes(range(256))
+    data = torch.frombuffer(bytearray(patterns), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    data = data.reshape(16, 16).to(device)
+    weight_scale = torch.tensor(scale_value, dtype=torch.float32, device=device)
+    destination = torch.empty(16, 16, dtype=dtype, device=device)
+    provider.decode(torch, {"data": data, "weight_scale": weight_scale}, destination)
+    got = destination.reshape(-1).double().cpu().tolist()
+
+    worst_rel, worst_abs, nan_ok = 0.0, 0.0, True
+    for index, byte in enumerate(patterns):
+        want = e4m3_value(byte) * scale_value
+        have = got[index]
+        if math.isnan(want):
+            nan_ok = nan_ok and math.isnan(have)
+            continue
+        error = abs(have - want)
+        worst_abs = max(worst_abs, error)
+        if want != 0.0:
+            worst_rel = max(worst_rel, error / abs(want))
+    bound = 2.0 * _eps(torch, dtype)
+    return Sweep(
+        patterns=256,
+        max_abs_error=worst_abs,
+        max_rel_error=worst_rel,
+        tolerance=bound,
+        nan_preserved=nan_ok,
+        passed=worst_rel <= bound and nan_ok,
+    )
+
+
+def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
+    """Decode all 256 e4m3 patterns against 256 DIFFERENT row scales — 65,536 pairs.
+
+    `fp8-rowwise/1`'s scale is a CONTINUOUS f32 per output row, not a format with 256 code
+    points, so there is no finite cross-product to exhaust the way `mxfp8/1` has. The
+    honest substitute is the one that would catch the failure this route actually has: a
+    row scale is applied per ROW, so the domain that matters is (every element pattern) x
+    (a scale spread across the f32 exponent range), and a decoder that mis-strides the
+    scale — reads it down the columns, or broadcasts a rank-2 `[out, 1]` as `[1, out]` —
+    gets the wrong answer on every row but the diagonal.
+
+    The scales are exact powers of two so the product carries ONE rounding, which is the
+    same two-rounding budget the other decode oracles hold their providers to. That is a
+    deliberate narrowing and it is stated: it checks the ROUTING of the scale exactly and
+    the ROUNDING of an arbitrary f32 multiply not at all.
+    """
+    rows = cols = 256
+    data = (
+        torch.frombuffer(bytearray(bytes(range(256)) * rows), dtype=torch.uint8)
+        .view(torch.float8_e4m3fn)
+        .reshape(rows, cols)
+        .to(device)
+    )
+    exponents = [(r % 60) - 30 for r in range(rows)]
+    scale = torch.tensor(
+        [math.ldexp(1.0, e) for e in exponents], dtype=torch.float32, device=device
+    )
+    destination = torch.empty(rows, cols, dtype=dtype, device=device)
+    provider.decode(torch, {"data": data, "scale": scale}, destination)
+    got = destination.double().cpu().reshape(-1).tolist()
+    return _domain_sweep(
+        torch, dtype, got, [(math.ldexp(1.0, e), f"row scale 2**{e}") for e in exponents]
+    )
+
+
+def _domain_sweep(
+    torch: Any, dtype: Any, got: Sequence[float], scales: Sequence[tuple[float, str]]
+) -> Sweep:
+    """Grade a decode of all 256 e4m3 elements under each row's `(scale, label)` into the
+    five bands `_numerics_mx` names. `got` is row-major, one row per scale."""
     info = torch.finfo(dtype)
-    finite_max = float(info.max)
-    smallest_normal = float(info.tiny)
-    ulp_sub = float(getattr(info, "smallest_normal", info.tiny)) * _eps(torch, dtype)
-    rel_bound = 2.0 * _eps(torch, dtype)
-    abs_bound = 2.0 * ulp_sub
+    finite_max, smallest_normal = float(info.max), float(info.tiny)
+    ulp_sub = smallest_normal * _eps(torch, dtype)
+    rel_bound, abs_bound = 2.0 * _eps(torch, dtype), 2.0 * ulp_sub
     elements = [e4m3_value(b) for b in range(256)]
-    scales = [e8m0_value(b) for b in range(256)]
-    bands = ("normal", "subnormal", "overflow", "underflow", "nan")
-    counts = dict.fromkeys(bands, 0)
-    wrong = dict.fromkeys(bands, 0)
+    counts = dict.fromkeys(("normal", "subnormal", "overflow", "underflow", "nan"), 0)
+    wrong = dict.fromkeys(counts, 0)
     worst_rel = worst_abs = 0.0
     first_bad = ""
 
@@ -185,12 +425,11 @@ def _numerics_mx(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str
         wrong[band] += 1
         first_bad = first_bad or why
 
-    for r in range(rows):
-        s = scales[r]
-        for c in range(cols):
-            want = elements[c] * s
-            have = got[r * cols + c]
-            where = f"element {c:#04x} x scale {r:#04x}"
+    for r, (s, label) in enumerate(scales):
+        for c, element in enumerate(elements):
+            want = element * s
+            have = got[r * len(elements) + c]
+            where = f"element {c:#04x} x {label}"
             if math.isnan(want):
                 counts["nan"] += 1
                 if not math.isnan(have):
@@ -223,157 +462,26 @@ def _numerics_mx(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str
                         "normal",
                         f"{where}: {have} != {want} (rel {relative:.3e} > {rel_bound:.3e})",
                     )
-    return {
-        "pairs": rows * cols,
-        "domain": counts,
-        "max_abs_error": worst_abs,
-        "max_rel_error": worst_rel,
-        "tolerance": rel_bound,
-        "subnormal_tolerance": abs_bound,
-        "nan_preserved": wrong["nan"] == 0,
-        "wrong": wrong,
-        "first_wrong": first_bad,
-        "passed": not any(wrong.values()),
-    }
-
-
-def _numerics(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str, Any]:
-    """Decode all 256 e4m3 patterns at a known scale and compare to the oracle.
-
-    The tolerance is DERIVED, not chosen: the route casts the element to the destination
-    dtype and multiplies by the scale in that dtype, so two roundings are the whole error
-    budget. A decoder that adds anything of its own fails here.
-    """
-    scale_value = 0.013671875  # exactly representable in f16/bf16/f32: 7 * 2^-9
-    patterns = bytes(range(256))
-    data = torch.frombuffer(bytearray(patterns), dtype=torch.uint8).view(torch.float8_e4m3fn)
-    data = data.reshape(16, 16).to(device)
-    weight_scale = torch.tensor(scale_value, dtype=torch.float32, device=device)
-    destination = torch.empty(16, 16, dtype=dtype, device=device)
-    provider.decode(torch, {"data": data, "weight_scale": weight_scale}, destination)
-    got = destination.reshape(-1).double().cpu().tolist()
-
-    worst_rel, worst_abs, nan_ok = 0.0, 0.0, True
-    for index, byte in enumerate(patterns):
-        want = e4m3_value(byte) * scale_value
-        have = got[index]
-        if math.isnan(want):
-            nan_ok = nan_ok and math.isnan(have)
-            continue
-        error = abs(have - want)
-        worst_abs = max(worst_abs, error)
-        if want != 0.0:
-            worst_rel = max(worst_rel, error / abs(want))
-    bound = 2.0 * _eps(torch, dtype)
-    return {
-        "patterns": 256,
-        "max_abs_error": worst_abs,
-        "max_rel_error": worst_rel,
-        "tolerance": bound,
-        "nan_preserved": nan_ok,
-        "passed": bool(worst_rel <= bound and nan_ok),
-    }
-
-
-def _numerics_rowwise(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str, Any]:
-    """Decode all 256 e4m3 patterns against 256 DIFFERENT row scales — 65,536 pairs.
-
-    `fp8-rowwise/1`'s scale is a CONTINUOUS f32 per output row, not a format with 256 code
-    points, so there is no finite cross-product to exhaust the way `mxfp8/1` has. The
-    honest substitute is the one that would catch the failure this route actually has: a
-    row scale is applied per ROW, so the domain that matters is (every element pattern) x
-    (a scale spread across the f32 exponent range), and a decoder that mis-strides the
-    scale — reads it down the columns, or broadcasts a rank-2 `[out, 1]` as `[1, out]` —
-    gets the wrong answer on every row but the diagonal.
-
-    The scales are exact powers of two so the product carries ONE rounding, which is the
-    same two-rounding budget the other decode oracles hold their providers to. That is a
-    deliberate narrowing and it is stated: it checks the ROUTING of the scale exactly and
-    the ROUNDING of an arbitrary f32 multiply not at all.
-    """
-    rows = cols = 256
-    data = (
-        torch.frombuffer(bytearray(bytes(range(256)) * rows), dtype=torch.uint8)
-        .view(torch.float8_e4m3fn)
-        .reshape(rows, cols)
-        .to(device)
+    return Sweep(
+        pairs=len(got),
+        domain=counts,
+        max_abs_error=worst_abs,
+        max_rel_error=worst_rel,
+        tolerance=rel_bound,
+        subnormal_tolerance=abs_bound,
+        nan_preserved=wrong["nan"] == 0,
+        wrong=wrong,
+        first_wrong=first_bad,
+        passed=not any(wrong.values()),
     )
-    exponents = [(r % 60) - 30 for r in range(rows)]
-    scale = torch.tensor(
-        [math.ldexp(1.0, e) for e in exponents], dtype=torch.float32, device=device
-    )
-    if provider.required == frozenset({"data", "scale"}) and getattr(
-        provider, "keepdim", False
-    ):  # pragma: no cover - the rank-2 variant is served by the same provider
-        scale = scale.reshape(rows, 1)
-    destination = torch.empty(rows, cols, dtype=dtype, device=device)
-    provider.decode(torch, {"data": data, "scale": scale}, destination)
-    got = destination.double().cpu().reshape(-1).tolist()
-
-    info = torch.finfo(dtype)
-    finite_max, smallest_normal = float(info.max), float(info.tiny)
-    ulp_sub = smallest_normal * _eps(torch, dtype)
-    rel_bound, abs_bound = 2.0 * _eps(torch, dtype), 2.0 * ulp_sub
-    elements = [e4m3_value(b) for b in range(256)]
-    counts = {"normal": 0, "subnormal": 0, "overflow": 0, "underflow": 0, "nan": 0}
-    wrong = dict.fromkeys(counts, 0)
-    worst_rel = worst_abs = 0.0
-    first_bad = ""
-
-    def note(band: str, why: str) -> None:
-        nonlocal first_bad
-        wrong[band] += 1
-        first_bad = first_bad or why
-
-    for r in range(rows):
-        s = math.ldexp(1.0, exponents[r])
-        for c in range(cols):
-            want = elements[c] * s
-            have = got[r * cols + c]
-            where = f"element {c:#04x} x row scale 2**{exponents[r]}"
-            if math.isnan(want):
-                counts["nan"] += 1
-                if not math.isnan(have):
-                    note("nan", f"{where}: {have} != nan")
-            elif abs(want) > finite_max:
-                counts["overflow"] += 1
-                if not math.isinf(have) or (have > 0) != (want > 0):
-                    note("overflow", f"{where}: {have} != inf")
-            elif want != 0.0 and abs(want) < ulp_sub / 2.0:
-                counts["underflow"] += 1
-                if have != 0.0:
-                    note("underflow", f"{where}: {have} != 0")
-            elif abs(want) < smallest_normal:
-                counts["subnormal"] += 1
-                error = abs(have - want)
-                worst_abs = max(worst_abs, error)
-                if error > abs_bound:
-                    note("subnormal", f"{where}: {have} != {want} (abs {error:.3e})")
-            else:
-                counts["normal"] += 1
-                error = abs(have - want)
-                worst_abs = max(worst_abs, error)
-                worst_rel = max(worst_rel, error / abs(want))
-                if error / abs(want) > rel_bound:
-                    note("normal", f"{where}: {have} != {want} (rel {error / abs(want):.3e})")
-    return {
-        "pairs": rows * cols,
-        "domain": counts,
-        "max_abs_error": worst_abs,
-        "max_rel_error": worst_rel,
-        "tolerance": rel_bound,
-        "subnormal_tolerance": abs_bound,
-        "nan_preserved": wrong["nan"] == 0,
-        "wrong": wrong,
-        "first_wrong": first_bad,
-        "passed": not any(wrong.values()),
-    }
 
 
 # ------------------------------------------------------------------- the native oracles
 
 
-def _native_agreement(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str, Any]:
+def _native_agreement(
+    torch: Any, provider: LeafProvider, device: Any, dtype: Any
+) -> NativeAgreement:
     """A NATIVE LEAF is checked by running its kernel and comparing it to arithmetic.
 
     A decode provider is checked against a format oracle because its output IS a number per
@@ -400,48 +508,30 @@ def _native_agreement(torch: Any, provider: Any, device: Any, dtype: Any) -> dic
     measure worse than 0.5 relative, and no correct w8a8 route measures worse than 0.15.
     """
     weight, roles = _weight_roles(torch, provider, device)
-    if not roles:
-        return {
-            "kind": "native",
-            "passed": False,
-            "note": f"no operand builder for suite {provider.suite!r}",
-        }
     x = _activation(torch, device, dtype)
     reference = _reference_gemm(torch, x, weight)
     replaced = _StandIn(int(weight.shape[1]), int(weight.shape[0]))
     try:
-        leaf = provider.leaf(torch, roles, replaced, dtype)
-        got = leaf(x)
+        got = provider.leaf(torch, roles, replaced, dtype)(x)
     except Exception as exc:  # the kernel, the dtype or the arch says no — verbatim
-        return {
-            "kind": "native",
-            "passed": False,
-            "kernel": f"{type(exc).__module__}.{type(exc).__name__}: {exc}",
-            "note": "the native kernel refused on this device; no record is minted, and the "
+        return NativeAgreement(
+            passed=False,
+            kernel=f"{type(exc).__module__}.{type(exc).__name__}: {exc}",
+            note="the native kernel refused on this device; no record is minted, and the "
             "encoding falls to whichever decode provider this card DID qualify",
-        }
+        )
     deviation = _relative(torch, got, reference)
-    return {
-        "kind": "native",
-        "shape": [int(x.shape[0]), *[int(n) for n in weight.shape]],
-        "deviation_rel": deviation,
-        "tolerance": NATIVE_DEVIATION_BOUND,
-        "finite": bool(torch.isfinite(got).all()),
-        "out_dtype": str(got.dtype).removeprefix("torch."),
-        "out_dtype_is_contract": str(got.dtype) == str(x.dtype),
-        "passed": bool(
-            deviation <= NATIVE_DEVIATION_BOUND
-            and torch.isfinite(got).all()
-            and str(got.dtype) == str(x.dtype)
-        ),
-    }
-
-
-#: Where a native route's GEMM stops being lossy and starts being wrong. #515a measured the
-#: real thing at 0.0421 relative (27.5 dB) and #517d at 0.146 (16.7 dB) on a harder subject;
-#: a mis-strided scale or an unswizzled grid measures past 0.5. The line is drawn in the gap
-#: and it is a SANITY bound, not a quality one — quality is the ranked axis, not the gate.
-NATIVE_DEVIATION_BOUND = 0.30
+    finite = bool(torch.isfinite(got).all())
+    contract = str(got.dtype) == str(x.dtype)
+    return NativeAgreement(
+        passed=deviation <= NATIVE_DEVIATION_BOUND and finite and contract,
+        shape=[int(x.shape[0]), *[int(n) for n in weight.shape]],
+        deviation_rel=deviation,
+        tolerance=NATIVE_DEVIATION_BOUND,
+        finite=finite,
+        out_dtype=str(got.dtype).removeprefix("torch."),
+        out_dtype_is_contract=contract,
+    )
 
 
 class _StandIn:
@@ -461,16 +551,13 @@ class _StandIn:
         self.bias = None
 
 
-def _weight_roles(torch: Any, provider: Any, device: Any) -> tuple[Any, dict[str, Any]]:
+def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dict[str, Any]]:
     """A deterministic `BENCH_SHAPE` weight and the stored roles of it, per suite.
 
     SEEDED, so two probes of one device measure the same tensor and their records are
     comparable; and quantized by the encoding's OWN equation, so what the routes are then
     compared on is a real carrier rather than random bytes that no producer would emit.
     """
-    from cozy_runtime.internal.encoding import MX_BLOCK
-    from cozy_runtime.internal.instruments import quantize_rowwise
-
     rows, cols = BENCH_SHAPE
     generator = torch.Generator(device="cpu").manual_seed(0x511B)
     weight = torch.randn(rows, cols, generator=generator, dtype=torch.float32).to(device) * 0.05
@@ -498,10 +585,10 @@ def _weight_roles(torch: Any, provider: Any, device: Any) -> tuple[Any, dict[str
         scale = (amax / 448.0).to(torch.float32)
         payload = (weight / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
         return weight, {"data": payload, "weight_scale": scale.reshape(())}
-    return weight, {}
+    raise AssertionError(f"no operand builder for suite {provider.suite!r}")
 
 
-def _exact_weight(torch: Any, provider: Any, roles: Mapping[str, Any]) -> Any:
+def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> Any:
     """The EXACT float64 value of the stored roles. The reference both routes are scored on.
 
     Written here in f64 rather than delegated to the decode provider on purpose: a reference
@@ -510,8 +597,6 @@ def _exact_weight(torch: Any, provider: Any, roles: Mapping[str, Any]) -> Any:
     element and a power-of-two or f32 scale multiply without rounding in f64 — so what the
     deviation below measures is entirely the route's own.
     """
-    from cozy_runtime.internal.encoding import MX_BLOCK
-
     data = roles["data"].double()
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         return data * roles["scale"].double().reshape(int(data.shape[0]), 1)
@@ -540,9 +625,7 @@ def _relative(torch: Any, got: Any, reference: Any) -> float:
     return float(delta / reference.norm().clamp(min=1e-30))
 
 
-def _route_axes(
-    torch: Any, provider: Any, device: Any, dtype: Any, native: Mapping[str, Any] | None
-) -> dict[str, Any]:
+def _decode_axes(torch: Any, provider: Provider, device: Any, dtype: Any) -> RouteAxes:
     """The two MEASURED axes #517e's ranking orders providers on, in ONE comparable frame.
 
     Both routes are scored against the same reference — an f64 matmul over the exact value
@@ -555,50 +638,40 @@ def _route_axes(
     Footprint is the other side of the same fact and is read the same way: what stays
     RESIDENT per logical element once the fill is over. On a decode route that is the
     destination dtype's own width, because the weights are float either way; on a native
-    route it is the role bytes, because the roles are the weight.
+    route it is the role bytes, because the roles are the weight (`_native_axes`).
     """
-    weight, roles = _weight_roles(torch, provider, device)
-    numel = int(weight.numel())
-    if provider.route == "encoded_gemm":
-        if native is None or not native.get("passed"):
-            return {"deviation_rel": -1.0, "resident_bits_per_element": -1.0}
-        parts = {
-            role: _RolePartLike(tuple(int(n) for n in t.shape), int(t.numel() * t.element_size()))
-            for role, t in roles.items()
-        }
-        return {
-            "deviation_rel": float(native["deviation_rel"]),
-            "resident_bits_per_element": provider.resident_bits_per_element(parts, numel),
-        }
-    if not roles:
-        return {"deviation_rel": -1.0, "resident_bits_per_element": -1.0}
+    _, roles = _weight_roles(torch, provider, device)
     destination = torch.empty(*BENCH_SHAPE, dtype=dtype, device=device)
     provider.decode(torch, roles, destination)
     x = _activation(torch, device, dtype)
-    got = x @ destination.t()
-    return {
-        "deviation_rel": _relative(
-            torch, got, _reference_gemm(torch, x, _exact_weight(torch, provider, roles))
-        ),
-        # The weights are FLOAT after this route's fill, which is the whole of "it buys
-        # bytes read and load time, NOT VRAM". Reading it off the destination rather than
-        # asserting 16 keeps it true for an f32 destination too.
-        "resident_bits_per_element": 8.0 * destination.element_size(),
+    reference = _reference_gemm(torch, x, _exact_weight(torch, provider, roles))
+    # The weights are FLOAT after this route's fill, which is the whole of "it buys bytes
+    # read and load time, NOT VRAM". Reading it off the destination rather than asserting
+    # 16 keeps it true for an f32 destination too.
+    return RouteAxes(
+        _relative(torch, x @ destination.t(), reference), 8.0 * destination.element_size()
+    )
+
+
+#: torch dtype name -> TensorFS carrier name, for the role parts a leaf prices.
+_CARRIER = {name: carrier for carrier, name in TORCH_DTYPES.items()}
+
+
+def _native_axes(torch: Any, provider: LeafProvider, device: Any, deviation: float) -> RouteAxes:
+    """A native route's axes: its measured GEMM deviation, and the role bytes the leaf keeps
+    resident, priced by the provider from the probe's real tensors (MXFP8 pads its scale grid
+    to the blocked layout, so a raw byte count would under-price it)."""
+    weight, roles = _weight_roles(torch, provider, device)
+    parts = {
+        role: RolePart(
+            role,
+            _CARRIER[str(t.dtype).removeprefix("torch.")],
+            tuple(int(n) for n in t.shape),
+            int(t.numel() * t.element_size()),
+        )
+        for role, t in roles.items()
     }
-
-
-class _RolePartLike:
-    """Role geometry and bytes measured from the probe's real tensors.
-
-    Native providers can pad stored roles for device layouts; MXFP8 uses the scale
-    grid's shape to price its blocked representation rather than its raw byte count.
-    """
-
-    __slots__ = ("nbytes", "shape")
-
-    def __init__(self, shape: tuple[int, ...], nbytes: int) -> None:
-        self.shape = shape
-        self.nbytes = nbytes
+    return RouteAxes(deviation, provider.resident_bits_per_element(parts, int(weight.numel())))
 
 
 # ------------------------------------------------------- the reviewed spec's own vectors
@@ -610,7 +683,31 @@ class _RolePartLike:
 VECTOR_ROOT = Path(__file__).resolve().parent / "encoding" / "vectors"
 
 
-def vector_tensor(torch: Any, blob: Mapping[str, Any], device: Any) -> Any:
+class VectorBlob(msgspec.Struct, frozen=True):
+    dtype: str
+    shape: list[int]
+    bits: str
+
+
+class MinedLogical(msgspec.Struct, frozen=True):
+    dtype: str
+    shape: list[int]
+
+
+class MinedCase(msgspec.Struct, frozen=True):
+    name: str
+    logical: MinedLogical
+    roles: dict[str, VectorBlob]
+    expect_logical_bits: str
+
+
+class VectorDocument(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """A producer-mined vector document, as TensorFS vendors it."""
+
+    cases: list[MinedCase]
+
+
+def vector_tensor(torch: Any, blob: VectorBlob, device: Any) -> Any:
     """One vector role/logical field -> the tensor it encodes. PUBLIC: the conformance
     runner builds the same tensors to compare a rounding rule against the reference.
 
@@ -619,23 +716,17 @@ def vector_tensor(torch: Any, blob: Mapping[str, Any], device: Any) -> Any:
     binding for is a refusal rather than a guess, for the same reason the fill plane refuses
     one: landing the wrong number of bytes is worse than not landing them.
     """
-    import base64
-
-    name = str(blob["dtype"])
-    torch_name = TORCH_DTYPES.get(name)
+    torch_name = TORCH_DTYPES.get(blob.dtype)
     if torch_name is None:
         raise AssertionError(
-            f"the vendored vectors cite carrier dtype {name!r} and this "
+            f"the vendored vectors cite carrier dtype {blob.dtype!r} and this "
             "runtime has no torch binding for it"
         )
-    raw = bytearray(base64.b64decode(blob["bits"]))
-    shape = [int(n) for n in blob["shape"]]
-    flat = torch.frombuffer(raw, dtype=torch.uint8)
-    tensor = flat.view(getattr(torch, torch_name))
-    return tensor.reshape(shape).to(device)
+    flat = torch.frombuffer(bytearray(base64.b64decode(blob.bits)), dtype=torch.uint8)
+    return flat.view(getattr(torch, torch_name)).reshape(blob.shape).to(device)
 
 
-def spec_vector_document(spec_digest: str) -> dict[str, Any] | None:
+def spec_vector_document(spec_digest: str) -> VectorDocument | None:
     """The vendored vector document this SPEC DIGEST names, or None if it names none.
 
     #549.4's substance. A provider declares reviewed spec DIGESTS; each reviewed digest maps
@@ -644,24 +735,24 @@ def spec_vector_document(spec_digest: str) -> dict[str, Any] | None:
     nothing and its evidence is the fill plane's byte-identity proof.
 
     The reviewed table pins both the nested spec digest and its vector-byte digest. A copied
-    fixture that drifts therefore stops before JSON parsing or provider execution.
+    fixture that drifts therefore stops before JSON parsing or provider execution. Pinned
+    bytes this reader cannot decode raise `msgspec.ValidationError`: that is the reader
+    drifting from the bytes, and it must fail rather than skip.
     """
     pinned = SPEC_VECTORS.get(spec_digest)
     if pinned is None:
         return None
     name, expected_digest = pinned
-    path = VECTOR_ROOT / name
     try:
-        raw = path.read_bytes()
-        if "sha256:" + hashlib.sha256(raw).hexdigest() != expected_digest:
-            return None
-        data = json.loads(raw)
-    except (OSError, ValueError):
+        raw = (VECTOR_ROOT / name).read_bytes()
+    except OSError:
         return None
-    return data if isinstance(data, dict) and set(data) == {"cases"} else None
+    if "sha256:" + hashlib.sha256(raw).hexdigest() != expected_digest:
+        return None
+    return msgspec.json.decode(raw, type=VectorDocument)
 
 
-def case_dtype(case: Mapping[str, Any]) -> str | None:
+def case_dtype(case: MinedCase) -> str | None:
     """The TORCH dtype name one mined case's logical value carries, or None.
 
     The key is `dtype`. These documents are TensorFS's producer-mined vector artifacts,
@@ -671,10 +762,10 @@ def case_dtype(case: Mapping[str, Any]) -> str | None:
     here matched nothing, and a document that matches nothing reports SKIPPED, which is a
     pass locally and an absence everywhere else.
     """
-    return TORCH_DTYPES.get(str((case.get("logical") or {}).get("dtype")))
+    return TORCH_DTYPES.get(case.logical.dtype)
 
 
-def _spec_vectors(torch: Any, provider: Any, device: Any) -> dict[str, Any]:
+def _spec_vectors(torch: Any, provider: Provider, device: Any) -> SpecVectors:
     """Decode the REVIEWED SPEC's own producer-mined cases, BIT-FOR-BIT (#549.4).
 
     The synthetic oracles above sweep a format's whole domain against arithmetic written from
@@ -706,105 +797,70 @@ def _spec_vectors(torch: Any, provider: Any, device: Any) -> dict[str, Any]:
     check, so every accelerator lost every non-verbatim record and `tensorfs.fit` refused
     `encoding_unqualified` on a card whose decode had actually passed.
     """
-    cases: list[dict[str, Any]] = []
-    document = spec_vector_document(str(provider.encoding))
+    spec = f"{provider.encoding[:30]}…"
+    try:
+        document = spec_vector_document(provider.encoding)
+    except msgspec.ValidationError as exc:
+        return SpecVectors(passed=False, note=f"the vendored document for spec {spec}: {exc}")
     if document is None:
-        return {
-            "kind": "spec-vectors",
-            "skipped": True,
-            "note": f"no vendored vector document for spec {str(provider.encoding)[:30]}…",
-            "passed": True,
-        }
-    mined = tuple(document.get("cases", ()))
-    if mined and not any(case_dtype(case) for case in mined):
-        return {
-            "kind": "spec-vectors",
-            "passed": False,
-            "note": f"the vendored document for spec {str(provider.encoding)[:30]}… declares "
-            f"no logical dtype this runtime reads — its cases carry "
-            f"{sorted({str((c.get('logical') or {}).get('dtype')) for c in mined})}, and "
-            "the reader and the mined bytes have to agree before a case can run",
-        }
-    for case in mined:
+        return SpecVectors(
+            passed=True, skipped=True, note=f"no vendored vector document for spec {spec}"
+        )
+    if document.cases and not any(case_dtype(case) for case in document.cases):
+        return SpecVectors(
+            passed=False,
+            note=f"the vendored document for spec {spec} declares no logical dtype this "
+            f"runtime reads — its cases carry {sorted({c.logical.dtype for c in document.cases})}"
+            ", and the reader and the mined bytes have to agree before a case can run",
+        )
+    cases: list[VectorCheck] = []
+    for case in document.cases:
         logical_dtype = case_dtype(case)
         if logical_dtype is None:
             continue
-        logical = case["logical"]
-        roles = {role: vector_tensor(torch, blob, device) for role, blob in case["roles"].items()}
+        roles = {role: vector_tensor(torch, blob, device) for role, blob in case.roles.items()}
         missing = sorted(provider.required - set(roles))
         surplus = sorted(set(roles) - provider.required - provider.optional)
         if missing or surplus:
-            cases.append(
-                {
-                    "name": case.get("name"),
-                    "passed": False,
-                    "why": f"the mined case stores roles {sorted(roles)} and this provider "
-                    f"requires {sorted(provider.required)} (missing {missing}, "
-                    f"unhandled {surplus})",
-                }
+            why = (
+                f"the mined case stores roles {sorted(roles)} and this provider requires "
+                f"{sorted(provider.required)} (missing {missing}, unhandled {surplus})"
             )
+            cases.append(VectorCheck(case.name, passed=False, why=why))
             continue
-        shape = [int(n) for n in logical["shape"]]
+        shape = case.logical.shape
         why = provider.supports(shape)
         if why:
-            cases.append({"name": case.get("name"), "skipped": True, "why": why, "passed": True})
+            cases.append(VectorCheck(case.name, passed=True, skipped=True, why=why))
             continue
         destination = torch.empty(*shape, dtype=getattr(torch, logical_dtype), device=device)
         provider.decode(torch, roles, destination)
-        want = vector_tensor(torch, {**logical, "bits": case["expect_logical_bits"]}, device)
+        want = vector_tensor(
+            torch, VectorBlob(case.logical.dtype, shape, case.expect_logical_bits), device
+        )
         got_bits = destination.reshape(-1).view(torch.uint8).cpu()
         want_bits = want.reshape(-1).view(torch.uint8).cpu()
         differing = int((got_bits != want_bits).sum())
         cases.append(
-            {
-                "name": case.get("name"),
-                "elements": int(want.numel()),
-                "differing_bytes": differing,
-                "passed": differing == 0,
-            }
+            VectorCheck(
+                case.name,
+                passed=differing == 0,
+                elements=int(want.numel()),
+                differing_bytes=differing,
+            )
         )
     if not cases:
-        return {
-            "kind": "spec-vectors",
-            "skipped": True,
-            "note": "the vendored document carries no case",
-            "passed": True,
-        }
-    vector_ref = SPEC_VECTORS.get(str(provider.encoding))
-    return {
-        "kind": "spec-vectors",
-        "document": ({"filename": vector_ref[0], "sha256": vector_ref[1]} if vector_ref else None),
-        "cases": cases,
-        "passed": all(c["passed"] for c in cases),
-    }
+        return SpecVectors(passed=True, skipped=True, note="the vendored document carries no case")
+    filename, sha256 = SPEC_VECTORS[provider.encoding]
+    return SpecVectors(
+        passed=all(c.passed for c in cases), document=VectorRef(filename, sha256), cases=cases
+    )
 
 
-#: Which self-check a provider gets, keyed by the ORACLE IT DECLARES (`Provider.suite`).
-#: Keyed on the declaration and never on the class, so a second implementation of one
-#: encoding is measured by the same oracle as the first — which is the only way two
-#: implementations' records mean the same thing. A suite name with no entry qualifies
-#: NOTHING (see `qualify`): minting a record for a decoder no oracle checked is exactly the
-#: fabricated evidence the capability table exists to forbid.
-#:
-#: It USED to be keyed on the declared ROLE SET, which was correct until two providers of
-#: one encoding declared the same roles. `mxfp8/1`'s decode and its native leaf both take
-#: `{data, scale}`, so the role key would have handed the native leaf the decode oracle —
-#: a suite that never runs the kernel, cannot see #515d's layout hazard, and mints a record
-#: saying a GEMM was measured. The bug that key would have caused is the exact bug the
-#: capability table exists to make impossible.
-SUITES: dict[str, Any] = {}
-
-
-def _bench_parts(torch: Any, provider: Any, device: Any) -> dict[str, Any]:
-    """A realistic role set at `BENCH_SHAPE`, built from the provider's own declaration."""
-    _, roles = _weight_roles(torch, provider, device)
-    return dict(roles)
-
-
-def _micro_bench(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str, Any]:
+def _micro_bench(torch: Any, provider: Provider, device: Any, dtype: Any) -> DecodeBench:
     rows, cols = BENCH_SHAPE
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
-    parts = _bench_parts(torch, provider, device)
+    _, parts = _weight_roles(torch, provider, device)
     provider.decode(torch, parts, destination)
     # The fence goes through the accelerator boundary (#447): timing an MPS queue without
     # its own synchronize would mint a fictional decode rate, so mps refuses typed there.
@@ -820,15 +876,10 @@ def _micro_bench(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str
     moved = rows * cols * destination.element_size() + sum(
         int(t.numel() * t.element_size()) for t in parts.values()
     )
-    return {
-        "shape": list(BENCH_SHAPE),
-        "reps": BENCH_REPS,
-        "decode_ns": int(took),
-        "gb_per_s": round(moved / took, 3),
-    }
+    return DecodeBench(list(BENCH_SHAPE), BENCH_REPS, int(took), round(moved / took, 3))
 
 
-def _leaf_bench(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str, Any]:
+def _leaf_bench(torch: Any, provider: LeafProvider, device: Any, dtype: Any) -> LeafBench:
     """One native leaf's FORWARD, timed, against the same shape's bf16 GEMM.
 
     The decode bench times a decode because that is the whole of what a decode route costs
@@ -847,7 +898,7 @@ def _leaf_bench(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str,
     leaf = provider.leaf(torch, roles, _StandIn(int(weight.shape[1]), int(weight.shape[0])), dtype)
     float_weight = weight.to(dtype)
 
-    def timed(fn: Any) -> float:
+    def timed(fn: Callable[[], object]) -> float:
         fn()
         accel.synchronize(torch, device.type)
         started = time.perf_counter_ns()
@@ -858,33 +909,40 @@ def _leaf_bench(torch: Any, provider: Any, device: Any, dtype: Any) -> dict[str,
 
     leaf_ns = timed(lambda: leaf(x))
     float_ns = timed(lambda: x @ float_weight.t())
-    return {
-        "shape": [FIDELITY_TOKENS, *[int(n) for n in weight.shape]],
-        "reps": BENCH_REPS,
-        "leaf_ns": int(leaf_ns),
-        "float_gemm_ns": int(float_ns),
-        "speedup_x": round(float_ns / max(leaf_ns, 1.0), 4),
-    }
+    return LeafBench(
+        shape=[FIDELITY_TOKENS, *[int(n) for n in weight.shape]],
+        reps=BENCH_REPS,
+        leaf_ns=int(leaf_ns),
+        float_gemm_ns=int(float_ns),
+        speedup_x=round(float_ns / max(leaf_ns, 1.0), 4),
+    )
 
 
-#: Populated once, after every suite exists. The key is a provider's declared `suite`; a
-#: provider whose oracle name is absent qualifies nothing.
-SUITES["fp8-scalar-decode"] = _numerics
-SUITES["mxfp8-decode"] = _numerics_mx
-SUITES["fp8-rowwise-decode"] = _numerics_rowwise
-SUITES["fp8-rowwise-native"] = _native_agreement
-SUITES["mxfp8-native"] = _native_agreement
+#: Which self-check a provider gets, keyed by the ORACLE IT DECLARES (`Provider.suite`) and
+#: never by class or role set, so a second implementation of one encoding is measured by the
+#: same oracle as the first. A suite name in neither table qualifies NOTHING: minting a record
+#: for a decoder no oracle checked is exactly the fabricated evidence the table forbids.
+#: (Keyed on the ROLE SET, `mxfp8/1`'s decode and native leaf — both `{data, scale}` — would
+#: have shared the decode oracle, which never runs the kernel and cannot see #515d.)
+DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
+    "fp8-scalar-decode": _numerics,
+    "mxfp8-decode": _numerics_mx,
+    "fp8-rowwise-decode": _numerics_rowwise,
+}
+
+#: Native leaves' oracle is their own GEMM against arithmetic (`_native_agreement`).
+NATIVE_SUITES = frozenset({"fp8-rowwise-native", "mxfp8-native"})
 
 
 def qualify(
     torch: Any,
-    providers: Mapping[str, Any],
+    providers: Mapping[str, tuple[Provider, ...]],
     device: DeviceFacts,
     output_dtypes: Sequence[str],
     *,
     release: str,
     runtime: RuntimeIdentity | None = None,
-) -> tuple[Capabilities, dict[str, Any]]:
+) -> tuple[Capabilities, QualificationResult]:
     """Run the suite and return this process's admission table.
 
     The evidence for a route that decodes nothing (`plain/1`) is the fill plane's own
@@ -907,29 +965,14 @@ def qualify(
     accel.qualification_gate(device.kind)
     if runtime is None:
         runtime = measure_runtime(torch, release)
-    candidates = {
-        digest: (tuple(value) if isinstance(value, tuple | list) else (value,))
-        for digest, value in providers.items()
-    }
+    target = torch.device("cuda" if device.kind == "cuda" else "cpu")
     started = time.perf_counter_ns()
-    observations: list[dict[str, Any]] = []
-    for encoding, group in sorted(candidates.items()):
-        for provider in group:
+    observations: list[Observation] = []
+    for encoding in sorted(providers):
+        for provider in providers[encoding]:
             for name in output_dtypes:
                 dtype = getattr(torch, name)
-                target = torch.device("cuda" if device.kind == "cuda" else "cpu")
-                axes: dict[str, Any] = {
-                    "deviation_rel": -1.0,
-                    "resident_bits_per_element": -1.0,
-                }
-                if provider.route == "verbatim":
-                    evidence: dict[str, Any] = {
-                        "kind": "verbatim",
-                        "note": "no decode: the stored bytes ARE the logical bytes, and the "
-                        "fill plane's source-comparison proves them byte for byte",
-                        "passed": True,
-                    }
-                elif not dtype.is_floating_point:
+                if provider.route != "verbatim" and not dtype.is_floating_point:
                     # A decoded-float route has nothing to say about an integer destination,
                     # and neither has a native leaf: `_scaled_mm` emits floats. DERIVED from
                     # the dtype rather than listed — the registry's fp8 specs declare float
@@ -937,145 +980,132 @@ def qualify(
                     # this skip removes a record that could never be selected rather than
                     # hiding one that could.
                     continue
-                elif not device.satisfies(provider.device_predicate):
-                    # THE PROVIDER'S OWN FLOOR, honoured before its oracle runs. Qualifying
-                    # a leaf on a card whose kernel it does not claim would either fail
-                    # confusingly or — worse — pass, and mint a record whose predicate says
-                    # this card because `device.predicate` is where records get theirs.
-                    evidence = {
-                        "kind": "unmeasured",
-                        "note": f"{provider.name} declares the floor "
-                        f"{provider.device_predicate} and this device is {device.predicate}; "
-                        "its suite is not run and it mints no record",
-                        "passed": False,
-                    }
-                else:
-                    suite = SUITES.get(provider.suite)
-                    if suite is None:
-                        # An implementation no oracle covers. NOT an error and NOT a pass:
-                        # it mints no record, so the encoding refuses at bind naming this
-                        # device — the same answer an unqualified card gets, for the same
-                        # reason.
-                        evidence = {
-                            "kind": "unmeasured",
-                            "note": f"no oracle named {provider.suite!r}; an unchecked "
-                            "implementation is not a qualified one",
-                            "passed": False,
-                        }
-                    elif provider.route == "encoded_gemm":
-                        evidence = {"kind": "native"}
-                        evidence["numerics"] = suite(torch, provider, target, dtype)
-                        evidence["passed"] = bool(evidence["numerics"]["passed"])
-                        if evidence["passed"]:
-                            evidence["micro_bench"] = _leaf_bench(torch, provider, target, dtype)
-                        axes = _route_axes(torch, provider, target, dtype, evidence["numerics"])
-                    else:
-                        evidence = {"kind": "decode"}
-                        evidence["numerics"] = suite(torch, provider, target, dtype)
-                        # #549.4: the REVIEWED SPEC's own producer-mined cases, decoded
-                        # bit-for-bit. The synthetic sweep proves the arithmetic; this proves
-                        # the provider reads the layout a real producer emits at the rank and
-                        # stride THIS digest pins. Both must pass to mint.
-                        evidence["spec_vectors"] = _spec_vectors(torch, provider, target)
-                        evidence["micro_bench"] = _micro_bench(torch, provider, target, dtype)
-                        evidence["passed"] = bool(
-                            evidence["numerics"]["passed"] and evidence["spec_vectors"]["passed"]
-                        )
-                        if evidence["passed"]:
-                            axes = _route_axes(torch, provider, target, dtype, None)
-                evidence["route_axes"] = axes
                 observations.append(
-                    {
-                        "encoding_spec_id": encoding,
-                        "implementation": provider.name,
-                        "implementation_digest": implementation_digest(provider),
-                        "implementation_revision": str(provider.code_revision),
-                        "device_predicate": device.predicate,
-                        "output_dtype": name,
-                        # WHAT SHAPE THIS WAS MEASURED AT (#549.9). Evidence, not a filter:
-                        # `Provider.supports` gates a tensor's geometry, and filtering
-                        # admission on this string too would refuse the decode floor for the
-                        # ragged tensor it is the only route for.
-                        "geometry_class": geometry_class(BENCH_SHAPE),
-                        "delivery_route": provider.route,
-                        "evidence": evidence,
-                    }
+                    Observation(
+                        encoding_spec_id=encoding,
+                        implementation=provider.name,
+                        implementation_digest=implementation_digest(provider),
+                        implementation_revision=provider.code_revision,
+                        device_predicate=device.predicate,
+                        output_dtype=name,
+                        geometry_class=geometry_class(BENCH_SHAPE),
+                        delivery_route=provider.route,
+                        evidence=_evidence(torch, provider, device, target, dtype),
+                    )
                 )
-    result = {
-        "tuple": device.tuple_key(),
-        "device": device.document(),
-        "device_predicate": device.predicate,
-        "runtime_release": release,
-        "runtime": runtime.document(),
-        "suite_ms": (time.perf_counter_ns() - started) // 1_000_000,
-        "observations": observations,
-    }
+    result = QualificationResult(
+        tuple_key=device.tuple_key(),
+        device=device,
+        device_predicate=device.predicate,
+        runtime_release=release,
+        runtime=runtime,
+        suite_ms=(time.perf_counter_ns() - started) // 1_000_000,
+        observations=observations,
+    )
     return _table(result), result
 
 
-def _table(result: Mapping[str, Any]) -> Capabilities:
-    """Observations -> the admission table. A FAILED observation mints no record."""
-    caps = Capabilities()
-    runtime = dict(result.get("runtime") or {})
-    facts = dict(result.get("device") or {})
-    for observation in result["observations"]:
-        if not observation["evidence"]["passed"]:
-            continue
-        axes = observation["evidence"].get("route_axes") or {}
-        caps.add(
-            CapabilityRecord(
-                encoding_spec_id=observation["encoding_spec_id"],
-                implementation_digest=observation["implementation_digest"],
-                runtime_release=str(result["runtime_release"]),
-                device_predicate=observation["device_predicate"],
-                output_dtype=observation["output_dtype"],
-                delivery_route=observation["delivery_route"],
-                evidence_digest=canonical.digest(observation["evidence"]),
-                # A record read back from a probe file written before the axes existed
-                # carries -1.0, which makes it UNRANKABLE rather than plausible — the same
-                # discipline `DeliveryFact.step_ms` applies one plane over, and for the same
-                # reason: a zero would win every comparison it was never entitled to enter.
-                resident_bits_per_element=float(axes.get("resident_bits_per_element", -1.0)),
-                kernel_numeric_error=float(axes.get("deviation_rel", -1.0)),
-                leaf_speedup_x=_leaf_speedup(observation),
-                # #549.9's identity, carried onto every record it minted. A record read back
-                # from a probe file written before these existed carries empty strings, which
-                # is honest — the file genuinely did not record what it ran on.
-                runtime_source_digest=str(runtime.get("source_digest", "")),
-                torch_build=str(runtime.get("torch_build", "")),
-                os_arch=str(facts.get("os_arch", "")),
-                device_index=int(facts.get("index", 0)),
-                device_driver=str(facts.get("driver", "")),
-                cuda_runtime=str(facts.get("cuda_runtime", "")),
-                geometry_class=str(observation.get("geometry_class", "")),
-                implementation_revision=str(observation.get("implementation_revision", "")),
-            )
+def _evidence(
+    torch: Any, provider: Provider, device: DeviceFacts, target: Any, dtype: Any
+) -> Evidence:
+    """One (implementation, output dtype)'s evidence. Only a PASSED one mints a record."""
+    if provider.route == "verbatim":
+        return VerbatimEvidence(
+            note="no decode: the stored bytes ARE the logical bytes, and the fill plane's "
+            "source-comparison proves them byte for byte"
         )
-    return caps
+    if not device.satisfies(provider.device_predicate):
+        # THE PROVIDER'S OWN FLOOR, honoured before its oracle runs. Qualifying a leaf on a
+        # card whose kernel it does not claim would either fail confusingly or — worse —
+        # pass, and mint a record whose predicate says this card because `device.predicate`
+        # is where records get theirs.
+        return UnmeasuredEvidence(
+            note=f"{provider.name} declares the floor {provider.device_predicate} and this "
+            f"device is {device.predicate}; its suite is not run and it mints no record"
+        )
+    if isinstance(provider, LeafProvider) and provider.suite in NATIVE_SUITES:
+        agreement = _native_agreement(torch, provider, target, dtype)
+        if not agreement.passed:
+            return NativeEvidence(numerics=agreement, passed=False, route_axes=RouteAxes())
+        return NativeEvidence(
+            numerics=agreement,
+            passed=True,
+            micro_bench=_leaf_bench(torch, provider, target, dtype),
+            route_axes=_native_axes(torch, provider, target, agreement.deviation_rel),
+        )
+    suite = DECODE_SUITES.get(provider.suite)
+    if suite is None:
+        # An implementation no oracle covers. NOT an error and NOT a pass: it mints no
+        # record, so the encoding refuses at bind naming this device — the same answer an
+        # unqualified card gets, for the same reason.
+        return UnmeasuredEvidence(
+            note=f"no oracle named {provider.suite!r}; an unchecked implementation is not a "
+            "qualified one"
+        )
+    sweep = suite(torch, provider, target, dtype)
+    # #549.4: the REVIEWED SPEC's own producer-mined cases, decoded bit-for-bit. The
+    # synthetic sweep proves the arithmetic; this proves the provider reads the layout a real
+    # producer emits at the rank and stride THIS digest pins. Both must pass to mint.
+    vectors = _spec_vectors(torch, provider, target)
+    passed = sweep.passed and vectors.passed
+    return DecodeEvidence(
+        numerics=sweep,
+        spec_vectors=vectors,
+        micro_bench=_micro_bench(torch, provider, target, dtype),
+        passed=passed,
+        route_axes=_decode_axes(torch, provider, target, dtype) if passed else RouteAxes(),
+    )
 
 
-def _leaf_speedup(observation: Mapping[str, Any]) -> float:
-    """`speedup_x` off a passed encoded-GEMM observation's leaf bench; -1.0 for everything
-    else, including a document written before the bench existed."""
-    if observation.get("delivery_route") != "encoded_gemm":
-        return -1.0
-    bench = observation["evidence"].get("micro_bench") or {}
-    return float(bench.get("speedup_x", -1.0))
+def _table(result: QualificationResult) -> Capabilities:
+    """Observations -> the admission table. A FAILED observation mints no record."""
+    return Capabilities(
+        [
+            CapabilityRecord(
+                encoding_spec_id=observation.encoding_spec_id,
+                implementation_digest=observation.implementation_digest,
+                runtime_release=result.runtime_release,
+                device_predicate=observation.device_predicate,
+                output_dtype=observation.output_dtype,
+                delivery_route=observation.delivery_route,
+                evidence_digest=canonical.digest(msgspec.to_builtins(observation.evidence)),
+                resident_bits_per_element=observation.evidence.route_axes.resident_bits_per_element,
+                kernel_numeric_error=observation.evidence.route_axes.deviation_rel,
+                leaf_speedup_x=_leaf_speedup(observation.evidence),
+                # #549.9's identity, carried onto every record it minted.
+                runtime_source_digest=result.runtime.source_digest,
+                torch_build=result.runtime.torch_build,
+                os_arch=result.device.os_arch,
+                device_index=result.device.index,
+                device_driver=result.device.driver,
+                cuda_runtime=result.device.cuda_runtime,
+                geometry_class=observation.geometry_class,
+                implementation_revision=observation.implementation_revision,
+            )
+            for observation in result.observations
+            if observation.evidence.passed
+        ]
+    )
 
 
-def leaf_speedups(result: Mapping[str, Any]) -> dict[str, float]:
+def _leaf_speedup(evidence: Evidence) -> float:
+    """`speedup_x` off a native observation's leaf bench; -1.0 for everything else."""
+    if isinstance(evidence, NativeEvidence) and evidence.micro_bench is not None:
+        return evidence.micro_bench.speedup_x
+    return -1.0
+
+
+def leaf_speedups(result: QualificationResult) -> dict[str, float]:
     """`<implementation>@<output dtype>` -> the WORST `speedup_x` a passed leaf observation
     banked for it, across every spec digest it was measured under. What the boot record
     prints, so a leaf this card measured losing to its float GEMM is read where the route
     census is read."""
     worst: dict[str, float] = {}
-    for observation in result.get("observations", ()):
-        if not observation["evidence"]["passed"]:
+    for observation in result.observations:
+        speedup = _leaf_speedup(observation.evidence)
+        if not observation.evidence.passed or speedup < 0.0:
             continue
-        speedup = _leaf_speedup(observation)
-        if speedup < 0.0:
-            continue
-        name = f"{observation['implementation']}@{observation['output_dtype']}"
+        name = f"{observation.implementation}@{observation.output_dtype}"
         worst[name] = min(worst.get(name, speedup), speedup)
     return dict(sorted(worst.items()))
 
@@ -1102,24 +1132,31 @@ class Qualification:
     """
 
     capabilities: Capabilities
-    result: dict[str, Any]
+    result: QualificationResult
     key: str
     measured: bool
     note: str = ""
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, str | int | dict[str, float]]:
         return {
             "key": self.key,
             "source": "measured" if self.measured else "reused",
-            "suite_ms": int(self.result.get("suite_ms", 0)),
-            "observations": len(self.result.get("observations", ())),
+            "suite_ms": self.result.suite_ms,
+            "observations": len(self.result.observations),
             "leaf_speedup_x": leaf_speedups(self.result),
             "note": self.note,
         }
 
 
+class StoredQualification(msgspec.Struct, frozen=True):
+    """One cache file: a result, filed under the key it was measured for."""
+
+    key: str
+    result: QualificationResult
+
+
 def qualification_key(
-    providers: Mapping[str, Any],
+    providers: Mapping[str, tuple[Provider, ...]],
     device: DeviceFacts,
     output_dtypes: Sequence[str],
     *,
@@ -1152,20 +1189,17 @@ def qualification_key(
             "device": device.document(),
             "runtime": runtime.document(),
             "providers": {
-                str(spec): sorted(
-                    implementation_digest(one)
-                    for one in (value if isinstance(value, tuple | list) else (value,))
-                )
-                for spec, value in providers.items()
+                spec: sorted(implementation_digest(one) for one in group)
+                for spec, group in providers.items()
             },
-            "output_dtypes": [str(name) for name in output_dtypes],
+            "output_dtypes": list(output_dtypes),
         }
     )
 
 
 def qualified(
     torch: Any,
-    providers: Mapping[str, Any],
+    providers: Mapping[str, tuple[Provider, ...]],
     device: DeviceFacts,
     output_dtypes: Sequence[str],
     *,
@@ -1209,28 +1243,27 @@ def qualified(
     )
 
 
-def _read_qualification(cache: str, key: str) -> tuple[dict[str, Any] | None, str]:
-    """The stored document for this key, or nothing and the reason there is nothing."""
+def _read_qualification(cache: str, key: str) -> tuple[QualificationResult | None, str]:
+    """The stored result for this key, or nothing and the reason there is nothing."""
     if not cache:
         return None, "no cache directory"
-    path = Path(cache) / f"{key}.json"
     try:
-        document = json.loads(path.read_bytes())
+        # stdlib JSON both ways: a failed native route can measure a NaN or infinite
+        # deviation, which `msgspec.json` would write as null and then refuse to read back.
+        raw = json.loads((Path(cache) / f"{key}.json").read_bytes())
+        stored = msgspec.convert(raw, StoredQualification)
     except FileNotFoundError:
         return None, ""
-    except (OSError, ValueError) as exc:
-        return None, f"unreadable: {type(exc).__name__}"
-    if not isinstance(document, dict) or document.get("key") != key:
+    except (OSError, ValueError, msgspec.ValidationError) as exc:
+        return None, f"unreadable: {type(exc).__name__}: {exc}"
+    if stored.key != key:
         # A document that does not carry the key it is filed under is not evidence about
         # these inputs, whatever it is evidence about.
         return None, "stored document does not carry its own key"
-    result = document.get("result")
-    if not isinstance(result, dict) or not isinstance(result.get("observations"), list):
-        return None, "stored document carries no observations"
-    return result, ""
+    return stored.result, ""
 
 
-def _write_qualification(cache: str, key: str, result: Mapping[str, Any]) -> str:
+def _write_qualification(cache: str, key: str, result: QualificationResult) -> str:
     """Keep this measurement for the next process. Returns why it was not kept, or ""."""
     if not cache:
         return "no cache directory"
@@ -1238,7 +1271,7 @@ def _write_qualification(cache: str, key: str, result: Mapping[str, Any]) -> str
     temporary = directory / f".{key}.{os.getpid()}"
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(json.dumps({"key": key, "result": dict(result)}))
+        temporary.write_text(json.dumps(msgspec.to_builtins(StoredQualification(key, result))))
         temporary.chmod(0o600)
         os.replace(temporary, directory / f"{key}.json")
         _prune_qualifications(directory)
@@ -1266,7 +1299,7 @@ class UnreportableObservation(Exception):
     """
 
 
-def observed_capability_records(result: Mapping[str, Any]) -> dict[str, Any]:
+def observed_capability_records(result: QualificationResult) -> dict[str, list[dict[str, str]]]:
     """This probe result, projected into TensorFS's OBSERVED capability-records document.
 
     The sibling of `_table`, over the same observation and for the other consumer. `_table`
@@ -1290,41 +1323,40 @@ def observed_capability_records(result: Mapping[str, Any]) -> dict[str, Any]:
     over the implementation's name, route, floor, oracle, roles, revision and reviewed specs
     and over no timing at all.
     """
-    records: dict[tuple[str, str], dict[str, set[str]]] = {}
-    fallback = str(result.get("device_predicate") or "")
-    for observation in result.get("observations", ()):
-        evidence = observation.get("evidence") or {}
-        if not evidence.get("passed") or not _reportable(evidence):
+    records: dict[tuple[str, str], tuple[set[str], set[str]]] = {}
+    for observation in result.observations:
+        if not observation.evidence.passed or not _reportable(observation.evidence):
             continue
-        key = (
-            str(observation["encoding_spec_id"]),
-            str(observation.get("device_predicate") or fallback),
+        implementations, dtypes = records.setdefault(
+            (observation.encoding_spec_id, observation.device_predicate), (set(), set())
         )
-        into = records.setdefault(key, {"implementations": set(), "dtypes": set()})
-        into["implementations"].add(
-            f"{observation['implementation']}[{observation['delivery_route']}]"
-            f"@{observation['implementation_digest']}"
+        implementations.add(
+            f"{observation.implementation}[{observation.delivery_route}]"
+            f"@{observation.implementation_digest}"
         )
-        into["dtypes"].add(str(observation["output_dtype"]))
-    out = []
-    for (encoding, device), parts in sorted(records.items()):
-        out.append(
-            {
-                "device": device,
-                "encoding": encoding,
-                "implementation": " ".join(sorted(parts["implementations"])),
-                "note": (
-                    "qualified by the cozy-runtime probe suite for output dtypes "
-                    + ",".join(sorted(parts["dtypes"]))
-                ),
-            }
-        )
-    document = {"records": out}
-    _ascii_only(document)
-    return document
+        dtypes.add(observation.output_dtype)
+    out = [
+        {
+            "device": device,
+            "encoding": encoding,
+            "implementation": " ".join(sorted(implementations)),
+            "note": "qualified by the cozy-runtime probe suite for output dtypes "
+            + ",".join(sorted(dtypes)),
+        }
+        for (encoding, device), (implementations, dtypes) in sorted(records.items())
+    ]
+    # TensorFS's canonical layer is printable-ASCII only. A stray character would refuse the
+    # document at the border with an error that points at bytes, not at the provider.
+    for index, record in enumerate(out):
+        for field, value in record.items():
+            if not value.isascii() or not value.isprintable():
+                raise UnreportableObservation(
+                    f".records[{index}].{field} carries a non-printable-ASCII character: {value!r}"
+                )
+    return {"records": out}
 
 
-def _reportable(evidence: Mapping[str, Any]) -> bool:
+def _reportable(evidence: Evidence) -> bool:
     """May this passing observation be REPORTED, not merely believed here?
 
     A `verbatim` route decodes nothing and its evidence is the fill plane's byte-identity
@@ -1335,25 +1367,6 @@ def _reportable(evidence: Mapping[str, Any]) -> bool:
     that keeps a spec TensorFS carries vectorless out of the document, where it would refuse
     the whole thing rather than one record.
     """
-    if evidence.get("kind") == "verbatim":
+    if isinstance(evidence, VerbatimEvidence):
         return True
-    vectors = evidence.get("spec_vectors") or {}
-    return bool(vectors) and not vectors.get("skipped")
-
-
-def _ascii_only(value: Any, path: str = "") -> None:
-    """TensorFS's canonical layer is printable-ASCII only. A stray character would refuse
-    the document at the border with an error that points at bytes, not at the provider that
-    wrote them."""
-    if isinstance(value, str):
-        if not value.isascii() or not value.isprintable():
-            raise UnreportableObservation(
-                f"{path or 'document'} carries a non-printable-ASCII character: {value!r}"
-            )
-    elif isinstance(value, Mapping):
-        for key, item in value.items():
-            _ascii_only(str(key), f"{path}.{key}")
-            _ascii_only(item, f"{path}.{key}")
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        for index, item in enumerate(value):
-            _ascii_only(item, f"{path}[{index}]")
+    return isinstance(evidence, DecodeEvidence) and not evidence.spec_vectors.skipped

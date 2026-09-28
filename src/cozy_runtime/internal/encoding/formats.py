@@ -47,9 +47,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from cozy_runtime.author._loader import TORCH_DTYPES as _TORCH_DTYPES
+
+# `Any` below is a torch module, tensor, dtype or nn.Module: torch is absent from the check venv.
 
 #: This module's own refusal codes, added to cr-005's matrix. Closed, like that one.
 REFUSALS = frozenset(
@@ -255,6 +257,11 @@ class Provider(Protocol):
     """
 
     @property
+    def encoding(self) -> str:
+        """The spec digest this instance serves: one instance per reviewed digest."""
+        ...
+
+    @property
     def name(self) -> str: ...
 
     @property
@@ -315,7 +322,8 @@ class Provider(Protocol):
     def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None: ...
 
 
-class LeafProvider(Protocol):
+@runtime_checkable
+class LeafProvider(Provider, Protocol):
     """A MODULE-REPLACING provider: the stored roles stay stored and the leaf changes.
 
     `Provider.decode` writes a float destination the contract's dtype named, which is the

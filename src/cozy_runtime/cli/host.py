@@ -473,8 +473,8 @@ def capability(config: RuntimeConfig, args: list[str], opts: Options) -> Result:
         ("device", device.predicate),
         ("card", f"{device.name} #{device.index}"),
         ("runtime", __version__),
-        ("suite_ms", str(result.get("suite_ms", 0))),
-        ("observations", str(len(result.get("observations", ())))),
+        ("suite_ms", str(result.suite_ms)),
+        ("observations", str(len(result.observations))),
         ("qualified", str(len(records))),
         *tuple((r["encoding"][:19], r["implementation"]) for r in records),
     )

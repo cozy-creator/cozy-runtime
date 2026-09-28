@@ -25,8 +25,10 @@ outputs, owned by the eval plane, and a Frobenius norm may never stand in for on
 from __future__ import annotations
 
 import platform
-from collections.abc import Mapping, Sequence
+import subprocess
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, NoReturn
 
 from cozy_runtime.internal import accel, canonical
@@ -34,6 +36,7 @@ from cozy_runtime.internal.encoding.formats import (
     MX_BLOCK,
     Encoded,
     MicroScaledDequant,
+    Provider,
     RowwiseDequant,
     ScaledScalarDequant,
     Verbatim,
@@ -42,6 +45,8 @@ from cozy_runtime.internal.encoding.formats import (
     registry_digests,
 )
 from cozy_runtime.internal.encoding.leaves import MicroScaledNativeLeaf, RowwiseNativeLeaf
+
+# `torch: Any` is the torch module, which the check venv does not carry.
 
 # ------------------------------------------------------------------------- the device
 
@@ -113,7 +118,7 @@ class DeviceFacts:
             f"driver={self.driver}/cudart={self.cuda_runtime}/{self.os_arch}"
         )
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, str | int]:
         return {
             "kind": self.kind,
             "name": self.name,
@@ -167,8 +172,6 @@ def _nvml(query: str, index: int) -> str:
     host was keyed by card ZERO's power cap and MIG profile, however many cards the fill
     plane was about to use.
     """
-    import subprocess
-
     try:
         out = subprocess.run(
             [
@@ -219,7 +222,7 @@ class RuntimeIdentity:
     source_digest: str
     torch_build: str
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, str]:
         return {
             "release": self.release,
             "source_digest": self.source_digest,
@@ -246,8 +249,6 @@ def runtime_source_digest() -> str:
     A source file that cannot be read is recorded as absent rather than silently omitted:
     two builds that differ by a deleted module must not share a digest.
     """
-    from pathlib import Path
-
     root = Path(__file__).resolve().parent.parent.parent
     body: dict[str, str] = {}
     for rel in IDENTITY_SOURCES:
@@ -348,7 +349,7 @@ class CapabilityRecord:
             return self.kernel_numeric_error
         return -1.0
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, str | int | float]:
         return {
             "encoding_spec_id": self.encoding_spec_id,
             "implementation_digest": self.implementation_digest,
@@ -398,7 +399,7 @@ class Capabilities:
         encoding: str,
         device: DeviceFacts,
         output_dtype: str,
-        among: Mapping[str, Any],
+        among: Mapping[str, Provider],
     ) -> list[CapabilityRecord]:
         """Every record that admits one of `among` on this device, for this dtype.
 
@@ -421,7 +422,7 @@ class Capabilities:
         ]
 
     def rank(
-        self, records: Sequence[CapabilityRecord], among: Mapping[str, Any], objective: str
+        self, records: Sequence[CapabilityRecord], among: Mapping[str, Provider], objective: str
     ) -> list[CapabilityRecord]:
         """Order candidates best-first under one objective. NEVER refuses (#549.3).
 
@@ -438,7 +439,7 @@ class Capabilities:
         axis = OBJECTIVE_AXIS.get(objective)
 
         def key(record: CapabilityRecord) -> tuple[int, float, str]:
-            name = str(among[record.implementation_digest].name)
+            name = among[record.implementation_digest].name
             if axis is None:
                 return (0, 0.0, name)
             value = record.axis(objective)
@@ -454,7 +455,7 @@ class Capabilities:
         alias: str,
         *,
         objective: str,
-        among: Mapping[str, Any],
+        among: Mapping[str, Provider],
     ) -> CapabilityRecord:
         """The best qualified record for this (encoding, device, dtype). One answer.
 
@@ -477,7 +478,7 @@ class Capabilities:
         device: DeviceFacts,
         output_dtype: str,
         alias: str,
-        among: Mapping[str, Any],
+        among: Mapping[str, Provider],
     ) -> str:
         elsewhere = sorted(
             {r.device_predicate for r in self.records if r.encoding_spec_id == encoding}
@@ -490,7 +491,7 @@ class Capabilities:
         built = " | ".join(
             f"{p.name} [{p.route}] floor {p.device_predicate}"
             f"{'' if device.satisfies(p.device_predicate) else ' — this card misses that floor'}"
-            for p in sorted(among.values(), key=lambda p: str(p.name))
+            for p in sorted(among.values(), key=lambda p: p.name)
         )
         return (
             f"{alias} ({encoding[:23]}…) has no qualified provider on "
@@ -545,7 +546,7 @@ class SpecUnreviewed(Exception):
     """
 
 
-def launch_providers() -> dict[str, tuple[Any, ...]]:
+def launch_providers() -> dict[str, tuple[Provider, ...]]:
     """The LAUNCH TIER provider set: spec digest -> the ORDERED CANDIDATES for that digest.
 
     **Built from `reviewed_specs`, not from aliases** (#549.4). Each provider names the exact
@@ -565,21 +566,22 @@ def launch_providers() -> dict[str, tuple[Any, ...]]:
     probe measured.
     """
     known = registry_digests()
-    out: dict[str, list[Any]] = {}
+    out: dict[str, list[Provider]] = {}
     declared: list[tuple[str, str]] = []
-    for build in (
+    builds: tuple[Callable[[str], Provider], ...] = (
         Verbatim,
         ScaledScalarDequant,
         RowwiseDequant,
         RowwiseNativeLeaf,
         MicroScaledDequant,
         MicroScaledNativeLeaf,
-    ):
+    )
+    for build in builds:
         # The provider is instantiated once per digest it reviewed, which is what makes
         # `provider.encoding` a fact rather than a lookup.
         probe = build("")
         for digest in sorted(probe.reviewed_specs):
-            declared.append((str(probe.name), digest))
+            declared.append((probe.name, digest))
             if digest not in known:
                 continue
             out.setdefault(digest, []).append(build(digest))
@@ -599,7 +601,7 @@ def launch_providers() -> dict[str, tuple[Any, ...]]:
 # ------------------------------------------------------------------------------ digests
 
 
-def implementation_digest(provider: Any) -> str:
+def implementation_digest(provider: Provider) -> str:
     """The provider's identity: name, route, device floor, oracle, role set, revision, specs.
 
     `suite` joins the key because it is part of what a record MEANS: two implementations
@@ -631,7 +633,7 @@ def implementation_digest(provider: Any) -> str:
 class Selection:
     """What the fill plane needs to move and decode one tensor."""
 
-    provider: Any
+    provider: Provider
     record: CapabilityRecord
     encoded: Encoded
     reason: str = ""
@@ -675,16 +677,13 @@ class Selector:
 
     def __init__(
         self,
-        providers: Mapping[str, Any],
+        providers: Mapping[str, tuple[Provider, ...]],
         capabilities: Capabilities,
         device: DeviceFacts,
         objective: str = "kernel_numeric_error",
     ) -> None:
-        #: digest -> ORDERED CANDIDATES. A single provider is accepted and wrapped.
-        self.providers = {
-            digest: tuple(value) if isinstance(value, tuple | list) else (value,)
-            for digest, value in providers.items()
-        }
+        #: digest -> ORDERED CANDIDATES.
+        self.providers = providers
         self.capabilities = capabilities
         self.device = device
         self.objective = objective
@@ -704,8 +703,8 @@ class Selector:
         providers = self.providers.get(encoded.encoding)
         if not providers:
             self._refuse_unknown(key, encoded)
-        among: dict[str, Any] = {}
-        mismatched: list[tuple[Any, list[str], list[str]]] = []
+        among: dict[str, Provider] = {}
+        mismatched: list[tuple[Provider, list[str], list[str]]] = []
         geometry: list[tuple[str, str]] = []
         for candidate in providers:
             missing = sorted(candidate.required - encoded.roles)
@@ -715,7 +714,7 @@ class Selector:
                 continue
             why = candidate.supports(shape)
             if why:
-                geometry.append((str(candidate.name), why))
+                geometry.append((candidate.name, why))
                 continue
             among[implementation_digest(candidate)] = candidate
         if not among and mismatched and not geometry:
@@ -743,7 +742,7 @@ class Selector:
                 [key],
             )
         records = self.capabilities.qualified(encoded.encoding, self.device, output_dtype, among)
-        offered = frozenset(str(provider.route) for provider in among.values())
+        offered = frozenset(provider.route for provider in among.values())
         if not records:
             return TensorCandidates(
                 key,
@@ -771,9 +770,9 @@ class Selector:
 
     def _reason(
         self,
-        provider: Any,
+        provider: Provider,
         record: CapabilityRecord,
-        among: Mapping[str, Any],
+        among: Mapping[str, Provider],
         geometry: Sequence[tuple[str, str]],
     ) -> str:
         peers = sorted(p.name for p in among.values() if p.name != provider.name)
