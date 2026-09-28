@@ -1,9 +1,10 @@
 """A machine answers for its runs, packages, weights and environment (wire 66), from a real
-Worker over its gRPC listener."""
+Worker over its gRPC listener, and keeps delivered products until its store's GC evicts them."""
 
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib.metadata
 import platform
 import queue
@@ -16,12 +17,16 @@ from pathlib import Path
 
 import grpc
 import pytest
+import tensorfs
 
 import signed_claims
+from cozy_runtime.internal import fill
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal.worker import machine_models, products
+from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.internal.worker.workspace import NativeHold, Workspace
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
@@ -30,6 +35,7 @@ from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from test_machine_calls import request, running
 from test_machine_execution import complete, offer, settle
 from test_model_runtime_closure import _snapshot
+from test_workspace_byte_outputs import producing
 
 CLAIM = signed_claims.claim()
 
@@ -261,3 +267,42 @@ def test_the_reads_refuse_a_caller_that_is_not_the_owner(machine: Machine) -> No
         with pytest.raises(grpc.RpcError) as refused:
             call(query)
         assert refused.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+
+
+@pytest.mark.parametrize("delivery", [True, False])
+def test_an_acknowledged_product_stays_until_gc_where_the_store_tracks_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery: bool
+) -> None:
+    """The run log's hold on a product, as `Products` takes it; then the owner's ack."""
+    if not delivery:
+        monkeypatch.setattr(fill, "capabilities", frozenset)
+    elif "deliver/1" not in fill.capabilities():
+        pytest.skip("the installed TensorFS does not track delivery")
+    workspace, spec, manifest, path = producing(tmp_path)
+    source = outputs.commit(
+        workspace, "owner", "producer", 1, spec, "video", manifest, [("payload", path)], 200000
+    )
+    data = path.read_bytes()
+    content = pb.Ref(digest=hashlib.sha256(data).digest(), length=len(data))
+    grant = machine_models.retain_bytes(
+        workspace,
+        "owner",
+        products.recipient("producer"),
+        products.hold_path(content, source),
+        source,
+    )
+    store = tensorfs.Store.open(str(workspace.store_root))
+    assert store.tree_root(grant.retention_id) is not None
+
+    products.Products(workspace, Executions(workspace), None).deliver("owner", "producer")
+    tensorfs.gc(str(workspace.store_root))  # no pressure: only unreferenced bytes go
+    with workspace.locked() as db:
+        held = db.one(NativeHold, "SELECT * FROM holds WHERE id=?", (grant.retention_id,))
+    assert held is not None and held.state == ("held" if delivery else "released")
+    root = store.tree_root(grant.retention_id)
+    if delivery:
+        assert root is not None and not root["released"]
+        # A replayed acknowledgement delivers again, the root already delivered.
+        products.Products(workspace, Executions(workspace), None).deliver("owner", "producer")
+    else:
+        assert root is None or root["released"]

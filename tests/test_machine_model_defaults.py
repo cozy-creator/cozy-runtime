@@ -109,6 +109,23 @@ def target() -> Target:
     )
 
 
+@pytest.fixture(params=["ensure", "pull"])
+def fetch(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Both model fetch paths against the same Hub: TensorFS `ensure` where the installed
+    TensorFS names it, and `pull`, which the Runtime keeps for an older TensorFS."""
+    if request.param == "pull":
+        monkeypatch.setattr(fill, "capabilities", frozenset)
+    elif "ensure/1" not in fill.capabilities():
+        pytest.skip("the installed TensorFS has no ensure")
+    else:
+
+        def forbidden(*_: object, **__: object) -> None:
+            raise AssertionError("a TensorFS with ensure was asked to pull")
+
+        monkeypatch.setattr(tensorfs, "pull", forbidden)
+    return str(request.param)
+
+
 def test_default_capture_requires_complete_exact_inventory() -> None:
     body = captured()
     defaults.verify(peer(body), parsed(body), interfaces())
@@ -378,7 +395,7 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
 
 
 def test_cold_default_native_pull_requires_deployment_object_storage_host(
-    tmp_path: Path,
+    tmp_path: Path, fetch: str
 ) -> None:
     origin_root = tmp_path / "origin"
     origin_root.mkdir()
@@ -457,7 +474,7 @@ def test_cold_default_native_pull_requires_deployment_object_storage_host(
         thread.join()
 
 
-def test_a_cold_preparation_pulls_its_slots_at_once(tmp_path: Path) -> None:
+def test_a_cold_preparation_pulls_its_slots_at_once(tmp_path: Path, fetch: str) -> None:
     """Run 1510 pulled H3's turbo adapter only after its 100 GB base had landed. Here each
     slot's closure waits for the other's, which a one-after-another pull never shows."""
     refs: dict[str, tuple[str, int]] = {}
@@ -549,7 +566,7 @@ def test_a_cold_preparation_pulls_its_slots_at_once(tmp_path: Path) -> None:
 
 
 def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hub_only(
-    tmp_path: Path,
+    tmp_path: Path, fetch: str
 ) -> None:
     """The machine's own Hub serves its owner's unpublished checkpoint only to the worker
     capability; another origin never sees it, and a refused or absent grant is surfaced
