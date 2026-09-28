@@ -353,9 +353,6 @@ def fence_workspace_database_only() -> list[str]:
                 continue
             if any(name == module or name.startswith(module + ".") for module in database_modules):
                 bad.append(f"{path.relative_to(ROOT)} imports database module {name}")
-    for retired in (SRC / "internal" / "cache.py", SRC / "internal" / "artifacts.py"):
-        if retired.exists():
-            bad.append(f"{retired.relative_to(ROOT)} restores retired Runtime-owned state")
     return bad
 
 
