@@ -25,7 +25,6 @@ from PIL.Image import open as pil_open
 from cozy_runtime.author import _color
 from cozy_runtime.author._assets import Asset, AudioAsset, Image, ImageAsset, VideoAsset
 from cozy_runtime.author._errors import AuthorError, CapabilityError, InvalidRequest, RuntimeFailure
-from cozy_runtime.author._image_profile import require_image_preparation_profile
 from cozy_runtime.author._markers import ImagePreparation
 
 
@@ -1228,8 +1227,6 @@ def decode_image_path(
         source.seek(0)
         rotation = _jpeg_rotation(source) if jpeg else None
     av = _av()
-    if preparation is not None:
-        require_image_preparation_profile(av)
     with av.open(str(path), mode="r") as container:
         streams = list(container.streams.video)
         if len(streams) != 1:
