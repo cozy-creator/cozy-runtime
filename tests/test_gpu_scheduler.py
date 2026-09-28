@@ -213,8 +213,10 @@ def test_a_group_and_singletons_share_devices_and_execute_one_at_a_time() -> Non
     assert refused.value.code == "device_group_infeasible"  # never a smaller group
     helper = lane_set.bind("helper", (), model_bearing=False, measured={})
     assert helper.ordinals == () and helper.devices == "" and lane_set.lane_of("helper") is helper
-    assert lane_set.release("helper") and lane_set.lane_of("helper") is None
-    assert lane_set.release("h3") and "lane-0+1+2+3" not in lane_set.by_id
+    lane_set.release("helper")
+    assert lane_set.lane_of("helper") is None
+    lane_set.release("h3")
+    assert "lane-0+1+2+3" not in lane_set.by_id
     assert [lane_set.lane_of(f"q{o}") for o in range(3)] == qwen
 
 

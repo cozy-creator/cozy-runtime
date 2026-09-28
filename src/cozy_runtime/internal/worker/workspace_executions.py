@@ -116,17 +116,14 @@ class State:
 class ExecutionRow(msgspec.Struct, frozen=True):
     """One `executions` row as the supervision logic reads it, decoded once."""
 
-    request: str
     ordinal: int
     generation: int
     state: str
     desired: str
-    collected: bool
     retention_waived: bool
     #: the durable acceptance order (rowid): a root's GPU priority
     priority: int
     offer: bytes
-    preparation: bytes
     #: its current attempt reached an executor (the dispatch mark)
     dispatched: bool
 
@@ -511,16 +508,13 @@ class Executions:
         if row is None:
             return None
         return ExecutionRow(
-            request=row["request"],
             ordinal=row["ordinal"],
             generation=row["generation"],
             state=row["state"],
             desired=row["desired"],
-            collected=bool(row["collected"]),
             retention_waived=bool(row["retention_waived"]),
             priority=row["rowid"],
             offer=row["offer"],
-            preparation=row["preparation"],
             dispatched=row["attempt_state"] == "running",
         )
 
@@ -759,9 +753,8 @@ class Executions:
         *,
         lost: bool = False,
     ) -> None:
-        """Record the current attempt's terminal if, and only if, it was never dispatched
-        (or, `lost`, was dispatched and no one holds it): a compare-and-set against the
-        dispatch mark, built from the attempt row's own columns. A held attempt ends only
+        """Record the current attempt's terminal only if it was never dispatched (or, `lost`,
+        no one holds it): a compare-and-set against the dispatch mark. A held attempt ends only
         through its runner (`ExecutionChanged` otherwise)."""
         states = "('accepted','running')" if lost else "('accepted')"
         with self.workspace.locked() as db, transaction(db):
@@ -795,9 +788,8 @@ class Executions:
 
     def reconcile(self, owner: str, request: str, *, requeue: str = "") -> None:
         """Project the current attempt's durable outcome onto its execution. Every outcome is
-        final except the one kind of work the machine never got: an attempt whose Runtime
-        process died before dispatching it. Boot reconcile passes its `requeue` worker boot,
-        and that attempt runs again as ordinal+1, once per execution."""
+        final except work the machine never got (its process died before dispatch): boot
+        reconcile passes its `requeue` boot and that runs again as ordinal+1, once."""
         with self.workspace.locked() as db, transaction(db):
             row = self._row(db, owner, request)
             attempt = db.execute(
@@ -873,10 +865,9 @@ class Executions:
             return offer
 
     def dispatched(self, owner: str, request: str, ordinal: int) -> None:
-        """Execution STARTS: the attempt row moves accepted -> running and the execution
-        queued -> running in one transaction, immediately before the executor is handed the
-        command. `running` means this and nothing earlier; everything before it is work the
-        machine never ran. A terminal recorded first wins (`ExecutionChanged`)."""
+        """Execution STARTS: attempt accepted -> running and execution queued -> running in one
+        transaction, just before the executor gets the command. `running` means this and
+        nothing earlier. A terminal recorded first wins (`ExecutionChanged`)."""
         with self.workspace.locked() as db, transaction(db):
             row = self._row(db, owner, request)
             moved = db.execute(

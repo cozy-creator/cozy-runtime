@@ -346,21 +346,17 @@ class LaneSet:
             self.by_id[lane.lane_id] = lane
         return lane
 
-    def release(self, placement_id: str) -> bool:
-        """A placement leaves; a group or host lane it held alone goes with it. True when a
-        lane left the set."""
-        gone = False
+    def release(self, placement_id: str) -> None:
+        """A placement leaves; a group or host lane it held alone goes with it."""
         for lane in self.lanes:
             lane.placements.discard(placement_id)
             lane.forget(placement_id)
             if lane.group and not lane.placements:
                 self.by_id.pop(lane.lane_id, None)
-                gone = True
         self.lanes = tuple(lane for lane in self.lanes if lane.lane_id in self.by_id)
         host = self.composition.pop(HOST_LANE + placement_id, None)
         if host is not None:
             self.by_id.pop(host.lane_id, None)
-        return gone or host is not None
 
     # ------------------------------------------------------------------ residency
 

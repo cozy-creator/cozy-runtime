@@ -105,10 +105,9 @@ class ActivityFile:
 
 
 def active_work(worker: Worker) -> bool:
-    """Work this machine owes, live and progressing: a supervised unit (an execution, an
-    attempt, a rebuild), a preparation, or an activating placement. By construction every
-    accepted execution not yet terminal has a live unit, or the worker is FAILED; a FAILED
-    worker has failed every execution it held, so it holds no rental and the idle clock runs.
+    """Work this machine owes: a supervised unit, a preparation, or an activating placement.
+    Every open execution has a live unit unless the worker FAILED, and a FAILED worker failed
+    them all, so it holds no rental.
 
     Do not take the control lock: model preparation can hold it for minutes while
     the reporter must keep telling the supervisor that preparation is active.

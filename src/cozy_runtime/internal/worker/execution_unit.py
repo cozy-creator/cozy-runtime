@@ -1,17 +1,16 @@
 """One machine execution, root or child, as its own supervised unit.
 
-The unit runs its execution start to finish on one thread: a child's call phase, the queued
-wait for its GPU grant, its attempt INLINE (staged beside the device, on the device, its post
-phase) and its settlement into its parent. It blocks only in `wait_for`, woken by what it
-waits on (its grant, a control, a preparation, its own deadline), and re-reads its row on
-every wake. Its exception fails this execution and nothing else (`crashed`).
+The unit runs its execution start to finish on one thread: a child's call phase, the wait
+for its GPU grant, its attempt inline, and its settlement into its parent. It re-reads its
+row on every wake. Its exception fails this execution and nothing else (`crashed`).
 """
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from cozy_runtime.internal.worker import machine_lanes
 from cozy_runtime.internal.worker.attempts import safe
@@ -52,8 +51,6 @@ class Execution:
         self.shape: machine_lanes.Shape | None = None
         self.shaped = 0
 
-    # ------------------------------------------------------------------ supervision
-
     def run(self, unit: Unit) -> None:
         try:
             while not self.worker.stop.is_set():
@@ -80,8 +77,6 @@ class Execution:
         self.failure = safe(fault_text(exc), 4096)
         return True
 
-    # ------------------------------------------------------------------ the phases
-
     def _step(self, unit: Unit) -> bool:
         """One pass over this execution's durable state. False when the unit is done."""
         row = self.executions.row(self.owner, self.request)
@@ -100,24 +95,21 @@ class Execution:
             unit.wait()  # its attempt ends through the thread that holds it
             return True
         if row.dispatched:
-            # Dispatched, and no thread here holds it: its outcome is recorded and only
-            # unprojected, or its attempt was lost (it failed), never run again.
+            # No thread here holds it: its outcome is only unprojected, or its attempt was
+            # lost and it fails. It never runs again.
             self.executions.reconcile(self.owner, self.request)
             now = self.executions.row(self.owner, self.request)
             if now is not None and not now.terminal:
-                self.worker.fail_execution(
-                    self.owner, self.request, "the dispatched attempt is held by no one"
-                )
+                self._fail("the dispatched attempt is held by no one")
             return True
         self.failure = self.failure or self.worker.failure_reason
         if self.failure:
-            self.worker.fail_execution(self.owner, self.request, self.failure)
+            self._fail(self.failure)
             return True
         if row.desired != "run":
             self.executions.stop_queued(self.owner, self.request)
             return True
-        if action := self.calls.ancestor_stop(self.owner, self.request):
-            # Its parent stopped (a control, a failure, a restart): this child follows it.
+        if action := self.calls.journal.ancestor_stop(self.owner, self.request):
             self.executions.control(
                 self.owner,
                 self.request,
@@ -131,14 +123,16 @@ class Execution:
 
     def _queued(self, unit: Unit, row: ExecutionRow) -> None:
         offered = row.attempt_offer()
-        spec = documents.parse(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
-        due = _due(spec.deadline_unix_ms)
+        deadline = documents.parse(
+            offered.invocation_spec_canonical_bytes, pb.InvocationSpec
+        ).deadline_unix_ms
+        due = time.monotonic() + deadline / 1000 - time.time() if deadline else None
         if due is not None and due <= time.monotonic():
             self.executions.stop_queued(self.owner, self.request, deadline=True)
             return
         shape = self._shaped(row)
         if shape.refusal:
-            self._refuse(offered, shape.refusal.partition(":")[0], shape.refusal)
+            self._refuse(offered, shape.refusal)
             return
         grant_key = f"{self.request}#{row.ordinal}"
         ordinals: tuple[int, ...] = ()
@@ -147,7 +141,7 @@ class Execution:
             if shape.kind != "cpu":
                 want = self._want(shape)
                 if isinstance(want, str):
-                    self._refuse(offered, want.partition(":")[0], want)
+                    self._refuse(offered, want)
                     return
                 broker = self.worker.gpu
                 broker.want(grant_key, want)
@@ -167,15 +161,22 @@ class Execution:
             if attempt is None and shape.kind != "cpu":
                 self.worker.gpu.release(grant_key)
 
+    def _fail(self, why: str) -> None:
+        """End this execution FAILED: an undispatched attempt gets the terminal; a recorded
+        one is projected."""
+        self.worker.note("execution", f"{self.request} failed: {why[:400]}")
+        try:
+            self.executions.fail(self.owner, self.request, why)
+        except ExecutionChanged:
+            self.executions.reconcile(self.owner, self.request)
+
     def _settle(self, unit: Unit, row: ExecutionRow) -> None:
-        """A terminal execution delivers to its parent, stops its children, and releases
-        what it retains. The row is already terminal: a failure here is noted, never the
-        worker's."""
-        worker, owner, request = self.worker, self.owner, self.request
+        """A terminal execution delivers to its parent, stops its children and releases what
+        it retains. The row is already terminal: a failed step is noted, never the worker's."""
         steps: tuple[tuple[str, Callable[[], None]], ...] = (
-            ("custody", lambda: self.calls.deliver(unit, owner, request, row)),
-            ("children", lambda: worker.stop_children(owner, request, row)),
-            ("retention", lambda: worker.release_retention(owner, request, row)),
+            ("custody", lambda: self.calls.deliver(unit, self.owner, self.request, row)),
+            ("children", lambda: self._stop_children(row)),
+            ("retention", lambda: self._release_retention(row)),
         )
         for name, step in steps:
             try:
@@ -183,30 +184,50 @@ class Execution:
             except FENCES:
                 raise
             except Exception as exc:
-                worker.settle_fault(owner, request, name, exc)
+                why = fault_text(exc)
+                self.worker.note("execution", f"{self.request} settle {name} faulted: {why}"[:400])
+                fault = {"step": name, "fault": why[:1024]}
+                with contextlib.suppress(Exception):
+                    self.executions.record(self.owner, self.request, "settle_fault", fault)
 
-    # ------------------------------------------------------------------ helpers
+    def _stop_children(self, row: ExecutionRow) -> None:
+        """Open children follow their terminal parent: cancelled with it, else paused. A
+        pending call's unit learns that no parent awaits it."""
+        action: Literal["pause", "cancel"] = "cancel" if row.state == "canceled" else "pause"
+        for call in self.calls.journal.children(self.owner, self.request):
+            if not self.executions.owns(self.owner, call.child_request):
+                self.worker.supervisor.poke(key(call.child_request))
+            elif row.state != "succeeded":
+                self.worker.control_tree(self.owner, call.child_request, action, row.generation)
+        self.calls.serving.forget(self.request, row.ordinal)
+
+    def _release_retention(self, row: ExecutionRow) -> None:
+        """A canceled execution, or one whose hold this boot releases, relinquishes what it
+        retains once no effect is in doubt."""
+        boot = self.request in self.worker.releasing
+        if (
+            (row.desired == "cancel" or boot)
+            and not row.retention_waived
+            and self.executions.release(self.owner, self.request, boot=boot)
+        ):
+            self.worker.releasing.discard(self.request)
 
     def _track_root(self, row: ExecutionRow) -> None:
         """A root's GPU lease exists exactly while its row is open and wants to run."""
-        open_now = row.desired == "run" and row.state in ("queued", "running")
-        if open_now and not self.root_open and self._is_root():
+        if row.desired != "run" or row.state not in ("queued", "running"):
+            self._close_root()
+            return
+        if self.is_root is None:
+            root, _ = self.executions.scheduling_root(self.owner, self.request)
+            self.is_root = root == self.request
+        if self.is_root and not self.root_open:
             self.worker.gpu.open_root(self.request, row.priority)
             self.root_open = True
-        elif not open_now:
-            self._close_root()
 
     def _close_root(self) -> None:
         if self.root_open:
             self.root_open = False
             self.worker.gpu.close_root(self.request)
-
-    def _is_root(self) -> bool:
-        if self.is_root is None:
-            self.is_root = self.executions.scheduling_root(self.owner, self.request)[0] == (
-                self.request
-            )
-        return self.is_root
 
     def _shaped(self, row: ExecutionRow) -> machine_lanes.Shape:
         if self.shape is None or self.shaped != row.ordinal:
@@ -239,15 +260,9 @@ class Execution:
         return (
             now is None
             or (now.state, now.desired, now.generation) != (row.state, row.desired, row.generation)
-            or bool(self.calls.ancestor_stop(self.owner, self.request))
+            or bool(self.calls.journal.ancestor_stop(self.owner, self.request))
         )
 
-    def _refuse(self, offered: pb.AttemptOffer, code: str, detail: str) -> None:
+    def _refuse(self, offered: pb.AttemptOffer, detail: str) -> None:
+        code = detail.partition(":")[0]
         self.worker.refuse(offered, code, detail, pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE)
-
-
-def _due(deadline_unix_ms: int) -> float | None:
-    """The caller's absolute deadline as a monotonic instant, or None for no deadline."""
-    if not deadline_unix_ms:
-        return None
-    return time.monotonic() + deadline_unix_ms / 1000 - time.time()

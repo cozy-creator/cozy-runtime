@@ -43,10 +43,8 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 # Native codes for IO that may succeed when repeated; others are refusals of this closure.
 _TRANSIENT_NATIVE = frozenset({"STORE_BUSY", "TRANSFER_FAILED", "DEADLINE_EXCEEDED"})
-# An effect that lands nothing new on consecutive tries is settled after this many (refused
-# before its commit, or left for its owner's readback after it); any landed object resets
-# the count. The backoff between tries doubles up to its ceiling: it paces a remote, and
-# decides nothing.
+# An effect settles after this many consecutive tries land nothing new (any landed object
+# resets the count). The doubling backoff between tries only paces a remote.
 _STALLED_ATTEMPTS = 10
 _MAX_BACKOFF_SECONDS = 60.0
 # Hub's durable finalization job is progressing on its own: poll it at most 8 s apart.

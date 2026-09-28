@@ -1,10 +1,8 @@
 """GPU scheduling policy: one lease per root, exact device sets, level-triggered.
 
-Policy only, no I/O. Each pass takes the open roots with their durable priority and every
-demand not yet released from its device; anything missing is gone, so a hold cannot leak.
-`GpuBroker` runs one pass per change: units register their roots and demands and drop them
-when they end, and each new grant is handed to the unit that asked. A root's lease grows
-only from free ordinals and ends when the root stops or says it is done with GPUs
+Each pass takes the open roots with their durable priority and every demand not yet
+released from its device; anything missing is gone, so a hold cannot leak. A root's lease
+grows only from free ordinals and ends when the root stops or says it is done with GPUs
 (`release_root`, the author's `ctx.release_gpus()`; a root that is itself the GPU call is
 done at its device exit), so the Python gap between two children never lets another root
 in. Priority orders the waiters: the oldest waiter that cannot start reserves the free
@@ -261,15 +259,9 @@ Observed = Callable[[list[Event], dict[str, int], Document, dict[str, str]], Non
 
 
 class GpuBroker(GpuScheduler):
-    """The policy driven by changes instead of a tick.
-
-    Units register their root while its row is open and their demand until its attempt
-    leaves the device; each change runs one policy pass, pokes the units granted in it
-    (`granted_to`) and journals the pass (`observed`) in pass order. `outside()` is the set
-    of GPUs held by attempts no unit schedules (direct offers), read on every pass;
-    `warm(template)` the ordinals where that template is resident. A pass that raises
-    leaves grant state no one can trust: `fault` fails the worker.
-    """
+    """The policy, one pass per change: it pokes the units granted (`granted_to`) and
+    journals each pass in order (`observed`). A pass that raises leaves grant state no one
+    can trust: `fault` fails the worker."""
 
     def __init__(
         self,
@@ -282,13 +274,8 @@ class GpuBroker(GpuScheduler):
         fault: Callable[[str], None],
     ) -> None:
         super().__init__(devices)
-        self.granted_to, self.observed, self.outside, self.warm = (
-            granted_to,
-            observed,
-            outside,
-            warm,
-        )
-        self.fault = fault
+        self.granted_to, self.observed, self.fault = granted_to, observed, fault
+        self.outside, self.warm = outside, warm
         self.changes = threading.Lock()
         self.roots: dict[str, int] = {}
         self.wants: dict[str, Want] = {}

@@ -98,8 +98,10 @@ def test_a_group_lane_overlaps_its_device_lanes_and_shares_their_locks() -> None
     # a group is ONE device seat and ONE staged seat regardless of K (per-lane constants)
     assert (lanes.LANE_RUNNING, lanes.LANE_STAGED) == (1, 1)
     group.placements.add("p")
-    assert not lanes_.release("q") and lanes_.by_id["lane-0+1"] is group
-    assert lanes_.release("p"), "the group left with its last placement"
+    lanes_.release("q")
+    assert lanes_.by_id["lane-0+1"] is group
+    lanes_.release("p")
+    assert "lane-0+1" not in lanes_.by_id, "the group left with its last placement"
     assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-1", "lane-2"]
 
 

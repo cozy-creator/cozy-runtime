@@ -95,6 +95,7 @@ from cozy_runtime.internal.worker import (
     execution_unit,
     gpu_scheduler,
     grants,
+    internal_calls,
     lane_wire,
     machine_byte_inputs,
     machine_capture,
@@ -1129,29 +1130,21 @@ class Worker:
         self._published_latch = ""
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
-        #: thread name -> its kernel thread id, recorded by each `_lane`-wrapped thread as
-        #: it starts (convergence, report, sender). An observer judging this worker's
-        #: PROGRESS by CPU reads the threads that work and leaves out the ones that tick on
-        #: a clock (`pollers`).
+        #: thread name -> kernel thread id of each `_lane`-wrapped thread (read by `pollers`)
         self.lane_threads: dict[str, int] = {}
-        #: Every unit of work is its own supervised thread: an execution, a direct attempt,
-        #: an attempt's guard, a rebuild. One unit's exception is its own terminal.
         self.supervisor = Supervisor(
-            integrity=self.fail_machine,
-            note=lambda step: self.note("supervision", step),
+            integrity=self.fail_machine, note=lambda step: self.note("supervision", step)
         )
-        #: units waiting on a worker-level fact (a placement's readiness, attempts draining):
-        #: woken whenever an attempt leaves or a placement settles
+        #: units waiting for an attempt to leave or a placement to settle
         self._capacity_waiters: set[str] = set()
         #: signalled whenever a held attempt leaves (placement drains wait on it)
         self.attempts_left = threading.Condition()
         #: replicas one execution is activating right now; the others wait for it
         self._activating: set[str] = set()
-        #: boot reconcile runs once per process, for the owner it was run for
+        #: the owner this process's one boot reconcile ran for
         self._reconciled = ""
         #: terminal executions whose hold this boot releases once their effects settle
-        self._releasing: set[str] = set()
-        #: why this worker FAILED, once it has
+        self.releasing: set[str] = set()
         self.failure_reason = ""
         self.bundles = triage.BundleStore(
             options.triage_root or self.root / "triage",
@@ -1575,8 +1568,6 @@ class Worker:
         selected_job = None
         bindings_digest = ""
         if attempt.spec.get("job") is not None or self.accepted.mode == "job":
-            from . import machine_slots
-
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
             selected_job = self.job_slots.get(machine_slots.key(attempt.request_id)) or next(
                 (
@@ -1706,16 +1697,13 @@ class Worker:
             )
         return any(self._placement_dispatchable(placement_id) for placement_id in lane.placements)
 
-    def _lane_slots(self, lane: DeviceLane, *, machine_owned: bool = False) -> int:
+    def _lane_slots(self, lane: DeviceLane) -> int:
         """Free seats on ONE lane, now: its capacity less what is queued for or on its
         device, NONE while
         more than `LANE_RELEASED` released attempts await their ack (cr-079 D3), and NONE
         while the worker's admission is CLOSED — that is one structural fact per worker,
         and `lanes[]` must never show a seat the worker-level count denies."""
-        if (
-            self.admission_state(machine_owned=machine_owned)
-            != pb.AdmissionState.ADMISSION_STATE_OPEN
-        ):
+        if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN:
             return 0
         if not self._lane_dispatchable(lane):
             return 0
@@ -2267,15 +2255,6 @@ class Worker:
                 raise WorkspaceRefusal("workspace bootstrap proof was refused")
             return self.fence.record_owner_id
 
-    def operation_minor(self, request_id: str) -> int:
-        """The wire minor one attempt's operation was negotiated at (worker-protocol: gate the
-        operation, never the connection). A machine execution keeps its submitting Claim's;
-        only stream-offered work speaks the minor of the stream that offered it."""
-        executions, owner = self.executions, self.fence.record_owner_id
-        if executions is not None and owner and executions.owns(owner, request_id):
-            return min(WIRE_MINOR, executions.wire_minor(owner, request_id))
-        return self.fence.wire_minor
-
     def _execution_service(self, claim: pb.Claim) -> tuple[workspace_executions.Executions, str]:
         owner = self.authorize_workspace(claim)
         if self.executions is None:
@@ -2289,14 +2268,11 @@ class Worker:
         return self.machine_calls.serving.prefetch(attempt, frame)
 
     def _release_gpus(self, attempt: AttemptRecord) -> None:
-        """`ctx.release_gpus()`: the attempt's root ends its GPU lease now, and the next
-        waiter is granted in the same pass. A direct attempt holds no lease."""
-        if self.executions is None or not attempt.machine:
-            return
-        root, _parent = self.executions.scheduling_root(
-            self.fence.record_owner_id, attempt.request_id
-        )
-        self.gpu.release_root(root)
+        """`ctx.release_gpus()`: the attempt's root ends its GPU lease now. A direct attempt
+        holds no lease."""
+        if self.executions is not None and attempt.machine:
+            owner = self.fence.record_owner_id
+            self.gpu.release_root(self.executions.scheduling_root(owner, attempt.request_id)[0])
 
     def _machine_call(
         self, attempt: AttemptRecord, request: pb.ChildCallRequest, action: str
@@ -2318,7 +2294,7 @@ class Worker:
         """Start the unit that owns this execution, or wake the one that does."""
         if self.machine_calls is None or self.stop.is_set():
             return
-        unit = self.machine_calls.unit(owner, request)
+        unit = execution_unit.Execution(self, self.machine_calls, owner, request)
         self.supervisor.spawn(execution_unit.key(request), unit.run, unit.crashed)
 
     def _effect_settled(self, owner: str, call: Call) -> None:
@@ -2371,9 +2347,8 @@ class Worker:
             )
 
     def _dispatched(self, attempt: AttemptRecord) -> None:
-        """Execution STARTS: journaled immediately before the executor is handed its
-        command. A machine execution moves to `running` with it; a terminal recorded first
-        (a stop that won) keeps the executor from ever being called."""
+        """Execution STARTS, journaled just before the executor gets its command: a terminal
+        recorded first (a stop that won) keeps the executor from ever being called."""
         owner = self.fence.record_owner_id
         if attempt.machine and self.executions is not None:
             self.executions.dispatched(owner, attempt.request_id, attempt.attempt)
@@ -2382,62 +2357,10 @@ class Worker:
         ):
             self.workspace.mark_running(owner, self.engine.accepted_message(attempt))
 
-    def fail_execution(self, owner: str, request: str, why: str) -> None:
-        """End this execution FAILED with `why`, from its own unit (the only writer): its
-        undispatched attempt gets the terminal; a recorded one is projected."""
-        assert self.executions is not None
-        self.note("execution", f"{request} failed: {why[:400]}")
-        try:
-            self.executions.fail(owner, request, why)
-        except ExecutionChanged:
-            self.executions.reconcile(owner, request)
-
-    def stop_children(
-        self, owner: str, request: str, row: workspace_executions.ExecutionRow
-    ) -> None:
-        """A terminal execution's open children follow it: cancelled with it, or paused when
-        it failed or paused; its pending calls' units learn no parent awaits them."""
-        assert self.machine_calls is not None and self.executions is not None
-        action: Literal["pause", "cancel"] = "cancel" if row.state == "canceled" else "pause"
-        for call in self.machine_calls.journal.children(owner, request):
-            if self.executions.owns(owner, call.child_request):
-                if row.state != "succeeded":
-                    self.control_tree(owner, call.child_request, action, row.generation)
-            else:
-                self.supervisor.poke(execution_unit.key(call.child_request))
-        if self.machine_calls is not None:
-            self.machine_calls.serving.forget(request, row.ordinal)
-
-    def release_retention(
-        self, owner: str, request: str, row: workspace_executions.ExecutionRow
-    ) -> None:
-        """A canceled execution relinquishes what it retains once no effect is in doubt, as
-        does one whose hold this boot releases (collected, or canceled or failed)."""
-        assert self.executions is not None
-        boot = request in self._releasing
-        if (
-            (row.desired == "cancel" or boot)
-            and not row.retention_waived
-            and self.executions.release(owner, request, boot=boot)
-        ):
-            self._releasing.discard(request)
-
-    def settle_fault(self, owner: str, request: str, step: str, exc: BaseException) -> None:
-        """A terminal execution's cleanup failed: noted and journaled, never the worker's."""
-        why = fault_text(exc)
-        self.note("execution", f"{request} settle {step} faulted: {why}"[:400])
-        if self.executions is not None:
-            with contextlib.suppress(Exception):
-                self.executions.record(
-                    owner, request, "settle_fault", {"step": step, "fault": why[:1024]}
-                )
-
     def reconcile_executions(self) -> None:
-        """BOOT: the one pass that rebuilds this worker's live work from the journal, then
-        nothing but events. Dispatched attempts of a dead process are recovered as failed,
-        the work it never dispatched runs once more, custody no parent will read is released,
-        what a terminal execution still holds is released, and every execution still owed gets
-        its unit."""
+        """BOOT, once per process: rebuild live work from the journal. A dead process's
+        dispatches fail, its undispatched work runs once more, unread custody and terminal
+        holds are released, and every owed execution gets its unit."""
         if (
             self.executions is None
             or self.machine_calls is None
@@ -2464,7 +2387,7 @@ class Worker:
         self.machine_calls.release_stranded(owner)
         for request in self.executions.held(owner, self.options.worker_id):
             if not self.executions.release(owner, request, boot=True):
-                self._releasing.add(request)  # an effect is in doubt: once it settles
+                self.releasing.add(request)  # an effect is in doubt: once it settles
         for request in owed:
             self.execution(owner, request)
         for request in self.machine_calls.journal.unsettled_effects(owner):
@@ -2499,17 +2422,7 @@ class Worker:
                 descriptor = spec["job"]["job_descriptor_id"]
                 binding = self.engine.jobs.get(descriptor)
                 if binding is None or binding.installation_id != spec["job"]["installation_id"]:
-                    from cozy_runtime.internal import job_plan
-
-                    binding = JobBinding.read(
-                        json.loads(
-                            job_plan.path(
-                                self.config.cozy_home / "job-plans",
-                                spec["job"]["installation_id"],
-                                descriptor,
-                            ).read_bytes()
-                        )
-                    )
+                    binding = self._job_plan(spec["job"]["installation_id"], descriptor)
                 declaration = self.engine._job_declaration(binding, descriptor)
                 result_schema = canonical.write(declaration["result"])
                 memoize = declaration.get("invocable", {}).get("memoize", False) is True
@@ -2717,28 +2630,25 @@ class Worker:
             self._dead_replicas[placement_id] = current
         return current is not None
 
-    def _revive(self, placement_id: str) -> bool:
+    def _revive(self, placement_id: str) -> None:
         """Rebuild a deferred dead replica now that a grant holds its devices, here."""
         executor = self._dead_replicas.pop(placement_id, None)
         lane = self.lanes.lane_of(placement_id)
-        if executor is None or lane is None or self._placement_by_id(placement_id) is None:
-            return False
-        self._rebuild_on(lane, executor, placement_id, granted=True)
-        return True
+        placement = self._placement_by_id(placement_id)
+        if executor is not None and lane is not None and placement is not None:
+            self._rebuild_lane(lane, placement_id, executor, granted=True)
 
     def _cpu_job(self, job: pb.JobDirective) -> bool:
         """An orchestration job granted no device holds no GPU (`machine_slots.admits`)."""
         if not job.orchestration:
             return False
-        binding = JobBinding.read(
-            json.loads(
-                job_plan.path(
-                    self.config.cozy_home / "job-plans", job.installation_id, job.job_descriptor_id
-                ).read_bytes()
-            )
-        )
+        binding = self._job_plan(job.installation_id, job.job_descriptor_id)
         declaration = self.engine._job_declaration(binding, binding.job_descriptor_id)
         return machine_slots.admits(job, declaration)
+
+    def _job_plan(self, installation_id: str, descriptor: str) -> JobBinding:
+        plan = job_plan.path(self.config.cozy_home / "job-plans", installation_id, descriptor)
+        return JobBinding.read(json.loads(plan.read_bytes()))
 
     def _failed_execution_binding(self, attempt: AttemptRecord) -> str | None:
         """A known construction refusal is terminal before waiting for a GPU seat.
@@ -2840,9 +2750,8 @@ class Worker:
     def _await_capacity(
         self, unit: Unit, ready: Callable[[], bool], moved: Callable[[], bool]
     ) -> bool:
-        """Wait for a worker-level fact (a placement's readiness, the attempts draining)
-        that changes only when an attempt leaves or a placement settles, both of which wake
-        this unit. False when what the caller waits on moved first."""
+        """Wait for a fact that moves only when an attempt leaves or a placement settles
+        (`_capacity_changed`). False when what the caller waits on moved first."""
         self._capacity_waiters.add(unit.key)
         try:
             unit.wait_for(lambda: ready() or moved())
@@ -2874,15 +2783,7 @@ class Worker:
             held = self.job_slots.get(machine_slots.key(request_id))
             if held is not None and held.ready():
                 return True
-            binding = JobBinding.read(
-                json.loads(
-                    job_plan.path(
-                        self.config.cozy_home / "job-plans",
-                        desired.job.installation_id,
-                        desired.job.job_descriptor_id,
-                    ).read_bytes()
-                )
-            )
+            binding = self._job_plan(desired.job.installation_id, desired.job.job_descriptor_id)
             with self.control_lock:
                 machine_capture.restore(self, preparation)
             return machine_slots.ensure(self, request_id, desired.job, binding)
@@ -2925,10 +2826,9 @@ class Worker:
         unit: Unit,
         moved: Callable[[], bool],
     ) -> bool:
-        """Activate this machine replica on its grant, beside every other placement, on the
-        calling execution's thread. One execution activates (or revives) a replica and any
-        other that needs it waits for that; a failed one refuses the demand that met it and
-        leaves in the background, so the next demand activates it afresh."""
+        """Activate this machine replica on its grant, beside every other placement. One
+        execution activates (or revives) it and the others wait; a failed one refuses the
+        demand that met it and retires, so the next demand activates it afresh."""
         (row,) = read_placement_set(desired.placement_set)
         pins = desired.placement_set.device_pins
         pin = tuple(pins[0].device_ordinals) if pins else None
@@ -2973,11 +2873,7 @@ class Worker:
                     self._activating.discard(placement_id)
                 self._capacity_changed()
         assert hosted is not None
-
-        def retire(_: Unit) -> None:
-            self._retire_one(placement_id)
-
-        self.supervisor.spawn(f"retire:{placement_id}", retire)
+        self.supervisor.spawn(f"retire:{placement_id}", lambda _: self._retire_one(placement_id))
         fault = next((f for f in reversed(self.engine.faults) if f.subject == placement_id), None)
         detail = f"{fault.reason}: {fault.detail}" if fault else hosted.latched
         raise WorkspaceRefusal(f"model preparation failed: {detail or placement_id}")
@@ -3175,10 +3071,8 @@ class Worker:
         so a frame authored before a re-claim still leaves under the live envelope, and an
         unacknowledged terminal is replayed after a reconnect.
 
-        A machine execution's attempt frames never reach a stream: its outcome is recorded
-        in the journal and projected onto its execution here, on the thread that built it,
-        and acknowledged at once (its unit settles custody; collection is a separate
-        durable obligation).
+        A machine execution's attempt frames never reach a stream: its outcome is projected
+        onto its execution here and acknowledged at once (its unit settles custody).
 
         STAMP AND ENQUEUE ARE ONE STEP, under the same lock claim acceptance takes: the
         envelope a frame carries and the stream it is queued on are then the same epoch
@@ -3390,13 +3284,13 @@ class Worker:
             )
         )
 
-    def admission_state(self, *, machine_owned: bool = False) -> pb.AdmissionState:
+    def admission_state(self) -> pb.AdmissionState:
         """CLOSED is STRUCTURAL (#486c): before the snapshot barrier, while draining, while
         the placement is not dispatchable. OPEN with zero slots is TRANSIENT saturation, and
         a RecordOwner backs off differently for each — so the two never collapse into one
         counter here either."""
         if (
-            (not machine_owned and not self.fence.dispatch_open)
+            not self.fence.dispatch_open
             or self.accepted.posture == pb.Posture.POSTURE_DRAINING
             or self.phase != pb.WorkerPhase.WORKER_PHASE_ONLINE
             or not self.dispatchable()
@@ -3437,17 +3331,10 @@ class Worker:
         self._settle()
 
     def fail_machine(self, why: str) -> None:
-        """A worker INTEGRITY failure: admission closes and every execution it holds ends
-        FAILED with this reason, now.
-
-        `WORKER_PHASE_FAILED` is where that fact lives (#482). It is reserved for what no one
-        execution owns: a failure no journal write could record, an unbuildable last-resort
-        terminal, an executor whose reclaim is not proved, a GPU scheduling pass that raised.
-        Each execution's unit writes its own FAILED terminal (a live attempt is cancelled
-        with the reason first), and `active_work` reads false at once, so a failed worker
-        never holds a rental. A marker makes the next boot fail what this one held rather
-        than run it again.
-        """
+        """A worker INTEGRITY failure (`WORKER_PHASE_FAILED`, #482), for what no one execution
+        owns: admission closes and each held execution's unit ends it FAILED with this reason,
+        so a failed worker never holds a rental. A marker makes the next boot fail what this
+        one held rather than run it again."""
         if self.phase == pb.WorkerPhase.WORKER_PHASE_FAILED:
             return
         self.failure_reason = safe(f"the worker failed: {why}", 4096)
@@ -4346,8 +4233,6 @@ class Worker:
         if disposition != "closed":
             return
         self.calls.close(acked.request_id, acked.attempt_ordinal)
-        from . import machine_slots
-
         machine_slots.release(self, acked.request_id, ordinal=acked.attempt_ordinal)
         # A closed child is its parent's result: its unit settles custody now.
         self.supervisor.poke(execution_unit.key(acked.request_id))
@@ -7041,9 +6926,7 @@ class Worker:
 
         EVERY OFFER GETS A JOURNALED OUTCOME (§7): `AttemptAccepted` or a journaled
         `AttemptOutcome(REFUSED)`, never silence. A pre-execution refusal consumes the
-        `attempt_ordinal` and ZERO billed execution budget (`execution_started` stays false),
-        and the RecordOwner may mint `attempt_ordinal + 1` and dispatch it elsewhere.
-        Machine executions never come here: their unit holds its own attempt.
+        `attempt_ordinal` and ZERO billed execution budget (`execution_started` stays false).
         """
         # THE ADMISSION FENCE FIRST (§6): the cheapest deterministic verdict, and a stale
         # epoch means the RecordOwner dispatched against a picture that no longer holds.
@@ -7055,12 +6938,11 @@ class Worker:
                 CAUSE.CAUSE_CODE_NO_CAPACITY,
             )
             return
-        minor = self.fence.wire_minor
-        if minor < MIN_COMPATIBLE_WIRE_MINOR:
+        if self.fence.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
             self.refuse(
                 offered,
                 CAPABILITY_UNAVAILABLE_CODE,
-                _capability_unavailable("execution", minor),
+                _capability_unavailable("execution", self.fence.wire_minor),
                 CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
             )
             return
@@ -7234,53 +7116,40 @@ class Worker:
     ) -> tuple[str, str, pb.CauseCode] | None:
         """What this attempt's own declaration refuses: an internal callable offered by
         anything but its managed parent, or a job whose binding is not prepared here."""
+        internal: tuple[str, str] | None = None  # (installation, entrypoint)
         if "serving" in attempt.spec:
             hosted = self.hosted.get(offered.placement_id)
             bindings = hosted.bindings if hosted is not None else self.bindings
             declared = bindings.get(attempt.spec["serving"]["entrypoint_binding_digest"])
             if declared is not None and declared.internal:
-                from . import internal_calls
-
                 placement = self._placement_by_id(offered.placement_id)
                 revision = (
                     machine_capture.installation_identity(placement.document) if placement else ""
                 )
-                try:
-                    internal_calls.require_child(
-                        self.workspace,
-                        self.fence.record_owner_id,
-                        offered,
-                        revision,
-                        declared.entrypoint,
-                        machine_owned=machine_owned,
-                    )
-                except WorkspaceRefusal as exc:
-                    return "internal_callable", str(exc), CAUSE.CAUSE_CODE_INVALID_REQUEST
-        if "job" not in attempt.spec:
-            return None
-        descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
-        slot = self.job_slots.get(machine_slots.key(attempt.request_id))
-        binding = slot.binding if slot is not None else self.engine.jobs.get(descriptor)
-        if binding is None or binding.installation_id != attempt.spec["job"]["installation_id"]:
-            return (
-                "job_binding_unavailable",
-                "the selected job is not prepared",
-                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            )
-        try:
-            declaration = self.engine._job_declaration(binding, descriptor)
-        except AttemptRefusal as exc:
-            return exc.code, exc.detail, exc.cause
-        if declaration.get("internal", False):
-            from . import internal_calls
-
+                internal = revision, declared.entrypoint
+        elif "job" in attempt.spec:
+            descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
+            slot = self.job_slots.get(machine_slots.key(attempt.request_id))
+            binding = slot.binding if slot is not None else self.engine.jobs.get(descriptor)
+            if binding is None or binding.installation_id != attempt.spec["job"]["installation_id"]:
+                return (
+                    "job_binding_unavailable",
+                    "the selected job is not prepared",
+                    CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                )
+            try:
+                declaration = self.engine._job_declaration(binding, descriptor)
+            except AttemptRefusal as exc:
+                return exc.code, exc.detail, exc.cause
+            if declaration.get("internal", False):
+                internal = binding.installation_id, binding.job
+        if internal is not None:
             try:
                 internal_calls.require_child(
                     self.workspace,
                     self.fence.record_owner_id,
                     offered,
-                    binding.installation_id,
-                    binding.job,
+                    *internal,
                     machine_owned=machine_owned,
                 )
             except WorkspaceRefusal as exc:
@@ -7297,8 +7166,6 @@ class Worker:
         is one that is not dispatchable, and its lane is whichever its slot would take."""
         if self.accepted.mode == "job" or (attempt is not None and "job" in attempt.spec):
             if attempt is not None:
-                from . import machine_slots
-
                 if local := self.job_slots.get(machine_slots.key(attempt.request_id)):
                     return local.lane
                 descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
@@ -7387,10 +7254,8 @@ class Worker:
 
     def run_attempt(self, attempt: AttemptRecord) -> None:
         """ONE held attempt, start to terminal, on the calling thread: staged beside the
-        device, then the device under its lane's lock, then its post phase. The device is
-        held from entry to release (cr-022, cr-079), and a rebuild the attempt leaves behind
-        runs under the same hold, before the next attempt on that lane can enter. A fault is
-        this attempt's terminal; its GPUs go back at device exit whatever happened."""
+        device, then the device under its lane's lock (entry to release, cr-022, cr-079) with
+        any rebuild it leaves behind, then its post phase. A fault is its terminal."""
         lane = self.lanes.by_id[attempt.lane_id]
         released: Released | None = None
         try:
@@ -7406,7 +7271,8 @@ class Worker:
                     return
                 if self.enter(attempt) if staged else self.admit(attempt):
                     released = self.execute(attempt, lane)
-                self._rebuild_after(lane, attempt)
+                # On REFUSALS too (#458): a poisoned generation refuses every attempt.
+                self._rebuild_lane(lane, attempt.placement_id)
         except Exception as exc:
             self._attempt_faulted(attempt, exc)
         finally:
@@ -7419,38 +7285,30 @@ class Worker:
             with lane.posting:
                 self.finish(released)
 
-    def _rebuild_after(self, lane: DeviceLane, attempt: AttemptRecord) -> None:
-        """Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt, so a
-        rebuild gated on admission could never run again."""
-        if lane.lane_id.startswith("cpu-"):
-            return
-        if lane is self.lanes.orchestration:
-            self._rebuild_orchestration()
-        else:
-            self.rebuild_if_needed(attempt.placement_id)
-
-    def _rebuild_on(
+    def _rebuild_lane(
         self,
         lane: DeviceLane,
-        executor: child.Executor,
-        placement_id: str = "",
+        placement_id: str,
+        executor: child.Executor | None = None,
         *,
         granted: bool = False,
     ) -> None:
-        """An executor's death, rebuilt under its lane's device hold (no attempt enters a
-        half-built executor)."""
+        """Rebuild under the lane's device hold, so no attempt enters a half-built executor:
+        the exact dead `executor`, or whatever the last attempt left in need."""
         with lane.device:
             if lane.lane_id.startswith("cpu-"):
                 return
             if lane is self.lanes.orchestration:
                 self._rebuild_orchestration()
+            elif executor is None:
+                self.rebuild_if_needed(placement_id)
             else:
                 self.rebuild_exited(executor, placement_id, granted=granted)
 
     def _executor_died(self, lane: DeviceLane, executor: child.Executor, placement_id: str) -> None:
         self.supervisor.spawn(
             f"rebuild:{placement_id or lane.lane_id}:{executor.epoch}",
-            lambda _: self._rebuild_on(lane, executor, placement_id),
+            lambda _: self._rebuild_lane(lane, placement_id, executor),
         )
 
     def _attempt_faulted(self, attempt: AttemptRecord, exc: BaseException) -> None:
@@ -7488,10 +7346,8 @@ class Worker:
 
     def _guard(self, unit: Unit, attempt: AttemptRecord) -> None:
         """This attempt's clock, the WORKER's and never author code's: its deadline, then a
-        cancel's measured stall. A cancelled attempt stops at its executor's next safe point
-        and the executor stays warm; it is killed only when its frames stop against their own
-        measured cadence (`AttemptRecord.cancel_stall`), never after a flat grace. It sleeps
-        until exactly the next instant either can fall due, and ends with the attempt."""
+        cancel's stall. A cancelled executor is killed only when its frames stop against their
+        own measured cadence (`AttemptRecord.cancel_stall`), never after a flat grace."""
         floor = liveness.noise_floor()
         while not self.stop.is_set():
             if (
@@ -7645,8 +7501,7 @@ class Worker:
 
     def cancel(self, message: pb.CancelAttempt, *, failure: str = "") -> str:
         """Mark the cancel; a STAGED attempt has nothing on the device, so its terminal is
-        recorded now rather than when the device reaches it. Anything later is watched by
-        the attempt's guard, which escalates only on measured stillness."""
+        recorded now. Anything later is watched by the attempt's guard."""
         done = self.engine.cancel(message, failure=failure)
         held = self.engine.live.get(message.request_id)
         if held is None or held.attempt != message.attempt_ordinal or not held.canceling:

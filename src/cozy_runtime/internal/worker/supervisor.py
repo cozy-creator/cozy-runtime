@@ -1,13 +1,8 @@
 """Supervised units: one thread per unit of work, contained, woken only by its own events.
 
-A unit's exception is its own: `crashed(exc)` records the failure where the unit's owner
-reads it, and every other unit and the worker go on. A crash handler that itself raises
-leaves work with no owner, which is the one thing a worker may not survive: that is a worker
-integrity failure (`integrity(why)`).
-
-Nothing here polls. A unit blocks in `wait_for` until something it depends on pokes it or
-its own next due instant arrives (a deadline), and re-reads its state when woken: a wake is
-a hint, so a lost or repeated one cannot wedge it.
+A unit's exception is its own: `crashed(exc)` records it where the unit's owner reads it.
+A crash handler that itself raises leaves work with no owner: a worker `integrity` failure.
+Nothing polls: a unit re-reads its state on every wake, so a lost or repeated one is harmless.
 """
 
 from __future__ import annotations
@@ -33,13 +28,10 @@ class Stopping(Exception):
 
 
 class Unit:
-    """One supervised unit: a named thread and the event that wakes it."""
-
     def __init__(self, key: str, stopping: threading.Event) -> None:
         self.key = key
         self.stopping = stopping
         self.woken = threading.Event()
-        #: parked in `wait_for` with nothing pending (tests read it through `quiet`)
         self.idle = False
 
     def poke(self) -> None:
@@ -55,30 +47,19 @@ class Unit:
         self.woken.clear()
 
     def wait_for(self, ready: Callable[[], bool], until: float | None = None) -> bool:
-        """Block until `ready()` or the monotonic instant `until`; re-check on every poke."""
+        """Block until `ready()`, re-checked on every poke, or the monotonic instant `until`."""
         while not ready():
             if self.stopping.is_set():
                 raise Stopping(self.key)
-            timeout = None if until is None else until - time.monotonic()
-            if timeout is not None and timeout <= 0:
+            if until is not None and until <= time.monotonic():
                 return False
-            self.idle = True
-            self.woken.wait(timeout)
-            self.idle = False
-            self.woken.clear()
+            self.wait(until)
         return True
 
 
 class Supervisor:
-    """The registry of live units and their containment."""
-
-    def __init__(
-        self,
-        integrity: Callable[[str], None],
-        note: Callable[[str], None],
-    ) -> None:
-        self.integrity = integrity
-        self.note = note
+    def __init__(self, integrity: Callable[[str], None], note: Callable[[str], None]) -> None:
+        self.integrity, self.note = integrity, note
         self.units: dict[str, Unit] = {}
         self.lock = threading.Lock()
         self.stopping = threading.Event()
@@ -89,22 +70,19 @@ class Supervisor:
         key: str,
         body: Callable[[Unit], object],
         crashed: Callable[[BaseException], bool] = lambda exc: False,
-    ) -> bool:
-        """Start unit `key` unless it is live (then poke it). `crashed(exc)` records the
-        failure and answers whether to run `body` again; if it raises, the work has no owner
-        left and the worker fails. True when a unit started."""
+    ) -> None:
+        """Start unit `key`, or poke it when live. `crashed(exc)` records a crash and answers
+        whether to run `body` again."""
         with self.lock:
-            unit = self.units.get(key)
-            if unit is not None:
+            if (unit := self.units.get(key)) is not None:
                 unit.poke()
-                return False
+                return
             if self.stopping.is_set():
-                return False
+                return
             unit = self.units[key] = Unit(key, self.stopping)
         threading.Thread(
             target=self._run, args=(unit, body, crashed), name=key, daemon=True
         ).start()
-        return True
 
     def _run(
         self, unit: Unit, body: Callable[[Unit], object], crashed: Callable[[BaseException], bool]
@@ -154,7 +132,6 @@ class Supervisor:
             unit.poke()
 
     def join(self) -> None:
-        """Wait for every unit to leave (after `stop`)."""
         with self.lock:
             self.drained.wait_for(lambda: not self.units)
 
@@ -163,8 +140,7 @@ class Supervisor:
             return [key for key in self.units if key.startswith(prefix)]
 
     def busy(self, prefix: str = "") -> bool:
-        with self.lock:
-            return any(key.startswith(prefix) for key in self.units)
+        return bool(self.keys(prefix))
 
     def quiet_now(self) -> bool:
         """Every unit parked with nothing pending: what a test waits for instead of a tick."""

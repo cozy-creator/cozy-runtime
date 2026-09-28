@@ -11,6 +11,7 @@ import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.call_intent import canonical_intent
+from cozy_runtime.internal.effect_interfaces import MODULE
 from cozy_runtime.internal.worker.workspace import Journal, Row, Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import transaction
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -129,8 +130,6 @@ class Calls:
     @staticmethod
     def unsettled_effects_in(db: Journal, owner: str, root_request: str) -> bool:
         """Include descendants: canceling a root cannot waive an uncertain child effect."""
-        from cozy_runtime.internal.effect_interfaces import MODULE
-
         return (
             db.execute(
                 "WITH RECURSIVE descendants(request) AS (VALUES(?) UNION "
@@ -256,8 +255,6 @@ class Calls:
 
     def unsettled_effects(self, owner: str) -> list[str]:
         """Sent effect calls whose remote commit is still in doubt: owed a readback."""
-        from cozy_runtime.internal.effect_interfaces import MODULE
-
         with self.workspace.locked() as db:
             return [
                 row[0]

@@ -1,10 +1,8 @@
-"""Machine-local child calls: each call is its child's own supervised unit.
+"""Machine-local child calls: each call runs on its child's own unit (`execution_unit`).
 
-A parent's call journals its intent and starts the unit named for the child's request
-(`execution_unit`). That unit resolves the call and either answers it (a memo hit, a native
-source, an effect) or submits the child and goes on as the child's execution; when the child
-is terminal it settles the result into the call row. It is the one writer of that row: a
-parent's poll only reads.
+That unit answers the call (a memo hit, a native source, an effect) or submits the child and
+goes on as its execution, then settles the result into the call row. It is that row's one
+writer: a parent's poll only reads.
 """
 
 from __future__ import annotations
@@ -12,13 +10,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import threading
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
 from cozy_runtime.internal import effect_interfaces, source_interfaces
 from cozy_runtime.internal.worker import (
-    execution_unit,
     machine_byte_inputs,
     machine_byte_results,
     machine_child_target,
@@ -438,9 +435,6 @@ class Calls:
             )
         self.worker.calls.wake(call.parent_request)
 
-    def ancestor_stop(self, owner: str, request: str) -> Literal["", "pause", "cancel"]:
-        return self.journal.ancestor_stop(owner, request)
-
     def _check_ancestors(
         self, owner: str, parent: AttemptRecord, target: machine_child_target.Target, payload: bytes
     ) -> None:
@@ -501,6 +495,3 @@ class Calls:
             ).fetchall()
         for row in rows:
             machine_models.release(self.workspace, owner, row["child_request"])
-
-    def unit(self, owner: str, request: str) -> execution_unit.Execution:
-        return execution_unit.Execution(self.worker, self, owner, request)

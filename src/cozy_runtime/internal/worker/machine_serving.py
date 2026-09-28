@@ -318,7 +318,7 @@ class Serving:
                     }
                 ),
             )
-        _, models = arguments(target, request.request_canonical_bytes)
+        payload, models = arguments(target, request.request_canonical_bytes)
 
         def waiting() -> bool:
             parent = self.worker.engine.live.get(call.parent_request)
@@ -348,7 +348,6 @@ class Serving:
             prepared = future.result()
             placement = prepared.placement
             # The durable row holds the placement template; its devices are chosen at grant.
-            _, models = arguments(target, request.request_canonical_bytes)
             names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
             for name, supplied in models.items():
                 if name in names and supplied is not None:
@@ -366,7 +365,6 @@ class Serving:
             )
             if selected is None:
                 raise WorkspaceRefusal("captured inference has no complete prepared Model binding")
-            payload, _ = arguments(target, request.request_canonical_bytes)
             digest = documents.spell(hashlib.sha256(payload).digest())
             with workspace.locked() as db:
                 row = db.execute(
