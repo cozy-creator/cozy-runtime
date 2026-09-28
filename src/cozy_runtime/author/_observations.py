@@ -58,7 +58,7 @@ Kind = Literal["log", "stage", "metric", "confession", "boot", "liveness", "faul
 KINDS: tuple[Kind, ...] = ("log", "stage", "metric", "confession", "boot", "liveness", "fault")
 
 #: A retained value: one scalar, never a structure. A nested payload has no cap.
-Scalar = str | int | float | None
+Scalar = str | bool | int | float | None
 
 #: The caps. Every one is a ceiling the deployment may lower and nothing in code raises.
 MAX_EVENTS = 256
