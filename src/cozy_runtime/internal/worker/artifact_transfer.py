@@ -8,7 +8,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, BinaryIO, cast
+from typing import BinaryIO, cast
 from urllib.parse import urlparse
 
 from cozy_runtime import canonical_json
@@ -119,14 +119,14 @@ class NativeArtifactTransfers:
             raise WorkspaceRefusal("native artifact has no matching held owner obligation")
         return held
 
-    def _closure(self, store: Any, manifest: str, length: int, trees: bool) -> _Closure:
+    def _closure(self, store: fill.Store, manifest: str, length: int, trees: bool) -> _Closure:
         key = manifest, trees
         with self.lock:
             cached = self.closures.get(key)
             if cached is not None:
                 self.closures.move_to_end(key)
                 return cached
-        body = bytes(store.manifest(manifest)["manifest"])
+        body = store.manifest(manifest)["manifest"]
         if len(body) != length or "sha256:" + hashlib.sha256(body).hexdigest() != manifest:
             raise WorkspaceRefusal("native artifact manifest identity changed")
         objects = {manifest: length}
@@ -160,7 +160,7 @@ class NativeArtifactTransfers:
 
     def execute(self, command: pb.NativeArtifactTransfer) -> pb.NativeArtifactTransferStatus:
         result = self._status(command)
-        reader: Any = None
+        reader: io.BytesIO | _LeaseReader | None = None
         try:
             if command.HasField("source") == command.HasField("byte_source"):
                 raise WorkspaceRefusal("native artifact transfer requires exactly one source")

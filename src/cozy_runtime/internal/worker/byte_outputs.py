@@ -6,7 +6,6 @@ import hashlib
 import os
 import stat
 from pathlib import Path
-from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import workspace_byte_outputs
@@ -126,12 +125,12 @@ def reexport(
     )
 
 
-def settle_result(value: Any, outputs: list[pb.OutputEntry]) -> bytes:
+def settle_result(value: object, outputs: list[pb.OutputEntry]) -> bytes:
     """Rewrite only declared output leaves using the post phase's verified identities."""
     replacements = {entry.output_id: entry for entry in outputs if entry.HasField("native_tree")}
     found: set[str] = set()
 
-    def replace(node: Any, path: str) -> None:
+    def replace(node: object, path: str) -> None:
         entry = replacements.get(path)
         if entry is not None:
             if not isinstance(node, dict) or "asset_ref" not in node:

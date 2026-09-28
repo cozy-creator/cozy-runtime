@@ -7,7 +7,7 @@ import re
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 from cozy_runtime.internal import fill
 from cozy_runtime.protocol import documents, weights_limits
@@ -18,7 +18,16 @@ from .model_source_prepare import _IDENTIFIER, _OBJECT_ID, ModelSourceRefusal, _
 Request = pb.CheckpointPageRequest | pb.CheckpointTransferRequest
 
 
-def _subject(request: Request) -> dict[str, Any]:
+class _Subject(TypedDict):
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    subject: pb.CheckpointSubject
+    plan_digest: bytes
+    head: pb.Ref
+
+
+def _subject(request: Request) -> _Subject:
     return {
         "record_owner_epoch": request.record_owner_epoch,
         "control_stream_epoch": request.control_stream_epoch,
@@ -62,27 +71,23 @@ def _identity(request: Request, root: Path) -> None:
         raise ModelSourceRefusal("checkpoint_identity_invalid", "invalid checkpoint identity")
 
 
-def _uint(value: object, *, positive: bool = False) -> int:
-    if type(value) is not int or not int(positive) <= value < 1 << 64:
+def _uint(value: int, *, positive: bool = False) -> int:
+    if not int(positive) <= value < 1 << 64:
         raise ModelSourceRefusal("checkpoint_result_invalid", "invalid checkpoint counter")
     return value
 
 
-def _ref(object_id: object, length: object) -> pb.Ref:
-    if not isinstance(object_id, str) or _OBJECT_ID.fullmatch(object_id) is None:
+def _ref(object_id: str, length: int) -> pb.Ref:
+    if _OBJECT_ID.fullmatch(object_id) is None:
         raise ModelSourceRefusal("checkpoint_result_invalid", "invalid checkpoint object")
     return pb.Ref(digest=documents.raw(object_id), length=_uint(length, positive=True))
 
 
-def _optional_ref(value: object) -> pb.Ref | None:
-    if value is None:
-        return None
-    if not isinstance(value, (tuple, list)) or len(value) != 2:
-        raise ModelSourceRefusal("checkpoint_result_invalid", "invalid checkpoint reference")
-    return _ref(*value)
+def _optional_ref(value: tuple[str, int] | None) -> pb.Ref | None:
+    return None if value is None else _ref(*value)
 
 
-def _page(store: Any, request: Request, offset: int, limit: int) -> pb.CheckpointPageResult:
+def _page(store: fill.Store, request: Request, offset: int, limit: int) -> pb.CheckpointPageResult:
     if not 1 <= limit <= weights_limits.MAX_CHECKPOINT_OBJECTS:
         raise ModelSourceRefusal("checkpoint_page_bound", "checkpoint page exceeds its bound")
     operation, slot = _operation_slot(request.subject)
@@ -95,28 +100,25 @@ def _page(store: Any, request: Request, offset: int, limit: int) -> pb.Checkpoin
         offset=offset,
         limit=limit,
     )
-    if not isinstance(value, dict):
-        raise ModelSourceRefusal("checkpoint_result_invalid", "invalid checkpoint page")
-    objects = value.get("objects")
-    if not isinstance(objects, list) or len(objects) > limit:
+    if len(value["objects"]) > limit:
         raise ModelSourceRefusal("checkpoint_result_invalid", "invalid checkpoint inventory")
     result = pb.CheckpointPageResult(
         **_subject(request),
-        index=_uint(value.get("index")),
-        bytes=_uint(value.get("bytes")),
-        previous=_optional_ref(value.get("previous")),
-        progress=_optional_ref(value.get("progress")),
+        index=_uint(value["index"]),
+        bytes=_uint(value["bytes"]),
+        previous=_optional_ref(value["previous"]),
+        progress=_optional_ref(value["progress"]),
     )
-    for row in objects:
-        if not isinstance(row, dict) or row.get("kind") not in {"blob", "manifest"}:
+    for row in value["objects"]:
+        if row["kind"] not in {"blob", "manifest"}:
             raise ModelSourceRefusal("checkpoint_result_invalid", "invalid object kind")
         result.objects.append(
             pb.CheckpointObject(
-                ref=_ref(row.get("object_id"), row.get("length")),
+                ref=_ref(row["object_id"], row["length"]),
                 manifest=row["kind"] == "manifest",
             )
         )
-    next_offset = value.get("next_offset")
+    next_offset = value["next_offset"]
     if next_offset is not None:
         next_offset = _uint(next_offset)
         if not offset < next_offset < 1 << 32:
@@ -144,7 +146,7 @@ def page(request: pb.CheckpointPageRequest, *, tensorfs_root: Path) -> pb.Checkp
         return pb.CheckpointPageResult(**_subject(request), safe_code=code, safe_detail=detail)
 
 
-def _member(store: Any, request: pb.CheckpointTransferRequest) -> None:
+def _member(store: fill.Store, request: pb.CheckpointTransferRequest) -> None:
     """The admitted Link, not the request, determines which object may move."""
     offset = 0
     while True:
