@@ -41,7 +41,6 @@ from cozy_runtime.internal.worker.package_prepare import (
     prepare_package_set,
 )
 from cozy_runtime.protocol import worker_pb2 as pb
-from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "examples" / "marco-polo"
@@ -461,9 +460,6 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_wrong_hash() -> None:
             assert "cozy_runtime.internal.derive" not in set(sys.modules) - loaded
             staged = root / "artifacts" / hashlib.sha256(interface).hexdigest()
             assert staged.read_bytes() == interface
-            # Minor 60 callers still have this pre-check while the 60-61 window is supported.
-            assert hasattr(pb_grpc.RuntimePreparationServicer, "CheckPackageSetCompatibility")
-            assert hasattr(pb, "CheckPackageSetCompatibilityResult")
 
             # A local controller can run a different CPython than the release.
             # Its preinstalled SDK must never supply this published wheel closure.

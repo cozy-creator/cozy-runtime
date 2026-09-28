@@ -27,7 +27,7 @@ from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_executions import Executions
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config
 from test_group_lanes import _placement
@@ -90,10 +90,10 @@ def target() -> Target:
     )
 
 
-def test_default_capture_requires_complete_exact_inventory_and_capable_peer() -> None:
+def test_default_capture_requires_complete_exact_inventory() -> None:
     body = captured()
     interfaces = {INSTALLATION: {"entrypoints": [{"name": "generate", **target().declaration}]}}
-    request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=56))
+    request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=WIRE_MINOR))
     defaults.verify(peer(body), request, body, interfaces)
     mutations: list[Callable[[dict[str, Any]], Any]] = [
         lambda value: value["model_defaults"].pop(),
@@ -116,9 +116,6 @@ def test_default_capture_requires_complete_exact_inventory_and_capable_peer() ->
         mutate(changed)
         with pytest.raises(WorkspaceRefusal):
             defaults.verify(peer(changed), request, changed, interfaces)
-    request.claim.wire_minor = 55
-    with pytest.raises(WorkspaceRefusal, match="wire56"):
-        defaults.verify(peer(body), request, body, interfaces)
     assert defaults.valid_origin("http://127.0.0.1:8819", local=True)
     assert not defaults.valid_origin("http://127.0.0.1:8819", local=False)
     assert not defaults.valid_origin("http://169.254.169.254", local=True)

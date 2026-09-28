@@ -96,7 +96,11 @@ def test_ledger_releasing_more_than_it_took_moves_the_baseline_not_a_leak() -> N
 @pytest.mark.parametrize(
     ("hello", "remedy"),
     [
-        ({"runtime_version": "0.18.20"}, "publish the package against cozy-runtime>=0.18.30"),
+        ({"runtime_version": "0.18.33"}, "publish the package against cozy-runtime>=0.18.51"),
+        (
+            {"runtime_version": "0.18.49", "executor_protocol_revision": 1},
+            "publish the package against cozy-runtime>=0.18.51",
+        ),
         ({"executor_protocol_revision": 2}, "cozy rental update <rental>"),
     ],
 )
@@ -149,7 +153,7 @@ def test_stale_placement_shape_asks_its_owner_to_prepare_again(tmp_path: Path) -
         worker._apply_desired_state(pb.DesiredWorkerState(revision=3, placement_set=desired))
         (fault,) = [row for row in worker.engine.faults if row.reason == REPREPARE]
         assert fault.kind == pb.FAULT_KIND_ARTIFACT_FETCH_FAILED
-        assert fault.desired_state_revision == 3 and fault.subject == "revision 3"
+        assert fault.desired_state_revision == 3
         assert not worker.latched
     finally:
         worker.shutdown()

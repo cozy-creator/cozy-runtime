@@ -1,4 +1,4 @@
-"""Device lanes ON THE WIRE (proto-024, minor 22): the read and emit sites, isolated.
+"""Device lanes ON THE WIRE (proto-024): the read and emit sites, isolated.
 
 * `read_device_pins`      - `DesiredPlacementSet.device_pins[4]` -> {placement_id: ordinals}
 * `emit_lanes`            - `ObservedWorkerState.lanes[26]` / `WorkerSnapshotBody.lanes[12]`,
@@ -6,19 +6,12 @@
 * `emit_held_manifests`   - `ObservedWorkerState.held_manifests[27]` /
                             `WorkerSnapshotBody.held_manifests[13]` (proto-026)
 * `emit_device_lane_id`   - `PlacementStatus.device_lane_id[19]`
-* `lanes_on_wire`         - the fence condition: the NEGOTIATED minor carries lanes
 
 RESIDENCY CROSSES AS TWO SETS AND NOTHING ELSE (residency-aware-routing.md §5, cr-080):
 the placements resident on a lane and the manifests the verified store holds. No bytes,
 ceiling, headroom, plan or LRU order is named in this module — `checks/architecture.py`'s
 `residency-sets-only` fence refuses the vocabulary here and on every construction of the
 three residency-bearing messages.
-
-The vendored bindings carry every field; what varies per session is the RecordOwner's
-minor. An owner below 22 cannot read `lanes[]` (one worker-level count over N lanes is the
-mirror defect cr-066 fenced) and cannot send a pin, so a wide serving envelope still
-refuses `device_lanes_unsupported` typed for that owner; the group machinery is reachable
-only through a pin, which only a 22-owner can send.
 """
 
 from __future__ import annotations
@@ -26,19 +19,7 @@ from __future__ import annotations
 from typing import Any
 
 from cozy_runtime.internal.worker.lanes import DeviceLane
-from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
-
-#: The minor that put lanes, pins and `device_lane_id` on the wire (worker-protocol#42).
-LANES_WIRE_MINOR = 22
-
-assert WIRE_MINOR >= LANES_WIRE_MINOR, f"vendored minor {WIRE_MINOR} predates device lanes"
-
-
-def lanes_on_wire(negotiated_minor: int) -> bool:
-    """Whether the RecordOwner of this session reads lanes: it negotiated at least the
-    minor that carries them. This is the condition that lifts cr-066's fence."""
-    return negotiated_minor >= LANES_WIRE_MINOR
 
 
 def read_device_pins(desired_set: pb.DesiredPlacementSet) -> dict[str, tuple[int, ...]]:

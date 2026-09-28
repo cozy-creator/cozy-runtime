@@ -2395,11 +2395,7 @@ class AttemptEngine:
             grants.abort_outputs(spool)
             return None, encode_error
         entries = []
-        native = (
-            self.tensorfs_root is not None
-            and self.calls is not None
-            and self.calls.minor(attempt.request_id) >= 43
-        )
+        native = self.tensorfs_root is not None and self.calls is not None
         try:
             if len(rows) + bool(reply.get("capture")) > 32:
                 raise grants.GrantRefusal(
@@ -2774,7 +2770,6 @@ class AttemptEngine:
             ):
                 from cozy_runtime.internal.worker import machine_models
                 from cozy_runtime.internal.worker.workspace import Workspace
-                from cozy_runtime.protocol import RETAINED_MODEL_RESULTS_WIRE_MINOR
 
                 workspace = Workspace(self.tensorfs_root)
                 owner = self.owner_scope()
@@ -2798,12 +2793,6 @@ class AttemptEngine:
                             canonical.parse_canonical(result.canonical),
                             schema,
                         )
-                        if records and (
-                            self.calls is None
-                            or self.calls.minor(attempt.request_id)
-                            < RETAINED_MODEL_RESULTS_WIRE_MINOR
-                        ):
-                            raise ValueError("native Model collection requires wire53")
                         for pointer, artifact, retention in records:
                             body.result.retained_models.append(
                                 pb.RetainedModelResult(

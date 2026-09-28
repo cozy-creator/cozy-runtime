@@ -440,7 +440,7 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
 
     workspace, reply, data = retained(tmp_path)
     sent: list[pb.WorkerFrame] = []
-    worker = Calls(sent.append, lambda: 1, lambda _: 44, workspace=workspace, owner=lambda: "owner")
+    worker = Calls(sent.append, lambda: 1, workspace=workspace, owner=lambda: "owner")
     request = pb.ChildCallRequest(
         parent_request_id="parent",
         parent_attempt_ordinal=1,

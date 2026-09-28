@@ -29,7 +29,7 @@ from typing import Any
 import pytest
 
 from conftest import sample_python
-from cozy.worker.v1.wire_version import MIN_COMPATIBLE_WIRE_MINOR
+from cozy.worker.v1.wire_version import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
 from cozy_runtime.internal import accel, child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
@@ -39,7 +39,7 @@ from cozy_runtime.internal.local import (
     SliceOutcome,
     run_slice,
 )
-from cozy_runtime.internal.worker import lane_wire, lanes
+from cozy_runtime.internal.worker import lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import (
@@ -216,7 +216,7 @@ def test_a_two_device_serving_envelope_serves_a_supported_owner_per_lane() -> No
         assert status.device_lane_id == "lane-0"
         assert list(report.lanes[0].placement_ids) == [status.placement_id]
         assert list(report.lanes[1].placement_ids) == []
-    assert report.applied_wire_minor >= lane_wire.LANES_WIRE_MINOR
+    assert report.applied_wire_minor == WIRE_MINOR
 
 
 @needs_executor

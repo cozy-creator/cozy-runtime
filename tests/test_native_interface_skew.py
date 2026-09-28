@@ -183,7 +183,6 @@ def test_older_executor_calls_native_operations_under_this_worker(
                     offer=offer.attempt_offer,
                     prepared_state=state,
                     payload_canonical_bytes=canonical_json.encode({}),
-                    max_attempts=1,
                     expected_execution_workspace_id=client.GetMachineExecutionWorkspace(
                         pb.MachineExecutionWorkspaceQuery(claim=claim)
                     ).execution_workspace_id,

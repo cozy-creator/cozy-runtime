@@ -151,10 +151,6 @@ def test_gated_download_presents_the_submitted_credential_and_keeps_it_nowhere(
     gate = tmp_path / "gate"
     gate.touch()
     with gated_pod(monkeypatch, gate) as (pod, origin):
-        workspace = pod.client.GetMachineExecutionWorkspace(
-            pb.MachineExecutionWorkspaceQuery(claim=pod.claim)
-        )
-        assert workspace.source_credentials
         # Without the owner's credential the provider refuses, as it did before this fix.
         pod.submit("anonymous")
         assert pod.outcome("anonymous")["status"] == pb.OUTCOME_STATUS_FAILED

@@ -27,18 +27,12 @@ def key(request: str) -> str:
 def admits(directive: pb.JobDirective, declaration: Mapping[str, Any]) -> bool:
     """Whether a job takes the CPU slot. The device grant alone decides: the declaration's
     Models are derive-only Manifest views and its weights outputs are TensorFS writes."""
-    del declaration  # no rule reads it; MODEL_INPUTS asks this function about one
+    del declaration  # no rule reads it
     return not (
         directive.device_count
         or directive.resource_caps.device_required
         or directive.resource_caps.max_device_memory_bytes
     )
-
-
-#: What `MachineExecutionWorkspace.cpu_slot_model_inputs` reports: asked of `admits` itself.
-MODEL_INPUTS = admits(
-    pb.JobDirective(orchestration=True), {"models": [{}], "weights_outputs": [{}]}
-)
 
 
 def _warm_key(binding: JobBinding, directive: pb.JobDirective) -> tuple[str, str, bytes]:

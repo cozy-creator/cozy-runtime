@@ -65,7 +65,6 @@ class Calls:
         self,
         send: Callable[[pb.WorkerFrame], None],
         stream: Callable[[], int],
-        minor: Callable[[str], int],
         *,
         workspace: Workspace | None = None,
         owner: Callable[[], str] = lambda: "",
@@ -78,7 +77,7 @@ class Calls:
         self.prefetch = prefetch
         self.release_gpus = release_gpus
         self.installed_bindings = installed_bindings
-        self.send, self.stream, self.minor = send, stream, minor
+        self.send, self.stream = send, stream
         self.workspace, self.owner = workspace, owner
         self.local = local
         self.pending: dict[tuple[str, int, int], _Pending] = {}
@@ -130,12 +129,8 @@ class Calls:
             return {"ok": True}
         with self.lock:
             try:
-                if (
-                    self.minor(attempt.request_id) < 44
-                    or attempt.state != "running"
-                    or attempt.canceling
-                ):
-                    raise ValueError("parent call is not active under a capable owner")
+                if attempt.state != "running" or attempt.canceling:
+                    raise ValueError("parent call is not active")
                 if frame.get("kind") == "model_prefetch":
                     if self.prefetch is None:
                         return {"ok": True, "scheduled": False}
@@ -352,8 +347,6 @@ class Calls:
             raise ValueError("call request must be a canonical object")
         capture = None
         if frame.get("capture") is not None:
-            if self.minor(attempt.request_id) < 43:
-                raise ValueError("owner does not support capture")
             if allowed.get("native_source") or allowed.get("native_effect"):
                 raise ValueError("activation capture requires an ordinary serving invocation")
             capture = msgspec.convert(frame["capture"], type=ActivationCapture, strict=True)

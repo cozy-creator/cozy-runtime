@@ -90,7 +90,7 @@ def test_reserved_capture_grant_commits_native_tree_without_author_asset(tmp_pat
     )
     engine = SimpleNamespace(
         tensorfs_root=workspace.store_root,
-        calls=SimpleNamespace(minor=lambda _: 43),
+        calls=SimpleNamespace(),
         owner_scope=lambda: "owner",
         _encode_frames=lambda *args: None,
         _publication=lambda *args: SimpleNamespace(document=lambda: {}, digest=lambda: b"r" * 32),

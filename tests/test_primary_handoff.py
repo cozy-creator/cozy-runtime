@@ -25,7 +25,7 @@ from cozy_runtime.internal.worker.child import Executor, ExecutorSupervision
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config, _workspace, needs_executor
 
@@ -137,7 +137,7 @@ def test_replacement_waits_for_work_then_retires_before_assignment() -> None:
             raw, digest = documents.identity(pb.PlacementSet(placements=[primary, neighbor]))
             return pb.DesiredWorkerState(
                 revision=revision,
-                wire_minor=49,
+                wire_minor=WIRE_MINOR,
                 posture=pb.POSTURE_ACCEPTING,
                 placement_set=pb.DesiredPlacementSet(
                     placement_set_digest=digest,
@@ -302,7 +302,7 @@ def test_only_the_process_identity_decides_between_in_place_and_replacement() ->
                 worker._apply_desired_state(
                     pb.DesiredWorkerState(
                         revision=1,
-                        wire_minor=49,
+                        wire_minor=WIRE_MINOR,
                         posture=pb.POSTURE_ACCEPTING,
                         placement_set=pb.DesiredPlacementSet(
                             placement_set_digest=digest, placement_set_canonical_bytes=raw

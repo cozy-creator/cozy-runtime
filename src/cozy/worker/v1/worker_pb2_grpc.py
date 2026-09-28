@@ -92,7 +92,7 @@ class WorkerControlServicer(object):
     """
 
     def GetMachineExecutionWorkspace(self, request, context):
-        """MINOR59. Discover Runtime's durable journal lifetime before freezing a submit.
+        """Discover Runtime's durable journal lifetime before freezing a submit.
         Authenticated like the other machine calls; no continuing Control stream needed.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -100,7 +100,7 @@ class WorkerControlServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def SubmitMachineExecution(self, request, context):
-        """MINOR51. Runtime owns accepted work independently of the caller connection.
+        """Runtime owns accepted work independently of the caller connection.
         These calls observe/control that authority; they do not establish a second
         RecordOwner or require a client coordinator inside the worker.
         """
@@ -139,8 +139,8 @@ class WorkerControlServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ReadMachineExecutionTriage(self, request, context):
-        """Capability supports_machine_execution_triage. The triage bundle one terminal attempt's
-        outcome names, read over the same authenticated seam as the outcome.
+        """The triage bundle one terminal attempt's outcome names, read over the same authenticated
+        seam as the outcome.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -506,7 +506,7 @@ class WorkerControl(object):
 class RuntimePreparationStub(object):
     """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
     service on its external listener. Runtime receives logical refs, hub-known release facts,
-    (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+    (local packages only) verified local wheel paths, and BOTH halves of the
     signed download delegation, because the party that resolves a model's closure against the hub
     is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
     anonymous public index directives inside locked_requirements are the other origin that
@@ -584,21 +584,6 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
                 _registered_method=True)
-        self.ImportWorkspace = channel.stream_unary(
-                '/cozy.worker.v1.RuntimePreparation/ImportWorkspace',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportFrame.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
-                _registered_method=True)
-        self.ActivateWorkspaceImport = channel.unary_unary(
-                '/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceActivationCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
-                _registered_method=True)
-        self.CheckPackageSetCompatibility = channel.unary_unary(
-                '/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckPackageSetCompatibilityResult.FromString,
-                _registered_method=True)
         self.PreparePackageSet = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/PreparePackageSet',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
@@ -664,7 +649,7 @@ class RuntimePreparationStub(object):
 class RuntimePreparationServicer(object):
     """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
     service on its external listener. Runtime receives logical refs, hub-known release facts,
-    (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+    (local packages only) verified local wheel paths, and BOTH halves of the
     signed download delegation, because the party that resolves a model's closure against the hub
     is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
     anonymous public index directives inside locked_requirements are the other origin that
@@ -722,7 +707,7 @@ class RuntimePreparationServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def WorkspaceRetainByteTree(self, request, context):
-        """MINOR43. Ordinary byte-tree custody uses the same authenticated Workspace.
+        """Ordinary byte-tree custody uses the same authenticated Workspace.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -741,7 +726,7 @@ class RuntimePreparationServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ImportInputTree(self, request_iterator, context):
-        """MINOR55. Authenticated root input intake; native bytes commit before a receipt.
+        """Authenticated root input intake; native bytes commit before a receipt.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -749,27 +734,6 @@ class RuntimePreparationServicer(object):
 
     def WorkspaceWeightsIntentReady(self, request, context):
         """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ImportWorkspace(self, request_iterator, context):
-        """One-time authority transfer from a quiesced legacy Host journal. This is
-        never forwarded from PodHost or exposed as an author-controlled cache write.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ActivateWorkspaceImport(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def CheckPackageSetCompatibility(self, request, context):
-        """Retained for supported minor-60 Hosts. May retire only after minor60 leaves WIRE_MINIMUM.
-        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -914,21 +878,6 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.SerializeToString,
             ),
-            'ImportWorkspace': grpc.stream_unary_rpc_method_handler(
-                    servicer.ImportWorkspace,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportFrame.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.SerializeToString,
-            ),
-            'ActivateWorkspaceImport': grpc.unary_unary_rpc_method_handler(
-                    servicer.ActivateWorkspaceImport,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceActivationCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.SerializeToString,
-            ),
-            'CheckPackageSetCompatibility': grpc.unary_unary_rpc_method_handler(
-                    servicer.CheckPackageSetCompatibility,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckPackageSetCompatibilityResult.SerializeToString,
-            ),
             'PreparePackageSet': grpc.unary_unary_rpc_method_handler(
                     servicer.PreparePackageSet,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.FromString,
@@ -1000,7 +949,7 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
 class RuntimePreparation(object):
     """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
     service on its external listener. Runtime receives logical refs, hub-known release facts,
-    (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+    (local packages only) verified local wheel paths, and BOTH halves of the
     signed download delegation, because the party that resolves a model's closure against the hub
     is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
     anonymous public index directives inside locked_requirements are the other origin that
@@ -1359,87 +1308,6 @@ class RuntimePreparation(object):
             _registered_method=True)
 
     @staticmethod
-    def ImportWorkspace(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_unary(
-            request_iterator,
-            target,
-            '/cozy.worker.v1.RuntimePreparation/ImportWorkspace',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportFrame.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ActivateWorkspaceImport(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceActivationCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def CheckPackageSetCompatibility(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckPackageSetCompatibilityResult.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
     def PreparePackageSet(request,
             target,
             options=(),
@@ -1767,8 +1635,7 @@ class RuntimePreparation(object):
 class RuntimeWeightsStub(object):
     """Loopback-only Runtime-hosted weights seam. pod-supervisor is its only client and dials it on
     the same loopback listener as WorkerControl and RuntimePreparation; it is never registered
-    on the external listener. It carries the supervisor<->Runtime privates that were
-    direction-annotated WorkerControl frames before minor 21.
+    on the external listener. Runtime sends custody observations and outcomes on WorkerControl.
     """
 
     def __init__(self, channel):
@@ -1777,11 +1644,6 @@ class RuntimeWeightsStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.Exchange = channel.stream_stream(
-                '/cozy.worker.v1.RuntimeWeights/Exchange',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostEvent.FromString,
-                _registered_method=True)
         self.Upload = channel.unary_unary(
                 '/cozy.worker.v1.RuntimeWeights/Upload',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsUploadRequest.SerializeToString,
@@ -1792,18 +1654,8 @@ class RuntimeWeightsStub(object):
 class RuntimeWeightsServicer(object):
     """Loopback-only Runtime-hosted weights seam. pod-supervisor is its only client and dials it on
     the same loopback listener as WorkerControl and RuntimePreparation; it is never registered
-    on the external listener. It carries the supervisor<->Runtime privates that were
-    direction-annotated WorkerControl frames before minor 21.
+    on the external listener. Runtime sends custody observations and outcomes on WorkerControl.
     """
-
-    def Exchange(self, request_iterator, context):
-        """Retired at minor 41; implementations refuse this legacy custody stream. Runtime
-        commits its common workspace journal and sends custody observations and outcomes
-        on the same ordered WorkerControl stream. The Host never grants native authority.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
 
     def Upload(self, request, context):
         """One validated upload grant in, one terminal answer out. Runtime streams the bytes it holds.
@@ -1815,11 +1667,6 @@ class RuntimeWeightsServicer(object):
 
 def add_RuntimeWeightsServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'Exchange': grpc.stream_stream_rpc_method_handler(
-                    servicer.Exchange,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostEvent.SerializeToString,
-            ),
             'Upload': grpc.unary_unary_rpc_method_handler(
                     servicer.Upload,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsUploadRequest.FromString,
@@ -1836,36 +1683,8 @@ def add_RuntimeWeightsServicer_to_server(servicer, server):
 class RuntimeWeights(object):
     """Loopback-only Runtime-hosted weights seam. pod-supervisor is its only client and dials it on
     the same loopback listener as WorkerControl and RuntimePreparation; it is never registered
-    on the external listener. It carries the supervisor<->Runtime privates that were
-    direction-annotated WorkerControl frames before minor 21.
+    on the external listener. Runtime sends custody observations and outcomes on WorkerControl.
     """
-
-    @staticmethod
-    def Exchange(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_stream(
-            request_iterator,
-            target,
-            '/cozy.worker.v1.RuntimeWeights/Exchange',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostEvent.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
 
     @staticmethod
     def Upload(request,
@@ -2084,11 +1903,6 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferStatus.FromString,
                 _registered_method=True)
-        self.LocalPackageFetch = channel.unary_stream(
-                '/cozy.worker.v1.PodHost/LocalPackageFetch',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
-                _registered_method=True)
         self.LocalPackageUpload = channel.stream_stream(
                 '/cozy.worker.v1.PodHost/LocalPackageUpload',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.SerializeToString,
@@ -2289,7 +2103,7 @@ class PodHostServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ImportInputTree(self, request_iterator, context):
-        """MINOR55. Proxies the bounded stream to Runtime without owning its byte custody.
+        """Proxies the bounded stream to Runtime without owning its byte custody.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -2326,12 +2140,6 @@ class PodHostServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def CheckpointTransfer(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def LocalPackageFetch(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -2518,11 +2326,6 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.CheckpointTransfer,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferStatus.SerializeToString,
-            ),
-            'LocalPackageFetch': grpc.unary_stream_rpc_method_handler(
-                    servicer.LocalPackageFetch,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.SerializeToString,
             ),
             'LocalPackageUpload': grpc.stream_stream_rpc_method_handler(
                     servicer.LocalPackageUpload,
@@ -3407,33 +3210,6 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/CheckpointTransfer',
             cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferStatus.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def LocalPackageFetch(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/cozy.worker.v1.PodHost/LocalPackageFetch',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
             options,
             channel_credentials,
             insecure,

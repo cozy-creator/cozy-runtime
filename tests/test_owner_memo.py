@@ -163,10 +163,6 @@ def pod(monkeypatch: pytest.MonkeyPatch, gate: Path, origin: str, hub: Hub) -> I
         calls.native_registry = (FIXTURE / "registry.json").read_bytes()
         calls.publication = lambda *_: hub.client()
         rented.start(())
-        workspace = rented.client.GetMachineExecutionWorkspace(
-            pb.MachineExecutionWorkspaceQuery(claim=rented.claim)
-        )
-        assert workspace.memo_lookup
         yield rented
 
 

@@ -8,13 +8,12 @@ import grpc
 
 from cozy_runtime.internal.worker import (
     workspace_byte_outputs,
-    workspace_import,
     workspace_input_trees,
     workspace_memo,
 )
 from cozy_runtime.internal.worker.servicer_context import ServicerContext
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceBusy, WorkspaceRefusal
-from cozy_runtime.protocol import documents, weights_limits
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 _INTEGRITY_CODES = (
@@ -218,34 +217,10 @@ class WorkspaceRPC:
                 grpc.StatusCode.INVALID_ARGUMENT, "input tree needs its exact first header"
             )
         header = first.header
-        if header.claim.wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
-            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "native root input requires wire55")
         return self._workspace_call(
             header.claim,
             context,
             lambda service, owner: workspace_input_trees.receive(
                 service.workspace, owner, header, iterator
             ),
-        )
-
-    def ImportWorkspace(
-        self, requests: Iterable[pb.WorkspaceImportFrame], context: ServicerContext
-    ) -> pb.WorkspaceImportResult:
-        service = self.workspace_service
-        if service is None:
-            context.abort(grpc.StatusCode.UNIMPLEMENTED, "workspace custody is unavailable")
-        try:
-            return workspace_import.receive(service.workspace, requests, service.authorize)
-        except WorkspaceRefusal as exc:
-            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
-        except Exception:
-            context.abort(grpc.StatusCode.UNAVAILABLE, "workspace import failed")
-
-    def ActivateWorkspaceImport(
-        self, request: pb.WorkspaceActivationCall, context: ServicerContext
-    ) -> pb.WorkspaceImportResult:
-        return self._workspace_call(
-            request.claim,
-            context,
-            lambda s, _: workspace_import.activate(s.workspace, request, s.authorize),
         )

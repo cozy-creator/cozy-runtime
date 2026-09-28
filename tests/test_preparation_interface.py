@@ -1,4 +1,5 @@
-"""Both supported prepare shapes install with uv and describe once, only without metadata."""
+"""A prepare with or without the release's interface installs with uv and describes once,
+only without metadata."""
 
 from __future__ import annotations
 
@@ -84,7 +85,7 @@ def _placement(result: pb.PreparePackageSetResult) -> dict[str, Any]:
 
 @needs_executor
 @pytest.mark.parametrize("metadata", [False, True])
-def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata: bool) -> None:
+def test_absent_and_present_interface_share_preparation(metadata: bool) -> None:
     uv = shutil.which("uv")
     assert uv is not None
     with _workspace() as root:
@@ -173,10 +174,8 @@ def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata
                         described = 0 if metadata else 1
                         modern = client.PreparePackageSet(request)
                         assert len(worker.descriptions) == described
-                        # Field 12 did not exist at minor 60; this is its actual wire shape.
+                        # Without the release's interface Runtime describes the install itself.
                         request.ClearField("package_interface")
-                        compatibility = client.CheckPackageSetCompatibility(request)
-                        assert not compatibility.refusal_code and not compatibility.refusal_detail
                         legacy = client.PreparePackageSet(request)
                         assert _placement(legacy) == _placement(modern)
                         # One immutable installation is described once per worker.

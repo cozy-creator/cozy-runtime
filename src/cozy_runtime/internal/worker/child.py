@@ -38,9 +38,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from packaging.specifiers import SpecifierSet
-from packaging.version import InvalidVersion, Version
-
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.internal import accel, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import (
@@ -119,25 +116,19 @@ class ExecutorProtocolMismatch(ExecutorGone):
 
 def require_executor_protocol(hello: dict[str, Any]) -> None:
     revision = hello.get("executor_protocol_revision")
-    if revision is None:
-        # Older Runtime releases predate the hello field but use the reviewed
-        # revision-1 command/reply contract. Do not require patch-level lockstep;
-        # unknown older implementations are still refused.
-        try:
-            legacy = Version(str(hello.get("runtime_version", "")))
-            if legacy in SpecifierSet(">=0.18.30,<0.18.34"):
-                revision = 1
-        except InvalidVersion:
-            pass
-    if type(revision) is int and revision == EXECUTOR_PROTOCOL_REVISION:
+    if (
+        type(revision) is int
+        and revision == EXECUTOR_PROTOCOL_REVISION
+        and isinstance(hello.get("native_interfaces"), dict)
+    ):
         return
-    # A real capability floor: an executor before protocol 1 (cozy-runtime 0.18.30) speaks
-    # an unreviewed command set this worker cannot drive. Say which side to update.
+    # The executor states its revision and native interfaces in its hello (cozy-runtime
+    # 0.18.51 on). Say which side to update.
     executor = hello.get("runtime_version", "unknown")
     remedy = (
         "update the rental's Runtime: cozy rental update <rental>"
         if type(revision) is int and revision > EXECUTOR_PROTOCOL_REVISION
-        else "publish the package against cozy-runtime>=0.18.30 (its lock pins "
+        else "publish the package against cozy-runtime>=0.18.51 (its lock pins "
         f"cozy-runtime {executor}), then run it again"
     )
     raise ExecutorProtocolMismatch(
