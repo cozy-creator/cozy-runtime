@@ -810,22 +810,11 @@ class PlanChooser:
         largest = max([max(sizes.values(), default=declared.model_weight_bytes), *scoped])
         activations = terms["activations"]
         free = self.ledger.device_free
-        # WHAT MAY DENY A RUNG, AND WHAT MAY ONLY DESCRIBE ONE (cr-100).
-        #
-        # `Coefficient.enforceable` already says a number may refuse OR SELECT A WORSE RUNG
-        # only on a measured basis. The walk was the consumer that honoured the first half
-        # and not the second: an envelope the ledger had just labelled `bound` — an upper
-        # bound the kernels chose on a roomier card — was still the number that pushed a
-        # FULLY RESIDENT generation onto the staged rung. Measured on an rtx-a4000: sdxl
-        # 12.6 s alone, ~25 s on every later run once a co-tenant had touched the pod,
-        # with `all_resident` scored short by 1.18 GiB of activations it never had to have
-        # and the staged rung "fitting" only because it is allowed to free the 6.46 GiB of
-        # weights a restore had just put back.
-        #
-        # So an inapplicable envelope is charged NOTHING where it would only be spending
-        # bytes the tenant already holds, and everything where a rung would have to ACQUIRE
-        # bytes: declining to move gigabytes on a guess is conservative, while spending
-        # residency that is already paid for on the same guess is not.
+        # WHAT MAY DENY A RUNG, AND WHAT MAY ONLY DESCRIBE ONE (cr-100). A `bound` envelope
+        # (an upper bound the kernels chose on a roomier card) does not size a staged
+        # scope's headroom. The resident rung still charges it unless a completed resident
+        # serve at no more room waives it: lane arbitration makes that room by vacating idle
+        # co-tenants first, so the tenant keeps its residency without betting on the kernel.
         planning_headroom = 0 if activations.provenance == "bound" else activations.value
         measured_scopes = self.ledger.activation_scopes_for(cell)
         planning_scope_headrooms = {
@@ -846,19 +835,12 @@ class PlanChooser:
         #     still, on a card with no more room than this one. That is the outcome the
         #     rung is trying to predict, already observed, so it outranks an envelope.
         sufficiency = self.ledger.resident_sufficiency(cell)
-        # Restoring weights does not prove that the request can run beside them. A
-        # successful staged request measured scratch after freeing other components;
-        # even a tiny driver-free change can classify that measurement as a bound.
-        # Only prior nonmoving execution can justify waiving that bound for residency.
-        resident_headroom = (
-            planning_headroom
-            if absent_bytes == 0 and (activations.provenance != "bound" or sufficiency)
-            else activations.value
-        )
-        headroom_basis = activations.provenance if resident_headroom else "already_resident"
+        # Only a nonmoving serve at no more room than now waives the envelope. One that
+        # completed on a roomier card proves nothing here: Qwen waived its bound beside
+        # 61 GB another generation held, nothing made room, and it OOMed (darkness 1514).
+        resident_headroom, headroom_basis = activations.value, activations.provenance
         if absent_bytes == 0 and sufficiency and free >= 0 and sufficiency <= free:
-            resident_headroom = 0
-            headroom_basis = "completed_resident"
+            resident_headroom, headroom_basis = 0, "completed_resident"
         shortfall = self.ledger.insufficient_for(cell, free) if free >= 0 else 0
         rows: list[Rung] = []
         chosen = ""

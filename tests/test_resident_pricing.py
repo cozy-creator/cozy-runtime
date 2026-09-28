@@ -10,19 +10,15 @@ staged rung "fitted" only because it is allowed to free the 6.46 GiB of weights 
 had just put back. The attempt then peaked BELOW its own weight set: admission threw them
 away again inside the attempt and streamed them back per scope.
 
-Two facts had to change together and neither is sufficient alone. The NUMBER: a peak
-observed with more room than there is now is an upper bound the kernels chose (decisions
-698), and `Coefficient.enforceable` already said such a number may not "refuse or select a
-worse rung" — the walk was the consumer that ignored the second half. The RUNG: residency
-that is already paid for is not re-priced against an estimate of what it would cost to
-acquire, so a rung with nothing to bring back is denied only by evidence, never by an
-estimate. Correcting only the number leaves the structure to lose on a tighter card;
-correcting only the structure prices the fast rung against an inflated figure and buys the
-fast path by evicting a neighbour that did not need evicting, which is the alternating
-thrash the owner has named a defect.
+A peak observed with more room than there is now is an upper bound the kernels chose
+(decisions 698): it may not refuse, and it does not size a staged scope. The resident rung
+still charges it unless this shape completed resident with no more room than now: darkness
+1514 waived it on a roomier serve and OOMed mid-kernel. On a shared lane the resident rung
+is kept by vacating idle co-tenants first (owner, 2026-09-28: keep the executing tenant hot,
+page idle ones LRU), not by betting on the kernel.
 
-The arithmetic arms below use the pod's own numbers and no device. The end-to-end arm is
-`tests/test_resident_pricing_lane.py`, which needs a card.
+The arithmetic arms below use the pod's own numbers and no device. The lane arm (idle
+co-tenants paged for a resident tenant) is in `tests/test_gpu_scheduler.py`.
 """
 
 from __future__ import annotations
@@ -288,28 +284,27 @@ def _row(walk: Walk, rung: str) -> Rung:
 # --------------------------------------------------------------- the defect, in arithmetic
 
 
-def test_a_generation_holding_its_weights_is_not_demoted_by_an_envelope_it_outgrew() -> None:
-    """THE RED ARM. Every declared component is resident, so `all_resident` has nothing to
-    bring back and nothing to move: its marginal cost is zero. The only banked envelope was
-    measured with 9.1 GiB free and there are 2.81 GiB free now, so it is an upper bound the
-    kernels chose — and an upper bound may not cost a tenant bytes it is already holding.
-
-    Before this change the walk scored `all_resident` short by 1.18 GiB against that
-    envelope and took `component_staged`, whose capacity counts freeing all 6.46 GiB of
-    resident weights. That is the 25 s steady state: the plan chose to throw away the
-    residency a restore had just paid for.
-    """
+def test_a_serve_on_a_roomier_card_does_not_waive_the_envelope() -> None:
+    """Every component is resident, and the only serve behind the 3.91 GiB envelope ran with
+    9.1 GiB free; there are 2.81 GiB now. That serve proves nothing about this card, so
+    `all_resident` is charged the envelope and, standing alone, the ladder deepens. On a
+    shared lane, arbitration vacates idle co-tenants until the resident rung fits instead
+    (darkness 1514: the waiver let Qwen run beside 61 GB it could not free, and it OOMed).
+    At the room that serve completed in, it waives the envelope again."""
     ledger = _resident_ledger()
     _bank_solo_serve(ledger)
     chosen, walk = _walk(ledger)
-    assert chosen == "all_resident", walk.rungs
+    assert chosen == "component_staged", walk.rungs
     resident = _row(walk, "all_resident")
-    assert resident.needs_bytes == 0, resident
-    assert resident.absent_bytes == 0 and resident.headroom_basis == "already_resident"
-    # the envelope is still REPORTED, and still says what it is
+    assert resident.verdict == "short" and resident.needs_bytes == SOLO_ACTIVATIONS, resident
+    assert resident.headroom_basis == "bound"
     envelope = walk.activations
     assert envelope.value == SOLO_ACTIVATIONS and envelope.provenance == "bound"
     assert not envelope.enforceable and "upper bound" in envelope.source
+    ledger.device_free = SOLO_FREE
+    chosen, walk = _walk(ledger)
+    assert chosen == "all_resident", walk.rungs
+    assert _row(walk, "all_resident").headroom_basis == "completed_resident"
 
 
 def test_what_the_executor_admits_against_is_what_the_walk_decided_with() -> None:
@@ -326,14 +321,14 @@ def test_what_the_executor_admits_against_is_what_the_walk_decided_with() -> Non
         PreparedModel(delivery_rung="verbatim"),
         PreparedRequest.unresolved("generate", {"width": 1024, "height": 1024}),
     )
-    assert plan.placement == "all_resident"
+    assert plan.placement == "component_staged"
     assert plan.headroom_bytes == 0, plan.headroom_bytes
     assert dict(plan.scope_headroom_bytes) == dict.fromkeys(
         ("encode_prompt", "denoise", "decode"), 0
     ), plan.scope_headroom_bytes
     # and the person reading a terminal is told both numbers, not one of them
     assert f"{SOLO_ACTIVATIONS} B of activations (bound)" in plan.decision_explanation
-    assert "admitted against 0 B (already_resident)" in plan.decision_explanation
+    assert "admitted against 0 B (bound)" in plan.decision_explanation
 
 
 def test_a_scope_measurement_that_does_not_apply_is_absent_whoever_measured_it() -> None:
@@ -365,7 +360,7 @@ def test_a_measured_failure_at_no_more_room_than_this_denies_the_resident_rung()
     assert resident.verdict == "refused_on_measured_shortfall"
     assert resident.denied_at_free_bytes == TIGHT_FREE
     # and a picture with MORE room than the one that failed is not answered here
-    ledger.device_free = TIGHT_FREE + GiB
+    ledger.device_free = SOLO_FREE
     assert _walk(ledger)[0] == "all_resident"
 
 
