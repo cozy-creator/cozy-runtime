@@ -9,9 +9,7 @@ A mismatch refuses only that operation. No whole-interface digest is compared.
 from __future__ import annotations
 
 import dataclasses
-import json
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import msgspec
@@ -27,24 +25,7 @@ _SERVICES = {
     effect_interfaces.MODULE: (effect_interfaces, "native_effect"),
 }
 
-#: The documents each released executor that does not state its own expects, keyed by the
-#: first release carrying them (0.18.30-0.18.49). Executors before 0.18.39 also require each
-#: row to echo their document digest and refuse unknown result fields; later ones refuse a
-#: row naming an operation they lack. Frozen: every later executor states its documents.
-UNSTATED: dict[str, dict[str, Any]] = json.loads(
-    (Path(__file__).with_name("native-interfaces-unstated.json")).read_bytes()
-)
 UPDATE_RENTAL = "run `cozy rental update <rental>`"
-
-
-def released(version: str) -> dict[str, Any]:
-    try:
-        running = Version(version)
-    except InvalidVersion:
-        running = Version("0")
-    carried = [release for release in UNSTATED if Version(release) <= running]
-    # An unknown executor gets the fewest operations: a row it lacks fails its whole broker.
-    return UNSTATED[max(carried, key=Version) if carried else min(UNSTATED, key=Version)]
 
 
 def stated() -> dict[str, Any]:
@@ -76,10 +57,8 @@ def rows(hello: Mapping[str, Any]) -> list[dict[str, Any]]:
     serve carries `unavailable`, and only a call to it is refused.
     """
     expected = hello.get("native_interfaces")
-    strict = not isinstance(expected, dict)
-    if strict:
-        expected = released(str(hello.get("runtime_version", "")))
-    assert isinstance(expected, dict)
+    if not isinstance(expected, dict):
+        return []
     result: list[dict[str, Any]] = []
     for module, document in expected.items():
         operations = document.get("operations") if isinstance(document, dict) else None
@@ -87,20 +66,10 @@ def rows(hello: Mapping[str, Any]) -> list[dict[str, Any]]:
             continue
         service, flag = _SERVICES[module]
         offered = canonical_json.decode(service.DOCUMENT)["operations"]
-        try:
-            # Echoed for executors that compare it; this Runtime compares nothing.
-            digest = canonical_json.digest(document)
-        except ValueError:
-            digest = ""
         for name, wanted in operations.items():
-            row: dict[str, Any] = {
-                "interface_digest": digest,
-                "module": module,
-                "export": name,
-                flag: True,
-            }
+            row: dict[str, Any] = {"module": module, "export": name, flag: True}
             try:
-                problem = _refusal(module, name, wanted, offered.get(name), strict=strict)
+                problem = _refusal(module, name, wanted, offered.get(name))
             except (KeyError, TypeError, AttributeError):
                 problem = f"{module}.{name} is stated in a form this Runtime cannot read"
             if problem:
@@ -114,7 +83,7 @@ def rows(hello: Mapping[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def _refusal(module: str, name: str, wanted: Any, offered: Any, *, strict: bool) -> str:
+def _refusal(module: str, name: str, wanted: Any, offered: Any) -> str:
     if offered is None:
         return (
             f'native operation "{name}" is not offered by this machine\'s Runtime '
@@ -122,9 +91,9 @@ def _refusal(module: str, name: str, wanted: Any, offered: Any, *, strict: bool)
         )
     # The worker reads the request and ignores unknown options only when they are optional:
     # dropping a required one would change what was asked. The executor ignores unknown
-    # result fields unless it is a strict reader.
+    # result fields.
     missing, unread = _gaps(wanted["request"], offered["request"], ignore="optional")
-    absent, extra = _gaps(offered["result"], wanted["result"], ignore="" if strict else "all")
+    absent, extra = _gaps(offered["result"], wanted["result"], ignore="all")
     problems = [
         *(f"request {field} is not sent" for field in missing),
         *(f"request {field} is not read" for field in unread),

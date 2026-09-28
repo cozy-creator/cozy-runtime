@@ -27,8 +27,6 @@ from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.models.minimax_h3.table_layout import TableLayout
 
-STALE = "sha256:" + "0" * 64
-
 
 def _broker(tmp_path: Path, rows: list[dict[str, object]]) -> object:
     left, right = socket.socketpair()
@@ -36,15 +34,6 @@ def _broker(tmp_path: Path, rows: list[dict[str, object]]) -> object:
         return Executor(Channel(left), tmp_path)._call_broker(
             {"request_id": "parent", "call_interfaces": rows}
         )
-
-
-def test_native_operations_bind_when_the_recorded_interface_digest_moved(tmp_path: Path) -> None:
-    rows = [
-        {**row, "interface_digest": STALE}
-        for row in native_interfaces.rows({"native_interfaces": native_interfaces.stated()})
-    ]
-    broker = _broker(tmp_path, rows)
-    assert set(broker.bindings) == {(row["module"], row["export"]) for row in rows}  # type: ignore[attr-defined]
 
 
 def test_native_rows_bind_per_operation(tmp_path: Path) -> None:
