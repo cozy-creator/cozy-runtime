@@ -49,8 +49,9 @@ from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from local_owner import LocalRecordOwner, LocalRequest
 from test_end_to_end import NO_EXECUTOR, _development, _wheel_rows
 
-#: The executor floor (`child.require_executor_protocol`), and the Runtime SDXL 2.3.23 pins.
-VERSIONS = ("0.18.51", "0.18.67")
+#: The executor floor (`child.require_executor_protocol`), the Runtime SDXL 2.3.23 pins, and the
+#: Runtime the owner's H3/Qwen environments pin.
+VERSIONS = ("0.18.51", "0.18.67", "0.18.69")
 
 CACHE = (
     Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
