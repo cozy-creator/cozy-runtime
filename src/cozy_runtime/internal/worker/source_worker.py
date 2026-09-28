@@ -128,8 +128,8 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
         )
         return {"selection": selection, "implementation": store.implementation_sha256}
     if operation in ("download_huggingface", "download_civitai"):
-        produced = materialize(store, command)
-        root = produced["artifact"]
+        materialized = materialize(store, command)
+        root = materialized["artifact"]
         receipt = root["receipt"]
         result = {
             "producer_request_id": command["service_id"],
@@ -140,7 +140,7 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
         return {
             "result": result,
             "native_receipt": base64.b64encode(receipt).decode(),
-            "transferred_bytes": produced["transferred_bytes"],
+            "transferred_bytes": materialized["transferred_bytes"],
         }
     if operation != "convert_cozytensors":
         raise ValueError("unknown fixed source operation")
@@ -163,6 +163,8 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
             else None
         )
         retained = store.tree_root(command["source_owner"])
+        if retained is None:
+            raise ValueError("conversion source has no retained native root")
         total = sum(int(row["length"]) for row in store.walk(retained["manifest_digest"]))
         written = 0
         report("convert", 0, total)
@@ -237,7 +239,7 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
                 names,
             )
             receipt["manifest"] = {
-                "sha256": inherited["manifest_id"].removeprefix("sha256:"),
+                "sha256": str(inherited["manifest_id"]).removeprefix("sha256:"),
                 "length": inherited["manifest_length"],
             }
     native_receipt = canonical_json.encode(receipt)

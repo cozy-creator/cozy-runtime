@@ -1371,8 +1371,10 @@ def _resolve_development_models(
         manifest_length = int(release["manifest_length"])
         try:
             manifest = store.manifest(manifest_digest)
-            manifest_bytes = bytes(manifest["manifest"])
-            header = tensorfs.parse_header(bytes(manifest["header"]))
+            manifest_bytes, header_bytes = manifest["manifest"], manifest["header"]
+            if header_bytes is None:
+                raise ValueError("the manifest has no cozytensors header")
+            header = tensorfs.parse_header(header_bytes)
         except Exception as exc:
             raise RuntimeError(
                 f"development_model_manifest_invalid: {binding.ref}: {type(exc).__name__}: {exc}"

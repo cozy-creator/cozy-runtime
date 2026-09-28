@@ -120,10 +120,10 @@ def _held(worker: Worker, local: str) -> dict[str, Any] | None:
     try:
         facts = canonical_json.decode(_evidence(worker, local).read_bytes())
         row = store.resolve_local(local)
-        manifest = {"digest": row["manifest_digest"], "length": int(row["manifest_length"])}
-        if facts.get("manifest") != manifest:
+        digest, length = row["manifest_digest"], row["manifest_length"]
+        if facts.get("manifest") != {"digest": digest, "length": length}:
             return None
-        store.verify_checkpoint_source("local/" + local, manifest["digest"], manifest["length"])
+        store.verify_checkpoint_source("local/" + local, digest, length)
     except (FileNotFoundError, ValueError, fill.tensorfs_module().errors.Refusal):
         return None
     return dict(facts)

@@ -237,9 +237,9 @@ def record_complete(
                         "source completion lacks its exact retained native receipt"
                     )
             else:
-                observed = store.derived_lookup(row["native_owner"])
-                if observed.get("state") != "committed" or not weights_sink.same_receipt(
-                    observed["receipt"], canonical_json.decode(native_receipt)
+                derived = store.derived_lookup(row["native_owner"])
+                if derived.get("state") != "committed" or not weights_sink.same_receipt(
+                    derived["receipt"], canonical_json.decode(native_receipt)
                 ):
                     raise WorkspaceRefusal(
                         "converted model completion lacks its exact native derive receipt"

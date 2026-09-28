@@ -62,7 +62,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, canonical_dtype, census
 from cozy_runtime.internal import accel
@@ -81,6 +81,9 @@ from cozy_runtime.internal.encoding import (
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
 from cozy_runtime.internal.paging import BlockLayout, PageUnit, partition
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan, TensorResolution
+
+if TYPE_CHECKING:
+    from tensorfs import Store as Store
 
 # ------------------------------------------------------------------------- refusals
 
@@ -329,7 +332,7 @@ def tensorfs_module() -> Any:
     return tensorfs
 
 
-_stores: dict[tuple[int, str], Any] = {}
+_stores: dict[tuple[int, str], Store] = {}
 _stores_lock = threading.Lock()
 
 
@@ -338,7 +341,7 @@ _stores_lock = threading.Lock()
 RECEIPTS = "digest"
 
 
-def store(root: str | Path) -> Any:
+def store(root: str | Path) -> Store:
     """The process's ONE TensorFS Store handle for `root`.
 
     TensorFS keeps its trust index and catalog connection alive only while a handle to the
@@ -353,18 +356,18 @@ def store(root: str | Path) -> Any:
         return held
 
 
-def ensure_store(root: str | Path) -> Any:
+def ensure_store(root: str | Path) -> Store:
     """`store(root)`, first creating the Store when its catalog is absent."""
     path = os.path.abspath(root)
     if not os.path.isfile(os.path.join(path, "tensorfs.sqlite")):
-        created = tensorfs_module().Store.ensure(path, receipts=RECEIPTS)
+        created: Store = tensorfs_module().Store.ensure(path, receipts=RECEIPTS)
         with _stores_lock:
             _stores[(os.getpid(), path)] = created
         return created
     return store(path)
 
 
-def open_store(root: Path) -> Any:
+def open_store(root: Path) -> Store:
     """The process's Store handle for one caller-prepared root, refusals in fill vocabulary."""
 
     try:
@@ -522,8 +525,10 @@ class Checkpoint:
         self.manifest_id = manifest_id
         with store_refusals(f"opening manifest {manifest_id[:23]}"):
             self.store = store(self.root)
-            manifest = self.store.manifest(manifest_id)
-            self.header_bytes: bytes = manifest["header"]
+            header = self.store.manifest(manifest_id)["header"]
+            if header is None:
+                raise _refuse("checkpoint_unreadable", f"{manifest_id}: no cozytensors header")
+            self.header_bytes = header
             # Encoding definitions are nested directly in cozytensors/1. TensorFS parses
             # and validates the header once and exposes each definition with the digest
             # that tensor rows cite; there is no second closure-object lookup.

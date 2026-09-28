@@ -1184,10 +1184,10 @@ def _selected_models(
             if len(parts) != 2 or not all(parts) or bool(release) != bool(lane):
                 raise PreparationRefusal("package_prepare_model_selection_mismatch", model)
             held = store.manifest(digest)
-            raw = bytes(held["manifest"])
-            if not raw or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
+            raw, header = held["manifest"], held["header"]
+            if not raw or header is None or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
                 raise PreparationRefusal("package_prepare_model_manifest_mismatch", digest)
-            manifests[digest] = (len(raw), raw, bytes(held["header"]))
+            manifests[digest] = (len(raw), raw, header)
         for digest, (length, raw, header_raw) in sorted(manifests.items()):
             header_digest, header_length = acquire.cozytensors_ref(tensorfs, raw)
             if (

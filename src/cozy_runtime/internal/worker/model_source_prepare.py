@@ -47,18 +47,15 @@ def prepare_model_source(
             )
         profiles, roster, landed, checkpoints = _request(request)
         tensorfs = fill.tensorfs_module()
-        adoption: dict[str, str] = {}
-        if request.adopt_from_operation_id:
-            if (
-                _IDENTIFIER.fullmatch(request.adopt_from_operation_id) is None
-                or request.adopt_from_operation_id == request.operation_id
-                or landed
-            ):
-                raise ModelSourceRefusal(
-                    "model_source_adoption_invalid",
-                    "adoption requires an old operation and no active source conversion",
-                )
-            adoption["adopt_from_operation_id"] = request.adopt_from_operation_id
+        if request.adopt_from_operation_id and (
+            _IDENTIFIER.fullmatch(request.adopt_from_operation_id) is None
+            or request.adopt_from_operation_id == request.operation_id
+            or landed
+        ):
+            raise ModelSourceRefusal(
+                "model_source_adoption_invalid",
+                "adoption requires an old operation and no active source conversion",
+            )
 
         def write_bound(payload: int = 0) -> storage_admission.Write:
             bound = storage_admission.native_write(tensorfs_root, payload, len(roster))
@@ -84,7 +81,7 @@ def prepare_model_source(
                 roster,
                 landed,
                 checkpoints=checkpoints,
-                **adoption,
+                adopt_from_operation_id=request.adopt_from_operation_id or None,
             )
             prepared = advance(write_budget_bytes=0) if bounded else advance()
         if bounded and (required := prepared["required_write_bytes"]) > 0:

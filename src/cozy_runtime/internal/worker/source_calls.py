@@ -700,6 +700,8 @@ class SourceCalls:
             if store.derived_lookup(command["native_owner"]).get("state") == "committed":
                 return (storage_admission.native_write(self.workspace.store_root),)
             root = store.tree_root(command["source_owner"])
+            if root is None:
+                raise WorkspaceRefusal("conversion source has no retained native root")
             # Source conversion admits identity/permutation classes only. Their
             # body bytes cannot exceed the verified carrier roster; no quantizer
             # or value-expanding converter runs on this native source path.

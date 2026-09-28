@@ -117,5 +117,7 @@ def test_a_whole_model_declaration_commits_with_a_constant_size_receipt(tmp_path
         len(frame.weights_receipt.weights_receipt_canonical_bytes) < 16 << 10 for frame in recorded
     )
     assert receipt["declaration_digest"] == documents.spell(intent.tensorfs_declaration_digest)
-    header = tensorfs.parse_header(bytes(store.manifest(artifact.manifest.digest)["header"]))
+    header_bytes = store.manifest(artifact.manifest.digest)["header"]
+    assert header_bytes is not None
+    header = tensorfs.parse_header(header_bytes)
     assert list(header["components"]["unet"]) == keys

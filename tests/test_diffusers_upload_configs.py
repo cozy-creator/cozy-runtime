@@ -61,7 +61,7 @@ def _repository(modular: bool) -> dict[str, bytes]:
     weights = (FIXTURE / "first.safetensors").read_bytes()
     size = 8 + int.from_bytes(weights[:8], "little")
     other = weights[:size] + bytes(255 - byte for byte in weights[size:])  # same tensor, new values
-    classes = {
+    classes: dict[str, list[object]] = {
         "encoder": ["diffusers", "FixtureEncoder"],
         "decoder": ["diffusers", "AutoencoderKL"],
         "scheduler": ["diffusers", "EulerDiscreteScheduler"],
