@@ -126,13 +126,19 @@ class Calls:
                 if body.HasField("observation"):
                     result.observation.CopyFrom(body.observation)
                 capture = body.observation.HasField("capture")
+            # An effect froze its own plan in `prepared`; its result declares no byte grants.
+            schema = (
+                {}
+                if request.module == effect_interfaces.MODULE
+                else call.plan().result_schema or {}
+            )
             result.byte_result_grants.extend(
                 machine_byte_results.grants(
                     self.workspace,
                     owner,
                     call.parent_request,
                     call.call_index,
-                    call.plan().result_schema or {},
+                    schema,
                     capture=capture,
                 )
             )
