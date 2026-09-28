@@ -12,6 +12,7 @@ import re
 import threading
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from google.protobuf import json_format
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import job_plan, package_installation, package_interface
+from cozy_runtime.internal import fill, job_plan, package_installation, package_interface
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -330,6 +331,8 @@ class ReleaseRoots:
         credentials: Mapping[str, str],
         note: machine_source_models.Note,
     ) -> list[dict[str, Any]]:
+        """Each slot for this machine. A manifest it already holds needs no catalog read; the
+        package's bindings are read once and its catalog slots then resolve beside each other."""
         slots = declaration.get("models", [])
         if not slots:
             return []
@@ -337,36 +340,65 @@ class ReleaseRoots:
             choice.parameter: json_format.MessageToDict(choice, preserving_proto_field_name=True)
             for choice in root.models
         }
-        pinned = {
-            parameter
-            for parameter, choice in choices.items()
-            if choice.get("source") or choice.get("manifest", {}).get("length")
+        for choice in choices.values():
+            if "manifest" in choice:
+                digest = documents.spell(base64.b64decode(choice["manifest"]["digest"]))
+                length = int(choice["manifest"].get("length", 0)) or self._held_length(digest)
+                choice["manifest"] = {"digest": digest, "length": length}
+        parameters = [model["path"].rpartition(".")[2] for model in slots]
+        sourced = {
+            parameter for parameter in parameters if choices.get(parameter, {}).get("source")
         }
-        if not root.catalog_origin and any(
-            model["path"].rpartition(".")[2] not in pinned for model in slots
-        ):
+        open_slots = [
+            model
+            for model, parameter in zip(slots, parameters, strict=True)
+            if not choices.get(parameter, {}).get("source")
+            and not choices.get(parameter, {}).get("manifest", {}).get("length")
+        ]
+        if open_slots and not root.catalog_origin:
             raise WorkspaceRefusal("release root needs a catalog origin to resolve its Models")
         catalog = machine_model_resolve.Catalog(root.catalog_origin)
         fits = machine_model_defaults.fitter(self.worker)
-        rows = []
-        for model in slots:
-            parameter = model["path"].rpartition(".")[2]
-            choice = choices.get(parameter)
-            if choice and choice.get("source"):
-                # A provider source is made here: headers first, only its profile's members.
-                rows.append(
-                    machine_source_models.slot(self.worker, parameter, choice, credentials, note)
+        laddered = [
+            model
+            for model in open_slots
+            if "manifest" not in choices.get(model["path"].rpartition(".")[2], {})
+        ]
+        if laddered and not root.package.startswith("local/"):
+            catalog.binding(root.package, str(laddered[0]["path"]))
+        with ThreadPoolExecutor(max_workers=len(slots)) as pool:
+            resolving = {
+                parameter: pool.submit(
+                    machine_model_resolve.slot,
+                    catalog,
+                    root.package,
+                    model,
+                    parameter,
+                    choices.get(parameter),
+                    fits,
                 )
-                continue
-            if choice and "manifest" in choice:
-                choice["manifest"] = {
-                    "digest": documents.spell(base64.b64decode(choice["manifest"]["digest"])),
-                    "length": int(choice["manifest"].get("length", 0)),
-                }
-            rows.append(
-                machine_model_resolve.slot(catalog, root.package, model, parameter, choice, fits)
+                for model, parameter in zip(slots, parameters, strict=True)
+                if parameter not in sourced
+            }
+            resolved = {parameter: row.result() for parameter, row in resolving.items()}
+        # A provider source is made here, in order: headers first, only its profile's members.
+        return [
+            machine_source_models.slot(
+                self.worker, parameter, choices[parameter], credentials, note
             )
-        return rows
+            if parameter in sourced
+            else resolved[parameter]
+            for parameter in parameters
+        ]
+
+    def _held_length(self, digest: str) -> int:
+        """The length of a manifest this machine's store holds, else 0 (the catalog says)."""
+        root = self.worker.options.tensorfs_root
+        try:
+            raw = bytes(fill.store(root).manifest(digest)["manifest"]) if root else b""
+        except Exception:  # not held here
+            return 0
+        return len(raw) if raw and documents.spell(hashlib.sha256(raw).digest()) == digest else 0
 
     def _progress(self, job: _Job, frame: Mapping[str, Any]) -> None:
         position, total = frame.get("position"), frame.get("total")

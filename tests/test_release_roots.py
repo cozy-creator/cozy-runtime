@@ -24,7 +24,7 @@ import tensorfs
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import canonical, hostfacts, storage_admission
-from cozy_runtime.internal.worker import machine_model_defaults
+from cozy_runtime.internal.worker import machine_model_defaults, machine_release_roots
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.internal.worker.workspace_calls import Call
@@ -60,7 +60,12 @@ class Catalog:
     serves the checkpoint's manifest bytes, as `served`."""
 
     def __init__(
-        self, manifest: str, length: int | None, ladder: list[dict[str, Any]], served: bytes = b""
+        self,
+        manifest: str,
+        length: int | None,
+        ladder: list[dict[str, Any]],
+        served: bytes = b"",
+        together: threading.Barrier | None = None,
     ) -> None:
         self.reads: list[str] = []
         self.served = served
@@ -82,6 +87,8 @@ class Catalog:
                 elif url.path == "/v1/models/resolve":
                     query = parse_qs(url.query)
                     assert query == {"ref": [f"{PACKAGE}@{RELEASE}"], "lane": [LANE]}, query
+                    if together is not None:
+                        together.wait(30)  # each lane is read beside the others
                     body = {
                         "model": PACKAGE,
                         "release": RELEASE,
@@ -278,6 +285,21 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
             submission(machine, "second", catalog.origin), Context()
         )
         assert replay == receipt
+        # A checkpoint named by digest alone that this machine holds costs no catalog read.
+        catalog.reads.clear()
+        pinned = submission(machine, "pinned", catalog.origin)
+        pinned.release_root.models.add(
+            parameter="model",
+            repository=PACKAGE,
+            manifest=pb.Ref(digest=documents.raw(machine.manifest)),
+        )
+        assert machine.rpc.SubmitMachineExecution(pinned, Context()).request_id == "pinned"
+        assert catalog.reads == []
+        assert [
+            canonical_json.decode(event.body)["models"][0]["manifest"]
+            for event in machine.executions.events(OWNER, "pinned").events
+            if event.kind == "resolved"
+        ] == [{"digest": machine.manifest, "length": length}]
         # An observer holds one read open until the next event, instead of polling.
         head = machine.executions.events(OWNER, "second").head_sequence
         query = pb.MachineExecutionEventsQuery(
@@ -521,3 +543,39 @@ def test_a_published_job_is_a_release_root_the_machine_mints(published: Machine)
     # No declared accelerator and no torch in its lock: a CPU orchestration job.
     assert desired.job.orchestration and not desired.job.device_count
     assert desired.job.job_descriptor_id == spec["job"]["job_descriptor_id"]
+
+
+def test_a_roots_catalog_slots_resolve_beside_each_other(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The package's bindings are read once; its slots' lanes are then read at once."""
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    ladder = [{"gpu": "*", "lane": LANE}]
+    catalog = Catalog(published.manifest, 1, ladder, together=threading.Barrier(2))
+    root = pb.ReleaseRoot(
+        package=PACKAGE,
+        release=RELEASE,
+        entrypoint="touch",
+        catalog_origin=catalog.origin,
+        models=[
+            pb.ModelChoice(parameter=parameter, repository=PACKAGE, release=RELEASE, lane=LANE)
+            for parameter in ("model", "second")
+        ],
+    )
+    declaration = {"models": [{"path": SLOT}, {"path": "touch.models.second"}]}
+    try:
+        rows = machine_release_roots.ReleaseRoots(published.worker)._resolve(
+            root, declaration, {}, lambda *_: None
+        )
+    finally:
+        catalog.close()
+    assert [row["parameter"] for row in rows] == ["model", "second"]
+    assert [urlsplit(path).path for path in catalog.reads] == [
+        "/v1/packages/cozytest/tenant/bindings",
+        "/v1/models/resolve",
+        "/v1/models/resolve",
+    ]
