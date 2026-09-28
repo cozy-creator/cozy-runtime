@@ -1153,7 +1153,7 @@ def test_a_pin_that_cannot_be_honoured_refuses_through_the_whole_real_path() -> 
             )
     # A request-scoped pin refusal terminates the attempt; it does not fault the binding (#678).
     assert outcome.status == "OUTCOME_STATUS_REFUSED", outcome.terminal
-    message = str(outcome.terminal.get("safe_message", ""))
+    message = outcome.terminal.safe_message
     assert message.startswith("attention_kernel_unsupported"), outcome.terminal
     assert "sageattention" in message
     assert outcome.result is None, outcome.result

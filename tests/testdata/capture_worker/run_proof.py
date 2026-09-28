@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -210,7 +210,7 @@ def main() -> None:
     evidence["exit_code"] = outcome.exit_code
     evidence["ended"] = outcome.ended
     evidence["errors"] = errors
-    evidence["worker_records"] = outcome.attempt_records
+    evidence["worker_records"] = [asdict(row) for row in outcome.attempt_records]
     (root / (key + ".json")).write_text(json.dumps(evidence, indent=2))
     assert not errors, errors
     assert outcome.exit_code == 0 and outcome.ended == "terminal", (
@@ -218,7 +218,7 @@ def main() -> None:
         outcome.error,
     )
     assert outcome.result and outcome.result["device"] == "cuda"
-    assert any(row["kind"] == "closed" for row in outcome.attempt_records)
+    assert any(row.kind == "closed" for row in outcome.attempt_records)
     print(
         json.dumps(
             {

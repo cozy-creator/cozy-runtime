@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import mimetypes
 import shutil
 import sys
 import uuid
@@ -40,6 +41,8 @@ from cozy_runtime.internal.local import (
     run_slice,
 )
 from cozy_runtime.internal.worker.session import WorkerOptions
+from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
 
 VALUE_FLAGS = (
     "--model",
@@ -77,15 +80,15 @@ TERMINAL_EXITS: Mapping[str, Exit] = {
 #: A refusal terminal carries a CAUSE, and the cause is what picks the code — a refusal is
 #: not one condition. `capacity` is the quantified below-floor exit (14), which is never
 #: exit 0 and never the structural 6.
-CAUSE_EXITS: Mapping[str, Exit] = {
-    "CAUSE_CODE_INVALID_REQUEST": Exit.validation,
-    "CAUSE_CODE_UNSUPPORTED_INPUT": Exit.structural,
-    "CAUSE_CODE_CONSTRAINT_INFEASIBLE": Exit.capacity,
-    "CAUSE_CODE_ARTIFACT_UNFETCHABLE": Exit.offline_miss,
-    "CAUSE_CODE_CAPABILITY_UNAVAILABLE": Exit.structural,
-    "CAUSE_CODE_DEADLINE_EXPIRED": Exit.deadline,
-    "CAUSE_CODE_LOCAL_SAFETY": Exit.validation,
-    "CAUSE_CODE_CLIENT_CANCEL": Exit.canceled,
+CAUSE_EXITS: Mapping[int, Exit] = {
+    pb.CauseCode.CAUSE_CODE_INVALID_REQUEST: Exit.validation,
+    pb.CauseCode.CAUSE_CODE_UNSUPPORTED_INPUT: Exit.structural,
+    pb.CauseCode.CAUSE_CODE_CONSTRAINT_INFEASIBLE: Exit.capacity,
+    pb.CauseCode.CAUSE_CODE_ARTIFACT_UNFETCHABLE: Exit.offline_miss,
+    pb.CauseCode.CAUSE_CODE_CAPABILITY_UNAVAILABLE: Exit.structural,
+    pb.CauseCode.CAUSE_CODE_DEADLINE_EXPIRED: Exit.deadline,
+    pb.CauseCode.CAUSE_CODE_LOCAL_SAFETY: Exit.validation,
+    pb.CauseCode.CAUSE_CODE_CLIENT_CANCEL: Exit.canceled,
 }
 
 
@@ -571,8 +574,7 @@ def _render(
         )
     status = outcome.status
     terminal = outcome.terminal
-    cause = (terminal.get("cause") or {}) if isinstance(terminal, dict) else {}
-    code = _exit_for(status, cause)
+    code = _exit_for(status, terminal.cause)
 
     saved = _save(outcome, out_dir)
     rows: list[tuple[str, str]] = []
@@ -581,9 +583,8 @@ def _render(
         rows.append((name, f"{path}  {stat.st_size} B"))
     if not saved:
         rows.append(("outputs", "0 assets"))
-    accepted = outcome.accepted
-    if accepted and accepted.get("lane_id"):
-        rows.append(("lane", str(accepted["lane_id"])))
+    if outcome.accepted.lane_id:
+        rows.append(("lane", outcome.accepted.lane_id))
     # The bind's CONFESSION, rendered where the person who ran it will see it. The runtime
     # already decided to ignore those keys; this is the "loudly" half of "loudly ignored".
     facts = _bind_facts(outcome)
@@ -596,19 +597,29 @@ def _render(
         rows.append(("ignored_extra_keys", ", ".join(str(k) for k in ignored)))
     if markers := _split(facts.get("transcribed_markers")):
         rows.append(("transcribed_markers", ", ".join(str(m) for m in markers)))
-    metrics = terminal.get("metrics", {}) if isinstance(terminal, dict) else {}
     rows.append(("runtime", f"{outcome.timings.get('wall_ms', 0) / 1000:.2f} s"))
-    if peak := int(metrics.get("peak_vram_bytes", 0)):
+    if peak := terminal.metrics.peak_device_memory_bytes:
         rows.append(("peak_vram", f"{peak / MIB:.0f} MiB"))
-    for row in _adjustments(terminal):
-        rows.append(("adjusted", row))
+    rows.extend(
+        (
+            "adjusted",
+            f"{row.field}: requested {row.requested} -> applied {row.applied} ({row.reason})",
+        )
+        for row in terminal.result.adjustments
+    )
+    # The protocol messages are rendered as their documents here, at the output boundary only.
     document: dict[str, Any] = {
         "status": status,
         "result": outcome.result,
-        "observation": terminal.get("observation"),
+        "observation": documents.body(terminal.observation)
+        if terminal.HasField("observation")
+        else None,
         "outputs": saved,
-        "invocation": outcome.invocation,
-        "accepted": accepted,
+        "invocation": {
+            "digest": outcome.invocation_digest,
+            "document": documents.document(outcome.invocation),
+        },
+        "accepted": documents.body(outcome.accepted),
         "ledger": outcome.ledger,
         "timings": outcome.timings,
         "warnings": warnings,
@@ -632,15 +643,13 @@ def _render(
         document["publication_scope"] = outcome.publication_scope
         rows.append(("publication_scope", outcome.publication_scope))
     if outcome.checkpoints:
-        document["checkpoints"] = outcome.checkpoints
+        document["checkpoints"] = msgspec.to_builtins(outcome.checkpoints)
         rows.append(("checkpoints", f"{len(outcome.checkpoints)} durable receipt(s)"))
     if code != Exit.ok:
-        message = str(terminal.get("safe_message", "")) if isinstance(terminal, dict) else ""
-        detail = str(cause.get("detail", "")) if isinstance(cause, dict) else ""
         raise Refusal(
             _name_for(code),
-            message or f"the attempt ended {status}",
-            detail or "the terminal's own remedy is rendered verbatim",
+            terminal.safe_message or f"the attempt ended {status}",
+            terminal.cause.detail or "the terminal's own remedy is rendered verbatim",
             code,
         )
     result = Result(
@@ -671,42 +680,14 @@ def _bind_facts(outcome: SliceOutcome) -> dict[str, Any]:
     return {}
 
 
-def _adjustments(terminal: Mapping[str, Any]) -> list[str]:
-    """The adjustments envelope, verbatim — the runtime clamped it, this only prints it."""
-    envelope = terminal.get("result") or {}
-    rows = envelope.get("adjustments") or () if isinstance(envelope, dict) else ()
-    return [
-        f"{row.get('field', '?')}: requested {row.get('requested', '?')} -> applied "
-        f"{row.get('applied', '?')} ({row.get('reason', '')})"
-        for row in rows
-        if isinstance(row, dict)
-    ]
-
-
 def _name_for(code: Exit) -> str:
     return code.name
 
 
-def _exit_for(status: str, cause: Mapping[str, Any]) -> Exit:
+def _exit_for(status: str, cause: pb.OutcomeCause) -> Exit:
     if status == "OUTCOME_STATUS_REFUSED":
-        return CAUSE_EXITS.get(_cause_name(cause.get("code")), Exit.validation)
+        return CAUSE_EXITS.get(cause.code, Exit.validation)
     return TERMINAL_EXITS.get(status, Exit.failed)
-
-
-def _cause_name(code: Any) -> str:
-    """The cause's spelling. A canonical document carries the ENUM'S NUMBER, not its name —
-    which is right for the wire and was silently wrong here: keying the exit table on names
-    matched nothing, so every refusal came out as exit 3 including the capacity one."""
-    from cozy_runtime.protocol import worker_pb2 as pb
-
-    if isinstance(code, str):
-        return code
-    if isinstance(code, int):
-        try:
-            return str(pb.CauseCode.Name(code))
-        except ValueError:
-            return ""
-    return ""
 
 
 def _save(outcome: SliceOutcome, out_dir: Path) -> dict[str, str]:
@@ -745,9 +726,7 @@ def _save(outcome: SliceOutcome, out_dir: Path) -> dict[str, str]:
 
 def _extension(outcome: SliceOutcome, field: str) -> str:
     """`.png` from `image/png`. An unknown or absent media type stays extensionless."""
-    import mimetypes
-
-    node: Any = outcome.result
+    node: object = outcome.result
     for part in field.split("."):
         if not isinstance(node, dict):
             return ""

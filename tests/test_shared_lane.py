@@ -414,9 +414,9 @@ class TwoTenantOwner(LocalRecordOwner):
             )
         )
         canonical_bytes, digest = documents.identity(spec)
+        self.spec = spec
         self.spec_digest = digest
         self.spec_canonical_bytes = canonical_bytes
-        self.spec_document = documents.read(canonical_bytes, pb.InvocationSpec)
         self._send(
             pb.RecordOwnerFrame(
                 attempt_offer=self._env(

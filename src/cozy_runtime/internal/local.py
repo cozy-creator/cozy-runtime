@@ -37,20 +37,25 @@ import hashlib
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol
+
+import msgspec
 
 from cozy_runtime.author._capture import ActivationCapture
+from cozy_runtime.author._media import SNIFF_BYTES, sniff
 from cozy_runtime.internal import bindings as binding_table
 from cozy_runtime.internal import (
     canonical,
     derive_child,
     fill,
+    job_plan,
     liveness,
     model_config,
     package_interface,
@@ -58,14 +63,14 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
+from cozy_runtime.internal.worker import byte_inputs, triage, workspace_byte_outputs
 from cozy_runtime.internal.worker import grants as grants_module
-from cozy_runtime.internal.worker import triage
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     ModelBinding,
 )
-from cozy_runtime.internal.worker.records import WorkerRecords
+from cozy_runtime.internal.worker.records import Record
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -77,7 +82,11 @@ if TYPE_CHECKING:
 #: the InvocationSpec digest deliberately excludes it.
 LOCAL_PLACEMENT = "plc-local"
 
-_M = TypeVar("_M")
+
+class _Enveloped(Protocol):
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
 
 
 class LocalBindingError(Exception):
@@ -103,7 +112,7 @@ class DevelopmentPlacementDocuments:
     placement: pb.Placement
     bindings: Mapping[str, DeclaredBinding] = field(default_factory=dict)
 
-    def subjects(self) -> tuple[dict[str, Any], ...]:
+    def subjects(self) -> tuple[dict[str, str], ...]:
         return tuple(
             {
                 "entrypoint": entrypoint.name,
@@ -115,7 +124,7 @@ class DevelopmentPlacementDocuments:
 
 @dataclass(frozen=True, slots=True)
 class _DevelopmentModel:
-    slot: Any
+    slot: _InterfaceSlot
     repo: str
     name: str
     version: str
@@ -142,7 +151,7 @@ class LocalRequest:
     """One request, as a RecordOwner would put it on the wire."""
 
     entrypoint: str
-    payload: dict[str, Any]
+    payload: Mapping[str, object]
     #: the result FIELD PATHS the caller grants a destination for (`image`, `detail.thumb`).
     #: cr-016 derives these from the package interface; here the driver names them, and a
     #: set that does not match what the handler produced refuses the tail whole (#248).
@@ -186,18 +195,32 @@ class LocalRequest:
     explicit later act under the caller's own credentials (jobs.md)."""
 
 
+class LocalCheckpoint(msgspec.Struct, frozen=True):
+    """One durable checkpoint request this owner answered, and how."""
+
+    operation_key: str
+    logical_key: str
+    content_digest: str
+    seq: int
+    outcome: str
+
+
 @dataclass(slots=True)
 class SliceOutcome:
-    """Everything one local run OBSERVED. No field is inferred; each has a producer."""
+    """Everything one local run OBSERVED. No field is inferred; each has a producer.
+
+    Protocol facts are the worker's own messages; a field at its proto3 default means the run
+    never observed that fact (no terminal, no acceptance, no dispatch).
+    """
 
     status: str = ""
-    terminal: dict[str, Any] = field(default_factory=dict)
-    result: dict[str, Any] | None = None
-    result_schema_digest: str = ""
-    invocation: dict[str, Any] = field(default_factory=dict)
+    terminal: pb.AttemptOutcomeBody = field(default_factory=pb.AttemptOutcomeBody)
+    #: the package's inline typed result, decoded by the canonical reader that wrote it
+    result: dict[str, object] | None = None
+    invocation: pb.InvocationSpec = field(default_factory=pb.InvocationSpec)
+    invocation_digest: str = ""
     invocation_canonical_bytes: bytes = b""
-    accepted: dict[str, Any] = field(default_factory=dict)
-    manifest: list[dict[str, Any]] = field(default_factory=list)
+    accepted: pb.AttemptAccepted = field(default_factory=pb.AttemptAccepted)
     #: cr-009's typed publication receipt — ONE canonical bundle snapshot per publication,
     #: recorded before the terminal named it. `manifest_id` on the terminal IS its digest.
     publication: dict[str, Any] = field(default_factory=dict)
@@ -206,11 +229,13 @@ class SliceOutcome:
     terminal_canonical_bytes: bytes = b""
     placement_set_digest: str = ""
     placement_set_canonical_bytes: bytes = b""
-    worker_resources: dict[str, Any] = field(default_factory=dict)
-    accelerator_qualification: dict[str, Any] = field(default_factory=dict)
+    worker_resources: pb.WorkerResources = field(default_factory=pb.WorkerResources)
+    accelerator_qualification: pb.AcceleratorQualification = field(
+        default_factory=pb.AcceleratorQualification
+    )
     ledger: dict[str, Any] = field(default_factory=dict)
     reconciliation: dict[str, Any] = field(default_factory=dict)
-    attempt_records: list[dict[str, Any]] = field(default_factory=list)
+    attempt_records: list[Record] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
     faults: list[dict[str, str]] = field(default_factory=list)
     progress: int = 0
@@ -224,7 +249,7 @@ class SliceOutcome:
     workspace_deleted: bool = False
     #: JOB mode: the durable checkpoint requests this run received, in arrival order, and
     #: the scratch model its outputs were rewritten into.
-    checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    checkpoints: list[LocalCheckpoint] = field(default_factory=list)
     publication_scope: str = ""
     #: how the run ENDED, which is not always "it produced a terminal": `terminal`,
     #: `worker_error` (the worker reported it could not become ready), `worker_wedged` (it
@@ -260,20 +285,18 @@ PRE_EXECUTION_REFUSALS = frozenset(
 )
 
 
-def redispatchable(body: Mapping[str, Any]) -> bool:
+def redispatchable(body: pb.AttemptOutcomeBody) -> bool:
     """Can this attempt's ordinal + 1 go straight to another worker?
 
     `execution_started` is the BILLING FACT and it is STRUCTURAL (#480c) — the worker states
     it rather than leaving a RecordOwner to infer it from a cause-code allowlist. Both are
     checked: the cause says whose judgment it was, and the bit says whether anything ran.
     """
-    if body.get("status") != pb.OutcomeStatus.OUTCOME_STATUS_REFUSED:
-        return False
-    cause = body.get("cause") or {}
     return (
-        cause.get("code") in PRE_EXECUTION_REFUSALS
-        and cause.get("origin") == pb.CauseOrigin.CAUSE_ORIGIN_WORKER
-        and not body.get("execution_started", False)
+        body.status == pb.OutcomeStatus.OUTCOME_STATUS_REFUSED
+        and body.cause.code in PRE_EXECUTION_REFUSALS
+        and body.cause.origin == pb.CauseOrigin.CAUSE_ORIGIN_WORKER
+        and not body.execution_started
     )
 
 
@@ -296,12 +319,12 @@ class LocalRecordOwner:
         package_installation_id: str,
         placement: pb.Placement | None = None,
         auto_ack: bool = True,
-        on_progress: Any = None,
+        on_progress: Callable[[pb.AttemptProgress], None] | None = None,
     ) -> None:
         self.request = request
         self.bindings = bindings  # entrypoint -> entrypoint_binding_digest
         #: JOB mode: the durable checkpoint requests this owner answered, in order.
-        self.checkpoints: list[dict[str, Any]] = []
+        self.checkpoints: list[LocalCheckpoint] = []
         self.workspace = workspace
         self.package_installation_id = package_installation_id
         self.placement = placement
@@ -325,8 +348,8 @@ class LocalRecordOwner:
         self.accepted: pb.AttemptAccepted | None = None
         self.terminal: pb.AttemptOutcome | None = None
         self.reports: list[pb.ObservedWorkerState] = []
+        self.spec = pb.InvocationSpec()
         self.spec_digest = b""
-        self.spec_document: dict[str, Any] = {}
         self.spec_canonical_bytes = b""
         self.worker_resources = pb.WorkerResources()
         self.placement_set_digest = b""
@@ -432,12 +455,11 @@ class LocalRecordOwner:
             return None
         return (working + below, cursors)
 
-    def _env(self, message: _M) -> _M:
+    def _env[M: _Enveloped](self, message: M) -> M:
         """The owner's half of the three-field envelope (02 §0)."""
-        inner: Any = message
-        inner.record_owner_epoch = self.record_owner_epoch
-        inner.control_stream_epoch = self.control_stream_epoch
-        inner.worker_boot_id = self.boot_id
+        message.record_owner_epoch = self.record_owner_epoch
+        message.control_stream_epoch = self.control_stream_epoch
+        message.worker_boot_id = self.boot_id
         return message
 
     # ------------------------------------------------------------------ the exchange
@@ -533,11 +555,9 @@ class LocalRecordOwner:
                 f"snapshot digest mismatch: carried {snapshot.snapshot_digest.hex()[:16]} "
                 f"and the bytes hash to {recomputed.hex()[:16]}; NOT acknowledged"
             )
-        body = pb.WorkerSnapshotBody()
-        document = documents.read(snapshot.snapshot_canonical_bytes, pb.WorkerSnapshotBody)
-        self.snapshot_document = document
-        self.admission_epoch = int(document.get("admission_epoch", 0))
-        del body
+        self.admission_epoch = documents.parse(
+            snapshot.snapshot_canonical_bytes, pb.WorkerSnapshotBody
+        ).admission_epoch
         self._send(
             pb.RecordOwnerFrame(
                 snapshot_ack=self._env(
@@ -670,28 +690,15 @@ class LocalRecordOwner:
             return
         if hashlib.sha256(outcome.outcome_canonical_bytes).digest() != outcome.outcome_digest:
             raise LocalBindingError("native output outcome digest changed")
-        body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
-        rows = (body.get("output_manifest") or {}).get("outputs") or []
-        for row in rows:
-            native = row.get("native_tree")
-            if native is None:
+        body = documents.parse(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        for row in body.output_manifest.outputs:
+            if not row.HasField("native_tree"):
                 continue
             if self.native_workspace is None:
                 raise LocalBindingError("native local output has no configured workspace")
-            from cozy_runtime.internal.worker import byte_inputs, workspace_byte_outputs
-
-            source = pb.NativeByteTreeRef(
-                producer_root_id=native["producer_root_id"],
-                receipt_digest=documents.raw(native["receipt_digest"]),
-                manifest=pb.Ref(
-                    digest=documents.raw(native["manifest"]["digest"]),
-                    length=native["manifest"]["length"],
-                ),
-                content_bytes=native.get("content_bytes", 0),
-            )
-            output_id = row["output_id"]
+            output_id = row.output_id
             hold = pb.NativeByteRetentionRequest(
-                source=source,
+                source=row.native_tree,
                 retention_id=documents.spell(
                     hashlib.sha256(
                         canonical.write(
@@ -708,7 +715,7 @@ class LocalRecordOwner:
             staging = self.output_dir / (
                 ".native-" + hashlib.sha256(output_id.encode()).hexdigest()
             )
-            tree = row.get("mime_type") == workspace_byte_outputs.TREE_MIME
+            tree = row.mime_type == workspace_byte_outputs.TREE_MIME
             workspace_byte_outputs.change_hold(
                 self.native_workspace, "local-run", hold, release=False
             )
@@ -718,7 +725,7 @@ class LocalRecordOwner:
                     "local-run",
                     hold,
                     staging,
-                    expected_blob=(row["digest"], row.get("length", 0)) if not tree else None,
+                    expected_blob=None if tree else (documents.spell(row.digest), row.length),
                 )
                 if tree:
                     os.rename(staging, destination)
@@ -906,9 +913,9 @@ class LocalRecordOwner:
                 raise RuntimeError("serving dispatch has no exact prepared placement")
             spec.serving.bindings_digest = documents.spell(self.placement.bindings_digest)
         canonical_bytes, digest = documents.identity(spec)
+        self.spec = spec
         self.spec_digest = digest
         self.spec_canonical_bytes = canonical_bytes
-        self.spec_document = documents.read(canonical_bytes, pb.InvocationSpec)
         self.marks["dispatched"] = time.perf_counter()
         self._send(
             pb.RecordOwnerFrame(
@@ -1005,20 +1012,21 @@ class LocalRecordOwner:
             (
                 row
                 for row in self.checkpoints
-                if row["operation_key"] == request.operation_key
-                and row["logical_key"] == request.logical_key
+                if row.operation_key == request.operation_key
+                and row.logical_key == request.logical_key
             ),
             None,
         )
-        conflict = held is not None and held["content_digest"] != digest
-        row = {
-            "operation_key": request.operation_key,
-            "logical_key": request.logical_key,
-            "content_digest": digest,
-            "seq": request.seq,
-            "outcome": "CONFLICT" if conflict else ("REPLAYED" if held else "RECORDED"),
-        }
-        self.checkpoints.append(row)
+        conflict = held is not None and held.content_digest != digest
+        self.checkpoints.append(
+            LocalCheckpoint(
+                operation_key=request.operation_key,
+                logical_key=request.logical_key,
+                content_digest=digest,
+                seq=request.seq,
+                outcome="CONFLICT" if conflict else ("REPLAYED" if held else "RECORDED"),
+            )
+        )
         outcome = (
             pb.CheckpointOutcome.CHECKPOINT_OUTCOME_CONFLICT
             if conflict
@@ -1436,8 +1444,6 @@ def _derive_components(
     dtypes: Mapping[str, str],
 ) -> tuple[str, ...]:
     """What the private bounded child constructs for this config in this package venv."""
-    import sys
-
     try:
         request = derive_child.DeriveRequest(
             (derive_child.SlotRequest(slot, config_bytes, assets, dtypes),),
@@ -1465,24 +1471,6 @@ def _exact_model_ref(value: str) -> tuple[str, str, str]:
     return parts[0], parts[1], version
 
 
-def _exact_ref(raw: bytes) -> dict[str, Any]:
-    return {"digest": "sha256:" + hashlib.sha256(raw).hexdigest(), "length": len(raw)}
-
-
-def _stage_exact(root: Path, raw: bytes) -> tuple[dict[str, Any], Path]:
-    ref = _exact_ref(raw)
-    digest = str(ref["digest"])
-    root.mkdir(parents=True, exist_ok=True)
-    path = (root / digest.removeprefix("sha256:")).resolve()
-    try:
-        with path.open("xb") as handle:
-            handle.write(raw)
-    except FileExistsError:
-        if path.read_bytes() != raw:
-            raise RuntimeError(f"content-addressed local document changed at {path}") from None
-    return ref, path
-
-
 def _input_facts(path: Path) -> tuple[str, int, str]:
     """Stream one local input once into its exact digest, length, and media claim.
 
@@ -1490,8 +1478,6 @@ def _input_facts(path: Path) -> tuple[str, int, str]:
     instead. Either way it is a CLAIM, and the worker sniffs what it actually received and
     refuses a disagreement — which is the point of declaring it at all.
     """
-    from cozy_runtime.author._media import SNIFF_BYTES, sniff
-
     digest = hashlib.sha256()
     length = 0
     head = bytearray()
@@ -1521,8 +1507,6 @@ def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str,
     plans: dict[str, str] = {}
     for record in records:
         descriptor_id = str(record["job_descriptor_id"])
-        from cozy_runtime.internal import job_plan
-
         job_plan.write(directory, record)
         plans[str(record["job"])] = descriptor_id
     return plans
@@ -1531,7 +1515,6 @@ def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str,
 def run_slice(
     config: RuntimeConfig,
     request: LocalRequest,
-    binding_records: list[dict[str, Any]] | None = None,
     *,
     workspace: Path,
     package_installation_id: str,
@@ -1543,7 +1526,7 @@ def run_slice(
     options: WorkerOptions | None = None,
     delete_workspace: bool = True,
     auto_ack: bool = True,
-    record_owner_hook: Any = None,
+    record_owner_hook: Callable[[LocalRecordOwner, Worker], None] | None = None,
 ) -> SliceOutcome:
     """One request in, one typed result out, through the whole real path.
 
@@ -1552,10 +1535,6 @@ def run_slice(
     runtime (decisions #249: fault injection belongs to the harness).
     """
     workspace.mkdir(parents=True, exist_ok=True)
-    if binding_records:
-        raise RuntimeError(
-            "flat local binding records were removed; supply the canonical provisioned closure"
-        )
     bindings: dict[str, str] = {}
     staged: StagedDevelopmentPlacement | None = None
     if package_interface_document is not None:
@@ -1622,7 +1601,7 @@ def _collect(
     delete_workspace: bool,
 ) -> SliceOutcome:
     outcome = SliceOutcome(exit_code=exit_code, ended=record_owner.ended, error=record_owner.error)
-    outcome.attempt_records = _record_rows(worker.records)
+    outcome.attempt_records = list(worker.records.records)
     ledger = worker.primary_ledger()
     outcome.reconciliation = ledger.reconciliations[-1] if ledger.reconciliations else {}
     # The ledger as it stood AT ATTEMPT CLOSE, not after shutdown. Reading it here would
@@ -1643,31 +1622,21 @@ def _collect(
     outcome.publication_scope = (
         record_owner.scratch_model() if record_owner.request.kind == "job" else ""
     )
-    if record_owner.spec_document:
-        outcome.invocation = {
-            "digest": _spell(record_owner.spec_digest),
-            "document": record_owner.spec_document,
-        }
+    if record_owner.spec_digest:
+        outcome.invocation = record_owner.spec
+        outcome.invocation_digest = _spell(record_owner.spec_digest)
         outcome.invocation_canonical_bytes = record_owner.spec_canonical_bytes
-
     if record_owner.accepted is not None:
-        accepted = record_owner.accepted
-        outcome.accepted = {
-            "request_id": accepted.request_id,
-            "attempt_ordinal": accepted.attempt_ordinal,
-            "invocation_spec_digest": _spell(accepted.invocation_spec_digest),
-            "placement_id": accepted.placement_id,
-            "lane_id": accepted.lane_id,
-        }
+        outcome.accepted = record_owner.accepted
     if record_owner.terminal is not None:
         outcome.terminal_digest = _spell(record_owner.terminal.outcome_digest)
         outcome.terminal_canonical_bytes = bytes(record_owner.terminal.outcome_canonical_bytes)
-        body = documents.read(record_owner.terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        body = documents.parse(outcome.terminal_canonical_bytes, pb.AttemptOutcomeBody)
         outcome.terminal = body
         # The triage read, exactly as cl-006 will do it: take the opaque subject off the
         # terminal, and read the bundle BY KEY, verified against its in-memory receipt.
         # Nothing here holds a path to it.
-        outcome.triage_subject = str((body.get("triage_bundle") or {}).get("subject_id", ""))
+        outcome.triage_subject = body.triage_bundle.subject_id
         if outcome.triage_subject:
             with contextlib.suppress(triage.TriageError, canonical.CanonicalError):
                 outcome.triage = triage.BundleStore.read(
@@ -1676,33 +1645,25 @@ def _collect(
                     worker.records,
                 )
                 outcome.triage_explained = triage.explain(outcome.triage)
-        outcome.status = pb.OutcomeStatus.Name(
-            body.get("status", pb.OutcomeStatus.OUTCOME_STATUS_UNSPECIFIED)
-        )
+        outcome.status = pb.OutcomeStatus.Name(body.status)
         outcome.redispatchable = redispatchable(body)
-        envelope = body.get("result") or {}
-        inline = envelope.get("inline_result")
-        if isinstance(inline, str):
+        if body.result.inline_result:
             # The typed result rode the terminal INLINE. Read it with the canonical reader
             # that wrote it, never a looser JSON parser: the whole point of the envelope is
             # that the bytes a RecordOwner holds and the value a caller sees are one thing.
-            decoded = canonical.parse(_b64(inline))
+            decoded = canonical.parse(body.result.inline_result)
             outcome.result = decoded if isinstance(decoded, dict) else {"value": decoded}
-        outcome.result_schema_digest = str(envelope.get("result_schema_digest", ""))
-        manifest = body.get("output_manifest") or {}
-        outcome.manifest = list(manifest.get("outputs", ()))
         outcome.publication = next(
-            (row["body"] for row in outcome.attempt_records if row.get("kind") == "publication"),
-            {},
+            (row.body for row in outcome.attempt_records if row.kind == "publication"), {}
         )
-        for row in outcome.manifest:
-            path = record_owner.destination(str(row.get("output_id", "")))
+        for row in body.output_manifest.outputs:
+            path = record_owner.destination(row.output_id)
             if path.is_file() or path.is_dir():
-                outcome.outputs[str(row["output_id"])] = str(path)
+                outcome.outputs[row.output_id] = str(path)
 
     outcome.placement_set_digest = _spell(record_owner.placement_set_digest)
     outcome.placement_set_canonical_bytes = record_owner.placement_set_canonical_bytes
-    outcome.worker_resources = documents.body(record_owner.worker_resources)
+    outcome.worker_resources = record_owner.worker_resources
     placement = next(
         (
             item
@@ -1713,7 +1674,7 @@ def _collect(
         None,
     )
     if placement is not None:
-        outcome.accelerator_qualification = documents.body(placement.accelerator)
+        outcome.accelerator_qualification = placement.accelerator
 
     marks = record_owner.marks
     outcome.timings = {
@@ -1730,7 +1691,7 @@ def _collect(
     outcome.timings["wall_ms"] = round((time.perf_counter() - started) * 1000, 2)
 
     # A closed one-shot run has no remaining reader for its disposable workspace.
-    closed = any(row.get("kind") == "closed" for row in outcome.attempt_records)
+    closed = any(row.kind == "closed" for row in outcome.attempt_records)
     if delete_workspace and closed:
         shutil.rmtree(worker.root, ignore_errors=True)
         outcome.workspace_deleted = True
@@ -1740,17 +1701,3 @@ def _collect(
 def _spell(raw: bytes) -> str:
     """`sha256:<hex>`, or the empty string for a digest a mode genuinely does not have."""
     return documents.spell(raw) if len(raw) == 32 else ""
-
-
-def _b64(text: str) -> bytes:
-    import base64
-
-    return base64.b64decode(text)
-
-
-def _record_rows(source: WorkerRecords) -> list[dict[str, Any]]:
-    """Project the current process's ordered worker facts."""
-    return [
-        {"seq": row.seq, "kind": row.kind, "at_unix_ms": row.at_unix_ms, "body": row.body}
-        for row in source.records
-    ]

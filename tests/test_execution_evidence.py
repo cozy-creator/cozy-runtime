@@ -246,7 +246,7 @@ def test_the_triage_bundle_keeps_the_record_and_each_row_once() -> None:
             )
     sys.modules.pop(MODULE, None)
     assert outcome.result == {"steps": 4}, (outcome.error, outcome.faults)
-    assert outcome.triage, (outcome.triage_subject, outcome.terminal.get("triage_bundle"))
+    assert outcome.triage, (outcome.triage_subject, outcome.terminal.triage_bundle)
     measurements = outcome.triage["measurements"]
     [rank] = measurements["execution"]["ranks"]
     assert measurements["execution"]["degree"] == 1 and rank["pid"] not in (0, os.getpid())

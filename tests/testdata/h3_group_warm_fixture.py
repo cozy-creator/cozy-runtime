@@ -35,6 +35,7 @@ from cozy_runtime.internal.local import (
 )
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 from cozy_runtime.internal.worker.session import WorkerOptions
+from cozy_runtime.protocol import documents
 
 PACKAGE = Path(__file__).parent / "h3_group_warm"
 sys.path.insert(0, str(PACKAGE))
@@ -215,7 +216,7 @@ def main() -> None:
         "exit_code": outcome.exit_code,
         "faults": outcome.faults,
         "result": outcome.result,
-        "accepted": outcome.accepted,
+        "accepted": documents.body(outcome.accepted),
         "executions": outcome.executions,
     }
     (root / "outcome.json").write_text(json.dumps(report, indent=2) + "\n")
