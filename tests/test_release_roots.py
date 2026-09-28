@@ -264,6 +264,7 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
         assert [urlsplit(path).path for path in catalog.reads] == [
             tenant,
             tenant + "/locked-requirements",
+            f"/v1/packages/{CALLEE}",
             callee,
             callee + "/locked-requirements",
             "/v1/packages/cozytest/tenant/bindings",
@@ -410,7 +411,7 @@ def test_an_unstated_manifest_length_is_measured_from_the_bytes_its_digest_names
     try:
         receipt, _ = submit(machine, submission(machine, "first"))
         assert receipt.request_id == "first"
-        assert [urlsplit(path).path for path in catalog.reads][4:] == [
+        assert [urlsplit(path).path for path in catalog.reads][5:] == [
             "/v1/packages/cozytest/tenant/bindings",
             "/v1/models/resolve",
             f"/v1/models/{PACKAGE}/checkpoints/{machine.manifest}",
@@ -437,6 +438,43 @@ def state_installation(machine: Machine, request: str) -> str:
     offer = machine.executions.offer(OWNER, request)
     spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
     return str(spec["installation_id"])
+
+
+def test_a_newer_callee_release_serves_the_callee_a_lock_names(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tenant's lock names callee 1.0.0; the catalog publishes 1.1.0, which serves its
+    calls. A lock is a floor, so a callee fix needs no relock of its callers."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    length = len(
+        tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+    )
+    catalog = Catalog(
+        machine.manifest, length, [{"gpu": "H100", "lane": LANE}], interface=machine.interface
+    )
+    path = f"/v1/packages/{CALLEE}"
+    catalog.releases[path]["releases"].append({"release": "1.1.0"})
+    catalog.releases[f"{path}/releases/1.1.0"] = {
+        **catalog.releases[f"{path}/releases/{RELEASE}"],
+        "release": {"release": "1.1.0"},
+    }
+    catalog.releases[f"{path}/releases/1.1.0/locked-requirements"] = (
+        b"callee==1.1.0 --hash=sha256:" + b"c" * 64 + b"\n"
+    )
+    catalog.serve(machine)
+    try:
+        receipt, _ = submit(machine, submission(machine, "newer"))
+        assert receipt.request_id == "newer"
+        capture = machine.executions.capture(OWNER, "newer")
+        assert [row["key"] for row in capture["deferred_installations"]] == [f"{CALLEE}@1.1.0"]
+        assert f"{path}/releases/{RELEASE}" not in [urlsplit(row).path for row in catalog.reads]
+    finally:
+        catalog.close()
 
 
 def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
