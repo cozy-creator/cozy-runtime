@@ -39,8 +39,15 @@ the last consumer leaves. Completed verified TensorFS objects survive cancellati
 and can be reused; model pull resumes at the object boundary. CPU validation
 already in progress finishes within its ordinary construction boundary. Preparation
 counts as active work until it stops, while cached metadata does not extend the
-rental idle window. Background progress is a log observation and does not overwrite
-the current inference stage or percentage.
+rental idle window. Background progress is a log observation (once per hundredth of
+its bytes, with `unit: bytes` and a rate) and does not overwrite the current inference
+stage or percentage.
+
+Every model pull is two `model fetch` log records on the parent: `start` (model,
+manifest, entrypoint, whether it is a prefetch, the step it blocks) and `end` (bytes,
+moved bytes, elapsed time, rate). A call held for its callee's preparation writes
+`model wait` records (`start`, then `end` with `waited_ms`) naming its step, so a client
+times the step without the wait and the wait as the download's.
 
 This optimization currently applies to captured machine-local composition.
 Unsupported remote/older workers can decline it and keep ordinary demand loading.

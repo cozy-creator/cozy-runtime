@@ -173,6 +173,21 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             row.get("position") == row.get("total") and row.get("total", 0) > 0
             for row in observations
         )
+        # The prefetch's byte samples say they count bytes; its pull is one fetch record
+        # at each end, naming the model, and the end has its bytes, time and rate.
+        assert all(
+            row.get("unit") == "bytes" for row in observations if row.get("position") is not None
+        )
+        fetch = [row["fields"] for row in progress if row.get("name") == "model fetch"]
+        assert [row["event"] for row in fetch] == ["start", "end"]
+        start, end = fetch
+        assert start["model"] == end["model"] == "proof/model" and start["manifest"] == manifest
+        assert (
+            start["prefetch"] is True and start["step"] == "" and start["entrypoint"] == "generate"
+        )
+        assert end["completed"] is True and end["bytes"] == end["total_bytes"] > 0
+        assert end["moved_bytes"] == end["bytes"] and end["elapsed_ms"] > 0
+        assert end["rate_bytes_per_second"] > 0
         # The exact finished selection serves every demand; nothing is prepared again.
         again = serving._shared("owner", call, target, request, {}, speculative=False)
         assert again is not None and again is first
@@ -196,9 +211,10 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         thread.join()
 
 
-def test_a_prefetch_narrates_each_tenth_of_its_download_once() -> None:
+def test_a_prefetch_narrates_each_hundredth_of_its_download_once() -> None:
     """Run 1510's 100 GB prefetch logged 4,065 positions: 4,065 of the run's 4,096 events.
-    A demanded download's positions stay its live progress, on the lossy lane."""
+    A hundredth a watcher can read; a demanded download's positions stay its live progress,
+    on the lossy lane."""
     rows: list[dict[str, Any]] = []
     worker = cast(
         Worker,
@@ -215,8 +231,8 @@ def test_a_prefetch_narrates_each_tenth_of_its_download_once() -> None:
                 serving._progress(call, request, frame)
     finally:
         serving.close()
-    hinted, demanded = rows[:11], rows[11:]
-    assert [row["fields"]["position"] for row in hinted] == list(range(0, 1001, 100))
+    hinted, demanded = rows[:101], rows[101:]
+    assert [row["fields"]["position"] for row in hinted] == list(range(0, 1001, 10))
     assert {row["name"] for row in hinted} == {"model-prefetch"}
     assert [row["position"] for row in demanded] == list(range(1001))
     assert serving.narrated == {}
@@ -269,3 +285,33 @@ def test_narrated_positions_never_shed_a_record() -> None:
     # A bundle over its cap sheds the narration before any record.
     kept = msgspec.json.decode(bundle.build(len(bundle.build()) - 1), type=triage.Assembly)
     assert (kept.streams, len(kept.events), kept.caps["shed_to_fit"]) == ([], MAX_EVENTS, 1)
+
+
+def test_a_call_held_for_weights_says_which_step_waits_and_for_how_long() -> None:
+    """Run 1560's five references read 5m35s each: 28 s of work behind a 4m34s download of
+    weights another call started. A held call names its step, so the step is timed without
+    the wait and the wait is the download's."""
+    rows: list[dict[str, Any]] = []
+    worker = cast(
+        Worker,
+        SimpleNamespace(
+            workspace=None,
+            emit_progress=lambda _p, _o, frame: rows.append(frame),
+            calls=SimpleNamespace(progress_label=lambda *_: "Creating reference Subject-4"),
+        ),
+    )
+    serving = Serving(worker)
+    call = Call("parent", 3, 1, 0, b"", b"", "call-4", b"", False, b"", "", "")
+    target = Target("installed-model", "generate_image", {}, {}, None, "")
+    try:
+        released = serving.holding(call, pb.ChildCallRequest(parent_attempt_ordinal=1), target)
+        time.sleep(0.01)
+        released()
+    finally:
+        serving.close()
+    start, end = (row["fields"] for row in rows)
+    assert {row["name"] for row in rows} == {"model wait"}
+    assert (start["event"], end["event"]) == ("start", "end")
+    assert start["step"] == end["step"] == "Creating reference Subject-4"
+    assert start["call"] == "call-4" and start["entrypoint"] == "generate_image"
+    assert end["waited_ms"] >= 10

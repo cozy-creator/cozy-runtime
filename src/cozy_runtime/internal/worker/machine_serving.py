@@ -41,7 +41,7 @@ from . import (
 )
 from .machine_child_target import Target
 from .preparations import Preparations
-from .stage_progress import Emit
+from .stage_progress import Emit, StageProgress
 from .supervisor import Unit
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
@@ -223,15 +223,16 @@ class Serving:
             observer(frame)
             return
         if call.call_index == (1 << 32) - 1 and frame.get("kind") == "progress":
-            # A prefetch narrates on its parent's durable log, so once per tenth of its bytes:
-            # every position filled 4,065 of run 1510's 4,096 events and hid its segments.
+            # A prefetch narrates on its parent's durable log, so once per hundredth of its
+            # bytes: every position filled 4,065 of run 1510's 4,096 events and hid its
+            # segments, and a tenth left a watcher a minute and a half between readings.
             total, position = frame.get("total"), frame.get("position", 0)
             if isinstance(total, int) and isinstance(position, int) and total > 0:
-                tenth = position * 10 // total
-                if tenth <= self.narrated.get(call.child_request, -1):
+                hundredth = position * 100 // total
+                if hundredth <= self.narrated.get(call.child_request, -1):
                     return
-                self.narrated[call.child_request] = tenth
-                if tenth >= 10:
+                self.narrated[call.child_request] = hundredth
+                if hundredth >= 100:
                     self.narrated.pop(call.child_request, None)
             frame = {
                 "kind": "log",
@@ -277,6 +278,106 @@ class Serving:
                     },
                 },
             )
+
+    @contextlib.contextmanager
+    def fetching(
+        self,
+        call: Call,
+        request: pb.ChildCallRequest,
+        target: Target,
+        row: machine_model_defaults.Selected,
+    ) -> Iterator[Callable[[int, int], None]]:
+        """One model's pull, on its parent's durable log: a record when it starts, naming the
+        model and the step it blocks (none for a prefetch), and one when it ends, with its
+        bytes, time and rate. A call that waits on it says so itself (`holding`)."""
+        prefetch = call.call_index == (1 << 32) - 1
+        step = (
+            ""
+            if prefetch
+            else self.worker.calls.progress_label(
+                call.parent_request, request.parent_attempt_ordinal, call.call_index
+            )
+        )
+        started, started_ms = time.perf_counter(), int(time.time() * 1000)
+        landed: list[int] = []  # first sample, latest sample, total
+
+        def sample(available: int, total: int) -> None:
+            landed[:] = [landed[0] if landed else available, available, total]
+
+        def record(fields: dict[str, object]) -> None:
+            self._progress(
+                call,
+                request,
+                {
+                    "kind": "log",
+                    "name": "model fetch",
+                    "value": "info",
+                    "at_unix_ms": int(time.time() * 1000),
+                    "fields": {
+                        "model": row.repository,
+                        "manifest": row.manifest.digest,
+                        "entrypoint": target.entrypoint,
+                        "prefetch": prefetch,
+                        "step": step,
+                        "started_unix_ms": started_ms,
+                        **fields,
+                    },
+                },
+            )
+
+        record({"event": "start"})
+        completed = False
+        try:
+            with self.phase(call, request, "Downloading model weights"):
+                yield sample
+            completed = True
+        finally:
+            elapsed = time.perf_counter() - started
+            fields: dict[str, object] = {
+                "event": "end",
+                "completed": completed,
+                "elapsed_ms": round(elapsed * 1000, 3),
+            }
+            if landed:
+                first, latest, total = landed
+                fields.update(bytes=latest, total_bytes=total, moved_bytes=latest - first)
+                if elapsed > 0:
+                    fields["rate_bytes_per_second"] = round((latest - first) / elapsed, 1)
+            record(fields)
+
+    def holding(
+        self, call: Call, request: pb.ChildCallRequest, target: Target
+    ) -> Callable[[], None]:
+        """A call held for its callee's model preparation (a download, then its check): the
+        step it runs in, when it started waiting and, from the returned callable, for how
+        long, so the step is timed without the wait."""
+        step = self.worker.calls.progress_label(
+            call.parent_request, request.parent_attempt_ordinal, call.call_index
+        )
+        started = time.perf_counter()
+
+        def record(fields: dict[str, object]) -> None:
+            self._progress(
+                call,
+                request,
+                {
+                    "kind": "log",
+                    "name": "model wait",
+                    "value": "info",
+                    "at_unix_ms": int(time.time() * 1000),
+                    "fields": {
+                        "step": step,
+                        "call": call.child_request,
+                        "entrypoint": target.entrypoint,
+                        **fields,
+                    },
+                },
+            )
+
+        record({"event": "start"})
+        return lambda: record(
+            {"event": "end", "waited_ms": round((time.perf_counter() - started) * 1000, 3)}
+        )
 
     def close(self) -> None:
         self.preparations.close()
@@ -448,8 +549,13 @@ class Serving:
         finally:
             self.waiting.discard(unit.key)
         future.add_done_callback(lambda _: unit.poke())
-        if not unit.wait_for(lambda: future.done() or waiting()) or not future.done():
-            return False
+        waited = None if future.done() else self.holding(call, request, target)
+        try:
+            if not unit.wait_for(lambda: future.done() or waiting()) or not future.done():
+                return False
+        finally:
+            if waited is not None:
+                waited()
         prepared = None
         try:
             prepared = future.result()
@@ -747,17 +853,18 @@ class Serving:
                     cancellation.cancel,
                 )
 
+            # The download's bytes and rate, once a second, on the ordinary progress lane.
+            stage: list[StageProgress] = []
+
             def progress(available: int, total: int) -> None:
-                self._progress(
-                    call,
-                    request,
-                    {
-                        "kind": "progress",
-                        "stage": target.entrypoint + " / Downloading model weights",
-                        "position": available,
-                        "total": total,
-                    },
-                )
+                if not stage:
+                    stage.append(
+                        StageProgress(
+                            target.entrypoint + " / Downloading model weights",
+                            lambda frame: self._progress(call, request, frame),
+                        )
+                    )
+                stage[0].update(available, total)
                 if check is not None:
                     check.poke()
 
@@ -766,7 +873,7 @@ class Serving:
                     worker,
                     defaults,
                     access if matched is None else None,
-                    downloading=lambda: self.phase(call, request, "Downloading model weights"),
+                    downloading=lambda row: self.fetching(call, request, target, row),
                     cancellation=cancellation,
                     progress=progress,
                 )

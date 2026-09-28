@@ -67,6 +67,10 @@ class _Capture(msgspec.Struct, frozen=True):
     model_defaults: tuple[Captured, ...] = ()
 
 
+# One model's pull: the bytes landed of its total.
+Sample = Callable[[int, int], None]
+
+
 class Selected(msgspec.Struct, frozen=True, kw_only=True):
     """One slot's exact checkpoint for this machine, as a preparation lands and binds it."""
 
@@ -297,7 +301,9 @@ def materialize(
     rows: Iterable[Mapping[str, object]],
     access: ExitStack | None,
     *,
-    downloading: Callable[[], AbstractContextManager[None]] = nullcontext,
+    downloading: Callable[[Selected], AbstractContextManager[Sample | None]] = (
+        lambda _: nullcontext()
+    ),
     cancellation: Cancellation | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> None:
@@ -307,6 +313,7 @@ def materialize(
     admission still verifies and retains every checkpoint before submission. A cold
     preparation pulls its slots at once and reports their summed bytes: run 1510 pulled
     H3's 1.6 GB turbo adapter after its 100 GB base, 46 s more before the first segment.
+    `downloading` brackets one model's pull and may take its own byte samples.
     """
     selected = decode(rows)
     if not selected:
@@ -317,8 +324,11 @@ def materialize(
     pulled: dict[str, tuple[int, int]] = {}
     lock = threading.Lock()
 
-    def report(digest: str, available: int, total: int) -> None:
-        assert progress is not None
+    def report(digest: str, sample: Sample | None, available: int, total: int) -> None:
+        if sample is not None:
+            sample(available, total)
+        if progress is None:
+            return
         with lock:
             pulled[digest] = (available, total)
             landed = sum(done for done, _ in pulled.values())
@@ -339,7 +349,7 @@ def materialize(
             try:
                 store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
             except facade.errors.Refusal:
-                with downloading():
+                with downloading(row) as sample:
                     facade.pull(
                         store,
                         row.public_origin,
@@ -349,7 +359,9 @@ def materialize(
                         allow_local=local_development(worker),
                         streams=8,
                         cancellation=cancellation,
-                        progress=None if progress is None else partial(report, manifest.digest),
+                        progress=None
+                        if progress is None and sample is None
+                        else partial(report, manifest.digest, sample),
                     )
                 store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
 
