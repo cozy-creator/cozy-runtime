@@ -75,6 +75,18 @@ def test_preparation_lossless_handoff_and_idempotence(tmp_path: Path, orientatio
     assert source.read_bytes() == original
 
 
+def test_preparation_accepts_any_codec_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs 1563/1564: an exact PyAV/Pillow/libav closure refused every image input on a pod
+    that resolved a newer codec. Preparation must work on whatever codec is installed."""
+    source = tmp_path / "photo.png"
+    Image.linear_gradient("L").resize((900, 600)).convert("RGB").save(source)
+    monkeypatch.setattr(av, "__version__", "99.0.0")
+    prepared = decode(source, ImagePreparation(max_edge=300))
+    assert (prepared.width, prepared.height) == (300, 200)
+
+
 def test_jpeg_orientation_reads_only_bounded_header_segments(tmp_path: Path) -> None:
     source = tmp_path / "orientation.jpg"
     exif = Image.Exif()

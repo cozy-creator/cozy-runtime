@@ -37,10 +37,7 @@ from cozy_runtime.author._decode import (
     image_target_size,
 )
 from cozy_runtime.author._errors import AuthorError, CapabilityError
-from cozy_runtime.author._image_profile import (
-    image_preparation_profile,
-    require_image_preparation_profile,
-)
+from cozy_runtime.author._image_profile import image_preparation_profile
 from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE, ImagePreparation
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, sniff
 from cozy_runtime.cli.io import CliError, Result
@@ -140,7 +137,7 @@ def _prepare(request: _Request) -> Result:
         # Raw fallback keeps normal Runtime validation; do not decode small images twice.
         return _raw(source, source_length, source_mime, request.max_bytes)
     try:
-        require_image_preparation_profile(_av())
+        _av()
     except CapabilityError:
         return _raw(source, source_length, source_mime, request.max_bytes)
     carrier = next(
