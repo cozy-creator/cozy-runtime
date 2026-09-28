@@ -7822,10 +7822,12 @@ class Worker:
         if self.activity_file is None:
             return
         try:
+            held = activity.holding(self)
             self.activity_file.publish(
                 owner_attached=bool(self.attached_streams),
                 attempts_in_flight=self.engine.in_flight(),
-                active_work=activity.active_work(self),
+                active_work=bool(held),
+                holding=held,
                 execution_retention_required=(
                     self.executions is not None
                     and self.fence.record_owner_recorded

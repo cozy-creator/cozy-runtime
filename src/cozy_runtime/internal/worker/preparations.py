@@ -86,9 +86,15 @@ class Preparations[T]:
                         del self.entries[key]
             self._schedule()
 
-    def active(self) -> bool:
+    def started(self) -> list[str]:
+        """The preparations under way. A queued one, a hint still waiting for a worker
+        among them, is no work yet."""
         with self.lock:
-            return any(not entry.future.done() for entry in self.entries.values())
+            return [
+                str(key)
+                for key, entry in self.entries.items()
+                if entry.started and not entry.future.done()
+            ]
 
     def _schedule(self) -> None:
         if self.closed:

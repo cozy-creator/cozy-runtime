@@ -17,6 +17,7 @@ from cozy_runtime.author._calls import _Broker, _CallType, _current
 from cozy_runtime.internal.worker import activity
 from cozy_runtime.internal.worker.preparations import Preparations
 from cozy_runtime.internal.worker.session import Worker
+from cozy_runtime.protocol import worker_pb2 as pb
 
 
 class Payload(msgspec.Struct):
@@ -100,7 +101,7 @@ def test_background_preparation_overlaps_current_work_and_demand_joins() -> None
         assert demanded is hinted and count == 1
         finish.set()
         assert demanded is not None and demanded.result(5) == b"verified model binding"
-        assert current_work.is_set() and not queue.active()
+        assert current_work.is_set() and not queue.started()
         assert queue.request("exact-B", ("second-parent", 1), prepare, speculative=False) is hinted
     finally:
         finish.set()
@@ -154,6 +155,46 @@ def test_speculation_reserves_demand_capacity_and_promotes_queued_work() -> None
         queue.close()
 
 
+def idle_worker(queue: Preparations[bytes]) -> Worker:
+    """A worker doing nothing but its preparations."""
+    return cast(
+        Worker,
+        SimpleNamespace(
+            phase=pb.WorkerPhase.WORKER_PHASE_ONLINE,
+            supervisor=SimpleNamespace(keys=lambda _prefix: []),
+            machine_calls=SimpleNamespace(serving=SimpleNamespace(preparations=queue)),
+            preparation_lock=threading.Lock(),
+            placement=None,
+            hosted={},
+        ),
+    )
+
+
+def test_a_queued_hint_holds_nothing_and_work_under_way_is_named() -> None:
+    """A hint still waiting for a worker is no work: it never keeps the machine from idling.
+    The preparation under way is named as what holds the machine."""
+    queue = Preparations[bytes]()
+    go = threading.Event()
+    worker = idle_worker(queue)
+    try:
+        demanded = queue.request(
+            "model-a", "caller", lambda _: go.wait(5) and b"", speculative=False
+        )
+        queue.request("model-c", "caller", lambda _: go.wait(5) and b"", speculative=False)
+        queue.request("model-b", "parent", lambda _: go.wait(5) and b"", speculative=True)
+        deadline = time.monotonic() + 5
+        while len(queue.started()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # Both workers prepare demanded models; the hint waits, and holds nothing.
+        assert "model-b" in queue.entries
+        assert activity.holding(worker) == ["preparation:model-a", "preparation:model-c"]
+        go.set()
+        assert demanded is not None and demanded.result(5) == b""
+    finally:
+        go.set()
+        queue.close()
+
+
 def test_last_interest_cancels_native_work_and_activity_lasts_until_it_stops() -> None:
     queue = Preparations[bytes]()
     started, native_cancel, stop_finished = (threading.Event() for _ in range(3))
@@ -167,17 +208,7 @@ def test_last_interest_cancels_native_work_and_activity_lasts_until_it_stops() -
         assert stop_finished.wait(5)
         return b"partial native bytes retained"
 
-    worker = cast(
-        Worker,
-        SimpleNamespace(
-            machine_calls=SimpleNamespace(serving=SimpleNamespace(preparations=queue)),
-            preparation_lock=threading.Lock(),
-            placement=None,
-            hosted={},
-            engine=SimpleNamespace(PRE_RELEASE=(), history={}),
-            executions=None,
-        ),
-    )
+    worker = idle_worker(queue)
     try:
         first = queue.request(
             "B", "parent-one", transfer, speculative=True, cancel=native_cancel.set

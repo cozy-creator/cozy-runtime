@@ -2,6 +2,9 @@
   "active_work": true,
   "attempts_in_flight": 1,
   "execution_retention_required": false,
+  "holding": [
+    "unit:execution:job-4f2a"
+  ],
   "meter": "5482930715:19b4dd2f0c5a7e63",
   "owner_attached": true,
   "sequence": 137,

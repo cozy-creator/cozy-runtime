@@ -29,6 +29,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: (tensorhub `pod-supervisor/activity.go`); a change here is a change there, and the
 #: fixture in each repo is what catches a drift in one of them.
 VERSION = 2
+MAX_HOLDING, MAX_REASON = 12, 96
 
 
 class ActivityFile:
@@ -57,10 +58,16 @@ class ActivityFile:
         meter: str | None,
         active_work: bool,
         execution_retention_required: bool = False,
+        holding: list[str] | None = None,
     ) -> None:
         with self._lock:
             self._publish(
-                owner_attached, attempts_in_flight, meter, active_work, execution_retention_required
+                owner_attached,
+                attempts_in_flight,
+                meter,
+                active_work,
+                execution_retention_required,
+                holding or [],
             )
 
     def _publish(
@@ -70,6 +77,7 @@ class ActivityFile:
         meter: str | None,
         active_work: bool,
         execution_retention_required: bool,
+        holding: list[str],
     ) -> None:
         self.sequence += 1
         document: dict[str, Any] = {
@@ -82,6 +90,9 @@ class ActivityFile:
             "owner_attached": owner_attached,
             "attempts_in_flight": attempts_in_flight,
             "active_work": active_work,
+            # What keeps the machine from idling, for whoever asks why it has not: bounded so
+            # the document stays inside the supervisor's 4 KiB read.
+            "holding": [reason[:MAX_REASON] for reason in holding[:MAX_HOLDING]],
             "execution_retention_required": execution_retention_required,
             "meter": meter,
             "still_factor": liveness.STILL_FACTOR,
@@ -104,25 +115,34 @@ class ActivityFile:
             raise
 
 
-def active_work(worker: Worker) -> bool:
-    """Work this machine owes: a supervised unit, a preparation, or an activating placement.
-    Every open execution has a live unit unless the worker FAILED, and a FAILED worker failed
-    them all, so it holds no rental.
+def holding(worker: Worker) -> list[str]:
+    """What this machine is doing that keeps it from idling: a supervised unit, a model
+    preparation under way, the preparation lock, an activating placement. Every open
+    execution has a live unit unless the worker FAILED, and a FAILED worker failed them all,
+    so it holds nothing. A queued preparation holds nothing until it starts.
 
     Do not take the control lock: model preparation can hold it for minutes while
     the reporter must keep telling the supervisor that preparation is active.
     """
     if worker.phase == pb.WorkerPhase.WORKER_PHASE_FAILED:
-        return False
-    if worker.supervisor.busy():
-        return True
+        return []
+    held = [f"unit:{key}" for key in worker.supervisor.keys("")]
     calls = worker.machine_calls
-    if calls is not None and calls.serving.preparations.active():
-        return True
+    if calls is not None:
+        held += [f"preparation:{key}" for key in calls.serving.preparations.started()]
     if worker.preparation_lock.locked():
-        return True
+        held.append("preparation_lock")
     placements = [worker.placement, *(h.placement for h in tuple(worker.hosted.values()))]
-    return any(p and p.serving == pb.SERVING_STATE_ACTIVATING for p in placements)
+    held += [
+        f"activating:{p.placement_id}"
+        for p in placements
+        if p and p.serving == pb.SERVING_STATE_ACTIVATING
+    ]
+    return held
+
+
+def active_work(worker: Worker) -> bool:
+    return bool(holding(worker))
 
 
 def meter(worker: Worker) -> str | None:

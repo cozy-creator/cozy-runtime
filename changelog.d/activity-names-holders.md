@@ -1,0 +1,1 @@
+The activity document names what keeps the machine from idling (`holding`: supervised units, preparations under way, the preparation lock, activating placements), so an idle release that does not come says why. A queued preparation, a hint still waiting for a worker, holds nothing until it starts.
