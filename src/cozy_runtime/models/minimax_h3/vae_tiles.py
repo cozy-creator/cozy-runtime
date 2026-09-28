@@ -27,6 +27,8 @@ from collections.abc import Iterator
 
 import torch
 from diffusers import AutoencoderKLMiniMaxH3
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from diffusers.models.modeling_utils import get_parameter_dtype
 
 from cozy_runtime.author import spread
 
@@ -124,6 +126,40 @@ class TileBatchedVideoVAE(AutoencoderKLMiniMaxH3):  # type: ignore[misc]
         token_drop = self.config.token_drop
         return moments[:, :, :-token_drop] if token_drop > 0 else moments
 
+    def encode_frames(
+        self,
+        pixels: torch.Tensor,
+        pixel_mean: tuple[float, float, float],
+        pixel_std: tuple[float, float, float],
+    ) -> DiagonalGaussianDistribution:
+        """`encode` of uint8 `(1, 3, T, H, W)` pixels normalized as `encode_condition` does,
+        each clip normalized on the rank that encodes it: a clip crosses to a follower as
+        uint8, a quarter of its float32 bytes (run 1516: 3.5-3.9 s per continuation export).
+        Normalization is elementwise and padding repeats the last frame, so every clip's
+        floats are the ones `_encode` would slice from the normalized video."""
+        clip_length = self.config.clip_length
+        if pixels.shape[2] % clip_length:
+            pad = pixels[:, :, -1:].repeat(1, 1, (-pixels.shape[2]) % clip_length, 1, 1)
+            pixels = torch.cat([pixels, pad], dim=2)
+        clips = (
+            (pixels[:, :, i : i + clip_length], pixel_mean, pixel_std)
+            for i in range(0, pixels.shape[2], clip_length)
+        )
+        moments = torch.cat(list(spread(self, "_encode_frames_clip", clips)), dim=2)
+        token_drop = self.config.token_drop
+        if token_drop > 0:
+            moments = moments[:, :, :-token_drop]
+        return DiagonalGaussianDistribution(moments)
+
+    def _encode_frames_clip(
+        self,
+        clip: torch.Tensor,
+        pixel_mean: tuple[float, float, float],
+        pixel_std: tuple[float, float, float],
+    ) -> torch.Tensor:
+        dtype = get_parameter_dtype(self.encoder)  # as `encode` aligns its pixels
+        return self._encode_clip(_normalized(clip, pixel_mean, pixel_std).to(dtype))
+
     def _decode_clip(self, z: torch.Tensor) -> torch.Tensor:
         if not self.use_tiling:
             return self.decoder(self.post_quant_conv(z))
@@ -175,13 +211,25 @@ def encode_condition(
     exactly as that step lays them out."""
     device = next(vae.parameters()).device
     pixels = pixels.to(device)
-    if pixels.ndim == 3:
-        pixels = pixels.permute(2, 0, 1)[None, :, None]
+    if pixels.ndim == 4 and isinstance(vae, TileBatchedVideoVAE):
+        posterior = vae.encode_frames(pixels.permute(3, 0, 1, 2)[None], pixel_mean, pixel_std)
     else:
-        pixels = pixels.permute(3, 0, 1, 2)[None]
-    mean = torch.tensor(pixel_mean, device=pixels.device).view(1, -1, 1, 1, 1)
-    std = torch.tensor(pixel_std, device=pixels.device).view(1, -1, 1, 1, 1)
-    pixels = (pixels.to(torch.float32).div(255.0) - mean) / std
-    posterior = vae.encode(pixels, return_dict=False)[0]
+        if pixels.ndim == 3:
+            pixels = pixels.permute(2, 0, 1)[None, :, None]
+        else:
+            pixels = pixels.permute(3, 0, 1, 2)[None]
+        posterior = vae.encode(_normalized(pixels, pixel_mean, pixel_std), return_dict=False)[0]
     latents = posterior.sample(generator=torch.Generator().manual_seed(seed))
     return latents.to(torch.float16).float()
+
+
+def _normalized(
+    pixels: torch.Tensor,
+    pixel_mean: tuple[float, float, float],
+    pixel_std: tuple[float, float, float],
+) -> torch.Tensor:
+    """Diffusers' `encode_vae_condition` pixel convention: uint8 to float32, over 255, minus
+    the per-channel mean, over the per-channel std."""
+    mean = torch.tensor(pixel_mean, device=pixels.device).view(1, -1, 1, 1, 1)
+    std = torch.tensor(pixel_std, device=pixels.device).view(1, -1, 1, 1, 1)
+    return (pixels.to(torch.float32).div(255.0) - mean) / std

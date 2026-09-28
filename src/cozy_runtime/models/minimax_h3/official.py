@@ -1482,7 +1482,9 @@ class OfficialH3Pipeline:
                     pixels = reference.frames[:count].copy()
                 else:
                     continue
-                visual[index] = (pixels, (*identity, *reference_digest(pixels)))
+                # A context window has no memo: hashing its 170 MB of pixels buys nothing.
+                key = () if memo is None else (*identity, *reference_digest(pixels))
+                visual[index] = (pixels, key)
             latents: dict[int, Any] = {}
             if memo is not None:
                 for index, (_, key) in visual.items():
@@ -1752,8 +1754,9 @@ class OfficialH3Pipeline:
             )
         raw = tail.export(frames, state.audio[0], int(state.sampling_rate), provenance)
         encoded = {}
-        # Run exactly the native reference encoder, separately for each requested
-        # window. Do not slice latent suffixes: both VAEs have window-local grids.
+        # Run exactly the native reference encoder (`_encode_references`, its clips spread
+        # as uint8), separately for each requested window. Do not slice latent suffixes:
+        # both VAEs have window-local grids.
         for count in sorted(set(windows)):
             selected = raw.select(count)
             encoding = PipelineState(
@@ -1768,7 +1771,8 @@ class OfficialH3Pipeline:
                     ],
                 }
             )
-            self._run("ref2va", "vae_encoder", encoding, component="video_vae")
+            with _audio_weight_norm_scope(self.components["audio_vae"]):
+                self._encode_references("ref2va", encoding, None)
             encoded[count] = (
                 encoding.condition_latents[0].detach().float().cpu().contiguous(),
                 encoding.audio_condition_latents[0].detach().float().cpu().contiguous(),

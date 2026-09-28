@@ -1,0 +1,1 @@
+H3's continuation export and video-reference encodes spread their VAE clips to the group's ranks as uint8 pixels, normalized on the rank that encodes them, a quarter of the float32 bytes the attempt spool used to copy through the host; the latents are bitwise the official reference encoder's. The export no longer hashes its context window.

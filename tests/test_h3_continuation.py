@@ -17,6 +17,7 @@ from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (  # n
 from diffusers.modular_pipelines.minimax_h3 import (  # noqa: E402
     MiniMaxH3Blocks,
     MiniMaxH3ModularPipeline,
+    MiniMaxH3VideoReference,
 )
 from diffusers.modular_pipelines.modular_pipeline import PipelineState  # noqa: E402
 
@@ -251,6 +252,21 @@ def test_export_encodes_only_the_named_windows_of_the_landed_tail() -> None:
     for ours, theirs in zip(one.windows[22], every.windows[22], strict=True):
         assert torch.equal(ours, theirs)
     assert decode_context(encode_context(one)).select(22).frame_count == 22
+    # The export's encoder, its clips spread as uint8, is Diffusers' reference encoder step
+    # over the same window, value for value.
+    window = state.completed_av_tail.export(frames, state.audio[0], 32000, "p").select(56)
+    official = PipelineState()
+    official.set(
+        "normalized_references",
+        [
+            MiniMaxH3VideoReference(
+                frames=window.frames, fps=24.0, audio=window.audio, sample_rate=window.sample_rate
+            )
+        ],
+    )
+    pipe._run("ref2va", "vae_encoder", official, component="video_vae")
+    theirs = (official.condition_latents[0], official.audio_condition_latents[0])
+    assert all(torch.equal(a, b.float()) for a, b in zip(every.windows[56], theirs, strict=True))
     with pytest.raises(InvalidRequest):
         pipe.export_completed_av_tail(state, frames=frames, windows=(), provenance="p")
     with pytest.raises(InvalidRequest, match="completed"):
