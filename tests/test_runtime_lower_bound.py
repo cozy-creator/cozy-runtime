@@ -170,3 +170,60 @@ def test_a_lower_bound_installs_the_machines_runtime_and_a_frozen_one_is_rebuilt
     assert _runtime(rebuilt.python) == expected
     assert _runtime(frozen.python) == LOCKED, "a running executor's generation is kept"
     assert package_installation.refresh(root, "legacy").generation == rebuilt.generation
+
+
+def test_a_published_installation_follows_the_machines_runtime(tmp_path: Path) -> None:
+    """A published release's installation keeps its lock. Built on a machine that ran another
+    Runtime (it was updated since), installing it again rebuilds its SDK as a new generation
+    at this machine's Runtime; the rest of the lock stays as installed."""
+    project = tmp_path / "project"
+    _source(project)
+    exported = subprocess.run(
+        ["uv", "export", "--frozen", "--no-dev", "--no-emit-project", "--project", str(project)],
+        env=package_install_environment(),
+        capture_output=True,
+        check=True,
+    ).stdout
+    mine, published = importlib.metadata.version("cozy-runtime"), _published().releases
+    expected = mine if mine in published else max(published, key=Version)
+    root = tmp_path / "installs"
+
+    def install() -> package_installation.InstalledEnvironment:
+        return package_installation.install(
+            root,
+            package="proof/bound-probe",
+            release="1.0.0",
+            python=PYTHON,
+            installation_id="published",
+            requirements=exported,
+        )
+
+    first = install()
+    assert _runtime(first.python) == expected
+    assert not package_installation.stale(root, "published")
+    # As a machine on the lock's Runtime left it.
+    subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(first.python),
+            "--no-deps",
+            f"cozy-runtime=={LOCKED}",
+        ],
+        env=package_install_environment(),
+        capture_output=True,
+        check=True,
+    )
+    path = root / "installations/published/installation.json"
+    record = json.loads(path.read_text())
+    record["machine"] = {"cozy-runtime": LOCKED}
+    path.write_text(json.dumps(record))
+    assert package_installation.stale(root, "published")
+
+    again = install()
+    assert again.generation != first.generation
+    assert _runtime(again.python) == expected
+    assert not package_installation.stale(root, "published")
+    assert install().generation == again.generation

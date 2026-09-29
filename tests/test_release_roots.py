@@ -536,6 +536,49 @@ def state_installation(machine: Machine, request: str) -> str:
     return str(spec["installation_id"])
 
 
+def test_a_placement_built_against_another_runtime_is_prepared_again(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held placement whose environment chose its SDK against another machine Runtime (the
+    machine was updated since) is not reused as it is: the root prepares it again, and its
+    installation follows this Runtime (`package_installation.refresh`)."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    length = len(
+        tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+    )
+    catalog = Catalog(
+        machine.manifest, length, [{"gpu": "H100", "lane": LANE}], interface=machine.interface
+    )
+    catalog.serve(machine)
+    installs: list[pb.PreparePackageSetRequest] = []
+    prepare = machine.worker.prepare_package_set
+
+    def counted(request: pb.PreparePackageSetRequest) -> Any:
+        installs.append(request)
+        return prepare(request)
+
+    monkeypatch.setattr(machine.worker, "prepare_package_set", counted)
+    try:
+        submit(machine, submission(machine, "before"))
+        submit(machine, submission(machine, "warm"))
+        assert len(installs) == 1, "a current placement is reused"
+        # The installation keeps its lock and was built against another machine Runtime.
+        directory = machine.install_root / "installations" / state_installation(machine, "before")
+        (directory / "requirements.txt").write_bytes(LOCKED)
+        record = json.loads((directory / "installation.json").read_text())
+        record["machine"] = {"cozy-runtime": "0.0.1"}
+        (directory / "installation.json").write_text(json.dumps(record))
+        submit(machine, submission(machine, "after-update"))
+        assert len(installs) == 2, "a placement built against another Runtime was reused"
+    finally:
+        catalog.close()
+
+
 def test_a_newer_callee_release_serves_the_callee_a_lock_names(
     published: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -258,6 +258,14 @@ def _cancelled(root: Path, request_id: str) -> bool:
         return False
 
 
+def _distribution_version(name: str) -> str:
+    """An installed distribution's version in this environment, or ""."""
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+
+
 def _proc_status(field: str) -> str:
     with open("/proc/self/status") as handle:
         for line in handle:
@@ -709,6 +717,7 @@ class Executor:
             "python_abi": (sys.implementation.cache_tag or "").replace("cpython-", "cp"),
             "python_executable": sys.executable,
             "runtime_version": RUNTIME_VERSION,
+            "tensorfs_version": _distribution_version("tensorfs"),
             "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
             "native_interfaces": native_interfaces.stated(),
             #: what the worker's memory manager may ask beyond the floor's commands

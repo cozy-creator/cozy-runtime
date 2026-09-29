@@ -2402,6 +2402,24 @@ class Worker:
             if event == "gpu.wait":
                 self._gpu_waiting(owner, root, body, view)
 
+    def _record_executor(self, attempt: AttemptRecord) -> None:
+        """The SDK the attempt's executor loaded, as it stated in its hello, on the execution's
+        root: what ran it, which a package environment built against another Runtime shows."""
+        executor = attempt.executor
+        if self.executions is None or executor is None:
+            return
+        owner = self.fence.record_owner_id
+        body = {
+            "request": attempt.request_id,
+            "attempt": attempt.attempt,
+            "pid": executor.pid,
+            "runtime_version": str(executor.hello.get("runtime_version", "")),
+            "tensorfs_version": str(executor.hello.get("tensorfs_version", "")),
+        }
+        with contextlib.suppress(WorkspaceRefusal):
+            root, _ = self.executions.scheduling_root(owner, attempt.request_id)
+            self.executions.record(owner, root, "executor", body)
+
     def gpu_identity(self, ordinal: int) -> execution_evidence.GpuIdentity:
         """Envelope ordinal `ordinal` as the GPU a person names (`execution_evidence.identify`)."""
         entries = self.lanes.entries
@@ -6692,6 +6710,7 @@ class Worker:
 
         A terminal built here is one the device phase itself produced (cancelled before
         dispatch, the executor died, the worker faulted) and is sent at once."""
+        self._record_executor(attempt)
         with self.memory.watch(lane) as seen:
             try:
                 released = self.engine.execute(attempt)

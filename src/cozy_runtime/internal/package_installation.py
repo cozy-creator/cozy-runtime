@@ -448,7 +448,8 @@ def _install(
                 "package_installation_conflict",
                 "installation ID belongs to another package release",
             )
-        return installed
+        # Held from before a Runtime update: its SDK follows this machine's Runtime.
+        return _refresh(root, identifier, cache, lock_fd)
     directory.parent.mkdir(parents=True, exist_ok=True, mode=0o711)
     directory.mkdir(exist_ok=True, mode=0o711)
     # A failure retains unpublished uv state for the next operation replay. The process
@@ -508,36 +509,58 @@ def _install(
     )
 
 
+def _retained(directory: Path) -> bool:
+    """Whether an installation keeps the inputs it was built from: a synced source, wheels,
+    or a published release's lock."""
+    return any((directory / name).exists() for name in ("source", "wheels", "requirements.txt"))
+
+
+def stale(root: Path, installation_id: str) -> bool:
+    """Whether an installation's SDK was chosen against another machine Runtime than this
+    one (a Runtime update) and `refresh` rebuilds it."""
+    directory = _directory(root, installation_id)
+    try:
+        record = _read_record(directory)
+    except (OSError, msgspec.DecodeError):
+        return False
+    return record.get("machine") != machine_sdk() and _retained(directory)
+
+
 def refresh(root: Path, installation_id: str, *, cache: Path | None = None) -> InstalledEnvironment:
     """The installation, rebuilt from its retained inputs as a new generation when its SDK
     was chosen against another machine Runtime (a Runtime update): its ID names a package
     revision, not an executor. Executors of the old generation keep its files."""
-    directory = _directory(root, installation_id)
     with _installation_lock(root, installation_id) as lock_fd:
-        installed = open_installation(root, installation_id)
-        record = _read_record(directory)
-        machine = machine_sdk()
-        retained = (directory / "source").is_dir() or (directory / "wheels").is_dir()
-        if record.get("machine") == machine or not retained:
-            return installed
-        key = hashlib.sha256(json.dumps(machine, sort_keys=True).encode()).hexdigest()[:16]
-        generation = directory / f"venv-{key}"
-        shutil.rmtree(generation, ignore_errors=True)
-        sdk = _build(
-            directory,
-            generation,
-            Path(record.get("interpreter", installed.python)),
-            package=installed.package,
-            release=installed.release,
-            environment=_environment(directory, cache),
-            lock_fd=lock_fd,
-        )
-        record["machine"], record["sdk"] = machine, sdk
-        _write_record(directory, generation, record)
-        for stale in directory.glob("venv*"):
-            if stale not in (generation, installed.generation):
-                shutil.rmtree(stale, ignore_errors=True)
-        return open_installation(root, installation_id)
+        return _refresh(root, installation_id, cache, lock_fd)
+
+
+def _refresh(
+    root: Path, installation_id: str, cache: Path | None, lock_fd: int
+) -> InstalledEnvironment:
+    directory = _directory(root, installation_id)
+    installed = open_installation(root, installation_id)
+    record = _read_record(directory)
+    machine = machine_sdk()
+    if record.get("machine") == machine or not _retained(directory):
+        return installed
+    key = hashlib.sha256(json.dumps(machine, sort_keys=True).encode()).hexdigest()[:16]
+    generation = directory / f"venv-{key}"
+    shutil.rmtree(generation, ignore_errors=True)
+    sdk = _build(
+        directory,
+        generation,
+        Path(record.get("interpreter", installed.python)),
+        package=installed.package,
+        release=installed.release,
+        environment=_environment(directory, cache),
+        lock_fd=lock_fd,
+    )
+    record["machine"], record["sdk"] = machine, sdk
+    _write_record(directory, generation, record)
+    for old in directory.glob("venv*"):
+        if old not in (generation, installed.generation):
+            shutil.rmtree(old, ignore_errors=True)
+    return open_installation(root, installation_id)
 
 
 def open_existing_environment(
