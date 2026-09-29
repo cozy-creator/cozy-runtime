@@ -83,3 +83,13 @@ func TestUnsupportedInstalledBundleCannotReplaceRepairAgent(t *testing.T) {
 		t.Fatal("uncommitted unsupported application was not refused")
 	}
 }
+
+func TestApplicationReplacementRequiresTransactionEvenWhenBundleSupportsABI(t *testing.T) {
+	root := t.TempDir()
+	executable(t, filepath.Join(root, "opt/cozy/python/bin/cozy-machine"), `echo '{"name":"cozy-machine","wire_minor":68,"minimum_wire_minor":64,"capabilities":["hub-access/1","runtime-update/1","machine-bootstrap/1"]}'`)
+	d := &directLauncher{root: root, out: io.Discard}
+	answer, err := d.maintain("agent-replace", []string{"another-running-agent"})
+	if err != nil || answer != "" || d.replacement != "" {
+		t.Fatalf("unjournaled application replacement: %q %v", answer, err)
+	}
+}

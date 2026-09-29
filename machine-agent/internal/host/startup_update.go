@@ -371,7 +371,7 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 	if slices.Contains(status.Failed, next) {
 		return skip("candidate previously failed; waiting for a different published pair")
 	}
-	if next == verified {
+	if next == verified && m.applicationMatchesBundle() {
 		return skip("installed pair is current within its compatible major lines")
 	}
 	if err := os.MkdirAll(m.startupPath(), 0o700); err != nil {
@@ -573,4 +573,18 @@ func (m *Machine) transactionPending() bool {
 func automaticSoftwareUpdates(root string) (bool, error) {
 	policy, _, err := readSoftwarePolicy(root)
 	return err == nil && policy.StartupUpdate == "auto", err
+}
+
+// An application-only change still needs the same rollback/readiness transaction,
+// even when both Python distribution versions are already current.
+func (m *Machine) applicationMatchesBundle() bool {
+	if m.grant == nil || m.grant.agentBefore == "" || m.transactionAgent() != "bundled" {
+		return true
+	}
+	current, err := hashFile(m.grant.agentBefore)
+	if err != nil {
+		return false
+	}
+	selected, err := hashFile(filepath.Join(m.layout.Root, "opt/cozy/python/bin/cozy-machine"))
+	return err == nil && current == selected
 }
