@@ -138,19 +138,17 @@ def encode_png(width: int, height: int, rgb: bytes) -> bytes:
     return body
 
 
-def encode_webp(width: int, height: int, rgb: bytes, *, method: int = 5) -> bytes:
-    """Encode exact RGB pixels with WebP's maximum practical lossless settings.
+def encode_webp(width: int, height: int, rgb: bytes) -> bytes:
+    """Encode exact RGB pixels as lossless WebP at its fastest effort.
 
-    Method 5 is the measured knee: on the retained 1024px Anima output, method 6 took
-    17.16s instead of 1.41s to save only another 10,296 bytes. Compression is lossless,
-    quality 100 and exact either way; method 6 would turn output packaging into a second
-    inference tail. Input preparation uses method 0 to prioritize upload latency;
-    either choice preserves exactly the same pixels.
+    Lossless and exact at every setting: effort trades only bytes for time. On three
+    1024px SDXL outputs, method 5 at quality 100 took 1.15 s for 1.07 MB; method 0 at
+    quality 50 took 0.12 s for 1.20 MB. Packaging is on every image run's critical path.
     """
 
     encoded = io.BytesIO()
     _image(width, height, rgb).save(
-        encoded, format="WEBP", lossless=True, method=method, quality=100, exact=True
+        encoded, format="WEBP", lossless=True, method=0, quality=50, exact=True
     )
     body = encoded.getvalue()
     if len(body) < 12 or body[:4] != b"RIFF" or body[8:12] != b"WEBP":

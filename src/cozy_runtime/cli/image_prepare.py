@@ -153,7 +153,7 @@ def _prepare(request: _Request) -> Result:
     )
     # Choose and encode once. A second format is never tried to improve this result.
     encoded = (
-        _codec.encode_webp(image.width, image.height, image.rgb, method=0)
+        _codec.encode_webp(image.width, image.height, image.rgb)
         if carrier == "image/webp"
         else _codec.encode_png(image.width, image.height, image.rgb)
     )
