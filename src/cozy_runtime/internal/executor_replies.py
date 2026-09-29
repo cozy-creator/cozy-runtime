@@ -138,6 +138,8 @@ class AttemptReply(msgspec.Struct, frozen=True, kw_only=True):
     result_ref: ResultRef | None = None
     result_schema_digest: str = ""
     adjustments: tuple[Adjustment, ...] = ()
+    ignored: tuple[str, ...] = ()
+    """Request fields the package's types do not declare, dropped before decoding."""
     oversize_result_bytes: int = 0
     metrics: Metrics = Metrics()
 
@@ -179,6 +181,7 @@ _ADVISORY: dict[type, frozenset[str]] = {
             "execution",
             "attention_applied",
             "adjustments",
+            "ignored",
             "oversize_result_bytes",
             "metrics",
         }
