@@ -4407,6 +4407,7 @@ class Executor:
             "rss_after_bytes": after,
             "rss_released_bytes": max(0, before - after) if min(before, after) >= 0 else -1,
             "host_memory": self.planner.host_memory() if self.planner is not None else {},
+            "host_reclaim": self.planner.host_reclaim_status() if self.planner is not None else {},
         }
 
     def vacate(self, residents: bool = True, ranks: tuple[int, ...] = ()) -> dict[str, Any]:

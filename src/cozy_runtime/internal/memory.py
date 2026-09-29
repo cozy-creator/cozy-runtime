@@ -147,6 +147,7 @@ class Held:
     #: a scope declaring it is open
     whole: bool = False
     last_used: int = 0
+    readonly_lost_reason: str = ""
     ops: dict[str, Callable[..., object]] = field(default_factory=dict)
 
 
@@ -933,18 +934,95 @@ class Planner:
                 break
         return self._released_host_bytes(before)
 
+    @staticmethod
+    def _unit_host_backings(
+        unit: tiers.Unit, *, cached: bool = True, resident: bool = True
+    ) -> dict[int, int]:
+        found: dict[int, int] = {}
+        tensors = list(unit.host.values()) if cached else []
+        if resident and unit.tier == HOST:
+            tensors.extend(tensor for *_, tensor in unit.slots())
+        for tensor in tensors:
+            if tensor.device.type == "cpu":
+                storage = tensor.untyped_storage()
+                found[storage.data_ptr()] = storage.nbytes()
+        return found
+
     def _host_backings(self, *, cached: bool = True, resident: bool = True) -> dict[int, int]:
         found: dict[int, int] = {}
         for held in self.held.values():
             for unit in held.part.units:
-                tensors = list(unit.host.values()) if cached else []
-                if resident and unit.tier == HOST:
-                    tensors.extend(tensor for *_, tensor in unit.slots())
-                for tensor in tensors:
-                    if tensor.device.type == "cpu":
-                        storage = tensor.untyped_storage()
-                        found[storage.data_ptr()] = storage.nbytes()
+                found.update(self._unit_host_backings(unit, cached=cached, resident=resident))
         return found
+
+    def host_reclaim_status(self) -> dict[str, object]:
+        """Explain current gates without changing backing or claiming RSS ownership.
+
+        Byte totals deduplicate storage within each reason and component. Shared
+        backing can appear under multiple reasons; those subtotals are not additive.
+        """
+        blocked = (
+            "active_stack"
+            if self.stack
+            else "active_scope"
+            if self.scopes
+            else "group_phase"
+            if self.group_phase
+            else ""
+        )
+        reasons: dict[str, dict[int, int]] = {}
+        components: dict[str, object] = {}
+        for held in self.held.values():
+            part = held.part
+            compiled = held.compiled or _compiled(part.root)
+            whole_ready = all(
+                unit.tier in (HOST, DISK)
+                and unit.readonly
+                and not unit.mutable
+                and tiers.store_safe(unit)
+                for unit in part.units
+            )
+            local: dict[str, dict[int, int]] = {}
+            for unit in part.units:
+                backing = self._unit_host_backings(unit)
+                if not backing:
+                    continue
+                if blocked:
+                    reason = blocked
+                elif compiled:
+                    reason = "compiled_component"
+                elif unit.mutable:
+                    reason = "mutable_state"
+                elif not unit.readonly:
+                    reason = "readonly_authority_lost"
+                elif unit.tier == DEVICE:
+                    reason = "eligible_cached_copy"
+                elif part.store is None:
+                    reason = "no_store"
+                elif not tiers.store_safe(unit):
+                    reason = "unsafe_storage_geometry"
+                elif not part.unit_loads and not whole_ready:
+                    reason = "whole_component_not_droppable"
+                else:
+                    reason = "eligible_host_weight"
+                local.setdefault(reason, {}).update(backing)
+                reasons.setdefault(reason, {}).update(backing)
+            if local:
+                components[held.key] = {
+                    "bytes_by_reason": {
+                        reason: sum(backing.values()) for reason, backing in local.items()
+                    },
+                    "readonly_lost_reason": held.readonly_lost_reason,
+                    "unit_loads": part.unit_loads,
+                    "has_store": part.store is not None,
+                    "compiled": compiled,
+                }
+        return {
+            "bytes_by_reason": {
+                reason: sum(backing.values()) for reason, backing in reasons.items()
+            },
+            "components": components,
+        }
 
     def host_memory(self) -> dict[str, int]:
         """Deduplicated managed CPU storage, separate from the process's total RSS."""
@@ -1058,7 +1136,10 @@ class Planner:
         held.last_used = self.clock
         self.seq.append(held.key)
         self._pin_state(held)
-        readonly = retryable or self._state_contract(held, leaves)
+        contract_reason = "" if retryable else self._state_contract_reason(held, leaves)
+        readonly = not contract_reason
+        if contract_reason and not held.readonly_lost_reason:
+            held.readonly_lost_reason = contract_reason
         for unit in held.part.units:
             unit.readonly = unit.readonly and readonly and not unit.mutable
             if not unit.readonly:
@@ -1859,15 +1940,19 @@ class Planner:
 
     def _state_contract(self, held: Held, leaves: list[object]) -> bool:
         """The current body and hooks are covered, even where replay is disabled."""
+        return not self._state_contract_reason(held, leaves)
+
+    def _state_contract_reason(self, held: Held, leaves: list[object]) -> str:
+        """The first unproven contract, retained when an operation loses readonly authority."""
         torch = self.torch
         root = held.part.root
         hooks = torch.nn.modules.module
         if hooks._global_forward_hooks or hooks._global_forward_pre_hooks:
-            return False
+            return "global_forward_hook"
         custom = getattr(root, "_cozy_retry_state", None)
         forward = tiers.original(getattr(root, "forward", None))
         if custom is None and not (is_declared_pure(root) or is_declared_pure(forward)):
-            return False
+            return "undeclared_root"
 
         def identity(value: object) -> tuple[int, int]:
             value = tiers.original(value)
@@ -1881,7 +1966,7 @@ class Planner:
                 getattr(hook, "_is_stateful", True) and identity(hook) not in claimed_hooks
                 for hook in getattr(registry, "hooks", {}).values()
             ):
-                return False
+                return "stateful_diffusers_hook"
             # The module contract covers class implementations, but not an unclassified
             # replacement installed afterward. Our adapters retain the actual callable.
             replaced = tiers.original(vars(module).get("forward"))
@@ -1894,9 +1979,9 @@ class Planner:
                     is getattr(type(module), "forward", None)
                 )
             ):
-                return False
+                return "unclaimed_forward_replacement"
             if not all(tiers.ours(fn) or identity(fn) in claimed_hooks for fn in _hook_fns(module)):
-                return False
+                return "unclaimed_forward_hook"
         plain = (
             *_SCALAR,
             torch.Tensor,
@@ -1905,9 +1990,10 @@ class Planner:
             torch.device,
             torch.nn.Module,
         )
-        return (custom is not None and not getattr(root, "_cozy_retry_plain_args", False)) or all(
-            isinstance(leaf, plain) for leaf in leaves
-        )
+        covered = (
+            custom is not None and not getattr(root, "_cozy_retry_plain_args", False)
+        ) or all(isinstance(leaf, plain) for leaf in leaves)
+        return "" if covered else "unsupported_argument_state"
 
     def _arm(self, held: Held, leaves: list[object]) -> Snapshot:
         torch = self.torch

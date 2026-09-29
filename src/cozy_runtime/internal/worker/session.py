@@ -6014,7 +6014,8 @@ class Worker:
             self.memory.note(
                 f"host reclaim {tenant.slot!r}: managed_released_bytes="
                 f"{reply.get('managed_released_bytes', 0)}, rss_before_bytes={before}, "
-                f"rss_after_bytes={after}; grants use freshly observed aggregate headroom"
+                f"rss_after_bytes={after}; grants use freshly observed aggregate headroom; "
+                f"retained={json.dumps(reply.get('host_reclaim', {}), sort_keys=True)}"
             )
         facts = reply.get("host_memory", {})
         if not isinstance(facts, dict):
