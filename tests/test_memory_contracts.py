@@ -165,7 +165,9 @@ def test_memory_capabilities_are_additive_and_current_extras_are_supported() -> 
     legacy.pop("memory")
     require_executor_protocol(legacy)
     # A current peer can advertise the full set and independent future capabilities.
-    require_executor_protocol({**hello, "memory": [*hello["memory"], "future_memory_probe"]})
+    require_executor_protocol(
+        {**hello, "memory": [*sorted(EXECUTOR_MEMORY_CAPABILITIES), "future_memory_probe"]}
+    )
 
 
 def test_additive_rank_facts_do_not_change_the_attempt_outcome() -> None:

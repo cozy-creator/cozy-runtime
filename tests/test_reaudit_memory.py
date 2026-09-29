@@ -74,23 +74,14 @@ def test_modeled_invoke_refills_disk_weights_and_records_the_invoke_leg(
 
     from cozy_runtime.author import pure
 
-    class Model(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.empty(2, device="meta"))
-
-        @pure
-        def forward(self, value: object) -> object:
-            return value + self.weight.sum()
-
-    root = Model()
+    root = pure(nn.Linear(2, 1, bias=False, device="meta"))
     owner = memory.Planner(torch, torch.device("cpu"))
     loaded: list[str] = []
 
     class Store:
         def load(self, name: str) -> None:
             loaded.append(name)
-            root.weight = torch.nn.Parameter(torch.ones(2))
+            root.weight = torch.nn.Parameter(torch.ones(1, 2))
 
         def load_unit(self, name: str, unit: object) -> None:
             raise AssertionError("this component is restored as a whole")
@@ -123,8 +114,8 @@ def test_modeled_invoke_refills_disk_weights_and_records_the_invoke_leg(
     monkeypatch.setattr(owner, "_cap", lambda: None)
     monkeypatch.setattr(owner, "_arm", lambda *_: memory.Snapshot([], [], (), (), lambda: (), None))
     with torch.no_grad():
-        value = owner.run(held, "forward", root.forward, (torch.tensor(3.0),), {})
-    assert value == 5
+        value = owner.run(held, "forward", root.forward, (torch.tensor([3.0, 4.0]),), {})
+    assert value == 7
     counts = owner.operations["c/model.forward"]
     assert counts["placement_calls"] == counts["invoke_calls"] == 1
     assert owner.refilled == 8 and held.part.on("device") == 8
