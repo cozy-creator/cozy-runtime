@@ -8,6 +8,13 @@ Build from this directory with `go build .`; run with `cozy-machine run` and the
 machine grant in its environment. `cozy-machine version --json` reports identity.
 No Creator checkout or client configuration is required.
 
+The Linux x86-64 and ARM64 `cozy-runtime` PyPI wheels include the `cozy-machine`
+executable. `uv pip install cozy-runtime` installs it alongside the Python commands;
+installation does not start a service. The wheel uses the standard scripts
+installation directory and contains the native executable, with no Python launcher
+or first-run binary download. The portable wheel and source distribution remain
+toolchain-free and do not contain the Linux agent.
+
 The personal controller and Tensorhub both connect to this machine API. A local
 machine uses `COZY_MACHINE_LIFETIME=persistent`, a stable locally generated
 `COZY_WORKER_ID`, its root/port, and `COZY_AUTHORIZED_KEYS`. It needs no Hub
@@ -40,7 +47,15 @@ source provenance records, not deployment-equality requirements.
 Delivery and lifecycle integration are tracked at
 https://github.com/cozy-creator/tracker/issues/249.
 
-Build a release from committed source with
+The Runtime PyPI publisher builds both static agents from its release source and
+includes them in Linux wheels. The included executable reports that Runtime release
+version; transport compatibility still uses capabilities and worker-protocol ranges.
+The native-kernel x86-64 wheel also contains the agent. Additional Python-independent
+Linux x86-64/ARM64 wheels carry the agent without CUDA kernels. macOS and Windows
+continue to install the portable Python wheel.
+
+Standalone artifacts remain available for existing image and client installers.
+Build a standalone release from committed source with
 `scripts/build-release.sh --version VERSION --output /absolute/output`.
 The private repository's `machine-agent` workflow runs the tests and makes the
 same artifacts on manual dispatch. It does not publish or need a public-repo
