@@ -171,7 +171,7 @@ def test_worker_execution_boundary_excludes_preparation_and_postprocessing(
     timing = Timing(executions, calls, lambda *_: "Render", monotonic=lambda: clock[0])
     timing.phase("owner", call.child_request, 1, "preparing", fresh=True)
     clock[0] = 90
-    settled = []
+    settled: list[object] = []
     outcome = object()
 
     def execute(attempt: Any) -> object:

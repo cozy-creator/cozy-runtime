@@ -8,7 +8,6 @@ for its unobserved interval. Finalizing is wall time after author execution retu
 from __future__ import annotations
 
 import logging
-import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -17,7 +16,6 @@ from typing import Literal
 
 from cozy_runtime.internal import effect_interfaces, source_interfaces
 from cozy_runtime.internal.canonical import Json
-from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
 
@@ -73,7 +71,7 @@ class Timing:
     ) -> dict[str, Json]:
         try:
             return self._phase(owner, request, attempt, phase, fresh=fresh, status=status)
-        except (WorkspaceRefusal, OSError, sqlite3.Error):
+        except Exception:
             # Observability cannot refuse an accepted call or abandon its valid outcome.
             # Once an interval is unrecorded, later totals for this attempt are unknown.
             with self.lock:
