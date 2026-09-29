@@ -50,8 +50,8 @@ https://github.com/cozy-creator/tracker/issues/249.
 The Runtime PyPI publisher builds both static agents from its release source and
 includes them in Linux wheels. The included executable reports that Runtime release
 version; transport compatibility still uses capabilities and worker-protocol ranges.
-The native-kernel x86-64 wheel also contains the agent. Additional Python-independent
-Linux x86-64/ARM64 wheels carry the agent without CUDA kernels. macOS and Windows
+The native-kernel x86-64 wheel (glibc 2.28+) also contains the agent. A Python-independent
+Linux ARM64 wheel (glibc 2.17+) carries the agent without CUDA kernels. macOS and Windows
 continue to install the portable Python wheel.
 
 Standalone artifacts remain available for existing image and client installers.

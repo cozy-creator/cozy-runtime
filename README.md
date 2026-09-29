@@ -1,6 +1,6 @@
 # cozy-runtime (v2)
 
-Installing a `cozy-runtime` PyPI wheel on glibc Linux x86-64 or ARM64 also installs
+Installing a `cozy-runtime` PyPI wheel on supported glibc Linux also installs
 `cozy-machine`, the standalone machine API and Runtime supervisor. For example:
 
 ```sh
@@ -13,6 +13,7 @@ an explicit operation. The agent runs as a separate process from the Python
 Runtime and from the client controller. See [machine-agent/README.md](machine-agent/README.md).
 The portable wheel and source distribution remain available for Runtime use on
 other platforms; the machine agent currently requires Linux process containment.
+The agent wheels support x86-64 with glibc 2.28+ and ARM64 with glibc 2.17+.
 Source-only, portable-wheel and musl installations do not include the agent.
 The ARM64 agent wheel does not remove native-build requirements of dependencies
 that do not yet publish ARM64 wheels.

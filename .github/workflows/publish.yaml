@@ -124,7 +124,7 @@ jobs:
       # Everything visible in dist/ is uploaded, so the set is exact; the digests travel to
       # `publish` outside the artifact.
       - id: dist
-        name: Release carries the sdist, portable wheel and three Linux wheels
+        name: Release carries the sdist, portable wheel and two Linux wheels
         working-directory: source
         run: |
           uv run --no-project --python 3.12 python - <<'PY'
@@ -134,7 +134,6 @@ jobs:
               f"cozy_runtime-{v}.tar.gz",
               f"cozy_runtime-{v}-py3-none-any.whl",
               f"cozy_runtime-{v}-cp312-abi3-manylinux_2_28_x86_64.whl",
-              f"cozy_runtime-{v}-py3-none-manylinux_2_17_x86_64.whl",
               f"cozy_runtime-{v}-py3-none-manylinux_2_17_aarch64.whl",
           }
           dist = pathlib.Path("dist")

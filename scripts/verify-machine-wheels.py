@@ -36,7 +36,6 @@ def main() -> None:
     expected = {
         "py3-none-any": None,
         "cp312-abi3-manylinux_2_28_x86_64": 62,
-        "py3-none-manylinux_2_17_x86_64": 62,
         "py3-none-manylinux_2_17_aarch64": 183,
     }
     assert {w.name for w in wheels} == {f"cozy_runtime-{version}-{tag}.whl" for tag in expected}, (
@@ -70,9 +69,6 @@ def main() -> None:
             assert binary[:6] == b"\x7fELF\x02\x01", "expected a 64-bit little-endian ELF"
             assert int.from_bytes(binary[18:20], "little") == architecture
             binaries[str(tag)] = binary
-    assert (
-        binaries["cp312-abi3-manylinux_2_28_x86_64"] == binaries["py3-none-manylinux_2_17_x86_64"]
-    ), "both x86 wheels must carry the same agent"
 
     for minor in (12, 13, 14):
         for platforms, want in (
@@ -80,7 +76,7 @@ def main() -> None:
                 ["manylinux_2_28_x86_64", "manylinux_2_17_x86_64"],
                 "cp312-abi3-manylinux_2_28_x86_64",
             ),
-            (["manylinux_2_17_x86_64"], "py3-none-manylinux_2_17_x86_64"),
+            (["manylinux_2_17_x86_64"], "py3-none-any"),
             (["manylinux_2_17_aarch64"], "py3-none-manylinux_2_17_aarch64"),
             (["win_amd64"], "py3-none-any"),
             (["macosx_14_0_arm64"], "py3-none-any"),
@@ -116,22 +112,10 @@ def main() -> None:
             str(dist),
             f"cozy-runtime=={version}",
         )
-        for expected_tag in ("cp312-abi3-manylinux_2_28_x86_64", "py3-none-manylinux_2_17_x86_64"):
-            if expected_tag.startswith("py3-"):
-                run(
-                    "uv",
-                    "pip",
-                    "install",
-                    "--python",
-                    python,
-                    "--no-deps",
-                    "--reinstall",
-                    str(dist / f"cozy_runtime-{version}-{expected_tag}.whl"),
-                )
-            command = venv / "bin/cozy-machine"
-            assert command.read_bytes() == binaries[expected_tag]
-            identity = json.loads(run(str(command), "version", "--json"))
-            assert identity["name"] == "cozy-machine" and identity["version"] == version
+        command = venv / "bin/cozy-machine"
+        assert command.read_bytes() == binaries["cp312-abi3-manylinux_2_28_x86_64"]
+        identity = json.loads(run(str(command), "version", "--json"))
+        assert identity["name"] == "cozy-machine" and identity["version"] == version
         run("uv", "pip", "uninstall", "--python", python, "cozy-runtime")
         assert not command.exists(), "uninstall must remove the owned command"
     print(f"{version}: RECORDs, ELF platforms, modes, selection, installs and uninstall verified")

@@ -23,7 +23,7 @@ from email.parser import BytesParser
 from pathlib import Path
 
 NATIVE_TAG = "cp312-abi3-manylinux_2_28_x86_64"
-PLATFORMS = {"amd64": "x86_64", "arm64": "aarch64"}
+ARCHITECTURES = ("amd64", "arm64")
 
 
 def bundle(source: Path, binary: Path, tag: str, destination: Path) -> Path:
@@ -64,7 +64,10 @@ def bundle(source: Path, binary: Path, tag: str, destination: Path) -> Path:
         subprocess.run(
             [sys.executable, "-m", "wheel", "pack", str(tree), "--dest-dir", str(output)],
             check=True,
-            env={**os.environ, "SOURCE_DATE_EPOCH": os.environ.get("SOURCE_DATE_EPOCH", "946684800")},
+            env={
+                **os.environ,
+                "SOURCE_DATE_EPOCH": os.environ.get("SOURCE_DATE_EPOCH", "946684800"),
+            },
         )
         (built,) = output.glob("*.whl")
         target = destination / built.name
@@ -86,16 +89,16 @@ def main() -> None:
             "build the pure and native Runtime wheels at the agent's release version first"
         )
     binaries = {}
-    for arch in PLATFORMS:
+    for arch in ARCHITECTURES:
         binary = args.agents / f"cozy-machine-linux-{arch}"
         expected = manifest["platforms"][f"linux-{arch}"]["sha256"]
         if hashlib.sha256(binary.read_bytes()).hexdigest() != expected:
             raise ValueError(f"{binary.name} differs from the built agent manifest")
         binaries[arch] = binary
-    # Build the portable Linux wheels first; then replace only the staged native
-    # wheel. No published artifact is modified by this packaging command.
-    for arch, platform in PLATFORMS.items():
-        bundle(pure, binaries[arch], f"py3-none-manylinux_2_17_{platform}", args.dist)
+    # Keep one Linux wheel per architecture: older updaters select the first
+    # matching wheel, so a second x86 wheel must not silently drop CUDA kernels.
+    # No published artifact is modified by this packaging command.
+    bundle(pure, binaries["arm64"], "py3-none-manylinux_2_17_aarch64", args.dist)
     bundle(native, binaries["amd64"], NATIVE_TAG, args.dist)
 
 
