@@ -1027,8 +1027,10 @@ class Worker:
         # Captured machine executions persist their immutable receipt and restore this
         # same inventory after restart, independent of their code's publication origin.
         self.prepared_installations: dict[tuple[str, str, bytes], Placement] = {}
-        #: a published installation's described interface, by (installation, distribution)
-        self._published_interfaces: dict[tuple[str, str], bytes] = {}
+        #: Successful interfaces of owned environment incarnations, shared by all prepares.
+        self._installed_interfaces: dict[
+            tuple[str, tuple[int, int, int, int], Path, str, str], bytes
+        ] = {}
         self.local_operations: dict[tuple[str, str], Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
@@ -1912,9 +1914,33 @@ class Worker:
         *,
         application: str = "",
     ) -> bytes:
-        """Import package code only inside a dedicated preparation executor."""
+        """Describe an owned environment incarnation once, in an isolated executor.
+
+        Installation validation/refresh precedes this call. Adopted mutable environments
+        have no incarnation and must be rediscovered. The record is replaced on every
+        rebuild, including repairs and SDK rollbacks to a previously used venv path.
+        """
+        from cozy_runtime.internal import package_interface
+
+        key = (
+            (
+                installed.installation_id,
+                installed.incarnation,
+                installed.generation,
+                distribution,
+                application,
+            )
+            if installed.incarnation is not None
+            else None
+        )
         with self.preparation_slot:
-            return self._describe_in_slot(installed, distribution, application=application)
+            if key is not None and key in self._installed_interfaces:
+                return self._installed_interfaces[key]
+            raw = self._describe_in_slot(installed, distribution, application=application)
+            package_interface.parse(raw, "installed package interface")
+            if key is not None:
+                self._installed_interfaces[key] = raw
+            return raw
 
     def _describe_in_slot(
         self,
@@ -1974,18 +2000,6 @@ class Worker:
         finally:
             supervision.close()
 
-    def _describe_published(
-        self, installed: package_installation.InstalledEnvironment, distribution: str
-    ) -> bytes:
-        """A published installation is content-keyed and immutable: describe it once."""
-        key = (installed.installation_id, distribution)
-        raw = self._published_interfaces.get(key)
-        if raw is None:
-            raw = self._published_interfaces[key] = self._describe_installed(
-                installed, distribution
-            )
-        return raw
-
     def _prepare_local_in(
         self, request: pb.PrepareLocalPackageRequest
     ) -> pb.PreparePackageSetResult:
@@ -2033,7 +2047,7 @@ class Worker:
         published: list[package_installation.InstalledEnvironment] = []
         result = package_prepare.prepare_package_set(
             machine_release_catalog.complete(self, request),
-            describe=self._describe_published,
+            describe=self._describe_installed,
             python_root=self.config.managed_python_root,
             cancel=self.stop.is_set,
             progress=lambda message: self.note("python", message),
@@ -2115,8 +2129,8 @@ class Worker:
             shutil.rmtree(self.config.cozy_home / "job-plans" / identifier, ignore_errors=True)
             for key in [key for key in self.prepared_installations if key[1] == identifier]:
                 del self.prepared_installations[key]
-            for described in [key for key in self._published_interfaces if key[0] == identifier]:
-                del self._published_interfaces[described]
+            for described in [key for key in self._installed_interfaces if key[0] == identifier]:
+                del self._installed_interfaces[described]
             self.note("installation", f"collected superseded {installed.package} {identifier}")
 
     def host_facts(self) -> hostfacts.HostFacts:
