@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"regexp"
-	"strings"
 )
 
 // hubClient speaks the Hub's worker API as this machine: its worker id and token in the
@@ -70,34 +69,4 @@ func (h *hubClient) post(ctx context.Context, path string, body any) error {
 
 func (h *hubClient) release(ctx context.Context) error {
 	return h.post(ctx, "/v1/worker/rental/release", map[string]string{"worker_id": h.workerID})
-}
-
-func (h *hubClient) observeCache(ctx context.Context, o cacheObservation) error {
-	if o.Scope == "" {
-		o.Scope = "runtime"
-	}
-	return h.post(ctx, "/v1/worker/rental/cache-observations", o)
-}
-
-// modelSource is where a run of hub fetches its Models: "" or this machine's own Hub, or
-// another Hub it is registered at (wire 67). A Hub it is not registered at has none.
-func (m *Machine) modelSource(hub string) (hubSource, bool) {
-	g, same := m.grant, func(a, b string) bool { return strings.TrimSuffix(a, "/") == strings.TrimSuffix(b, "/") }
-	if hub == "" || same(hub, g.HubOrigin) {
-		source := hubSource{hub: g.PublicOrigin, credential: "worker " + g.WorkerID + " " + g.WorkerToken, allowHosts: g.ObjectHosts, own: true}
-		if len(g.HubCA) > 0 {
-			source.caFile = m.layout.boot("tensorhub-ca.crt")
-		}
-		return source, true
-	}
-	for i, other := range g.Hubs {
-		if same(hub, other.Origin) {
-			source := hubSource{hub: other.PublicOrigin, credential: "worker " + other.WorkerID + " " + other.WorkerToken, allowHosts: other.ObjectHosts}
-			if len(other.CA) > 0 {
-				source.caFile = m.layout.boot(fmt.Sprintf("hub-ca-%d.crt", i+1))
-			}
-			return source, true
-		}
-	}
-	return hubSource{}, false
 }

@@ -53,6 +53,7 @@ func (m *Machine) listen() (*listeners, error) {
 	routes := http.NewServeMux()
 	routes.HandleFunc("GET /v1/bootstrap/receipt", m.serveReceipt)
 	routes.HandleFunc("GET /v1/health", serveHealth)
+	routes.HandleFunc("POST /v1/hubs/access", m.serveHubAccess)
 	routes.HandleFunc("GET /v1/runs/{run}/outputs/{output}", m.serveOutput)
 	routes.HandleFunc("GET /v1/runs/{run}/outputs/{output}/{index}", m.serveOutput)
 	routes.HandleFunc("GET /v1/machine/runtime", m.serveRuntimeState)

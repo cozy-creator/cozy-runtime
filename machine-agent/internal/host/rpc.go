@@ -50,7 +50,7 @@ var routes = func() map[string]*route {
 	}
 	execution := []string{"GetMachineExecutionWorkspace", "SubmitMachineExecution", "GetMachineExecution",
 		"ListMachineExecutionEvents", "ControlMachineExecution", "CollectMachineExecution",
-		"AcknowledgeMachineExecutionCollection", "ReadMachineExecutionTriage", "ListMachineExecutions", "ListPackages"}
+		"AcknowledgeMachineExecutionCollection", "ReadMachineExecutionTriage", "ListMachineExecutions", "ListPackages", "CloseMachineSubmission"}
 	for _, from := range []string{podHost, control} {
 		for _, method := range execution {
 			add(from, method, control, method)
@@ -131,6 +131,14 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 		}
 		defer func() { _ = a.finish(err == nil, time.Now()) }()
 	}
+	if m.phase() != "ready" && publicReadMethod(string(r.method.Name())) {
+		if answer, handled, err := m.publicFallback(ctx, first); handled {
+			if err != nil {
+				return err
+			}
+			return stream.SendMsg(answer)
+		}
+	}
 	conn, err := m.runtime(ctx)
 	if err != nil {
 		return err
@@ -181,6 +189,14 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 	}
 	stream.SetTrailer(out.Trailer())
 	return nil
+}
+
+func publicReadMethod(name string) bool {
+	switch name {
+	case "GetMachineExecutionWorkspace", "GetMachineExecution", "ListMachineExecutions", "ListMachineExecutionEvents":
+		return true
+	}
+	return false
 }
 
 // admitCall verifies the client Claim a message carries.
@@ -304,27 +320,16 @@ func (m *Machine) answerControl(stream grpc.ServerStream) error {
 		ack.Rejection = pb.ClaimRejection_CLAIM_REJECTION_UNAUTHENTICATED
 		return stream.SendMsg(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
 	}
-	if m.restarts.gone() {
-		return stream.SendMsg(&pb.WorkerFrame{Msg: &pb.WorkerFrame_BootFailure{BootFailure: &pb.BootFailure{
-			RecordOwnerEpoch: claim.RecordOwnerEpoch, WorkerBootId: m.id.BootID, WorkerId: m.grant.WorkerID,
-			Detail: "the Runtime exited twice without completing work; the machine is known idle"}}})
-	}
-	ctx, cancel := context.WithTimeout(stream.Context(), time.Second)
-	_, err := m.runtime(ctx)
-	cancel()
 	m.mu.Lock()
 	runtimeAck := m.runtimeAck
 	m.control++
-	epoch := m.control
+	ack.Accepted, ack.ControlStreamEpoch = true, m.control
 	m.mu.Unlock()
-	if err != nil || runtimeAck == nil {
-		ack.Rejection = pb.ClaimRejection_CLAIM_REJECTION_UNDURABLE
-		return stream.SendMsg(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
+	if runtimeAck != nil {
+		ack.WireMinor = min(pb.WireMinor, runtimeAck.WireMinor)
+		ack.WorkerInstanceId, ack.WorkerReleaseId = runtimeAck.WorkerInstanceId, runtimeAck.WorkerReleaseId
+		ack.ControlRuntimeDigest, ack.GitCommit, ack.Resources = runtimeAck.ControlRuntimeDigest, runtimeAck.GitCommit, runtimeAck.Resources
 	}
-	ack.Accepted, ack.ControlStreamEpoch = true, epoch
-	ack.WireMinor = min(pb.WireMinor, runtimeAck.WireMinor)
-	ack.WorkerInstanceId, ack.WorkerReleaseId = runtimeAck.WorkerInstanceId, runtimeAck.WorkerReleaseId
-	ack.ControlRuntimeDigest, ack.GitCommit, ack.Resources = runtimeAck.ControlRuntimeDigest, runtimeAck.GitCommit, runtimeAck.Resources
 	if err := stream.SendMsg(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}}); err != nil {
 		return err
 	}

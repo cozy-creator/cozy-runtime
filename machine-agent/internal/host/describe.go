@@ -28,18 +28,23 @@ func (m *Machine) describeMachine(stream grpc.ServerStream) error {
 	hostname, _ := os.Hostname()
 	host := &pb.MachineHost{Version: build.Version, WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor,
 		Platform: runtime.GOOS + "/" + runtime.GOARCH, OsRelease: osRelease(), Hostname: hostname, Phase: m.phase(),
-		Hubs:            []*pb.MachineHub{{Origin: m.grant.HubOrigin, MachineId: m.grant.WorkerID}},
 		Filesystems:     []*pb.MachineFilesystem{filesystem(m.layout.Store), filesystem(m.layout.Root)},
 		StartedAtUnixMs: uint64(m.started.UnixMilli())}
+	if m.grant.HubOrigin != "" {
+		host.Hubs = append(host.Hubs, &pb.MachineHub{Origin: m.grant.HubOrigin, MachineId: m.grant.WorkerID})
+	}
 	for _, other := range m.grant.Hubs {
 		host.Hubs = append(host.Hubs, &pb.MachineHub{Origin: other.Origin, MachineId: other.WorkerID})
 	}
-	if !m.idle.releasedNow() {
+	if !m.owned && !m.idle.releasedNow() {
 		host.IdleDeadlineUnixMs = uint64(m.idle.deadline().UnixMilli())
 	}
 	answer := &pb.MachineDescription{WorkerId: m.grant.WorkerID, WorkerBootId: m.id.BootID, Host: host}
 	if !m.running() {
-		answer.RuntimeAbsent = "the Runtime is stopped; the next call that needs it starts it"
+		answer.RuntimeAbsent = m.runtimeGone()
+		if answer.RuntimeAbsent == "" {
+			answer.RuntimeAbsent = "the Runtime coordinator is starting"
+		}
 		return stream.SendMsg(answer)
 	}
 	ctx, cancel := context.WithTimeout(stream.Context(), 30*time.Second)

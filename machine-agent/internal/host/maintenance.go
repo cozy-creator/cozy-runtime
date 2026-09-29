@@ -26,6 +26,8 @@ import (
 // maintain runs one op against the machine rooted at root; p is its current Runtime.
 func maintain(root string, p *runtimeProcess, op string, args []string) (string, error) {
 	switch op {
+	case "capabilities":
+		return probeRuntimeCapabilities(filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker"))
 	case "restart":
 		return guardedRestart(root, p)
 	case "pair":
@@ -158,7 +160,7 @@ func installPair(root string, wheels []string) error {
 		"--python", filepath.Join(root, "opt/cozy/python/bin/python"), "--break-system-packages",
 		"--offline", "--no-deps", "--reinstall"}, wheels...)...)
 	cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin", "HOME=" + filepath.Join(root, "tmp")}
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := childOutput(cmd, true); err != nil {
 		return fmt.Errorf("install %s: %v: %s", strings.Join(wheels, ", "), err, strings.TrimSpace(string(out)))
 	}
 	return nil

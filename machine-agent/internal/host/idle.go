@@ -29,6 +29,7 @@ type idleState struct {
 }
 
 type idle struct {
+	persistent bool
 	path       string
 	mu         sync.Mutex
 	s          idleState
@@ -100,7 +101,7 @@ func (i *idle) work(now time.Time) error {
 func (i *idle) admit(call context.Context, now time.Time) (*admission, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.s.Released || now.UnixMilli() >= max(i.s.Deadline, i.renewed) {
+	if !i.persistent && (i.s.Released || now.UnixMilli() >= max(i.s.Deadline, i.renewed)) {
 		return nil, errReleased
 	}
 	a := &admission{i: i, call: call}
@@ -127,6 +128,9 @@ func (i *idle) claim(now time.Time) (bool, error) {
 			delete(i.admissions, a)
 		}
 	}
+	if i.persistent {
+		return false, nil
+	}
 	if i.s.Released {
 		return true, nil
 	}
@@ -150,7 +154,7 @@ func (i *idle) reset(now time.Time) error {
 func (i *idle) keepalive(id string, now time.Time) (time.Time, time.Time, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.s.Released || now.UnixMilli() >= max(i.s.Deadline, i.renewed) {
+	if !i.persistent && (i.s.Released || now.UnixMilli() >= max(i.s.Deadline, i.renewed)) {
 		return time.Time{}, time.Time{}, errReleased
 	}
 	if seen, ok := i.s.Keepalives[id]; ok {
@@ -214,10 +218,6 @@ func (a *activity) observe(now time.Time) (busy bool, err error) {
 		a.meter, a.moved = facts.Meter, now
 	}
 	holders := strings.Join(facts.Holding, ", ")
-	if still := time.Duration(facts.Still * float64(time.Second)); facts.Meter != "" && still > 0 && now.Sub(a.moved) >= still {
-		a.say(now, "cozy machine: the Runtime's work has not moved for "+still.String()+"; it no longer holds the machine: "+holders)
-		return false, nil
-	}
 	a.say(now, "cozy machine: idle held by the Runtime: "+holders)
 	return true, nil
 }
@@ -230,59 +230,62 @@ func (a *activity) say(now time.Time, line string) {
 	a.said, a.saidAt = line, now
 }
 
-// restarts is the crash rule (#865/#869): relaunch without limit after the Runtime completed
-// work; relaunch once after an exit without work; a second consecutive one leaves the
-// machine known idle. The fact survives daemon restarts; work is never re-run.
+// restarts paces transient failures and exposes structural failures until repair/update.
+// It never persists a crash count as idleness or infers success from CPU activity.
 type restarts struct {
-	path             string
-	worked, progress bool
+	mu       sync.Mutex
+	failures uint
+	retryAt  time.Time
+	blocked  bool
+	detail   string
+	safeCode string
 }
 
-func (r *restarts) fact() string {
-	raw, _ := os.ReadFile(r.path)
-	return strings.TrimSpace(string(raw))
+func (r *restarts) gone() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.blocked }
+func (r *restarts) due(now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.blocked && !now.Before(r.retryAt)
 }
-
-func (r *restarts) gone() bool { return r.fact() == "gone" }
-
-// observe records progress: work seen, then the machine idle again.
-func (r *restarts) observe(busy bool, err error) error {
-	if err != nil || r.progress {
-		return nil
-	}
-	if busy {
-		r.worked = true
-		return nil
-	}
-	if !r.worked {
-		return nil
-	}
-	r.progress = true
-	return r.clear()
+func (r *restarts) code() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return cmpOr(r.safeCode, "runtime_failed")
 }
-
+func (r *restarts) reason() string { r.mu.Lock(); defer r.mu.Unlock(); return r.detail }
 func (r *restarts) clear() error {
-	if err := os.Remove(r.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failures = 0
+	r.blocked = false
+	r.detail, r.safeCode = "", ""
+	r.retryAt = time.Time{}
 	return nil
 }
-
-// exited decides whether the Runtime is launched again.
-func (r *restarts) exited() (bool, error) {
-	progressed := r.progress
-	r.worked, r.progress = false, false
-	if progressed {
-		return true, nil
+func (r *restarts) fail(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.blocked = true
+	r.detail = err.Error()
+	var refusal *launchRefusal
+	if errors.As(err, &refusal) {
+		r.safeCode = refusal.code
 	}
-	next := "once"
-	if r.fact() != "" {
-		next = "gone"
+}
+func (r *restarts) exited(err error) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.detail = "Runtime exited: " + exitText(err)
+	var exited interface{ ExitCode() int }
+	if errors.As(err, &exited) && exited.ExitCode() == 6 {
+		r.safeCode = "runtime_launch_refused"
+		r.blocked = true
+		return false
 	}
-	if err := writeAtomic(r.path, []byte(next+"\n"), 0o600); err != nil {
-		return false, err
-	}
-	return next == "once", nil
+	r.failures++
+	delay := min(time.Second*time.Duration(uint64(1)<<min(r.failures-1, 5)), 30*time.Second)
+	r.retryAt = time.Now().Add(delay)
+	return true
 }
 
 func (i *idle) releasedNow() bool {

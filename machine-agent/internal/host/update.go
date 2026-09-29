@@ -130,6 +130,10 @@ func (m *Machine) maintenance(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return false
 	}
+	if !m.launcherReady() {
+		http.Error(w, "machine_starting: the process launcher is not ready", http.StatusServiceUnavailable)
+		return false
+	}
 	return true
 }
 
@@ -234,8 +238,8 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 
 // installedPair reads the Runtime and TensorFS versions opt/cozy/python holds.
 func (m *Machine) installedPair() (pairVersions, error) {
-	out, err := exec.Command(filepath.Join(m.layout.Root, "opt/cozy/python/bin/python"), "-I", "-c",
-		"import importlib.metadata as m; print(m.version('"+hostruntime.Distribution+"')); print(m.version('tensorfs'))").Output()
+	out, err := childOutput(exec.Command(filepath.Join(m.layout.Root, "opt/cozy/python/bin/python"), "-I", "-c",
+		"import importlib.metadata as m; print(m.version('"+hostruntime.Distribution+"')); print(m.version('tensorfs'))"), false)
 	lines := strings.Fields(string(out))
 	if err != nil || len(lines) != 2 {
 		return pairVersions{}, fmt.Errorf("the machine's Runtime environment is unreadable: %v", err)

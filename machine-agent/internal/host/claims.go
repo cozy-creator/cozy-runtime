@@ -29,8 +29,7 @@ type claims struct {
 	leafDigest       []byte
 	mu               sync.Mutex
 	authorized       []ed25519.PublicKey
-	floor            map[string]uint64 // the highest epoch each key has presented
-	changed          chan struct{}     // closed when the authorized set changes
+	changed          chan struct{} // closed when the authorized set changes
 	// own is the daemon's key for its Runtime; the Runtime is launched trusting only it.
 	own   ed25519.PrivateKey
 	claim *pb.Claim
@@ -42,7 +41,7 @@ func newClaims(workerID, bootID string, leafDigest []byte, authorized []ed25519.
 		return nil, err
 	}
 	c := &claims{workerID: workerID, bootID: bootID, leafDigest: leafDigest, authorized: authorized,
-		floor: map[string]uint64{}, own: own, changed: make(chan struct{})}
+		own: own, changed: make(chan struct{})}
 	proof, err := c.transcript(runtimeOwnerEpoch)
 	if err != nil {
 		return nil, err
@@ -81,13 +80,6 @@ func (c *claims) verify(claim *pb.Claim) (ed25519.PublicKey, error) {
 		if len(claim.Proof) != ed25519.SignatureSize || !ed25519.Verify(key, transcript, claim.Proof) {
 			continue
 		}
-		id := string(key)
-		if claim.RecordOwnerEpoch < c.floor[id] {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"record_owner_epoch %d is older than %d, which this key already presented; the client re-claims",
-				claim.RecordOwnerEpoch, c.floor[id])
-		}
-		c.floor[id] = claim.RecordOwnerEpoch
 		return key, nil
 	}
 	return nil, status.Error(codes.Unauthenticated, "the Claim is not signed by a key this machine authorizes")

@@ -31,11 +31,12 @@ type envelope struct {
 
 // receipt holds the one envelope this boot publishes and the one-shot key that seals it.
 type receipt struct {
-	path     string
-	mu       sync.Mutex
-	key      []byte
-	retained []byte // the payload of an envelope an earlier process of this boot sealed
-	sealed   []byte
+	path       string
+	mu         sync.Mutex
+	key        []byte
+	retained   []byte // the payload of an envelope an earlier process of this boot sealed
+	sealed     []byte
+	standalone bool
 }
 
 // openReceipt reads a retained envelope. A provider replaying the original environment on a
@@ -83,6 +84,14 @@ func (r *receipt) seal(raw []byte, workerPort int, observed *OwnerAuth, webrtc m
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.standalone {
+		body, err := json.Marshal(envelope{Payload: payload})
+		if err != nil {
+			return err
+		}
+		r.sealed, r.retained = body, payload
+		return nil
+	}
 	if r.retained != nil {
 		return sameAttestation(r.retained, payload)
 	}
@@ -111,6 +120,7 @@ func rewritePayload(raw []byte, workerPort int, observed *OwnerAuth, webrtc map[
 	if err := json.Unmarshal(raw, &members); err != nil {
 		return nil, fmt.Errorf("the Runtime readiness payload is not one object: %w", err)
 	}
+	delete(members, "process_incarnation") // private readiness is never a retained public fact
 	var err error
 	if members["worker_internal_port"], err = json.Marshal(workerPort); err != nil {
 		return nil, err

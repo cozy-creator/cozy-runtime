@@ -209,6 +209,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	WorkerControl_GetMachineExecutionWorkspace_FullMethodName          = "/cozy.worker.v1.WorkerControl/GetMachineExecutionWorkspace"
 	WorkerControl_SubmitMachineExecution_FullMethodName                = "/cozy.worker.v1.WorkerControl/SubmitMachineExecution"
+	WorkerControl_CloseMachineSubmission_FullMethodName                = "/cozy.worker.v1.WorkerControl/CloseMachineSubmission"
 	WorkerControl_GetMachineExecution_FullMethodName                   = "/cozy.worker.v1.WorkerControl/GetMachineExecution"
 	WorkerControl_ListMachineExecutionEvents_FullMethodName            = "/cozy.worker.v1.WorkerControl/ListMachineExecutionEvents"
 	WorkerControl_ControlMachineExecution_FullMethodName               = "/cozy.worker.v1.WorkerControl/ControlMachineExecution"
@@ -236,6 +237,8 @@ type WorkerControlClient interface {
 	// These calls observe/control that authority; they do not establish a second
 	// RecordOwner or require a client coordinator inside the worker.
 	SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error)
+	// Atomically close a submission key against delayed acceptance, returning any existing receipt.
+	CloseMachineSubmission(ctx context.Context, in *MachineSubmissionClose, opts ...grpc.CallOption) (*MachineSubmissionClosure, error)
 	GetMachineExecution(ctx context.Context, in *MachineExecutionQuery, opts ...grpc.CallOption) (*MachineExecutionState, error)
 	ListMachineExecutionEvents(ctx context.Context, in *MachineExecutionEventsQuery, opts ...grpc.CallOption) (*MachineExecutionEventPage, error)
 	ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error)
@@ -289,6 +292,16 @@ func (c *workerControlClient) SubmitMachineExecution(ctx context.Context, in *Ma
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MachineExecutionReceipt)
 	err := c.cc.Invoke(ctx, WorkerControl_SubmitMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerControlClient) CloseMachineSubmission(ctx context.Context, in *MachineSubmissionClose, opts ...grpc.CallOption) (*MachineSubmissionClosure, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineSubmissionClosure)
+	err := c.cc.Invoke(ctx, WorkerControl_CloseMachineSubmission_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -440,6 +453,8 @@ type WorkerControlServer interface {
 	// These calls observe/control that authority; they do not establish a second
 	// RecordOwner or require a client coordinator inside the worker.
 	SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error)
+	// Atomically close a submission key against delayed acceptance, returning any existing receipt.
+	CloseMachineSubmission(context.Context, *MachineSubmissionClose) (*MachineSubmissionClosure, error)
 	GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error)
 	ListMachineExecutionEvents(context.Context, *MachineExecutionEventsQuery) (*MachineExecutionEventPage, error)
 	ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error)
@@ -484,6 +499,9 @@ func (UnimplementedWorkerControlServer) GetMachineExecutionWorkspace(context.Con
 }
 func (UnimplementedWorkerControlServer) SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitMachineExecution not implemented")
+}
+func (UnimplementedWorkerControlServer) CloseMachineSubmission(context.Context, *MachineSubmissionClose) (*MachineSubmissionClosure, error) {
+	return nil, status.Error(codes.Unimplemented, "method CloseMachineSubmission not implemented")
 }
 func (UnimplementedWorkerControlServer) GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetMachineExecution not implemented")
@@ -574,6 +592,24 @@ func _WorkerControl_SubmitMachineExecution_Handler(srv interface{}, ctx context.
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(WorkerControlServer).SubmitMachineExecution(ctx, req.(*MachineExecutionSubmit))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerControl_CloseMachineSubmission_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineSubmissionClose)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerControlServer).CloseMachineSubmission(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerControl_CloseMachineSubmission_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerControlServer).CloseMachineSubmission(ctx, req.(*MachineSubmissionClose))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -790,6 +826,10 @@ var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SubmitMachineExecution",
 			Handler:    _WorkerControl_SubmitMachineExecution_Handler,
+		},
+		{
+			MethodName: "CloseMachineSubmission",
+			Handler:    _WorkerControl_CloseMachineSubmission_Handler,
 		},
 		{
 			MethodName: "GetMachineExecution",
@@ -2043,6 +2083,7 @@ const (
 	PodHost_KeepRentalAlive_FullMethodName                       = "/cozy.worker.v1.PodHost/KeepRentalAlive"
 	PodHost_GetMachineExecutionWorkspace_FullMethodName          = "/cozy.worker.v1.PodHost/GetMachineExecutionWorkspace"
 	PodHost_SubmitMachineExecution_FullMethodName                = "/cozy.worker.v1.PodHost/SubmitMachineExecution"
+	PodHost_CloseMachineSubmission_FullMethodName                = "/cozy.worker.v1.PodHost/CloseMachineSubmission"
 	PodHost_GetMachineExecution_FullMethodName                   = "/cozy.worker.v1.PodHost/GetMachineExecution"
 	PodHost_ListMachineExecutionEvents_FullMethodName            = "/cozy.worker.v1.PodHost/ListMachineExecutionEvents"
 	PodHost_ControlMachineExecution_FullMethodName               = "/cozy.worker.v1.PodHost/ControlMachineExecution"
@@ -2115,6 +2156,8 @@ type PodHostClient interface {
 	GetMachineExecutionWorkspace(ctx context.Context, in *MachineExecutionWorkspaceQuery, opts ...grpc.CallOption) (*MachineExecutionWorkspace, error)
 	// Authenticated forwarding only. Runtime is the sole execution journal/owner.
 	SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error)
+	// Atomically close a submission key against delayed acceptance, returning any existing receipt.
+	CloseMachineSubmission(ctx context.Context, in *MachineSubmissionClose, opts ...grpc.CallOption) (*MachineSubmissionClosure, error)
 	GetMachineExecution(ctx context.Context, in *MachineExecutionQuery, opts ...grpc.CallOption) (*MachineExecutionState, error)
 	ListMachineExecutionEvents(ctx context.Context, in *MachineExecutionEventsQuery, opts ...grpc.CallOption) (*MachineExecutionEventPage, error)
 	ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error)
@@ -2194,6 +2237,16 @@ func (c *podHostClient) SubmitMachineExecution(ctx context.Context, in *MachineE
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MachineExecutionReceipt)
 	err := c.cc.Invoke(ctx, PodHost_SubmitMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) CloseMachineSubmission(ctx context.Context, in *MachineSubmissionClose, opts ...grpc.CallOption) (*MachineSubmissionClosure, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineSubmissionClosure)
+	err := c.cc.Invoke(ctx, PodHost_CloseMachineSubmission_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2636,6 +2689,8 @@ type PodHostServer interface {
 	GetMachineExecutionWorkspace(context.Context, *MachineExecutionWorkspaceQuery) (*MachineExecutionWorkspace, error)
 	// Authenticated forwarding only. Runtime is the sole execution journal/owner.
 	SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error)
+	// Atomically close a submission key against delayed acceptance, returning any existing receipt.
+	CloseMachineSubmission(context.Context, *MachineSubmissionClose) (*MachineSubmissionClosure, error)
 	GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error)
 	ListMachineExecutionEvents(context.Context, *MachineExecutionEventsQuery) (*MachineExecutionEventPage, error)
 	ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error)
@@ -2699,6 +2754,9 @@ func (UnimplementedPodHostServer) GetMachineExecutionWorkspace(context.Context, 
 }
 func (UnimplementedPodHostServer) SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitMachineExecution not implemented")
+}
+func (UnimplementedPodHostServer) CloseMachineSubmission(context.Context, *MachineSubmissionClose) (*MachineSubmissionClosure, error) {
+	return nil, status.Error(codes.Unimplemented, "method CloseMachineSubmission not implemented")
 }
 func (UnimplementedPodHostServer) GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetMachineExecution not implemented")
@@ -2876,6 +2934,24 @@ func _PodHost_SubmitMachineExecution_Handler(srv interface{}, ctx context.Contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(PodHostServer).SubmitMachineExecution(ctx, req.(*MachineExecutionSubmit))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_CloseMachineSubmission_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineSubmissionClose)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).CloseMachineSubmission(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_CloseMachineSubmission_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).CloseMachineSubmission(ctx, req.(*MachineSubmissionClose))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3471,6 +3547,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SubmitMachineExecution",
 			Handler:    _PodHost_SubmitMachineExecution_Handler,
+		},
+		{
+			MethodName: "CloseMachineSubmission",
+			Handler:    _PodHost_CloseMachineSubmission_Handler,
 		},
 		{
 			MethodName: "GetMachineExecution",

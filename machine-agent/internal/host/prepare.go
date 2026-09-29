@@ -2,8 +2,8 @@ package host
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -21,9 +21,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// A preparation lands a package set's models through TensorFS and has the Runtime install
-// and place it, reporting each stage as a PrepareEvent. The Runtime installs while the
-// models still land. A refusal that retrying cannot change ends the stream as REFUSED; any
+// A preparation delegates package, model, and memory decisions to Runtime. A refusal that retrying cannot change ends the stream as REFUSED; any
 // other ends it Unavailable, and the client asks again.
 
 type prepared struct {
@@ -116,12 +114,6 @@ func (m *Machine) prepare(stream grpc.ServerStream, message proto.Message,
 	return nil
 }
 
-func downloading(emit func(*pb.PrepareEvent)) func(landed, total int64) {
-	return func(landed, total int64) {
-		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_DOWNLOADING, TotalBytes: uint64(total), TransferredBytes: uint64(landed)})
-	}
-}
-
 func (m *Machine) preparePackageSet(stream grpc.ServerStream) error {
 	call := &pb.PreparePackageSetCall{}
 	return m.prepare(stream, call, func(ctx context.Context, conn *grpc.ClientConn, emit func(*pb.PrepareEvent)) prepared {
@@ -133,59 +125,18 @@ func (m *Machine) preparePackageSet(stream grpc.ServerStream) error {
 		if _, err := canonical.Read(desired, selected); err != nil {
 			return refused("package_set_invalid", fmt.Errorf("download document: %w", err), false)
 		}
-		source, registered := m.modelSource(call.Hub)
-		if !registered {
-			return refused("hub_unregistered", fmt.Errorf("this machine is not registered at %s", call.Hub), false)
+		var document struct {
+			Models []json.RawMessage `json:"models"`
 		}
-		modelsOnly := call.Application == "" && len(call.LockedRequirements) == 0 && len(selected.Packages) == 0
+		_ = json.Unmarshal(desired, &document)
+		if len(document.Models) > 0 && !m.supportsRuntime("runtime-model-preparation/1") {
+			return prepared{code: pb.CapabilityUnavailableCode, detail: "the installed Runtime does not support model preparation; update its Runtime wheel"}
+		}
 		request := &pb.PreparePackageSetRequest{DownloadDelegation: desired, InstallRoot: m.layout.Installs,
 			Application: call.Application, PythonRequires: call.PythonRequires, PythonVersion: call.PythonVersion,
 			ModelSlotPaths: call.ModelSlotPaths, ImageInventory: call.ImageInventory,
 			LockedRequirements: call.LockedRequirements, PackageInterface: call.PackageInterface, Hub: call.Hub}
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED})
-		warm, stopWarm := context.WithCancel(ctx)
-		defer stopWarm()
-		warmed := make(chan prepared, 1)
-		if !modelsOnly && len(selected.Models) > 0 {
-			go func() { // install the release while its models land
-				landing := proto.Clone(request).(*pb.PreparePackageSetRequest)
-				landing.ModelsLanding = true
-				var trailer metadata.MD
-				_, err := pb.NewRuntimePreparationClient(conn).PreparePackageSet(warm, landing, grpc.Trailer(&trailer))
-				if err != nil && warm.Err() == nil {
-					if answer := runtimeRefused(err, trailer); !answer.retry {
-						warmed <- answer
-						stopWarm()
-					}
-				}
-				close(warmed)
-			}()
-		} else {
-			close(warmed)
-		}
-		if err := m.tfs.fetch(warm, source, desired, downloading(emit)); err != nil {
-			stopWarm()
-			if answer, ok := <-warmed; ok {
-				return answer
-			}
-			var fetch *fetchRefusal
-			if errors.As(err, &fetch) {
-				return prepared{code: fetch.Code, detail: safe(fetch.Detail), retry: fetch.Resumable}
-			}
-			return refused("model_fetch_failed", err, true)
-		}
-		if answer, ok := <-warmed; ok {
-			return answer
-		}
-		if modelsOnly {
-			raw, err := canonical.Bytes(&pb.PlacementSet{})
-			if err != nil {
-				return refused("model_download_receipt_invalid", err, false)
-			}
-			sum := sha256.Sum256(raw)
-			return prepared{result: &pb.PreparePackageSetResult{PlacementSet: &pb.DesiredPlacementSet{
-				PlacementSetCanonicalBytes: raw, PlacementSetDigest: sum[:]}}}
-		}
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARING})
 		var trailer metadata.MD
 		result, err := pb.NewRuntimePreparationClient(conn).PreparePackageSet(ctx, request, grpc.Trailer(&trailer))
@@ -203,21 +154,10 @@ func (m *Machine) preparePrivatePlacement(stream grpc.ServerStream) error {
 		if selected.GetOperationId() == "" || selected.GetInstallationId() == "" {
 			return refused("placement_invalid", errors.New("an unpublished placement names its prepared operation and installation"), false)
 		}
+		if len(selected.NativeModels) > 0 && !m.supportsRuntime("runtime-model-preparation/1") {
+			return prepared{code: pb.CapabilityUnavailableCode, detail: "the installed Runtime does not support model preparation; update its Runtime wheel"}
+		}
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED})
-		desired := selected.DownloadDelegation
-		if adapters := adapterDownloads(selected); adapters != nil {
-			desired = adapters
-		}
-		if len(desired) > 0 {
-			source, _ := m.modelSource("")
-			if err := m.tfs.fetch(ctx, source, desired, downloading(emit)); err != nil {
-				var fetch *fetchRefusal
-				if errors.As(err, &fetch) {
-					return prepared{code: fetch.Code, detail: safe(fetch.Detail), retry: fetch.Resumable}
-				}
-				return refused("model_fetch_failed", err, true)
-			}
-		}
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARING})
 		request := &pb.PreparePrivatePlacementRequest{OperationId: selected.OperationId, InstallationId: selected.InstallationId,
 			DownloadDelegation: selected.DownloadDelegation, DownloadDelegationSignature: selected.DownloadDelegationSignature,
@@ -232,31 +172,6 @@ func (m *Machine) preparePrivatePlacement(stream grpc.ServerStream) error {
 		}
 		return prepared{result: result}
 	})
-}
-
-// adapterDownloads adds the adapters native models bind to the download set.
-func adapterDownloads(selected *pb.DesiredPrivatePlacementSet) []byte {
-	set := &pb.DownloadDelegation{}
-	if len(selected.DownloadDelegation) > 0 {
-		if _, err := canonical.Read(selected.DownloadDelegation, set); err != nil {
-			return nil
-		}
-	}
-	added := false
-	for _, model := range selected.NativeModels {
-		for _, a := range model.GetAdapters() {
-			set.Models = append(set.Models, &pb.DownloadModelRef{Slot: model.Slot, Model: a.Model, Release: a.Release, Lane: a.Lane, Manifest: a.Manifest})
-			added = true
-		}
-	}
-	if !added {
-		return nil
-	}
-	raw, err := canonical.Bytes(set)
-	if err != nil {
-		return nil
-	}
-	return raw
 }
 
 // prepareLocalPackage installs uploaded local code. With no upload it asks the Runtime to

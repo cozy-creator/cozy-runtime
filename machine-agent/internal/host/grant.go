@@ -1,4 +1,4 @@
-// Package host is the machine role of `cozy daemon`: it supervises this machine's Runtime,
+// Package host is the machine agent: it supervises this machine's Runtime,
 // proves readiness to the Hub, releases the machine when it idles, and serves the one
 // machine endpoint that clients, the Hub and players reach. A rented pod runs it as PID 1;
 // this computer runs the same code.
@@ -21,6 +21,7 @@ import (
 // gives it. Only the names read here matter; any other is logged and ignored, so a newer Hub
 // cannot stop an older machine from booting.
 type Grant struct {
+	Lifetime      string // persistent (standalone) or rental (provider-owned allocation)
 	Root          string // COZY_MACHINE_ROOT; the image layout is rooted here
 	StoreRoot     string // COZY_TENSORFS_ROOT; empty keeps <root>/var/lib/tensorfs
 	ListenHost    string
@@ -66,7 +67,7 @@ type OwnerAuth struct {
 const receiptKeyName = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL"
 
 var grantNames = map[string]bool{
-	"COZY_MACHINE_ROOT": true, "COZY_TENSORFS_ROOT": true, "COZY_LISTEN_HOST": true,
+	"COZY_MACHINE_LIFETIME": true, "COZY_MACHINE_ROOT": true, "COZY_TENSORFS_ROOT": true, "COZY_LISTEN_HOST": true,
 	"COZY_WORKER_ID": true, "COZY_WORKER_AUTH_TOKEN": true, "COZY_WORKER_INTERNAL_PORT": true,
 	"COZY_MEDIA_INTERNAL_PORT": true, "COZY_WEBRTC_INTERNAL_PORT": true, "COZY_RECORD_OWNER_AUTH_JSON": true, "COZY_AUTHORIZED_KEYS": true,
 	"COZY_REPO_CACHE_ROOT": true, receiptKeyName: true, "TENSORHUB_ORIGIN": true,
@@ -115,7 +116,11 @@ func ReadGrant(environ []string) (*Grant, error) {
 	if g.WorkerID = env["COZY_WORKER_ID"]; g.WorkerID == "" || len(g.WorkerID) > 256 || strings.TrimSpace(g.WorkerID) != g.WorkerID {
 		return nil, fmt.Errorf("COZY_WORKER_ID must be one identifier of at most 256 bytes")
 	}
-	if g.WorkerToken = env["COZY_WORKER_AUTH_TOKEN"]; len(decode64(g.WorkerToken)) != 32 {
+	g.Lifetime = cmpOr(env["COZY_MACHINE_LIFETIME"], "rental")
+	if g.Lifetime != "persistent" && g.Lifetime != "rental" {
+		return nil, fmt.Errorf("COZY_MACHINE_LIFETIME must be persistent or rental")
+	}
+	if g.WorkerToken = env["COZY_WORKER_AUTH_TOKEN"]; g.WorkerToken != "" && len(decode64(g.WorkerToken)) != 32 || g.Lifetime == "rental" && g.WorkerToken == "" {
 		return nil, fmt.Errorf("COZY_WORKER_AUTH_TOKEN must be 32 bytes of unpadded base64url")
 	}
 	if g.WorkerPort, err = port(env, "COZY_WORKER_INTERNAL_PORT", true); err != nil {
@@ -130,12 +135,17 @@ func ReadGrant(environ []string) (*Grant, error) {
 	if g.MediaPort == g.WorkerPort {
 		return nil, fmt.Errorf("the worker and media ports must differ")
 	}
-	own, err := hubGrant(env)
+	own, err := hubGrant(env, g.Lifetime == "rental")
 	if err != nil {
 		return nil, err
 	}
 	g.HubOrigin, g.PublicOrigin, g.HubCA, g.ObjectHosts = own.Origin, own.PublicOrigin, own.CA, own.ObjectHosts
 	g.Hubs, g.Skipped = otherHubs(env["COZY_MACHINE_HUBS_JSON"], g.HubOrigin)
+	if g.Lifetime == "persistent" {
+		// A copied legacy environment cannot silently restore machine registration
+		// authority. Content access is explicitly attached as a scoped bearer.
+		g.WorkerToken, g.Hubs = "", nil
+	}
 	g.RepoCacheRoot = env["COZY_REPO_CACHE_ROOT"]
 	if text := env["COZY_RECORD_OWNER_AUTH_JSON"]; text != "" {
 		g.ObservedAuth = &OwnerAuth{}
@@ -175,10 +185,10 @@ func ReadGrant(environ []string) (*Grant, error) {
 }
 
 // hubGrant reads one Hub's TENSORHUB_* settings.
-func hubGrant(env map[string]string) (HubGrant, error) {
+func hubGrant(env map[string]string, required bool) (HubGrant, error) {
 	var h HubGrant
 	var err error
-	if h.Origin, err = origin(env, "TENSORHUB_ORIGIN", true); err != nil {
+	if h.Origin, err = origin(env, "TENSORHUB_ORIGIN", required); err != nil {
 		return h, err
 	}
 	if h.PublicOrigin, err = origin(env, "TENSORHUB_PUBLIC_ORIGIN", false); err != nil {
@@ -217,7 +227,7 @@ func otherHubs(text, own string) ([]HubGrant, []string) {
 		}
 		h, err := HubGrant{}, json.Unmarshal(raw, &row)
 		if err == nil {
-			h, err = hubGrant(row.Environment)
+			h, err = hubGrant(row.Environment, true)
 		}
 		switch {
 		case err != nil:
