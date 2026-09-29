@@ -2034,6 +2034,11 @@ class Tenant(Protocol):
         ...
 
     @property
+    def unattributed(self) -> dict[int, int]:
+        """Measured device usage that cannot be assigned to a legacy process."""
+        ...
+
+    @property
     def overhead(self) -> dict[int, int]: ...
 
     @property
@@ -2197,33 +2202,50 @@ class Machine:
         Missing facts for a live neighbour remain unknown, never a zero charge. The
         caller must include tenants from every overlapping group, including active ones.
         """
-        rows = {t.slot: (t.ordinals, dict(t.held)) for t in tenants}
+        rows = {
+            t.slot: (t.ordinals, dict(t.held), dict(t.unattributed)) for t in tenants
+        }
         if me.slot not in rows:
-            rows[me.slot] = (me.ordinals, dict(me.held))
+            rows[me.slot] = (me.ordinals, dict(me.held), dict(me.unattributed))
         result: dict[int, int | None] = {}
         for ordinal in me.ordinals:
             measured = self.driver(ordinal)
+            mine_facts = rows[me.slot][1]
+            others = sum(
+                held.get(ordinal, 0)
+                for slot, (devices, held, _unattributed) in rows.items()
+                if slot != me.slot and ordinal in devices
+            )
+            mine = mine_facts.get(ordinal, 0)
+            aggregate = max(
+                (
+                    unattributed.get(ordinal, 0)
+                    for _slot, (_devices, _held, unattributed) in rows.items()
+                ),
+                default=0,
+            )
+            unassigned = max(aggregate - others - mine, 0)
             unknown = any(
                 ordinal in devices and ordinal not in held
-                for slot, (devices, held) in rows.items()
+                for slot, (devices, held, _unattributed) in rows.items()
                 if slot != me.slot
             )
-            if measured is None or (unknown and (ordinal in self.budget or -1 in self.budget)):
+            budgeted = ordinal in self.budget or -1 in self.budget
+            if measured is None or (unknown and budgeted and not unassigned):
                 result[ordinal] = None
                 continue
             free, total = measured
             if unknown:
-                # Without a quota, free physical bytes are usable even when a legacy
-                # neighbour cannot attribute its occupancy. Its missing facts stay missing.
-                result[ordinal] = min(total, free + rows[me.slot][1].get(ordinal, 0))
+                if budgeted:
+                    limit = min(
+                        self.budget.get(ordinal, self.budget.get(-1, total)),
+                        total - unassigned,
+                    )
+                    result[ordinal] = limit - others
+                else:
+                    result[ordinal] = min(total, free + mine)
                 continue
-            others = sum(
-                held[ordinal]
-                for slot, (devices, held) in rows.items()
-                if slot != me.slot and ordinal in devices
-            )
-            mine = rows[me.slot][1].get(ordinal, 0)
-            foreign = max(total - free - others - mine, 0)
+            foreign = max(total - free - others - mine, unassigned)
             limit = min(self.budget.get(ordinal, self.budget.get(-1, total)), total - foreign)
             result[ordinal] = limit - others
         return result

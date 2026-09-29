@@ -1170,26 +1170,6 @@ def process_identity(pid: int) -> ProcessIdentity:
         raise ProcessLookupError(pid) from exc
 
 
-def host_pid(pid: int) -> int | None:
-    """Translate a process-visible PID to the host PID reported by GPU drivers.
-
-    ``NSpid`` lists the same process from the outer namespace to the current one. A
-    missing or inconsistent marker is unreadable rather than a reason to guess a PID.
-    """
-    _linux_only("host_pid")
-    try:
-        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if not line.startswith("NSpid:"):
-                continue
-            values = [int(value) for value in line.split()[1:]]
-            if values and (values[-1] == pid or values[0] == pid):
-                return values[0]
-            return None
-    except (OSError, ValueError):
-        return None
-    return None
-
-
 def _linux_stat(pid: int) -> list[str]:
     """The fields after ``comm`` in Linux ``/proc/<pid>/stat``."""
     _linux_only("process_identity")

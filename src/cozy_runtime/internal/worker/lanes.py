@@ -91,6 +91,8 @@ class LaneRow:
     held: dict[int, int] = field(default_factory=dict)
     #: ordinal -> its process's non-allocator bytes there: context, modules, communicators
     overhead: dict[int, int] = field(default_factory=dict)
+    #: ordinal -> measured device usage that could not be attributed to a legacy process.
+    unattributed: dict[int, int] = field(default_factory=dict)
     #: (entrypoint, shape cell) -> per-ordinal historical peaks, never a shared rank maximum
     peak: dict[tuple[str, str], dict[int, int]] = field(default_factory=dict)
     #: Latest successful construction preparation, a retention-cost hint rather than a fit.
@@ -111,6 +113,7 @@ class LaneRow:
             self.disk_revision.clear()
             self.held.clear()
             self.overhead.clear()
+            self.unattributed.clear()
             self.peak.clear()
             self.memory_generation = generation
 

@@ -145,25 +145,6 @@ def test_follower_memory_is_not_copied_from_the_leader() -> None:
     # Missing follower facts retain the prior conservative report, never a guessed zero.
     Worker._observe_memory(lane, row, {"reserved_bytes": 0}, (2,))
     assert row.held == {1: 12, 2: 8}
-    # A full snapshot replaces every rank. An omitted rank is unknown rather than
-    # the previous observation, while rank-selective vacate above keeps untouched ranks.
-    Worker._observe_memory(lane, row, {"rank_memory": {"1": {"reserved_bytes": 4}}})
-    assert row.held == {2: 4}
-
-
-def test_old_namespace_pid_is_translated_for_driver_accounting(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from cozy_runtime.internal import proctree
-
-    monkeypatch.setattr(
-        Path,
-        "read_text",
-        lambda path: "Name:\texecutor\nNSpid:\t420 42\n"
-        if str(path) == "/proc/42/status"
-        else (_ for _ in ()).throw(AssertionError(path)),
-    )
-    assert proctree.host_pid(42) == 420
 
 
 def test_process_facts_do_not_survive_its_generation() -> None:
@@ -359,13 +340,14 @@ def test_residency_restore_precedes_fresh_attempt_grant() -> None:
 
     class ExecutorStub:
         hello = {"memory": ()}
+        active = "construction"
 
         @contextlib.contextmanager
         def watched(self, _name: str):
             yield
 
         def call(self, _command: object, **_kwargs: object) -> dict[str, object]:
-            events.append("restore")
+            events.append(type(_command).__name__.lower())
             return {"ok": True, "residency": {}}
 
     executor = ExecutorStub()
@@ -399,5 +381,5 @@ def test_residency_restore_precedes_fresh_attempt_grant() -> None:
     worker._observe_memory = lambda *_args: None
 
     Worker._arbitrate_residency(worker, attempt, slot)
-    assert events == ["restore", "grant"]
+    assert events == ["grant", "activate", "restore"]
     assert attempt.memory_grants == (17,)

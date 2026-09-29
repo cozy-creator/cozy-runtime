@@ -5976,14 +5976,18 @@ class Worker:
                     continue
                 ordinal = lane.ordinals[rank]
                 entry = lane.entries[ordinal]
-                driver_pid = proctree.host_pid(pid)
-                if driver_pid is None:
-                    continue
                 measured = accel.process_memories_by_device(
-                    {driver_pid}, accel.host_backend_family(), (entry,), allow_subprocess=False
-                )[entry][driver_pid]
+                    {pid}, accel.host_backend_family(), (entry,), allow_subprocess=False
+                )[entry][pid]
                 if measured.state == "present":
                     row.held[ordinal] = measured.bytes
+                    row.unattributed.pop(ordinal, None)
+                else:
+                    device = accel.device_memory(entry, accel.host_backend_family())
+                    if device.state == "measured":
+                        row.unattributed[ordinal] = max(
+                            device.total_bytes - device.free_bytes, 0
+                        )
         if "0" in reports:
             row.ledger.observe_memory(reports["0"])
         for rank, ordinal in enumerate(lane.ordinals):
@@ -6518,12 +6522,34 @@ class Worker:
                     exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
                 ) from exc
 
+        attempt.memory_grants = self.memory.attempt_grants(
+            me, self._tenants(set(lane.ordinals)), peak, authorize
+        )
+        attempt.memory_grant = min(attempt.memory_grants)
         executor = row.executor()
         if (
             executor is not None
             and self.memory.executor_placement(executor.hello.get("memory", ())) == "all_resident"
             and row.ledger.evicted
         ):
+            active = getattr(executor, "active", "")
+            if active:
+                with executor.watched("restore-grant"):
+                    grant_reply = executor.call(
+                        Activate(
+                            construction=active,
+                            authorized_device_limit_bytes=attempt.memory_grant,
+                            memory_grants=attempt.memory_grants,
+                        ),
+                        timeout=None,
+                        on_request=self._room(lane, attempt.placement_id),
+                    )
+                if not grant_reply.get("ok"):
+                    raise AttemptRefusal(
+                        str(grant_reply.get("code") or "residency_grant_refused"),
+                        str(grant_reply.get("detail") or "executor rejected the fresh device grant"),
+                        cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+                    )
             with executor.watched("restore"):
                 reply = executor.call(
                     Restore(names=tuple(sorted(row.ledger.evicted))),
@@ -6538,10 +6564,6 @@ class Worker:
                 )
             row.ledger.observe_restore(reply, "revision-1 resident placement")
             self._observe_memory(lane, row, reply)
-        attempt.memory_grants = self.memory.attempt_grants(
-            me, self._tenants(set(lane.ordinals)), peak, authorize
-        )
-        attempt.memory_grant = min(attempt.memory_grants)
         lane.touch(attempt.placement_id)
         row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
 
@@ -7896,6 +7918,10 @@ class _Tenant:
     @property
     def overhead(self) -> dict[int, int]:
         return self.row.overhead
+
+    @property
+    def unattributed(self) -> dict[int, int]:
+        return self.row.unattributed
 
     @property
     def last_used(self) -> int:

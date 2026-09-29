@@ -65,6 +65,27 @@ def test_only_reusable_memory_refusals_can_decline_a_spread(code: str) -> None:
     assert memory.Planner.spread_decline(RuntimeError("device lost")) is None
 
 
+def test_unknown_legacy_usage_is_charged_once_under_a_budget() -> None:
+    from types import SimpleNamespace
+
+    machine = memory.Machine({0: 800}, lambda _ordinal: (500, 1000), lambda _note: None)
+    legacy = SimpleNamespace(
+        slot="legacy",
+        ordinals=(0,),
+        held={},
+        unattributed={0: 500},
+        overhead={},
+    )
+    current = SimpleNamespace(
+        slot="current",
+        ordinals=(0,),
+        held={},
+        unattributed={},
+        overhead={},
+    )
+    assert machine.quote(current, [legacy, current]) == {0: 500}
+
+
 def test_modeled_invoke_refills_disk_weights_and_records_the_invoke_leg(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
