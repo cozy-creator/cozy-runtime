@@ -458,6 +458,77 @@ def test_auto_preserves_h3_attention_precision_and_explicit_fp8_remains_availabl
     assert not any("_cozy_flash_attn3_fp8" in values for values in _backends(roots).values())
 
 
+def _classic(dtype: Any) -> dict[str, Any]:
+    """Diffusers' own classic `Attention` sites: a narrow SDXL-style UNet and AutoencoderKL."""
+    import torch
+    from diffusers import AutoencoderKL, UNet2DConditionModel
+
+    torch.manual_seed(0)
+    unet = UNet2DConditionModel(
+        sample_size=8,
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
+        up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
+        cross_attention_dim=32,
+        attention_head_dim=(2, 4),
+    )
+    vae = AutoencoderKL(block_out_channels=(32,), latent_channels=4)
+    return {"unet": unet.eval().to(dtype), "vae": vae.eval().to(dtype)}
+
+
+def test_classic_attention_sites_are_managed_observed_and_bit_identical() -> None:
+    """SDXL's UNet and every AutoencoderKL ran torch SDPA through `AttnProcessor2_0`, which no
+    selection could reach: evidence said `unobserved` and every pin refused (run 1632)."""
+    why = _diffusers_skip()
+    if why:
+        pytest.skip(why)
+    import torch
+    from diffusers.models.attention_processor import AttnProcessor2_0
+
+    roots = _classic(torch.float32)
+    sample, text, image = torch.randn(1, 4, 8, 8), torch.randn(1, 5, 32), torch.randn(1, 3, 16, 16)
+    with torch.no_grad():
+        before = (roots["unet"](sample, 10, text).sample, roots["vae"](image).sample)
+    records = list(attention._attention_records(roots))
+    assert records and all(type(row[3]) is AttnProcessor2_0 for row in records)
+    assert not list(attention._sites(roots))
+
+    device = _device(0, kind="cpu")
+    applied = attention.select(device, roots)
+    assert applied.totals() == {"sdpa": len(records)}
+    assert set(applied.hosts) == {"unet", "vae"}
+    assert attention.observed(roots).totals() == {"sdpa": len(records)}
+    with torch.no_grad():
+        after = (roots["unet"](sample, 10, text).sample, roots["vae"](image).sample)
+    assert all(torch.equal(old, new) for old, new in zip(before, after, strict=True))
+    assert attention.check(device, roots, "unet=sdpa").name == "sdpa"
+
+    processors = [processor for _, _, processor in attention._sites(roots)]
+    attention.select(device, roots)
+    assert [processor for _, _, processor in attention._sites(roots)] == processors
+    assert len({id(processor) for processor in processors}) == len(records)
+
+
+def test_auto_keeps_sdpa_on_classic_sites_and_a_pin_moves_them() -> None:
+    """Adoption changes what can be chosen, never what auto chooses: a classic site keeps the
+    kernel it always ran while a native site on the same card takes the ranked one."""
+    why = _diffusers_skip()
+    if why:
+        pytest.skip(why)
+    import torch
+
+    roots = _classic(torch.float16)
+    attention.adopt(roots)
+    roots["dit"] = _sites_of(2, dim_head=64, heads=1, dtype=torch.float16)
+    applied = attention.install(_ready(*RANKED), roots)
+    assert applied.hosts["dit"] == {"flash-attn3": 2}
+    assert set(applied.hosts["unet"]) == set(applied.hosts["vae"]) == {"sdpa"}
+    pinned = attention.install(_ready("flash-attn3"), {"unet": roots["unet"]}, "unet=flash-attn3")
+    assert set(pinned.hosts["unet"]) == {"flash-attn3"}
+    assert _backends({"unet": roots["unet"]}) == {"unet": ["_cozy_flash_attn3"]}
+
+
 def test_per_request_swap_can_be_followed_by_auto_without_pin_leak() -> None:
     """A pinned attempt changes live processors only for that attempt's boundary."""
     why = _diffusers_skip()

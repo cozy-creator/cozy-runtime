@@ -78,9 +78,12 @@ an interrupted call is not fabricated as complete. A Turbo request whose policy 
 of sparse acceleration. Request-owned Sol hooks are removed even if applying or
 executing an override fails; prepared Sol hooks remain owned by the generation.
 
-Legacy Diffusers processors such as `AttnProcessor2_0` call SDPA directly and have
-no per-site backend selection contract. Runtime leaves them untouched and does not
-report an installed backend for them. Model policies receive an empty `eligible`
+Diffusers' classic `AttnProcessor2_0` (SDXL's UNet, AutoencoderKL) calls SDPA
+directly. Selection first replaces it with `ClassicSdpa`, the same math through
+backend dispatch: auto keeps SDPA there (bit-identical), and pins and model policies
+may choose another kernel. Other legacy processors have no per-site backend selection
+contract. Runtime leaves them untouched and does not report an installed backend for
+them. Model policies receive an empty `eligible`
 and `recommended` context explaining this limitation. Explicit matching pins or
 policy choices refuse, including components mixing managed and legacy processors;
 Runtime never creates an unused processor attribute to claim partial coverage.

@@ -1,4 +1,8 @@
-"""Legacy SDPA processors must not be advertised as controllable registry sites."""
+"""A processor that bypasses backend dispatch is never advertised as a controllable site.
+
+Diffusers' `AttnProcessor2_0` is the exception Runtime removes rather than tolerates: `adopt`
+replaces it with `ClassicSdpa`, which really dispatches. Any other legacy processor (here
+`AttnProcessor`) stays untouched and refused."""
 
 from __future__ import annotations
 
@@ -20,7 +24,7 @@ def _modules() -> tuple[Any, Any]:
     torch = pytest.importorskip("torch")
     module = pytest.importorskip("diffusers.models.attention_processor")
     wan = pytest.importorskip("diffusers.models.transformers.transformer_wan")
-    legacy = module.Attention(query_dim=8, heads=1, dim_head=8, processor=module.AttnProcessor2_0())
+    legacy = module.Attention(query_dim=8, heads=1, dim_head=8, processor=module.AttnProcessor())
     managed = wan.WanAttention(dim=8, heads=1, dim_head=8, processor=wan.WanAttnProcessor())
     assert not hasattr(legacy.processor, "_attention_backend")
     assert hasattr(managed.processor, "_attention_backend")
@@ -43,6 +47,35 @@ def test_legacy_processor_bypasses_registry_but_managed_control_does_not() -> No
         assert torch.equal(legacy(query), baseline)
         with pytest.raises(RuntimeError, match="registry backend was called"):
             mixed["managed"](query)
+
+
+def test_an_adopted_classic_sdpa_site_really_dispatches_through_the_registry() -> None:
+    torch = pytest.importorskip("torch")
+    module = pytest.importorskip("diffusers.models.attention_processor")
+    dispatch = pytest.importorskip("diffusers.models.attention_dispatch")
+    classic = module.Attention(
+        query_dim=8, heads=1, dim_head=8, processor=module.AttnProcessor2_0()
+    )
+    query = torch.randn(1, 4, 8)
+    with torch.no_grad():
+        baseline = classic(query)
+    attention.adopt({"classic": classic})
+    assert type(classic.processor) is attention.ClassicSdpa
+
+    def reject_registry_call(query: Any, key: Any, value: Any, **_: Any) -> Any:
+        raise RuntimeError("registry backend was called")
+
+    member = register("_cozy_classic_coverage_test", reject_registry_call)
+    with (
+        torch.no_grad(),
+        dispatch.attention_backend(member),
+        pytest.raises(RuntimeError, match="registry backend was called"),
+    ):
+        classic(query)
+    applied = attention.select(_device(), {"classic": classic})
+    assert applied.totals() == {"sdpa": 1}
+    with torch.no_grad():
+        assert torch.equal(classic(query), baseline)
 
 
 def test_default_keeps_legacy_untouched_and_does_not_report_a_selection() -> None:
