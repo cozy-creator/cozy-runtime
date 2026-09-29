@@ -7,6 +7,7 @@ checkpoint: every comparison is bit-for-bit against the same weights resident.
 
 from __future__ import annotations
 
+from types import MethodType
 from typing import Any
 
 import pytest
@@ -14,9 +15,12 @@ import pytest
 torch = pytest.importorskip("torch")
 diffusers = pytest.importorskip("diffusers")
 
+from cozy_runtime.author import pure  # noqa: E402
 from cozy_runtime.internal import memory, tiers  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+# The executor's allocator configuration (worker session `alloc_conf`).
+torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 MiB = 1 << 20
 DEVICE = torch.device("cuda", 0)
 
@@ -83,29 +87,52 @@ def _loop(unet: Any, inputs: dict[str, Any], steps: int = 3) -> Any:
     return x
 
 
+_planners: list[memory.Planner] = []
+
+
 def _planner() -> memory.Planner:
+    torch.cuda.set_per_process_memory_fraction(1.0, DEVICE)
     torch.cuda.empty_cache()
     free, total = torch.cuda.mem_get_info(DEVICE)
     planner = memory.Planner(torch, DEVICE)
     # Everything the card holds beyond this process's allocator counts against it here.
     planner.overhead = total - free - torch.cuda.memory_reserved(DEVICE)
+    _planners.append(planner)
     return planner
+
+
+@pytest.fixture(autouse=True)
+def _one_process_one_planner() -> Any:
+    """An executor has one planner. A test's leaves nothing on the card for the next test's."""
+    yield
+    while _planners:
+        planner = _planners.pop()
+        planner.vacate()
+        for construction in {held.construction for held in planner.held.values()}:
+            planner.forget(construction)
+    torch.cuda.set_per_process_memory_fraction(1.0, DEVICE)
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture
 def reference() -> Any:
+    # The cap a previous test's grant left on this process is not this test's.
+    torch.cuda.set_per_process_memory_fraction(1.0, DEVICE)
     unet = _unet().to(DEVICE)
     inputs = _inputs()
+    torch.cuda.reset_peak_memory_stats(DEVICE)
+    base = torch.cuda.memory_allocated(DEVICE)
     resident = _loop(unet, inputs)
+    working = torch.cuda.max_memory_allocated(DEVICE) - base
     unet.to("cpu")
     torch.cuda.empty_cache()
-    yield unet, inputs, resident
+    yield unet, inputs, resident, working
     del unet
     torch.cuda.empty_cache()
 
 
 def test_innermost_units_hold_sdxls_unet_to_one_block(reference: Any) -> None:
-    unet, _, _ = reference
+    unet, _, _, _ = reference
     part = tiers.partition("unet", unet, tiers.HOST)
     # Innermost repeated no-split instances: no unit contains another, and the largest one
     # is a transformer or resnet block, never a whole up block.
@@ -117,24 +144,38 @@ def test_innermost_units_hold_sdxls_unet_to_one_block(reference: Any) -> None:
 
 @pytest.mark.parametrize("fraction", [2, 4])
 def test_streaming_at_a_grant_is_bit_identical_to_resident(reference: Any, fraction: int) -> None:
-    unet, inputs, resident = reference
+    unet, inputs, resident, working = reference
     planner = _planner()
     held = planner.adopt("c", "unet", unet, None, tiers.HOST)
-    planner.begin(held.part.nbytes // fraction + planner.overhead)
+    grant = held.part.nbytes // fraction + working + planner.overhead
+    planner.begin(grant)
     streamed = _loop(unet, inputs)
     facts = planner.end()
     assert torch.equal(streamed, resident)
     assert 0 < held.part.on(tiers.DEVICE) < held.part.nbytes
-    assert facts["peak_bytes"] <= held.part.nbytes // fraction + planner.overhead
+    assert facts["peak_bytes"] <= grant
     planner.vacate()
     assert held.part.on(tiers.DEVICE) == 0
 
 
-def test_a_forced_out_of_memory_step_recovers_bit_identical(reference: Any) -> None:
-    unet, inputs, resident = reference
+def test_a_forward_its_author_replaced_is_still_a_planned_op(reference: Any) -> None:
+    unet, inputs, resident, working = reference
+    original = unet.forward
+    unet.forward = MethodType(pure(lambda _self, *a, **k: original(*a, **k)), unet)
     planner = _planner()
     held = planner.adopt("c", "unet", unet, None, tiers.HOST)
-    grant = held.part.nbytes // 2 + planner.overhead
+    planner.begin(held.part.nbytes // 2 + working + planner.overhead)
+    replaced = _loop(unet, inputs)
+    planner.end()
+    assert "unet.forward" in planner.plans
+    assert torch.equal(replaced, resident)
+
+
+def test_a_forced_out_of_memory_step_recovers_bit_identical(reference: Any) -> None:
+    unet, inputs, resident, working = reference
+    planner = _planner()
+    held = planner.adopt("c", "unet", unet, None, tiers.HOST)
+    grant = held.part.nbytes // 2 + working + planner.overhead
     planner.begin(grant)
     _loop(unet, inputs, steps=1)
     planner.end()
@@ -174,23 +215,25 @@ def test_a_decode_tiles_only_when_untiled_cannot_fit() -> None:
 def test_an_op_with_a_foreign_hook_fails_typed_and_leaves_the_device_clean(
     reference: Any,
 ) -> None:
-    unet, inputs, _ = reference
+    unet, inputs, _, working = reference
     planner = _planner()
     held = planner.adopt("c", "unet", unet, None, tiers.HOST)
+    grant = held.part.nbytes // 2 + working + planner.overhead
     handle = unet.down_blocks[0].register_forward_hook(lambda *_: None)
     try:
-        planner.begin(held.part.nbytes // 2 + planner.overhead)
+        planner.begin(grant)
         _loop(unet, inputs, steps=1)
         planner.end()
         for record in planner.records.values():
             record.ok //= 4
-        planner.begin(held.part.nbytes // 2 + planner.overhead)
-        before = torch.cuda.memory_allocated(DEVICE)
+        planner.begin(grant)
+        # Clean: nothing but the weights the plan placed outlives the refused op.
+        before = torch.cuda.memory_allocated(DEVICE) - held.part.on(tiers.DEVICE)
         with pytest.raises(memory.MemoryRefusal) as refused:
             _loop(unet, inputs, steps=1)
         assert refused.value.code == "device_out_of_memory"
         assert "cannot be put back" in refused.value.message
         planner.end()
-        assert torch.cuda.memory_allocated(DEVICE) <= before
+        assert torch.cuda.memory_allocated(DEVICE) - held.part.on(tiers.DEVICE) <= before
     finally:
         handle.remove()

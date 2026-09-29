@@ -373,7 +373,7 @@ def release(component: Component) -> None:
     component.hooks.clear()
     for name in (*OP_METHODS, "_apply", "_cozy_op"):
         value = vars(component.root).get(name)
-        if value is not None and (ours(value) or name == "_cozy_op"):
+        if value is not None and (installed(value) or name == "_cozy_op"):
             del component.root.__dict__[name]
 
 
@@ -381,10 +381,10 @@ def wrap(root: Module, run: Run) -> None:
     """Route the root's forward, encode and decode through `run`, keeping each signature. A
     forward someone replaced on the instance is wrapped too; ours is never wrapped twice."""
     for method in OP_METHODS:
-        installed = vars(root).get(method)
-        if ours(installed):
+        replaced = vars(root).get(method)
+        if installed(replaced):
             continue
-        bound = installed if installed is not None else getattr(root, method, None)
+        bound = replaced if replaced is not None else getattr(root, method, None)
         if callable(bound):
             root.__dict__[method] = op(method, bound, run)
 
@@ -402,8 +402,14 @@ def op(
     return op
 
 
+def installed(value: object) -> bool:
+    """This module put it there: a wrapper, hook or `_apply` it installs and removes."""
+    return bool(getattr(value, "__cozy_op__", False))
+
+
 def ours(value: object) -> bool:
-    return bool(getattr(value, "__cozy_op__", False) or getattr(value, "__cozy_pure__", False))
+    """Safe to run again after an OOM: installed here, or marked pure by its author."""
+    return installed(value) or bool(getattr(value, "__cozy_pure__", False))
 
 
 def trim(torch: Torch) -> None:

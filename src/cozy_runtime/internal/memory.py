@@ -21,7 +21,6 @@ import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import NoReturn, Protocol
 
 from cozy_runtime.author._errors import DEVICE_OOM, RuntimeFailure
@@ -73,17 +72,6 @@ def _asked(text: str) -> int:
         return 0
     unit = match[2][0] if match[2] != "B" else " "
     return int(float(match[1]) * 1024 ** " KMGT".index(unit))
-
-
-def _pressure() -> bool:
-    """Every runnable task on the host stalled on memory in the last ten seconds and over the
-    last minute (PSI `full`): sustained thrash, not the routine blips of a desktop."""
-    try:
-        full = Path("/proc/pressure/memory").read_text().splitlines()[1].split()
-        windows = dict(field.split("=", 1) for field in full[1:])
-        return float(windows["avg10"]) > 0 and float(windows["avg60"]) > 0
-    except (OSError, IndexError, KeyError, ValueError):
-        return False
 
 
 def _leaves(value: object) -> Iterator[object]:
@@ -1016,11 +1004,9 @@ class Planner:
             self._home(part, unit)
 
     def _host_room(self, nbytes: int) -> bool:
-        """Host memory takes a copy while the kernel shows no stall and it fits what is
-        available; otherwise clean caches, then idle host units, go back to the store."""
-        if _pressure():
-            self._release_host(nbytes)
-            return False
+        """Host memory takes a copy when what is available covers it (MemAvailable already
+        nets out the kernel's reserve); otherwise clean caches, then idle host units, go back
+        to the store. Stall pressure is no gate: a desktop reports it with gigabytes free."""
         available = proctree.available_host_bytes()
         if available < 0 or available >= nbytes:
             return True
@@ -1256,7 +1242,7 @@ class Machine:
                 tenant.end(f"reclaimed before {me.slot!r} runs")
         for ordinal in me.ordinals:
             if peak is None:
-                self.room(me, ordinal, 1 << 62, None, tenants, measured=False)
+                self.room(me, ordinal, None, None, tenants, measured=False)
             else:
                 self.room(me, ordinal, 0, peak, tenants, measured=True)
         return {ordinal: self.grant(me, ordinal, tenants) for ordinal in me.ordinals}
@@ -1265,26 +1251,31 @@ class Machine:
         self,
         me: Tenant,
         ordinal: int,
-        free_wanted: int,
+        free_wanted: int | None,
         grant_wanted: int | None,
         tenants: Sequence[Tenant],
         *,
         measured: bool,
     ) -> int | None:
-        """Free `ordinal` for `me` until the driver has `free_wanted` bytes free and its grant
-        reaches `grant_wanted`: dead tenants first, then idle tenants' weights, least recently
-        used first, then (for a measured need) idle processes. Never an active tenant."""
+        """Free `ordinal` for `me` until the driver has `free_wanted` bytes free (None: until
+        nothing idle is left) and its grant reaches `grant_wanted`: dead tenants first, then
+        idle tenants' weights, least recently used first, then (for a measured need) idle
+        processes. Never an active tenant."""
         tried: set[str] = set()
         while True:
             measured_now = self.driver(ordinal)
             if measured_now is None:
                 return None
             grant = self.grant(me, ordinal, tenants)
-            if measured_now[0] >= free_wanted and (
-                grant_wanted is None or grant is None or grant >= grant_wanted
+            if (
+                free_wanted is not None
+                and measured_now[0] >= free_wanted
+                and (grant_wanted is None or grant is None or grant >= grant_wanted)
             ):
                 return grant
             victim = self._victim(me, ordinal, tenants, tried, measured)
+            if victim is None and free_wanted is None:
+                return grant
             if victim is None:
                 self.note(
                     f"GPU {ordinal}: nothing idle is left to give {me.slot!r} room "
