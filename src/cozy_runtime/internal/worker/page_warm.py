@@ -55,14 +55,17 @@ def warm_component(
 
     try:
         slots = [bytearray(fill.slot_bytes(fill.WINDOW_BYTES)) for _ in range(count)]
+    finally:
+        # The promise covers allocation. Once materialized, live cgroup usage
+        # already includes these buffers throughout their streaming lifetime.
+        release()
+    try:
         before = fill.block_read_bytes()
         started = time.perf_counter()
         with checkpoint.acquire() as lease:
             streamed = lease.stream(plan, slots, delivered, readers=fill.READERS)
     except _Superseded:
         return {"component": component, "skipped": "queue changed or demand preparation started"}
-    finally:
-        release()
     took = (time.perf_counter() - started) * 1000
     after = fill.block_read_bytes()
     return {

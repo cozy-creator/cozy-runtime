@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from cozy_runtime.internal.memory import Machine
 from cozy_runtime.internal.worker.page_warm import warm_component
 from test_weights_resume_native import _committed
@@ -31,6 +33,8 @@ def test_superseded_read_returns_slots_and_host_credit(tmp_path: Path) -> None:
     def wanted() -> bool:
         nonlocal checks
         checks += 1
+        if checks > 1:
+            assert not policy.host_reserved  # Materialized slots already count in cgroup usage.
         return checks == 1
 
     report = warm_component(
@@ -67,4 +71,29 @@ def test_host_denial_skips_prefetch_without_claiming_a_load(tmp_path: Path) -> N
         wanted=lambda: True,
     )
     assert "skipped" in report and "bytes" not in report
+    assert not policy.host_reserved
+
+
+def test_failed_slot_allocation_releases_the_promise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cozy_runtime.internal.worker import page_warm
+
+    store, _, _, receipt = _committed(tmp_path)
+    policy = Machine({}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30)
+
+    def fail(nbytes: int) -> bytearray:
+        assert policy.host_reserved == {"prefetch": nbytes}
+        raise MemoryError("slot allocation refused")
+
+    monkeypatch.setattr(page_warm, "bytearray", fail, raising=False)
+    with pytest.raises(MemoryError, match="slot allocation refused"):
+        warm_component(
+            str(store.root),
+            receipt.artifact.manifest.digest,
+            "model",
+            reserve=lambda n: policy.reserve_host("prefetch", n),
+            release=lambda: policy.release_host("prefetch"),
+            wanted=lambda: True,
+        )
     assert not policy.host_reserved
