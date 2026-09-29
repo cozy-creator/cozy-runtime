@@ -94,6 +94,7 @@ from cozy_runtime.internal.executor_commands import (
     DescribeInstalled,
     Load,
     ModelLoad,
+    Restore,
     Start,
     Unload,
     Vacate,
@@ -5931,6 +5932,37 @@ class Worker:
         row.disk = observed
         row.disk_epoch = observed_epochs
         reports = executor_replies.rank_memory_facts(reply.get("rank_memory"))
+        executor = row.executor()
+        if executor is not None and "rank_memory" not in executor.hello.get("memory", ()):
+            # Revision-1 peers report process births rather than allocator vectors.
+            # Attribute actual driver bytes to each verified birth, never copy rank 0
+            # onto the other devices or substitute a guessed context allowance.
+            processes = reply.get("processes")
+            for process in processes if isinstance(processes, list) else ():
+                if not isinstance(process, dict):
+                    continue
+                rank, pid, ticks = (process.get(key) for key in ("rank", "pid", "started_ticks"))
+                if not all(type(value) is int for value in (rank, pid, ticks)):
+                    continue
+                if not (isinstance(rank, int) and isinstance(pid, int) and isinstance(ticks, int)):
+                    continue
+                if not 0 <= rank < len(lane.ordinals):
+                    continue
+                identity = proctree.ProcessIdentity(pid=pid, started_ticks=ticks)
+                owned = (
+                    proctree.cgroup_contains(executor.scope, identity)
+                    if isinstance(executor.scope, proctree.CgroupScope)
+                    else proctree.process_scope_contains(executor.scope, identity)
+                )
+                if not owned or proctree.process_state(identity) in (None, "Z"):
+                    continue
+                ordinal = lane.ordinals[rank]
+                entry = lane.entries[ordinal]
+                measured = accel.process_memories_by_device(
+                    {pid}, accel.host_backend_family(), (entry,), allow_subprocess=False
+                )[entry][pid]
+                if measured.state == "present":
+                    row.held[ordinal] = measured.bytes
         if "0" in reports:
             row.ledger.observe_memory(reports["0"])
         chosen = set(lane.ordinals if ordinals is None else ordinals)
@@ -6367,9 +6399,7 @@ class Worker:
             def warm_pages(_: Unit, read: Callable[[], None] = read) -> None:
                 read()
 
-            self.supervisor.spawn(
-                f"page-warm:{placement_id}:{construction}", warm_pages
-            )
+            self.supervisor.spawn(f"page-warm:{placement_id}:{construction}", warm_pages)
         self._refresh_memory_queue()
 
     def _warm_construction_pages(
@@ -6472,6 +6502,26 @@ class Worker:
             me, self._tenants(set(lane.ordinals)), peak, authorize
         )
         attempt.memory_grant = min(attempt.memory_grants)
+        executor = row.executor()
+        if (
+            executor is not None
+            and self.memory.executor_placement(executor.hello.get("memory", ())) == "all_resident"
+            and row.ledger.evicted
+        ):
+            with executor.watched("restore"):
+                reply = executor.call(
+                    Restore(names=tuple(sorted(row.ledger.evicted))),
+                    timeout=None,
+                    on_request=self._room(lane, attempt.placement_id),
+                )
+            if not reply.get("ok"):
+                raise AttemptRefusal(
+                    str(reply.get("code") or "residency_restore_failed"),
+                    str(reply.get("detail") or "executor could not restore its resident weights"),
+                    cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+                )
+            row.ledger.observe_restore(reply, "revision-1 resident placement")
+            self._observe_memory(lane, row, reply)
         lane.touch(attempt.placement_id)
         row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
 

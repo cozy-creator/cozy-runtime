@@ -39,9 +39,9 @@ from typing import Any, NoReturn
 #: Worker/executor command-and-reply compatibility, independent of SDK package
 #: version or source build. Compatible additive fields keep this revision; only
 #: an incompatible change to required commands/semantics raises it.
-EXECUTOR_PROTOCOL_REVISION = 2
+EXECUTOR_PROTOCOL_REVISION = 1
 
-#: Revision 2 requires planner grants, aggregate host credits and prepared group calls.
+#: Additive memory operations are negotiated independently of the command protocol.
 EXECUTOR_MEMORY_CAPABILITIES = frozenset(
     {
         "plan", "rank_memory", "prepare_commit", "import_only", "vacate_ranks", "host_room",

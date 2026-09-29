@@ -482,6 +482,13 @@ class Planner:
         return True
 
     @staticmethod
+    def spread_decline(exc: Exception) -> str | None:
+        """A reusable refusal before the tensor answer can run on another rank."""
+        if isinstance(exc, MemoryRefusal) and exc.reusable:
+            return f"{exc.code}: {exc.message}"[:300]
+        return None
+
+    @staticmethod
     def group_retry(
         statuses: Sequence[OpReady],
         *,
@@ -790,6 +797,28 @@ class Planner:
             else:
                 self._load_common(held)
             self._cap()
+
+    def restore_resident(self, construction: str, names: tuple[str, ...]) -> dict[str, object]:
+        """A revision-1 Worker's explicit restore, without evicting another component."""
+        restored: dict[str, int] = {}
+        held_back: dict[str, str] = {}
+        for held in self.held.values():
+            part = held.part
+            if (
+                held.construction != construction
+                or held.hosted
+                or (names and part.name not in names)
+            ):
+                continue
+            missing = part.nbytes - part.on(DEVICE)
+            if missing <= 0:
+                continue
+            if missing > self.allocatable():
+                held_back[part.name] = "insufficient device room"
+                continue
+            self._stage_whole(held, [])
+            restored[part.name] = missing
+        return {"restored": restored, "held": held_back, "restored_bytes": sum(restored.values())}
 
     def _stage_whole(self, held: Held, victims: list[Held]) -> None:
         for victim in victims:
@@ -2139,6 +2168,11 @@ class Machine:
                 SHORTFALL, f"{lane_id}: other tenants exceed the device budget: {negative!r}"
             )
         return tuple(grant for grant in granted if grant is not None)
+
+    @staticmethod
+    def executor_placement(capabilities: Iterable[str]) -> str:
+        """Only an executor advertising the planner may stage within an operation."""
+        return "component_staged" if "plan" in capabilities else "all_resident"
 
     def attempt_grants(
         self,

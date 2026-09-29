@@ -314,8 +314,11 @@ def test_a_placeable_component_runs_on_its_follower(tmp_path: Path, degree: int)
 
 
 @pytest.mark.parametrize("degree", [2, 4])
+@pytest.mark.parametrize("decline", ["", "exception", "wire"])
 @pytest.mark.usefixtures("rank_threads")
-def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degree: int) -> None:
+def test_h3_vae_clips_spread_over_the_group_equal_one_rank(
+    tmp_path: Path, degree: int, decline: str
+) -> None:
     """Each temporal clip decodes on some rank from its own latent window; rank 0 cross-fades
     them in order. Encode clips spread the same way. Both must equal a single-rank run."""
     pytest.importorskip("diffusers")
@@ -325,7 +328,13 @@ def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degre
     def launch(module_argv: list[str], fd: int) -> spawn.Child:
         return spawn.spawn_follower(
             python=sys.executable,
-            module_argv=[str(fixture), *module_argv[2:], "--spread"],
+            module_argv=[
+                str(fixture),
+                *module_argv[2:],
+                "--spread",
+                *(["--spread-decline"] if decline else []),
+                *(["--spread-wire-refusal"] if decline == "wire" else []),
+            ],
             inherit_fd=fd,
             env=environment,
         )
@@ -354,7 +363,13 @@ def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degre
         assert leader.facts["sequence_parallel"]["spread_ranks"] == list(range(degree))
         leader._attempt_spool = tmp_path / "attempt"
         assert torch.equal(model.encode(x), moments)
-        assert sorted(group.rank_records) == list(range(1, degree))
+        assert sorted(group.rank_records) == list(range(2 if decline else 1, degree))
+        if decline:
+            assert any(
+                row["declined"].get("1", "").startswith("device_shortfall:")
+                for row in group.spread_log.values()
+            )
+            assert not group.broken
         group.rank_records.clear()
         actual = model.decode(z)
         assert torch.equal(actual, expected)

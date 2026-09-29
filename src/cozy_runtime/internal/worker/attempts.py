@@ -74,6 +74,7 @@ from cozy_runtime.internal import (
     executor_replies,
     fill,
     liveness,
+    memory,
     output_budget,
     package_interface,
     readiness,
@@ -1408,7 +1409,12 @@ class AttemptEngine:
                     cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                 )
             try:
-                plan = slot.chooser.choose(declared, loaded.prepared_model, prepared)
+                plan = slot.chooser.choose(
+                    declared,
+                    loaded.prepared_model,
+                    prepared,
+                    placement=memory.Machine.executor_placement(executor.hello.get("memory", ())),
+                )
             except PlanRefusal as exc:
                 raise AttemptRefusal(
                     exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE

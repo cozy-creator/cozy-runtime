@@ -1,8 +1,4 @@
-"""Current-capability executors serve old lower-bound locks; retired peers fail before Start.
-
-Real published old executors are retained only as early-rejection controls. Persistent
-record/journal evolution remains covered independently; software rejection never deletes rows.
-"""
+"""Actual published peers exercise additive Worker/executor memory compatibility."""
 
 from __future__ import annotations
 
@@ -34,7 +30,7 @@ from conftest import image_python
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env, package_installation
 from cozy_runtime.internal.config import Credentials, RuntimeConfig, package_install_environment
-from cozy_runtime.internal.worker import activity, child
+from cozy_runtime.internal.worker import activity
 from cozy_runtime.internal.worker.control import GrpcControlHost, InMemoryControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -45,10 +41,10 @@ from local_owner import LocalRecordOwner, LocalRequest
 from test_end_to_end import NO_EXECUTOR, _development, _wheel_rows
 
 #: Real retired releases exercise refusal at the capability boundary, not version gating.
-VERSIONS = ("0.18.51", "0.18.67", "0.18.69")
+VERSIONS = ("0.18.51",)
 
 #: An old dependency lock with a supported lower bound adopts the current machine SDK.
-CASES = (("0.18.67", ">=0.18.67"),)
+CASES = (("0.18.67", ">=0.18.67"), ("0.18.86", "==0.18.86"), ("0.18.87", "==0.18.87"))
 
 CACHE = (
     Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
@@ -536,13 +532,18 @@ def test_job_derives_adopts_and_reads_weights(harness: Harness) -> None:
 
 
 def test_an_old_lower_bound_lock_runs_the_current_machine_runtime(harness: Harness) -> None:
-    assert harness.version == importlib.metadata.version("cozy-runtime")
-    assert Version(harness.version) > Version("0.18.67")
+    if harness.requirement.startswith("=="):
+        assert harness.version == harness.requirement.removeprefix("==")
+    else:
+        assert harness.version == importlib.metadata.version("cozy-runtime")
+        assert Version(harness.version) > Version("0.18.67")
 
 
 @pytest.mark.parametrize("version", VERSIONS)
-def test_retired_published_executor_is_rejected_before_start(version: str, tmp_path: Path) -> None:
-    """Actual old hello, no Start/package invocation/CUDA initialization sent to that peer."""
+def test_old_published_executor_without_memory_fields_remains_compatible(
+    version: str, tmp_path: Path
+) -> None:
+    """An older hello may omit additive memory fields while keeping the command seam valid."""
     from test_device_lanes import _config
 
     environment = CACHE / "unsupported-peers" / version
@@ -570,8 +571,8 @@ def test_retired_published_executor_is_rejected_before_start(version: str, tmp_p
         InMemoryControlHost(),
     )
     try:
-        with pytest.raises(child.ExecutorProtocolMismatch, match="executor_protocol_incompatible"):
-            worker.supervision.spawn(imposed=worker.imposed(worker.lanes.envelope))
-        assert worker.supervision.current is None
+        executor = worker.supervision.spawn(imposed=worker.imposed(worker.lanes.envelope))
+        assert executor.hello["executor_protocol_revision"] == 1
+        assert "memory" not in executor.hello
     finally:
         worker.supervision.close()
