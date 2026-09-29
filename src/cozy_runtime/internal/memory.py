@@ -2084,10 +2084,21 @@ class Demand:
             raise ValueError("load cost must be finite and nonnegative")
 
 
-class Tenant(Protocol):
-    """One executor as the Worker's memory policy sees it: a process over some devices."""
+class HostTenant(Protocol):
+    """Host victim identity; reclaim_host is an optional negotiated operation."""
 
     slot: str
+
+    @property
+    def last_used(self) -> int: ...
+
+    def state(self) -> str:
+        """`active`, `idle`, or `dead`."""
+        ...
+
+
+class Tenant(HostTenant, Protocol):
+    """One executor as the Worker's device policy sees it: a process over some devices."""
 
     @property
     def ordinals(self) -> tuple[int, ...]: ...
@@ -2100,19 +2111,8 @@ class Tenant(Protocol):
     @property
     def overhead(self) -> dict[int, int]: ...
 
-    @property
-    def last_used(self) -> int: ...
-
-    def state(self) -> str:
-        """`active` (it holds its devices), `idle`, or `dead`."""
-        ...
-
     def vacate(self, ordinals: tuple[int, ...]) -> bool:
         """Its weights leave these devices; `held` is updated from the reply."""
-        ...
-
-    def reclaim_host(self, nbytes: int) -> tuple[int, int] | None:
-        """Return managed bytes released and remaining, or None when unavailable."""
         ...
 
     def end(self, why: str) -> bool:
@@ -2179,7 +2179,7 @@ class Machine:
         return tuple(frontier)
 
     def reserve_host(
-        self, owner: str, nbytes: int, *, requester: str = "", tenants: Sequence[Tenant] = ()
+        self, owner: str, nbytes: int, *, requester: str = "", tenants: Sequence[HostTenant] = ()
     ) -> bool:
         """Reserve against fresh aggregate room, reclaiming safe idle cache if needed.
 
@@ -2515,7 +2515,7 @@ class Machine:
                 return victim, act
         return None
 
-    def _reuse(self, tenant: Tenant, ordinal: int | None) -> tuple[float, float, int, str]:
+    def _reuse(self, tenant: HostTenant, ordinal: int | None) -> tuple[float, float, int, str]:
         """Farthest next use first; among ties, discard the cheapest measured reload.
 
         Missing demand means no predicted reuse. Missing cost is not a free reload.

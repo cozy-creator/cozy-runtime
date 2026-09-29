@@ -3,17 +3,18 @@
 import os
 import socket
 import threading
+from typing import Any
 
 import pytest
 
-from cozy_runtime.author._executor_requests import Answer, HostRoom, encode
+from cozy_runtime.author._executor_requests import Answer, HostRoom, Request, encode
 from cozy_runtime.internal import proctree
 from cozy_runtime.internal.executor_commands import Probe, ReclaimHost
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.worker.child import Executor
 
 
-def endpoint():
+def endpoint() -> tuple[Executor, Channel]:
     ours, theirs = socket.socketpair()
     peer = Channel(theirs)
     child = Executor(
@@ -26,26 +27,28 @@ def endpoint():
     return child, peer
 
 
-def test_reciprocal_midcall_host_requests_never_wait_for_other_stream():
+def test_reciprocal_midcall_host_requests_never_wait_for_other_stream() -> None:
     a, pa = endpoint()
     b, pb = endpoint()
     barrier = threading.Barrier(2)
-    answers = []
-    errors = []
+    answers: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
 
-    def peer(channel):
+    def peer(channel: Channel) -> None:
         try:
-            assert channel.recv()["cmd"] == "probe"
+            command = channel.recv()
+            assert command is not None and command["cmd"] == "probe"
             channel.send(
                 {"event": "request", "seq": 1, **encode(HostRoom(reservation="copy", nbytes=1))}
             )
-            assert channel.recv()["ok"]
+            answer = channel.recv()
+            assert answer is not None and answer["ok"]
             channel.send({"reply": "probe", "ok": True})
         except BaseException as error:
             errors.append(error)
 
-    def call(ours, other):
-        def room(_):
+    def call(ours: Executor, other: Executor) -> None:
+        def room(_: Request) -> Answer:
             barrier.wait(5)
             answer = other.call_if_idle(ReclaimHost(nbytes=1), eligible=lambda: True)
             answers.append(answer)
@@ -76,22 +79,23 @@ def test_reciprocal_midcall_host_requests_never_wait_for_other_stream():
             channel.close()
 
 
-def test_idle_call_rechecks_eligibility_after_stream_acquisition_without_sending():
+def test_idle_call_rechecks_eligibility_after_stream_acquisition_without_sending() -> None:
     child, peer = endpoint()
     try:
         answer = child.call_if_idle(ReclaimHost(nbytes=1), eligible=lambda: False)
         assert answer["code"] == "executor_busy" and not child._calls.locked()
         # A refused call must not leave an unmatched command on the peer stream.
-        seen = []
+        seen: list[str] = []
 
-        def respond():
+        def respond() -> None:
             frame = peer.recv()
+            assert frame is not None
             seen.append(frame["cmd"])
             peer.send({"reply": frame["cmd"], "ok": True})
 
         thread = threading.Thread(target=respond)
         thread.start()
-        observed = []
+        observed: list[tuple[bool, bool]] = []
         assert child.call_if_idle(
             Probe(),
             eligible=lambda: True,
@@ -106,7 +110,10 @@ def test_idle_call_rechecks_eligibility_after_stream_acquisition_without_sending
 
 
 @pytest.mark.parametrize("mode", ["exit", "stalled"])
-def test_idle_reclaim_ends_on_child_exit_or_proven_stalled_progress(mode, monkeypatch):
+def test_idle_reclaim_ends_on_child_exit_or_proven_stalled_progress(
+    mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import subprocess
     import sys
     import time
@@ -143,6 +150,7 @@ sys.exit(3)
         seal_digest="",
     )
     try:
+        assert process.stdout is not None
         assert process.stdout.readline().strip() == "ready"
         started = time.monotonic()
         with pytest.raises(ExecutorGone) as caught:
