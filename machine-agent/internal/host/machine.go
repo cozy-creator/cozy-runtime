@@ -27,6 +27,7 @@ import (
 
 // Machine is one running machine role.
 type Machine struct {
+	lease    *machineLease
 	grant    *Grant
 	layout   Layout
 	id       *Identity
@@ -70,11 +71,14 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	}
 
 	layout := NewLayout(g)
-	unlock, err := lockMachine(layout.State)
+	lease, err := lockMachine(layout.State)
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer lease.close()
+	if err := lease.watchRoot(layout.Root); err != nil {
+		return err
+	}
 	id, err := prepare(g, layout)
 	if err != nil {
 		return err
@@ -99,7 +103,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	if err != nil {
 		return err
 	}
-	m := &Machine{grant: g, layout: layout, id: id, claims: c, receipt: rec, hub: newHubClient(g), idle: state,
+	m := &Machine{lease: lease, grant: g, layout: layout, id: id, claims: c, receipt: rec, hub: newHubClient(g), idle: state,
 		restarts: &restarts{}, log: log, started: now,
 		inUpdate: true, // listener liveness is available while startup admission remains held
 		owned:    g.Lifetime == "persistent", ready: make(chan struct{}), wake: make(chan struct{}, 1), initialized: make(chan struct{})}
@@ -117,6 +121,9 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	m.openUpdates()
 	m.tfs = &tensorFS{bin: layout.TFS, store: layout.Store, repoCache: g.RepoCacheRoot}
 	if m.childAddr, err = freeLoopback(); err != nil {
+		return err
+	}
+	if err := lease.check(); err != nil {
 		return err
 	}
 	// The endpoint binds before anything slow: any HTTP answer tells the Hub the machine is up.
@@ -142,14 +149,17 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	if err := m.prepareLauncher(); err != nil {
 		return err
 	}
+	defer m.launcher.close()
 	// The privileged guardian prepares software after the network agent drops root.
 	startup, startupErr := m.launcher.maintain("startup-prepare", []string{g.Lifetime, layout.Store})
 	m.mu.Lock()
 	g.startupPending = startup == "boot_pending"
 	m.mu.Unlock()
 	m.setUpdating(m.startupPending())
+	if err := lease.check(); err != nil {
+		return err
+	}
 	m.launchMu.Lock() // initial boot shares update/supervisor launch admission
-	defer m.launcher.close()
 	if startupErr != nil {
 		m.restarts.fail(&launchRefusal{"runtime_update_recovery_required", startupErr.Error()})
 	} else if err := m.tfs.initStore(ctx); err != nil {
@@ -491,6 +501,9 @@ func (m *Machine) supervise(ctx context.Context) error {
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	for {
+		if err := m.lease.check(); err != nil {
+			return err
+		}
 		now := time.Now()
 		m.mu.Lock()
 		p := m.proc

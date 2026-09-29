@@ -91,7 +91,9 @@ The installer-owned `etc/cozy/software-policy.json` accepts
 explicitly selected installation without disabling explicit maintenance. Missing
 policy defaults to auto; unknown or unreadable policy defers discovery. Local,
 development and prerelease software also skips automatic discovery.
-An explicit wheel or version supplied through maintenance durably pins its
+Maintenance requests require a boolean `pin`: true for explicit wheels or versions,
+false for default-latest selection. The server never infers this intent from the
+resolved version fields. An explicit selection durably pins its
 resulting pair, including a restart between health commit and the API response.
 Rentals may update before first use; any accepted work pins software for every
 later restart and retry, even after all work has been collected.

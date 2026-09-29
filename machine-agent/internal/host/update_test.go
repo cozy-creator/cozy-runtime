@@ -117,7 +117,8 @@ func postUpdate(server *httptest.Server, token, operation string, choice *wheelC
 	if choice == nil {
 		choice = &wheelChoice{Version: "0.18.87"}
 	}
-	raw, _ := json.Marshal(updateRequest{Operation: operation, Runtime: choice})
+	pin := true
+	raw, _ := json.Marshal(updateRequest{Operation: operation, Runtime: choice, Pin: &pin})
 	return updateCall(server.Client(), http.MethodPost, server.URL+"/v1/machine/runtime/update", token, bytes.NewReader(raw))
 }
 
@@ -161,7 +162,7 @@ func TestRuntimeUpdateConcurrentAdmissionAndStaging(t *testing.T) {
 	replies := make(chan updateReply, callers)
 	for n := range callers {
 		go func() {
-			raw := fmt.Sprintf(`{"operation":"update-%d","runtime":{"version":"0.18.87"}}`, n)
+			raw := fmt.Sprintf(`{"operation":"update-%d","pin":false,"runtime":{"version":"0.18.87"}}`, n)
 			replies <- updateCall(server.Client(), http.MethodPost, server.URL+"/v1/machine/runtime/update?concurrent=1", token, strings.NewReader(raw))
 		}()
 	}
@@ -382,5 +383,36 @@ func TestNativeUpdateDefersUnreadyRuntimeBeforeAdmission(t *testing.T) {
 	reply = postUpdate(server, token, "already-admitted", nil)
 	if reply.code != http.StatusOK || reply.status.State != "waiting" {
 		t.Fatalf("readiness hid accepted operation: %+v", reply)
+	}
+}
+
+func TestNativeUpdateRequiresExplicitPinIntent(t *testing.T) {
+	for _, decision := range []string{"omitted", "null", "false", "true"} {
+		t.Run(decision, func(t *testing.T) {
+			m, token, mux := updateMachine(t)
+			gate := make(chan struct{})
+			m.launcher = &updateLauncher{pairReady: gate}
+			server := httptest.NewServer(mux)
+			defer server.Close()
+			body := `{"operation":"pin-proof","runtime":{"version":"0.18.87"}`
+			if decision != "omitted" {
+				body += `,"pin":` + decision
+			}
+			body += "}"
+			reply := updateCall(server.Client(), http.MethodPost, server.URL+"/v1/machine/runtime/update", token, strings.NewReader(body))
+			if decision == "omitted" || decision == "null" {
+				close(gate)
+				if reply.code != http.StatusBadRequest || m.updates.status != nil {
+					t.Fatalf("missing pin intent admitted: %+v", reply)
+				}
+				return
+			}
+			if reply.code != http.StatusAccepted || reply.status.Pinned != (decision == "true") {
+				close(gate)
+				t.Fatalf("pin intent changed: %+v", reply)
+			}
+			close(gate)
+			awaitUpdate(t, server, token, "pin-proof")
+		})
 	}
 }

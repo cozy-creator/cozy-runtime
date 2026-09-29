@@ -31,7 +31,7 @@ import (
 //
 //	GET  /v1/machine/runtime                 the installed pair and the last update
 //	PUT  /v1/machine/runtime/wheels/{file}   stage one wheel
-//	POST /v1/machine/runtime/update          {operation, runtime, tensorfs}: each a staged
+//	POST /v1/machine/runtime/update          {operation, pin, runtime, tensorfs}: each pair member a staged
 //	                                         {file, sha256}, a {version} to fetch, or omitted
 //
 // Staged wheels serve the next accepted operation. Uploads are refused while an
@@ -52,6 +52,7 @@ type wheelChoice struct {
 
 type updateRequest struct {
 	Operation string       `json:"operation"`
+	Pin       *bool        `json:"pin"`
 	Runtime   *wheelChoice `json:"runtime,omitempty"`
 	TensorFS  *wheelChoice `json:"tensorfs,omitempty"`
 }
@@ -67,7 +68,7 @@ type updateStatus struct {
 	Error            string       `json:"error,omitempty"`
 	From             pairVersions `json:"from"`
 	To               pairVersions `json:"to"`
-	Pinned           bool         `json:"pinned,omitempty"`            // an explicitly supplied wheel owns this installed pair
+	Pinned           bool         `json:"pinned,omitempty"`            // the caller explicitly selected this installed pair
 	PreviouslyPinned bool         `json:"previously_pinned,omitempty"` // failed maintenance retains the previous selection
 }
 
@@ -245,8 +246,8 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var request updateRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&request); err != nil || !operationName.MatchString(request.Operation) ||
-		request.Runtime == nil && request.TensorFS == nil {
-		http.Error(w, "an update names its operation and a Runtime or TensorFS", http.StatusBadRequest)
+		request.Pin == nil || request.Runtime == nil && request.TensorFS == nil {
+		http.Error(w, "an update requires operation, a boolean pin decision, and a Runtime or TensorFS", http.StatusBadRequest)
 		return
 	}
 	m.updates.mu.Lock()
@@ -282,7 +283,7 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	pinned := request.Runtime != nil || request.TensorFS != nil
+	pinned := *request.Pin
 	status := updateStatus{Operation: request.Operation, State: "waiting", From: installed, Pinned: pinned}
 	status.PreviouslyPinned = current != nil && current.pins(installed)
 	if err := m.writeUpdate(status); err != nil {
@@ -350,7 +351,7 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 	}
 	status.State = "installing"
 	m.saveUpdate(status)
-	payload, _ := json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime})
+	payload, _ := json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned})
 	answer, err := m.launcher.maintain("update-prepare", []string{string(payload)})
 	if err != nil || answer != "boot_pending" {
 		if err == nil {

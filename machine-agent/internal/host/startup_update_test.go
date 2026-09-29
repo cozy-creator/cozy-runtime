@@ -271,7 +271,7 @@ func TestAutomaticAndExplicitUpdatesShareRecoveryAndCommit(t *testing.T) {
  *) cp '%s/before.json' '%s/current.json' ;;
  esac`, root, root, root, root, root))
 			if explicit {
-				request, _ := json.Marshal(pairTransaction{Before: before, After: after, Previous: previous, Candidate: candidate, Store: m.layout.Store, Lifetime: "persistent"})
+				request, _ := json.Marshal(pairTransaction{Before: before, After: after, Previous: previous, Candidate: candidate, Store: m.layout.Store, Lifetime: "persistent", Pin: true})
 				answer, err := maintain(root, nil, "update-prepare", []string{string(request)})
 				if err != nil || answer != "boot_pending" {
 					t.Fatalf("explicit preparation: %s %v", answer, err)
@@ -460,5 +460,30 @@ func TestDefaultHelpersDoNotInheritAgentCredentials(t *testing.T) {
 	raw, err = childOutput(cmd, false)
 	if err != nil || string(raw) != "COZY_EXPLICIT_RUNTIME_GRANT=fixture-explicit\n" {
 		t.Fatal("explicit Runtime launch grant was changed")
+	}
+}
+
+func TestDefaultSelectionUnpinsDespiteStaleRequestReport(t *testing.T) {
+	m := &Machine{layout: NewLayout(&Grant{Root: t.TempDir()}), log: io.Discard}
+	pair := pairVersions{Runtime: "0.18.88", TensorFS: "0.3.78"}
+	// Default-latest commit is authoritative even if a prior observer report still
+	// describes the same versions as explicitly pinned.
+	raw, _ := json.Marshal(updateStatus{Operation: "old", State: "succeeded", To: pair, Pinned: true})
+	if err := writeAtomic(m.updatePath(), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, pin := range []bool{false, true} {
+		if err := m.startupSave(startupStatus{State: "succeeded", After: pair, Pinned: pin}); err != nil {
+			t.Fatal(err)
+		}
+		if got := m.explicitlyPinnedPair(pair); got != pin {
+			t.Fatalf("committed pin=%v reported %v", pin, got)
+		}
+	}
+	if err := m.startupSave(startupStatus{State: "rolled_back", Before: pair, PreviouslyPinned: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !m.explicitlyPinnedPair(pair) {
+		t.Fatal("failed default selection removed the prior pin")
 	}
 }

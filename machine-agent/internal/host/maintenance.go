@@ -56,7 +56,7 @@ func maintain(root string, p *runtimeProcess, op string, args []string) (string,
 			}
 		}
 		status.Workspace = state.Workspace
-		if err := m.preparePair(context.Background(), request.Before, request.After, request.Candidate, request.Previous, status, true); err != nil {
+		if err := m.preparePair(context.Background(), request.Before, request.After, request.Candidate, request.Previous, status, request.Pin); err != nil {
 			if m.transactionPending() {
 				return "recovery_required", err
 			}

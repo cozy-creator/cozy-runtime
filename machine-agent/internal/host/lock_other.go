@@ -4,7 +4,7 @@ package host
 
 import "errors"
 
-func lockMachine(string) (func(), error) {
+func lockMachine(string) (*machineLease, error) {
 	return nil, errors.New("cozy-machine requires Linux process containment")
 }
 

@@ -31,6 +31,7 @@ type softwareState struct {
 }
 
 type pairTransaction struct {
+	Pin                 bool
 	Before, After       pairVersions
 	Candidate, Previous []string
 	Store, Lifetime     string
@@ -157,13 +158,16 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// A successful explicit wheel operation owns its particular installed pair.
+// A successful explicit maintenance selection owns its particular installed pair.
 // This file can only defer discovery; it never authorizes privileged mutation.
 func (m *Machine) explicitlyPinnedPair(installed pairVersions) bool {
 	var transaction startupStatus
 	if raw, err := os.ReadFile(m.startupPath("status.json")); err == nil && json.Unmarshal(raw, &transaction) == nil {
-		if transaction.State == "succeeded" && transaction.After == installed && transaction.Pinned || transaction.State == "rolled_back" && transaction.Before == installed && transaction.PreviouslyPinned {
-			return true
+		if transaction.State == "succeeded" && transaction.After == installed {
+			return transaction.Pinned
+		}
+		if transaction.State == "rolled_back" && transaction.Before == installed {
+			return transaction.PreviouslyPinned
 		}
 	}
 	var previous updateStatus
@@ -314,7 +318,7 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 		return skip("development pair, retained work, or previously used rental; update deferred")
 	}
 	if m.explicitlyPinnedPair(installed.pairVersions) {
-		return skip("installed pair is owned by an explicit wheel update")
+		return skip("installed pair is owned by an explicit update")
 	}
 	verified, err := m.startupVerify(ctx)
 	if err != nil {

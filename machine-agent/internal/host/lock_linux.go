@@ -9,7 +9,7 @@ import (
 
 // lockMachine is process-held exclusion, not durable owner history. File contents
 // and stale PIDs do not authorize taking over a running machine.
-func lockMachine(state string) (func(), error) {
+func lockMachine(state string) (*machineLease, error) {
 	if err := os.MkdirAll(state, 0755); err != nil {
 		return nil, err
 	}
@@ -21,7 +21,12 @@ func lockMachine(state string) (func(), error) {
 		f.Close()
 		return nil, fmt.Errorf("another machine agent owns this root: %w", err)
 	}
-	return func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN); _ = f.Close() }, nil
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &machineLease{lock: f, lockPath: filepath.Join(state, "agent.lock"), lockInfo: info}, nil
 }
 
 // Hold the same process lease as Runtime while checking retained work and
