@@ -3,6 +3,7 @@ package host
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,32 +84,80 @@ func (l *lastWords) last() string {
 }
 
 type directLauncher struct {
-	path, root string // the Runtime entrypoint and the machine root
-	env        []string
-	out        io.Writer
-	mu         sync.Mutex
-	current    *runtimeProcess
+	replacement     string // next application selected by a stopped-runtime handoff
+	agentExecutable string // parent-held descriptor naming the running application ELF
+	path, root      string // the Runtime entrypoint and the machine root
+	env             []string
+	out             io.Writer
+	mu              sync.Mutex
+	current         *runtimeProcess
 }
 
 func (d *directLauncher) close() {}
 
 func (d *directLauncher) maintain(op string, args []string) (string, error) {
-	if op == "public-read" {
+	if op == "public-read" || op == "software-state" {
 		store := filepath.Join(d.root, "var/lib/tensorfs")
 		for _, entry := range d.env {
 			if value, ok := strings.CutPrefix(entry, "COZY_TENSORFS_ROOT="); ok && value != "" {
 				store = value
 			}
 		}
+		if op == "software-state" {
+			m := &Machine{layout: NewLayout(&Grant{Root: d.root, StoreRoot: store})}
+			var state softwareState
+			if err := m.startupPython(context.Background(), &state, "inspect", store); err != nil {
+				return "", err
+			}
+			raw, err := json.Marshal(state)
+			return string(raw), err
+		}
 		return readPublic(d.root, store, args)
 	}
 	d.mu.Lock()
-	p := d.current
-	d.mu.Unlock()
-	return maintain(d.root, p, op, args)
+	defer d.mu.Unlock()
+	if op == "agent-replace" {
+		if d.current != nil && !d.current.exited() {
+			return "", errors.New("agent replacement requires a guarded stopped Runtime")
+		}
+		if len(args) < 1 {
+			return "", errors.New("current application identity required")
+		}
+		m := &Machine{layout: NewLayout(&Grant{Root: d.root})}
+		restored := len(args) == 2 && args[1] == "rollback"
+		if !restored && !m.transactionPending() {
+			return "", nil
+		}
+		selected := m.selectedApplication()
+		if restored {
+			selected = m.restoredApplication()
+		}
+		hash, err := hashFile(selected)
+		if err != nil {
+			return "", err
+		}
+		if hash == args[0] {
+			return "", nil
+		}
+		if _, err := m.readAgentIdentity(context.Background(), selected); err != nil {
+			if m.transactionPending() {
+				return "", err
+			}
+			fmt.Fprintln(d.out, "cozy machine: installed application cannot attach to this bootstrap; retaining repair agent:", err)
+			return "", nil
+		}
+		d.replacement = selected
+		return "replace", nil
+	}
+	return maintainWithAgent(d.root, d.current, op, args, d.agentExecutable)
 }
 
 func (d *directLauncher) launch(incarnation string) (*runtimeProcess, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.current != nil && !d.current.exited() {
+		return nil, errors.New("a Runtime process is already running")
+	}
 	stopRead, stopWrite, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -146,9 +195,21 @@ func (d *directLauncher) launch(incarnation string) (*runtimeProcess, error) {
 	if err := <-started; err != nil {
 		return nil, fmt.Errorf("start the Runtime: %w", err)
 	}
-	d.mu.Lock()
 	d.current = p
-	d.mu.Unlock()
+	// Only a journaled, uncommitted candidate is disposable on measured stalls.
+	// Accepted work is never monitored by this preparation-only guard.
+	journal := filepath.Join(d.root, "var/lib/cozy/startup-update/status.json")
+	var state startupStatus
+	if raw, err := os.ReadFile(journal); err == nil && json.Unmarshal(raw, &state) == nil && state.State == "boot_pending" {
+		go killWhenStill(p.done, func() uint64 { return processTreeTicks(p.pid) + output.Load() }, func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			var current startupStatus
+			if raw, err := os.ReadFile(journal); err == nil && json.Unmarshal(raw, &current) == nil && current.State == "boot_pending" {
+				_ = cmd.Process.Kill()
+			}
+		})
+	}
 	return p, nil
 }
 
@@ -172,6 +233,17 @@ func killWhenStill(done <-chan struct{}, progress func() uint64, kill func()) {
 }
 
 // cpuTicks is the process's own and reaped children's CPU time.
+func processTreeTicks(pid int) uint64 {
+	total := cpuTicks(pid)
+	raw, _ := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
+	for _, word := range strings.Fields(string(raw)) {
+		if child, err := strconv.Atoi(word); err == nil {
+			total += processTreeTicks(child)
+		}
+	}
+	return total
+}
+
 func cpuTicks(pid int) uint64 {
 	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	end := bytes.LastIndexByte(raw, ')')
@@ -227,10 +299,11 @@ type guardianLauncher struct {
 	answered chan guardianStatus
 	calls    sync.Mutex // one maintenance op at a time
 	cmd      *exec.Cmd
+	failed   error // the status stream has ended; no future command can be answered
 }
 
 func startGuardian(runtimePath, root string, env []string, out io.Writer) (*guardianLauncher, error) {
-	self, err := os.Executable()
+	self, err := guardianExecutable()
 	if err != nil {
 		return nil, err
 	}
@@ -277,8 +350,11 @@ func (g *guardianLauncher) read(status io.ReadCloser) {
 			}
 		case "refused":
 			if g.current != nil && g.current.incarnation == s.Incarnation && g.started != nil {
-				g.started <- errors.New(s.Error)
+				g.current.err = errors.New(s.Error)
+				g.started <- g.current.err
 				g.started = nil
+				close(g.current.done)
+				g.current = nil
 			}
 		case "exited":
 			if g.current != nil && g.current.incarnation == s.Incarnation {
@@ -300,6 +376,7 @@ func (g *guardianLauncher) read(status io.ReadCloser) {
 	}
 	status.Close()
 	g.mu.Lock()
+	g.failed = readError
 	if g.answered != nil {
 		g.answered <- guardianStatus{Error: readError.Error()}
 		g.answered = nil
@@ -327,9 +404,25 @@ func (g *guardianLauncher) launch(incarnation string) (*runtimeProcess, error) {
 	p := &runtimeProcess{done: make(chan struct{}), incarnation: incarnation}
 	p.stop = func() { p.stopped.Store(true); _ = g.send("stop", incarnation) }
 	g.mu.Lock()
+	if g.failed != nil {
+		err := g.failed
+		g.mu.Unlock()
+		return nil, err
+	}
+	if g.current != nil && !g.current.exited() {
+		g.mu.Unlock()
+		return nil, errors.New("a Runtime process is already running or launching")
+	}
 	g.current, g.started = p, started
 	g.mu.Unlock()
 	if err := g.send("launch", incarnation); err != nil {
+		g.mu.Lock()
+		if g.current == p {
+			p.err = err
+			close(p.done)
+			g.current, g.started = nil, nil
+		}
+		g.mu.Unlock()
 		return nil, err
 	}
 	if err := <-started; err != nil {
@@ -344,6 +437,11 @@ func (g *guardianLauncher) maintain(op string, args []string) (string, error) {
 	defer g.calls.Unlock()
 	answered := make(chan guardianStatus, 1)
 	g.mu.Lock()
+	if g.failed != nil {
+		err := g.failed
+		g.mu.Unlock()
+		return "", err
+	}
 	g.answered = answered
 	g.mu.Unlock()
 	body, _ := json.Marshal(guardianCommand{Op: op, Args: args})
@@ -362,7 +460,9 @@ func (g *guardianLauncher) maintain(op string, args []string) (string, error) {
 
 func (g *guardianLauncher) close() {
 	g.control.Close()
-	_ = waitChild(g.cmd)
+	if g.cmd != nil {
+		_ = waitChild(g.cmd)
+	}
 }
 
 type guardianProcesses struct {
@@ -378,7 +478,7 @@ func (g *guardianProcesses) set(p *runtimeProcess) {
 
 // stop selects a process before its returned action may be scheduled. An old
 // stop command must never follow current into a replacement Runtime. Empty
-// incarnation selects the current process for launch replacement or shutdown.
+// incarnation selects the current process for shutdown.
 func (g *guardianProcesses) stop(incarnation string) func() {
 	g.mu.Lock()
 	p := g.current
@@ -415,6 +515,18 @@ func RunGuardian(args []string) int {
 	direct := &directLauncher{path: args[1], root: args[2], env: os.Environ(), out: os.Stderr}
 	adoptOrphans()
 	processes := &guardianProcesses{}
+	err := serveGuardianCommands(control, direct, processes, report)
+	processes.stop("")()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cozy machine: guardian control stream failed:", err)
+		return 1
+	}
+	return 0
+}
+
+func serveGuardianCommands(control io.Reader, direct *directLauncher, processes *guardianProcesses, report func(guardianStatus)) error {
+	var ops sync.WaitGroup
+	defer ops.Wait()
 	scanner := bufio.NewScanner(control)
 	scanner.Buffer(make([]byte, 64<<10), maxGuardianFrameBytes)
 	for scanner.Scan() {
@@ -424,7 +536,6 @@ func RunGuardian(args []string) int {
 		}
 		switch c.Op {
 		case "launch":
-			processes.stop("")()
 			p, err := direct.launch(c.Incarnation)
 			if err != nil {
 				report(guardianStatus{Phase: "refused", Incarnation: c.Incarnation, Error: err.Error()})
@@ -445,7 +556,9 @@ func RunGuardian(args []string) int {
 			stop := processes.stop(c.Incarnation)
 			go stop()
 		default:
+			ops.Add(1)
 			go func(c guardianCommand) {
+				defer ops.Done()
 				answer, err := direct.maintain(c.Op, c.Args)
 				s := guardianStatus{Phase: "maintained", Answer: answer}
 				if err != nil {
@@ -459,12 +572,7 @@ func RunGuardian(args []string) int {
 			}(c)
 		}
 	}
-	processes.stop("")()
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, "cozy machine: guardian control stream failed:", err)
-		return 1
-	}
-	return 0
+	return scanner.Err()
 }
 
 type runtimeExit struct {

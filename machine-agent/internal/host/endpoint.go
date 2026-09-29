@@ -1,6 +1,7 @@
 package host
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/capability"
 	"google.golang.org/grpc"
 )
 
@@ -22,11 +24,15 @@ import (
 const maxMessageBytes = 16 << 20
 
 type listeners struct {
-	servers []*http.Server
-	failed  chan error
+	cancelAuthority context.CancelFunc
+	servers         []*http.Server
+	failed          chan error
 }
 
 func (l *listeners) close() {
+	if l.cancelAuthority != nil {
+		l.cancelAuthority()
+	}
 	for _, s := range l.servers {
 		_ = s.Close()
 	}
@@ -42,6 +48,10 @@ func (m *Machine) listen() (*listeners, error) {
 	if mediaPort == 0 {
 		mediaHost = "127.0.0.1"
 	}
+	if m.grant.bootstrap != nil {
+		_, port, _ := net.SplitHostPort(m.grant.bootstrap.MediaAddr)
+		mediaPort, _ = strconv.Atoi(port)
+	}
 	media, err := listen(mediaHost, mediaPort)
 	if err != nil {
 		endpoint.Close()
@@ -54,6 +64,7 @@ func (m *Machine) listen() (*listeners, error) {
 	routes.HandleFunc("GET /v1/bootstrap/receipt", m.serveReceipt)
 	routes.HandleFunc("GET /v1/health", serveHealth)
 	routes.HandleFunc("POST /v1/hubs/access", m.serveHubAccess)
+	routes.HandleFunc("DELETE /v1/hubs/access", m.serveForgetHubAccess)
 	routes.HandleFunc("GET /v1/runs/{run}/outputs/{output}", m.serveOutput)
 	routes.HandleFunc("GET /v1/runs/{run}/outputs/{output}/{index}", m.serveOutput)
 	routes.HandleFunc("GET /v1/machine/runtime", m.serveRuntimeState)
@@ -64,13 +75,15 @@ func (m *Machine) listen() (*listeners, error) {
 			grpcServer.ServeHTTP(w, r)
 			return
 		}
-		routes.ServeHTTP(w, r)
+		m.serveAuthorizedHTTP(routes, w, r)
 	})
 	receiptOnly := http.NewServeMux()
 	receiptOnly.HandleFunc("GET /v1/bootstrap/receipt", m.serveReceipt)
 	receiptOnly.HandleFunc("GET /v1/health", serveHealth)
 	errorLog := log.New(m.log, "cozy machine: ", 0)
-	l := &listeners{failed: make(chan error, 2)}
+	authorityContext, cancelAuthority := context.WithCancel(context.Background())
+	m.startAuthority(authorityContext)
+	l := &listeners{failed: make(chan error, 2), cancelAuthority: cancelAuthority}
 	for _, s := range []struct {
 		listener net.Listener
 		handler  http.Handler
@@ -86,8 +99,8 @@ func (m *Machine) listen() (*listeners, error) {
 	return l, nil
 }
 
-// serveReceipt answers 425 until the envelope is sealed, launching a stopped Runtime as a call
-// would, and 503 once the Runtime cannot start. Any answer tells the Hub the machine is up;
+// serveReceipt observes readiness without waking or launching a Runtime. It answers
+// 425 until the envelope is sealed and 503 once the Runtime cannot start.
 // the sealed envelope tells it the Runtime is ready.
 func (m *Machine) serveReceipt(w http.ResponseWriter, _ *http.Request) {
 	envelope := m.receipt.Envelope()
@@ -100,7 +113,6 @@ func (m *Machine) serveReceipt(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	if envelope == nil {
-		m.poke()
 		http.Error(w, `{"error":{"code":"media.bootstrap_pending","message":"the machine is booting"}}`, http.StatusTooEarly)
 		return
 	}
@@ -116,4 +128,46 @@ func serveHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Stop copying output bytes after this reader loses authority; execution remains durable.
+type authorityWriter struct {
+	http.ResponseWriter
+	ctx context.Context
+}
+
+func (w *authorityWriter) Write(data []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.ResponseWriter.Write(data)
+}
+func (w *authorityWriter) Flush() {
+	if w.ctx.Err() != nil {
+		return
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (m *Machine) serveAuthorizedHTTP(routes http.Handler, w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/bootstrap/receipt" && r.URL.Path != "/v1/health" {
+		if _, err := m.claims.refreshAuthority(r.Context()); err != nil {
+			http.Error(w, "rental_authority_unavailable: current rental authority could not be verified", http.StatusServiceUnavailable)
+			return
+		}
+		token, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Cozy-Cap ")
+		grant, err := capability.Verify(token, m.grant.WorkerID, m.claims.authorizedKeys(), time.Now(), "")
+		if err != nil {
+			http.Error(w, "a current machine capability is required", http.StatusForbidden)
+			return
+		}
+		call, cancel := m.claims.watchAuthority(r.Context(), grant.Key)
+		defer cancel()
+		r = r.WithContext(call)
+		w = &authorityWriter{ResponseWriter: w, ctx: call}
+		go func() { <-call.Done(); _ = r.Body.Close() }()
+	}
+	routes.ServeHTTP(w, r)
 }

@@ -76,9 +76,13 @@ func (m *Machine) publicRead(query map[string]any, answer proto.Message) error {
 
 // publicFallback serves observations while the coordinator is down. Commands
 // still require it; journal availability never grants permission to mutate it.
-func (m *Machine) publicFallback(ctx context.Context, request proto.Message) (proto.Message, bool, error) {
+func (m *Machine) publicFallback(ctx context.Context, request proto.Message) (answer proto.Message, handled bool, err error) {
+	defer func() {
+		if errors.Is(err, outputs.ErrUnavailable) {
+			err = unavailable("runtime_starting", "Runtime observations are not ready; retry when the coordinator finishes starting")
+		}
+	}()
 	query := map[string]any{}
-	var answer proto.Message
 	switch q := request.(type) {
 	case *pb.MachineExecutionWorkspaceQuery:
 		if q.Describe != nil {
@@ -127,7 +131,7 @@ func (m *Machine) publicFallback(ctx context.Context, request proto.Message) (pr
 	default:
 		return nil, false, nil
 	}
-	err := m.publicRead(query, answer)
+	err = m.publicRead(query, answer)
 	if workspace, ok := answer.(*pb.MachineExecutionWorkspace); ok {
 		workspace.WorkerId, workspace.WorkerBootId = m.grant.WorkerID, m.id.BootID
 	}
@@ -155,6 +159,11 @@ func (m *Machine) readPublicLog(ctx context.Context, run, after uint64, wait boo
 		for _, event := range page.Events {
 			log.add(event)
 		}
+		current := &pb.MachineExecutionState{}
+		if err := m.publicRead(map[string]any{"op": "get", "request": state.RequestId, "workspace": list.ExecutionWorkspaceId}, current); err != nil {
+			return nil, err
+		}
+		log.observeState(current)
 		if log.next >= page.HeadSequence || len(page.Events) == 0 {
 			if !wait || log.terminal || len(log.after(after)) > 0 {
 				return log.final(), nil
