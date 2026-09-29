@@ -125,7 +125,7 @@ func (d *directLauncher) maintain(op string, args []string) (string, error) {
 		}
 		m := &Machine{layout: NewLayout(&Grant{Root: d.root})}
 		restored := len(args) == 2 && args[1] == "rollback"
-		if !restored && !m.transactionPending() && m.transactionAgent() == "explicit" {
+		if !restored && !m.transactionPending() {
 			return "", nil
 		}
 		selected := m.selectedApplication()

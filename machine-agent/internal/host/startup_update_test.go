@@ -491,3 +491,25 @@ func TestInstalledPairProbeUsesActualRunningApplication(t *testing.T) {
 		t.Fatal("running repair agent stood in for a missing candidate")
 	}
 }
+
+func TestCurrentPairStillNeedsTransactionForDifferentApplication(t *testing.T) {
+	root := t.TempDir()
+	running := filepath.Join(root, "running")
+	m := &Machine{grant: &Grant{Root: root, agentBefore: running}, layout: NewLayout(&Grant{Root: root})}
+	if err := writeAtomic(running, []byte("running bytes"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(root, "opt/cozy/python/bin/cozy-machine")
+	if err := writeAtomic(bundle, []byte("candidate bytes"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if m.applicationMatchesBundle() {
+		t.Fatal("same distribution versions hid different application")
+	}
+	if err := writeAtomic(bundle, []byte("running bytes"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if !m.applicationMatchesBundle() {
+		t.Fatal("identical current application needs no replacement")
+	}
+}
