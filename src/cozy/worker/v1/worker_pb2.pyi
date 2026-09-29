@@ -637,7 +637,7 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., describe: _Optional[_Union[PackageSelection, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "described_release", "run_output_log", "release_root_owner")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "described_release", "run_output_log", "release_root_owner", "submission_close")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -647,6 +647,7 @@ class MachineExecutionWorkspace(_message.Message):
     DESCRIBED_RELEASE_FIELD_NUMBER: _ClassVar[int]
     RUN_OUTPUT_LOG_FIELD_NUMBER: _ClassVar[int]
     RELEASE_ROOT_OWNER_FIELD_NUMBER: _ClassVar[int]
+    SUBMISSION_CLOSE_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -656,7 +657,8 @@ class MachineExecutionWorkspace(_message.Message):
     described_release: DescribedRelease
     run_output_log: bool
     release_root_owner: bool
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., described_release: _Optional[_Union[DescribedRelease, _Mapping]] = ..., run_output_log: bool = ..., release_root_owner: bool = ...) -> None: ...
+    submission_close: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., described_release: _Optional[_Union[DescribedRelease, _Mapping]] = ..., run_output_log: bool = ..., release_root_owner: bool = ..., submission_close: bool = ...) -> None: ...
 
 class DescribedRelease(_message.Message):
     __slots__ = ("package", "release", "package_interface")
@@ -683,6 +685,30 @@ class MachineDevice(_message.Message):
     pci_bus_id: str
     driver_version: str
     def __init__(self, ordinal: _Optional[int] = ..., name: _Optional[str] = ..., uuid: _Optional[str] = ..., memory_bytes: _Optional[int] = ..., pci_bus_id: _Optional[str] = ..., driver_version: _Optional[str] = ...) -> None: ...
+
+class MachineSubmissionClose(_message.Message):
+    __slots__ = ("claim", "submission_id", "request_id", "expected_execution_workspace_id")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    submission_id: str
+    request_id: str
+    expected_execution_workspace_id: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., request_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ...) -> None: ...
+
+class MachineSubmissionClosure(_message.Message):
+    __slots__ = ("submission_id", "request_id", "execution_workspace_id", "receipt")
+    SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    RECEIPT_FIELD_NUMBER: _ClassVar[int]
+    submission_id: str
+    request_id: str
+    execution_workspace_id: str
+    receipt: MachineExecutionReceipt
+    def __init__(self, submission_id: _Optional[str] = ..., request_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., receipt: _Optional[_Union[MachineExecutionReceipt, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionSubmit(_message.Message):
     __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id", "source_credentials", "release_root", "owner_memo", "account")

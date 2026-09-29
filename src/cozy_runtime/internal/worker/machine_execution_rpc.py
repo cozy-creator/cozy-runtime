@@ -129,6 +129,7 @@ class MachineExecutionRPC:
                 described_release=described,
                 run_output_log=True,
                 release_root_owner=True,
+                submission_close=True,
             )
 
         return self._call(request.claim, context, get)
@@ -286,6 +287,29 @@ class MachineExecutionRPC:
                 raise
 
         return self._call(request.claim, context, submit)
+
+    def CloseMachineSubmission(
+        self, request: pb.MachineSubmissionClose, context: ServicerContext
+    ) -> pb.MachineSubmissionClosure:
+        def close() -> pb.MachineSubmissionClosure:
+            assert self.worker.executions is not None
+            owner = self.worker.authorize_workspace(request.claim)
+            receipt = self.worker.executions.close_submission(
+                owner,
+                request.submission_id,
+                request.request_id,
+                request.expected_execution_workspace_id,
+            )
+            return pb.MachineSubmissionClosure(
+                submission_id=request.submission_id,
+                request_id=request.request_id,
+                execution_workspace_id=request.expected_execution_workspace_id,
+                receipt=pb.MachineExecutionReceipt(**dataclasses.asdict(receipt))
+                if receipt
+                else None,
+            )
+
+        return self._call(request.claim, context, close)
 
     def GetMachineExecution(
         self, request: pb.MachineExecutionQuery, context: ServicerContext
