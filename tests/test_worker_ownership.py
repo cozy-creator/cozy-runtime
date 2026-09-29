@@ -23,12 +23,14 @@ from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents, worker_pb2 as pb
 root=Path(sys.argv[1]); mode=sys.argv[2]; epoch=int(sys.argv[3]); owner=sys.argv[4]
 key=Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-boot='different-boot' if mode=='wrong-boot' else 'same-pod-boot'
+sole=mode.startswith('supervisor')
+boot=mode if sole else 'different-boot' if mode=='wrong-boot' else 'same-pod-boot'
 try:
     worker=Worker(RuntimeConfig(cozy_home=root/'home',credentials=Credentials(),
         record_owner_public_key=key.public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)),
         WorkerOptions(root=root/'worker',tensorfs_root=root/'store',
             worker_id='fence-proof',worker_boot_id=boot,ownership_required=mode!='first',
+            sole_supervisor=sole,process_incarnation=mode if sole else '',
             worker_tls_certificate_digest='sha256:'+'a'*64),InMemoryControlHost())
 except LaunchRefusal as exc:
     print('PROOF '+json.dumps({'startup_refusal':exc.code}),flush=True)
@@ -39,13 +41,18 @@ try:
         wire_minor=37 if mode=='legacy' else 60 if mode=='previous' else WIRE_MINOR)
     transcript=documents.canonical_bytes(pb.ClaimProof(record_owner_epoch=epoch,
         worker_boot_id=boot,worker_id='fence-proof',worker_tls_certificate_digest=b'\xaa'*32))
-    claim.proof=key.sign(transcript) if mode!='forged' else bytes(64)
+    claim.proof=key.sign(transcript) if not mode.endswith('forged') else bytes(64)
+    authorized=''
+    if sole:
+        try: authorized=worker.authorize_workspace(claim)
+        except ValueError: authorized='refused'
     frames=[]
     worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]),frames.append)
     ack=next(frame.claim_ack for frame in frames if frame.WhichOneof('msg')=='claim_ack')
     old=pb.CancelAttempt(record_owner_epoch=8,control_stream_epoch=1,worker_boot_id=boot)
     print('PROOF '+json.dumps({'accepted':ack.accepted,'stream':ack.control_stream_epoch,
-        'rejection':pb.ClaimRejection.Name(ack.rejection),'old_fenced':worker.fenced(old)}),flush=True)
+        'rejection':pb.ClaimRejection.Name(ack.rejection),'old_fenced':worker.fenced(old),
+        'authorized':authorized}),flush=True)
     if mode=='hold':sys.stdin.readline()
 finally:
     worker.shutdown()
@@ -164,3 +171,32 @@ def test_previous_minor_owner_remains_compatible_with_current_worker(tmp_path: P
     older = _run(tmp_path, "previous")
     assert older["accepted"] and older["stream"] == 2
     assert _run(tmp_path, "same")["stream"] == 3
+
+
+def test_supervised_machine_relaunch_ignores_old_control_history(tmp_path: Path) -> None:
+    assert _run(tmp_path, "first")["accepted"]
+    history = tmp_path / "worker/ownership.json"
+    # Adoption can encounter another boot, absent history, or a torn obsolete file.
+    for index, old in enumerate((history.read_bytes(), b"invalid old history", None)):
+        if old is None:
+            history.unlink()
+        else:
+            history.write_bytes(old)
+        result = _run(tmp_path, f"supervisor-{index}", 1, "cozy-local-client")
+        assert result["accepted"] and result["stream"] == 1
+        # Machine calls authenticate before a legacy Control conversation exists.
+        assert result["authorized"] == "cozy-local-client"
+        assert history.read_bytes() == old if old is not None else not history.exists()
+
+
+def test_supervised_machine_still_authenticates_its_private_caller(tmp_path: Path) -> None:
+    for mode, epoch, owner in (
+        ("supervisor-forged", 1, "cozy-local-client"),
+        ("supervisor-other", 1, "other-client"),
+        ("supervisor-epoch", 9, "cozy-local-client"),
+    ):
+        result = _run(tmp_path, mode, epoch, owner)
+        assert result["authorized"] == "refused"
+        assert not result["accepted"]
+        assert result["rejection"] == "CLAIM_REJECTION_UNAUTHENTICATED"
+    assert not (tmp_path / "worker/ownership.json").exists()

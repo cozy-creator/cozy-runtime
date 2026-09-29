@@ -459,8 +459,8 @@ requires-dist = [
     { name = "protobuf", specifier = ">=6.31" },
     { name = "safetensors", marker = "extra == 'minimax-h3'", specifier = ">=0.8.0" },
     { name = "safetensors", marker = "extra == 'qwen-image21'", specifier = ">=0.8" },
-    { name = "tensorfs", specifier = ">=0.3.74" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.74" },
+    { name = "tensorfs", specifier = ">=0.3.78" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.78" },
     { name = "tokenizers", marker = "extra == 'minimax-h3'", specifier = ">=0.23.1" },
     { name = "tokenizers", marker = "extra == 'qwen-image21'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13" },
@@ -482,7 +482,7 @@ dev = [
     { name = "mypy", specifier = ">=1.13" },
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.3.74,<0.4" },
+    { name = "tensorfs", specifier = ">=0.3.78,<0.4" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
 

@@ -138,10 +138,12 @@ class Effects:
         executions: Executions,
         authority: PublicationAuthority | None,
         *,
+        authority_for: Callable[[str, str], PublicationAuthority | None] | None = None,
         allow_local: bool = False,
         progress: Progress | None = None,
     ):
         self.workspace, self.executions, self.authority = workspace, executions, authority
+        self.authority_for = authority_for or (lambda _owner, _request: self.authority)
         self.allow_local, self.report = allow_local, progress
         self.journal = Calls(workspace)
         self.lock = threading.Lock()
@@ -240,9 +242,10 @@ class Effects:
         if pure is None or pure["memoize"]:
             raise PublicationRefusal("publication.impure_call_forbidden")
         grant = self.executions.publication_authorization(owner, request)
-        if not grant or self.authority is None:
+        authority = self.authority_for(owner, request)
+        if not grant or authority is None:
             raise PublicationRefusal("publication.authority_absent", status=403)
-        return self.authority.client(grant)
+        return authority.client(grant)
 
     def _before_stage(self, owner: str, call: Call) -> None:
         with self.lock:
@@ -281,11 +284,12 @@ class Effects:
             if pure is None or (pure["memoize"] and not granted):
                 raise PublicationRefusal("publication.impure_call_forbidden")
             grant = self.executions.publication_authorization(owner, call.parent_request)
-            if not grant or self.authority is None:
+            authority = self.authority_for(owner, call.parent_request)
+            if not grant or authority is None:
                 raise PublicationRefusal("publication.authority_absent", status=403)
             if intent.module != effect_interfaces.MODULE:
                 raise PublicationRefusal("publication.interface_changed")
-            client = self.authority.client(grant)
+            client = authority.client(grant)
             result: ReleaseReceipt | CheckpointRef | AssessmentRef
             if operation == "publish_release":
                 request = msgspec.convert(
@@ -460,10 +464,11 @@ class Effects:
         checkpoint, objects = self._closure(call, upload)
         try:
             grant = self.executions.publication_authorization(owner, call.parent_request)
-            if not grant or self.authority is None:
+            authority = self.authority_for(owner, call.parent_request)
+            if not grant or authority is None:
                 raise PublicationRefusal("publication.authority_absent", status=403)
             reconcile_checkpoint(
-                self.authority.client(grant),
+                authority.client(grant),
                 operation=call.child_request,
                 checkpoint=checkpoint,
                 objects=objects,

@@ -479,9 +479,9 @@ def test_a_run_reads_the_hub_it_came_from(
 
         elsewhere = submission(machine, "elsewhere")
         elsewhere.release_root.hub = "https://elsewhere.example"
-        with pytest.raises(Refused, match="not registered at") as refused:
+        with pytest.raises(Refused, match="no execution access for") as refused:
             submit(machine, elsewhere)
-        assert refused.value.trailers.get("cozy-error-code") == "hub_unregistered"
+        assert refused.value.trailers.get("cozy-error-code") == "hub_access_absent"
     finally:
         home.close()
         other.close()

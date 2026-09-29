@@ -236,6 +236,9 @@ class _Handle:
                 "WHERE state IN ('accepted','running')"
             )
             _number_runs(db)
+            from .machine_public_reads import install
+
+            install(db)
             stat = os.stat(self.path)
             self.db, self.identity = db, (stat.st_dev, stat.st_ino)
         return self.db
