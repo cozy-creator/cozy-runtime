@@ -245,7 +245,7 @@ func copyWheel(source, target string) error {
 		return err
 	}
 	defer os.Remove(out.Name())
-	if _, err := io.Copy(out, in); err == nil {
+	if _, err = io.Copy(out, in); err == nil {
 		err = out.Chmod(0o644)
 	}
 	if err == nil {

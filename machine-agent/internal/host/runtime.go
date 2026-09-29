@@ -109,6 +109,11 @@ func (d *directLauncher) maintain(op string, args []string) (string, error) {
 }
 
 func (d *directLauncher) launch(incarnation string) (*runtimeProcess, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.current != nil && !d.current.exited() {
+		return nil, errors.New("a Runtime process is already running")
+	}
 	stopRead, stopWrite, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -146,9 +151,7 @@ func (d *directLauncher) launch(incarnation string) (*runtimeProcess, error) {
 	if err := <-started; err != nil {
 		return nil, fmt.Errorf("start the Runtime: %w", err)
 	}
-	d.mu.Lock()
 	d.current = p
-	d.mu.Unlock()
 	return p, nil
 }
 
@@ -227,6 +230,7 @@ type guardianLauncher struct {
 	answered chan guardianStatus
 	calls    sync.Mutex // one maintenance op at a time
 	cmd      *exec.Cmd
+	failed   error // the status stream has ended; no future command can be answered
 }
 
 func startGuardian(runtimePath, root string, env []string, out io.Writer) (*guardianLauncher, error) {
@@ -277,8 +281,11 @@ func (g *guardianLauncher) read(status io.ReadCloser) {
 			}
 		case "refused":
 			if g.current != nil && g.current.incarnation == s.Incarnation && g.started != nil {
-				g.started <- errors.New(s.Error)
+				g.current.err = errors.New(s.Error)
+				g.started <- g.current.err
 				g.started = nil
+				close(g.current.done)
+				g.current = nil
 			}
 		case "exited":
 			if g.current != nil && g.current.incarnation == s.Incarnation {
@@ -300,6 +307,7 @@ func (g *guardianLauncher) read(status io.ReadCloser) {
 	}
 	status.Close()
 	g.mu.Lock()
+	g.failed = readError
 	if g.answered != nil {
 		g.answered <- guardianStatus{Error: readError.Error()}
 		g.answered = nil
@@ -327,9 +335,25 @@ func (g *guardianLauncher) launch(incarnation string) (*runtimeProcess, error) {
 	p := &runtimeProcess{done: make(chan struct{}), incarnation: incarnation}
 	p.stop = func() { p.stopped.Store(true); _ = g.send("stop", incarnation) }
 	g.mu.Lock()
+	if g.failed != nil {
+		err := g.failed
+		g.mu.Unlock()
+		return nil, err
+	}
+	if g.current != nil && !g.current.exited() {
+		g.mu.Unlock()
+		return nil, errors.New("a Runtime process is already running or launching")
+	}
 	g.current, g.started = p, started
 	g.mu.Unlock()
 	if err := g.send("launch", incarnation); err != nil {
+		g.mu.Lock()
+		if g.current == p {
+			p.err = err
+			close(p.done)
+			g.current, g.started = nil, nil
+		}
+		g.mu.Unlock()
 		return nil, err
 	}
 	if err := <-started; err != nil {
@@ -344,6 +368,11 @@ func (g *guardianLauncher) maintain(op string, args []string) (string, error) {
 	defer g.calls.Unlock()
 	answered := make(chan guardianStatus, 1)
 	g.mu.Lock()
+	if g.failed != nil {
+		err := g.failed
+		g.mu.Unlock()
+		return "", err
+	}
 	g.answered = answered
 	g.mu.Unlock()
 	body, _ := json.Marshal(guardianCommand{Op: op, Args: args})
@@ -378,7 +407,7 @@ func (g *guardianProcesses) set(p *runtimeProcess) {
 
 // stop selects a process before its returned action may be scheduled. An old
 // stop command must never follow current into a replacement Runtime. Empty
-// incarnation selects the current process for launch replacement or shutdown.
+// incarnation selects the current process for shutdown.
 func (g *guardianProcesses) stop(incarnation string) func() {
 	g.mu.Lock()
 	p := g.current
@@ -424,7 +453,6 @@ func RunGuardian(args []string) int {
 		}
 		switch c.Op {
 		case "launch":
-			processes.stop("")()
 			p, err := direct.launch(c.Incarnation)
 			if err != nil {
 				report(guardianStatus{Phase: "refused", Incarnation: c.Incarnation, Error: err.Error()})

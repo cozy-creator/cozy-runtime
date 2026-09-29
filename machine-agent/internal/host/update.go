@@ -33,6 +33,9 @@ import (
 //	POST /v1/machine/runtime/update          {operation, runtime, tensorfs}: each a staged
 //	                                         {file, sha256}, a {version} to fetch, or omitted
 //
+// Staged wheels serve the next accepted operation. Uploads are refused while an
+// operation owns staging; its terminal status is published only after cleanup.
+//
 // A machine without these routes predates native updates.
 
 // UpdateCapability is what GET /v1/machine/runtime advertises.
@@ -72,6 +75,7 @@ func (s updateStatus) terminal() bool {
 type runtimeUpdates struct {
 	mu     sync.Mutex
 	status *updateStatus
+	active string // held through cleanup, even after the installer has finished
 }
 
 var (
@@ -99,12 +103,20 @@ func (m *Machine) openUpdates() {
 
 func (m *Machine) saveUpdate(status updateStatus) {
 	m.updates.mu.Lock()
+	defer m.updates.mu.Unlock()
 	m.updates.status = &status
-	m.updates.mu.Unlock()
+	_ = m.writeUpdate(status)
+}
+
+// writeUpdate persists a status without publishing it. Admission must succeed
+// durably before the operation can start or replace the previous status.
+func (m *Machine) writeUpdate(status updateStatus) error {
 	raw, _ := json.Marshal(status)
 	if err := writeAtomic(m.updatePath(), raw, 0o600); err != nil {
 		fmt.Fprintln(m.log, "cozy machine: the Runtime update state was not recorded:", err)
+		return err
 	}
+	return nil
 }
 
 func (m *Machine) updating() bool {
@@ -156,6 +168,14 @@ func (m *Machine) serveRuntimeState(w http.ResponseWriter, r *http.Request) {
 
 func (m *Machine) serveStageWheel(w http.ResponseWriter, r *http.Request) {
 	if !m.maintenance(w, r) {
+		return
+	}
+	// Staging belongs to the next accepted update. Do not acknowledge an upload
+	// while that update owns the directory or is still cleaning it up.
+	m.updates.mu.Lock()
+	defer m.updates.mu.Unlock()
+	if m.updates.active != "" || m.updates.status != nil && !m.updates.status.terminal() {
+		http.Error(w, "the machine is running a Runtime update; stage wheels after it finishes", http.StatusConflict)
 		return
 	}
 	file := r.PathValue("file")
@@ -212,9 +232,9 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.updates.mu.Lock()
+	defer m.updates.mu.Unlock()
 	current := m.updates.status
-	busy := current != nil && !current.terminal()
-	m.updates.mu.Unlock()
+	busy := m.updates.active != "" || current != nil && !current.terminal()
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case current != nil && current.Operation == request.Operation:
@@ -230,7 +250,11 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := updateStatus{Operation: request.Operation, State: "waiting", From: installed}
-	m.saveUpdate(status)
+	if err := m.writeUpdate(status); err != nil {
+		http.Error(w, "cannot record the Runtime update: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	m.updates.status, m.updates.active = &status, request.Operation
 	go m.runUpdate(request, status)
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(status)
@@ -249,13 +273,24 @@ func (m *Machine) installedPair() (pairVersions, error) {
 
 // runUpdate performs one update to its end, then records it.
 func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
+	defer func() {
+		m.updates.mu.Lock()
+		defer m.updates.mu.Unlock()
+		if m.updates.active == request.Operation {
+			if err := os.RemoveAll(m.stagePath()); err != nil {
+				fmt.Fprintln(m.log, "cozy machine: cannot remove completed update files:", err)
+			}
+			m.setUpdating(false)
+			m.updates.status = &status
+			_ = m.writeUpdate(status)
+			m.updates.active = ""
+		}
+	}()
 	fail := func(state string, err error) {
 		status.State, status.Error = state, err.Error()
 		fmt.Fprintln(m.log, "cozy machine: Runtime update", status.Operation, state+":", err)
-		m.saveUpdate(status)
 	}
 	ctx := context.Background()
-	defer os.RemoveAll(m.stagePath()) // staged wheels serve one update; the kept pair is elsewhere
 	previous, err := m.previousPair(ctx, status.From)
 	if err != nil {
 		fail("failed", err)
@@ -278,7 +313,6 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		fail("failed", err)
 		return
 	}
-	defer m.setUpdating(false)
 	status.State = "installing"
 	m.saveUpdate(status)
 	err = m.replacePair(ctx, candidate, status.To)
@@ -286,7 +320,6 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		if _, err = m.launcher.maintain("select", candidate); err == nil {
 			status.State, status.Error = "succeeded", ""
 			_ = m.restarts.clear()
-			m.saveUpdate(status)
 			return
 		}
 	}
@@ -304,13 +337,16 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 func (m *Machine) quiesce(ctx context.Context) error {
 	wait := time.Second
 	for {
+		m.launchMu.Lock()
 		m.setUpdating(true)
 		answer, err := m.launcher.maintain("restart", nil)
 		if err == nil && answer == "accepted" {
 			m.stopRuntime() // the Runtime exited; the guardian's report settles it here
+			m.launchMu.Unlock()
 			return nil
 		}
 		m.setUpdating(false)
+		m.launchMu.Unlock()
 		if err != nil {
 			return err
 		}

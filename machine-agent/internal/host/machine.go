@@ -46,6 +46,7 @@ type Machine struct {
 	conn        *grpc.ClientConn
 	launcher    launcher
 	initialized chan struct{} // closed after the process launcher is installed
+	launchMu    sync.Mutex    // normal launches and guarded update acquisition
 
 	mu          sync.Mutex
 	proc        *runtimeProcess
@@ -234,6 +235,8 @@ func (m *Machine) prepareLauncher() error {
 	return nil
 }
 
+// launch is called under launchMu by the supervisor, or while an update owns
+// inUpdate after acquiring that same lock in quiesce.
 func (m *Machine) launch() error {
 	raw, err := m.launcher.maintain("capabilities", nil)
 	if err != nil {
@@ -399,6 +402,9 @@ func (m *Machine) runtime(ctx context.Context) (*grpc.ClientConn, error) {
 			if m.restarts.gone() {
 				return nil, refusal(codes.FailedPrecondition, m.restarts.code(), m.runtimeGone())
 			}
+			if !m.restarts.due(time.Now()) {
+				return nil, unavailable("runtime_restarting", m.runtimeGone())
+			}
 			m.poke()
 			select {
 			case <-ctx.Done():
@@ -538,6 +544,13 @@ func (m *Machine) relaunchAfter(p *runtimeProcess) error {
 
 // launchOrIdle records a launch failure while the API keeps serving repair and status calls.
 func (m *Machine) launchOrIdle() {
+	m.launchMu.Lock()
+	defer m.launchMu.Unlock()
+	// The supervisor's earlier observations are only a wake-up hint. An update
+	// may have acquired the Runtime, or another launch may have finished, since.
+	if m.updating() || m.running() || !m.restarts.due(time.Now()) || !m.owned && m.idle.releasedNow() {
+		return
+	}
 	if err := m.launch(); err != nil {
 		fmt.Fprintln(m.log, "cozy machine: the Runtime could not be launched:", err)
 		m.restarts.fail(err)
