@@ -414,6 +414,8 @@ def test_scoped_access_renews_without_machine_registration_and_revokes_per_hub(
     path.write_text(json.dumps({"version": 1, "hubs": [{**row, "expires_at": 1}]}))
     with pytest.raises(PublicationRefusal, match="authority_expired"):
         machine_model_defaults.credential(worker, origin)
+    with pytest.raises(ValueError, match="execution access has expired"):
+        machine_model_resolve.own(worker, hub=origin)
     path.write_text(json.dumps({"version": 1, "hubs": []}))
     assert machine_model_resolve.registration(worker, origin) is None
     with pytest.raises(PublicationRefusal, match="authority_absent"):

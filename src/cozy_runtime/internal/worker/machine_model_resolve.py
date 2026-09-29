@@ -23,6 +23,7 @@ from cozy_runtime.author._model_defaults import default_ladder, reference
 from cozy_runtime.internal import egress, fill
 from cozy_runtime.protocol import documents
 
+from .machine_publication import PublicationRefusal
 from .workspace import WorkspaceRefusal
 from .workspace_executions import ExecutionWorkspaceRefusal
 
@@ -252,10 +253,17 @@ def own(worker: Worker, package: str = "", hub: str = "") -> Catalog:
     authority = registration(worker, key)
     if authority is None:
         raise WorkspaceRefusal("this machine has no Hub grant to read the catalog at")
+    try:
+        headers = authority.headers()
+    except PublicationRefusal as exc:
+        raise ExecutionWorkspaceRefusal(
+            "hub_access_expired",
+            "this machine's execution access has expired; renew it at the controller",
+        ) from exc
     return Catalog(
         authority.origin,
         authority.context(),
-        authority.headers(),
+        headers,
         worker.resolutions.of(package, key) if package else None,
     )
 

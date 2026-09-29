@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import threading
@@ -118,6 +119,7 @@ def test_models_only_prepare_fetches_exact_checkpoint_then_works_offline(tmp_pat
         server.shutdown()
         thread.join()
         seen.clear()
+        worker.options = dataclasses.replace(worker.options, hubs=())
         assert worker.prepare_package_set(request) == result
         assert seen == []
     finally:
