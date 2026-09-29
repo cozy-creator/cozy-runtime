@@ -2236,7 +2236,7 @@ class Machine:
         self.note = note
         self.queue: tuple[Demand, ...] = ()
         self._host_lock = Lock()
-        #: Serializes only long-running host-reclaim RPCs; never held with _host_lock.
+        #: Serializes host-reclaim RPCs; the reservation lock never spans an RPC.
         self._host_reclaim_lock = Lock()
         self.host_available = host_available
         self.host_pressure = host_pressure
@@ -2382,7 +2382,7 @@ class Machine:
                     generation_used = generation
                     if held == 0 or debt <= 0:
                         break
-                if debt < 0 or debt <= 0:
+                if debt <= 0:
                     break
             if after is None or debt < 0:
                 return {

@@ -1413,9 +1413,7 @@ def host_pressure() -> HostPressure | None:
     The returned debt is the largest ``max(0, current - bounded inactive_file - limit)``
     across this process's cgroup ancestors.  ``limit`` is the minimum finite v2
     ``memory.high``/``memory.max``; v1 uses ``memory.limit_in_bytes``.  Very large finite
-    limits naturally produce zero debt.  Any unreadable finite fact refuses the observation
-    rather than
-    turning uncertainty into permission to reclaim or allocate.
+    limits naturally produce zero debt. An unreadable finite fact yields no observation.
     """
     _linux_only("host_pressure")
 

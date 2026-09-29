@@ -1,9 +1,11 @@
 """Host admission honors reclaim pressure and never trusts claimed freed bytes."""
 
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, RLock
 from time import monotonic, sleep
+from typing import Any, cast
 
 import pytest
 
@@ -43,7 +45,7 @@ def test_host_pressure_excludes_bounded_inactive_file_cache(
     assert pressure.debt_bytes == 200
 
 
-def test_host_pressure_v1_max_sentinel_is_unbounded(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_host_pressure_v1_large_limit_leaves_parent_debt(monkeypatch: pytest.MonkeyPatch) -> None:
     files = {
         "/proc/self/cgroup": "7:memory:/parent/child\n",
         "/sys/fs/cgroup/memory/parent/child/memory.usage_in_bytes": "1300",
@@ -80,8 +82,8 @@ def test_unlimited_ancestor_without_counters_does_not_hide_child_debt(
         "/sys/fs/cgroup/child/memory.high": "1000",
         "/sys/fs/cgroup/child/memory.max": "2000",
         "/sys/fs/cgroup/child/memory.stat": "inactive_file 0\n",
-        "/sys/fs/cgroup/memory/memory.high": "max",
-        "/sys/fs/cgroup/memory/memory.max": "max",
+        "/sys/fs/cgroup/memory.high": "max",
+        "/sys/fs/cgroup/memory.max": "max",
     }
     monkeypatch.setattr(
         Path,
@@ -100,7 +102,7 @@ class PressureCache:
     slot: str
     held: int
     pressure: list[proctree.HostPressure]
-    generation: int = 1
+    generation: int | None = 1
     status: str = "idle"
     last_used: int = 0
     calls: list[int] = field(default_factory=list)
@@ -109,7 +111,7 @@ class PressureCache:
         return self.status
 
     @property
-    def reclaim_generation(self) -> int:
+    def reclaim_generation(self) -> int | None:
         return self.generation
 
     def reclaim_host(self, nbytes: int) -> tuple[int, int]:
@@ -155,6 +157,38 @@ def test_zero_progress_victim_does_not_block_later_idle_victim() -> None:
     assert result["debt_bytes"] == 0
     assert protected.calls == [20]
     assert eligible.calls == [20, 10]
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_calls"),
+    [("active", 0), ("no_generation", 0), ("replaced", 1), ("unknown", 1), ("no_progress", 2)],
+)
+def test_pressure_relief_requires_idle_generation_and_monotone_progress(
+    change: str, expected_calls: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pressure = [proctree.HostPressure("/worker", 120, 100, 20)]
+    policy = memory.Machine({}, lambda _: None, lambda _: None, host_pressure=lambda: pressure[0])
+    cache = PressureCache("idle", 40, pressure)
+    original = cache.reclaim_host
+    if change == "active":
+        cache.status = "active"
+    if change == "no_generation":
+        cache.generation = None
+
+    def reclaim(nbytes: int) -> tuple[int, int]:
+        if change == "no_progress":
+            cache.calls.append(nbytes)
+            return 1, cache.held  # A claimed release cannot sustain an endless loop.
+        result = original(nbytes)
+        if change == "replaced":
+            cache.generation = 2
+        if change == "unknown":
+            policy.host_pressure = lambda: None
+        return result
+
+    monkeypatch.setattr(cache, "reclaim_host", reclaim)
+    policy.relieve_host_pressure([cache])
+    assert len(cache.calls) == expected_calls
 
 
 def test_pressure_relief_does_not_touch_cache_when_debt_is_covered() -> None:
@@ -216,17 +250,21 @@ def test_pressure_schedule_does_not_block_caller_or_duplicate_work() -> None:
     # Bind the production method to a minimal worker-shaped object.
     from cozy_runtime.internal.worker.session import Worker
 
-    Worker._schedule_host_pressure_relief(fake)
-    Worker._schedule_host_pressure_relief(fake)
+    Worker._schedule_host_pressure_relief(cast(Any, fake))
+    Worker._schedule_host_pressure_relief(cast(Any, fake))
     assert monotonic() - started_at < 1
     assert started.wait(1)
-    assert fake._host_pressure_scheduled
+
+    def scheduled() -> bool:
+        return fake._host_pressure_scheduled
+
+    assert scheduled()
     release.set()
     for _ in range(100):
-        if not fake._host_pressure_scheduled:
+        if not scheduled():
             break
         sleep(0.01)
-    assert not fake._host_pressure_scheduled
+    assert not scheduled()
 
 
 def test_pressure_schedule_resets_after_thread_start_failure(
@@ -248,10 +286,10 @@ def test_pressure_schedule_resets_after_thread_start_failure(
 
     from cozy_runtime.internal.worker import session
 
-    monkeypatch.setattr(session.threading, "Thread", BrokenThread)
+    monkeypatch.setattr(threading, "Thread", BrokenThread)
     fake = Fake()
     with pytest.raises(RuntimeError, match="thread start failed"):
-        session.Worker._schedule_host_pressure_relief(fake)
+        session.Worker._schedule_host_pressure_relief(cast(Any, fake))
     assert not fake._host_pressure_scheduled
 
 
