@@ -1277,6 +1277,21 @@ def descendants(pid: int) -> list[int]:
     return sorted(found)
 
 
+def trim_host_allocator() -> bool:
+    """Ask libc to return free heap pages; live allocations and aliases remain owned.
+
+    This is an optional pressure response, not a byte estimate. Callers must measure
+    RSS and aggregate host headroom afterward even when libc reports success.
+    """
+    try:
+        trim = ctypes.CDLL(None).malloc_trim
+    except (OSError, AttributeError):
+        return False
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    return bool(trim(0))
+
+
 def rss_bytes(pid: int) -> int:
     """Current resident bytes for one pid, read BY THE PARENT from the kernel — never the
     child's claim about itself. -1 when the process is gone (UNREADABLE)."""

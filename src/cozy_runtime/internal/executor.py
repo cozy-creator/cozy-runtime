@@ -4401,6 +4401,10 @@ class Executor:
         before = proctree.rss_bytes(os.getpid())
         self._synchronize()
         released = self.planner.reclaim_host(nbytes) if self.planner is not None else 0
+        # Freed pageable weight storage may remain resident in libc's arenas. This
+        # pressure-requested idle boundary returns only allocator-free pages; the
+        # measured RSS below, never libc's boolean result, describes physical relief.
+        proctree.trim_host_allocator()
         after = proctree.rss_bytes(os.getpid())
         return {
             **self.probe(),
