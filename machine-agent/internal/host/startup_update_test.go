@@ -217,8 +217,12 @@ func TestUsedRentalDefersUpdateBeforeProbing(t *testing.T) {
 }
 
 func TestAutomaticAndExplicitUpdatesShareRecoveryAndCommit(t *testing.T) {
-	for _, explicit := range []bool{false, true} {
-		t.Run(fmt.Sprint(explicit), func(t *testing.T) {
+	for _, mode := range []struct {
+		explicit bool
+		lifetime string
+	}{{false, "persistent"}, {true, "persistent"}, {true, "rental"}} {
+		explicit := mode.explicit
+		t.Run(fmt.Sprint(explicit)+"/"+mode.lifetime, func(t *testing.T) {
 			root := t.TempDir()
 			m := &Machine{grant: &Grant{Root: root, Lifetime: "persistent"}, layout: NewLayout(&Grant{Root: root}), log: io.Discard}
 			before := pairVersions{Runtime: "0.18.86", TensorFS: "0.3.78"}
@@ -246,7 +250,7 @@ func TestAutomaticAndExplicitUpdatesShareRecoveryAndCommit(t *testing.T) {
 				}
 			}
 			executable(t, filepath.Join(root, "opt/cozy/python/bin/python"), fmt.Sprintf(`case "$4" in
- inspect) echo '{"runtime":"0.18.86","tensorfs":"0.3.78","eligible":true,"quiescent":true,"workspace_id":"original"}' ;;
+ inspect) echo '{"runtime":"0.18.86","tensorfs":"0.3.78","eligible":true,"quiescent":true,"accepted_work":true,"workspace_id":"original"}' ;;
  dependencies) echo '[]' ;;
  probe) if [ -n "$5" ]; then cat '%s/after.json'; else cat '%s/current.json'; fi ;;
  *) printf '0.18.86\n0.3.78\n' ;;
@@ -269,7 +273,7 @@ func TestAutomaticAndExplicitUpdatesShareRecoveryAndCommit(t *testing.T) {
  *) cp '%s/before.json' '%s/current.json' ;;
  esac`, root, root, root, root, root))
 			if explicit {
-				request, _ := json.Marshal(pairTransaction{Before: before, After: after, Previous: previous, Candidate: candidate, Store: m.layout.Store, Lifetime: "persistent", Pin: true, Agent: "bundled"})
+				request, _ := json.Marshal(pairTransaction{Before: before, After: after, Previous: previous, Candidate: candidate, Store: m.layout.Store, Lifetime: mode.lifetime, Pin: true, Agent: "bundled"})
 				answer, err := maintain(root, nil, "update-prepare", []string{string(request)})
 				if err != nil || answer != "boot_pending" {
 					t.Fatalf("explicit preparation: %s %v", answer, err)

@@ -53,8 +53,8 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 		if err := m.startupPython(context.Background(), &state, "inspect", m.layout.Store); err != nil {
 			return "", err
 		}
-		if !state.Quiescent || request.Lifetime != "persistent" && state.AcceptedWork {
-			return "", errors.New("Runtime quiescence or unused rental required for software changes")
+		if !state.Quiescent {
+			return "", errors.New("Runtime quiescence required for explicit software changes")
 		}
 		var status startupStatus
 		if raw, err := os.ReadFile(m.startupPath("status.json")); err == nil {
