@@ -154,7 +154,7 @@ from cozy_runtime.internal.worker.lanes import (
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
-from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
+from cozy_runtime.internal.worker.machine_publication import PublicationAuthority, origin_key
 from cozy_runtime.internal.worker.memory import MemoryManager
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
@@ -893,6 +893,10 @@ class Worker:
             raise ValueError("a worker listener needs the RecordOwner's public key")
         self.config = config
         self.options = options
+        self.hub_access_lock = threading.Lock()
+        self.hub_access_principals = {
+            origin_key(held.origin): held.principal for held in options.hubs if held.access_token
+        }
         self.host = host
         self.root = Path(options.root)
         #: Per-slot executor uids (pod co-hosting). Each additional executor slot owns a

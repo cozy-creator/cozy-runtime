@@ -42,6 +42,17 @@ including publication-token renewal; rotation does not restart the coordinator. 
 fields and unreadable entries affect only the relevant Hub. Credentials never enter
 captured arguments or executor environments.
 
+Each Hub origin retains one delegated account. JWT issuer and `delegated_sub` identify that
+account; normal token refresh may change expiry and token bytes while preserving it. The
+agent rejects replacing the account with HTTP 409 `hub_access_principal_conflict`, including
+after the old grant expires, and leaves the retained grant untouched. Renew the original
+account's access. There is no implicit account reset while this machine retains work.
+Opaque credentials can be replayed but cannot rotate without identifiable continuity.
+This comparison is not JWT authentication: the Hub still verifies every credential. Runtime
+also remembers each observed delegated principal for its process and refuses a changed
+projection for catalog, TensorFS, and publication operations. This is credential continuity,
+not durable Runtime ownership history.
+
 Catalog reads use `Authorization: Bearer`; TensorFS receives `bearer <token>`. A publication
 grant is renewed with `X-Cozy-Execution-Access`; model mutations carry only its short-lived
 publication Bearer. Existing rentals may continue using `worker_id`/`worker_token` rows.

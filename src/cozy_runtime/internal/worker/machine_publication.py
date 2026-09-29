@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import msgspec
 
@@ -63,6 +63,45 @@ class PublicationClient(Protocol):
     def request(self, method: str, path: str, body: bytes | None = None) -> bytes: ...
 
 
+def origin_key(value: str) -> tuple[str, str, int]:
+    parsed = urlsplit(value.rstrip("/"))
+    return (
+        parsed.scheme,
+        (parsed.hostname or "").lower(),
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+    )
+
+
+def access_principal(token: str) -> tuple[str, ...]:
+    """Credential continuity only; the Hub remains the JWT signature/authority verifier."""
+    opaque = ("opaque", hashlib.sha256(token.encode()).hexdigest())
+    parts = token.split(".")
+    if len(token) > 32 << 10 or len(parts) != 3 or not parts[2]:
+        return opaque
+    try:
+        header, claims = (
+            msgspec.json.decode(
+                base64.b64decode(part + "=" * (-len(part) % 4), altchars=b"-_", validate=True)
+            )
+            for part in parts[:2]
+        )
+        issuer, subject = claims.get("iss"), claims.get("delegated_sub")
+        if (
+            not isinstance(header.get("typ"), str)
+            or header["typ"].lower() != "delegated-access+jwt"
+            or not isinstance(issuer, str)
+            or not 0 < len(issuer.encode()) <= 2048
+            or not isinstance(subject, str)
+            or not 0 < len(subject.encode()) <= 256
+            or claims.get("sub", "") != ""
+            or claims.get("permissions") != ["cozy.execution-access"]
+        ):
+            return opaque
+    except (ValueError, msgspec.DecodeError, AttributeError, TypeError):
+        return opaque
+    return "delegated", issuer, subject
+
+
 @dataclass(frozen=True)
 class PublicationAuthority:
     """Scoped catalog/publication access, independent of rental registration."""
@@ -76,11 +115,19 @@ class PublicationAuthority:
     expires_at: int = 0
     access_path: Path | None = field(default=None, repr=False, compare=False)
 
+    @property
+    def principal(self) -> tuple[str, ...]:
+        return (
+            access_principal(self.access_token) if self.access_token else ("worker", self.worker_id)
+        )
+
     def current(self) -> PublicationAuthority:
         if self.access_path is None:
             return self
         for authority in registrations(self.access_path)[0]:
-            if authority.origin == self.origin:
+            if origin_key(authority.origin) == origin_key(self.origin):
+                if authority.principal != self.principal:
+                    raise PublicationRefusal("publication.authority_principal_conflict", status=403)
                 return authority
         raise PublicationRefusal("publication.authority_absent", status=403)
 
