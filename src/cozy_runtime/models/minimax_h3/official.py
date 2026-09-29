@@ -18,7 +18,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -71,6 +71,7 @@ from cozy_runtime.author import (
     InvalidRequest,
     OutputError,
     Telemetry,
+    ThreadPoolExecutor,
     attention_scope,
     canonical_json,
     expect_attention,
