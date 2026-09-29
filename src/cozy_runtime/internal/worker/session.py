@@ -967,6 +967,7 @@ class Worker:
             self._driver,
             lambda text: self.note("residency", text),
             host_available=proctree.available_host_bytes,
+            host_pressure=proctree.host_pressure,
         )
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         # Before any executor starts: an older executor reads the image kernel site once.
@@ -1082,6 +1083,8 @@ class Worker:
         self._published_latch = ""
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
+        self._host_pressure_schedule_lock = threading.Lock()
+        self._host_pressure_scheduled = False
         #: thread name -> kernel thread id of each `_lane`-wrapped thread (read by `pollers`)
         self.lane_threads: dict[str, int] = {}
         self.supervisor = Supervisor(
@@ -7532,12 +7535,45 @@ class Worker:
                 from . import machine_compute
 
                 machine_compute.park_if_idle(self)
+                self._schedule_host_pressure_relief()
                 # Observation follows authentication, independently of the dispatch
                 # barrier. Only the current stream is eligible, after its snapshot.
                 if self.fence.control_stream_epoch in self.attached_streams:
                     self.send(pb.WorkerFrame(observed_state=self.observed_state()))
             except Exception as exc:  # one tick's failure is that tick's
                 self.note("report", f"tick faulted: {fault_text(exc)}"[:400])
+
+    def _schedule_host_pressure_relief(self) -> None:
+        """Queue optional reclaim without delaying the reporter heartbeat."""
+        with self._host_pressure_schedule_lock:
+            if self._host_pressure_scheduled:
+                return
+            self._host_pressure_scheduled = True
+
+        def run() -> None:
+            try:
+                # Take this small state snapshot under control protection.  The memory
+                # policy owns the snapshot after this point and performs no worker RPC
+                # while the control lock is held.
+                with self.control_lock:
+                    tenants = tuple(self._tenants(None))
+                result = self.memory.relieve_host_pressure(tenants)
+                if result is not None and result.get("attempts", 0):
+                    self.note("host-pressure", json.dumps(result, sort_keys=True)[:400])
+            finally:
+                with self._host_pressure_schedule_lock:
+                    self._host_pressure_scheduled = False
+
+        try:
+            threading.Thread(
+                target=self._lane("host-pressure", run, fatal=False),
+                daemon=True,
+                name="host-pressure",
+            ).start()
+        except BaseException:
+            with self._host_pressure_schedule_lock:
+                self._host_pressure_scheduled = False
+            raise
 
     def publish_activity(self, *, strict: bool = False) -> None:
         """Tell the pod supervisor what this worker is doing (`worker/activity.py`).
@@ -7968,6 +8004,11 @@ class _Tenant:
     @property
     def last_used(self) -> int:
         return self.row.last_used
+
+    @property
+    def reclaim_generation(self) -> tuple[int, int] | None:
+        current = self.row.supervision.current if self.row.supervision is not None else None
+        return (current.pid, current.epoch) if current is not None else None
 
     def state(self) -> str:
         current = self.row.supervision.current if self.row.supervision is not None else None
