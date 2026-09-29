@@ -155,11 +155,12 @@ def test_ceilings_are_measured_and_never_double_booked() -> None:
             worker = Worker(*claimable(_config(root / "home"), options), InMemoryControlHost())
             try:
                 lane = worker.lanes.lanes[0]
-                before = accel.device_memory("0", kind).free_bytes
+                free_before = accel.device_memory("0", kind).free_bytes
                 granted = worker._grant(lane, "a")
-                after = accel.device_memory("0", kind).free_bytes
+                free_after = accel.device_memory("0", kind).free_bytes
                 ceiling = dict(budget).get(0, real.total_bytes)
-                assert min(before, after, ceiling) <= granted <= min(max(before, after), ceiling)
+                low, high = sorted((free_before, free_after))
+                assert min(low, ceiling) <= granted <= min(high, ceiling)
             finally:
                 worker.supervision.close()
 

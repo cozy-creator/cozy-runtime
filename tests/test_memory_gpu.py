@@ -595,8 +595,9 @@ def test_a_longer_segment_is_not_admitted_on_a_shorter_ones_peak(
     """Run 1560: H3's 12 s segment ran on its 6 s segment's measured peak, because the length
     sat in an invocable's `payload` and both were one shape. A 4 s call after a 1 s one of the
     same entrypoint is unmeasured, so the idle neighbour goes instead of the call running out.
-    Small weights, so both tenants stay resident beside another process's memory."""
-    small = write_store(tmp_path, blocks=2, models=("p", "q"))
+    Q's weights are large enough that half of them outweighs the driver headroom the call
+    keeps free, and small enough that both tenants stay resident."""
+    small = write_store(tmp_path, blocks=12, models=("p", "q"))
     with serving(small, monkeypatch) as card:
         assert succeeded(card.call("q-touch", "touch", "q"))
         assert succeeded(card.call("s-1", "segment", "p", payload={"seconds": 1}))
