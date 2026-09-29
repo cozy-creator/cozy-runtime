@@ -6,6 +6,8 @@ import threading
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
+import msgspec
+
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import source_interfaces
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -17,6 +19,7 @@ from . import (
     workspace_memo,
     workspace_sources,
 )
+from .machine_calls import CallRecord, spans
 from .supervisor import Unit
 from .workspace import Journal, WorkspaceRefusal
 from .workspace_calls import Call
@@ -40,6 +43,28 @@ PROVIDERS = {
     pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE: "huggingface",
     pb.NATIVE_SOURCE_OPERATION_CIVITAI: "civitai",
 }
+
+
+def _label(row: workspace_sources.NativeCall) -> str:
+    """What a native call does, in words, when its author named it nothing."""
+    try:
+        asked = msgspec.json.decode(row.accepted, type=source_interfaces.TYPES[row.operation][0])
+    except (KeyError, msgspec.MsgspecError):
+        return row.operation
+    match asked:
+        case source_interfaces.HuggingFace(repository=repository):
+            return f"Download {repository} from Hugging Face"
+        case source_interfaces.Civitai(version=version):
+            return f"Download Civitai model version {version}"
+        case source_interfaces.Convert():
+            return "Convert to cozytensors"
+        case source_interfaces.UploadHuggingFace(repository=repository, destination=to):
+            return f"Upload {repository} from Hugging Face to {to}"
+        case source_interfaces.UploadCivitai(version=version, destination=to):
+            return f"Upload Civitai model version {version} to {to}"
+        case source_interfaces.CommitFile(slot=slot):
+            return f"Commit {slot}"
+    return "Read source files"
 
 
 class Sources:
@@ -137,8 +162,10 @@ class Sources:
         sent: set[int] = set()
         with self.lock:
             self.waiting[command.service_id] = unit
+        watched = False
         try:
             while not self._settled(owner, command.service_id, request):
+                watched = True
                 parent = self.worker.engine.live.get(call.parent_request)
                 if parent is None or parent.attempt != request.parent_attempt_ordinal:
                     return  # its parent stopped: the parent's cancel stops the native task
@@ -163,6 +190,8 @@ class Sources:
                     service.handle(command)
                     continue
                 unit.wait()
+            if watched:  # settled while this unit watched it, not before a restart
+                self._record(owner, call, request, command.service_id)
         finally:
             with self.lock:
                 if self.waiting.get(command.service_id) is unit:
@@ -182,6 +211,47 @@ class Sources:
             and row["parent_ordinal"] == request.parent_attempt_ordinal
             and row["state"] in ("complete", "failed", "stopped", "released", "releasing")
         )
+
+    def _record(
+        self, owner: str, call: Call, request: pb.ChildCallRequest, service_id: str
+    ) -> None:
+        """A settled native call is a call of its run, like an effect: its root keeps the
+        record (kind `call`) with each stage's time and bytes."""
+        service, workspace, executions = (
+            self.worker.source_calls,
+            self.worker.workspace,
+            self.worker.executions,
+        )
+        assert service is not None and workspace is not None and executions is not None
+        with workspace.locked() as db:
+            row = db.one(
+                workspace_sources.NativeCall,
+                "SELECT * FROM native_calls WHERE owner=? AND service_id=?",
+                (owner, service_id),
+            )
+        assert row is not None
+        status = "canceled" if row.state == "stopped" else "succeeded" if row.result else "failed"
+        label = self.worker.calls.progress_label(
+            call.parent_request, request.parent_attempt_ordinal, call.call_index
+        )
+        record = CallRecord(
+            request=call.child_request,
+            parent=call.parent_request,
+            index=call.call_index,
+            attempt=1,
+            module=source_interfaces.MODULE,
+            export=request.export,
+            label=(label or _label(row))[:200],
+            status=status,
+            error=""
+            if status == "succeeded"
+            else service.failure_detail(service_id) or row.native_error or "native_source_failed",
+            called_unix_ms=call.created_ms,
+            stages=spans(service.stages(service_id)),
+            steps={},
+        )
+        root, _ = executions.scheduling_root(owner, call.parent_request)
+        executions.record(owner, root, "call", msgspec.to_builtins(record.bounded()))
 
     def cancel(self, owner: str, request: pb.ChildCallRequest) -> None:
         if self.worker.source_calls is not None:

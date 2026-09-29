@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import threading
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -30,6 +31,7 @@ from cozy_runtime.internal.worker.machine_builtin import Builtins
 from cozy_runtime.internal.worker.machine_deferred import Deferred
 from cozy_runtime.internal.worker.machine_release_roots import ReleaseRoots
 from cozy_runtime.internal.worker.machine_serving import Serving
+from cozy_runtime.internal.worker.stage_progress import StageProgress
 from cozy_runtime.internal.worker.supervisor import Unit, fault_text
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call, CallFenced
@@ -55,8 +57,42 @@ class CallTrack(msgspec.Struct, frozen=True, kw_only=True):
     ended_unix_ms: int = 0
     series: tuple[tuple[int, float], ...] = ()
     series_dropped: int = 0
-    #: bytes the span moved: an effect's upload stage
+    #: bytes the span moved: an upload or a download
     bytes: int = 0
+
+
+def spans(stages: Iterable[StageProgress]) -> dict[str, CallTrack]:
+    """A native call's stages as its record spells them: one span per stage name, which a
+    stage entered again (a retry) adds to."""
+    tracks: dict[str, CallTrack] = {}
+    for stage in stages:
+        elapsed = round(stage.elapsed() * 1000, 3)
+        ended = stage.started_ms + round(elapsed)
+        prior = tracks.get(stage.stage)
+        tracks[stage.stage] = (
+            CallTrack(
+                count=1,
+                total_ms=elapsed,
+                first_ms=elapsed,
+                min_ms=elapsed,
+                max_ms=elapsed,
+                started_unix_ms=stage.started_ms,
+                ended_unix_ms=ended,
+                bytes=stage.position,
+            )
+            if prior is None
+            else CallTrack(
+                count=prior.count + 1,
+                total_ms=round(prior.total_ms + elapsed, 3),
+                first_ms=prior.first_ms,
+                min_ms=min(prior.min_ms, elapsed),
+                max_ms=max(prior.max_ms, elapsed),
+                started_unix_ms=prior.started_unix_ms,
+                ended_unix_ms=ended,
+                bytes=max(prior.bytes, stage.position),
+            )
+        )
+    return tracks
 
 
 class _Attribution(msgspec.Struct, frozen=True):

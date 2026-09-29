@@ -183,6 +183,35 @@ def test_gated_download_presents_the_submitted_credential_and_keeps_it_nowhere(
 
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+def test_a_download_is_a_call_of_its_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A settled model download is recorded on its root like any call: what it fetched, how it
+    ended, and its stage's time and bytes."""
+    gate = tmp_path / "gate"
+    gate.touch()
+    with gated_pod(monkeypatch, gate) as (pod, _origin):
+        pod.submit("anonymous")
+        pod.outcome("anonymous")
+        pod.submit("gated", credential())
+        pod.outcome("gated")
+        rows = pod.rows("SELECT request,body,at_ms FROM execution_events WHERE kind='call'")
+    calls = {row["request"]: json.loads(cast(bytes, row["body"])) for row in rows}
+    assert set(calls) == {"anonymous", "gated"}, rows
+    for root, call in calls.items():
+        assert call["parent"] == root and call["index"] == 0
+        assert call["module"] == "cozy_runtime.author.sources"
+        assert call["export"] == "download_civitai"
+        assert call["label"] == "Download Civitai model version 777"
+        assert call["called_unix_ms"] > 0
+    refused, fetched = calls["anonymous"], calls["gated"]
+    assert refused["status"] == "failed" and refused["error"], refused
+    assert fetched["status"] == "succeeded" and fetched["error"] == "", fetched
+    (download,) = fetched["stages"].values()
+    assert download["bytes"] == len(BODY) and download["count"] == 1
+    assert fetched["called_unix_ms"] <= download["started_unix_ms"] <= download["ended_unix_ms"]
+    assert download["total_ms"] > 0
+
+
+@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 def test_a_credential_lost_at_restart_holds_the_call_until_the_owner_supplies_it(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

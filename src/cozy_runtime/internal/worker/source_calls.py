@@ -245,6 +245,8 @@ class SourceCalls:
         self.progress = progress
         # The latest failure detail per native call, for the machine child-call result.
         self.details: dict[str, str] = {}
+        # The stages each native call ran, for the `call` record its root keeps.
+        self.ran: dict[str, list[StageProgress]] = {}
         self.endpoints = endpoints or {}
         self.native_registry = native_registry
         self.spool_root = spool_root
@@ -346,6 +348,19 @@ class SourceCalls:
     def failure_detail(self, service_id: str) -> str:
         with self.lock:
             return self.details.get(service_id, "")
+
+    def stages(self, service_id: str) -> list[StageProgress]:
+        """The stages a native call ran, handed over once."""
+        with self.lock:
+            return self.ran.pop(service_id, [])
+
+    def _stage(self, command: pb.NativeSourceCommand, name: str) -> StageProgress:
+        stage = StageProgress(name, lambda frame: self._emit(command, frame))
+        with self.lock:
+            self.ran.setdefault(command.service_id, []).append(stage)
+            while len(self.ran) > 256:
+                self.ran.pop(next(iter(self.ran)))
+        return stage
 
     def _emit(self, command: pb.NativeSourceCommand, frame: dict[str, object]) -> None:
         if self.progress is not None:
@@ -484,7 +499,7 @@ class SourceCalls:
             if stage is None or stage.stage != name:
                 if stage is not None:
                     stage.finish(True)
-                stage = StageProgress(name, lambda frame: self._emit(command, frame))
+                stage = self._stage(command, name)
             stage.update(position, total)
 
         def child[A: Answer](launch: Launch[UploadStep], answer: type[A]) -> A:
@@ -778,7 +793,7 @@ class SourceCalls:
                 if stage is None or stage.stage != label:
                     if stage is not None:
                         stage.finish(True)
-                    stage = StageProgress(label, lambda frame: self._emit(command, frame))
+                    stage = self._stage(command, label)
                 stage.update(sample.position, sample.total)
 
             launch = Launch(store=str(self.workspace.store_root), parent_pid=os.getpid(), step=step)

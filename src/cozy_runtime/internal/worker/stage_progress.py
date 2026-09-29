@@ -30,6 +30,7 @@ class StageProgress:
         self.sampled_at = self.started
         self.sampled = 0
         self.complete = self.done = False
+        self.ended: float | None = None
         emit({"kind": "progress", "stage": self.stage})
 
     def update(self, position: int, total: int) -> None:
@@ -55,13 +56,18 @@ class StageProgress:
         self.complete = position == total
         self.emit(frame)
 
+    def elapsed(self) -> float:
+        """Seconds the stage has run, or ran once it ended."""
+        return (self.clock() if self.ended is None else self.ended) - self.started
+
     def finish(self, completed: bool) -> None:
         if self.done:
             return
         if completed and self.total:
             self.update(self.total, self.total)
         self.done = True
-        elapsed = self.clock() - self.started
+        self.ended = self.clock()
+        elapsed = self.elapsed()
         moved = self.position - (self.baseline or 0)
         fields: dict[str, object] = {
             "phase": self.stage,

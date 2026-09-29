@@ -15,7 +15,7 @@ from cozy_runtime.internal import effect_interfaces, fill
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker import machine_assessment, machine_models
 from cozy_runtime.internal.worker.machine_artifacts import model_retention
-from cozy_runtime.internal.worker.machine_calls import CallRecord, CallTrack
+from cozy_runtime.internal.worker.machine_calls import CallRecord, spans
 from cozy_runtime.internal.worker.machine_models import ModelHold
 from cozy_runtime.internal.worker.machine_publication import (
     PublicationAuthority,
@@ -152,7 +152,7 @@ class Effects:
         # The stage each effect is in; it outlives retries, so its timing covers them.
         self.stages: dict[tuple[str, str], StageProgress] = {}
         # Each effect's ended stages, for the `call` record its root keeps.
-        self.tracks: dict[tuple[str, str], dict[str, CallTrack]] = {}
+        self.ended: dict[tuple[str, str], list[StageProgress]] = {}
         # Sent publications whose awaiting-owner notice this process already recorded.
         self.noticed: set[tuple[str, str]] = set()
         self.stopped = False
@@ -218,7 +218,8 @@ class Effects:
             return current
         if current is not None:
             current.finish(True)
-            self._track(key, current)
+            with self.lock:
+                self.ended.setdefault(key, []).append(current)
 
         def emit(frame: dict[str, object]) -> None:
             if self.report is not None:
@@ -530,47 +531,16 @@ class Effects:
             self.landed.pop(key, None)
             self.stalls.pop(key, None)
             stage = self.stages.pop(key, None)
+            ended = self.ended.pop(key, [])
         if stage is not None:
             stage.finish(completed)
-            self._track(key, stage)
-        self._record(owner, self.journal.get(owner, call.parent_request, call.call_index))
+            ended.append(stage)
+        self._record(owner, self.journal.get(owner, call.parent_request, call.call_index), ended)
 
-    def _track(self, key: tuple[str, str], stage: StageProgress) -> None:
-        """An ended stage, as the effect's `call` record spells its span."""
-        elapsed = round((stage.clock() - stage.started) * 1000, 3)
-        span = CallTrack(
-            count=1,
-            total_ms=elapsed,
-            first_ms=elapsed,
-            min_ms=elapsed,
-            max_ms=elapsed,
-            started_unix_ms=stage.started_ms,
-            ended_unix_ms=stage.started_ms + round(elapsed),
-            bytes=stage.position,
-        )
-        with self.lock:
-            spans = self.tracks.setdefault(key, {})
-            prior = spans.get(stage.stage)
-            if prior is not None:
-                # A stage entered again (a retried finalization) adds to its one span.
-                span = CallTrack(
-                    count=prior.count + 1,
-                    total_ms=round(prior.total_ms + elapsed, 3),
-                    first_ms=prior.first_ms,
-                    min_ms=min(prior.min_ms, elapsed),
-                    max_ms=max(prior.max_ms, elapsed),
-                    started_unix_ms=prior.started_unix_ms,
-                    ended_unix_ms=span.ended_unix_ms,
-                    bytes=max(prior.bytes, span.bytes),
-                )
-            spans[stage.stage] = span
-
-    def _record(self, owner: str, call: Call) -> None:
+    def _record(self, owner: str, call: Call, ended: list[StageProgress]) -> None:
         """A settled effect is a call of its run, like a child call: its root keeps the record
         (kind `call`) with each stage's time and bytes. Left for its owner to reconcile, it has
         not settled yet."""
-        with self.lock:
-            stages = self.tracks.pop((owner, call.child_request), {})
         if not call.result and not call.safe_code:
             return
         intent = canonical_json.decode_as(call.intent, _Effect)
@@ -593,7 +563,7 @@ class Effects:
             status="succeeded" if call.result else "failed",
             error="" if call.result else (call.safe_detail or call.safe_code),
             called_unix_ms=call.created_ms,
-            stages=stages,
+            stages=spans(ended),
             steps={},
         )
         root, _ = self.executions.scheduling_root(owner, call.parent_request)
