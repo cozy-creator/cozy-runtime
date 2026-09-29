@@ -117,12 +117,9 @@ jobs:
       - name: Bundle cozy-machine into the Linux wheels
         working-directory: source
         run: uv run --script scripts/bundle-machine-agent.py --dist dist --agents "$RUNNER_TEMP/machine-agent"
-      - name: Verify an ordinary wheel install provides the agent
+      - name: Verify wheel selection and installed agent commands
         working-directory: source
-        run: |
-          uv venv "$RUNNER_TEMP/machine-install" --python 3.12
-          uv pip install --python "$RUNNER_TEMP/machine-install/bin/python" --no-deps --no-index --find-links dist cozy-runtime
-          "$RUNNER_TEMP/machine-install/bin/cozy-machine" version --json
+        run: uv run --script scripts/verify-machine-wheels.py --dist dist
       # cr-095: a release silently missing a platform file is refused.
       # Everything visible in dist/ is uploaded, so the set is exact; the digests travel to
       # `publish` outside the artifact.

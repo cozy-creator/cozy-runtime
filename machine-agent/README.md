@@ -8,7 +8,7 @@ Build from this directory with `go build .`; run with `cozy-machine run` and the
 machine grant in its environment. `cozy-machine version --json` reports identity.
 No Creator checkout or client configuration is required.
 
-The Linux x86-64 and ARM64 `cozy-runtime` PyPI wheels include the `cozy-machine`
+The glibc Linux x86-64 and ARM64 `cozy-runtime` PyPI wheels include the `cozy-machine`
 executable. `uv pip install cozy-runtime` installs it alongside the Python commands;
 installation does not start a service. The wheel uses the standard scripts
 installation directory and contains the native executable, with no Python launcher

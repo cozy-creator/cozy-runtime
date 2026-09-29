@@ -22,9 +22,6 @@ import tempfile
 from email.parser import BytesParser
 from pathlib import Path
 
-from wheel.cli.pack import pack
-from wheel.cli.unpack import unpack
-
 NATIVE_TAG = "cp312-abi3-manylinux_2_28_x86_64"
 PLATFORMS = {"amd64": "x86_64", "arm64": "aarch64"}
 
@@ -32,7 +29,18 @@ PLATFORMS = {"amd64": "x86_64", "arm64": "aarch64"}
 def bundle(source: Path, binary: Path, tag: str, destination: Path) -> Path:
     with tempfile.TemporaryDirectory(prefix=".machine-wheel-", dir=destination) as directory:
         work = Path(directory)
-        unpack(str(source), str(work / "unpacked"))
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "wheel",
+                "unpack",
+                str(source),
+                "--dest",
+                str(work / "unpacked"),
+            ],
+            check=True,
+        )
         (tree,) = (work / "unpacked").iterdir()
         (info,) = tree.glob("*.dist-info")
         metadata = BytesParser().parsebytes((info / "METADATA").read_bytes())
@@ -53,7 +61,11 @@ def bundle(source: Path, binary: Path, tag: str, destination: Path) -> Path:
         command.chmod(0o755)
         output = work / "packed"
         output.mkdir()
-        pack(str(tree), str(output), build_number=None)
+        subprocess.run(
+            [sys.executable, "-m", "wheel", "pack", str(tree), "--dest-dir", str(output)],
+            check=True,
+            env={**os.environ, "SOURCE_DATE_EPOCH": os.environ.get("SOURCE_DATE_EPOCH", "946684800")},
+        )
         (built,) = output.glob("*.whl")
         target = destination / built.name
         os.replace(built, target)
@@ -70,7 +82,9 @@ def main() -> None:
     pure = args.dist / f"cozy_runtime-{version}-py3-none-any.whl"
     native = args.dist / f"cozy_runtime-{version}-{NATIVE_TAG}.whl"
     if not pure.is_file() or not native.is_file():
-        parser.error("build the pure and native Runtime wheels at the agent's release version first")
+        parser.error(
+            "build the pure and native Runtime wheels at the agent's release version first"
+        )
     binaries = {}
     for arch in PLATFORMS:
         binary = args.agents / f"cozy-machine-linux-{arch}"

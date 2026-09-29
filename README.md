@@ -1,6 +1,6 @@
 # cozy-runtime (v2)
 
-Installing `cozy-runtime` from PyPI on Linux x86-64 or ARM64 also installs
+Installing a `cozy-runtime` PyPI wheel on glibc Linux x86-64 or ARM64 also installs
 `cozy-machine`, the standalone machine API and Runtime supervisor. For example:
 
 ```sh
@@ -13,6 +13,9 @@ an explicit operation. The agent runs as a separate process from the Python
 Runtime and from the client controller. See [machine-agent/README.md](machine-agent/README.md).
 The portable wheel and source distribution remain available for Runtime use on
 other platforms; the machine agent currently requires Linux process containment.
+Source-only, portable-wheel and musl installations do not include the agent.
+The ARM64 agent wheel does not remove native-build requirements of dependencies
+that do not yet publish ARM64 wheels.
 
 Machine execution requires worker wire 59. Before first submission, the authenticated
 RecordOwner reads `GetMachineExecutionWorkspace` and durably pins its workspace ID
