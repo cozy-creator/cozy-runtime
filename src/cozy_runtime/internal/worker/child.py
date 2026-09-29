@@ -263,10 +263,13 @@ class Executor:
         try:
             if not eligible():
                 return {"ok": False, "code": "executor_busy"}
-            reply = self._exchange(command, None, None, None, None)
-            if on_reply is not None:
-                on_reply(reply)
-            return reply
+            # Start observation only after claiming an eligible idle stream. A
+            # contended call must never place a watcher over another attempt.
+            with self.watched(str(command.__struct_config__.tag)):
+                reply = self._exchange(command, None, None, None, None)
+                if on_reply is not None:
+                    on_reply(reply)
+                return reply
         finally:
             self._calls.release()
 
