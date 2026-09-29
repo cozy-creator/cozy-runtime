@@ -4252,8 +4252,8 @@ class Executor:
         except msgspec.ValidationError as exc:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
 
-    def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool], None]:
-        def activity(sequence: int, active: bool, known: bool) -> None:
+    def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool, bool], None]:
+        def activity(sequence: int, active: bool, known: bool, finished: bool) -> None:
             self.channel.send(
                 {
                     "event": "progress",
@@ -4262,6 +4262,7 @@ class Executor:
                     "sequence": sequence,
                     "active": active,
                     "known": known,
+                    "finished": finished,
                 }
             )
 

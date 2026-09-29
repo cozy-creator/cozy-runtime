@@ -1744,7 +1744,8 @@ class AttemptEngine:
         )
 
         def on_progress(frame: dict[str, Any]) -> None:
-            attempt.moved()
+            if frame.get("kind") != "execution_activity":
+                attempt.moved()
             self.progress(attempt.request_id, attempt.attempt, frame)
 
         def on_request(request: Request) -> Reply:

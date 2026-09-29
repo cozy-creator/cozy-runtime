@@ -44,8 +44,10 @@ the private executor channel; ordinary progress and execution boundaries publish
 cumulative snapshot. The journal keeps only the latest snapshot per root attempt,
 preserving settled attempts across retry and never adding their paused gaps.
 
-Older executors, a lost activity observation, an interrupted clock, untracked Python
+Older executors, a lost activity observation, an interrupted clock, new untracked Python
 threads, and unsupported event-loop policies report unknown execution duration.
+Threads already present at the executor's first author call form its baseline;
+independent work on those pre-existing threads is outside this cooperative measurement.
 Windows and custom loop policies retain their normal execution behavior. The client
 must not replace unknown execution with admission-to-outcome wall time or advance a
 stale snapshot using its own clock. Timing failures cannot fail accepted execution.

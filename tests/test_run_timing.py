@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import itertools
+import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -25,7 +28,7 @@ from test_machine_execution import complete, offer
 def test_private_loop_excludes_waits_but_preserves_parallel_author_work(threaded: bool) -> None:
     observed: list[tuple[float, bool, bool]] = []
     activity = Activity(
-        lambda _seq, active, known: observed.append((time.monotonic(), active, known))
+        lambda _seq, active, known, _finished: observed.append((time.monotonic(), active, known))
     )
     loop = EventLoop(activity)
     busy = threading.Event()
@@ -58,7 +61,7 @@ def test_private_loop_excludes_waits_but_preserves_parallel_author_work(threaded
 
 def test_untracked_thread_makes_cooperative_measurement_unknown() -> None:
     observed: list[bool] = []
-    activity = Activity(lambda _seq, _active, known: observed.append(known))
+    activity = Activity(lambda _seq, _active, known, _finished: observed.append(known))
     loop = EventLoop(activity)
     release = threading.Event()
     thread = threading.Thread(target=release.wait)
@@ -74,6 +77,37 @@ def test_untracked_thread_makes_cooperative_measurement_unknown() -> None:
     assert observed[-1] is False
 
 
+def test_canceled_pool_submission_cannot_hide_an_untracked_thread() -> None:
+    activity = Activity(None)
+    loop = EventLoop(activity)
+    release = threading.Event()
+
+    async def invoke() -> None:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = loop.run_in_executor(pool, release.wait)
+            canceled = loop.run_in_executor(pool, lambda: None)
+            canceled.cancel()
+            release.set()
+            await first
+        assert not activity.submitted
+        raw_release = threading.Event()
+        raw = threading.Thread(target=raw_release.wait)
+        raw.start()
+        try:
+            await asyncio.sleep(0.01)
+            assert not activity.known
+        finally:
+            raw_release.set()
+            raw.join()
+
+    activity.change(1)
+    try:
+        loop.run_until_complete(invoke())
+    finally:
+        loop.close()
+        activity.change(-1)
+
+
 def test_run_timing_unions_nested_work_and_keeps_one_cumulative_snapshot(tmp_path: Path) -> None:
     executions = Executions(Workspace(tmp_path / "store"))
     executions.submit(
@@ -84,11 +118,23 @@ def test_run_timing_unions_nested_work_and_keeps_one_cumulative_snapshot(tmp_pat
         expected_execution_workspace_id=executions.workspace_id,
     )
     child = Calls(executions.workspace).accept("owner", request(running(executions))).child_request
+    executions.submit(
+        "owner",
+        child,
+        b"c" * 32,
+        offer(child),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     clock = [0.0]
     timing = Timing(executions, monotonic=lambda: clock[0])
 
-    def active(name: str, sequence: int, state: bool) -> None:
-        timing.observe("owner", name, 1, {"sequence": sequence, "active": state, "known": True})
+    def active(name: str, sequence: int, state: bool, *, finished: bool = False) -> None:
+        timing.observe(
+            "owner",
+            name,
+            1,
+            {"sequence": sequence, "active": state, "known": True, "finished": finished},
+        )
 
     timing.begin("owner", "parent", 1)
     active("parent", 1, True)
@@ -100,12 +146,12 @@ def test_run_timing_unions_nested_work_and_keeps_one_cumulative_snapshot(tmp_pat
     clock[0] = 104
     active("parent", 3, True)  # parent CPU overlaps child; the union counts once
     clock[0] = 107
-    active(child, 2, False)
+    active(child, 2, False, finished=True)
     timing.end("owner", child, 1)
     clock[0] = 110
     for _ in range(300):
         timing.snapshot("owner", "parent", 1)
-    active("parent", 4, False)
+    active("parent", 4, False, finished=True)
     timing.end("owner", "parent", 1)
     with executions.workspace.locked() as db:
         events = db.execute("SELECT body FROM execution_events WHERE kind='run.timing'").fetchall()
@@ -115,7 +161,7 @@ def test_run_timing_unions_nested_work_and_keeps_one_cumulative_snapshot(tmp_pat
     assert timing.runs == timing.members == {}
 
 
-@pytest.mark.parametrize("problem", ["legacy", "missing", "recovery"])
+@pytest.mark.parametrize("problem", ["legacy", "missing", "recovery", "died_while_blocked"])
 def test_incomplete_executor_observations_never_become_execution_time(
     tmp_path: Path, problem: str
 ) -> None:
@@ -137,7 +183,17 @@ def test_incomplete_executor_observations_never_become_execution_time(
     if problem != "legacy":
         timing.observe("owner", "parent", 1, {"sequence": 1, "active": True, "known": True})
         clock[0] = 100
-        timing.observe("owner", "parent", 1, {"sequence": 3, "active": False, "known": True})
+        timing.observe(
+            "owner",
+            "parent",
+            1,
+            {
+                "sequence": 2 if problem == "died_while_blocked" else 3,
+                "active": False,
+                "known": True,
+                "finished": problem != "died_while_blocked",
+            },
+        )
     timing.end("owner", "parent", 1)
     with executions.workspace.locked() as db:
         event = canonical_json.decode(
@@ -146,7 +202,10 @@ def test_incomplete_executor_observations_never_become_execution_time(
     assert event == {"attempt": 1, "terminal": True}
 
 
-def test_root_ending_with_an_open_child_retires_members_and_reports_unknown(tmp_path: Path) -> None:
+@pytest.mark.parametrize("refuse_record", [False, True])
+def test_root_ending_with_an_open_child_retires_members_and_reports_unknown(
+    tmp_path: Path, refuse_record: bool
+) -> None:
     executions = Executions(Workspace(tmp_path / "store"))
     executions.submit(
         "owner",
@@ -156,15 +215,32 @@ def test_root_ending_with_an_open_child_retires_members_and_reports_unknown(tmp_
         expected_execution_workspace_id=executions.workspace_id,
     )
     child = Calls(executions.workspace).accept("owner", request(running(executions))).child_request
+    executions.submit(
+        "owner",
+        child,
+        b"c" * 32,
+        offer(child),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     timing = Timing(executions)
     for name in ("parent", child):
         timing.begin("owner", name, 1)
         timing.observe("owner", name, 1, {"sequence": 1, "active": True, "known": True})
-    timing.observe("owner", "parent", 1, {"sequence": 2, "active": False, "known": True})
+    timing.observe(
+        "owner", "parent", 1, {"sequence": 2, "active": False, "known": True, "finished": True}
+    )
+    if refuse_record:
+        with executions.workspace.locked() as db:
+            db.execute(
+                "CREATE TRIGGER refuse_timing BEFORE INSERT ON execution_events "
+                "WHEN NEW.kind='run.timing' BEGIN SELECT RAISE(ABORT,'unavailable'); END"
+            )
     timing.end("owner", "parent", 1)
     timing.observe("owner", child, 1, {"sequence": 2, "active": False, "known": True})
     timing.end("owner", child, 1)
     assert timing.runs == timing.members == {}
+    if refuse_record:
+        return
     with executions.workspace.locked() as db:
         event = canonical_json.decode(
             db.execute("SELECT body FROM execution_events WHERE kind='run.timing'").fetchone()[0]
@@ -189,7 +265,12 @@ def test_retry_retains_each_attempt_without_counting_paused_gap(tmp_path: Path) 
         timing.begin("owner", "parent", ordinal)
         timing.observe("owner", "parent", ordinal, {"sequence": 1, "active": True, "known": True})
         clock[0] = end
-        timing.observe("owner", "parent", ordinal, {"sequence": 2, "active": False, "known": True})
+        timing.observe(
+            "owner",
+            "parent",
+            ordinal,
+            {"sequence": 2, "active": False, "known": True, "finished": True},
+        )
         timing.end("owner", "parent", ordinal)
         complete(executions, "parent", status=pb.OUTCOME_STATUS_FAILED)
         if ordinal == 1:
@@ -202,3 +283,104 @@ def test_retry_retains_each_attempt_without_counting_paused_gap(tmp_path: Path) 
         {"attempt": 1, "terminal": True, "execution_ms": 2000},
         {"attempt": 2, "terminal": True, "execution_ms": 3000},
     ]
+
+
+def test_stale_root_or_descendant_cannot_join_a_retry_clock(tmp_path: Path) -> None:
+    executions = Executions(Workspace(tmp_path / "store"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"p" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
+    child = Calls(executions.workspace).accept("owner", request(running(executions))).child_request
+    executions.submit(
+        "owner",
+        child,
+        b"c" * 32,
+        offer(child),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
+    complete(executions, "parent", status=pb.OUTCOME_STATUS_FAILED)
+    executions.control("owner", "parent", "resume", 1, "resume")
+    timing = Timing(executions)
+    timing.begin("owner", "parent", 1)
+    assert timing.runs == timing.members == {}
+    timing.begin("owner", "parent", 2)
+    timing.begin("owner", child, 1)
+    assert set(timing.members) == {("owner", "parent", 2)}
+
+
+@pytest.mark.parametrize("runtime", ["", "0.18.85"], ids=["current-sdk", "older-sdk"])
+def test_real_worker_nested_child_wait_is_not_run_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime: str
+) -> None:
+    import test_job_preparation_isolation as fixture
+    from test_end_to_end import NO_EXECUTOR
+    from test_machine_partial_work import machine
+
+    if NO_EXECUTOR:
+        pytest.skip(NO_EXECUTOR)
+    if runtime:
+        monkeypatch.setattr(fixture, "package", functools.partial(fixture.package, runtime=runtime))
+    entered, gate = tmp_path / "entered", tmp_path / "gate"
+    source = f"""import asyncio, time, msgspec, importlib.metadata, json
+from pathlib import Path
+from cozy_runtime.author import App, Context, Telemetry, invocable
+from cozy_runtime.author._invoke import Invocation
+app=App()
+class Request(msgspec.Struct):
+    pass
+class Result(msgspec.Struct):
+    value: int
+@invocable
+async def leaf(ctx: Context, tel: Telemetry, *, n: int) -> Result:
+    Path({str(entered)!r}).write_text(json.dumps({{
+        "runtime": importlib.metadata.version("cozy-runtime"),
+        "activity": "activity" in Invocation.__dataclass_fields__,
+    }}))
+    tel.progress(0.25, stage="Ready")
+    while not Path({str(gate)!r}).exists():
+        await asyncio.sleep(0.01)
+    start = time.monotonic()
+    value = n
+    while time.monotonic() - start < 0.15:
+        value = (value * 17 + 11) % 1000003
+    return Result(value)
+app.job(leaf)
+@app.job
+async def nested(ctx: Context, payload: Request) -> Result:
+    return await leaf(n=3)
+"""
+    with machine(monkeypatch, source) as pod:
+        pod.start(("leaf",))
+        pod.submit("timed")
+        pod.wait("the nested child to await its gate", entered.exists, 120)
+        sdk = json.loads(entered.read_text())
+        assert sdk["activity"] is (not runtime), sdk
+        time.sleep(0.6)  # controlled observation interval, not a production timeout
+        gate.touch()
+        outcome = pod.outcome("timed")
+        assert outcome["status"] == pb.OUTCOME_STATUS_SUCCEEDED, outcome
+        rows = pod.rows(
+            "SELECT body FROM execution_events WHERE request='timed' AND kind='run.timing'"
+        )
+        assert len(rows) == 1
+        measured = canonical_json.decode(bytes(rows[0]["body"]))
+        if runtime:
+            assert measured == {"attempt": 1, "terminal": True}
+            return
+        assert measured["terminal"] is True and measured["execution_ms"] >= 100, measured
+        calls = pod.rows(
+            "SELECT body FROM execution_events WHERE request='timed' AND kind='call.phase'"
+        )
+        terminal = next(
+            canonical_json.decode(bytes(row["body"]))
+            for row in reversed(calls)
+            if canonical_json.decode(bytes(row["body"]))["phase"] == "terminal"
+        )
+        # The existing child phase is its author envelope; the run measurement
+        # must exclude the real blocked interval while retaining its CPU work.
+        assert terminal["execution_ms"] - measured["execution_ms"] >= 400, (terminal, measured)
+        assert not pod.rows("SELECT body FROM execution_events WHERE kind='execution_activity'")
