@@ -175,13 +175,10 @@ func (i *idle) deadline() time.Time {
 	return time.UnixMilli(max(i.s.Deadline, i.renewed))
 }
 
-// activity reads the Runtime's activity file. Work that holds is fresh, active, and moving:
-// a meter that has not changed for the Runtime's own still window no longer holds (#872).
+// activity reads Runtime demand. Quiet counters do not prove that active work ended.
 type activity struct {
 	path   string
 	log    io.Writer
-	meter  string
-	moved  time.Time
 	said   string
 	saidAt time.Time
 }
@@ -204,18 +201,12 @@ func (a *activity) observe(now time.Time) (busy bool, err error) {
 	var facts struct {
 		ActiveWork *bool    `json:"active_work"`
 		Holding    []string `json:"holding"`
-		Meter      string   `json:"meter"`
-		Still      float64  `json:"still_floor_seconds"`
 	}
 	if err := json.NewDecoder(io.LimitReader(file, 4096)).Decode(&facts); err != nil || facts.ActiveWork == nil {
 		return false, errors.New("the Runtime's activity does not report active_work")
 	}
 	if !*facts.ActiveWork {
-		a.meter, a.moved = "", time.Time{}
 		return false, nil
-	}
-	if facts.Meter != a.meter || a.moved.IsZero() {
-		a.meter, a.moved = facts.Meter, now
 	}
 	holders := strings.Join(facts.Holding, ", ")
 	a.say(now, "cozy machine: idle held by the Runtime: "+holders)
