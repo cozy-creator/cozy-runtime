@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/capability"
@@ -32,6 +33,9 @@ import (
 //	PUT  /v1/machine/runtime/wheels/{file}   stage one wheel
 //	POST /v1/machine/runtime/update          {operation, runtime, tensorfs}: each a staged
 //	                                         {file, sha256}, a {version} to fetch, or omitted
+//
+// Staged wheels serve the next accepted operation. Uploads are refused while an
+// operation owns staging; its terminal status is published only after cleanup.
 //
 // A machine without these routes predates native updates.
 
@@ -81,6 +85,7 @@ func (s updateStatus) pins(pair pairVersions) bool {
 type runtimeUpdates struct {
 	mu     sync.Mutex
 	status *updateStatus
+	active string // held through cleanup, even after the installer has finished
 }
 
 var (
@@ -94,12 +99,12 @@ func (m *Machine) stagePath(names ...string) string {
 }
 
 // openUpdates reads the last update. One this daemon was part-way through when it stopped
-// failed: the operator reads the installed pair and runs it again.
+// failed at the request layer; the shared private journal recovers installation before admission.
 func (m *Machine) openUpdates() {
 	var status updateStatus
 	if raw, err := os.ReadFile(m.updatePath()); err == nil && json.Unmarshal(raw, &status) == nil {
 		if !status.terminal() {
-			status.State, status.Error = "failed", "the machine restarted during its Runtime update; run it again"
+			status.State, status.Error = "failed", "the machine restarted during its Runtime update; installation recovery runs before admission"
 			m.saveUpdate(status)
 		}
 		m.updates.status = &status
@@ -108,12 +113,20 @@ func (m *Machine) openUpdates() {
 
 func (m *Machine) saveUpdate(status updateStatus) {
 	m.updates.mu.Lock()
+	defer m.updates.mu.Unlock()
 	m.updates.status = &status
-	m.updates.mu.Unlock()
+	_ = m.writeUpdate(status)
+}
+
+// writeUpdate persists a status without publishing it. Admission must succeed
+// durably before the operation can start or replace the previous status.
+func (m *Machine) writeUpdate(status updateStatus) error {
 	raw, _ := json.Marshal(status)
 	if err := writeAtomic(m.updatePath(), raw, 0o600); err != nil {
 		fmt.Fprintln(m.log, "cozy machine: the Runtime update state was not recorded:", err)
+		return err
 	}
+	return nil
 }
 
 func (m *Machine) updating() bool {
@@ -140,7 +153,7 @@ func (m *Machine) maintenance(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	if !m.launcherReady() {
-		http.Error(w, "machine_starting: the process launcher is not ready", http.StatusServiceUnavailable)
+		runtimeStarting(w, "starting")
 		return false
 	}
 	return true
@@ -155,7 +168,7 @@ func (m *Machine) serveRuntimeState(w http.ResponseWriter, r *http.Request) {
 	status := m.updates.status
 	m.updates.mu.Unlock()
 	answer := map[string]any{"capabilities": []string{UpdateCapability}, "runtime": installed.Runtime,
-		"tensorfs": installed.TensorFS, "update": status}
+		"tensorfs": installed.TensorFS, "update": status, "phase": m.phase()}
 	var startup startupStatus
 	if raw, err := os.ReadFile(filepath.Join(m.layout.State, "startup-update-status.json")); err == nil && json.Unmarshal(raw, &startup) == nil {
 		answer["startup_update"] = startup
@@ -173,6 +186,14 @@ func (m *Machine) serveStageWheel(w http.ResponseWriter, r *http.Request) {
 	}
 	if m.startupPending() {
 		http.Error(w, "startup update is awaiting Runtime readiness", http.StatusServiceUnavailable)
+		return
+	}
+	// Staging belongs to the next accepted update. Do not acknowledge an upload
+	// while that update owns the directory or is still cleaning it up.
+	m.updates.mu.Lock()
+	defer m.updates.mu.Unlock()
+	if m.updates.active != "" || m.updates.status != nil && !m.updates.status.terminal() {
+		http.Error(w, "the machine is running a Runtime update; stage wheels after it finishes", http.StatusConflict)
 		return
 	}
 	file := r.PathValue("file")
@@ -222,10 +243,6 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 	if !m.maintenance(w, r) {
 		return
 	}
-	if m.startupPending() {
-		http.Error(w, "startup update is awaiting Runtime readiness", http.StatusServiceUnavailable)
-		return
-	}
 	var request updateRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&request); err != nil || !operationName.MatchString(request.Operation) ||
 		request.Runtime == nil && request.TensorFS == nil {
@@ -233,9 +250,9 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.updates.mu.Lock()
+	defer m.updates.mu.Unlock()
 	current := m.updates.status
-	busy := current != nil && !current.terminal()
-	m.updates.mu.Unlock()
+	busy := m.updates.active != "" || current != nil && !current.terminal()
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case current != nil && current.Operation == request.Operation:
@@ -245,15 +262,34 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the machine is running another Runtime update: "+current.Operation, http.StatusConflict)
 		return
 	}
+	if m.startupPending() {
+		runtimeStarting(w, "booting")
+		return
+	}
+	m.mu.Lock()
+	process, ready := m.proc, m.ready
+	m.mu.Unlock()
+	if process != nil && !process.exited() {
+		select {
+		case <-ready:
+		default:
+			runtimeStarting(w, "booting")
+			return
+		}
+	}
 	installed, err := m.installedPair()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	pinned := request.Runtime != nil && request.Runtime.File != "" || request.TensorFS != nil && request.TensorFS.File != ""
+	pinned := request.Runtime != nil || request.TensorFS != nil
 	status := updateStatus{Operation: request.Operation, State: "waiting", From: installed, Pinned: pinned}
 	status.PreviouslyPinned = current != nil && current.pins(installed)
-	m.saveUpdate(status)
+	if err := m.writeUpdate(status); err != nil {
+		http.Error(w, "cannot record the Runtime update: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	m.updates.status, m.updates.active = &status, request.Operation
 	go m.runUpdate(request, status)
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(status)
@@ -272,13 +308,24 @@ func (m *Machine) installedPair() (pairVersions, error) {
 
 // runUpdate performs one update to its end, then records it.
 func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
+	defer func() {
+		m.updates.mu.Lock()
+		defer m.updates.mu.Unlock()
+		if m.updates.active == request.Operation {
+			if err := os.RemoveAll(m.stagePath()); err != nil {
+				fmt.Fprintln(m.log, "cozy machine: cannot remove completed update files:", err)
+			}
+			m.setUpdating(false)
+			m.updates.status = &status
+			_ = m.writeUpdate(status)
+			m.updates.active = ""
+		}
+	}()
 	fail := func(state string, err error) {
 		status.State, status.Error = state, err.Error()
 		fmt.Fprintln(m.log, "cozy machine: Runtime update", status.Operation, state+":", err)
-		m.saveUpdate(status)
 	}
 	ctx := context.Background()
-	defer os.RemoveAll(m.stagePath()) // staged wheels serve one update; the kept pair is elsewhere
 	previous, err := m.previousPair(ctx, status.From)
 	if err != nil {
 		fail("failed", err)
@@ -301,22 +348,45 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		fail("failed", err)
 		return
 	}
-	defer m.setUpdating(false)
 	status.State = "installing"
 	m.saveUpdate(status)
-	err = m.replacePair(ctx, candidate, status.To)
+	payload, _ := json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime})
+	answer, err := m.launcher.maintain("update-prepare", []string{string(payload)})
+	if err != nil || answer != "boot_pending" {
+		if err == nil {
+			err = errors.New("candidate installation rolled back")
+		}
+		fail("failed", err)
+		if answer == "recovery_required" {
+			m.restarts.fail(&launchRefusal{"runtime_update_recovery_required", err.Error()})
+			return
+		}
+		if launchErr := m.launch(); launchErr != nil {
+			m.restarts.fail(launchErr)
+		}
+		return
+	}
+	m.mu.Lock()
+	m.grant.startupPending = true
+	m.mu.Unlock()
+	err = m.launch()
 	if err == nil {
-		if _, err = m.launcher.maintain("select", candidate); err == nil {
+		m.mu.Lock()
+		p, ready := m.proc, m.ready
+		m.mu.Unlock()
+		select {
+		case <-ready:
 			status.State, status.Error = "succeeded", ""
 			_ = m.restarts.clear()
-			m.saveUpdate(status)
 			return
+		case <-p.done:
+			err = fmt.Errorf("candidate exited before authenticated readiness: %s", exitText(p.err))
 		}
 	}
 	status.State, status.Error = "rolling_back", err.Error()
 	m.saveUpdate(status)
-	if rollback := m.replacePair(ctx, previous, status.From); rollback != nil {
-		fail("failed", fmt.Errorf("%v; rolling back failed too: %v", err, rollback))
+	if rollback := m.rollbackStartup(ctx); rollback != nil {
+		fail("failed", fmt.Errorf("%v; rollback failed: %w", err, rollback))
 		return
 	}
 	fail("rolled_back", err)
@@ -327,13 +397,34 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 func (m *Machine) quiesce(ctx context.Context) error {
 	wait := time.Second
 	for {
+		m.launchMu.Lock()
 		m.setUpdating(true)
+		m.mu.Lock()
+		process, ready := m.proc, m.ready
+		m.mu.Unlock()
+		if process != nil && !process.exited() {
+			select {
+			case <-ready:
+			default:
+				m.setUpdating(false)
+				m.launchMu.Unlock()
+				select {
+				case <-ready:
+				case <-process.done:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				continue
+			}
+		}
 		answer, err := m.launcher.maintain("restart", nil)
 		if err == nil && answer == "accepted" {
 			m.stopRuntime() // the Runtime exited; the guardian's report settles it here
+			m.launchMu.Unlock()
 			return nil
 		}
 		m.setUpdating(false)
+		m.launchMu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -344,36 +435,6 @@ func (m *Machine) quiesce(ctx context.Context) error {
 		}
 		wait = min(2*wait, 10*time.Second)
 	}
-}
-
-// replacePair installs a pair, relaunches the Runtime and checks it answers at versions.
-func (m *Machine) replacePair(ctx context.Context, wheels []string, want pairVersions) error {
-	m.stopRuntime()
-	if _, err := m.launcher.maintain("install", wheels); err != nil {
-		return err
-	}
-	if err := m.launch(); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	p, ready := m.proc, m.ready
-	m.mu.Unlock()
-	select {
-	case <-ready:
-	case <-p.done:
-		return fmt.Errorf("the new Runtime exited before it was ready: %s", exitText(p.err))
-	}
-	if err := m.requireRuntimeRange(ctx); err != nil {
-		return err
-	}
-	got, err := m.installedPair()
-	if err != nil {
-		return err
-	}
-	if got != want {
-		return fmt.Errorf("the machine runs Runtime %s / TensorFS %s, not %s / %s", got.Runtime, got.TensorFS, want.Runtime, want.TensorFS)
-	}
-	return nil
 }
 
 // previousPair is the installed pair's wheels, to roll back to: the kept pair, or the same
@@ -494,14 +555,21 @@ func (m *Machine) fetchWheel(ctx context.Context, name, version string) (string,
 func fileExists(path string) bool { _, err := os.Stat(path); return err == nil }
 
 func httpGet(ctx context.Context, url string) (*http.Response, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	progress := &progressBody{cancel: cancel, done: make(chan struct{})}
+	go killWhenStill(progress.done, progress.bytes.Load, cancel)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		progress.Close()
 		return nil, err
 	}
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
+		progress.Close()
 		return nil, err
 	}
+	progress.ReadCloser = response.Body
+	response.Body = progress
 	if response.StatusCode != http.StatusOK {
 		response.Body.Close()
 		return nil, fmt.Errorf("%s answered HTTP %d", url, response.StatusCode)
@@ -516,4 +584,45 @@ func getJSON(ctx context.Context, url string, into any) error {
 	}
 	defer response.Body.Close()
 	return json.NewDecoder(io.LimitReader(response.Body, 32<<20)).Decode(into)
+}
+
+func (m *Machine) manualUpdateActive() bool {
+	m.updates.mu.Lock()
+	defer m.updates.mu.Unlock()
+	return m.updates.active != ""
+}
+
+// Transfers reset the stall observation on every received byte; there is no
+// maximum transfer duration while useful progress continues.
+type progressBody struct {
+	io.ReadCloser
+	bytes  atomic.Uint64
+	cancel context.CancelFunc
+	done   chan struct{}
+	once   sync.Once
+}
+
+func (p *progressBody) Read(b []byte) (int, error) {
+	n, err := p.ReadCloser.Read(b)
+	p.bytes.Add(uint64(n))
+	return n, err
+}
+func (p *progressBody) Close() error {
+	p.once.Do(func() { close(p.done); p.cancel() })
+	if p.ReadCloser != nil {
+		return p.ReadCloser.Close()
+	}
+	return nil
+}
+
+// This response is emitted only before new update admission. Clients may observe
+// the read-only Runtime state and retry the same operation when phase is ready.
+func runtimeStarting(w http.ResponseWriter, phase string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Phase   string `json:"phase"`
+	}{"runtime_starting", "Runtime has not finished guarded readiness; observe GET /v1/machine/runtime", phase})
 }

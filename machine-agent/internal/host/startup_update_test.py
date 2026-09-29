@@ -12,29 +12,25 @@ spec.loader.exec_module(startup)
 
 
 class StartupMetadata(unittest.TestCase):
-    def test_all_owners_and_unfinished_states(self):
+    def test_only_runtime_owned_software_state_is_read(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Path(directory)
-            self.assertTrue(startup.safe_journal(store))
+            self.assertTrue(startup.software_state(store)["quiescent"])
             path = store / ".cozy-workspace/journal.sqlite3"
             path.parent.mkdir()
             with sqlite3.connect(path) as db:
-                db.executescript("CREATE TABLE runs(owner TEXT,state TEXT,collected INT); CREATE VIEW machine_runs_v1 AS SELECT * FROM runs;")
-                for state in ("queued", "running", "paused", "unknown"):
-                    db.execute("DELETE FROM runs")
-                    db.execute("INSERT INTO runs VALUES('other-owner',?,1)", (state,))
-                    db.commit()
-                    self.assertFalse(startup.safe_journal(store), state)
-                for state in ("succeeded", "failed", "canceled"):
-                    for collected in (0, 1):
-                        db.execute("DELETE FROM runs")
-                        db.execute("INSERT INTO runs VALUES('other-owner',?,?)", (state, collected))
-                        db.commit()
-                        self.assertEqual(startup.safe_journal(store), bool(collected))
-                db.execute("DROP VIEW machine_runs_v1")
+                db.executescript("CREATE TABLE state(quiescent INT, accepted_work INT, workspace_id TEXT); CREATE VIEW machine_software_update_v1 AS SELECT * FROM state;")
+                db.execute("INSERT INTO state VALUES(1,1,'original')")
+                db.commit()
+                self.assertEqual(startup.software_state(store), {"quiescent": True, "accepted_work": True, "workspace_id": "original"})
+                db.execute("DROP VIEW machine_software_update_v1")
                 db.commit()
                 with self.assertRaises(sqlite3.OperationalError):
-                    startup.safe_journal(store)
+                    startup.software_state(store)
+
+    def test_zero_major_stays_within_minor_line(self):
+        with patch.object(startup, "read_json", return_value={"releases": {"0.4.0": [], "1.0.0": []}}):
+            self.assertEqual(list(startup.candidates("tensorfs", "0.3.78")), [])
 
     def test_explicit_development_versions(self):
         for version in ("0.18.86.dev1", "0.18.86+local", "0.18.86rc1"):

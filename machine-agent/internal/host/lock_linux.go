@@ -41,3 +41,12 @@ func lockStartupWorker(root string) (func(), error) {
 	}
 	return func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN); _ = f.Close() }, nil
 }
+
+func syncInstallation(root string) error {
+	f, err := os.Open(filepath.Join(root, "opt/cozy/python"))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return unix.Syncfs(int(f.Fd()))
+}

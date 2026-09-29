@@ -40,25 +40,30 @@ def installed_metadata():
     return installed, requirements
 
 
-def safe_journal(store):
+def software_state(store):
     path = Path(store) / ".cozy-workspace/journal.sqlite3"
     if not path.exists():
-        return True
-    # Unknown views, unreadable records and unfinished/retained work defer updates.
+        return {"quiescent": True, "accepted_work": False, "workspace_id": ""}
+    # The Runtime owns this contract. Missing/unknown views defer updates; the
+    # agent never reconstructs its retention or child/native rules.
     with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2) as db:
         db.execute("PRAGMA query_only=ON")
-        return db.execute(
-            "SELECT 1 FROM machine_runs_v1 WHERE "
-            "state NOT IN ('succeeded','failed','canceled') OR collected=0 LIMIT 1"
-        ).fetchone() is None
+        row = db.execute("SELECT quiescent,accepted_work,workspace_id FROM machine_software_update_v1").fetchone()
+        if row is None:
+            raise ValueError("Runtime software-update state is unavailable")
+        return {"quiescent": bool(row[0]), "accepted_work": bool(row[1]), "workspace_id": row[2]}
 
 
 def read_json(url):
-    # A metadata request has a 15-second network observation budget. Failure
-    # leaves the verified installed pair in service; it never cancels a run.
+    # The guardian observes bytes as well as CPU/output using its existing stall
+    # policy. Continuous metadata progress has no arbitrary total deadline.
     request = urllib.request.Request(url, headers={"User-Agent": "cozy-machine-startup"})
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return json.load(response)
+    with urllib.request.urlopen(request) as response:
+        body = bytearray()
+        while chunk := response.read1(64 << 10):
+            body.extend(chunk)
+            print(f"received {len(chunk)} metadata bytes", file=sys.stderr, flush=True)
+        return json.loads(body)
 
 
 def candidates(name, floor):
@@ -67,7 +72,7 @@ def candidates(name, floor):
     compatible_tags = set(sys_tags())
     for version in sorted(index["releases"], key=Version, reverse=True):
         value = Version(version)
-        if not stable(version) or value.major != minimum.major or value < minimum:
+        if not stable(version) or value.major != minimum.major or (minimum.major == 0 and value.minor != minimum.minor) or value < minimum:
             continue
         release = read_json(f"https://pypi.org/pypi/{name}/{version}/json")
         info = release["info"]
@@ -147,7 +152,7 @@ def main():
     operation = sys.argv[1]
     if operation == "inspect":
         pair = versions()
-        result = {"runtime": pair["cozy-runtime"], "tensorfs": pair["tensorfs"], "eligible": all(stable(v) for v in pair.values()) and safe_journal(sys.argv[2])}
+        result = {"runtime": pair["cozy-runtime"], "tensorfs": pair["tensorfs"], "eligible": all(stable(v) for v in pair.values()), **software_state(sys.argv[2])}
     elif operation == "plan":
         result = plan()
     elif operation == "probe":

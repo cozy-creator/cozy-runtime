@@ -22,6 +22,20 @@ import (
 //go:embed startup_update.py
 var startupUpdateScript string
 
+type softwareState struct {
+	pairVersions
+	Eligible     bool
+	Quiescent    bool
+	AcceptedWork bool   `json:"accepted_work"`
+	Workspace    string `json:"workspace_id"`
+}
+
+type pairTransaction struct {
+	Before, After       pairVersions
+	Candidate, Previous []string
+	Store, Lifetime     string
+}
+
 type startupProbe struct {
 	pairVersions
 	WireMinor        uint32   `json:"wire_minor"`
@@ -30,6 +44,11 @@ type startupProbe struct {
 }
 
 func (m *Machine) startupVerify(ctx context.Context, overlay ...string) (pairVersions, error) {
+	if len(overlay) != 0 {
+		if err := m.verifyBundledAgent(ctx, overlay[0]); err != nil {
+			return pairVersions{}, err
+		}
+	}
 	var probe startupProbe
 	if err := m.startupPython(ctx, &probe, append([]string{"probe"}, overlay...)...); err != nil {
 		return pairVersions{}, err
@@ -40,15 +59,48 @@ func (m *Machine) startupVerify(ctx context.Context, overlay ...string) (pairVer
 	return probe.pairVersions, nil
 }
 
+// Every default update carries the next boot's agent. Its advertised contracts
+// and protocol range are checked before uv can replace the installed pair.
+func (m *Machine) verifyBundledAgent(ctx context.Context, overlay string) error {
+	cmd := exec.CommandContext(ctx, filepath.Join(overlay, "bin/cozy-machine"), "version", "--json")
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + filepath.Join(m.layout.Root, "tmp")}
+	raw, err := progressChildOutput(cmd, false)
+	if err != nil {
+		return fmt.Errorf("candidate Runtime requires a working bundled machine agent: %w", err)
+	}
+	var identity struct {
+		Name             string   `json:"name"`
+		WireMinor        uint32   `json:"wire_minor"`
+		MinimumWireMinor uint32   `json:"minimum_wire_minor"`
+		Capabilities     []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &identity); err != nil {
+		return fmt.Errorf("candidate bundled agent identity: %w", err)
+	}
+	if identity.Name != "cozy-machine" || identity.WireMinor < pb.MinCompatibleWireMinor || identity.MinimumWireMinor > pb.WireMinor {
+		return errors.New("candidate bundled agent has an unsupported identity or wire range")
+	}
+	for _, required := range build.Capabilities() {
+		if !slices.Contains(identity.Capabilities, required) {
+			return fmt.Errorf("candidate bundled agent lacks %s", required)
+		}
+	}
+	return nil
+}
+
 type startupWheel struct {
 	File, SHA256, Version, URL string
 }
 
 type startupStatus struct {
-	State         string `json:"state"` // installing | succeeded | rolled_back | skipped
-	Detail        string `json:"detail,omitempty"`
-	Before, After pairVersions
-	Previous      []startupWheel `json:"previous,omitempty"`
+	Workspace        string `json:"workspace,omitempty"`
+	Pinned           bool   `json:"pinned,omitempty"`
+	PreviouslyPinned bool   `json:"previously_pinned,omitempty"`
+	State            string `json:"state"` // installing | succeeded | rolled_back | skipped
+	Detail           string `json:"detail,omitempty"`
+	Before, After    pairVersions
+	Previous         []startupWheel `json:"previous,omitempty"`
+	Failed           []pairVersions `json:"failed,omitempty"`
 }
 
 func (m *Machine) startupPath(names ...string) string {
@@ -72,13 +124,17 @@ func (m *Machine) startupSave(status startupStatus) error {
 	}
 	// This secrets-free report remains readable after the agent drops privilege;
 	// only the private journal above is used to authorize recovery.
-	return writeAtomic(filepath.Join(m.layout.State, "startup-update-status.json"), raw, 0o644)
+	if err := writeAtomic(filepath.Join(m.layout.State, "startup-update-status.json"), raw, 0o644); err != nil {
+		fmt.Fprintln(m.log, "cozy machine: startup report unavailable:", err)
+	}
+	return nil
 }
 
 func (m *Machine) startupPython(ctx context.Context, into any, arguments ...string) error {
 	args := append([]string{"-I", "-c", startupUpdateScript}, arguments...)
 	cmd := exec.CommandContext(ctx, filepath.Join(m.layout.Root, "opt/cozy/python/bin/python"), args...)
-	out, err := cmd.Output()
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + filepath.Join(m.layout.Root, "tmp")}
+	out, err := progressChildOutput(cmd, false)
 	if err != nil {
 		if failed, ok := err.(*exec.ExitError); ok {
 			return fmt.Errorf("startup %s: %s", arguments[0], strings.TrimSpace(string(failed.Stderr)))
@@ -104,6 +160,12 @@ func hashFile(path string) (string, error) {
 // A successful explicit wheel operation owns its particular installed pair.
 // This file can only defer discovery; it never authorizes privileged mutation.
 func (m *Machine) explicitlyPinnedPair(installed pairVersions) bool {
+	var transaction startupStatus
+	if raw, err := os.ReadFile(m.startupPath("status.json")); err == nil && json.Unmarshal(raw, &transaction) == nil {
+		if transaction.State == "succeeded" && transaction.After == installed && transaction.Pinned || transaction.State == "rolled_back" && transaction.Before == installed && transaction.PreviouslyPinned {
+			return true
+		}
+	}
 	var previous updateStatus
 	raw, err := os.ReadFile(m.updatePath())
 	return err == nil && json.Unmarshal(raw, &previous) == nil && previous.pins(installed)
@@ -172,6 +234,9 @@ func (m *Machine) startupRollback(ctx context.Context, status startupStatus) err
 		return err
 	}
 	status.State = "rolled_back"
+	if !slices.Contains(status.Failed, status.After) {
+		status.Failed = append(status.Failed, status.After)
+	}
 	return m.startupSave(status)
 }
 
@@ -198,6 +263,23 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 	}
 	defer unlock()
 	if status.State == "installing" || status.State == "boot_pending" {
+		// Metadata identifies the installation independently of the health probe.
+		// A later explicit installation supersedes this transaction even if off.
+		if installed, err := m.installedPair(); err == nil {
+			if installed != status.After {
+				status.State = "superseded"
+				if installed == status.Before {
+					status.State = "rolled_back"
+					if !slices.Contains(status.Failed, status.After) {
+						status.Failed = append(status.Failed, status.After)
+					}
+				}
+				if err := m.startupSave(status); err != nil {
+					fmt.Fprintln(m.log, "cozy machine: recovery report:", err)
+				}
+				return nil
+			}
+		}
 		status.Detail = "recovering interrupted startup update"
 		if err := m.startupRollback(ctx, status); err != nil {
 			return fmt.Errorf("interrupted startup update could not be repaired: %w", err)
@@ -205,49 +287,61 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 		fmt.Fprintln(m.log, "cozy machine: restored the verified pair after interrupted startup update")
 		return nil
 	}
-	if m.grant.StartupUpdate == "off" || strings.ContainsAny(build.Version, "-+") {
+	automatic, policyErr := automaticSoftwareUpdates(m.layout.Root)
+	if policyErr != nil {
+		fmt.Fprintln(m.log, "cozy machine: startup update policy deferred:", policyErr)
+	}
+	if !automatic || strings.ContainsAny(build.Version, "-+") {
 		fmt.Fprintln(m.log, "cozy machine: startup update skipped: explicitly pinned or development agent")
 		return nil
 	}
 	skip := func(detail string) error {
 		fmt.Fprintln(m.log, "cozy machine: startup update retained installed pair:", detail)
-		return m.startupSave(startupStatus{State: "skipped", Detail: detail})
+		if status.State == "" {
+			status.State = "skipped"
+		}
+		status.Detail = detail
+		if err := m.startupSave(status); err != nil {
+			fmt.Fprintln(m.log, "cozy machine: startup report:", err)
+		}
+		return nil
 	}
-	var installed struct {
-		pairVersions
-		Eligible bool
-	}
+	var installed softwareState
 	if err := m.startupPython(ctx, &installed, "inspect", m.layout.Store); err != nil {
 		return skip("installed metadata or public work journal is unreadable; update deferred")
 	}
-	if !installed.Eligible {
-		return skip("development pair or unfinished retained work; update deferred")
+	if !installed.Eligible || !installed.Quiescent || m.grant.Lifetime != "persistent" && installed.AcceptedWork {
+		return skip("development pair, retained work, or previously used rental; update deferred")
 	}
 	if m.explicitlyPinnedPair(installed.pairVersions) {
 		return skip("installed pair is owned by an explicit wheel update")
 	}
 	verified, err := m.startupVerify(ctx)
 	if err != nil {
-		return fmt.Errorf("installed pair failed startup verification: %w", err)
+		return skip("installed pair failed verification; repair API remains available: " + err.Error())
 	}
 	var selected map[string]startupWheel
 	if err := m.startupPython(ctx, &selected, "plan"); err != nil {
 		return skip("release discovery unavailable or no compatible published pair; verified installed pair retained")
 	}
 	next := pairVersions{Runtime: selected["cozy-runtime"].Version, TensorFS: selected["tensorfs"].Version}
+	if slices.Contains(status.Failed, next) {
+		return skip("candidate previously failed; waiting for a different published pair")
+	}
 	if next == verified {
 		return skip("installed pair is current within its compatible major lines")
 	}
 	if err := os.MkdirAll(m.startupPath(), 0o700); err != nil {
-		return err
+		return skip("cannot create update staging: " + err.Error())
 	}
+	downloads := &Machine{layout: Layout{State: m.startupPath("downloads")}}
 	var candidate []string
 	for _, name := range []string{"cozy-runtime", "tensorfs"} {
 		wheel := selected[name]
 		if wheelDistribution(wheel.File) != name || wheelVersion(wheel.File) != wheel.Version || !sha256Hex.MatchString(wheel.SHA256) || !strings.HasPrefix(wheel.URL, "https://files.pythonhosted.org/") {
 			return skip("published wheel identity is invalid")
 		}
-		path, err := m.fetchWheel(ctx, name, wheel.Version)
+		path, err := downloads.fetchWheel(ctx, name, wheel.Version)
 		if err != nil {
 			return skip("published wheel download failed; verified installed pair retained")
 		}
@@ -267,13 +361,42 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 	if !samePair(previous, verified) {
 		previous = nil
 		for name, version := range map[string]string{"cozy-runtime": verified.Runtime, "tensorfs": verified.TensorFS} {
-			path, err := m.fetchWheel(ctx, name, version)
+			path, err := downloads.fetchWheel(ctx, name, version)
 			if err != nil {
 				return skip("verified installed wheels cannot be retained for offline rollback")
 			}
 			previous = append(previous, path)
 		}
 	}
+	status.Workspace = installed.Workspace
+	if err := m.preparePair(ctx, verified, next, candidate, previous, status, false); err != nil {
+		fmt.Fprintln(m.log, "cozy machine: update preparation failed; repair remains available:", err)
+		if m.transactionPending() {
+			return err
+		}
+	}
+	return nil
+}
+
+// preparePair is the sole stage/install/recovery engine for automatic and
+// explicit updates. Both finish through the same authenticated readiness gate.
+func (m *Machine) preparePair(ctx context.Context, verified, next pairVersions, candidate, previous []string, status startupStatus, pinned bool) error {
+	if !samePair(candidate, next) || !samePair(previous, verified) {
+		return errors.New("update pair is incomplete")
+	}
+	var private []string
+	for _, path := range candidate {
+		digest, err := hashFile(path)
+		if err != nil {
+			return err
+		}
+		copy, err := m.startupCopyWheel(path, "candidate", digest)
+		if err != nil {
+			return err
+		}
+		private = append(private, copy)
+	}
+	candidate = private
 	kept, err := m.startupPrevious(previous)
 	if err != nil {
 		return err
@@ -286,14 +409,25 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 	}
 	defer os.RemoveAll(overlay)
 	args := append([]string{"pip", "install", "--no-config", "--offline", "--no-deps", "--target", overlay, "--python", filepath.Join(m.layout.Root, "opt/cozy/python/bin/python")}, candidate...)
-	if _, err := exec.CommandContext(ctx, filepath.Join(m.layout.Root, "usr/local/bin/uv"), args...).CombinedOutput(); err != nil {
-		return skip("candidate staging failed; verified installed pair retained")
+	cmd := exec.CommandContext(ctx, filepath.Join(m.layout.Root, "usr/local/bin/uv"), args...)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + filepath.Join(m.layout.Root, "tmp")}
+	if _, err := progressChildOutput(cmd, true); err != nil {
+		return fmt.Errorf("candidate staging failed: %w", err)
 	}
 	probed, err := m.startupVerify(ctx, overlay)
 	if err != nil || probed != next {
-		return skip("candidate failed native/dependency preflight; verified installed pair retained")
+		if !slices.Contains(status.Failed, next) {
+			status.Failed = append(status.Failed, next)
+		}
+		if status.State == "" {
+			status.State = "skipped"
+		}
+		status.Detail = "candidate failed native/dependency preflight"
+		_ = m.startupSave(status)
+		return fmt.Errorf("candidate failed native/dependency preflight: %v", err)
 	}
-	status = startupStatus{State: "installing", Before: verified, After: next, Previous: kept}
+	status.PreviouslyPinned, status.Pinned = m.explicitlyPinnedPair(verified), pinned
+	status.State, status.Before, status.After, status.Previous = "installing", verified, next, kept
 	if err := m.startupSave(status); err != nil {
 		return err
 	}
@@ -328,7 +462,7 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 
 // Only the existing privileged launcher can commit or repair its private update
 // journal after the public agent has dropped privilege.
-func startupMaintenance(root, operation string) error {
+func startupMaintenance(root, operation string, workspace string) error {
 	m := &Machine{layout: NewLayout(&Grant{Root: root}), log: io.Discard}
 	raw, err := os.ReadFile(m.startupPath("status.json"))
 	var status startupStatus
@@ -339,6 +473,9 @@ func startupMaintenance(root, operation string) error {
 		return err
 	}
 	if operation == "startup-rollback" {
+		if status.State != "installing" && status.State != "boot_pending" {
+			return errors.New("no interrupted update awaits rollback")
+		}
 		status.Detail = "candidate failed authenticated Runtime startup"
 		return m.startupRollback(context.Background(), status)
 	}
@@ -349,6 +486,40 @@ func startupMaintenance(root, operation string) error {
 	if err != nil || got != status.After {
 		return errors.New("ready Runtime does not match startup candidate")
 	}
+	if status.Workspace != "" && status.Workspace != workspace {
+		return errors.New("ready Runtime changed the execution workspace")
+	}
 	status.State = "succeeded"
 	return m.startupSave(status)
+}
+
+func (m *Machine) transactionPending() bool {
+	var status startupStatus
+	raw, err := os.ReadFile(m.startupPath("status.json"))
+	return err == nil && json.Unmarshal(raw, &status) == nil && (status.State == "installing" || status.State == "boot_pending")
+}
+
+// The installer's typed machine policy is independent of transport credentials
+// and Runtime configuration. It controls discovery, never explicit maintenance.
+func automaticSoftwareUpdates(root string) (bool, error) {
+	raw, err := os.ReadFile(filepath.Join(root, "etc/cozy/software-policy.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var policy struct {
+		StartupUpdate string `json:"startup_update"`
+	}
+	if err := json.Unmarshal(raw, &policy); err != nil {
+		return false, err
+	}
+	switch policy.StartupUpdate {
+	case "auto":
+		return true, nil
+	case "off":
+		return false, nil
+	}
+	return false, errors.New("software-policy.json requires startup_update auto or off")
 }

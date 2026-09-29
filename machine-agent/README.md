@@ -70,31 +70,42 @@ Verify downloaded manifest hashes and `cozy-machine version --json` before
 promotion. Agent and Runtime versions evolve independently through advertised
 capabilities and the supported worker-protocol range.
 
-At boot, `COZY_STARTUP_UPDATE=auto` (the default) makes one attempt to select a
-stable Runtime/TensorFS pair within their installed major versions. Selection
+At boot, automatic discovery (the default) makes one attempt to select a
+stable Runtime/TensorFS pair within their installed compatible lines (major.minor for 0.x). Selection
 checks the real interpreter, mandatory dependencies, installed media/model
 extras, and reverse dependencies on the pair; other dependencies are never
 upgraded implicitly. Both native wheels are checked against PyPI's HTTPS
 metadata and SHA-256, staged separately, and probed against the existing base.
-`COZY_STARTUP_UPDATE=off` preserves an explicitly selected installation. Local,
+The installer-owned `etc/cozy/software-policy.json` accepts
+`{"startup_update":"auto"}` or `{"startup_update":"off"}`. Off preserves an
+explicitly selected installation without disabling explicit maintenance. Missing
+policy defaults to auto; unknown or unreadable policy defers discovery. Local,
 development and prerelease software also skips automatic discovery.
-An explicit wheel supplied through remote maintenance pins the resulting pair
-while that operation's successful selection remains installed; ordinary
-version-based maintenance does not permanently disable discovery.
+An explicit wheel or version supplied through maintenance durably pins its
+resulting pair, including a restart between health commit and the API response.
+Rentals may update before first use; any accepted work pins software for every
+later restart and retry, even after all work has been collected.
 
-The existing machine and Runtime-root locks protect admission. Every owner's
-unfinished or uncollected run in the public journal defers an update; unreadable
-history also defers it. The boot ID, certificate and execution journal are
+The existing machine and Runtime-root locks protect admission. The Runtime-owned
+software-update view applies retention rules across all owners, child attempts,
+native calls, holds, weight intents and input intakes. Missing or unreadable
+update state defers changes. The boot ID, certificate and execution journal are
 preserved. An unavailable index or incompatible candidate leaves the verified
-installed pair in service. Machine-agent executables advance through fresh
-worker images; this mechanism does not replace a running agent binary.
+installed pair in service. When the image launcher points to the wheel-owned
+`opt/cozy/python/bin/cozy-machine`, installing a Runtime wheel also stages its
+bundled agent for the next boot. The already-running agent and its guardian keep
+the same executing binary inode; no immediate self-replacement is attempted.
+Fresh worker images likewise start the bundled agent directly.
 
 The launcher retains hashed rollback wheels and a fsynced transaction under
 `var/lib/cozy/startup-update`, outside the unprivileged agent's writable state.
+Startup and explicit maintenance use this same transaction and readiness gate.
 Interrupted installation is repaired offline before launching, even when updates
-are now disabled. Success requires the actual new Runtime's authenticated fresh
+are now disabled; a later explicit pair supersedes a stale recovery journal. Success requires the actual new Runtime's authenticated fresh
 readiness, workspace and unused-submission closure before admitting any work.
 A candidate that fails that boot is rolled back and the prior Runtime relaunched
-in the same boot. Unrepairable rollback refuses to serve instead of declaring
-the installation healthy. `GET /v1/machine/runtime` includes the secrets-free
+in the same boot. Failed recovery blocks execution while status and repair routes stay available.
+Candidate preparation measures CPU/output and download-byte progress; pending
+readiness does not renew rental billing indefinitely. Previously failed pairs
+are skipped during later automatic discovery. `GET /v1/machine/runtime` includes the secrets-free
 `startup_update` report alongside explicit maintenance status.

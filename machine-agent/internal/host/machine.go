@@ -46,6 +46,7 @@ type Machine struct {
 	conn        *grpc.ClientConn
 	launcher    launcher
 	initialized chan struct{} // closed after the process launcher is installed
+	launchMu    sync.Mutex    // normal launches and guarded update acquisition
 
 	mu          sync.Mutex
 	proc        *runtimeProcess
@@ -140,34 +141,40 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 		return err
 	}
 	defer m.conn.Close()
-	if err := m.startupUpdate(ctx); err != nil {
-		return err
-	}
-	m.setUpdating(m.startupPending())
 	if err := m.prepareLauncher(); err != nil {
 		return err
 	}
-	close(m.initialized)
+	// The privileged guardian prepares software after the network agent drops root.
+	startup, startupErr := m.launcher.maintain("startup-prepare", []string{g.Lifetime, layout.Store})
+	m.mu.Lock()
+	g.startupPending = startup == "boot_pending"
+	m.mu.Unlock()
+	m.setUpdating(m.startupPending())
+	m.launchMu.Lock() // initial boot shares update/supervisor launch admission
 	defer m.launcher.close()
-	if err := m.tfs.initStore(ctx); err != nil {
+	if startupErr != nil {
+		m.restarts.fail(&launchRefusal{"runtime_update_recovery_required", startupErr.Error()})
+	} else if err := m.tfs.initStore(ctx); err != nil {
 		if m.startupPending() {
 			if err := m.rollbackStartup(ctx); err != nil {
-				return err
+				fmt.Fprintln(m.log, "cozy machine: repair required:", err)
 			}
 		} else {
-			m.restarts.fail(&launchRefusal{"tensorfs_unavailable", err.Error()})
+			m.restarts.fail(fmt.Errorf("TensorFS initialization failed: %w", err))
 		}
 	} else {
 		if err := m.launch(); err != nil {
-			if m.startupPending() {
+			if m.startupPending() && !m.manualUpdateActive() {
 				if err := m.rollbackStartup(ctx); err != nil {
-					return err
+					fmt.Fprintln(m.log, "cozy machine: repair required:", err)
 				}
 			} else {
 				m.restarts.fail(err)
 			}
 		}
 	}
+	m.launchMu.Unlock()
+	close(m.initialized)
 	errs := make(chan error, 1)
 	go func() { errs <- m.supervise(ctx) }()
 	select {
@@ -253,6 +260,8 @@ func (m *Machine) prepareLauncher() error {
 	return nil
 }
 
+// launch is called under launchMu by the supervisor, or while an update owns
+// inUpdate after acquiring that same lock in quiesce.
 func (m *Machine) launch() error {
 	raw, err := m.launcher.maintain("capabilities", nil)
 	if err != nil {
@@ -427,6 +436,9 @@ func (m *Machine) runtime(ctx context.Context) (*grpc.ClientConn, error) {
 			if m.restarts.gone() {
 				return nil, refusal(codes.FailedPrecondition, m.restarts.code(), m.runtimeGone())
 			}
+			if !m.restarts.due(time.Now()) {
+				return nil, unavailable("runtime_restarting", m.runtimeGone())
+			}
 			m.poke()
 			select {
 			case <-ctx.Done():
@@ -485,10 +497,10 @@ func (m *Machine) supervise(ctx context.Context) error {
 		m.mu.Lock()
 		p := m.proc
 		m.mu.Unlock()
-		if p != nil && p.exited() {
-			if m.startupPending() {
+		if p != nil && p.exited() && !(m.startupPending() && m.manualUpdateActive()) {
+			if m.startupPending() && !m.manualUpdateActive() {
 				if err := m.rollbackStartup(ctx); err != nil {
-					return err
+					fmt.Fprintln(m.log, "cozy machine: repair required:", err)
 				}
 				continue
 			}
@@ -501,7 +513,9 @@ func (m *Machine) supervise(ctx context.Context) error {
 			busy, err = work.observe(now)
 		}
 
-		if m.preparations() || m.updating() {
+		// Software maintenance is not accepted workload and cannot establish or
+		// renew a rental work obligation. Its own progress guard owns recovery.
+		if m.preparations() {
 			busy, err = true, nil
 		}
 		deadline, observeErr := m.idle.observe(now, busy, err == nil)
@@ -572,6 +586,13 @@ func (m *Machine) relaunchAfter(p *runtimeProcess) error {
 
 // launchOrIdle records a launch failure while the API keeps serving repair and status calls.
 func (m *Machine) launchOrIdle() {
+	m.launchMu.Lock()
+	defer m.launchMu.Unlock()
+	// The supervisor's earlier observations are only a wake-up hint. An update
+	// may have acquired the Runtime, or another launch may have finished, since.
+	if m.updating() || m.running() || !m.restarts.due(time.Now()) || !m.owned && m.idle.releasedNow() {
+		return
+	}
 	if err := m.launch(); err != nil {
 		fmt.Fprintln(m.log, "cozy machine: the Runtime could not be launched:", err)
 		m.restarts.fail(err)

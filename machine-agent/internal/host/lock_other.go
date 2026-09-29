@@ -11,3 +11,5 @@ func lockMachine(string) (func(), error) {
 func lockStartupWorker(string) (func(), error) {
 	return nil, errors.New("startup updates require Linux worker ownership")
 }
+
+func syncInstallation(string) error { return errors.New("installation durability requires Linux") }
