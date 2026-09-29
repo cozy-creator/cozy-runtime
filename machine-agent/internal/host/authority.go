@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,8 +18,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Rental authority is freshly checked for new controls. The Hub's explicit lease
+// Rental authority is refreshed in the background. The Hub's explicit lease
 // bounds already-open observation channels; losing authority never cancels work.
+var errAuthorityDenied = errors.New("rental authority denied")
+
 type rentalAuthority struct {
 	gate       chan struct{}
 	mu         sync.Mutex
@@ -33,7 +36,6 @@ func (m *Machine) startAuthority(ctx context.Context) {
 	}
 	c := m.claims
 	c.authority = &rentalAuthority{fetch: m.hub.authorizedKeys}
-	c.replaceKeys(nil)
 	go func() {
 		delay := time.Duration(0)
 		for {
@@ -41,7 +43,9 @@ func (m *Machine) startAuthority(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				c.replaceKeys(nil)
+				// Shutdown or a detached refresh transport does not prove that
+				// the Hub revoked the still-valid lease. Keep the last keys; the
+				// lease timer remains the authority for eventual expiry.
 				return
 			case <-timer.C:
 			}
@@ -69,6 +73,9 @@ func (h *hubClient) authorizedKeys(ctx context.Context) ([]ed25519.PublicKey, ti
 		return nil, 0, err
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return nil, 0, errAuthorityDenied
+	}
 	if response.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("rental authority returned HTTP %d", response.StatusCode)
 	}
@@ -130,19 +137,22 @@ func (c *claims) refreshAuthority(ctx context.Context) (time.Duration, error) {
 	started := time.Now()
 	keys, lease, err := a.fetch(call)
 	lease -= time.Since(started)
+	if errors.Is(err, errAuthorityDenied) {
+		keys, lease, err = nil, time.Second, nil
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.generation++
-	generation := a.generation
 	if err == nil && lease <= 0 {
 		err = fmt.Errorf("rental authority lease expired in transit")
 	}
+	if err != nil {
+		// A transport failure cannot revoke keys or extend their last valid lease.
+		return 0, status.Error(codes.Unavailable, "rental_authority_unavailable: current rental authority could not be verified")
+	}
+	a.generation++
+	generation := a.generation
 	if a.timer != nil {
 		a.timer.Stop()
-	}
-	if err != nil {
-		c.replaceKeys(nil)
-		return 0, status.Error(codes.Unavailable, "rental_authority_unavailable: current rental authority could not be verified")
 	}
 	c.replaceKeys(keys)
 	a.timer = time.AfterFunc(lease, func() {
@@ -179,4 +189,18 @@ func (c *claims) watchAuthority(ctx context.Context, keyID string) (context.Cont
 		}
 	}()
 	return call, cancel
+}
+
+// checkAuthority uses only the background-refreshed lease; callers never contact the Hub.
+func (c *claims) checkAuthority() error {
+	if c.authority == nil {
+		return nil
+	}
+	c.authority.mu.Lock()
+	initialized := c.authority.timer != nil
+	c.authority.mu.Unlock()
+	if !initialized && len(c.authorizedKeys()) == 0 {
+		return status.Error(codes.Unavailable, "rental_authority_unavailable: no current rental authority lease")
+	}
+	return nil
 }

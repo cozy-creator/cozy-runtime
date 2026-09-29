@@ -170,26 +170,12 @@ func (m *Machine) serveRuntimeState(w http.ResponseWriter, r *http.Request) {
 	m.updates.mu.Lock()
 	status := m.updates.status
 	m.updates.mu.Unlock()
-	answer := map[string]any{"capabilities": []string{UpdateCapability}, "runtime": installed.Runtime,
+	answer := map[string]any{"capabilities": []string{UpdateCapability, "runtime-update/2"}, "runtime": installed.Runtime,
 		"tensorfs": installed.TensorFS, "update": status, "phase": m.phase()}
 	digest, _ := hashFile("/proc/self/exe")
-	selection := "explicit"
-	if bundledAgentPolicy(m.layout.Root) {
-		selection = "bundled"
-	}
+	selection, repairFallback := m.runningAgentSelection(digest)
 	if m.grant.bootstrap != nil {
-		if m.startupPending() {
-			selection = m.grant.bootstrap.Selection
-		}
 		answer["bootstrap"] = map[string]any{"abi": bootstrapABI, "version": m.grant.bootstrap.BootstrapVersion, "update_boundary": "image-or-service-bootstrap"}
-	}
-	repairFallback := false
-	if selection == "bundled" {
-		bundleHash, err := hashFile(filepath.Join(m.layout.Root, "opt/cozy/python/bin/cozy-machine"))
-		if err != nil || bundleHash != digest {
-			selection = "explicit"
-			repairFallback = true
-		}
 	}
 	answer["agent"] = map[string]any{"version": build.Version, "sha256": digest, "selection": selection, "capabilities": build.Capabilities(), "repair_fallback": repairFallback}
 	var startup startupStatus
@@ -269,15 +255,57 @@ func (m *Machine) stageWheel(file string, body io.Reader) (string, int64, error)
 	return digest, size, os.Rename(temp.Name(), filepath.Join(dir, file))
 }
 
+// Selection reports the running application, including a retained repair fallback.
+func (m *Machine) runningAgentSelection(digest string) (string, bool) {
+	selection := "explicit"
+	if bundledAgentPolicy(m.layout.Root) {
+		selection = "bundled"
+	}
+	if m.grant.bootstrap != nil {
+		if m.startupPending() {
+			selection = m.grant.bootstrap.Selection
+		}
+	}
+	repairFallback := false
+	if selection == "bundled" {
+		bundleHash, err := hashFile(filepath.Join(m.layout.Root, "opt/cozy/python/bin/cozy-machine"))
+		if err != nil || bundleHash != digest {
+			selection = "explicit"
+			repairFallback = true
+		}
+	}
+	return selection, repairFallback
+}
+
 func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 	if !m.maintenance(w, r) {
 		return
 	}
 	var request updateRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&request); err != nil || !operationName.MatchString(request.Operation) ||
-		request.Pin == nil || (request.Agent != "bundled" && request.Agent != "explicit") || request.Runtime == nil && request.TensorFS == nil {
-		http.Error(w, "an update requires operation, a boolean pin decision, and a Runtime or TensorFS", http.StatusBadRequest)
+		(request.Agent != "" && request.Agent != "bundled" && request.Agent != "explicit") || request.Runtime == nil && request.TensorFS == nil {
+		http.Error(w, "an update requires operation, valid agent selection, and a Runtime or TensorFS", http.StatusBadRequest)
 		return
+	}
+	// runtime-update/1 clients omit selection intent. Preserve the current agent
+	// and keep their default-latest Runtime/TensorFS request unpinned.
+	if request.Pin == nil {
+		pin := false
+		request.Pin = &pin
+	}
+	if request.Agent == "" {
+		digest, err := hashFile("/proc/self/exe")
+		if err != nil {
+			// The v1 request carries no agent intent. Keep the daemon's
+			// current policy if executable identity cannot be read; the
+			// v2 response still reports the identity when available.
+			request.Agent = m.transactionAgent()
+		} else {
+			request.Agent, _ = m.runningAgentSelection(digest)
+		}
+		if request.Agent != "bundled" && request.Agent != "explicit" {
+			request.Agent = "explicit"
+		}
 	}
 	m.updates.staging.Lock()
 	defer m.updates.staging.Unlock()
