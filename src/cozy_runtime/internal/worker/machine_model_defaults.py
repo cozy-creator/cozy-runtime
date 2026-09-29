@@ -99,8 +99,9 @@ def local_development(worker: Worker) -> bool:
     """A machine registered at a Hub on loopback, as its grants name them: a development
     machine, which may reach the private addresses that Hub hands it (checkpoint pulls,
     object uploads). A production Hub is never loopback, and a job never names a grant."""
-    held = (worker.options.publication_authority, *worker.options.hubs)
-    return any(authority is not None and local_origin(authority.origin) for authority in held)
+    return any(
+        local_origin(authority.origin) for authority in machine_model_resolve.authorities(worker)
+    )
 
 
 def hub_ca(worker: Worker, origin: str) -> str | None:
@@ -114,7 +115,12 @@ def credential(worker: Worker, origin: str) -> str:
     owner's unpublished checkpoints. Any other origin gets nothing, and a refusal is never
     retried anonymously."""
     authority = machine_model_resolve.registration(worker, origin)
-    return "" if authority is None else f"worker {authority.worker_id} {authority.worker_token}"
+    if authority is None:
+        return ""
+    if authority.access_token:
+        authority.headers()  # an expired local grant is an operation failure, never anonymous
+        return "bearer " + authority.access_token
+    return f"worker {authority.worker_id} {authority.worker_token}"
 
 
 def storage_hosts(worker: Worker, origin: str) -> tuple[str, ...]:

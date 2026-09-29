@@ -350,6 +350,8 @@ class WorkerOptions:
     hubs: tuple[PublicationAuthority, ...] = ()
     """Every other Hub this machine is registered at (wire 67): a run naming one reads its
     release, index and Models there. Publication stays at the default Hub."""
+    hub_access_path: Path | None = None
+    """Atomic machine-agent access projection, re-read when privileged work uses a Hub."""
     tensorfs_root: Path | None = None
     """The one host-local executable TensorFS Store."""
     artifact_cache: Path | None = None
@@ -1001,6 +1003,7 @@ class Worker:
         self.restart_requested = False
         self.restart_sequence = 0
         self.idle_restart_pending = threading.Event()
+        self.compute_idle_since = time.monotonic()
         if options.owns_tensorfs_store:
             try:
                 self.model_source_operations.update(
@@ -1183,6 +1186,7 @@ class Worker:
                 self.workspace,
                 self.executions,
                 options.publication_authority,
+                authority_for=self._execution_publication_authority,
                 progress=self.native_progress,
             )
             if self.workspace is not None and self.executions is not None
@@ -1669,6 +1673,12 @@ class Worker:
             if prepared is None:
                 raise package_prepare.PreparationRefusal("local_revision_unprepared", revision)
 
+            from . import machine_materialization
+
+            machine_materialization.ensure(
+                self, request.download_delegation, native=request.native_models
+            )
+
             def mark_verified(digest: str, length: int, path: Path) -> None:
                 self.verified_artifacts.record(digest, length, path)
 
@@ -1725,6 +1735,7 @@ class Worker:
         """Derive one local PlacementSet while package imports stay in the isolated executor."""
 
         with self.preparation_lock:
+            self.compute_idle_since = time.monotonic()
             # Publish stack warnings on the durable activity lane consumed by Creator,
             # in addition to the installer's process-local diagnostics.
             raw_requirements = (
@@ -1741,9 +1752,49 @@ class Worker:
                         self.note("warning", warning)
             if not local:
                 assert isinstance(request, pb.PreparePackageSetRequest)
-                return self._prepare_published(request)
+                return self._prepare_materialized_package(request)
             assert isinstance(request, pb.PrepareLocalPackageRequest)
             return self._prepare_local_in(request)
+
+    def _prepare_materialized_package(
+        self, request: pb.PreparePackageSetRequest
+    ) -> pb.PreparePackageSetResult:
+        """Runtime owns model acquisition, including the models-only preparation lane."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from . import machine_materialization
+
+        selected = documents.parse(request.download_delegation, pb.DownloadDelegation)
+        # Older Hosts may still ask for a code-only warm phase before their own transfer.
+        if request.models_landing:
+            return self._prepare_published(request)
+        if not selected.packages:
+            if request.application or request.locked_requirements:
+                raise WorkspaceRefusal("models-only preparation cannot name package requirements")
+            machine_materialization.ensure(self, request.download_delegation, hub=request.hub)
+            raw, digest = documents.identity(pb.PlacementSet())
+            return pb.PreparePackageSetResult(
+                placement_set=pb.DesiredPlacementSet(
+                    placement_set_canonical_bytes=raw, placement_set_digest=digest
+                )
+            )
+        if selected.models:
+            landing = pb.PreparePackageSetRequest()
+            landing.CopyFrom(request)
+            landing.models_landing = True
+            # Package installation/prespawn overlaps disk transfer, as on either deployment.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="package-prepare") as pool:
+                installed = pool.submit(self._prepare_published, landing)
+                machine_materialization.ensure(self, request.download_delegation, hub=request.hub)
+                installed.result()
+        return self._prepare_published(request)
+
+    def _execution_publication_authority(
+        self, owner: str, request: str
+    ) -> PublicationAuthority | None:
+        assert self.executions is not None
+        root = self.executions.capture_root(owner, request)
+        return machine_model_resolve.registration(self, self.executions.prepared(owner, root).hub)
 
     def _installed_call_bindings(self, attempt: AttemptRecord) -> list[dict[str, Any]]:
         owner = self.fence.record_owner_id
@@ -1951,7 +2002,7 @@ class Worker:
             dependency_python=self.options.environment_python,
             dependency_cache=self.config.dependency_cache,
             hub=package_installation.HubIndex(authority.origin, authority.ca)
-            if (authority := self.options.publication_authority) is not None
+            if (authority := machine_model_resolve.registration(self, "")) is not None
             else None,
         )
         installed = materialized[0]
@@ -2281,7 +2332,13 @@ class Worker:
             executions, owner = self._execution_service(claim)
             executions.require_workspace(expected_execution_workspace_id)
             machine_lanes.admit(self, "", preparation, offer)
-            if publication_authorization_id and self.options.publication_authority is None:
+            if (
+                publication_authorization_id
+                and machine_model_resolve.registration(
+                    self, workspace_executions.Preparation.read(preparation).hub
+                )
+                is None
+            ):
                 raise WorkspaceRefusal("worker has no independent publication authority configured")
             result_schema, memoize = b"", False
             spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
@@ -2735,6 +2792,7 @@ class Worker:
 
     def _capacity_changed(self) -> None:
         """An attempt left or a placement settled: wake the units waiting on it."""
+        self.compute_idle_since = time.monotonic()
         for key in tuple(self._capacity_waiters):
             self.supervisor.poke(key)
         with self.attempts_left:
@@ -6947,6 +7005,9 @@ class Worker:
                 for subject in list(self.monitor.cursors):
                     self.monitor.sample(subject)
                 self.publish_activity()
+                from . import machine_compute
+
+                machine_compute.park_if_idle(self)
                 # Observation follows authentication, independently of the dispatch
                 # barrier. Only the current stream is eligible, after its snapshot.
                 if self.fence.control_stream_epoch in self.attached_streams:

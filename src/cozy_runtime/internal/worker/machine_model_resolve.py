@@ -135,7 +135,9 @@ class Catalog:
         if release:
             rows = [row for row in rows if str(row.get("release", "")).lower() == release.lower()]
         else:
-            rows = sorted((row for row in rows if not row.get("yanked")), key=_version, reverse=True)
+            rows = sorted(
+                (row for row in rows if not row.get("yanked")), key=_version, reverse=True
+            )
         if not rows:
             raise WorkspaceRefusal(f"model catalog has no release {release or '(any)'} of {model}")
         lanes = {str(row["lane"]): row for row in rows[0].get("lanes") or [] if row.get("lane")}
@@ -211,11 +213,21 @@ def same_origin(a: str, b: str) -> bool:
 
 
 def registration(worker: Worker, origin: str) -> PublicationAuthority | None:
-    """This machine's registration at an origin, its default Hub's first; else None."""
-    for held in (worker.options.publication_authority, *worker.options.hubs):
-        if held is not None and same_origin(held.origin, origin):
+    """Read this machine's current scoped access, including a renewed delegated token."""
+    for held in authorities(worker):
+        if not origin or same_origin(held.origin, origin):
             return held
     return None
+
+
+def authorities(worker: Worker) -> tuple[PublicationAuthority, ...]:
+    from .machine_publication import registrations
+
+    options = worker.options
+    path = getattr(options, "hub_access_path", None)
+    hubs = registrations(path)[0] if path else options.hubs
+    default = options.publication_authority
+    return (() if default is None else (default,)) + hubs
 
 
 def hub_key(worker: Worker, hub: str) -> str:
@@ -227,7 +239,7 @@ def hub_key(worker: Worker, hub: str) -> str:
     held = registration(worker, hub)
     if held is None:
         raise ExecutionWorkspaceRefusal(
-            "hub_unregistered", f"this machine is not registered at {hub[:256]}"
+            "hub_access_absent", f"this machine has no execution access for {hub[:256]}"
         )
     return held.origin
 
@@ -237,13 +249,13 @@ def own(worker: Worker, package: str = "", hub: str = "") -> Catalog:
     where it reads packages and Models, its owner's unpublished ones included. For a
     package, what it already read of it there."""
     key = hub_key(worker, hub)
-    authority = registration(worker, key) if key else worker.options.publication_authority
+    authority = registration(worker, key)
     if authority is None:
         raise WorkspaceRefusal("this machine has no Hub grant to read the catalog at")
     return Catalog(
         authority.origin,
         authority.context(),
-        {"X-Cozy-Worker-ID": authority.worker_id, "X-Cozy-Worker-Token": authority.worker_token},
+        authority.headers(),
         worker.resolutions.of(package, key) if package else None,
     )
 
@@ -352,7 +364,9 @@ def slot(
             release, have = catalog.lanes(model, release)
             if not have:
                 raise WorkspaceRefusal(f"{model}@{release} has no lane to serve {parameter}")
-            rungs = [r for r in (ladder[2] if ladder else []) if usable(r) and r.get("lane") in have]
+            rungs = [
+                r for r in (ladder[2] if ladder else []) if usable(r) and r.get("lane") in have
+            ]
             if not rungs:
                 lane = next((name for name in _FULL_PRECISION if name in have), None) or min(
                     have, key=lambda name: (int(have[name].get("bytes") or 0), name)
@@ -370,7 +384,9 @@ def slot(
     # The widest rung this machine holds: the width itself is the declared degree.
     rung = max(fitting, key=lambda candidate: int(candidate.get("gpus", 0) or 0))
     if have and note is not None:
-        note(f"{parameter}: {model}@{release} lane {rung['lane']} of {', '.join(sorted(have))}", 0, 0)
+        note(
+            f"{parameter}: {model}@{release} lane {rung['lane']} of {', '.join(sorted(have))}", 0, 0
+        )
     resolved = catalog.resolve(model, release, str(rung["lane"]))
     return {
         **base,

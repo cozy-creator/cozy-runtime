@@ -8,6 +8,7 @@ executors as that user and hands nothing over.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import select
 import signal
@@ -83,6 +84,19 @@ def main(
     try:
         if argv is None:
             argv = sys.argv[1:]
+        if list(argv) == ["capabilities", "--json"]:
+            print(
+                json.dumps(
+                    {
+                        "capabilities": [
+                            "machine-supervisor/1",
+                            "runtime-model-preparation/1",
+                            "machine-public-reads/1",
+                        ]
+                    }
+                )
+            )
+            return 0
         if argv:
             raise LaunchRefusal("worker_arguments_forbidden", "fixed worker takes no arguments")
         identity = Identity.detect()
@@ -251,6 +265,7 @@ def _worker_options(
         if config.tensorhub_origin
         else None,
         hubs=hubs,
+        hub_access_path=layout.machine_hubs,
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
         claim_ready=False,
         executor_uid=identity.executor_uid,

@@ -65,13 +65,31 @@ class PublicationClient(Protocol):
 
 @dataclass(frozen=True)
 class PublicationAuthority:
-    """This machine's Hub grant: the Hub it belongs to, and its worker capability."""
+    """Scoped catalog/publication access, independent of rental registration."""
 
     origin: str
-    worker_id: str
-    worker_token: str = field(repr=False)
+    worker_id: str = ""
+    worker_token: str = field(default="", repr=False)
     ca: Path | None = None  # the grant's private Hub CA, when its Hub uses one
     object_storage_hosts: tuple[str, ...] = ()  # where that Hub's presigned bytes live
+    access_token: str = field(default="", repr=False)
+    expires_at: int = 0
+    access_path: Path | None = field(default=None, repr=False, compare=False)
+
+    def current(self) -> PublicationAuthority:
+        if self.access_path is None:
+            return self
+        for authority in registrations(self.access_path)[0]:
+            if authority.origin == self.origin:
+                return authority
+        raise PublicationRefusal("publication.authority_absent", status=403)
+
+    def headers(self) -> dict[str, str]:
+        if self.access_token:
+            if self.expires_at <= time.time():
+                raise PublicationRefusal("publication.authority_expired", status=403)
+            return {"Authorization": "Bearer " + self.access_token}
+        return {"X-Cozy-Worker-ID": self.worker_id, "X-Cozy-Worker-Token": self.worker_token}
 
     def context(self) -> ssl.SSLContext:
         return ssl.create_default_context(cafile=str(self.ca) if self.ca else None)
@@ -83,15 +101,19 @@ class PublicationAuthority:
             self.context(),
             worker_id=self.worker_id,
             worker_token=self.worker_token,
+            access_token=self.access_token,
+            credential=self.current,
         )
 
 
 class _Hub(msgspec.Struct, frozen=True):
     origin: str
-    worker_id: str
-    worker_token: str
+    worker_id: str = ""
+    worker_token: str = ""
     ca: str = ""  # a file name beside the document
     object_storage_hosts: tuple[str, ...] = ()
+    access_token: str = ""
+    expires_at: int = 0
 
 
 class _Hubs(msgspec.Struct, frozen=True):
@@ -100,9 +122,10 @@ class _Hubs(msgspec.Struct, frozen=True):
 
 
 def registrations(path: Path) -> tuple[tuple[PublicationAuthority, ...], list[str]]:
-    """Every other Hub this machine is registered at (wire 67), as the Host writes them
-    beside the closed default-Hub grant, and what was not read. A newer, unreadable or
-    partly unreadable document confers what it can and never stops the machine."""
+    """Read rental credentials or scoped owned-machine access without requiring a Hub row.
+
+    Unreadable entries affect only their Hub, never machine boot or unrelated work.
+    """
     try:
         with path.open("rb") as source:
             raw = source.read((256 << 10) + 1)
@@ -123,11 +146,23 @@ def registrations(path: Path) -> tuple[tuple[PublicationAuthority, ...], list[st
             hub = msgspec.json.decode(entry, type=_Hub)
             parse_tensorhub_origin(hub.origin)
             token = base64.urlsafe_b64decode(hub.worker_token + "=" * (-len(hub.worker_token) % 4))
+            valid_access = (
+                bool(hub.access_token)
+                and len(hub.access_token) <= 16 << 10
+                and all(33 <= ord(c) <= 126 for c in hub.access_token)
+                and hub.expires_at > 0
+                and not hub.worker_id
+                and not hub.worker_token
+            )
+            valid_worker = (
+                not hub.access_token
+                and 0 < len(hub.worker_id) <= 128
+                and hub.worker_id.isprintable()
+                and len(token) == 32
+                and base64.urlsafe_b64encode(token).decode().rstrip("=") == hub.worker_token
+            )
             if (
-                not 0 < len(hub.worker_id) <= 128
-                or not hub.worker_id.isprintable()
-                or len(token) != 32
-                or base64.urlsafe_b64encode(token).decode().rstrip("=") != hub.worker_token
+                not (valid_access or valid_worker)
                 or (hub.ca and (Path(hub.ca).name != hub.ca or hub.ca in {".", ".."}))
                 or (hub.ca and not (path.parent / hub.ca).is_file())
             ):
@@ -143,6 +178,9 @@ def registrations(path: Path) -> tuple[tuple[PublicationAuthority, ...], list[st
                 hub.worker_token,
                 path.parent / hub.ca if hub.ca else None,
                 hosts,
+                access_token=hub.access_token,
+                expires_at=hub.expires_at,
+                access_path=path,
             )
         )
     return tuple(held), skipped
@@ -323,6 +361,8 @@ class MachinePublicationClient:
         *,
         worker_id: str,
         worker_token: str,
+        access_token: str = "",
+        credential: Callable[[], PublicationAuthority] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         parsed = parse_tensorhub_origin(origin)
@@ -336,13 +376,24 @@ class MachinePublicationClient:
             "publication.tls_verification_required",
         )
         _require(
-            bool(worker_id)
-            and len(worker_id) <= 256
-            and all(33 <= ord(c) <= 126 for c in worker_id)
-            and re.fullmatch(r"[A-Za-z0-9_-]{43}", worker_token) is not None,
+            (
+                bool(access_token)
+                and not worker_id
+                and not worker_token
+                and len(access_token) <= 16 << 10
+                and all(33 <= ord(c) <= 126 for c in access_token)
+            )
+            or (
+                not access_token
+                and bool(worker_id)
+                and len(worker_id) <= 256
+                and all(33 <= ord(c) <= 126 for c in worker_id)
+                and re.fullmatch(r"[A-Za-z0-9_-]{43}", worker_token) is not None
+            ),
             "publication.worker_authority_invalid",
         )
         self.worker_id, self.worker_token = worker_id, worker_token
+        self.access_token, self.credential = access_token, credential
         self.origin = parsed
         self.authorization_id, self.context, self.clock = authorization_id, context, clock
         self._token, self._expires = "", 0.0
@@ -351,11 +402,23 @@ class MachinePublicationClient:
     def _exchange(
         self, method: str, path: str, body: bytes | None, token: str = ""
     ) -> tuple[int, bytes]:
-        headers = {
-            "Accept": "application/json",
-            "X-Cozy-Worker-ID": self.worker_id,
-            "X-Cozy-Worker-Token": self.worker_token,
-        }
+        authority = self.credential() if self.credential else None
+        access_token = authority.access_token if authority else self.access_token
+        headers = {"Accept": "application/json"}
+        if access_token:
+            if authority is not None:
+                authority.headers()  # check refreshed access expiry before sending
+            if not token:
+                headers["X-Cozy-Execution-Access"] = access_token
+        else:
+            headers.update(
+                authority.headers()
+                if authority
+                else {
+                    "X-Cozy-Worker-ID": self.worker_id,
+                    "X-Cozy-Worker-Token": self.worker_token,
+                }
+            )
         if token:
             headers["Authorization"] = "Bearer " + token
         if body is not None:
