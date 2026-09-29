@@ -5642,11 +5642,10 @@ class Worker:
         if not reply.get("ok"):
             return False
         emptied = ordinals if ranks else lane.ordinals
+        for ordinal in emptied:
+            row.held[ordinal] = row.overhead.get(ordinal, 0)
         if not ranks or 0 in ranks:
             self._observe_memory(lane, row, reply, emptied)
-        else:
-            for ordinal in emptied:
-                row.held[ordinal] = row.overhead.get(ordinal, 0)
         row.ledger.observe_vacate(reply, "vacated for a co-tenant")
         return True
 
@@ -6123,7 +6122,7 @@ class Worker:
         lane = self.lanes.by_id[slot.lane_id]
         row = lane.row(attempt.placement_id)
         me = _Tenant(attempt.placement_id, lane, row, self)
-        grants = self.memory.admit(me, self._tenants(set(lane.ordinals)), _plans(row.executor()))
+        grants = self.memory.admit(me, self._tenants(set(lane.ordinals)), row.peak.get(_shape(attempt)))
         attempt.memory_grant = grants.get(lane.ordinals[0]) or 0
         lane.touch(attempt.placement_id)
         row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
@@ -6711,9 +6710,17 @@ class Worker:
             self.settle(released)
             return None
         if attempt.placement_id in lane.rows:
-            self._observe_memory(
-                lane, lane.row(attempt.placement_id), {"memory": released.reply.memory}
-            )
+            row = lane.row(attempt.placement_id)
+            reply = released.reply
+            self._observe_memory(lane, row, {"memory": reply.memory})
+            outcome = reply.outcome
+            peak = int(reply.memory.get("peak_bytes", reply.metrics.peak_vram_bytes))
+            shape = _shape(attempt)
+            if outcome is not None and outcome.terminal == "succeeded" and peak > 0:
+                row.peak[shape] = max(row.peak.get(shape, 0), peak)
+            elif outcome is not None and outcome.code in DEVICE_SHORTFALL_CODES:
+                # Failed on the device: the next call of this shape measures afresh.
+                row.peak.pop(shape, None)
         return released
 
     def finish(self, released: Released) -> None:
@@ -7301,6 +7308,12 @@ def _plans(executor: child.Executor | None) -> bool:
     return executor is not None and "plan" in executor.hello.get("memory", ())
 
 
+def _shape(attempt: AttemptRecord) -> tuple[str, str]:
+    """What a call's measured peak is kept by: its entrypoint and request shape cell."""
+    prepared = attempt.prepared
+    return (prepared.entrypoint, prepared.cell()) if prepared is not None else ("", "")
+
+
 @dataclass(eq=False)
 class _Tenant:
     """One lane row as the Worker's memory policy sees it."""
@@ -7316,7 +7329,11 @@ class _Tenant:
 
     @property
     def held(self) -> dict[int, int]:
-        return self.row.held
+        """What it reported holding; an executor that reports nothing holds what its
+        ledger says is resident."""
+        if self.row.held:
+            return self.row.held
+        return {ordinal: self.row.resident_bytes() for ordinal in self.lane.ordinals}
 
     @property
     def overhead(self) -> dict[int, int]:

@@ -91,6 +91,8 @@ class LaneRow:
     held: dict[int, int] = field(default_factory=dict)
     #: ordinal -> its process's non-allocator bytes there: context, modules, communicators
     overhead: dict[int, int] = field(default_factory=dict)
+    #: (entrypoint, shape cell) -> the most it held on one device during a call of it
+    peak: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def resident_bytes(self) -> int:
         return sum(self.ledger.resident.values())

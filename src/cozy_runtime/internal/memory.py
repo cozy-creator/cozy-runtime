@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import NoReturn, Protocol
 
 from cozy_runtime.author._errors import DEVICE_OOM, RuntimeFailure
 from cozy_runtime.internal import proctree, tiers
@@ -203,6 +203,8 @@ class Plan:
     evict: list[Held]
     need: int
     working: int
+    #: its victims include the scope's other components' common units
+    deep: bool = False
 
 
 @dataclass(eq=False)
@@ -244,6 +246,7 @@ class Planner:
         self.last_seq: dict[str, list[str]] = {}
         self.clock = 0
         self.spare = False
+        self.deep = False
         self.asked_room = False
         self.room_asks = 0
         self.peak = 0
@@ -444,43 +447,73 @@ class Planner:
         }
 
     def enter(self, construction: str, method: str, components: tuple[str, ...]) -> None:
-        """A declared method begins: the common unit of each declared component, and the whole
-        of each one the package reads itself, come onto the device before the body runs, so
-        `.device` and direct reads are true inside it. Blocks arrive with their ops."""
+        """A declared method begins. Each declared component comes onto the device whole when
+        it fits beside the rest of the scope, since a package may read its tensors outside
+        any forward; otherwise its common unit does, so `.device` reads true, and its blocks
+        arrive with its ops. One the package reads itself (`read_whole`) must fit whole."""
         self.scopes.append((construction, frozenset(components)))
         if not self.cuda:
             return
+        scope = {f"{construction}/{name}" for name in components}
         for name in components:
             held = self.held.get(f"{construction}/{name}")
             if held is None or held.hosted:
                 continue
             # A package may have replaced a forward since (a cache hook): it is an op again.
             tiers.wrap(held.part.root, functools.partial(self.run, held))
-            units = held.part.units if held.whole else (held.part.common,)
-            need = sum(unit.nbytes for unit in units if unit.tier != DEVICE)
-            if not need:
+            part = held.part
+            victims = [] if self.spare else [v for v in self._victims(held) if v.key not in scope]
+            whole = part.nbytes - part.on(DEVICE)
+            if part.on(DISK) and part.store is not None:
+                whole += part.store.transient(part.name)
+            common = part.common.nbytes if part.common.tier != DEVICE else 0
+            chosen = self._room_from(victims, whole) if whole else []
+            if chosen is None and (held.whole or not common):
+                chosen = self._room_from(victims, whole) if self._ask_room(
+                    whole, victims, measured=True
+                ) else None
+            if chosen is not None:
+                self._stage_whole(held, chosen)
                 continue
-            victims = [] if self.spare else self._victims(held)
-            chosen = self._room_from(victims, need)
-            if chosen is None and self._ask_room(need, victims, measured=True):
-                chosen = self._room_from(victims, need)
+            if held.whole:
+                self._refuse_scope(held, method, whole, victims)
+            chosen = self._room_from(victims, common)
+            if chosen is None and self._ask_room(common, victims, measured=True):
+                chosen = self._room_from(victims, common)
             if chosen is None:
-                self.scopes.pop()
-                available = self.allocatable() + sum(self._evictable(v) for v in victims)
-                self.refusal = MemoryRefusal(
-                    SPARED if self.spare else SHORTFALL,
-                    f"{held.key}: {method}() needs {need} B of it on the device before it "
-                    f"runs, and {available} B can be made allocatable",
-                    need,
-                    available,
-                )
-                raise self.refusal
+                self._refuse_scope(held, method, common, victims)
             for victim in chosen:
                 self._offload(victim)
             self._load_common(held)
-            for unit in held.part.blocks if held.whole else ():
-                self._load(held.part, unit)
             self._cap()
+
+    def _stage_whole(self, held: Held, victims: list[Held]) -> None:
+        for victim in victims:
+            self._offload(victim)
+        part = held.part
+        if part.on(DISK) == part.nbytes and part.store is not None:
+            with self._moving():
+                tiers.from_disk(self.torch, part, None)
+            self.loads += 1
+        else:
+            self._load_common(held)
+            for unit in part.blocks:
+                self._load(part, unit)
+        self._cap()
+
+    def _refuse_scope(
+        self, held: Held, method: str, need: int, victims: list[Held]
+    ) -> NoReturn:
+        self.scopes.pop()
+        available = self.allocatable() + sum(self._evictable(v) for v in victims)
+        self.refusal = MemoryRefusal(
+            SPARED if self.spare else SHORTFALL,
+            f"{held.key}: {method}() needs {need} B of it on the device before it runs, and "
+            f"{available} B can be made allocatable",
+            need,
+            available,
+        )
+        raise self.refusal
 
     def exit(self) -> None:
         if self.scopes:
@@ -718,20 +751,35 @@ class Planner:
     ) -> Plan:
         rungs, area = self._rungs(held, key, tiles)
         estimates = [(rung, *self._estimate(key, rung, area)) for rung in rungs]
-        victims = [] if self.spare else self._victims(held)
         snapshot = (
             sum(x.numel() * x.element_size() for x in leaves if isinstance(x, self.torch.Tensor))
             if retryable
             else 0
         )
-        if floor is not None:
-            return self._fit(held, estimates[floor:], victims, snapshot, floor=True)
         exact = any(known for _, _, known in estimates)
-        if retryable and all(working is None for _, working, _ in estimates):
-            return self._max_room(held, rungs[0], victims)
-        if not retryable and not exact:
-            return self._fit(held, estimates[-1:], victims, 0, floor=True)
-        return self._fit(held, estimates, victims, snapshot, floor=False)
+        for deep in (False, True):
+            # The second pass also takes the common units of the scope's other components:
+            # the last room there is, before a refusal.
+            self.deep = deep
+            victims = [] if self.spare else self._victims(held)
+            try:
+                if floor is not None:
+                    plan = self._fit(held, estimates[floor:], victims, snapshot, floor=True)
+                elif retryable and all(working is None for _, working, _ in estimates):
+                    plan = self._max_room(held, rungs[0], victims)
+                elif not retryable and not exact:
+                    plan = self._fit(held, estimates[-1:], victims, 0, floor=True)
+                else:
+                    plan = self._fit(held, estimates, victims, snapshot, floor=False)
+            except MemoryRefusal:
+                if deep or self.spare:
+                    raise
+                continue
+            finally:
+                self.deep = False
+            plan.deep = deep
+            return plan
+        raise AssertionError("unreachable")
 
     def _fit(
         self,
@@ -792,6 +840,8 @@ class Planner:
     def _need(self, part: tiers.Component, keep: int) -> int:
         """Net bytes the device must still find for `part` with `keep` blocks resident."""
         common = part.common.nbytes if part.common.tier != DEVICE else 0
+        if part.on(DISK) and not part.unit_loads and part.store is not None:
+            common += part.store.transient(part.name)
         load = sum(u.nbytes for u in part.blocks[:keep] if u.tier != DEVICE)
         drop = sum(u.nbytes for u in part.blocks[keep:] if u.tier == DEVICE)
         stream = max((u.nbytes for u in part.blocks[keep:]), default=0)
@@ -836,7 +886,8 @@ class Planner:
         for construction, names in self.scopes:
             for name in names:
                 key = f"{construction}/{name}"
-                common.add(key)
+                if not self.deep:
+                    common.add(key)
                 held = self.held.get(key)
                 if held is not None and held.whole:
                     whole.add(key)
@@ -871,8 +922,12 @@ class Planner:
     # ------------------------------------------------------------------ moving bytes
 
     def _apply(self, held: Held, plan: Plan) -> None:
-        for victim in plan.evict:
-            self._offload(victim)
+        self.deep = plan.deep
+        try:
+            for victim in plan.evict:
+                self._offload(victim)
+        finally:
+            self.deep = False
         part = held.part
         for unit in part.blocks[plan.keep :]:
             if unit.tier == DEVICE:
@@ -1160,20 +1215,30 @@ class Machine:
         if measured is None:
             return None
         free, total = measured
-        others = sum(t.held.get(ordinal, 0) for t in tenants if t is not me and ordinal in t.ordinals)
+        others = sum(t.held.get(ordinal, 0) for t in tenants if t.slot != me.slot and ordinal in t.ordinals)
         foreign = max(total - free - others - me.held.get(ordinal, 0), 0)
         limit = min(self.budget.get(ordinal, self.budget.get(-1, total)), total - foreign)
         return limit - others
 
-    def admit(self, me: Tenant, tenants: Sequence[Tenant], planned: bool) -> dict[int, int | None]:
-        """Before a call: dead tenants on its devices end. An executor that does not plan its
-        own memory (older than this policy) gets every idle tenant on its devices vacated."""
+    def admit(
+        self, me: Tenant, tenants: Sequence[Tenant], peak: int | None
+    ) -> dict[int, int | None]:
+        """Before a call: dead tenants on its devices end, and its grant reaches the most it
+        held during a call of the same shape, `peak` (memory its package holds between ops
+        included). A shape never measured gets every idle tenant's weights off its devices:
+        the call then measures what it really takes."""
         for tenant in tenants:
-            if tenant is not me and tenant.state() == "dead" and set(tenant.ordinals) & set(me.ordinals):
+            if (
+                tenant.slot != me.slot
+                and tenant.state() == "dead"
+                and set(tenant.ordinals) & set(me.ordinals)
+            ):
                 tenant.end(f"reclaimed before {me.slot!r} runs")
-        if not planned:
-            for ordinal in me.ordinals:
+        for ordinal in me.ordinals:
+            if peak is None:
                 self.room(me, ordinal, 1 << 62, None, tenants, measured=False)
+            else:
+                self.room(me, ordinal, 0, peak, tenants, measured=True)
         return {ordinal: self.grant(me, ordinal, tenants) for ordinal in me.ordinals}
 
     def room(
@@ -1221,7 +1286,7 @@ class Machine:
         self, me: Tenant, ordinal: int, tenants: Sequence[Tenant], tried: set[str], measured: bool
     ) -> tuple[Tenant, str] | None:
         present = [
-            t for t in tenants if t is not me and ordinal in t.ordinals and t.state() != "active"
+            t for t in tenants if t.slot != me.slot and ordinal in t.ordinals and t.state() != "active"
         ]
         for act, pool in (
             ("dead", [t for t in present if t.state() == "dead"]),

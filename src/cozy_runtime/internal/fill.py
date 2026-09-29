@@ -2236,6 +2236,10 @@ class StreamingFillBackend:
         del self.stage_log[:-64]
         return row
 
+    def transient(self, name: str) -> int:
+        memory = self.component_memory.get(name)
+        return memory.overhead if memory is not None else 0
+
     def unit_loads(self, name: str, keys: frozenset[str]) -> bool:
         """Units of `name` can each be filled alone: every tensor is stored verbatim, and the
         units' destinations are exactly the component's."""
