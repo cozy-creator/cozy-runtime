@@ -215,6 +215,10 @@ type guardianStatus struct {
 	ExitCode    int    `json:"exit_code,omitempty"`
 }
 
+// A public read can return one full RPC payload encoded as base64 inside JSON.
+// Commands also wrap an already-encoded public query in a JSON string.
+const maxGuardianFrameBytes = 2 * maxMessageBytes
+
 type guardianLauncher struct {
 	control  *os.File
 	mu       sync.Mutex
@@ -258,7 +262,7 @@ func startGuardian(runtimePath, root string, env []string, out io.Writer) (*guar
 
 func (g *guardianLauncher) read(status io.ReadCloser) {
 	scanner := bufio.NewScanner(status)
-	scanner.Buffer(make([]byte, 64<<10), 32<<20)
+	scanner.Buffer(make([]byte, 64<<10), maxGuardianFrameBytes)
 	for scanner.Scan() {
 		var s guardianStatus
 		if json.Unmarshal(scanner.Bytes(), &s) != nil {
@@ -290,18 +294,22 @@ func (g *guardianLauncher) read(status io.ReadCloser) {
 		}
 		g.mu.Unlock()
 	}
+	readError := errors.New("the Runtime guardian exited")
+	if err := scanner.Err(); err != nil {
+		readError = fmt.Errorf("the Runtime guardian status stream failed: %w", err)
+	}
 	status.Close()
 	g.mu.Lock()
 	if g.answered != nil {
-		g.answered <- guardianStatus{Error: "the Runtime guardian exited"}
+		g.answered <- guardianStatus{Error: readError.Error()}
 		g.answered = nil
 	}
 	if g.started != nil {
-		g.started <- errors.New("the Runtime guardian exited")
+		g.started <- readError
 		g.started = nil
 	}
 	if g.current != nil {
-		g.current.err = errors.New("the Runtime guardian exited")
+		g.current.err = readError
 		close(g.current.done)
 		g.current = nil
 	}
@@ -408,6 +416,7 @@ func RunGuardian(args []string) int {
 	adoptOrphans()
 	processes := &guardianProcesses{}
 	scanner := bufio.NewScanner(control)
+	scanner.Buffer(make([]byte, 64<<10), maxGuardianFrameBytes)
 	for scanner.Scan() {
 		var c guardianCommand
 		if json.Unmarshal(scanner.Bytes(), &c) != nil {
@@ -451,6 +460,10 @@ func RunGuardian(args []string) int {
 		}
 	}
 	processes.stop("")()
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "cozy machine: guardian control stream failed:", err)
+		return 1
+	}
 	return 0
 }
 
