@@ -60,3 +60,6 @@ calls without adding wait time. Submissions outside an invocation remain ordinar
 `asyncio.to_thread` and `run_in_executor` participate automatically. A joined helper
 thread nested inside tracked work is covered by that work's interval; a raw thread that
 continues after its tracked caller becomes idle makes the measurement unknown.
+The plain-script adapter uses the same observed loop and ends its author clock before
+framework shutdown. A synchronous script can still create its own event loop; managed
+child waits on an unobserved loop make its execution duration unknown.

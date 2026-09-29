@@ -400,9 +400,13 @@ def test_stale_root_or_descendant_cannot_join_a_retry_clock(tmp_path: Path) -> N
     assert set(timing.members) == {("owner", "parent", 2)}
 
 
-@pytest.mark.parametrize("runtime", ["", "0.18.85"], ids=["current-sdk", "older-sdk"])
+@pytest.mark.parametrize(
+    ("runtime", "mode"),
+    [("", "app"), ("", "script"), ("", "own-loop"), ("0.18.85", "app")],
+    ids=["current-sdk", "pep723-script", "script-own-loop", "older-sdk"],
+)
 def test_real_worker_nested_child_wait_is_not_run_execution(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime: str, mode: str
 ) -> None:
     import test_job_preparation_isolation as fixture
     from test_end_to_end import NO_EXECUTOR
@@ -457,8 +461,22 @@ app.job(leaf)
 async def nested(ctx: Context, payload: Request) -> Result:
     return await leaf(n=3)
 """
+    if mode != "app":
+        source = source[: source.index("app.job(leaf)")].replace("app=App()\n", "")
+        source = '# /// script\n# requires-python = ">=3.12"\n# dependencies = []\n# ///\n' + source
+        source += (
+            "async def main() -> int:\n    value = (await leaf(n=3)).value\n"
+            "    await asyncio.to_thread(work, 20)\n    return value\n"
+            if mode == "script"
+            else "def main() -> int:\n    async def nested():\n"
+            "        return (await leaf(n=3)).value\n    return asyncio.run(nested())\n"
+        )
+        source += (
+            '\nfrom cozy_runtime.author import script_app\n'
+            'app = script_app("prepare_nested")\napp.job(leaf)\n'
+        )
     with machine(monkeypatch, source) as pod:
-        pod.start(("leaf",))
+        pod.start(("leaf",), entrypoint="nested" if mode == "app" else "main")
         pod.submit("timed")
         pod.wait("the nested child to await its gate", entered.exists, 120)
         sdk = json.loads(entered.read_text())
@@ -474,7 +492,7 @@ async def nested(ctx: Context, payload: Request) -> Result:
         raw = rows[0]["body"]
         assert isinstance(raw, bytes)
         measured = canonical_json.decode(raw)
-        if runtime:
+        if runtime or mode == "own-loop":
             assert measured == {"attempt": 1, "terminal": True}
             return
         assert measured["terminal"] is True and measured["execution_ms"] >= 100, measured

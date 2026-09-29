@@ -169,11 +169,15 @@ def script_app(module: str) -> App:
                 )
             if inspect.isawaitable(result):
                 pending = result
+                from cozy_runtime.author._activity import author_done, event_loop
 
                 async def wait() -> Any:
-                    return await pending
+                    try:
+                        return await pending
+                    finally:
+                        author_done()
 
-                result = asyncio.run(wait())
+                result = asyncio.run(wait(), loop_factory=event_loop)
         except SystemExit as exc:
             if exc.code is not None and exc.code != 0:
                 raise ConformanceError(
