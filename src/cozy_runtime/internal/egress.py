@@ -131,7 +131,7 @@ def request_control_metadata(
     *,
     limit: int,
 ) -> tuple[int, bytes]:
-    """One bounded request to the operator's fixed HTTPS control authority.
+    """One bounded request to the fixed control authority, including delegated loopback HTTP.
 
     The origin comes from the host configuration, never a Python job or a
     redirect. Unlike a presigned data URL, an operator may intentionally host
@@ -145,8 +145,12 @@ def request_control_metadata(
         raise EgressRefusal("control_metadata_bound", "control metadata exceeds its bound")
     if method not in {"GET", "POST", "PUT"} or not path.startswith("/v1/"):
         raise EgressRefusal("control_route_invalid", "control route is invalid")
-    connection = http.client.HTTPSConnection(
-        origin.host, origin.port, context=context, timeout=SILENCE_SECONDS
+    connection = (
+        http.client.HTTPConnection(origin.host, origin.port, timeout=SILENCE_SECONDS)
+        if origin.scheme == "http"
+        else http.client.HTTPSConnection(
+            origin.host, origin.port, context=context, timeout=SILENCE_SECONDS
+        )
     )
     try:
         connection.request(method, path, body=body, headers=dict(headers))

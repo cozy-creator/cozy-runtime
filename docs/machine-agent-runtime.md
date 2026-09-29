@@ -47,6 +47,9 @@ grant is renewed with `X-Cozy-Execution-Access`; model mutations carry only its 
 publication Bearer. Existing rentals may continue using `worker_id`/`worker_token` rows.
 One row cannot combine rental credentials and delegated access. An expired delegated grant
 fails the operation visibly; locally retained checkpoints still work without Hub access.
+Delegated access may name a canonical HTTP development Hub on `localhost`, `127.0.0.1`, or
+`[::1]`. Other origins and rental worker credentials require HTTPS. Publication renewal uses
+the same explicitly delegated transport choice; it never follows redirects.
 
 `runtime-model-preparation/1` moves the explicit models-only and package/model preparation
 lanes into Runtime. Exact base and adapter checkpoints go through TensorFS `ensure/1`, with

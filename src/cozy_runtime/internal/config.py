@@ -138,11 +138,12 @@ class WorkerHostConfig:
 
 @dataclass(frozen=True, slots=True)
 class TensorhubOrigin:
-    """One operator-owned HTTPS authority; TLS always terminates in Tensorhub."""
+    """One validated Hub authority; HTTP is limited to explicitly delegated loopback access."""
 
     value: str
     host: str
     port: int
+    scheme: str = "https"
 
 
 # The host starts one current control worker. Provider/image inheritance is not a config
@@ -209,8 +210,8 @@ _TOKEN_HASH = re.compile(r"^[0-9a-f]{64}$")
 _ED25519_KEY = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
-def parse_tensorhub_origin(value: str) -> TensorhubOrigin:
-    """Refuse anything except canonical ``https://host[:port]``."""
+def parse_tensorhub_origin(value: str, *, allow_loopback_http: bool = False) -> TensorhubOrigin:
+    """Canonical HTTPS, or explicitly delegated access to a loopback HTTP development Hub."""
 
     if (
         value.strip() != value
@@ -224,7 +225,7 @@ def parse_tensorhub_origin(value: str) -> TensorhubOrigin:
         )
     try:
         parsed = urlsplit(value)
-        port = parsed.port or 443
+        port = parsed.port or (80 if parsed.scheme == "http" else 443)
     except ValueError as exc:
         raise ConfigError(
             "worker_host_config",
@@ -242,7 +243,14 @@ def parse_tensorhub_origin(value: str) -> TensorhubOrigin:
         explicit_port = parsed.netloc.rsplit(":", 1)[1]
         has_explicit_port = True
     if (
-        parsed.scheme != "https"
+        not (
+            parsed.scheme == "https"
+            or (
+                allow_loopback_http
+                and parsed.scheme == "http"
+                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+            )
+        )
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
@@ -250,7 +258,7 @@ def parse_tensorhub_origin(value: str) -> TensorhubOrigin:
         or parsed.query
         or parsed.fragment
         or parsed.netloc != parsed.netloc.lower()
-        or value != f"https://{parsed.netloc}"
+        or value != f"{parsed.scheme}://{parsed.netloc}"
         or (has_explicit_port and explicit_port != str(port))
         or not 1 <= port <= 65535
     ):
@@ -259,7 +267,7 @@ def parse_tensorhub_origin(value: str) -> TensorhubOrigin:
             "TENSORHUB_ORIGIN is not canonical https://host[:port]",
             "set the Tensorhub API origin",
         )
-    return TensorhubOrigin(value=value, host=parsed.hostname, port=port)
+    return TensorhubOrigin(value=value, host=parsed.hostname, port=port, scheme=parsed.scheme)
 
 
 def parse_object_storage_hosts(value: str) -> tuple[str, ...]:
@@ -332,13 +340,7 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
     return RuntimeConfig(
         cozy_home=home,
         credentials=creds,
-        child_base_env=tuple(
-            sorted(
-                (k, v)
-                for k, v in env.items()
-                if not child_env.erased(k)
-            )
-        ),
+        child_base_env=tuple(sorted((k, v) for k, v in env.items() if not child_env.erased(k))),
         fill_forensics_dir=env.get(child_env.FILL_FORENSICS_DIR, "").strip(),
         dependency_cache=Path(dependency_cache) if dependency_cache else None,
         python_root=Path(python_root) if python_root else None,
