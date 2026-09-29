@@ -93,16 +93,23 @@ The installer-owned `etc/cozy/software-policy.json` accepts
 explicitly selected installation without disabling explicit maintenance. Missing
 policy defaults to auto; unknown or unreadable policy defers discovery. Local,
 development and prerelease software also skips automatic discovery.
-Maintenance requests require `agent: "bundled" | "explicit"` and a boolean `pin`: true for explicit wheels or versions,
-false for default-latest selection. The server never infers this intent from the
-resolved version fields. The committed software-policy file is authoritative. A manual transaction journals
+Current maintenance clients send `agent: "bundled" | "explicit"` and a boolean
+`pin`: true for explicit wheels or versions, false for default-latest selection.
+Older clients may omit these fields; omission preserves the running agent and
+defaults to unpinned software. The server never infers pin intent from resolved
+version fields. The committed software-policy file is authoritative. A manual transaction journals
 its policy and entry changes with the wheel installation; rollback restores only
 its own changes and preserves later operator edits. Explicit agent selection
 retains the exact running application binary; bundled selection uses the candidate
 Runtime wheel. The client never rewrites this policy or entry after server commit.
 Automatic rental updates stop after any accepted work, including after collection,
-so ordinary restarts and retries retain software. Explicit owner maintenance may
-update a used rental once Runtime-owned quiescence is proven.
+so ordinary restarts and retries retain software. Explicit owner maintenance can
+prepare a candidate privately while current work continues. The durable
+`waiting_activation` state means the candidate is ready, while `from` remains
+installed. Activation drains preparations and waits for the live Runtime to
+accept a guarded restart and exit cleanly. Paused records remain in the same
+workspace for later resume. A cold Runtime with retained custody first recovers
+using its installed software; a failed recovery cannot authorize replacement.
 
 The existing machine and Runtime-root locks protect admission. The Runtime-owned
 software-update view applies retention rules across all owners, child attempts,
@@ -120,6 +127,11 @@ not advertised as newly replaced application code. Authenticated runtime status
 reports the actual public agent version, SHA-256 and selection separately from
 the bootstrap ABI/version. The immutable identity receipt remains historical;
 rental readiness and authenticated runtime status prove the selected application.
+An older bootstrap that supports `update-prepare` but lacks `update-stage` uses
+the earlier guarded-stop-then-prepare sequence and reports `waiting`, including
+its limitation. It cannot prepare during active work or activate over paused
+custody. Bootstraps predating `update-prepare` require service/image replacement.
+Upgrading the public agent alone does not add these guardian capabilities.
 
 The launcher retains hashed rollback wheels and a fsynced transaction under
 `var/lib/cozy/startup-update`, outside the unprivileged agent's writable state.
@@ -129,6 +141,9 @@ are now disabled; a later explicit pair supersedes a stale recovery journal. Suc
 readiness, workspace and unused-submission closure before admitting any work.
 A candidate that fails that boot is rolled back and the prior Runtime relaunched
 in the same boot. Failed recovery blocks execution while status and repair routes stay available.
+Both the original and replacement agent persist the terminal result before
+deleting the candidate. A failed status write keeps completion owned and retries;
+repairing the storage lets the same operation finish without another restart.
 Candidate preparation measures CPU/output and download-byte progress; pending
 readiness does not renew rental billing indefinitely. Previously failed pairs
 are skipped during later automatic discovery. `GET /v1/machine/runtime` includes the secrets-free

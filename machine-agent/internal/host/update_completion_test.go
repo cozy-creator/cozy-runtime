@@ -83,6 +83,7 @@ type completionLauncher struct {
 	process            *runtimeProcess
 	committed, release chan struct{}
 	rollbacks          atomic.Int32
+	cleanups           atomic.Int32
 }
 
 func (*completionLauncher) close() {}
@@ -103,6 +104,11 @@ func (l *completionLauncher) launch(incarnation string) (*runtimeProcess, error)
 }
 func (l *completionLauncher) maintain(op string, _ []string) (string, error) {
 	switch op {
+	case "update-cleanup":
+		l.cleanups.Add(1)
+		return "", nil
+	case "software-state":
+		return `{"quiescent":true}`, nil
 	case "pair":
 		return strings.Join(l.previous, "\n"), nil
 	case "restart":

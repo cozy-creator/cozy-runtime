@@ -41,6 +41,8 @@ func (*updateLauncher) launch(string) (*runtimeProcess, error) {
 func (*updateLauncher) close() {}
 func (l *updateLauncher) maintain(op string, _ []string) (string, error) {
 	switch op {
+	case "software-state":
+		return `{"quiescent":true}`, nil
 	case "pair":
 		if l.pairReady != nil {
 			<-l.pairReady
