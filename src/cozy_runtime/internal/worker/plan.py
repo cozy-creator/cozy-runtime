@@ -140,9 +140,7 @@ class AttemptPlan:
     placement: str
     reserved_vram_bytes: int
     """The wire's word for the generation's WEIGHT bytes (th-024 owns the field name). It is
-    not the resident set and it is not this attempt's activation envelope — `resident_bytes`
-    and `headroom_bytes` are those, named separately because they are different facts."""
-    headroom_bytes: int
+    not the resident set (`resident_bytes`) or this attempt's activation envelope."""
     entrypoint_binding_digest: str
     decision_explanation: str
     """WHY this plan, in numbers, for a person reading a terminal. It rides the wire as
@@ -168,12 +166,6 @@ class AttemptPlan:
     are not the same plan however identical their placement."""
     model_deliveries: tuple[tuple[str, CrossedDelivery], ...] = ()
     """Each model's resolved delivery and its cost under this attempt's placement."""
-    scope_headroom_bytes: tuple[tuple[str, int], ...] = ()
-    """Measured activation scratch by component-use method. The scalar headroom is its max;
-    staged admission uses each method's own value so unrelated weight/scratch maxima never add."""
-    measured_scopes: tuple[str, ...] = ()
-    """The methods whose scratch was measured at exactly this shape cell by a completed serve.
-    Staged admission keeps other components beside these and frees everything for the rest."""
 
     def document(self) -> dict[str, Json]:
         document: dict[str, Json] = {
@@ -183,9 +175,6 @@ class AttemptPlan:
             "compute_dtype": self.compute_dtype,
             "placement": self.placement,
             "reserved_vram_bytes": self.reserved_vram_bytes,
-            "headroom_bytes": self.headroom_bytes,
-            "scope_headroom_bytes": dict(self.scope_headroom_bytes),
-            "measured_scopes": list(self.measured_scopes),
             "entrypoint_binding_digest": self.entrypoint_binding_digest,
             "constructed_model_digest": self.constructed_model_digest,
             "request_features_digest": self.request_features_digest,
@@ -222,7 +211,6 @@ class AttemptPlan:
             compute_dtype="",
             placement="job_attempt",
             reserved_vram_bytes=int(caps.get("vram", 0)),
-            headroom_bytes=0,
             entrypoint_binding_digest=binding.job_descriptor_id,
             decision_explanation=(
                 f"job_attempt: {binding.job!r} on {max(device_count, 0)} assigned device(s), "
@@ -527,12 +515,10 @@ class DeclaredBinding:
 class PlanChooser:
     """ONE AttemptPlan from the request shape, the binding and the tenant's residency.
 
-    Nothing is priced here: the memory manager already made room for this call on every
-    device it needs (`memory.py`), and says whether the call's measured need fits. The rung
-    follows: `all_resident` when it fits and the construction holds everything it built,
-    else `component_staged`: one declared scope resident at a time, blocks paged, inside
-    whatever every idle tenant's eviction left. The executor's admission of each scope is
-    the check that bytes exist. No I/O.
+    Nothing about memory is decided here: the executor's memory planner places every weight
+    before each op (`memory.Planner`), inside the grant the worker's policy sent. The plan's
+    placement is `component_staged` because weights may move within the attempt; an older
+    executor reads it as its staged rung. No I/O.
     """
 
     def __init__(self, ledger: Ledger) -> None:
@@ -544,7 +530,7 @@ class PlanChooser:
         prepared_model: PreparedModel,
         prepared: PreparedRequest,
         *,
-        fits: bool = True,
+        placement: str = "component_staged",
     ) -> AttemptPlan:
         ledger = self.ledger
         if ledger.unreconciled:
@@ -556,15 +542,14 @@ class PlanChooser:
             )
         cell = prepared.cell()
         resident = dict(ledger.resident)
-        nominal = {**ledger.evicted, **resident}
-        nominal.update({name: row["total_bytes"] for name, row in ledger.paging.items()})
-        absent = sum(max(size - resident.get(name, 0), 0) for name, size in nominal.items())
+        # A partially resident component reports both portions. Neither overwrites the
+        # other, and their total is metadata rather than an admission floor on the GPU.
+        nominal = {
+            name: resident.get(name, 0) + ledger.evicted.get(name, 0)
+            for name in resident.keys() | ledger.evicted.keys()
+        }
+        absent = sum(ledger.evicted.values())
         weights = sum(nominal.values()) or declared.logical_weight_bytes
-        parked = [name for name in ledger.parked if name not in resident]
-        headroom = ledger.activations_for(cell)
-        scopes = ledger.activation_scopes_for(cell)
-        measured = ledger.measured_scopes(cell) & set(ledger.declared_scopes)
-        placement = "all_resident" if fits and not absent and not parked else "component_staged"
         rung = self._delivery(prepared_model, placement)
         return AttemptPlan(
             delivery=rung.delivery,
@@ -574,9 +559,6 @@ class PlanChooser:
             reserved_vram_bytes=weights,
             model_weight_bytes=weights,
             resident_bytes=sum(resident.values()),
-            headroom_bytes=headroom,
-            scope_headroom_bytes=tuple(sorted(scopes.items())),
-            measured_scopes=tuple(sorted(measured)),
             entrypoint_binding_digest=declared.entrypoint_binding_digest,
             constructed_model_digest=prepared_model.constructed_model_digest,
             request_features_digest=prepared.features_digest,
@@ -590,10 +572,8 @@ class PlanChooser:
                 f"{prepared_model.delivery_variant or declared.variant or 'default'!r} "
                 f"({rung.cost_class} decode, {rung.kernel} kernel) x {placement}: "
                 f"{len(nominal) or 1} component(s) totalling {weights} B, {absent} B not "
-                f"resident{f', {parked} parked at construction' if parked else ''}; the "
-                f"call's measured need {'fits' if fits else 'does not fit'} on its devices "
-                f"with {headroom} B of measured activations; request {prepared.entrypoint} "
-                f"on shape cell {cell}"
+                f"on the device before the call; request {prepared.entrypoint} on shape "
+                f"cell {cell}"
             ),
         )
 

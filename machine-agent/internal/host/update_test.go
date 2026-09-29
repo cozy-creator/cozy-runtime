@@ -51,6 +51,8 @@ func (l *updateLauncher) maintain(op string, _ []string) (string, error) {
 		return strings.Join(l.pair, "\n"), nil
 	case "restart":
 		return "accepted", nil
+	case "update-stage":
+		return "prepared", nil
 	case "update-prepare":
 		if l.installs.Add(1) == 1 && l.rollback != nil {
 			close(l.rollback)
@@ -386,7 +388,7 @@ func TestNativeUpdateDefersUnreadyRuntimeBeforeAdmission(t *testing.T) {
 	}
 }
 
-func TestNativeUpdateRequiresExplicitPinIntent(t *testing.T) {
+func TestNativeUpdateDefaultsLegacyPinIntent(t *testing.T) {
 	for _, decision := range []string{"omitted", "null", "false", "true"} {
 		t.Run(decision, func(t *testing.T) {
 			m, token, mux := updateMachine(t)
@@ -394,19 +396,13 @@ func TestNativeUpdateRequiresExplicitPinIntent(t *testing.T) {
 			m.launcher = &updateLauncher{pairReady: gate}
 			server := httptest.NewServer(mux)
 			defer server.Close()
-			body := `{"operation":"pin-proof","agent":"bundled","runtime":{"version":"0.18.87"}`
+			body := `{"operation":"pin-proof","runtime":{"version":"0.18.87"}`
 			if decision != "omitted" {
 				body += `,"pin":` + decision
 			}
 			body += "}"
 			reply := updateCall(server.Client(), http.MethodPost, server.URL+"/v1/machine/runtime/update", token, strings.NewReader(body))
-			if decision == "omitted" || decision == "null" {
-				close(gate)
-				if reply.code != http.StatusBadRequest || m.updates.status != nil {
-					t.Fatalf("missing pin intent admitted: %+v", reply)
-				}
-				return
-			}
+
 			if reply.code != http.StatusAccepted || reply.status.Pinned != (decision == "true") {
 				close(gate)
 				t.Fatalf("pin intent changed: %+v", reply)

@@ -548,7 +548,7 @@ def test_encoded_png_result_hydrates_as_existing_image_asset(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
-    "kind,mime", [("audio", "audio/wav"), ("image", "image/jpeg"), ("video", "image/png")]
+    "kind,mime", [("audio", "audio/wav"), ("image", "audio/wav"), ("video", "image/png")]
 )
 def test_encoded_png_refuses_a_wrong_kind_or_mime(tmp_path: Path, kind: str, mime: str) -> None:
     workspace, reply, _ = png_result(tmp_path)
@@ -557,6 +557,16 @@ def test_encoded_png_refuses_a_wrong_kind_or_mime(tmp_path: Path, kind: str, mim
     reply.result_canonical_bytes = canonical_json.encode(value)
     with pytest.raises(WorkspaceRefusal, match="media type"):
         child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+
+
+def test_encoded_png_uses_its_bytes_within_the_declared_image_family(tmp_path: Path) -> None:
+    workspace, reply, data = png_result(tmp_path)
+    value = canonical_json.decode(reply.result_canonical_bytes)
+    value["image"]["media_type"] = "image/jpeg"
+    reply.result_canonical_bytes = canonical_json.encode(value)
+    rows = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+    assert rows[0]["media_type"] == "image/png"
+    assert Path(rows[0]["local"]).read_bytes() == data
 
 
 def test_abort_reclaims_readonly_projections_without_following_storage_links(

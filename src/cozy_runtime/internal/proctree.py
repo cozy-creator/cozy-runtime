@@ -1277,6 +1277,23 @@ def descendants(pid: int) -> list[int]:
     return sorted(found)
 
 
+def trim_host_allocator() -> bool:
+    """Ask libc to return free heap pages; live allocations and aliases remain owned.
+
+    This is an optional pressure response, not a byte estimate. Callers must measure
+    RSS and aggregate host headroom afterward even when libc reports success.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        trim = ctypes.CDLL(None).malloc_trim
+    except (OSError, AttributeError):
+        return False
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    return bool(trim(0))
+
+
 def rss_bytes(pid: int) -> int:
     """Current resident bytes for one pid, read BY THE PARENT from the kernel — never the
     child's claim about itself. -1 when the process is gone (UNREADABLE)."""
@@ -1292,40 +1309,88 @@ def rss_bytes(pid: int) -> int:
 
 
 def available_host_bytes() -> int:
-    """The LIVE host budget, from the cgroup when there is one, else MemAvailable.
+    """Live physical and cgroup headroom, including reclaimable inactive file cache.
 
-    §3.2's host-RAM rule: re-read at every grant, because a budget fixed at boot describes
-    a machine nobody else is on. -1 means UNREADABLE, never 0.
+    Unknown physical availability remains unreadable; cache credit is bounded by both
+    observed usage and MemAvailable. Re-read at every grant, not just process startup.
     """
     _linux_only("available_host_bytes")
-    if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
+    try:
+        physical = next(
+            int(line.split()[1]) * 1024
+            for line in Path("/proc/meminfo").read_text().splitlines()
+            if line.startswith("MemAvailable:")
+        )
+    except (OSError, StopIteration, IndexError, ValueError):
+        return -1
+    if physical < 0:
+        return -1
+
+    def credit(directory: Path, limit_name: str, current_name: str, cache_name: str) -> int:
+        limit_text = (directory / limit_name).read_text().strip()
+        if limit_text == "max":
+            return physical
+        limit = int(limit_text)
+        current = int((directory / current_name).read_text().strip())
+        if limit < 0 or current < 0:
+            raise ValueError("negative cgroup memory counter")
+        # Missing cache statistics must not invent reclaimable memory.
+        inactive = 0
         try:
+            stats = dict(
+                line.split() for line in (directory / "memory.stat").read_text().splitlines()
+            )
+            inactive = max(0, int(stats.get(cache_name, "0")))
+        except (OSError, ValueError):
+            pass
+        return max(0, limit - current + min(current, inactive))
+
+    try:
+        if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
             relative = next(
                 line.split("::", 1)[1]
                 for line in Path("/proc/self/cgroup").read_text().splitlines()
                 if line.startswith("0::")
             )
-            cgroup = Path("/sys/fs/cgroup") / relative.lstrip("/")
-            v2_limit = (cgroup / "memory.max").read_text().strip()
-            if v2_limit != "max":
-                current = int((cgroup / "memory.current").read_text().strip())
-                return max(int(v2_limit) - current, 0)
-        except (OSError, StopIteration, ValueError):
-            pass
-    else:
-        try:
-            memory = _cgroup_v1_controller_path("memory")
-            v1_limit = int((memory / "memory.limit_in_bytes").read_text().strip())
-            current = int((memory / "memory.usage_in_bytes").read_text().strip())
-            # cgroup v1 represents "unlimited" as a page-rounded value near LONG_MAX.
-            if 0 < v1_limit < (1 << 60):
-                return max(v1_limit - current, 0)
-        except (ContainmentUnavailable, OSError, ValueError):
-            pass
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    except (OSError, IndexError, ValueError):
-        return -1
-    return -1
+            mount = Path("/sys/fs/cgroup")
+            cgroup = mount / relative.lstrip("/")
+            # A parent can constrain a child whose own memory.max is unlimited.
+            while cgroup.is_relative_to(mount):
+                physical = min(
+                    physical, credit(cgroup, "memory.max", "memory.current", "inactive_file")
+                )
+                # memory.high is the kernel's reclaim/throttle boundary, even when
+                # memory.max still has room. Do not promise storage past either.
+                if (cgroup / "memory.high").is_file():
+                    physical = min(
+                        physical, credit(cgroup, "memory.high", "memory.current", "inactive_file")
+                    )
+                if cgroup == mount:
+                    break
+                cgroup = cgroup.parent
+        else:
+            cgroup = _cgroup_v1_controller_path("memory")
+            mounts = tuple(
+                mount
+                for mount in _cgroup_v1_mounts()
+                if "memory" in mount.controllers and cgroup.is_relative_to(mount.target)
+            )
+            if len(mounts) != 1:
+                raise ContainmentUnavailable("memory cgroup path has no unique v1 mount")
+            v1_mount = mounts[0]
+            while cgroup.is_relative_to(v1_mount.target):
+                physical = min(
+                    physical,
+                    credit(
+                        cgroup,
+                        "memory.limit_in_bytes",
+                        "memory.usage_in_bytes",
+                        "total_inactive_file",
+                    ),
+                )
+                if cgroup == v1_mount.target:
+                    break
+                cgroup = cgroup.parent
+    except (ContainmentUnavailable, OSError, StopIteration, ValueError):
+        pass
+    return physical

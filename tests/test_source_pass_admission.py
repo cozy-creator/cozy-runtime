@@ -66,12 +66,13 @@ def test_source_pass_uses_native_bounds_instead_of_whole_carriers(
             "write_interval_bytes": preferred,
         }
 
-    def ensure(_: str, *, receipts: str) -> SimpleNamespace:
+    def ensure(_: str | Path) -> SimpleNamespace:
         assert admitted, "Store creation started before metadata admission"
         return SimpleNamespace(prepare_model_source=advance)
 
     facade = SimpleNamespace(Store=SimpleNamespace(ensure=ensure), manifest_max_bytes=lambda: 128)
     monkeypatch.setattr(fill, "tensorfs_module", lambda: facade)
+    monkeypatch.setattr(fill, "ensure_store", ensure)
     monkeypatch.setattr(storage, "admit", admit)
     result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "store")
     assert not admitted

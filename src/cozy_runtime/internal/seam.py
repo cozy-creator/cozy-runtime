@@ -41,6 +41,21 @@ from typing import Any, NoReturn
 #: an incompatible change to required commands/semantics raises it.
 EXECUTOR_PROTOCOL_REVISION = 1
 
+#: Additive memory operations are negotiated independently of the command protocol.
+EXECUTOR_MEMORY_CAPABILITIES = frozenset(
+    {
+        "plan",
+        "rank_memory",
+        "prepare_commit",
+        "import_only",
+        "vacate_ranks",
+        "host_room",
+        "group_host_credit",
+        "process_memory",
+        "reclaim_host",
+    }
+)
+
 #: Frames are control. 64 KiB is generous for a payload document and small enough that a
 #: caller trying to move tensors or media through here fails immediately.
 MAX_FRAME = 64 * 1024
