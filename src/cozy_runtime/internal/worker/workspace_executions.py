@@ -138,6 +138,8 @@ class Preparation(msgspec.Struct, frozen=True):
     wire_minor: int | msgspec.UnsetType = msgspec.UNSET
     #: the Hub its run came from, as `machine_model_resolve.hub_key` spells it
     hub: str = ""
+    #: the account owning the run, whose org-relative Models its unpublished code names
+    account: str = ""
 
     @classmethod
     def read(cls, raw: bytes) -> Preparation:

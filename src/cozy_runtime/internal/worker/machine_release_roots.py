@@ -726,6 +726,7 @@ class ReleaseRoots:
             state=base64.b64encode(desired.SerializeToString(deterministic=True)).decode(),
             runtime_builtin=worker.machine_calls.builtins.capture(),
             hub=prepared.hub,
+            account=root.owner or request.account,
         )
         worker.machine_sources.hold(owner, offer.request_id, request.source_credentials)
         receipt = worker.submit_execution(

@@ -685,7 +685,7 @@ class MachineDevice(_message.Message):
     def __init__(self, ordinal: _Optional[int] = ..., name: _Optional[str] = ..., uuid: _Optional[str] = ..., memory_bytes: _Optional[int] = ..., pci_bus_id: _Optional[str] = ..., driver_version: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionSubmit(_message.Message):
-    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id", "source_credentials", "release_root", "owner_memo")
+    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id", "source_credentials", "release_root", "owner_memo", "account")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -698,6 +698,7 @@ class MachineExecutionSubmit(_message.Message):
     SOURCE_CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
     RELEASE_ROOT_FIELD_NUMBER: _ClassVar[int]
     OWNER_MEMO_FIELD_NUMBER: _ClassVar[int]
+    ACCOUNT_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     submission_id: str
     capture_digest: bytes
@@ -710,7 +711,8 @@ class MachineExecutionSubmit(_message.Message):
     source_credentials: _containers.RepeatedCompositeFieldContainer[SourceCredential]
     release_root: ReleaseRoot
     owner_memo: bool
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., release_root: _Optional[_Union[ReleaseRoot, _Mapping]] = ..., owner_memo: bool = ...) -> None: ...
+    account: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., release_root: _Optional[_Union[ReleaseRoot, _Mapping]] = ..., owner_memo: bool = ..., account: _Optional[str] = ...) -> None: ...
 
 class ReleaseRoot(_message.Message):
     __slots__ = ("package", "release", "entrypoint", "models", "inputs", "input_access", "deadline_unix_ms", "attention_kernel", "capture", "job", "weights_destination", "publication_grant", "installation_id", "owner", "hub")
