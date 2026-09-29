@@ -1354,8 +1354,8 @@ def available_host_bytes() -> int:
             )
             if len(mounts) != 1:
                 raise ContainmentUnavailable("memory cgroup path has no unique v1 mount")
-            mount = mounts[0]
-            while cgroup.is_relative_to(mount.target):
+            v1_mount = mounts[0]
+            while cgroup.is_relative_to(v1_mount.target):
                 physical = min(
                     physical,
                     credit(
@@ -1365,7 +1365,7 @@ def available_host_bytes() -> int:
                         "total_inactive_file",
                     ),
                 )
-                if cgroup == mount.target:
+                if cgroup == v1_mount.target:
                     break
                 cgroup = cgroup.parent
     except (ContainmentUnavailable, OSError, StopIteration, ValueError):
