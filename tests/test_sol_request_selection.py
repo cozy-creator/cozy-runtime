@@ -320,7 +320,8 @@ def test_unrelated_corrupt_historical_metadata_does_not_block_capture(
 def test_leader_refuses_missing_semantic_acknowledgment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, missing: str
 ) -> None:
-    import torch
+    from types import SimpleNamespace
+
     from msgspec import UNSET
 
     from cozy_runtime.author._errors import InvalidRequest
@@ -330,7 +331,8 @@ def test_leader_refuses_missing_semantic_acknowledgment(
     setup_store(monkeypatch, tmp_path, (8, 9))
     applied = attention.Applied({"dit": {"sol-attn": 1}}, ())
     executor = object.__new__(Executor)
-    executor.torch, executor.device_kind, executor.rank = torch, "cuda", 0
+    executor.torch = SimpleNamespace(device=lambda *_: None)
+    executor.device_kind, executor.rank = "cuda", 0
     monkeypatch.setattr(executor, "group", object(), raising=False)
     restored = []
 

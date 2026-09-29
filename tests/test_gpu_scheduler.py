@@ -405,9 +405,12 @@ class Machine:
         self.worker.engine.history[attempt.key()] = attempt
         self.worker.engine.live[name] = attempt
         self.worker.execution(OWNER, name)
-        # This fixture promises the parent is already running. Wait for its real
-        # execution unit to publish root admission before simulating its child call.
-        self.tick()
+        # Wait for this root's admission, not global quiescence: another execution
+        # may deliberately be held mid-activation by this test.
+        bound = time.monotonic() + 120  # fixture deadlock bound, not product policy
+        while name not in self.worker.gpu.roots:
+            assert time.monotonic() < bound, self.worker.supervisor.keys("")
+            time.sleep(0.01)
         assert name in self.worker.gpu.roots
 
     def device_job(self, name: str) -> None:
