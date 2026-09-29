@@ -158,7 +158,7 @@ def test_run_timing_unions_nested_work_and_keeps_one_cumulative_snapshot(tmp_pat
     assert [canonical_json.decode(row[0]) for row in events] == [
         {"attempt": 1, "terminal": True, "execution_ms": 10000}
     ]
-    assert timing.runs == timing.members == {}
+    assert not timing.runs and not timing.members
 
 
 @pytest.mark.parametrize("problem", ["legacy", "missing", "recovery", "died_while_blocked"])
@@ -238,7 +238,7 @@ def test_root_ending_with_an_open_child_retires_members_and_reports_unknown(
     timing.end("owner", "parent", 1)
     timing.observe("owner", child, 1, {"sequence": 2, "active": False, "known": True})
     timing.end("owner", child, 1)
-    assert timing.runs == timing.members == {}
+    assert not timing.runs and not timing.members
     if refuse_record:
         return
     with executions.workspace.locked() as db:
@@ -306,7 +306,7 @@ def test_stale_root_or_descendant_cannot_join_a_retry_clock(tmp_path: Path) -> N
     executions.control("owner", "parent", "resume", 1, "resume")
     timing = Timing(executions)
     timing.begin("owner", "parent", 1)
-    assert timing.runs == timing.members == {}
+    assert not timing.runs and not timing.members
     timing.begin("owner", "parent", 2)
     timing.begin("owner", child, 1)
     assert set(timing.members) == {("owner", "parent", 2)}
@@ -367,7 +367,9 @@ async def nested(ctx: Context, payload: Request) -> Result:
             "SELECT body FROM execution_events WHERE request='timed' AND kind='run.timing'"
         )
         assert len(rows) == 1
-        measured = canonical_json.decode(bytes(rows[0]["body"]))
+        raw = rows[0]["body"]
+        assert isinstance(raw, bytes)
+        measured = canonical_json.decode(raw)
         if runtime:
             assert measured == {"attempt": 1, "terminal": True}
             return
@@ -375,11 +377,12 @@ async def nested(ctx: Context, payload: Request) -> Result:
         calls = pod.rows(
             "SELECT body FROM execution_events WHERE request='timed' AND kind='call.phase'"
         )
-        terminal = next(
-            canonical_json.decode(bytes(row["body"]))
-            for row in reversed(calls)
-            if canonical_json.decode(bytes(row["body"]))["phase"] == "terminal"
-        )
+        phases = []
+        for row in calls:
+            raw = row["body"]
+            assert isinstance(raw, bytes)
+            phases.append(canonical_json.decode(raw))
+        terminal = next(phase for phase in reversed(phases) if phase["phase"] == "terminal")
         # The existing child phase is its author envelope; the run measurement
         # must exclude the real blocked interval while retaining its CPU work.
         assert terminal["execution_ms"] - measured["execution_ms"] >= 400, (terminal, measured)
