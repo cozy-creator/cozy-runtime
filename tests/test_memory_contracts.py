@@ -29,7 +29,6 @@ from cozy_runtime.internal.seam import (
     SeamError,
 )
 from cozy_runtime.internal.worker.child import (
-    ExecutorProtocolMismatch,
     require_executor_protocol,
     respond,
 )
@@ -154,21 +153,19 @@ def test_process_facts_do_not_survive_its_generation() -> None:
     assert row.memory_generation is None and not row.held and not row.overhead and not row.peak
 
 
-def test_current_memory_contract_is_required_before_device_initialization() -> None:
+def test_memory_capabilities_are_additive_and_current_extras_are_supported() -> None:
     hello = {
         "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
         "native_interfaces": {},
         "memory": sorted(EXECUTOR_MEMORY_CAPABILITIES),
     }
     require_executor_protocol(hello)
-    for missing in EXECUTOR_MEMORY_CAPABILITIES:
-        with pytest.raises(ExecutorProtocolMismatch, match="current Runtime memory contract"):
-            require_executor_protocol(
-                {
-                    **hello,
-                    "memory": [v for v in sorted(EXECUTOR_MEMORY_CAPABILITIES) if v != missing],
-                }
-            )
+    # A peer from before the memory additions may omit the advisory capability list.
+    legacy = dict(hello)
+    legacy.pop("memory")
+    require_executor_protocol(legacy)
+    # A current peer can advertise the full set and independent future capabilities.
+    require_executor_protocol({**hello, "memory": [*hello["memory"], "future_memory_probe"]})
 
 
 def test_additive_rank_facts_do_not_change_the_attempt_outcome() -> None:
@@ -285,14 +282,17 @@ def test_rank_control_replies_retain_each_process_report(tmp_path: Path) -> None
         group.close()
 
 
-def test_old_worker_refuses_start_before_package_or_cuda_initialization(tmp_path: Path) -> None:
+def test_invalid_package_path_still_refuses_before_device_initialization(tmp_path: Path) -> None:
     ours, theirs = socket.socketpair()
     executor = Executor(Channel(ours), tmp_path)
     try:
-        # No readable package or torch is needed: capability refusal comes first.
+        # No readable package or torch is needed: package validation still comes first.
         result = executor.start(Start(package_interface="/does/not/exist"))
-        assert result["code"] == "worker_memory_upgrade_required"
-        assert executor.torch is None and not executor.poisoned
+        assert result["code"] == "package_prepare_path_invalid"
+        assert (
+            executor.torch is None
+            and executor.poisoned == "start without a readable package interface"
+        )
     finally:
         ours.close()
         theirs.close()
