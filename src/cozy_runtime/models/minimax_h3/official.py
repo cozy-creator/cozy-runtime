@@ -651,25 +651,24 @@ def _inspectable(tensor: Any) -> bool:
 
 
 class ResidentWeights:
-    """Finite-weight verdicts that live exactly as long as the bytes they describe.
+    """Finite-weight verdicts that live exactly as long as the weights they describe.
 
-    Weights are immutable once filled, so their scan runs once per fill rather than once
-    per request (h3a-016). A verdict is keyed on the storage object itself, held weakly:
-    eviction frees the storage and its verdict with it, and a re-stage fills a fresh
-    storage that has none. The fill writes in place, which bumps the tensor's version
-    counter, so a paged block refilled into a storage that was resized rather than
-    replaced is rescanned too. Nothing here holds a strong reference to a weight.
+    Weights are immutable once filled, so their scan runs once per byte-identical load
+    rather than once per request (h3a-016). A verdict is keyed on the Parameter object
+    itself, held weakly: the memory planner moves a weight between device and host by
+    rebinding its data, which keeps both the Parameter and its bytes, so the verdict holds;
+    a fill from the store makes new Parameters, which are scanned again. Nothing here holds
+    a strong reference to a weight.
     """
 
     def __init__(self) -> None:
-        self._verdicts: weakref.WeakKeyDictionary[Any, tuple[int, int, int]] = (
+        self._verdicts: weakref.WeakKeyDictionary[Any, tuple[tuple[int, ...], str]] = (
             weakref.WeakKeyDictionary()
         )
 
     @staticmethod
-    def _fill(tensor: Any) -> tuple[Any, tuple[int, int, int]]:
-        storage = tensor.untyped_storage()
-        return storage, (storage.data_ptr(), storage.nbytes(), tensor._version)
+    def _fill(tensor: Any) -> tuple[Any, tuple[tuple[int, ...], str]]:
+        return tensor, (tuple(tensor.shape), str(tensor.dtype))
 
     def verified(self, tensor: Any) -> bool:
         storage, fill = self._fill(tensor)

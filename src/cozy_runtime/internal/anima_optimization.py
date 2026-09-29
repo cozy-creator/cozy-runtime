@@ -22,6 +22,8 @@ from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
+from cozy_runtime.author._retry import pure
+
 DIFFUSERS_VERSION = "0.40.0"
 # The kernels ride cozy-runtime's own cp312-abi3 wheel (cr-094): the module is probed,
 # never version-pinned. The revision names the native sources' review state and is bumped
@@ -391,7 +393,7 @@ def _install_block_plan(block: Any, *, anima_kernels: Any, torch: Any, rope: _Ro
             "Anima Cosmos block projections or attention processors do not match the plan",
         )
     block.attn1.set_processor(_FusedSelfAttention(torch, anima_kernels, rope))
-    block.forward = MethodType(_block_forward, block)
+    block.forward = MethodType(pure(_block_forward), block)
 
 
 def _install_transformer_plan(transformer: Any, *, anima_kernels: Any, torch: Any) -> None:
@@ -422,13 +424,14 @@ def _install_transformer_plan(transformer: Any, *, anima_kernels: Any, torch: An
                 "anima_optimization_norm_shape",
                 "Anima RMSNorm affine/bias/epsilon does not match the fused plan",
             )
-        norm.forward = MethodType(_native_rms_forward, norm)
+        norm.forward = MethodType(pure(_native_rms_forward), norm)
     for block in blocks:
         _install_block_plan(block, anima_kernels=anima_kernels, torch=torch, rope=rope)
-    transformer.rope.forward = MethodType(_direct_rope_forward, transformer.rope)
+    transformer.rope.forward = MethodType(pure(_direct_rope_forward), transformer.rope)
 
     original_forward = transformer.forward
 
+    @pure
     def forward(_self: Any, *args: object, **kwargs: object) -> Any:
         rope.clear()
         try:

@@ -29,9 +29,14 @@ class _Request(msgspec.Struct, frozen=True, kw_only=True, tag_field="kind"):
 
 
 class DeviceRoom(_Request, frozen=True, kw_only=True, tag="device_room"):
-    """Idle co-tenants of the executor's devices give `free_bytes` back."""
+    """Idle co-tenants of the executor's devices give room back until the driver has
+    `free_bytes` free and the executor may hold `grant_bytes` in all (0: no such need).
+    `measured`: the need is a measurement, so idle processes may end for it."""
 
     free_bytes: int
+    grant_bytes: int = 0
+    measured: bool = True
+    ranks: tuple[int, ...] = ()
 
 
 class ChildEvents(_Request, frozen=True, kw_only=True, tag="child_events"):

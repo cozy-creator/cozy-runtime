@@ -213,17 +213,15 @@ class _Scope(Protocol):
 
 
 class Residency(Protocol):
-    """The runtime's component-use ADMISSION, installed on a constructed generation.
+    """The runtime's side of a declared scope, installed on a constructed generation.
 
-    Declared here because the contract has one home; implemented nowhere in this package,
-    because admission, materialization, event fencing and eviction all need a device and
-    this package is torch-free by construction. cozy-runtime supplies the body
-    (`internal/residency.py`); a promoted Varena adapter would supply a different one and the
-    package above would not be able to tell.
+    Declared here because the contract has one home; implemented by cozy-runtime's memory
+    planner (`internal/memory.py`), because every decision about device memory needs a
+    device and this package is torch-free by construction.
 
-    `admit` runs BEFORE method entry and either makes the declared set materialized or
-    refuses typed. `release` runs after the body returns, records the event fence, and makes
-    the leases EVICTABLE — it never forces eviction and never imposes a global scope order.
+    `admit` runs BEFORE method entry: what the method reads outside its components' own
+    forwards is on the device when its body starts, or it refuses typed. `release` runs
+    after the body returns and moves nothing.
     """
 
     def admit(self, method: str, components: tuple[str, ...]) -> None: ...

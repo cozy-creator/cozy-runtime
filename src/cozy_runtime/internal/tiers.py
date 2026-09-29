@@ -16,13 +16,23 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 DEVICE, HOST, DISK = "device", "host", "disk"
+
+#: torch is not importable where the Worker runs, so its objects are named rather than typed
+Torch = Any
+Tensor = Any
+Module = Any
+Device = Any
+Handle = Any
+Convert = Callable[[Tensor], Tensor]
+#: an op runner: (method, the bound method, args, kwargs) -> its result
+Run = Callable[[str, Callable[..., object], tuple[object, ...], dict[str, object]], object]
 OP_METHODS = ("forward", "encode", "decode")
 
 
 class Store(Protocol):
     """The disk tier: the fill plane's validated TensorFS path."""
 
-    def load(self, name: str) -> None: ...
+    def load(self, name: str) -> object: ...
 
     def load_unit(self, name: str, unit: Unit) -> None: ...
 
@@ -36,25 +46,25 @@ class Store(Protocol):
 @dataclass(eq=False)
 class Unit:
     path: str
-    module: Any
+    module: Module
     #: block roots the common unit skips; empty for a block
-    skip: tuple[Any, ...] = ()
+    skip: tuple[Module, ...] = ()
     nbytes: int = 0
     tier: str = DEVICE
     #: the host copy of each slot, kept while the device copy is the one it was copied to:
     #: a clean cache, so leaving the device again only rebinds
-    host: dict[tuple[int, str], Any] = field(default_factory=dict)
+    host: dict[tuple[int, str], Tensor] = field(default_factory=dict)
     seen: dict[tuple[int, str], int] = field(default_factory=dict)
     #: loaded by a forward hook for one forward, and sent home after it
     streamed: bool = False
     #: package conversions applied since the unit's last fill, and those waiting for its next
-    applied: list[Callable[[Any], Any]] = field(default_factory=list)
-    pending: list[Callable[[Any], Any]] = field(default_factory=list)
+    applied: list[Convert] = field(default_factory=list)
+    pending: list[Convert] = field(default_factory=list)
 
-    def owners(self) -> list[tuple[str, Any]]:
+    def owners(self) -> list[tuple[str, Module]]:
         """Every (path, module) whose own tensors belong to this unit."""
         skip = {id(module) for module in self.skip}
-        found: list[tuple[str, Any]] = []
+        found: list[tuple[str, Module]] = []
         stack = [(self.path, self.module)]
         while stack:
             path, module = stack.pop()
@@ -64,7 +74,7 @@ class Unit:
                     stack.append((f"{path}.{name}" if path else name, child))
         return found
 
-    def slots(self) -> Iterator[tuple[Any, str, bool, Any]]:
+    def slots(self) -> Iterator[tuple[Module, str, bool, Tensor]]:
         for _, module in self.owners():
             for name, tensor in list(module._parameters.items()):
                 if tensor is not None:
@@ -73,9 +83,9 @@ class Unit:
                 if tensor is not None:
                     yield module, name, False, tensor
 
-    def live(self, component: str) -> dict[str, Any]:
+    def live(self, component: str) -> dict[str, Tensor]:
         """The persistent destinations the fill plane writes, by component-qualified key."""
-        found: dict[str, Any] = {}
+        found: dict[str, Tensor] = {}
         for path, module in self.owners():
             prefix = f"{component}.{path}." if path else f"{component}."
             for name, tensor in module._parameters.items():
@@ -90,13 +100,13 @@ class Unit:
 @dataclass(eq=False)
 class Component:
     name: str
-    root: Any
+    root: Module
     common: Unit
     blocks: tuple[Unit, ...]
     store: Store | None = None
     #: the store can fill each unit alone; otherwise it refills the component whole
     unit_loads: bool = False
-    hooks: list[Any] = field(default_factory=list)
+    hooks: list[Handle] = field(default_factory=list)
     #: a move of ours is converting tensors: a package conversion is not intercepted
     moving: bool = False
 
@@ -112,7 +122,7 @@ class Component:
         return sum(unit.nbytes for unit in self.units if unit.tier == tier)
 
 
-def _bytes(tensors: Iterator[Any]) -> int:
+def _bytes(tensors: Iterator[Tensor]) -> int:
     seen: set[int] = set()
     total = 0
     for tensor in tensors:
@@ -122,7 +132,7 @@ def _bytes(tensors: Iterator[Any]) -> int:
     return total
 
 
-def _tokens(module: Any) -> Iterator[tuple[str, int]]:
+def _tokens(module: Module) -> Iterator[tuple[str, int]]:
     yield "module", id(module)
     for tensor in (*module._parameters.values(), *module._buffers.values()):
         if tensor is not None:
@@ -131,14 +141,14 @@ def _tokens(module: Any) -> Iterator[tuple[str, int]]:
                 yield "storage", tensor.untyped_storage().data_ptr()
 
 
-def partition(name: str, root: Any, tier: str, store: Store | None = None) -> Component:
+def partition(name: str, root: Module, tier: str, store: Store | None = None) -> Component:
     """Blocks are the innermost REPEATED instances of the declared no-split classes. The unit
     holding the root's first parameter stays common, so `.device` stays true; units that share
     a module or a storage join the common unit."""
     classes = set(getattr(root, "_no_split_modules", None) or ())
-    found: list[tuple[str, Any]] = []
+    found: list[tuple[str, Module]] = []
 
-    def walk(path: str, module: Any) -> bool:
+    def walk(path: str, module: Module) -> bool:
         inner = False
         for key, child in module._modules.items():
             if child is not None:
@@ -188,16 +198,16 @@ def measure(component: Component) -> None:
         unit.nbytes = _bytes(tensor for *_, tensor in unit.slots())
 
 
-def _bind(module: Any, name: str, parameter: bool, tensor: Any) -> None:
+def _bind(module: Module, name: str, parameter: bool, tensor: Tensor) -> None:
     if parameter:
         module._parameters[name].data = tensor
     else:
         module._buffers[name] = tensor
 
 
-def to_device(torch: Any, unit: Unit, device: Any) -> int:
+def to_device(torch: Torch, unit: Unit, device: Device) -> int:
     """Copy a host unit to the device; its host copy stays for a free return. Bytes copied."""
-    moves: list[tuple[Any, str, bool, Any, Any]] = []
+    moves: list[tuple[Module, str, bool, Tensor, Tensor]] = []
     with torch.inference_mode(False), torch.no_grad():
         for module, name, parameter, tensor in list(unit.slots()):
             if tensor.device.type == device.type:
@@ -215,7 +225,7 @@ def to_device(torch: Any, unit: Unit, device: Any) -> int:
     return sum(placed.numel() * placed.element_size() for *_, placed in moves)
 
 
-def to_host(torch: Any, unit: Unit) -> int:
+def to_host(torch: Torch, unit: Unit) -> int:
     """Rebind a device unit to its host copy, copying back only what changed. Bytes copied."""
     copied = 0
     with torch.inference_mode(False), torch.no_grad():
@@ -238,7 +248,7 @@ def to_host(torch: Any, unit: Unit) -> int:
     return copied
 
 
-def to_disk(torch: Any, component: Component, unit: Unit | None) -> None:
+def to_disk(torch: Torch, component: Component, unit: Unit | None) -> None:
     """Drop one unit's bytes, or with None the whole component's, wherever they are."""
     store = component.store
     if store is None:
@@ -262,7 +272,7 @@ def to_disk(torch: Any, component: Component, unit: Unit | None) -> None:
         each.tier = DISK
 
 
-def from_disk(torch: Any, component: Component, unit: Unit | None) -> None:
+def from_disk(torch: Torch, component: Component, unit: Unit | None) -> None:
     """Fill one unit, or with None the whole component, from the store onto the device; then
     apply the conversions a package made while it was on disk."""
     store = component.store
@@ -294,10 +304,10 @@ def install(
 ) -> None:
     """A block loads before its forward if it is absent, and a streamed block goes home after."""
 
-    def pre(unit: Unit, module: Any, args: Any) -> None:
+    def pre(unit: Unit, module: Module, args: object) -> None:
         enter(component, unit)
 
-    def post(unit: Unit, module: Any, args: Any, output: Any) -> None:
+    def post(unit: Unit, module: Module, args: object, output: object) -> None:
         leave(component, unit)
 
     for unit in component.blocks:
@@ -307,14 +317,14 @@ def install(
         component.hooks.append(unit.module.register_forward_hook(after, always_call=True))
 
 
-def intercept_apply(torch: Any, component: Component, applied: Callable[[], None]) -> None:
+def intercept_apply(torch: Torch, component: Component, applied: Callable[[], None]) -> None:
     """A package's `.to(dtype)` on the root converts the units on device and host now, and
     queues the conversion for units on disk, whose meta tensors keep the store's dtype. A
     device move (`.to(device)`, `.cuda()`, `.cpu()`) is the planner's to make, never a
     package's: only its dtype part is kept."""
     root = component.root
 
-    def _apply(fn: Callable[[Any], Any], recurse: bool = True) -> Any:
+    def _apply(fn: Convert, recurse: bool = True) -> Module:
         if component.moving or not recurse:
             return type(root)._apply(root, fn, recurse)
         probe = fn(torch.empty((), device="meta", dtype=torch.float16))
@@ -341,7 +351,7 @@ def intercept_apply(torch: Any, component: Component, applied: Callable[[], None
     root.__dict__["_apply"] = _apply
 
 
-def _cast(dtype: Any, tensor: Any) -> Any:
+def _cast(dtype: object, tensor: Tensor) -> Tensor:
     return tensor.to(dtype) if tensor.is_floating_point() else tensor
 
 
@@ -356,32 +366,36 @@ def release(component: Component) -> None:
             del component.root.__dict__[name]
 
 
-def wrap(root: Any, run: Callable[[str, Callable[..., Any], tuple[Any, ...], dict[str, Any]], Any]) -> None:
-    """Route the root's forward, encode and decode through `run`, keeping each signature."""
+def wrap(root: Module, run: Run) -> None:
+    """Route the root's forward, encode and decode through `run`, keeping each signature. A
+    forward someone replaced on the instance is wrapped too; ours is never wrapped twice."""
     for method in OP_METHODS:
-        bound = getattr(root, method, None)
-        if method not in vars(root) and callable(bound):
+        installed = vars(root).get(method)
+        if ours(installed):
+            continue
+        bound = installed if installed is not None else getattr(root, method, None)
+        if callable(bound):
             root.__dict__[method] = op(method, bound, run)
 
 
 def op(
     method: str,
-    bound: Callable[..., Any],
-    run: Callable[[str, Callable[..., Any], tuple[Any, ...], dict[str, Any]], Any],
-) -> Callable[..., Any]:
+    bound: Callable[..., object],
+    run: Run,
+) -> Callable[..., object]:
     @functools.wraps(bound)
-    def op(*args: Any, **kwargs: Any) -> Any:
+    def op(*args: object, **kwargs: object) -> object:
         return run(method, bound, args, kwargs)
 
     op.__cozy_op__ = True  # type: ignore[attr-defined]
     return op
 
 
-def ours(value: Any) -> bool:
+def ours(value: object) -> bool:
     return bool(getattr(value, "__cozy_op__", False) or getattr(value, "__cozy_pure__", False))
 
 
-def trim(torch: Any) -> None:
+def trim(torch: Torch) -> None:
     """Return cached device memory to the driver once every stream is idle."""
     torch.cuda.synchronize()
     torch.cuda.empty_cache()

@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author import ConformanceError, read_whole
 
 #: The forward-call selector: `attention_kwargs={ATTENTION_KWARG: TURBO_BANK}` names the bank
 #: one DiT forward serves. Absent, the forward is the base's, whatever overlay is attached.
@@ -72,9 +72,11 @@ class LoRAFactors(nn.Module):  # type: ignore[misc]
 
 
 class _LoRAHook:
-    """A permanent consumer hook, inactive for base forwards."""
+    """A permanent consumer hook, inactive for base forwards. It adds its update to the
+    output the forward just made, so a forward run again is updated again, once."""
 
     __slots__ = ("owner", "path")
+    __cozy_pure__ = True
 
     def __init__(self, owner: Any, path: str) -> None:
         self.owner = owner
@@ -187,6 +189,9 @@ class TurboOverlay(nn.Module):  # type: ignore[misc]
         final_table_dtype: torch.dtype,
     ) -> None:
         super().__init__()
+        # The trunk DiT reads these tables and heads directly, never through this module's
+        # forward: they stay whole on the device while a method declaring them runs.
+        read_whole(self)
         scale = alpha / rank
 
         def factors(in_features: int, out_features: int) -> LoRAFactors:
