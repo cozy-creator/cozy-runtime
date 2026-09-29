@@ -52,6 +52,16 @@ func newClaims(workerID, bootID string, leafDigest []byte, authorized []ed25519.
 	return c, nil
 }
 
+func (c *claims) useOwn(own ed25519.PrivateKey) error {
+	c.own = own
+	proof, err := c.transcript(runtimeOwnerEpoch)
+	if err != nil {
+		return err
+	}
+	c.claim = &pb.Claim{RecordOwnerEpoch: runtimeOwnerEpoch, RecordOwnerId: runtimeOwnerID, WorkerId: c.workerID, WorkerBootId: c.bootID, WireMinor: pb.WireMinor, Proof: ed25519.Sign(own, proof)}
+	return nil
+}
+
 // ownKey is the public half the Runtime verifies the daemon's Claim against.
 func (c *claims) ownKey() string {
 	return base64.RawURLEncoding.EncodeToString(c.own.Public().(ed25519.PublicKey))

@@ -84,11 +84,13 @@ func (l *lastWords) last() string {
 }
 
 type directLauncher struct {
-	path, root string // the Runtime entrypoint and the machine root
-	env        []string
-	out        io.Writer
-	mu         sync.Mutex
-	current    *runtimeProcess
+	replacement     string // next application selected by a stopped-runtime handoff
+	agentExecutable string // parent-held descriptor naming the running application ELF
+	path, root      string // the Runtime entrypoint and the machine root
+	env             []string
+	out             io.Writer
+	mu              sync.Mutex
+	current         *runtimeProcess
 }
 
 func (d *directLauncher) close() {}
@@ -114,7 +116,33 @@ func (d *directLauncher) maintain(op string, args []string) (string, error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return maintain(d.root, d.current, op, args)
+	if op == "agent-replace" {
+		if d.current != nil && !d.current.exited() {
+			return "", errors.New("agent replacement requires a guarded stopped Runtime")
+		}
+		if len(args) < 1 {
+			return "", errors.New("current application identity required")
+		}
+		m := &Machine{layout: NewLayout(&Grant{Root: d.root})}
+		restored := len(args) == 2 && args[1] == "rollback"
+		if !restored && !m.transactionPending() && m.transactionAgent() == "explicit" {
+			return "", nil
+		}
+		selected := m.selectedApplication()
+		if restored {
+			selected = m.restoredApplication()
+		}
+		hash, err := hashFile(selected)
+		if err != nil {
+			return "", err
+		}
+		if hash == args[0] {
+			return "", nil
+		}
+		d.replacement = selected
+		return "replace", nil
+	}
+	return maintainWithAgent(d.root, d.current, op, args, d.agentExecutable)
 }
 
 func (d *directLauncher) launch(incarnation string) (*runtimeProcess, error) {
@@ -425,7 +453,9 @@ func (g *guardianLauncher) maintain(op string, args []string) (string, error) {
 
 func (g *guardianLauncher) close() {
 	g.control.Close()
-	_ = waitChild(g.cmd)
+	if g.cmd != nil {
+		_ = waitChild(g.cmd)
+	}
 }
 
 type guardianProcesses struct {
@@ -478,6 +508,18 @@ func RunGuardian(args []string) int {
 	direct := &directLauncher{path: args[1], root: args[2], env: os.Environ(), out: os.Stderr}
 	adoptOrphans()
 	processes := &guardianProcesses{}
+	err := serveGuardianCommands(control, direct, processes, report)
+	processes.stop("")()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cozy machine: guardian control stream failed:", err)
+		return 1
+	}
+	return 0
+}
+
+func serveGuardianCommands(control io.Reader, direct *directLauncher, processes *guardianProcesses, report func(guardianStatus)) error {
+	var ops sync.WaitGroup
+	defer ops.Wait()
 	scanner := bufio.NewScanner(control)
 	scanner.Buffer(make([]byte, 64<<10), maxGuardianFrameBytes)
 	for scanner.Scan() {
@@ -507,7 +549,9 @@ func RunGuardian(args []string) int {
 			stop := processes.stop(c.Incarnation)
 			go stop()
 		default:
+			ops.Add(1)
 			go func(c guardianCommand) {
+				defer ops.Done()
 				answer, err := direct.maintain(c.Op, c.Args)
 				s := guardianStatus{Phase: "maintained", Answer: answer}
 				if err != nil {
@@ -521,12 +565,7 @@ func RunGuardian(args []string) int {
 			}(c)
 		}
 	}
-	processes.stop("")()
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, "cozy machine: guardian control stream failed:", err)
-		return 1
-	}
-	return 0
+	return scanner.Err()
 }
 
 type runtimeExit struct {

@@ -12,6 +12,9 @@ import (
 )
 
 func main() {
+	if host.RequestPlaneProcess(os.Args[0]) {
+		os.Exit(host.RunRequestPlane(os.Stderr))
+	}
 	if host.GuardianProcess(os.Args[0]) {
 		os.Exit(host.RunGuardian(os.Args))
 	}

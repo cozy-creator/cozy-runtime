@@ -22,7 +22,10 @@ import (
 // gives it. Only the names read here matter; any other is logged and ignored, so a newer Hub
 // cannot stop an older machine from booting.
 type Grant struct {
+	agentBefore    string
+	agentSelection string
 	startupPending bool
+	bootstrap      *bootstrapChild
 	Lifetime       string // persistent (standalone) or rental (provider-owned allocation)
 	Root           string // COZY_MACHINE_ROOT; the image layout is rooted here
 	StoreRoot      string // COZY_TENSORFS_ROOT; empty keeps <root>/var/lib/tensorfs

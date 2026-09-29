@@ -27,7 +27,21 @@ func Main(log io.Writer) int {
 	g.inherited = inherited(environ)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := Run(ctx, g, log); err != nil && !errors.Is(err, context.Canceled) {
+	if err := RunBootstrap(ctx, g, log); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintln(log, "cozy-machine:", err)
+		return 1
+	}
+	return 0
+}
+
+func runGranted(g *Grant, log io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	err := Run(ctx, g, log)
+	if err == nil {
+		return releasedAgentExit
+	}
+	if !errors.Is(err, context.Canceled) {
 		fmt.Fprintln(log, "cozy-machine:", err)
 		return 1
 	}

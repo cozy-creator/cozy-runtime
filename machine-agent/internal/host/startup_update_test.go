@@ -94,29 +94,19 @@ func TestStartupCommitRequiresItsLiveIncarnation(t *testing.T) {
 	}
 }
 
-func TestExplicitRemoteWheelPinAppliesOnlyToItsInstalledPair(t *testing.T) {
-	m := &Machine{layout: NewLayout(&Grant{Root: t.TempDir()})}
-	pair := pairVersions{Runtime: "0.18.86", TensorFS: "0.3.78"}
-	if !(updateStatus{State: "rolled_back", From: pair, PreviouslyPinned: true}).pins(pair) {
-		t.Fatal("failed maintenance erased the prior explicit selection")
-	}
-	for _, row := range []struct {
-		state     string
-		pinned    bool
-		installed pairVersions
-		want      bool
-	}{
-		{"succeeded", true, pair, true}, {"succeeded", false, pair, false}, {"failed", true, pair, false}, {"succeeded", true, pairVersions{Runtime: "0.18.87", TensorFS: "0.3.78"}, false},
-	} {
-		raw, err := json.Marshal(updateStatus{State: row.state, Pinned: row.pinned, To: pair})
-		if err != nil {
+func TestOperatorPolicyOverridesHistoricalPin(t *testing.T) {
+	m := &Machine{layout: NewLayout(&Grant{Root: t.TempDir()}), log: io.Discard}
+	pair := pairVersions{Runtime: "0.18.88", TensorFS: "0.3.78"}
+	for _, mode := range []string{"auto", "off", "auto"} {
+		raw, _ := json.Marshal(softwarePolicy{mode, "bundled"})
+		if err := writeAtomic(policyPath(m.layout.Root), raw, 0644); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeAtomic(m.updatePath(), raw, 0600); err != nil {
+		if err := m.startupSave(startupStatus{State: "succeeded", After: pair, Pinned: mode == "auto"}); err != nil {
 			t.Fatal(err)
 		}
-		if got := m.explicitlyPinnedPair(row.installed); got != row.want {
-			t.Fatalf("pin %s/%v: %v", row.state, row.pinned, got)
+		if got := m.explicitlyPinnedPair(pair); got != (mode == "off") {
+			t.Fatalf("operator mode %s overridden by historical journal", mode)
 		}
 	}
 }
@@ -257,10 +247,18 @@ func TestAutomaticAndExplicitUpdatesShareRecoveryAndCommit(t *testing.T) {
 			}
 			executable(t, filepath.Join(root, "opt/cozy/python/bin/python"), fmt.Sprintf(`case "$4" in
  inspect) echo '{"runtime":"0.18.86","tensorfs":"0.3.78","eligible":true,"quiescent":true,"workspace_id":"original"}' ;;
+ dependencies) echo '[]' ;;
  probe) if [ -n "$5" ]; then cat '%s/after.json'; else cat '%s/current.json'; fi ;;
  *) printf '0.18.86\n0.3.78\n' ;;
  esac`, root, root))
-			executable(t, filepath.Join(root, "bundled-agent"), fmt.Sprintf(`echo '{"name":"cozy-machine","wire_minor":%d,"minimum_wire_minor":%d,"capabilities":["hub-access/1","runtime-update/1"]}'`, pb.WireMinor, pb.MinCompatibleWireMinor))
+			executable(t, filepath.Join(root, "bundled-agent"), fmt.Sprintf(`echo '{"name":"cozy-machine","wire_minor":%d,"minimum_wire_minor":%d,"capabilities":["hub-access/1","runtime-update/1","machine-bootstrap/1"]}'`, pb.WireMinor, pb.MinCompatibleWireMinor))
+			body, err := os.ReadFile(filepath.Join(root, "bundled-agent"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(filepath.Join(root, "opt/cozy/python/bin/cozy-machine"), body, 0755); err != nil {
+				t.Fatal(err)
+			}
 			executable(t, filepath.Join(root, "usr/local/bin/uv"), fmt.Sprintf(`case "$*" in
  *--target*)
  for value in "$@"; do
@@ -271,7 +269,7 @@ func TestAutomaticAndExplicitUpdatesShareRecoveryAndCommit(t *testing.T) {
  *) cp '%s/before.json' '%s/current.json' ;;
  esac`, root, root, root, root, root))
 			if explicit {
-				request, _ := json.Marshal(pairTransaction{Before: before, After: after, Previous: previous, Candidate: candidate, Store: m.layout.Store, Lifetime: "persistent", Pin: true})
+				request, _ := json.Marshal(pairTransaction{Before: before, After: after, Previous: previous, Candidate: candidate, Store: m.layout.Store, Lifetime: "persistent", Pin: true, Agent: "bundled"})
 				answer, err := maintain(root, nil, "update-prepare", []string{string(request)})
 				if err != nil || answer != "boot_pending" {
 					t.Fatalf("explicit preparation: %s %v", answer, err)
@@ -384,7 +382,7 @@ func TestCandidateBundleRequiresContractsWithoutReleaseNumberGate(t *testing.T) 
 		ok   bool
 	}{
 		{`["runtime-update/1"]`, false},
-		{`["hub-access/1","runtime-update/1","future/2"]`, true},
+		{`["hub-access/1","runtime-update/1","machine-bootstrap/1","future/2"]`, true},
 	} {
 		executable(t, binary, fmt.Sprintf(`echo '{"name":"cozy-machine","version":"future.dev","wire_minor":%d,"minimum_wire_minor":%d,"capabilities":%s}'`, pb.WireMinor, pb.MinCompatibleWireMinor, row.caps))
 		if err := m.verifyBundledAgent(context.Background(), overlay); (err == nil) != row.ok {
@@ -463,27 +461,16 @@ func TestDefaultHelpersDoNotInheritAgentCredentials(t *testing.T) {
 	}
 }
 
-func TestDefaultSelectionUnpinsDespiteStaleRequestReport(t *testing.T) {
-	m := &Machine{layout: NewLayout(&Grant{Root: t.TempDir()}), log: io.Discard}
-	pair := pairVersions{Runtime: "0.18.88", TensorFS: "0.3.78"}
-	// Default-latest commit is authoritative even if a prior observer report still
-	// describes the same versions as explicitly pinned.
-	raw, _ := json.Marshal(updateStatus{Operation: "old", State: "succeeded", To: pair, Pinned: true})
-	if err := writeAtomic(m.updatePath(), raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	for _, pin := range []bool{false, true} {
-		if err := m.startupSave(startupStatus{State: "succeeded", After: pair, Pinned: pin}); err != nil {
-			t.Fatal(err)
+func TestCandidatePairUsesCandidateWireRange(t *testing.T) {
+	root := t.TempDir()
+	m := &Machine{layout: NewLayout(&Grant{Root: root})}
+	agent := fmt.Sprintf(`echo '{"name":"cozy-machine","wire_minor":%d,"minimum_wire_minor":%d,"capabilities":["hub-access/1","runtime-update/1","machine-bootstrap/1"]}'`, pb.WireMinor+20, pb.WireMinor+10)
+	executable(t, filepath.Join(root, "opt/cozy/python/bin/cozy-machine"), agent)
+	for _, floor := range []uint32{pb.WireMinor + 10, pb.WireMinor + 21} {
+		executable(t, filepath.Join(root, "opt/cozy/python/bin/python"), fmt.Sprintf(`echo '{"runtime":"0.18.88","tensorfs":"0.3.78","wire_minor":%d,"minimum_wire_minor":%d,"capabilities":["machine-supervisor/1","machine-public-reads/1"]}'`, pb.WireMinor+22, floor))
+		_, err := m.startupVerify(context.Background())
+		if (err == nil) != (floor == pb.WireMinor+10) {
+			t.Fatalf("candidate range floor=%d: %v", floor, err)
 		}
-		if got := m.explicitlyPinnedPair(pair); got != pin {
-			t.Fatalf("committed pin=%v reported %v", pin, got)
-		}
-	}
-	if err := m.startupSave(startupStatus{State: "rolled_back", Before: pair, PreviouslyPinned: true}); err != nil {
-		t.Fatal(err)
-	}
-	if !m.explicitlyPinnedPair(pair) {
-		t.Fatal("failed default selection removed the prior pin")
 	}
 }

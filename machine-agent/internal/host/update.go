@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/build"
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/capability"
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/hostruntime"
 )
@@ -52,6 +53,7 @@ type wheelChoice struct {
 
 type updateRequest struct {
 	Operation string       `json:"operation"`
+	Agent     string       `json:"agent"`
 	Pin       *bool        `json:"pin"`
 	Runtime   *wheelChoice `json:"runtime,omitempty"`
 	TensorFS  *wheelChoice `json:"tensorfs,omitempty"`
@@ -76,13 +78,6 @@ func (s updateStatus) terminal() bool {
 	return s.State == "succeeded" || s.State == "rolled_back" || s.State == "failed"
 }
 
-func (s updateStatus) pins(pair pairVersions) bool {
-	if s.State == "succeeded" {
-		return s.Pinned && s.To == pair
-	}
-	return s.PreviouslyPinned && s.From == pair
-}
-
 type runtimeUpdates struct {
 	mu     sync.Mutex
 	status *updateStatus
@@ -104,8 +99,14 @@ func (m *Machine) stagePath(names ...string) string {
 func (m *Machine) openUpdates() {
 	var status updateStatus
 	if raw, err := os.ReadFile(m.updatePath()); err == nil && json.Unmarshal(raw, &status) == nil {
-		if !status.terminal() {
+		if !status.terminal() && (m.grant.bootstrap == nil || !m.grant.bootstrap.Pending) {
 			status.State, status.Error = "failed", "the machine restarted during its Runtime update; installation recovery runs before admission"
+			if m.grant.bootstrap != nil && m.grant.bootstrap.CommittedPair != nil && *m.grant.bootstrap.CommittedPair == status.To {
+				status.State, status.Error = "succeeded", ""
+			}
+			if m.grant.bootstrap != nil && m.grant.bootstrap.RolledBack {
+				status.State, status.Error = "rolled_back", "candidate request plane exited; previous installation restored"
+			}
 			m.saveUpdate(status)
 		}
 		m.updates.status = &status
@@ -170,6 +171,18 @@ func (m *Machine) serveRuntimeState(w http.ResponseWriter, r *http.Request) {
 	m.updates.mu.Unlock()
 	answer := map[string]any{"capabilities": []string{UpdateCapability}, "runtime": installed.Runtime,
 		"tensorfs": installed.TensorFS, "update": status, "phase": m.phase()}
+	digest, _ := hashFile("/proc/self/exe")
+	selection := "explicit"
+	if bundledAgentPolicy(m.layout.Root) {
+		selection = "bundled"
+	}
+	if m.grant.bootstrap != nil {
+		if m.startupPending() {
+			selection = m.grant.bootstrap.Selection
+		}
+		answer["bootstrap"] = map[string]any{"abi": bootstrapABI, "version": m.grant.bootstrap.BootstrapVersion, "update_boundary": "image-or-service-bootstrap"}
+	}
+	answer["agent"] = map[string]any{"version": build.Version, "sha256": digest, "selection": selection, "capabilities": build.Capabilities()}
 	var startup startupStatus
 	if raw, err := os.ReadFile(filepath.Join(m.layout.State, "startup-update-status.json")); err == nil && json.Unmarshal(raw, &startup) == nil {
 		answer["startup_update"] = startup
@@ -246,7 +259,7 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var request updateRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&request); err != nil || !operationName.MatchString(request.Operation) ||
-		request.Pin == nil || request.Runtime == nil && request.TensorFS == nil {
+		request.Pin == nil || (request.Agent != "bundled" && request.Agent != "explicit") || request.Runtime == nil && request.TensorFS == nil {
 		http.Error(w, "an update requires operation, a boolean pin decision, and a Runtime or TensorFS", http.StatusBadRequest)
 		return
 	}
@@ -285,7 +298,7 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	pinned := *request.Pin
 	status := updateStatus{Operation: request.Operation, State: "waiting", From: installed, Pinned: pinned}
-	status.PreviouslyPinned = current != nil && current.pins(installed)
+	status.PreviouslyPinned = m.explicitlyPinnedPair(installed)
 	if err := m.writeUpdate(status); err != nil {
 		http.Error(w, "cannot record the Runtime update: "+err.Error(), http.StatusServiceUnavailable)
 		return
@@ -351,7 +364,7 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 	}
 	status.State = "installing"
 	m.saveUpdate(status)
-	payload, _ := json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned})
+	payload, _ := json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned, Agent: request.Agent})
 	answer, err := m.launcher.maintain("update-prepare", []string{string(payload)})
 	if err != nil || answer != "boot_pending" {
 		if err == nil {
@@ -370,7 +383,10 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 	m.mu.Lock()
 	m.grant.startupPending = true
 	m.mu.Unlock()
-	err = m.launch()
+	err = m.replaceApplication()
+	if err == nil {
+		err = m.launch()
+	}
 	if err == nil {
 		m.mu.Lock()
 		p, ready := m.proc, m.ready

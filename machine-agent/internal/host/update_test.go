@@ -118,7 +118,7 @@ func postUpdate(server *httptest.Server, token, operation string, choice *wheelC
 		choice = &wheelChoice{Version: "0.18.87"}
 	}
 	pin := true
-	raw, _ := json.Marshal(updateRequest{Operation: operation, Runtime: choice, Pin: &pin})
+	raw, _ := json.Marshal(updateRequest{Operation: operation, Runtime: choice, Pin: &pin, Agent: "bundled"})
 	return updateCall(server.Client(), http.MethodPost, server.URL+"/v1/machine/runtime/update", token, bytes.NewReader(raw))
 }
 
@@ -162,7 +162,7 @@ func TestRuntimeUpdateConcurrentAdmissionAndStaging(t *testing.T) {
 	replies := make(chan updateReply, callers)
 	for n := range callers {
 		go func() {
-			raw := fmt.Sprintf(`{"operation":"update-%d","pin":false,"runtime":{"version":"0.18.87"}}`, n)
+			raw := fmt.Sprintf(`{"operation":"update-%d","pin":false,"agent":"bundled","runtime":{"version":"0.18.87"}}`, n)
 			replies <- updateCall(server.Client(), http.MethodPost, server.URL+"/v1/machine/runtime/update?concurrent=1", token, strings.NewReader(raw))
 		}()
 	}
@@ -394,7 +394,7 @@ func TestNativeUpdateRequiresExplicitPinIntent(t *testing.T) {
 			m.launcher = &updateLauncher{pairReady: gate}
 			server := httptest.NewServer(mux)
 			defer server.Close()
-			body := `{"operation":"pin-proof","runtime":{"version":"0.18.87"}`
+			body := `{"operation":"pin-proof","agent":"bundled","runtime":{"version":"0.18.87"}`
 			if decision != "omitted" {
 				body += `,"pin":` + decision
 			}

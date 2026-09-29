@@ -48,6 +48,10 @@ func (m *Machine) listen() (*listeners, error) {
 	if mediaPort == 0 {
 		mediaHost = "127.0.0.1"
 	}
+	if m.grant.bootstrap != nil {
+		_, port, _ := net.SplitHostPort(m.grant.bootstrap.MediaAddr)
+		mediaPort, _ = strconv.Atoi(port)
+	}
 	media, err := listen(mediaHost, mediaPort)
 	if err != nil {
 		endpoint.Close()

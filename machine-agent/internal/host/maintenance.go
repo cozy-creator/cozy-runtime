@@ -26,6 +26,9 @@ import (
 
 // maintain runs one op against the machine rooted at root; p is its current Runtime.
 func maintain(root string, p *runtimeProcess, op string, args []string) (string, error) {
+	return maintainWithAgent(root, p, op, args, "")
+}
+func maintainWithAgent(root string, p *runtimeProcess, op string, args []string, runningAgent string) (string, error) {
 	switch op {
 	case "update-prepare":
 		if p != nil && !p.exited() || len(args) != 1 {
@@ -35,7 +38,11 @@ func maintain(root string, p *runtimeProcess, op string, args []string) (string,
 		if err := json.Unmarshal([]byte(args[0]), &request); err != nil {
 			return "", err
 		}
-		grant := &Grant{Root: root, StoreRoot: request.Store, Lifetime: request.Lifetime}
+		previousAgent, err := retainApplication(root, runningAgent)
+		if err != nil {
+			return "", err
+		}
+		grant := &Grant{Root: root, StoreRoot: request.Store, Lifetime: request.Lifetime, agentSelection: request.Agent, agentBefore: previousAgent}
 		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
 		unlock, err := lockStartupWorker(root)
 		if err != nil {
@@ -56,6 +63,13 @@ func maintain(root string, p *runtimeProcess, op string, args []string) (string,
 			}
 		}
 		status.Workspace = state.Workspace
+		mode := "auto"
+		if request.Pin {
+			mode = "off"
+		}
+		if err := m.snapshotPolicy(&status, &softwarePolicy{mode, request.Agent}); err != nil {
+			return "", err
+		}
 		if err := m.preparePair(context.Background(), request.Before, request.After, request.Candidate, request.Previous, status, request.Pin); err != nil {
 			if m.transactionPending() {
 				return "recovery_required", err
@@ -70,7 +84,11 @@ func maintain(root string, p *runtimeProcess, op string, args []string) (string,
 		if p != nil && !p.exited() || len(args) != 2 {
 			return "", errors.New("startup preparation requires a stopped Runtime and its machine policy")
 		}
-		grant := &Grant{Root: root, Lifetime: args[0], StoreRoot: args[1]}
+		previousAgent, err := retainApplication(root, runningAgent)
+		if err != nil {
+			return "", err
+		}
+		grant := &Grant{Root: root, Lifetime: args[0], StoreRoot: args[1], agentBefore: previousAgent}
 		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
 		if err := m.startupUpdate(context.Background()); err != nil {
 			return "", err
@@ -214,7 +232,7 @@ func wheelVersion(file string) string {
 	return parts[1]
 }
 
-// installPair replaces the pair in opt/cozy/python: exactly these wheels, nothing resolved.
+// installPair installs the pair and its explicit additive closure: exactly these wheels, no resolution.
 func installPair(root string, wheels []string) error {
 	if len(wheels) == 0 {
 		return errors.New("no wheels to install")

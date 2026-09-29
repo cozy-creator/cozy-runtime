@@ -71,7 +71,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	}
 
 	layout := NewLayout(g)
-	lease, err := lockMachine(layout.State)
+	lease, err := requestPlaneLease(g, layout.State)
 	if err != nil {
 		return err
 	}
@@ -79,7 +79,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	if err := lease.watchRoot(layout.Root); err != nil {
 		return err
 	}
-	id, err := prepare(g, layout)
+	id, err := requestPlaneIdentity(g, layout)
 	if err != nil {
 		return err
 	}
@@ -98,8 +98,13 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if g.bootstrap != nil {
+		if err := c.useOwn(g.bootstrap.Own); err != nil {
+			return err
+		}
+	}
 	now := time.Now()
-	state, err := openIdle(filepath.Join(layout.State, "idle.json"), rec.retained == nil, now)
+	state, err := openIdle(filepath.Join(layout.State, "idle.json"), rec.retained == nil && (g.bootstrap == nil || !g.bootstrap.Resume), now)
 	if err != nil {
 		return err
 	}
@@ -113,14 +118,16 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 		}
 	}
 	state.persistent = m.owned
-	if m.owned {
+	if m.owned && (g.bootstrap == nil || !g.bootstrap.Resume) {
 		if err := state.reset(now); err != nil {
 			return err
 		}
 	}
 	m.openUpdates()
 	m.tfs = &tensorFS{bin: layout.TFS, store: layout.Store, repoCache: g.RepoCacheRoot}
-	if m.childAddr, err = freeLoopback(); err != nil {
+	if g.bootstrap != nil {
+		m.childAddr = g.bootstrap.ChildAddr
+	} else if m.childAddr, err = freeLoopback(); err != nil {
 		return err
 	}
 	if err := lease.check(); err != nil {
@@ -151,16 +158,33 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	}
 	defer m.launcher.close()
 	// The privileged guardian prepares software after the network agent drops root.
-	startup, startupErr := m.launcher.maintain("startup-prepare", []string{g.Lifetime, layout.Store})
+	startup, startupErr := m.prepareApplication()
 	m.mu.Lock()
 	g.startupPending = startup == "boot_pending"
 	m.mu.Unlock()
 	m.setUpdating(m.startupPending())
+	if startupErr == nil && (g.bootstrap == nil || g.bootstrap.Incarnation == "") {
+		if err := m.replaceApplication(); err != nil {
+			startupErr = err
+		}
+	}
 	if err := lease.check(); err != nil {
 		return err
 	}
 	m.launchMu.Lock() // initial boot shares update/supervisor launch admission
-	if startupErr != nil {
+	if g.bootstrap != nil && g.bootstrap.Incarnation != "" {
+		g := m.launcher.(*guardianLauncher)
+		g.mu.Lock()
+		m.proc = g.current
+		g.mu.Unlock()
+		m.setUpdating(false)
+		if m.proc != nil {
+			if err := m.loadRuntimeCapabilities(); err != nil {
+				fmt.Fprintln(m.log, "cozy machine: retained Runtime capabilities:", err)
+			}
+			go m.claimRuntime(m.proc)
+		}
+	} else if startupErr != nil {
 		m.restarts.fail(&launchRefusal{"runtime_update_recovery_required", startupErr.Error()})
 	} else if err := m.tfs.initStore(ctx); err != nil {
 		if m.startupPending() {
@@ -187,10 +211,14 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	go func() { errs <- m.supervise(ctx) }()
 	select {
 	case err := <-errs:
-		m.stopRuntime()
+		if g.bootstrap == nil {
+			m.stopRuntime()
+		}
 		return err
 	case err := <-listeners.failed:
-		m.stopRuntime()
+		if g.bootstrap == nil {
+			m.stopRuntime()
+		}
 		return err
 	}
 }
@@ -239,6 +267,9 @@ func (m *Machine) runtimeEnvironment() []string {
 // prepareLauncher readies Runtime launches. A root machine starts its guardian and then
 // becomes the machine uid; everything after this runs unprivileged.
 func (m *Machine) prepareLauncher() error {
+	if m.grant.bootstrap != nil {
+		return m.adoptBootstrap()
+	}
 	env := m.runtimeEnvironment()
 	m.words = &lastWords{Writer: m.log}
 	if os.Geteuid() == 0 {
@@ -270,7 +301,7 @@ func (m *Machine) prepareLauncher() error {
 
 // launch is called under launchMu by the supervisor, or while an update owns
 // inUpdate after acquiring that same lock in quiesce.
-func (m *Machine) launch() error {
+func (m *Machine) loadRuntimeCapabilities() error {
 	raw, err := m.launcher.maintain("capabilities", nil)
 	if err != nil {
 		return err
@@ -284,6 +315,13 @@ func (m *Machine) launch() error {
 	m.mu.Lock()
 	m.runtimeCaps = advertised.Capabilities
 	m.mu.Unlock()
+	return nil
+}
+
+func (m *Machine) launch() error {
+	if err := m.loadRuntimeCapabilities(); err != nil {
+		return err
+	}
 	// The payload is this launch's readiness: an earlier Runtime's must not stand for it.
 	if err := os.Remove(m.layout.boot("readiness-payload")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err

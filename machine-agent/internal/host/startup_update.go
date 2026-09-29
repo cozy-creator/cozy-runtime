@@ -16,7 +16,6 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/build"
-	pb "github.com/cozy-creator/cozy-runtime/machine-agent/protocol/cozy/worker/v1"
 )
 
 //go:embed startup_update.py
@@ -32,6 +31,7 @@ type softwareState struct {
 
 type pairTransaction struct {
 	Pin                 bool
+	Agent               string
 	Before, After       pairVersions
 	Candidate, Previous []string
 	Store, Lifetime     string
@@ -44,9 +44,37 @@ type startupProbe struct {
 	Capabilities     []string `json:"capabilities"`
 }
 
+type agentIdentity struct {
+	Name             string   `json:"name"`
+	WireMinor        uint32   `json:"wire_minor"`
+	MinimumWireMinor uint32   `json:"minimum_wire_minor"`
+	Capabilities     []string `json:"capabilities"`
+}
+
 func (m *Machine) startupVerify(ctx context.Context, overlay ...string) (pairVersions, error) {
-	if len(overlay) != 0 {
-		if err := m.verifyBundledAgent(ctx, overlay[0]); err != nil {
+	var agent agentIdentity
+	selection := m.transactionAgent()
+	if m.grant != nil && m.grant.agentSelection != "" {
+		selection = m.grant.agentSelection
+	}
+	if selection == "bundled" {
+		location := filepath.Join(m.layout.Root, "opt/cozy/python")
+		if len(overlay) > 0 {
+			location = overlay[0]
+		}
+		var err error
+		agent, err = m.bundledIdentity(ctx, location)
+		if err != nil {
+			return pairVersions{}, err
+		}
+	} else {
+		path := m.selectedApplication()
+		if m.grant != nil && m.grant.agentBefore != "" {
+			path = m.grant.agentBefore
+		}
+		var err error
+		agent, err = m.readAgentIdentity(ctx, path)
+		if err != nil {
 			return pairVersions{}, err
 		}
 	}
@@ -54,39 +82,40 @@ func (m *Machine) startupVerify(ctx context.Context, overlay ...string) (pairVer
 	if err := m.startupPython(ctx, &probe, append([]string{"probe"}, overlay...)...); err != nil {
 		return pairVersions{}, err
 	}
-	if probe.WireMinor < pb.MinCompatibleWireMinor || probe.MinimumWireMinor > pb.WireMinor || !slices.Contains(probe.Capabilities, "machine-supervisor/1") || !slices.Contains(probe.Capabilities, "machine-public-reads/1") {
-		return pairVersions{}, errors.New("Runtime does not implement this agent's supported protocol/capabilities")
+	if probe.WireMinor < agent.MinimumWireMinor || probe.MinimumWireMinor > agent.WireMinor || !slices.Contains(probe.Capabilities, "machine-supervisor/1") || !slices.Contains(probe.Capabilities, "machine-public-reads/1") {
+		return pairVersions{}, errors.New("Runtime does not implement the selected agent's supported protocol/capabilities")
 	}
 	return probe.pairVersions, nil
 }
 
-// Every default update carries the next boot's agent. Its advertised contracts
-// and protocol range are checked before uv can replace the installed pair.
-func (m *Machine) verifyBundledAgent(ctx context.Context, overlay string) error {
-	cmd := exec.CommandContext(ctx, filepath.Join(overlay, "bin/cozy-machine"), "version", "--json")
+func (m *Machine) bundledIdentity(ctx context.Context, overlay string) (agentIdentity, error) {
+	return m.readAgentIdentity(ctx, filepath.Join(overlay, "bin/cozy-machine"))
+}
+func (m *Machine) readAgentIdentity(ctx context.Context, path string) (agentIdentity, error) {
+	cmd := exec.CommandContext(ctx, path, "version", "--json")
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + filepath.Join(m.layout.Root, "tmp")}
 	raw, err := progressChildOutput(cmd, false)
+	var identity agentIdentity
 	if err != nil {
-		return fmt.Errorf("candidate Runtime requires a working bundled machine agent: %w", err)
+		return identity, fmt.Errorf("candidate Runtime requires a working bundled machine agent: %w", err)
 	}
-	var identity struct {
-		Name             string   `json:"name"`
-		WireMinor        uint32   `json:"wire_minor"`
-		MinimumWireMinor uint32   `json:"minimum_wire_minor"`
-		Capabilities     []string `json:"capabilities"`
+	if err = json.Unmarshal(raw, &identity); err != nil {
+		return identity, err
 	}
-	if err := json.Unmarshal(raw, &identity); err != nil {
-		return fmt.Errorf("candidate bundled agent identity: %w", err)
+	if identity.Name != "cozy-machine" || identity.MinimumWireMinor > identity.WireMinor {
+		return identity, errors.New("candidate bundled agent has invalid identity or wire range")
 	}
-	if identity.Name != "cozy-machine" || identity.WireMinor < pb.MinCompatibleWireMinor || identity.MinimumWireMinor > pb.WireMinor {
-		return errors.New("candidate bundled agent has an unsupported identity or wire range")
-	}
-	for _, required := range build.Capabilities() {
+	for _, required := range []string{"hub-access/1", "runtime-update/1", bootstrapABI} {
 		if !slices.Contains(identity.Capabilities, required) {
-			return fmt.Errorf("candidate bundled agent lacks %s", required)
+			return identity, fmt.Errorf("candidate bundled agent lacks %s", required)
 		}
 	}
-	return nil
+	return identity, nil
+}
+
+func (m *Machine) verifyBundledAgent(ctx context.Context, overlay string) error {
+	_, err := m.bundledIdentity(ctx, overlay)
+	return err
 }
 
 type startupWheel struct {
@@ -94,11 +123,19 @@ type startupWheel struct {
 }
 
 type startupStatus struct {
-	Workspace        string `json:"workspace,omitempty"`
-	Pinned           bool   `json:"pinned,omitempty"`
-	PreviouslyPinned bool   `json:"previously_pinned,omitempty"`
-	State            string `json:"state"` // installing | succeeded | rolled_back | skipped
-	Detail           string `json:"detail,omitempty"`
+	Dependencies     []dependencyWheel `json:"dependencies,omitempty"`
+	EntryAfter       string            `json:"entry_after,omitempty"`
+	AgentBefore      string            `json:"agent_before,omitempty"`
+	PolicyBefore     []byte            `json:"policy_before,omitempty"`
+	PolicyAfter      *softwarePolicy   `json:"policy_after,omitempty"`
+	EntryBefore      string            `json:"entry_before,omitempty"`
+	EntryFile        bool              `json:"entry_file,omitempty"`
+	EntryMissing     bool              `json:"entry_missing,omitempty"`
+	Workspace        string            `json:"workspace,omitempty"`
+	Pinned           bool              `json:"pinned,omitempty"`
+	PreviouslyPinned bool              `json:"previously_pinned,omitempty"`
+	State            string            `json:"state"` // installing | succeeded | rolled_back | skipped
+	Detail           string            `json:"detail,omitempty"`
 	Before, After    pairVersions
 	Previous         []startupWheel `json:"previous,omitempty"`
 	Failed           []pairVersions `json:"failed,omitempty"`
@@ -160,19 +197,9 @@ func hashFile(path string) (string, error) {
 
 // A successful explicit maintenance selection owns its particular installed pair.
 // This file can only defer discovery; it never authorizes privileged mutation.
-func (m *Machine) explicitlyPinnedPair(installed pairVersions) bool {
-	var transaction startupStatus
-	if raw, err := os.ReadFile(m.startupPath("status.json")); err == nil && json.Unmarshal(raw, &transaction) == nil {
-		if transaction.State == "succeeded" && transaction.After == installed {
-			return transaction.Pinned
-		}
-		if transaction.State == "rolled_back" && transaction.Before == installed {
-			return transaction.PreviouslyPinned
-		}
-	}
-	var previous updateStatus
-	raw, err := os.ReadFile(m.updatePath())
-	return err == nil && json.Unmarshal(raw, &previous) == nil && previous.pins(installed)
+func (m *Machine) explicitlyPinnedPair(_ pairVersions) bool {
+	policy, _, err := readSoftwarePolicy(m.layout.Root)
+	return err == nil && policy.StartupUpdate == "off"
 }
 
 func (m *Machine) startupPrevious(wheels []string) ([]startupWheel, error) {
@@ -227,6 +254,9 @@ func (m *Machine) startupRollback(ctx context.Context, status startupStatus) err
 	if err := installPair(m.layout.Root, wheels); err != nil {
 		return err
 	}
+	if err := m.removeDependencies(ctx, status.Dependencies); err != nil {
+		return err
+	}
 	var got pairVersions
 	if err := m.startupPython(ctx, &got, "probe"); err != nil {
 		return err
@@ -235,6 +265,9 @@ func (m *Machine) startupRollback(ctx context.Context, status startupStatus) err
 		return errors.New("startup rollback did not restore the verified pair")
 	}
 	if err := selectPair(m.layout.Root, wheels); err != nil {
+		return err
+	}
+	if err := m.rollbackSoftwarePolicy(status); err != nil {
 		return err
 	}
 	status.State = "rolled_back"
@@ -373,6 +406,11 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 		}
 	}
 	status.Workspace = installed.Workspace
+	status.PolicyAfter = nil
+	status.PolicyBefore = nil
+	status.EntryBefore = ""
+	status.EntryFile = false
+	status.EntryMissing = false
 	if err := m.preparePair(ctx, verified, next, candidate, previous, status, false); err != nil {
 		fmt.Fprintln(m.log, "cozy machine: update preparation failed; repair remains available:", err)
 		if m.transactionPending() {
@@ -405,6 +443,14 @@ func (m *Machine) preparePair(ctx context.Context, verified, next pairVersions, 
 	if err != nil {
 		return err
 	}
+	additions, err := m.stageDependencies(ctx, candidate)
+	if err != nil {
+		return err
+	}
+	complete := append([]string{}, candidate...)
+	for _, wheel := range additions {
+		complete = append(complete, wheel.Path)
+	}
 	// Stage an overlay: uv touches no existing dependency or interpreter. Python
 	// imports the two candidate distributions from it against the actual base deps.
 	overlay, err := os.MkdirTemp(m.startupPath(), "probe-")
@@ -412,7 +458,7 @@ func (m *Machine) preparePair(ctx context.Context, verified, next pairVersions, 
 		return err
 	}
 	defer os.RemoveAll(overlay)
-	args := append([]string{"pip", "install", "--no-config", "--offline", "--no-deps", "--target", overlay, "--python", filepath.Join(m.layout.Root, "opt/cozy/python/bin/python")}, candidate...)
+	args := append([]string{"pip", "install", "--no-config", "--offline", "--no-deps", "--target", overlay, "--python", filepath.Join(m.layout.Root, "opt/cozy/python/bin/python")}, complete...)
 	cmd := exec.CommandContext(ctx, filepath.Join(m.layout.Root, "usr/local/bin/uv"), args...)
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + filepath.Join(m.layout.Root, "tmp")}
 	if _, err := progressChildOutput(cmd, true); err != nil {
@@ -430,12 +476,22 @@ func (m *Machine) preparePair(ctx context.Context, verified, next pairVersions, 
 		_ = m.startupSave(status)
 		return fmt.Errorf("candidate failed native/dependency preflight: %v", err)
 	}
+	if m.grant != nil {
+		status.AgentBefore = m.grant.agentBefore
+	}
+	if status.PolicyAfter == nil {
+		if err := m.snapshotPolicy(&status, nil); err != nil {
+			return err
+		}
+	}
+	m.preparePolicyEntry(&status)
+	status.Dependencies = additions
 	status.PreviouslyPinned, status.Pinned = m.explicitlyPinnedPair(verified), pinned
 	status.State, status.Before, status.After, status.Previous = "installing", verified, next, kept
 	if err := m.startupSave(status); err != nil {
 		return err
 	}
-	err = installPair(m.layout.Root, candidate)
+	err = installPair(m.layout.Root, complete)
 	if err == nil {
 		probed, err = m.startupVerify(ctx)
 	}
@@ -493,6 +549,9 @@ func startupMaintenance(root, operation string, workspace string) error {
 	if status.Workspace != "" && status.Workspace != workspace {
 		return errors.New("ready Runtime changed the execution workspace")
 	}
+	if err := m.commitSoftwarePolicy(&status); err != nil {
+		return err
+	}
 	status.State = "succeeded"
 	return m.startupSave(status)
 }
@@ -506,24 +565,6 @@ func (m *Machine) transactionPending() bool {
 // The installer's typed machine policy is independent of transport credentials
 // and Runtime configuration. It controls discovery, never explicit maintenance.
 func automaticSoftwareUpdates(root string) (bool, error) {
-	raw, err := os.ReadFile(filepath.Join(root, "etc/cozy/software-policy.json"))
-	if errors.Is(err, os.ErrNotExist) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	var policy struct {
-		StartupUpdate string `json:"startup_update"`
-	}
-	if err := json.Unmarshal(raw, &policy); err != nil {
-		return false, err
-	}
-	switch policy.StartupUpdate {
-	case "auto":
-		return true, nil
-	case "off":
-		return false, nil
-	}
-	return false, errors.New("software-policy.json requires startup_update auto or off")
+	policy, _, err := readSoftwarePolicy(root)
+	return err == nil && policy.StartupUpdate == "auto", err
 }

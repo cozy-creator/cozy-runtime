@@ -53,6 +53,7 @@ func (m *Machine) commitStartup(p *runtimeProcess, payload []byte) error {
 	m.mu.Lock()
 	m.grant.startupPending, m.inUpdate = false, false
 	m.mu.Unlock()
+	m.finishResumedUpdate("succeeded", "")
 	fmt.Fprintln(m.log, "cozy machine: startup update committed after authenticated Runtime readiness")
 	return nil
 }
@@ -72,6 +73,10 @@ func (m *Machine) rollbackStartup(ctx context.Context) error {
 	m.mu.Unlock()
 	if err := m.restarts.clear(); err != nil {
 		return err
+	}
+	if err := m.replaceApplication(true); err != nil {
+		m.restarts.fail(err)
+		return nil
 	}
 	if err := m.tfs.initStore(ctx); err != nil {
 		m.restarts.fail(err)

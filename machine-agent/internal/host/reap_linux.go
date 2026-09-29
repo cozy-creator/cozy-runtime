@@ -55,3 +55,9 @@ func prepareMaintenanceProcess(cmd *exec.Cmd) {
 	}
 }
 func killMaintenanceProcess(cmd *exec.Cmd) { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+
+func requestPlaneCredential(cmd *exec.Cmd) {
+	if os.Geteuid() == 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: machineUID, Gid: machineUID, Groups: []uint32{}}}
+	}
+}

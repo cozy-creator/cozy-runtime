@@ -16,3 +16,5 @@ func reapOrphans() {}
 
 func prepareMaintenanceProcess(*exec.Cmd)  {}
 func killMaintenanceProcess(cmd *exec.Cmd) { _ = cmd.Process.Kill() }
+
+func requestPlaneCredential(*exec.Cmd) {}

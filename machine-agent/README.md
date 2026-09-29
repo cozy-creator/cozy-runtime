@@ -84,17 +84,28 @@ At boot, automatic discovery (the default) makes one attempt to select a
 stable Runtime/TensorFS pair within their installed compatible lines (major.minor for 0.x). Selection
 checks the real interpreter, mandatory dependencies, installed media/model
 extras, and reverse dependencies on the pair; other dependencies are never
-upgraded implicitly. Both native wheels are checked against PyPI's HTTPS
-metadata and SHA-256, staged separately, and probed against the existing base.
+upgraded implicitly. Missing dependencies are resolved as an additive wheel-only
+closure with all installed versions fixed, including reverse constraints from
+unrelated frameworks. The pair and added wheels are checked against PyPI HTTPS
+metadata and SHA-256, staged privately, and probed together. Existing-file
+collisions and incompatible installed dependencies defer before mutation and
+require a compatible base. Rollback removes only added distributions whose
+version, private wheel URL/digest and installed RECORD hashes still prove
+transaction ownership. Later operator changes or uncertain partial files remain
+in place with an explicit repair-required result.
 The installer-owned `etc/cozy/software-policy.json` accepts
-`{"startup_update":"auto"}` or `{"startup_update":"off"}`. Off preserves an
+`{"startup_update":"auto","agent":"bundled"}` or
+`{"startup_update":"off","agent":"explicit"}` (both fields are required). Off preserves an
 explicitly selected installation without disabling explicit maintenance. Missing
 policy defaults to auto; unknown or unreadable policy defers discovery. Local,
 development and prerelease software also skips automatic discovery.
-Maintenance requests require a boolean `pin`: true for explicit wheels or versions,
+Maintenance requests require `agent: "bundled" | "explicit"` and a boolean `pin`: true for explicit wheels or versions,
 false for default-latest selection. The server never infers this intent from the
-resolved version fields. An explicit selection durably pins its
-resulting pair, including a restart between health commit and the API response.
+resolved version fields. The committed software-policy file is authoritative. A manual transaction journals
+its policy and entry changes with the wheel installation; rollback restores only
+its own changes and preserves later operator edits. Explicit agent selection
+retains the exact running application binary; bundled selection uses the candidate
+Runtime wheel. The client never rewrites this policy or entry after server commit.
 Rentals may update before first use; any accepted work pins software for every
 later restart and retry, even after all work has been collected.
 
@@ -103,11 +114,17 @@ software-update view applies retention rules across all owners, child attempts,
 native calls, holds, weight intents and input intakes. Missing or unreadable
 update state defers changes. The boot ID, certificate and execution journal are
 preserved. An unavailable index or incompatible candidate leaves the verified
-installed pair in service. When the image launcher points to the wheel-owned
-`opt/cozy/python/bin/cozy-machine`, installing a Runtime wheel also stages its
-bundled agent for the next boot. The already-running agent and its guardian keep
-the same executing binary inode; no immediate self-replacement is attempted.
-Fresh worker images likewise start the bundled agent directly.
+installed pair in service. The existing guardian is the stable parent, with private ABI
+`machine-bootstrap/1`. It owns the Runtime and a replaceable unprivileged public
+agent. A candidate replaces the public agent before admitting work; candidate
+agent exit or measured stall before commit restores the previous application
+and wheel pair. Public-agent disconnect or crash leaves an accepted Runtime
+running, with the same control signer, incarnation, workspace, TLS and boot ID.
+The parent is base infrastructure, updated on image/service bootstrap, and is
+not advertised as newly replaced application code. Authenticated runtime status
+reports the actual public agent version, SHA-256 and selection separately from
+the bootstrap ABI/version. The immutable identity receipt remains historical;
+rental readiness and authenticated runtime status prove the selected application.
 
 The launcher retains hashed rollback wheels and a fsynced transaction under
 `var/lib/cozy/startup-update`, outside the unprivileged agent's writable state.
