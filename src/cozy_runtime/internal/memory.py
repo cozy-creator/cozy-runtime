@@ -245,6 +245,8 @@ class Planner:
         self.loads = self.offloads = self.moved = 0
         #: bytes sent to the store and read back from it this attempt: the disk tier's traffic
         self.stored = self.refilled = 0
+        #: the allocator's counters when the attempt began: its churn is their growth
+        self.counters: dict[str, int] = {}
         #: allocator bytes the attempt's weight moves added (negative: gave back)
         self.transition = 0
         #: weights left the device since the last cap: their bytes sit in the allocator's cache
@@ -382,6 +384,7 @@ class Planner:
         self.peak = self.peak_allocated = self.working = 0
         self.loads = self.offloads = self.moved = self.transition = 0
         self.stored = self.refilled = 0
+        self.counters = self._counters()
         self.log = []
         self.plans = {}
         self.refusal = None
@@ -423,6 +426,10 @@ class Planner:
             "attempt_moved_bytes": self.moved,
             "attempt_stored_bytes": self.stored,
             "attempt_refilled_bytes": self.refilled,
+            **{
+                f"attempt_{name}": count - self.counters.get(name, 0)
+                for name, count in self._counters().items()
+            },
             "attempt_activation_peak_bytes": self.working,
             "attempt_absolute_peak_bytes": self.peak_allocated,
             "allocator_delta_bytes": self.transition,
@@ -432,6 +439,15 @@ class Planner:
             "plans": {op: list(seen) for op, seen in self.plans.items()},
             "poisoned": "",
         }
+
+    def _counters(self) -> dict[str, int]:
+        """Device allocations and frees, allocator retries (a cache flush to satisfy one
+        request) and out-of-memory errors so far."""
+        if not self.cuda:
+            return {}
+        stats = self.torch.cuda.memory_stats(self.device)
+        names = ("num_device_alloc", "num_device_free", "num_alloc_retries", "num_ooms")
+        return {name: int(stats.get(name, 0)) for name in names}
 
     def facts(self) -> dict[str, int]:
         return {
@@ -815,7 +831,9 @@ class Planner:
             for keep in [0] if floor else self._keeps(held):
                 need = self._need(part, keep) + working
                 chosen = self._room_from(victims, need)
-                if chosen is None and self._ask_room(need, victims, measured=working > 0):
+                # A floor is no guess: nothing smaller runs, so idle processes may give way.
+                proven = floor or working > 0
+                if chosen is None and self._ask_room(need, victims, measured=proven):
                     chosen = self._room_from(victims, need)
                 if chosen is not None:
                     return Plan(rung, keep, list(victims) if floor else chosen, need, working)
