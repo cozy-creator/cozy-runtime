@@ -127,3 +127,63 @@ def test_real_64_mib_reclaim_trims_free_pages_and_preserves_live_aliases() -> No
     assert alias.untyped_storage().data_ptr() == pointer
     assert torch.equal(alias, torch.ones_like(alias))
     assert int(retained.sum()) == retained.numel()
+
+
+def test_denied_local_copy_without_released_backing_does_not_trim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    planner = memory.Planner(torch, torch.device("cpu"), host_room=lambda *args: False)
+    monkeypatch.setattr(proctree, "trim_host_allocator", lambda: pytest.fail("no backing released"))
+    with planner._host_copy(1) as admitted:
+        assert not admitted
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux RSS and optional glibc trim")
+def test_local_pressure_retries_observed_room_after_trimming_64_mib(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    if not hasattr(ctypes.CDLL(None), "malloc_trim"):
+        pytest.skip("allocator has no malloc_trim")
+    torch.set_num_threads(2)
+    planner = memory.Planner(torch, torch.device("cpu"))
+    held = planner.adopt("idle", "weights", torch.nn.Linear(1, 1), None, tiers.DEVICE)
+    proctree.trim_host_allocator()
+    baseline = proctree.rss_bytes(os.getpid())
+    held.part.common.host = {(index, "weight"): torch.ones(128 * 1024) for index in range(128)}
+    # The live trailing allocation prevents automatic contraction of the heap tail.
+    barrier = torch.full((128 * 1024,), 7.0)
+    alias = barrier[1::2]
+    pointer = alias.untyped_storage().data_ptr()
+    refs = [weakref.ref(tensor) for tensor in held.part.common.host.values()]
+    # An explicit test envelope uses actual RSS at both admission checks, never the
+    # logical bytes dropped or malloc_trim's return value as available memory.
+    limit = baseline + 16 * 1024 * 1024
+    checks: list[tuple[int, bool]] = []
+    trimmed: list[int] = []
+    original_trim = proctree.trim_host_allocator
+
+    def trim() -> bool:
+        trimmed.append(proctree.rss_bytes(os.getpid()))
+        return original_trim()
+
+    def room(token: str, nbytes: int, release: bool) -> bool:
+        if release:
+            return True
+        rss = proctree.rss_bytes(os.getpid())
+        admitted = nbytes <= limit - rss
+        checks.append((rss, admitted))
+        return admitted
+
+    planner.host_room = room
+    monkeypatch.setattr(proctree, "trim_host_allocator", trim)
+    with planner._host_copy(8 * 1024 * 1024) as admitted:
+        assert admitted
+    assert len(checks) == 2 and not checks[0][1] and checks[1][1]
+    assert len(trimmed) == 1
+    assert checks[0][0] - checks[1][0] >= 32 * 1024 * 1024
+    assert all(ref() is None for ref in refs)
+    assert planner.host_memory()["managed_host_bytes"] == 0
+    assert alias.untyped_storage().data_ptr() == pointer
+    assert bool((alias == 7).all()) and bool((barrier == 7).all())
