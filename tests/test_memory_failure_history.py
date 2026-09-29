@@ -1,5 +1,7 @@
 """Repeated CPU managed calls with synthetic allocator facts, not GPU fit proof."""
 
+from typing import Any
+
 import pytest
 
 from cozy_runtime.author import pure
@@ -37,7 +39,7 @@ def test_smaller_replay_keeps_failure_until_richer_placement_succeeds(
         if owner.stack:
             owner.stack[-1].working = max(owner.stack[-1].working, state["working"])
 
-    def body(value: torch.Tensor) -> torch.Tensor:
+    def body(value: Any) -> Any:
         bodies.append(state["keep"])
         if state["keep"] == 2 and state["budget"] == 32:
             state["working"] = 16
@@ -115,7 +117,13 @@ def test_multiple_failures_keep_bound_and_richest_failed_placement(
         frame.working = working
         with pytest.raises(memory.MemoryRefusal):
             owner._recover(
-                held, key, memory.Plan(keep, []), frame, None, asked,
-                "CUDA out of memory", request_room=False,
+                held,
+                key,
+                memory.Plan(keep, []),
+                frame,
+                None,
+                asked,
+                "CUDA out of memory",
+                request_room=False,
             )
         assert owner.records[key] == expected

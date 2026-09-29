@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -150,8 +151,9 @@ def test_actual_executor_and_gloo_prepare_before_model_hooks(tmp_path: Path) -> 
 
 
 def test_mirrored_host_abort_reserves_once_and_commits_only_with_rank_credits(
-    tmp_path, monkeypatch,
-):
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from types import SimpleNamespace
 
     from cozy_runtime.author._executor_requests import Answer
@@ -161,14 +163,12 @@ def test_mirrored_host_abort_reserves_once_and_commits_only_with_rank_credits(
 
     torch = pytest.importorskip("torch")
     group = _group(tmp_path, "host_credit")
-    group.memory_capabilities = {
-        rank: ("prepare_commit", "group_host_credit") for rank in (1, 2)
-    }
+    group.memory_capabilities = {rank: ("prepare_commit", "group_host_credit") for rank in (1, 2)}
     group.memory_grants = (100, 100, 100)
     policy = memory.Machine({}, lambda _: None, lambda _: None, host_available=lambda: 48)
     events = []
 
-    def durable(request, _):
+    def durable(request: Any, _: Any) -> Any:
         events.append("release" if request.release else "reserve")
         if request.release:
             # All run replies must have been consumed before credits return.
@@ -186,10 +186,13 @@ def test_mirrored_host_abort_reserves_once_and_commits_only_with_rank_credits(
     entered = []
     root.register_forward_hook(lambda *_: entered.append("leader"))
     mirror_component(
-        root, name=("generation", "model"),
-        prepared={("generation", "model"): (model, root)}, group=group,
-        spool=lambda: tmp_path, planner=owner,
-        host_room=lambda statuses: Executor._group_host_room(executor, statuses),
+        root,
+        name=("generation", "model"),
+        prepared={("generation", "model"): (model, root)},
+        group=group,
+        spool=lambda: tmp_path,
+        planner=owner,
+        host_room=lambda statuses: Executor._group_host_room(cast(Executor, executor), statuses),
     )
     try:
         value = torch.ones(1)

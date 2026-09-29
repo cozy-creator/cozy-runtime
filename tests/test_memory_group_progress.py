@@ -1,6 +1,7 @@
 """Group retry needs complete monotone progress from the same measurement source."""
 
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -28,7 +29,12 @@ def planner_facts(**facts: object) -> Planner:
         ((100, 100), (120, 140), {0: (100, 120), 1: (100, 140)}, False),
     ],
 )
-def test_group_room_requires_full_new_gain_on_all_failed_ranks(after, grants, prior, expected):
+def test_group_room_requires_full_new_gain_on_all_failed_ranks(
+    after: tuple[int, int],
+    grants: tuple[int, int],
+    prior: dict[int, tuple[int, int]],
+    expected: bool,
+) -> None:
     leader = iter((100, after[0]))
     follower = iter((100, after[1]))
     requests = []
@@ -36,7 +42,7 @@ def test_group_room_requires_full_new_gain_on_all_failed_ranks(after, grants, pr
     planner = planner_facts(cuda=True, room_asks=0, _driver=lambda: (next(leader), 1000))
     group = SimpleNamespace(call=lambda _: [{"device_free_bytes": next(follower)}])
 
-    def durable(request, _):
+    def durable(request: Any, _: Any) -> Any:
         requests.append(request)
         assert request.measured and all(need.measured for need in request.rank_needs)
         return Room(ok=True, memory_grants=grants, memory_free=(10000, 10000))
@@ -64,7 +70,7 @@ def test_group_room_requires_full_new_gain_on_all_failed_ranks(after, grants, pr
         for rank, short in enumerate((20, 40))
     ]
     progress = dict(prior)
-    assert Executor._ask_group_room(executor, statuses, progress) is expected
+    assert Executor._ask_group_room(cast(Executor, executor), statuses, progress) is expected
     blocked = bool(prior) and any(
         100 + short <= prior[rank][0] and 100 + short <= prior[rank][1]
         for rank, short in enumerate((20, 40))
@@ -88,8 +94,8 @@ def test_group_room_requires_full_new_gain_on_all_failed_ranks(after, grants, pr
     ],
 )
 def test_preparation_prices_only_the_binding_constraint(
-    free, grant, after_free, after_grant, expected
-):
+    free: int, grant: int, after_free: int, after_grant: int, expected: bool
+) -> None:
     from cozy_runtime.internal.memory import MemoryRefusal
 
     facts = SimpleNamespace(
@@ -99,12 +105,14 @@ def test_preparation_prices_only_the_binding_constraint(
         _driver=lambda: (free, 4000),
         _reserved=lambda: 480,
     )
-    numbers = Planner.preparation_bytes(facts, MemoryRefusal("device_shortfall", "need", 50, 20))
+    numbers = Planner.preparation_bytes(
+        cast(Planner, facts), MemoryRefusal("device_shortfall", "need", 50, 20)
+    )
     assert (numbers["free_wanted"], numbers["grant_wanted"]) == (50, 530)
     leader = iter((free, after_free))
     requests = []
 
-    def durable(request, _):
+    def durable(request: Any, _: Any) -> Any:
         requests.append(request)
         assert request.measured and all(need.measured for need in request.rank_needs)
         return Room(ok=True, memory_grants=(after_grant, 4000))
@@ -118,14 +126,25 @@ def test_preparation_prices_only_the_binding_constraint(
         _rank_memory=lambda: {},
         _grant=lambda *_: None,
     )
-    status = OpReady(operation=1, rank=0, ok=False, code="device_shortfall", **numbers)
-    progress = {}
-    assert Executor._ask_group_room(executor, [status], progress) is expected
+    status = OpReady(
+        operation=1,
+        rank=0,
+        ok=False,
+        code="device_shortfall",
+        needed=numbers["needed"],
+        available=numbers["available"],
+        free_bytes=numbers["free_bytes"],
+        grant_bytes=numbers["grant_bytes"],
+        free_wanted=numbers["free_wanted"],
+        grant_wanted=numbers["grant_wanted"],
+    )
+    progress: dict[int, tuple[int, int]] = {}
+    assert Executor._ask_group_room(cast(Executor, executor), [status], progress) is expected
     assert (requests[0].rank_needs[0].free_bytes, requests[0].rank_needs[0].grant_bytes) == (
         50,
         530,
     )
     if expected:
         executor.planner._driver = lambda: (after_free, 4000)
-        assert not Executor._ask_group_room(executor, [status], progress)
+        assert not Executor._ask_group_room(cast(Executor, executor), [status], progress)
         assert len(requests) == 1  # An unchanged minimum cannot restart an abort loop.

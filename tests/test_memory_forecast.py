@@ -5,6 +5,7 @@ checks admission/replay boundaries, not GPU fit or output qualification.
 """
 
 from dataclasses import replace
+from typing import Any
 
 import pytest
 
@@ -23,7 +24,9 @@ def forecast(
     root.tile_sample_min_size = 256
     held = owner.adopt("generation", "vae", root, None, tiers.DEVICE)
     warm = memory.OpKey(
-        held.kind, "decode", (((1, 16, 1, 64, 64), "torch.bfloat16"),),
+        held.kind,
+        "decode",
+        (((1, 16, 1, 64, 64), "torch.bfloat16"),),
         mode=memory._mode(root),
     )
     key = replace(warm, tensors=(((1, 16, 1, 192, 192), "torch.bfloat16"),))
@@ -55,7 +58,7 @@ def test_scaled_hint_selects_floor_then_runs_body_once(monkeypatch: pytest.Monke
     monkeypatch.setattr(owner, "_arm", cpu_snapshot)
     calls: list[tuple[int, ...]] = []
 
-    def decode(value: torch.Tensor) -> object:
+    def decode(value: Any) -> object:
         calls.append(tuple(value.shape))
         return held.part.root(value)
 
@@ -71,7 +74,8 @@ def test_scaled_hint_selects_floor_then_runs_body_once(monkeypatch: pytest.Monke
 
 @pytest.mark.parametrize("kind", ["exact", "failed", "spread"])
 def test_measured_bounds_and_missing_retry_contract_still_refuse(
-    monkeypatch: pytest.MonkeyPatch, kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
 ) -> None:
     owner, held, key = forecast(monkeypatch)
     if kind == "exact":
@@ -104,14 +108,14 @@ def test_failed_exact_key_floor_survives_larger_forecast(
     assert caught.value.needed == 2000000000
 
 
-def test_tiled_forecast_does_not_scale_with_image_area(monkeypatch):
+def test_tiled_forecast_does_not_scale_with_image_area(monkeypatch: pytest.MonkeyPatch) -> None:
     owner, _held, key = forecast(monkeypatch)
     owner.records = {replace(k, mode=(("use_tiling", True),)): v for k, v in owner.records.items()}
     key = replace(key, mode=(("use_tiling", True),))
     assert owner._estimate(key) == (280341504, False)
 
 
-def test_nonretryable_forecast_is_not_a_refusal_proof(monkeypatch):
+def test_nonretryable_forecast_is_not_a_refusal_proof(monkeypatch: pytest.MonkeyPatch) -> None:
     owner, held, key = forecast(monkeypatch)
     assert owner._plan(held, key, False, False).keep == 0
     assert "forecast exceeded room" in owner.log[0]

@@ -162,14 +162,22 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
                             reference = backend(query=q, key=k, value=v)
                         else:
                             q, k, v = shards
+
+                            def local_attention(
+                                a: Any,
+                                b: Any,
+                                c: Any,
+                                at: AttentionLayout = layout,
+                                where: attention_sol.Site = site,
+                            ) -> Any:
+                                return attention_sol._execute(a, b, c, None, at, where)
+
                             actual = attention_ulysses.exchange(
                                 q,
                                 k,
                                 v,
                                 group,
-                                lambda a, b, c, at=layout, where=site: attention_sol._execute(
-                                    a, b, c, None, at, where
-                                ),
+                                local_attention,
                             )
                             q, k, v = tensors
                             reference = attention_sol._execute(q, k, v, None, layout, site)

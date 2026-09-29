@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from cozy_runtime.author._executor_requests import HostRoom
+from cozy_runtime.author._executor_requests import Answer, HostRoom
 from cozy_runtime.internal import proctree
 from cozy_runtime.internal.memory import Machine
 from cozy_runtime.internal.seam import Channel
@@ -44,7 +44,13 @@ def test_generation_change_releases_pending_and_rejects_old_handler(tmp_path: Pa
     try:
         worker.supervision.current = executor
         worker.executor_changed(executor)
-        answer = worker._room(worker._primary_lane(), worker._primary_slot())
+        handler = worker._room(worker._primary_lane(), worker._primary_slot())
+
+        def answer(request: HostRoom) -> Answer:
+            reply = handler(request)
+            assert isinstance(reply, Answer)
+            return reply
+
         assert answer(HostRoom(reservation="copy", nbytes=70)).ok
         assert not answer(HostRoom(reservation="other", nbytes=40)).ok
         assert answer(HostRoom(reservation="copy", release=True)).ok

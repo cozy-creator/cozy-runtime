@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from cozy_runtime.author import _executor_requests as requests
-from cozy_runtime.author._errors import RuntimeFailure
+from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
 from cozy_runtime.internal import memory, proctree, tiers
 
 torch = pytest.importorskip("torch")
@@ -256,7 +256,7 @@ def test_group_process_cannot_use_standalone_host_admission_before_gating() -> N
     assert events == [] and not broker.host_reserved
 
 
-class CPUBackedDeviceTensor(torch.Tensor):
+class CPUBackedDeviceTensor(torch.Tensor):  # type: ignore[name-defined, misc]
     """Exercise real tensor binding/copies with a device marker and CPU backing only."""
 
     @property
@@ -366,12 +366,12 @@ def test_measurements_never_cross_authored_modes_or_dtypes() -> None:
 
 def test_only_device_allocation_failures_are_classified_as_oom() -> None:
     unrelated = type("OutOfMemoryError", (RuntimeError,), {})
-    assert not memory.is_oom(unrelated("host store is full"))
-    assert not memory.is_oom(MemoryError("host memory exhausted"))
-    assert not memory.is_oom(torch.OutOfMemoryError("DefaultCPUAllocator: can't allocate memory"))
-    assert memory.is_oom(torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 1 MiB"))
-    assert memory.is_oom(RuntimeError("CUDA error: out of memory"))
-    assert not memory.is_oom(RuntimeError("CUDA error: illegal memory access"))
+    assert not is_device_oom(unrelated("host store is full"))
+    assert not is_device_oom(MemoryError("host memory exhausted"))
+    assert not is_device_oom(torch.OutOfMemoryError("DefaultCPUAllocator: can't allocate memory"))
+    assert is_device_oom(torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 1 MiB"))
+    assert is_device_oom(RuntimeError("CUDA error: out of memory"))
+    assert not is_device_oom(RuntimeError("CUDA error: illegal memory access"))
 
 
 def test_alias_backing_cannot_be_discarded_for_slot_only_store_refill() -> None:
@@ -470,10 +470,10 @@ def test_failed_placement_rollback_poison_survives_next_attempt() -> None:
     assert refused.value.code == "device_fault" and not refused.value.reusable
 
 
-def test_device_oom_classifier_is_shared_and_excludes_cpu():
+def test_device_oom_classifier_is_shared_and_excludes_cpu() -> None:
     from cozy_runtime.author._errors import classify, is_device_oom
 
-    assert memory.is_oom is is_device_oom
+    assert vars(memory)["is_oom"] is is_device_oom
     for exc in (
         torch.OutOfMemoryError("DefaultCPUAllocator: can't allocate memory"),
         MemoryError("host memory exhausted"),

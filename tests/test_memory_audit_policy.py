@@ -1,10 +1,12 @@
 """Audit regressions use actual CPU tensors and measured-policy fixtures, never CUDA."""
 
 from types import MethodType
+from typing import Any, cast
 
 import pytest
 
 from cozy_runtime.author import pure
+from cozy_runtime.author._errors import DEVICE_OOM
 from cozy_runtime.internal import attention_sol, memory, tiers
 from test_machine_memory_policy import Resident, machine
 
@@ -40,7 +42,9 @@ def test_unknown_admission_reclaims_contexts_only_for_current_minimum() -> None:
     assert not newer.actions
 
 
-def test_failed_residency_excluded_even_when_working_lower_bound_is_weak(monkeypatch) -> None:
+def test_failed_residency_excluded_even_when_working_lower_bound_is_weak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     root = torch.nn.Module()
     root.anchor = torch.nn.Parameter(torch.empty(0))
@@ -77,7 +81,7 @@ def test_sol_wrapper_does_not_launder_foreign_forward() -> None:
     root = pure(torch.nn.Identity())
     root.calls = 0
 
-    def stateful(self, value):
+    def stateful(self: Any, value: Any) -> Any:
         self.calls += 1
         return value + self.calls
 
@@ -95,7 +99,7 @@ def test_decode_selection_is_finite_and_restores_rng() -> None:
     rng = torch.get_rng_state().clone()
     calls = []
 
-    def probe(side):
+    def probe(side: int) -> None:
         assert torch.equal(torch.get_rng_state(), rng)
         calls.append(side)
         torch.rand(3)
@@ -109,13 +113,13 @@ def test_decode_selection_is_finite_and_restores_rng() -> None:
 
 
 @pytest.mark.parametrize("code,reusable", [("device_fault", False), ("host_shortfall", True)])
-def test_decode_selection_does_not_hide_other_faults(code, reusable) -> None:
+def test_decode_selection_does_not_hide_other_faults(code: str, reusable: bool) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     root = pure(torch.nn.Identity())
     owner.adopt("c", "vae", root, None, tiers.HOST)
     calls = []
 
-    def probe(side):
+    def probe(side: int) -> None:
         calls.append(side)
         raise memory.MemoryRefusal(code, "fault", reusable=reusable)
 
@@ -124,7 +128,9 @@ def test_decode_selection_does_not_hide_other_faults(code, reusable) -> None:
     assert calls == [8]
 
 
-def test_measured_plan_stops_offloading_after_needed_blocks(monkeypatch):
+def test_measured_plan_stops_offloading_after_needed_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     root = torch.nn.Module()
     root.anchor = torch.nn.Parameter(torch.empty(0))
@@ -135,7 +141,7 @@ def test_measured_plan_stops_offloading_after_needed_blocks(monkeypatch):
     moved = []
     monkeypatch.setattr(owner, "allocatable", lambda: room[0])
 
-    def home(_part, unit):
+    def home(_part: tiers.Component, unit: tiers.Unit) -> None:
         moved.append(unit)
         room[0] += unit.nbytes
         unit.tier = tiers.HOST
@@ -146,7 +152,9 @@ def test_measured_plan_stops_offloading_after_needed_blocks(monkeypatch):
     assert sum(unit.tier == tiers.DEVICE for unit in victim.part.blocks) == 3
 
 
-def test_startup_reclaims_measured_context_without_requesting_extra_free_bytes(monkeypatch):
+def test_startup_reclaims_measured_context_without_requesting_extra_free_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from types import SimpleNamespace
 
     from cozy_runtime.internal.executor import Executor
@@ -157,26 +165,28 @@ def test_startup_reclaims_measured_context_without_requesting_extra_free_bytes(m
     calls = []
     executor = SimpleNamespace(host=SimpleNamespace(planner=owner))
 
-    def room(free, grant, measured):
+    def room(free: int, grant: int, measured: bool) -> int:
         calls.append((free, grant, measured))
         owner.grant = grant
         return grant
 
     executor._ask_room = room
     monkeypatch.setattr(tiers, "trim", lambda _: None)
-    Executor._startup_budget(executor)
+    Executor._startup_budget(cast(Executor, executor))
     assert calls == [(0, 40, True)]
     assert owner.grant == 40
 
 
 @pytest.mark.parametrize("room", [3, 8])
-def test_optional_cache_uses_grant_and_retries_only_reusable_capacity(monkeypatch, room):
+def test_optional_cache_uses_grant_and_retries_only_reusable_capacity(
+    monkeypatch: pytest.MonkeyPatch, room: int
+) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     held = owner.adopt("c", "model", pure(torch.nn.Identity()), None, tiers.HOST)
     monkeypatch.setattr(owner, "allocatable", lambda: room)
     calls = []
 
-    def run(cache):
+    def run(cache: bool) -> str:
         calls.append(cache)
         if cache:
             raise memory.MemoryRefusal(memory.SHORTFALL, "operation working exceeds room")
@@ -186,17 +196,22 @@ def test_optional_cache_uses_grant_and_retries_only_reusable_capacity(monkeypatc
     assert calls == ([True, False] if room == 8 else [False])
 
 
-@pytest.mark.parametrize("fault", [
-    memory.MemoryRefusal(memory.DEVICE_OOM, "poisoned", reusable=False),
-    memory.MemoryRefusal("host_shortfall", "host fault"),
-    torch.OutOfMemoryError("outside managed operation"),
-])
-def test_optional_cache_does_not_retry_unrestorable_or_unrelated_faults(fault):
+@pytest.mark.parametrize(
+    "fault",
+    [
+        memory.MemoryRefusal(DEVICE_OOM, "poisoned", reusable=False),
+        memory.MemoryRefusal("host_shortfall", "host fault"),
+        torch.OutOfMemoryError("outside managed operation"),
+    ],
+)
+def test_optional_cache_does_not_retry_unrestorable_or_unrelated_faults(
+    fault: BaseException,
+) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     held = owner.adopt("c", "model", pure(torch.nn.Identity()), None, tiers.HOST)
     calls = []
 
-    def run(cache):
+    def run(cache: bool) -> str:
         calls.append(cache)
         raise fault
 
@@ -205,7 +220,7 @@ def test_optional_cache_does_not_retry_unrestorable_or_unrelated_faults(fault):
     assert calls == [True]
 
 
-def test_successful_decode_selection_releases_failed_probe_tensors_without_gc():
+def test_successful_decode_selection_releases_failed_probe_tensors_without_gc() -> None:
     import gc
     import weakref
 
@@ -214,7 +229,7 @@ def test_successful_decode_selection_releases_failed_probe_tensors_without_gc():
     owner.adopt("c", "vae", root, None, tiers.HOST)
     retained = []
 
-    def probe(side):
+    def probe(side: int) -> None:
         if side == 8:
             latent = torch.zeros(4)
             retained.append(weakref.ref(latent))
@@ -231,7 +246,9 @@ def test_successful_decode_selection_releases_failed_probe_tensors_without_gc():
         gc.collect()
 
 
-def test_scope_minimum_reclaims_sibling_blocks_without_evicting_common(monkeypatch):
+def test_scope_minimum_reclaims_sibling_blocks_without_evicting_common(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     a = torch.nn.Module()
     a.anchor = torch.nn.Parameter(torch.empty(1))
@@ -243,8 +260,10 @@ def test_scope_minimum_reclaims_sibling_blocks_without_evicting_common(monkeypat
     second = owner.adopt("c", "last", b, None, tiers.HOST)
     assert first.part.nbytes == 20 and second.part.nbytes == 8
     owner.cuda = True  # Real tensor sizes; simulate only device accounting and transfers.
-    def allocated():
+
+    def allocated() -> int:
         return sum(h.part.on(tiers.DEVICE) for h in owner.held.values())
+
     monkeypatch.setattr(owner, "_allocated", allocated)
     monkeypatch.setattr(owner, "_reserved", allocated)
     monkeypatch.setattr(owner, "allocatable", lambda: 24 - allocated())
@@ -259,7 +278,9 @@ def test_scope_minimum_reclaims_sibling_blocks_without_evicting_common(monkeypat
     assert allocated() == 20
 
 
-def test_replay_reclaims_sibling_common_even_at_minimum_block_residency(monkeypatch):
+def test_replay_reclaims_sibling_common_even_at_minimum_block_residency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     vae = pure(torch.nn.Linear(1, 1))
     sibling = torch.nn.Linear(1, 2)
@@ -269,7 +290,7 @@ def test_replay_reclaims_sibling_common_even_at_minimum_block_residency(monkeypa
     owner.scopes = [("c", frozenset(("vae", "other")))]
     owner.cuda = True
 
-    def allocated():
+    def allocated() -> int:
         return sum(h.part.on(tiers.DEVICE) for h in owner.held.values())
 
     monkeypatch.setattr(owner, "_allocated", allocated)
@@ -283,14 +304,14 @@ def test_replay_reclaims_sibling_common_even_at_minimum_block_residency(monkeypa
     # Real CPU snapshots and retry body; CUDA facts and transfer are the only substitutes.
     arm, rollback = owner._arm, owner._rollback
 
-    def cpu_arm(*args):
+    def cpu_arm(*args: Any) -> memory.Snapshot:
         owner.cuda = False
         try:
             return arm(*args)
         finally:
             owner.cuda = True
 
-    def cpu_rollback(*args):
+    def cpu_rollback(*args: Any) -> None:
         owner.cuda = False
         try:
             return rollback(*args)
@@ -301,7 +322,7 @@ def test_replay_reclaims_sibling_common_even_at_minimum_block_residency(monkeypa
     monkeypatch.setattr(owner, "_rollback", cpu_rollback)
     calls = []
 
-    def decode(value):
+    def decode(value: Any) -> Any:
         calls.append(owner.allocatable())
         if len(calls) == 1:
             raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 4 B")
@@ -309,7 +330,7 @@ def test_replay_reclaims_sibling_common_even_at_minimum_block_residency(monkeypa
 
     with torch.no_grad():
         result = owner.run(held, "decode", decode, (torch.ones(1),), {})
-        assert torch.equal(result, torch.tensor([2.]))
+        assert torch.equal(result, torch.tensor([2.0]))
     assert calls == [8, 24]  # Full measured gain before a second body invocation.
     assert other.part.common.tier == tiers.HOST
     assert owner.room_asks == 0
@@ -317,8 +338,10 @@ def test_replay_reclaims_sibling_common_even_at_minimum_block_residency(monkeypa
 
 @pytest.mark.parametrize("gained,success", [(2, True), (1, False)])
 def test_replay_requires_uncovered_allocation_deficit_not_entire_buffer(
-    monkeypatch, gained, success,
-):
+    monkeypatch: pytest.MonkeyPatch,
+    gained: int,
+    success: bool,
+) -> None:
     owner = memory.Planner(torch, torch.device("cpu"), room=lambda *_: 100)
     held = owner.adopt("c", "vae", pure(torch.nn.Identity()), None, tiers.HOST)
     state = {"free": 10, "placements": 0}
@@ -333,14 +356,14 @@ def test_replay_requires_uncovered_allocation_deficit_not_entire_buffer(
     monkeypatch.setattr(torch._C, "_cuda_clearCublasWorkspaces", lambda: None, raising=False)
     arm, rollback = owner._arm, owner._rollback
 
-    def cpu_arm(*args):
+    def cpu_arm(*args: Any) -> memory.Snapshot:
         owner.cuda = False
         try:
             return arm(*args)
         finally:
             owner.cuda = True
 
-    def cpu_rollback(*args):
+    def cpu_rollback(*args: Any) -> None:
         owner.cuda = False
         try:
             return rollback(*args)
@@ -348,7 +371,7 @@ def test_replay_requires_uncovered_allocation_deficit_not_entire_buffer(
             owner.cuda = True
             state["free"] = 10  # Failed transient activations are gone.
 
-    def apply(*_):
+    def apply(*_: Any) -> None:
         state["placements"] += 1
         if state["placements"] > 1:
             state["free"] += gained
@@ -357,7 +380,7 @@ def test_replay_requires_uncovered_allocation_deficit_not_entire_buffer(
     monkeypatch.setattr(owner, "_rollback", cpu_rollback)
     monkeypatch.setattr(owner, "_apply", apply)
 
-    def decode(value):
+    def decode(value: Any) -> Any:
         calls.append(state["free"])
         if len(calls) == 1:
             state["free"] = 6  # Eight-byte allocation lacked two bytes at failure.
@@ -367,7 +390,7 @@ def test_replay_requires_uncovered_allocation_deficit_not_entire_buffer(
     with torch.no_grad():
         if success:
             result = owner.run(held, "decode", decode, (torch.ones(1),), {})
-            assert torch.equal(result, torch.tensor([2.]))
+            assert torch.equal(result, torch.tensor([2.0]))
         else:
             with pytest.raises(memory.MemoryRefusal, match="shortfall needs 2 B"):
                 owner.run(held, "decode", decode, (torch.ones(1),), {})

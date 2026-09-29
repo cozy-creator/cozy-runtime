@@ -2,19 +2,24 @@
 
 import socket
 import threading
+from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn, cast
 
 import pytest
 
+from cozy_runtime.author._executor_requests import Answer, HostRoom
 from cozy_runtime.internal import memory, tiers
 from cozy_runtime.internal.executor import Executor
-from cozy_runtime.internal.parallel.group import OpReady
+from cozy_runtime.internal.parallel.group import OpReady, RankGroup
 from cozy_runtime.internal.seam import Channel
 
 torch = pytest.importorskip("torch")
 
 
-def test_rank_credit_counts_alias_backings_and_cannot_allocate_twice(monkeypatch):
+def test_rank_credit_counts_alias_backings_and_cannot_allocate_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     owner = memory.Planner(torch, torch.device("cpu"), grouped=True)
     root = torch.nn.Module()
     backing = torch.arange(4, dtype=torch.float32)
@@ -38,19 +43,22 @@ def test_rank_credit_counts_alias_backings_and_cannot_allocate_twice(monkeypatch
 
 
 @pytest.mark.parametrize("available", [31, 32])
-def test_worker_reserves_aggregate_before_distributing_and_releases_after_use(tmp_path, available):
+def test_worker_reserves_aggregate_before_distributing_and_releases_after_use(
+    tmp_path: Path, available: int
+) -> None:
     ours, theirs = socket.socketpair()
     leader = Executor(Channel(ours), tmp_path, world=2)
-    leader.group = SimpleNamespace(broken=False, operation_sequence=7)
+    leader.group = cast(RankGroup, SimpleNamespace(broken=False, operation_sequence=7))
     worker = Channel(theirs)
     policy = memory.Machine({}, lambda _: None, lambda _: None, host_available=lambda: available)
     requests = []
     error = []
 
-    def serve():
+    def serve() -> None:
         try:
             for _ in range(2 if available == 32 else 1):
                 request = worker.recv()
+                assert request is not None
                 requests.append(request)
                 assert request["kind"] == "host_room"
                 token = request["reservation"]
@@ -80,20 +88,26 @@ def test_worker_reserves_aggregate_before_distributing_and_releases_after_use(tm
         theirs.close()
 
 
-def test_broken_followers_are_reaped_before_promise_release(tmp_path):
+def test_broken_followers_are_reaped_before_promise_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ours, theirs = socket.socketpair()
     leader = Executor(Channel(ours), tmp_path, world=2)
     events = []
-    leader.group = SimpleNamespace(
-        broken=True, operation_sequence=1, close=lambda: events.append("reaped")
+    leader.group = cast(
+        RankGroup,
+        SimpleNamespace(broken=True, operation_sequence=1, close=lambda: events.append("reaped")),
     )
-    leader._durable = lambda request, _: (
-        events.append("release" if request.release else "reserve") or SimpleNamespace(ok=True)
-    )
+
+    def durable(request: HostRoom, _: object) -> Answer:
+        events.append("release" if request.release else "reserve")
+        return Answer(ok=True)
+
+    monkeypatch.setattr(leader, "_durable", durable)
     try:
-        with leader._group_host_room([
-            OpReady(operation=1, rank=r, ok=False, host_needed=8) for r in range(2)
-        ]):
+        with leader._group_host_room(
+            [OpReady(operation=1, rank=r, ok=False, host_needed=8) for r in range(2)]
+        ):
             events.append("operation")
         assert events == ["reserve", "operation", "reaped", "release"]
     finally:
@@ -101,7 +115,7 @@ def test_broken_followers_are_reaped_before_promise_release(tmp_path):
         theirs.close()
 
 
-def test_host_credit_remaining_survives_abort_without_being_reissued():
+def test_host_credit_remaining_survives_abort_without_being_reissued() -> None:
     owner = memory.Planner(torch, torch.device("cpu"), grouped=True)
     with pytest.raises(ValueError), owner.host_credit(32):
         with owner._host_copy(16) as admitted:
@@ -116,22 +130,30 @@ def test_host_credit_remaining_survives_abort_without_being_reissued():
     assert owner.host_remaining() == 0
 
 
-def test_failed_reap_retains_reservation_for_worker_generation_cleanup(tmp_path):
+def test_failed_reap_retains_reservation_for_worker_generation_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ours, theirs = socket.socketpair()
     leader = Executor(Channel(ours), tmp_path, world=2)
     events = []
 
-    def close():
+    def close() -> NoReturn:
         raise OSError("reap not proven")
 
-    leader.group = SimpleNamespace(broken=True, operation_sequence=1, close=close)
-    leader._durable = lambda request, _: (
-        events.append("release" if request.release else "reserve") or SimpleNamespace(ok=True)
-    )
+    leader.group = cast(RankGroup, SimpleNamespace(broken=True, operation_sequence=1, close=close))
+
+    def durable(request: HostRoom, _: object) -> Answer:
+        events.append("release" if request.release else "reserve")
+        return Answer(ok=True)
+
+    monkeypatch.setattr(leader, "_durable", durable)
     try:
-        with pytest.raises(OSError), leader._group_host_room([
-            OpReady(operation=1, rank=r, ok=False, host_needed=8) for r in range(2)
-        ]):
+        with (
+            pytest.raises(OSError),
+            leader._group_host_room(
+                [OpReady(operation=1, rank=r, ok=False, host_needed=8) for r in range(2)]
+            ),
+        ):
             pass
         assert events == ["reserve"]
     finally:

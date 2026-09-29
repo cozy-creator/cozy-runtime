@@ -1224,7 +1224,9 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     assert vacated() == [q0, q1, q2]
     # Repeating satisfied demand performs no additional reclaim.
     with group.device:
-        assert worker._room(group, h3)(DeviceRoom(free_bytes=GiB)).ok
+        repeated = worker._room(group, h3)(DeviceRoom(free_bytes=GiB))
+        assert isinstance(repeated, Room)
+        assert repeated.ok
     assert vacated() == [q0, q1, q2]
     # Qwen on card 1 needs room: the idle H3 group is its only co-tenant there
     machine.free.clear()  # type: ignore[attr-defined]

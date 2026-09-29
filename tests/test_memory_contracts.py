@@ -155,13 +155,19 @@ def test_process_facts_do_not_survive_its_generation() -> None:
 
 
 def test_current_memory_contract_is_required_before_device_initialization() -> None:
-    hello = {"executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
-             "native_interfaces": {}, "memory": sorted(EXECUTOR_MEMORY_CAPABILITIES)}
+    hello = {
+        "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
+        "native_interfaces": {},
+        "memory": sorted(EXECUTOR_MEMORY_CAPABILITIES),
+    }
     require_executor_protocol(hello)
     for missing in EXECUTOR_MEMORY_CAPABILITIES:
         with pytest.raises(ExecutorProtocolMismatch, match="current Runtime memory contract"):
             require_executor_protocol(
-                {**hello, "memory": [v for v in hello["memory"] if v != missing]}
+                {
+                    **hello,
+                    "memory": [v for v in sorted(EXECUTOR_MEMORY_CAPABILITIES) if v != missing],
+                }
             )
 
 

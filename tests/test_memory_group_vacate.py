@@ -1,17 +1,21 @@
 """CPU backing/transport cases for best-effort group memory reclamation."""
 
 from types import SimpleNamespace
+from typing import NoReturn, cast
 
 import pytest
 
 from cozy_runtime.internal import memory, tiers
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.parallel import mirror
+from cozy_runtime.internal.parallel.group import RankGroup
 
 torch = pytest.importorskip("torch")
 
 
-def test_grouped_unmovable_backing_is_not_promised_or_poisoned(monkeypatch) -> None:
+def test_grouped_unmovable_backing_is_not_promised_or_poisoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # CPU tensors stand in for device backing; a device-to-host copy needs new RAM.
     monkeypatch.setattr(tiers, "host_copy_bytes", lambda unit: unit.nbytes)
     owner = memory.Planner(torch, torch.device("cpu"), grouped=True)
@@ -24,7 +28,9 @@ def test_grouped_unmovable_backing_is_not_promised_or_poisoned(monkeypatch) -> N
     assert torch.equal(root.weight, before) and not owner.unusable
 
 
-def test_grouped_whole_store_can_drop_partly_hosted_component(monkeypatch) -> None:
+def test_grouped_whole_store_can_drop_partly_hosted_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(tiers, "host_copy_bytes", lambda unit: unit.nbytes)
     owner = memory.Planner(torch, torch.device("cpu"), grouped=True)
     root = torch.nn.Module()
@@ -35,7 +41,7 @@ def test_grouped_whole_store_can_drop_partly_hosted_component(monkeypatch) -> No
     held.part.blocks[0].tier = tiers.HOST
     dropped = []
 
-    def drop(name):
+    def drop(name: str) -> None:
         dropped.append(name)
         root.to_empty(device="meta")
 
@@ -51,28 +57,45 @@ def test_grouped_whole_store_can_drop_partly_hosted_component(monkeypatch) -> No
 def test_leader_vacate_failure_drains_every_follower_reply() -> None:
     sent, read = [], []
 
-    def fail():
+    def fail() -> NoReturn:
         raise memory.MemoryRefusal("device_fault", "failed leader move", reusable=False)
+
+    def reply_one(rank: int, command: str) -> dict[str, bool]:
+        read.append(rank)
+        return {"ok": True}
 
     group = SimpleNamespace(
         send_one=lambda rank, command: sent.append(rank),
-        reply_one=lambda rank, command: read.append(rank) or {"ok": True},
+        reply_one=reply_one,
     )
     executor = SimpleNamespace(
-        poisoned="", torch=torch, _device_ready=True, world=3, group=group,
+        poisoned="",
+        torch=torch,
+        _device_ready=True,
+        world=3,
+        group=group,
         planner=SimpleNamespace(vacate=fail),
     )
     with pytest.raises(memory.MemoryRefusal, match="failed leader move"):
-        Executor.vacate(executor)
+        Executor.vacate(cast(Executor, executor))
     assert sent == read == [1, 2]
 
 
 def test_hosted_reusable_refusal_preserves_the_group() -> None:
     group = SimpleNamespace(gpu=lambda rank: str(rank), broken="")
     with pytest.raises(memory.MemoryRefusal) as caught:
-        mirror._accept(("c", "vae"), group, 1, {
-            "ok": False, "code": "host_shortfall", "detail": "no host allocation",
-            "reusable": True, "needed": 24, "available": 0,
-        })
+        mirror._accept(
+            ("c", "vae"),
+            cast(RankGroup, group),
+            1,
+            {
+                "ok": False,
+                "code": "host_shortfall",
+                "detail": "no host allocation",
+                "reusable": True,
+                "needed": 24,
+                "available": 0,
+            },
+        )
     assert caught.value.reusable and caught.value.shortfall["resource"] == "ram"
     assert group.broken == ""

@@ -3,7 +3,9 @@
 import os
 import socket
 import threading
+from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import msgspec
 import pytest
@@ -11,17 +13,19 @@ import pytest
 from cozy_runtime.internal import fill, memory, proctree, tiers
 from cozy_runtime.internal.executor_replies import AttemptReply, decode
 from cozy_runtime.internal.seam import Channel
-from cozy_runtime.internal.worker.child import Executor
+from cozy_runtime.internal.worker.attempts import AttemptEngine
+from cozy_runtime.internal.worker.child import Executor, ExecutorSupervision
 from cozy_runtime.internal.worker.lanes import LaneSet
 from cozy_runtime.internal.worker.plan import DeclaredBinding
-from cozy_runtime.internal.worker.session import Worker
+from cozy_runtime.internal.worker.session import Placement, Tenant, Worker
+from cozy_runtime.internal.worker.supervisor import Supervisor
 from cozy_runtime.protocol import documents
 from test_weights_resume_native import _committed
 
 torch = pytest.importorskip("torch")
 
 
-def test_host_bytes_count_unique_backings_in_slots_and_retained_copies():
+def test_host_bytes_count_unique_backings_in_slots_and_retained_copies() -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     backing = torch.arange(32, dtype=torch.float32)
     a, b = torch.nn.Module(), torch.nn.Module()
@@ -41,7 +45,7 @@ def test_host_bytes_count_unique_backings_in_slots_and_retained_copies():
     assert owner.facts()["disk_weight_bytes"] == 0
 
 
-def test_cpu_drop_reports_real_store_transition_epochs():
+def test_cpu_drop_reports_real_store_transition_epochs() -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     root = torch.nn.Module()
     root.weight = torch.nn.Parameter(torch.ones(8))
@@ -72,7 +76,7 @@ def test_cpu_drop_reports_real_store_transition_epochs():
     assert owner.document("generation")["disk_epoch"] == {"generation/model": 2}
 
 
-def test_prefetch_cannot_clear_a_replacement_executors_memory_facts():
+def test_prefetch_cannot_clear_a_replacement_executors_memory_facts() -> None:
     lanes = LaneSet.from_envelope("0", worker_pid=os.getpid())
     lane = lanes.lanes[0]
     lane.placements.add("tenant")
@@ -82,23 +86,23 @@ def test_prefetch_cannot_clear_a_replacement_executors_memory_facts():
     executor = Executor(
         epoch=2,
         process=proctree.process_identity(os.getpid()),
-        scope=None,
+        scope=proctree.ProcessTreeScope("prefetch-proof", os.getuid()),
         channel=channel,
         seal_digest="cpu-test",
     )
-    row.supervision = SimpleNamespace(current=executor)
+    row.supervision = cast(ExecutorSupervision, SimpleNamespace(current=executor))
     comparing = threading.Event()
     published = threading.Event()
 
-    class PreviousGeneration(tuple):
-        def __ne__(self, other):
+    class PreviousGeneration(tuple[int, ...]):
+        def __ne__(self, other: object) -> bool:
             different = tuple(self) != other
             if threading.current_thread().name == "prefetch-race":
                 comparing.set()
                 assert published.wait(5), "replacement facts were not published"
             return different
 
-    row.memory_generation = PreviousGeneration((executor.pid, 1))
+    row.memory_generation = cast(tuple[int, int], PreviousGeneration((executor.pid, 1)))
     item = ("store", "manifest", "model")
     worker = Worker.__new__(Worker)
     worker.lanes = lanes
@@ -107,7 +111,7 @@ def test_prefetch_cannot_clear_a_replacement_executors_memory_facts():
     result = []
     errors = []
 
-    def prefetch():
+    def prefetch() -> None:
         try:
             result.append(worker._prefetch_tier(demand, item))
         except BaseException as error:
@@ -144,7 +148,10 @@ def test_prefetch_cannot_clear_a_replacement_executors_memory_facts():
         theirs.close()
 
 
-def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(tmp_path):
+def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store, _, _, receipt = _committed(tmp_path)
     item = (str(store.root), receipt.artifact.manifest.digest, "model")
     binding = DeclaredBinding(
@@ -174,33 +181,36 @@ def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(tmp
     executor = Executor(
         epoch=1,
         process=proctree.process_identity(os.getpid()),
-        scope=None,
+        scope=proctree.ProcessTreeScope("prefetch-proof", os.getuid()),
         channel=channel,
         seal_digest="cpu-test",
     )
-    row.supervision = SimpleNamespace(current=executor)
+    row.supervision = cast(ExecutorSupervision, SimpleNamespace(current=executor))
     worker = Worker.__new__(Worker)
     worker.lanes = lanes
     worker.stop = threading.Event()
-    worker.engine = SimpleNamespace(live={})
+    worker.engine = cast(AttemptEngine, SimpleNamespace(live={}))
     worker.memory = memory.Machine(
         {}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30
     )
     worker._page_warm_targets = {}
     worker._pages_warmed = {}
     worker._page_warm_frontier = ()
-    worker.placement = SimpleNamespace(
-        placement_id="tenant", installation_id="installation", bindings_digest=b"a" * 32
+    worker.placement = cast(
+        Placement,
+        SimpleNamespace(
+            placement_id="tenant", installation_id="installation", bindings_digest=b"a" * 32
+        ),
     )
     worker.hosted = {}
     template = ("installation", documents.spell(b"a" * 32))
     worker._memory_waiting = (template,)
     # Run the real scheduled function synchronously for deterministic CPU evidence.
-    worker.supervisor = SimpleNamespace(spawn=lambda name, work: work(None))
+    worker.supervisor = cast(Supervisor, SimpleNamespace(spawn=lambda name, work: work(None)))
     notes = []
-    worker.note = lambda topic, line: notes.append((topic, line))
+    monkeypatch.setattr(worker, "note", lambda topic, line: notes.append((topic, line)))
 
-    def observe():
+    def observe() -> None:
         reply = decode(
             msgspec.json.decode(
                 msgspec.json.encode(
@@ -214,7 +224,7 @@ def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(tmp
     try:
         observe()
         worker._warm_pages(
-            SimpleNamespace(placement=worker.placement, bindings={"binding": binding})
+            cast(Tenant, SimpleNamespace(placement=worker.placement, bindings={"binding": binding}))
         )
         assert worker._page_warm_targets == {"tenant": {item: (key,)}}
         assert len(notes) == 1 and "2048 B" in notes[-1][1]
@@ -257,7 +267,9 @@ def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(tmp
         theirs.close()
 
 
-def test_activation_warms_native_store_once_before_any_load_report(tmp_path):
+def test_activation_warms_native_store_once_before_any_load_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store, _, _, receipt = _committed(tmp_path)
     binding = DeclaredBinding(
         entrypoint_binding_digest="binding",
@@ -275,18 +287,20 @@ def test_activation_warms_native_store_once_before_any_load_report(tmp_path):
     worker.memory = memory.Machine(
         {}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30
     )
-    worker.lanes = SimpleNamespace(lane_of=lambda _: None)
+    worker.lanes = cast(LaneSet, SimpleNamespace(lane_of=lambda _: None))
     worker._page_warm_targets = {}
-    worker._refresh_memory_queue = lambda: None
+    monkeypatch.setattr(worker, "_refresh_memory_queue", lambda: None)
     scheduled = []
-    worker.supervisor = SimpleNamespace(spawn=lambda name, work: scheduled.append((name, work)))
+    worker.supervisor = cast(
+        Supervisor, SimpleNamespace(spawn=lambda name, work: scheduled.append((name, work)))
+    )
     notes = []
-    worker.note = lambda topic, line: notes.append((topic, line))
+    monkeypatch.setattr(worker, "note", lambda topic, line: notes.append((topic, line)))
     tenant = SimpleNamespace(
         placement=SimpleNamespace(placement_id="tenant"), bindings={"a": binding}
     )
-    worker._warm_pages(tenant)
-    worker._warm_pages(tenant)
+    worker._warm_pages(cast(Tenant, tenant))
+    worker._warm_pages(cast(Tenant, tenant))
     assert len(scheduled) == 1  # No queue, executor, tier report or CUDA context exists.
     scheduled[0][1](None)
     assert len(notes) == 1 and "2048 B" in notes[0][1]

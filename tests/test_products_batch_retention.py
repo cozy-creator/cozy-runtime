@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import products
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
+from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.workspace import NativeHold, Workspace
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
@@ -76,7 +78,7 @@ def test_finish_keeps_all_journaled_native_files_and_releases_only_unjournaled(
     notice = executions.notice
     count = 0
 
-    def failing_notice(*args, **kwargs):
+    def failing_notice(*args: Any, **kwargs: Any) -> Any:
         nonlocal count
         result = notice(*args, **kwargs)
         count += 1
@@ -88,17 +90,17 @@ def test_finish_keeps_all_journaled_native_files_and_releases_only_unjournaled(
     if fail_after is not None:
         monkeypatch.setattr(executions, "notice", failing_notice)
         with pytest.raises(RuntimeError, match="lost reply"):
-            log.finish("owner", attempt, entries)
+            log.finish("owner", cast(AttemptRecord, attempt), entries)
     else:
-        assert log.finish("owner", attempt, entries) is None
+        assert log.finish("owner", cast(AttemptRecord, attempt), entries) is None
     fold = log.fold("owner", "producer")
     assert len(fold.single) == (fail_after or 4)
     for name, product in fold.single.items():
         with outputs.leased(workspace, "owner", product.source) as (_, lease, members):
             blob = members[0].blob
-            data = bytearray(blob.length)
-            lease.read_into("sha256:" + blob.sha256, blob.length, 0, blob.length, data)
-            assert data == payloads[name]
+            readback = bytearray(blob.length)
+            lease.read_into("sha256:" + blob.sha256, blob.length, 0, blob.length, readback)
+            assert readback == payloads[name]
     with workspace.locked() as db:
         held = db.all(NativeHold, "SELECT * FROM holds WHERE owner=?", ("owner",))
     assert sum(h.state == "held" for h in held) == (fail_after or 4)

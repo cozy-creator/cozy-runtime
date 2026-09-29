@@ -12,13 +12,14 @@ torch = pytest.importorskip("torch")
 
 @pytest.mark.parametrize("nested", [False, True])
 def test_preparation_refusal_cannot_hide_an_unrestored_parent(
-    monkeypatch: pytest.MonkeyPatch, nested: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
 ) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
     child = torch.nn.Linear(2, 2)
     held_child = owner.adopt("generation", "child", child, None, tiers.HOST)
 
-    class Parent(torch.nn.Module):
+    class Parent(torch.nn.Module):  # type: ignore[name-defined, misc]
         def __init__(self) -> None:
             super().__init__()
             self.calls = 0

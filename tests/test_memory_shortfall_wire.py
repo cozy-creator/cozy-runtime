@@ -63,10 +63,13 @@ def test_signed_shortfall_reaches_real_terminal_wire(
     monkeypatch: pytest.MonkeyPatch, needed: int, available: int
 ) -> None:
     body = terminal(monkeypatch, needed, available)
-    shortfall = body["cause"]["shortfall"]
+    cause = body["cause"]
+    assert isinstance(cause, dict)
+    shortfall = cause["shortfall"]
+    assert isinstance(shortfall, dict)
     assert shortfall.get("needed_bytes", 0) == max(needed, 0)
     assert shortfall.get("available_bytes", 0) == max(available, 0)
-    assert body["cause"]["code"] == pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+    assert cause["code"] == pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE
     assert body["execution_started"] is True
 
 
