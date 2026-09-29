@@ -18,6 +18,7 @@ from __future__ import annotations
 import functools
 import math
 import re
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -247,6 +248,8 @@ class Planner:
         self.stored = self.refilled = 0
         #: the allocator's counters when the attempt began: its churn is their growth
         self.counters: dict[str, int] = {}
+        #: seconds spent waiting on the Worker for room, and moving weights between tiers
+        self.room_s = self.move_s = 0.0
         #: allocator bytes the attempt's weight moves added (negative: gave back)
         self.transition = 0
         #: weights left the device since the last cap: their bytes sit in the allocator's cache
@@ -384,6 +387,7 @@ class Planner:
         self.peak = self.peak_allocated = self.working = 0
         self.loads = self.offloads = self.moved = self.transition = 0
         self.stored = self.refilled = 0
+        self.room_s = self.move_s = 0.0
         self.counters = self._counters()
         self.log = []
         self.plans = {}
@@ -426,6 +430,8 @@ class Planner:
             "attempt_moved_bytes": self.moved,
             "attempt_stored_bytes": self.stored,
             "attempt_refilled_bytes": self.refilled,
+            "attempt_room_ms": round(self.room_s * 1000, 1),
+            "attempt_move_ms": round(self.move_s * 1000, 1),
             **{
                 f"attempt_{name}": count - self.counters.get(name, 0)
                 for name, count in self._counters().items()
@@ -896,14 +902,16 @@ class Planner:
         if self.room is None or self.asked_room or self.spare:
             return False
         own = sum(self._evictable(v) for v in victims)
-        slack = self._reserved() - self._allocated()
-        before = self.grant
+        if self._reserved() > self._allocated():
+            tiers.trim(self.torch)
+        before, started = self.grant, time.perf_counter()
         self.room_asks += 1
         grant = self.room(
-            max(need - own - slack, 0) + self.overhead,
-            self._allocated() - own + need + self.overhead,
+            max(need - own, 0) + self.overhead,
+            self._reserved() - own + need + self.overhead,
             measured,
         )
+        self.room_s += time.perf_counter() - started
         if grant is not None:
             self.grant = grant
         self.asked_room = grant is None or (before is not None and grant <= before)
@@ -972,12 +980,13 @@ class Planner:
 
     @contextmanager
     def _moving(self) -> Iterator[None]:
-        """Count what a weight move changes on the allocator: the attempt's transition."""
-        before = self._allocated()
+        """Count what a weight move changes on the allocator, and how long it takes."""
+        before, started = self._allocated(), time.perf_counter()
         try:
             yield
         finally:
             self.transition += self._allocated() - before
+            self.move_s += time.perf_counter() - started
 
     def _load_common(self, held: Held) -> None:
         part = held.part

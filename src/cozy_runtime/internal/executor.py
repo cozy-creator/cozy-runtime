@@ -2289,6 +2289,12 @@ class Executor:
                     "envelope": envelope,
                 }
         stage("warm")
+        # What the warm spent waiting on the Worker for room and moving weights.
+        planner = self.host.planner
+        warm_room_ms = round(planner.room_s * 1000, 1) if planner is not None else 0.0
+        warm_move_ms = round(planner.move_s * 1000, 1) if planner is not None else 0.0
+        if planner is not None:
+            planner.room_s = planner.move_s = 0.0
         if "sol-attn" in applied.totals():
             frozen = attention._baked_in({**backend.components, **backend.parked})
             if frozen:
@@ -2336,6 +2342,8 @@ class Executor:
             # absent-stat KeyError after a successful construction.
             "fill_ms": backend.stats.get("fill_ms", 0),
             "warm_ms": round(warm_ms, 2),
+            "warm_room_ms": warm_room_ms,
+            "warm_move_ms": warm_move_ms,
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
             "device_free_bytes": allocation["driver_free_bytes"],

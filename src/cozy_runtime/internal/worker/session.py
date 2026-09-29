@@ -5761,6 +5761,8 @@ class Worker:
             bytes=int(facts.get("filled_bytes", 0)),
             fill_ms=float(facts.get("fill_ms", 0)),
             warm_ms=float(facts.get("warm_ms", 0)),
+            warm_room_ms=float(facts.get("warm_room_ms", 0)),
+            warm_move_ms=float(facts.get("warm_move_ms", 0)),
             custody=str(facts.get("custody", "canonical")),
             ignored_extra_keys=", ".join(facts.get("ignored_extra_keys", ())),
         )
