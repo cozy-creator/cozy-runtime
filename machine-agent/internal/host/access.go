@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,8 +62,18 @@ func (m *Machine) serveHubAccess(w http.ResponseWriter, r *http.Request) {
 	}
 	replaced := false
 	for i, old := range file.Hubs {
-		if old.Origin == access.Origin {
+		if hubOriginKey(old.Origin) == hubOriginKey(access.Origin) {
+			if hubAccessPrincipal(old.Token) != hubAccessPrincipal(access.Token) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{
+					"code":    "hub_access_principal_conflict",
+					"message": "this machine already holds access for another account at this Hub; renew access for the original account",
+				}})
+				return
+			}
 			file.Hubs[i] = access
+			file.Hubs[i].Origin = old.Origin
 			replaced = true
 			break
 		}
@@ -87,6 +98,62 @@ func (m *Machine) serveHubAccess(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"origin": access.Origin, "expires_at": access.ExpiresAt})
+}
+
+func hubOriginKey(origin string) string {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return origin
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+		if u.Scheme == "http" {
+			port = "80"
+		}
+	} else if number, err := strconv.Atoi(port); err == nil {
+		port = strconv.Itoa(number)
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Hostname()) + ":" + port
+}
+
+// This is a continuity check, not JWT authentication: Tensorhub still verifies
+// each request. Opaque or unfamiliar tokens may only refresh with identical bytes.
+// The persisted grant itself retains the binding, including after it expires.
+func hubAccessPrincipal(token string) string {
+	fallback := func() string {
+		digest := sha256.Sum256([]byte(token))
+		return "opaque:" + hex.EncodeToString(digest[:])
+	}
+	parts := strings.Split(token, ".")
+	if len(token) > 32<<10 || len(parts) != 3 || parts[2] == "" {
+		return fallback()
+	}
+	header, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return fallback()
+	}
+	var kind struct {
+		Type string `json:"typ"`
+	}
+	if json.Unmarshal(header, &kind) != nil || !strings.EqualFold(strings.TrimSpace(kind.Type), "delegated-access+jwt") {
+		return fallback()
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return fallback()
+	}
+	var claims struct {
+		Issuer      string   `json:"iss"`
+		Subject     string   `json:"delegated_sub"`
+		User        string   `json:"sub"`
+		Permissions []string `json:"permissions"`
+	}
+	if json.Unmarshal(payload, &claims) != nil || claims.Issuer == "" || len(claims.Issuer) > 2048 || claims.Subject == "" || len(claims.Subject) > 256 || claims.User != "" || len(claims.Permissions) != 1 || claims.Permissions[0] != "cozy.execution-access" {
+		return fallback()
+	}
+	identity, _ := json.Marshal([2]string{claims.Issuer, claims.Subject})
+	return "delegated:" + string(identity)
 }
 
 func (m *Machine) accessPath() string { return filepath.Join(m.layout.State, "hub-access.json") }
@@ -148,10 +215,10 @@ func projectHubAccess(legacy []HubGrant, access hubAccessFile, layout Layout) er
 	doc.Hubs = make([]json.RawMessage, 0, len(legacy)+len(access.Hubs))
 	replaced := map[string]bool{}
 	for _, a := range access.Hubs {
-		replaced[strings.TrimSuffix(a.Origin, "/")] = true
+		replaced[hubOriginKey(a.Origin)] = true
 	}
 	for i, h := range legacy {
-		if replaced[strings.TrimSuffix(h.Origin, "/")] {
+		if replaced[hubOriginKey(h.Origin)] {
 			continue
 		}
 		row := map[string]any{"origin": h.Origin, "worker_id": h.WorkerID, "worker_token": h.WorkerToken, "object_storage_hosts": h.ObjectHosts}

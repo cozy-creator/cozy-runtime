@@ -23,7 +23,7 @@ from cozy_runtime.author._model_defaults import default_ladder, reference
 from cozy_runtime.internal import egress, fill
 from cozy_runtime.protocol import documents
 
-from .machine_publication import PublicationRefusal
+from .machine_publication import PublicationRefusal, origin_key
 from .workspace import WorkspaceRefusal
 from .workspace_executions import ExecutionWorkspaceRefusal
 
@@ -197,18 +197,9 @@ class Catalog:
         return length
 
 
-def _origin(value: str) -> tuple[str, str, int]:
-    parts = urlsplit(value.rstrip("/"))
-    return (
-        parts.scheme,
-        (parts.hostname or "").lower(),
-        parts.port or (443 if parts.scheme == "https" else 80),
-    )
-
-
 def same_origin(a: str, b: str) -> bool:
     try:
-        return _origin(a) == _origin(b)
+        return origin_key(a) == origin_key(b)
     except ValueError:
         return False
 
@@ -217,6 +208,16 @@ def registration(worker: Worker, origin: str) -> PublicationAuthority | None:
     """Read this machine's current scoped access, including a renewed delegated token."""
     for held in authorities(worker):
         if not origin or same_origin(held.origin, origin):
+            if held.access_token:
+                with worker.hub_access_lock:
+                    principal = worker.hub_access_principals.setdefault(
+                        origin_key(held.origin), held.principal
+                    )
+                if principal != held.principal:
+                    raise ExecutionWorkspaceRefusal(
+                        "hub_access_principal_conflict",
+                        "this machine's Hub access names another account; renew the original account's access",
+                    )
             return held
     return None
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,13 @@ import (
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/capability"
 )
 
+func accessToken(t *testing.T, issuer, subject, nonce string) string {
+	t.Helper()
+	header, _ := json.Marshal(map[string]any{"typ": "delegated-access+jwt", "alg": "EdDSA"})
+	payload, _ := json.Marshal(map[string]any{"iss": issuer, "delegated_sub": subject, "permissions": []string{"cozy.execution-access"}, "jti": nonce})
+	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + ".fixture-signature"
+}
+
 func TestAccessRefreshIsScopedAndContainsNoWorkerRegistration(t *testing.T) {
 	public, key, _ := ed25519.GenerateKey(rand.Reader)
 	claims, err := newClaims("local-machine", "boot", make([]byte, 32), []ed25519.PublicKey{public})
@@ -23,7 +31,7 @@ func TestAccessRefreshIsScopedAndContainsNoWorkerRegistration(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &Machine{grant: &Grant{WorkerID: "local-machine"}, claims: claims, layout: NewLayout(&Grant{Root: t.TempDir()})}
-	access := hubAccess{Origin: "https://example.test", Token: "scoped-credential", ExpiresAt: time.Now().Add(time.Hour).Unix(), Environment: map[string]string{"TENSORHUB_ORIGIN": "https://example.test", "FUTURE_HUB_SETTING": "ignored", "PATH": "/untrusted"}}
+	access := hubAccess{Origin: "https://example.test", Token: accessToken(t, "issuer", "account-a", "first"), ExpiresAt: time.Now().Add(time.Hour).Unix(), Environment: map[string]string{"TENSORHUB_ORIGIN": "https://example.test", "FUTURE_HUB_SETTING": "ignored", "PATH": "/untrusted"}}
 	send := func(action string, a hubAccess) *httptest.ResponseRecorder {
 		cap, _ := capability.Mint(key, capability.Grant{Machine: "local-machine", Action: action, Expires: time.Now().Add(time.Hour).Unix()})
 		raw, _ := json.Marshal(a)
@@ -39,7 +47,7 @@ func TestAccessRefreshIsScopedAndContainsNoWorkerRegistration(t *testing.T) {
 	if w := send(hubAccessAction, access); w.Code != 200 || strings.Contains(w.Body.String(), access.Token) {
 		t.Fatalf("grant response: %d %s", w.Code, w.Body.String())
 	}
-	access.Token = "refreshed-credential"
+	access.Token = accessToken(t, "issuer", "account-a", "refreshed")
 	if w := send(hubAccessAction, access); w.Code != 200 {
 		t.Fatalf("refresh: %s", w.Body.String())
 	}
@@ -62,12 +70,80 @@ func TestAccessRefreshIsScopedAndContainsNoWorkerRegistration(t *testing.T) {
 	if info, err := os.Stat(m.accessPath()); err != nil || info.Mode().Perm() != 0600 {
 		t.Fatal("access configuration is not private")
 	}
+	retained, _ := os.ReadFile(m.accessPath())
+	for _, tc := range []struct{ name, origin, token string }{
+		{"account", access.Origin, accessToken(t, "issuer", "account-b", "changed")},
+		{"issuer", access.Origin, accessToken(t, "other-issuer", "account-a", "changed")},
+		{"origin-alias", "https://EXAMPLE.test:443", accessToken(t, "issuer", "account-b", "changed")},
+		{"opaque", access.Origin, "different-opaque-token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := access
+			changed.Origin, changed.Token = tc.origin, tc.token
+			changed.Environment = map[string]string{"TENSORHUB_ORIGIN": tc.origin}
+			w := send(hubAccessAction, changed)
+			if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "hub_access_principal_conflict") || strings.Contains(w.Body.String(), changed.Token) {
+				t.Fatalf("account switch was not safely refused: %d %s", w.Code, w.Body.String())
+			}
+			state, _ := os.ReadFile(m.accessPath())
+			projection, _ := os.ReadFile(m.layout.boot("machine-hubs.json"))
+			if !bytes.Equal(state, retained) || !bytes.Equal(projection, raw) {
+				t.Fatal("refused account switch changed the retained grant")
+			}
+		})
+	}
+	// Expiry never turns old accepted work into permission to use another account.
+	file, _ := readHubAccess(m.accessPath())
+	file.Hubs[0].ExpiresAt = 1
+	expired, _ := json.Marshal(file)
+	if err := writeAtomic(m.accessPath(), expired, 0600); err != nil {
+		t.Fatal(err)
+	}
+	changed := access
+	changed.Token = accessToken(t, "issuer", "account-b", "expired-replacement")
+	if w := send(hubAccessAction, changed); w.Code != http.StatusConflict {
+		t.Fatal("expired old grant allowed another account")
+	}
+	if w := send(hubAccessAction, access); w.Code != http.StatusOK {
+		t.Fatal("original account could not renew expired access")
+	}
+	alias := access
+	alias.Origin = "https://example.test:443"
+	alias.Environment = map[string]string{"TENSORHUB_ORIGIN": alias.Origin}
+	if w := send(hubAccessAction, alias); w.Code != http.StatusOK {
+		t.Fatal("same-account origin alias could not refresh")
+	}
+	file, _ = readHubAccess(m.accessPath())
+	if len(file.Hubs) != 1 || file.Hubs[0].Origin != access.Origin {
+		t.Fatal("an equivalent origin changed the retained Hub slot")
+	}
+	opaque := hubAccess{Origin: "https://other.test", Token: "opaque-one", ExpiresAt: access.ExpiresAt, Environment: map[string]string{"TENSORHUB_ORIGIN": "https://other.test"}}
+	for range 2 {
+		if w := send(hubAccessAction, opaque); w.Code != http.StatusOK {
+			t.Fatal("opaque same-token replay was refused")
+		}
+	}
+	opaque.Token = "opaque-two"
+	if w := send(hubAccessAction, opaque); w.Code != http.StatusConflict {
+		t.Fatal("opaque replacement invented authority continuity")
+	}
 	access.ExpiresAt = time.Now().Add(-time.Hour).Unix()
 	if w := send(hubAccessAction, access); w.Code != 400 {
 		t.Fatal("expired access accepted")
 	}
 	if _, err := os.Stat(filepath.Join(m.layout.State, "worker-registration.json")); !os.IsNotExist(err) {
 		t.Fatal("access registered machine")
+	}
+}
+
+func TestOpaqueAccessDoesNotInventAccountContinuity(t *testing.T) {
+	if hubAccessPrincipal("opaque-one") != hubAccessPrincipal("opaque-one") || hubAccessPrincipal("opaque-one") == hubAccessPrincipal("opaque-two") {
+		t.Fatal("opaque tokens lost exact-token continuity")
+	}
+	for _, token := range []string{"x.y.z", "e30.e30.signature", "..", strings.Repeat("x", 33<<10)} {
+		if !strings.HasPrefix(hubAccessPrincipal(token), "opaque:") {
+			t.Fatal("unknown JWT acquired delegated continuity")
+		}
 	}
 }
 
