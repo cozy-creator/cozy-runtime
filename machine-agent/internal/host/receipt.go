@@ -34,6 +34,7 @@ type receipt struct {
 	path       string
 	mu         sync.Mutex
 	key        []byte
+	pending    []byte // one signed envelope awaiting a successful durable write
 	retained   []byte // the payload of an envelope an earlier process of this boot sealed
 	sealed     []byte
 	standalone bool
@@ -53,16 +54,24 @@ func openReceipt(path string, key []byte) (*receipt, error) {
 	if err != nil {
 		return nil, err
 	}
-	var env envelope
-	if err := json.Unmarshal(raw, &env); err != nil || len(env.Payload) == 0 {
-		return nil, fmt.Errorf("the retained readiness envelope is unreadable")
-	}
-	if len(key) != 0 && !hmac.Equal(mac(key, env.Payload), mustHex(env.HMAC)) {
-		return nil, fmt.Errorf("the retained readiness envelope does not verify under the granted key")
+	env, err := verifyEnvelope(raw, key)
+	if err != nil {
+		return nil, err
 	}
 	clear(key)
 	r.key, r.retained, r.sealed = nil, env.Payload, raw
 	return r, nil
+}
+
+func verifyEnvelope(raw, key []byte) (envelope, error) {
+	var env envelope
+	if len(raw) > maxReceiptBytes || json.Unmarshal(raw, &env) != nil || len(env.Payload) == 0 {
+		return env, errors.New("the retained readiness envelope is unreadable")
+	}
+	if len(key) != 0 && !hmac.Equal(mac(key, env.Payload), mustHex(env.HMAC)) {
+		return env, errors.New("the retained readiness envelope does not verify under the granted key")
+	}
+	return env, nil
 }
 
 // Envelope is the sealed bytes, or nil before readiness.
@@ -101,17 +110,37 @@ func (r *receipt) seal(raw []byte, workerPort int, observed *OwnerAuth, webrtc m
 	if len(r.key) == 0 {
 		return errors.New("the readiness key was spent; this boot signs nothing again")
 	}
-	sum := hex.EncodeToString(mac(r.key, payload))
-	clear(r.key)
-	r.key = nil
-	body, err := json.Marshal(envelope{Payload: payload, HMAC: sum})
-	if err != nil || len(body) > maxReceiptBytes {
-		return fmt.Errorf("the readiness envelope exceeds %d bytes", maxReceiptBytes)
+	body := r.pending
+	if body == nil {
+		// Rename can succeed even when syncing its directory fails. Recover that
+		// signature before considering a new one; it still cannot be advertised.
+		var readErr error
+		body, readErr = os.ReadFile(r.path)
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return readErr
+		}
+		if errors.Is(readErr, os.ErrNotExist) {
+			sum := hex.EncodeToString(mac(r.key, payload))
+			body, err = json.Marshal(envelope{Payload: payload, HMAC: sum})
+			if err != nil || len(body) > maxReceiptBytes {
+				return fmt.Errorf("the readiness envelope exceeds %d bytes", maxReceiptBytes)
+			}
+		}
 	}
-	if err := writeAtomic(r.path, body, 0o444); err != nil {
+	env, err := verifyEnvelope(body, r.key)
+	if err != nil {
 		return err
 	}
-	r.sealed, r.retained = body, payload
+	r.pending = body
+	if err := sameAttestation(env.Payload, payload); err != nil {
+		return err
+	}
+	if err := writeAtomic(r.path, r.pending, 0o444); err != nil {
+		return err
+	}
+	clear(r.key)
+	r.key = nil
+	r.sealed, r.retained, r.pending = r.pending, env.Payload, nil
 	return nil
 }
 
@@ -119,6 +148,9 @@ func rewritePayload(raw []byte, workerPort int, observed *OwnerAuth, webrtc map[
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil {
 		return nil, fmt.Errorf("the Runtime readiness payload is not one object: %w", err)
+	}
+	if members == nil {
+		return nil, errors.New("the Runtime readiness payload is not one object")
 	}
 	delete(members, "process_incarnation") // private readiness is never a retained public fact
 	var err error

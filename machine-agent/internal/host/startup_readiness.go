@@ -47,12 +47,20 @@ func (m *Machine) commitStartup(p *runtimeProcess, payload []byte) error {
 	if _, err := m.launcher.maintain("startup-commit", []string{p.incarnation, workspace.ExecutionWorkspaceId}); err != nil {
 		return err
 	}
-	if err := m.attestRuntime(payload); err != nil {
-		return err
+	// A later receipt failure cannot undo the committed installation. Keep API
+	// readiness closed and report repair, without sending a rollback for this journal.
+	p.startupCommitted = true
+	if !m.manualUpdateActive() {
+		defer m.setUpdating(false) // receipt and resumed cleanup retain admission
 	}
 	m.mu.Lock()
-	m.grant.startupPending, m.inUpdate = false, false
+	m.grant.startupPending = false
 	m.mu.Unlock()
+	if err := m.attestRuntime(payload); err != nil {
+		failure := fmt.Errorf("Runtime installation committed but readiness receipt failed: %w", err)
+		m.finishResumedUpdate("failed", failure.Error())
+		return failure
+	}
 	m.finishResumedUpdate("succeeded", "")
 	fmt.Fprintln(m.log, "cozy machine: startup update committed after authenticated Runtime readiness")
 	return nil
@@ -62,7 +70,11 @@ func (m *Machine) rollbackStartup(ctx context.Context, cause error) error {
 	// The caller owns update admission (and boot may already hold launchMu).
 	// Keep that fence through application handoff or the restored launch/error.
 	// An intentional process replacement exits without releasing this process's fence.
-	defer m.setUpdating(false)
+	defer func() {
+		if !m.manualUpdateActive() {
+			m.setUpdating(false)
+		}
+	}()
 	detail := cause.Error()
 	fmt.Fprintln(m.log, "cozy machine: rolling back startup candidate:", detail)
 	m.stopRuntime()

@@ -185,6 +185,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 			if err := m.loadRuntimeCapabilities(); err != nil {
 				fmt.Fprintln(m.log, "cozy machine: retained Runtime capabilities:", err)
 			}
+			m.proc.claimDone = make(chan struct{})
 			go m.claimRuntime(m.proc)
 		}
 	} else if startupErr != nil {
@@ -337,6 +338,7 @@ func (m *Machine) launch() error {
 	if err != nil {
 		return err
 	}
+	p.claimDone = make(chan struct{})
 	m.mu.Lock()
 	m.proc, m.ready, m.runtimeAck = p, make(chan struct{}), nil
 	m.mu.Unlock()
@@ -368,6 +370,16 @@ func mustLeaf(c tls.Certificate) *x509.Certificate {
 
 // claimRuntime verifies this child's fresh readiness and opens its private session.
 func (m *Machine) claimRuntime(p *runtimeProcess) {
+	defer close(p.claimDone)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-p.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	payload := m.layout.boot("readiness-payload")
 	var pendingPayload []byte
 	tick := time.NewTicker(50 * time.Millisecond)
@@ -410,7 +422,7 @@ func (m *Machine) claimRuntime(p *runtimeProcess) {
 		m.mu.Unlock()
 	}
 	for {
-		ack, err := m.controlClaim()
+		ack, err := m.controlClaim(ctx)
 		if err == nil && ack.Accepted {
 			if m.startupPending() {
 				if err := m.commitStartup(p, pendingPayload); err != nil {
@@ -444,8 +456,8 @@ func (m *Machine) attestRuntime(raw []byte) error {
 }
 
 // controlClaim records the daemon as the Runtime's owner on one Control stream.
-func (m *Machine) controlClaim() (*pb.ClaimAck, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+func (m *Machine) controlClaim(parent context.Context) (*pb.ClaimAck, error) {
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	stream, err := pb.NewWorkerControlClient(m.conn).Control(ctx)
 	if err != nil {
@@ -549,15 +561,21 @@ func (m *Machine) supervise(ctx context.Context) error {
 		m.mu.Lock()
 		p := m.proc
 		m.mu.Unlock()
-		if p != nil && p.exited() && !(m.startupPending() && m.manualUpdateActive()) {
-			if m.startupPending() && !m.manualUpdateActive() {
-				if err := m.rollbackStartup(ctx, fmt.Errorf("candidate Runtime exited before readiness: %s; %s", exitText(p.err), m.restarts.reason())); err != nil {
-					fmt.Fprintln(m.log, "cozy machine: repair required:", err)
+		if p != nil && p.exited() && !(m.updating() && m.manualUpdateActive()) {
+			select {
+			case <-p.claimDone:
+				// A resumed request plane has no manual update goroutine. Its
+				// readiness result still decides whether this candidate needs rollback.
+				if m.startupPending() && !m.manualUpdateActive() {
+					if err := m.rollbackStartup(ctx, fmt.Errorf("candidate Runtime exited before readiness: %s; %s", exitText(p.err), m.restarts.reason())); err != nil {
+						fmt.Fprintln(m.log, "cozy machine: repair required:", err)
+					}
+					continue
 				}
-				continue
-			}
-			if err := m.relaunchAfter(p); err != nil {
-				return err
+				if err := m.relaunchAfter(p); err != nil {
+					return err
+				}
+			default: // keep observing rental idleness while an in-flight commit settles
 			}
 		}
 		busy, err := false, error(errors.New("Runtime activity is unavailable"))

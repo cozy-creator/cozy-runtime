@@ -100,14 +100,17 @@ func (m *Machine) finishResumedUpdate(state, detail string) {
 		return
 	}
 	m.grant.bootstrap.Pending = false
+	m.updates.staging.Lock()
+	defer m.updates.staging.Unlock()
 	m.updates.mu.Lock()
-	defer m.updates.mu.Unlock()
-	if m.updates.status != nil && !m.updates.status.terminal() {
+	current := m.updates.status
+	m.updates.mu.Unlock()
+	if current != nil && !current.terminal() {
 		if err := os.RemoveAll(m.stagePath()); err != nil {
 			fmt.Fprintln(m.log, "cozy machine: update cleanup:", err)
 		}
-		m.updates.status.State = state
-		m.updates.status.Error = detail
-		_ = m.writeUpdate(*m.updates.status)
+		status := *current
+		status.State, status.Error = state, detail
+		m.saveUpdate(status)
 	}
 }

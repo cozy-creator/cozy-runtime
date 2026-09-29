@@ -26,12 +26,14 @@ import (
 
 // runtimeProcess is one launched Runtime.
 type runtimeProcess struct {
-	incarnation string
-	done        chan struct{}
-	err         error
-	stopped     atomic.Bool // this daemon asked it to stop
-	stop        func()      // cooperative: EOF on fd 3, then SIGKILL once it stops moving
-	pid         int         // known where this process started it
+	incarnation      string
+	done             chan struct{}
+	claimDone        chan struct{} // the authenticated readiness attempt has settled
+	startupCommitted bool          // private installation journal committed; read after claimDone
+	err              error
+	stopped          atomic.Bool // this daemon asked it to stop
+	stop             func()      // cooperative: EOF on fd 3, then SIGKILL once it stops moving
+	pid              int         // known where this process started it
 }
 
 func (p *runtimeProcess) exited() bool {
