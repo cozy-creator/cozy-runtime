@@ -257,3 +257,157 @@ def test_canceled_queued_hint_never_starts_and_demand_without_hint_still_runs() 
     finally:
         release.set()
         queue.close()
+
+
+def test_demand_before_callee_installation_holds_hints_until_submission() -> None:
+    queue = Preparations[str]()
+    computing = threading.Event()
+
+    def hint(_: Callable[[], bool]) -> str:
+        assert computing.is_set(), "hint ran while a real call still needed preparation"
+        return "next model"
+
+    try:
+        with queue.demand("parent"):
+            with queue.demand("parent"):
+                pending = queue.request("next", "parent", hint, speculative=True)
+                assert not queue.started()
+            # One parent's concurrent call must not release its sibling's demand.
+            assert not queue.started()
+            ready = queue.request("current", "parent", lambda _: "ready", speculative=False)
+            assert ready is not None and ready.result(5) == "ready"
+            assert pending is not None and not pending.done()
+            computing.set()  # the actual child can now be submitted
+        assert pending.result(5) == "next model"
+    finally:
+        computing.set()
+        queue.close()
+
+
+def test_running_hint_yields_and_promoted_demand_keeps_its_shared_future() -> None:
+    queue = Preparations[str]()
+    started, cancel, unwound = (threading.Event() for _ in range(3))
+    release = threading.Event()
+    attempts = 0
+
+    def prepare(cancelled: Callable[[], bool]) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            started.set()
+            assert cancel.wait(5)
+            assert cancelled()
+            assert release.wait(5)
+            unwound.set()  # native transfer and temporary holds have finished
+            raise InterruptedError("speculative transfer paused")
+        assert unwound.is_set() and not cancelled()
+        return "verified bytes retained across pause"
+
+    try:
+        shared = queue.request("next", "hint-parent", prepare, speculative=True, cancel=cancel.set)
+        assert started.wait(5)
+        with queue.demand("real-parent"):
+            assert cancel.is_set() and shared is not None and not shared.done()
+            ordinary = queue.request("current", "real-parent", lambda _: "ready", speculative=False)
+            assert ordinary is not None and ordinary.result(5) == "ready"
+            # Another real call needs the paused selection. It joins the SAME future;
+            # its restart must wait for the old transfer to relinquish its writer.
+            promoted = queue.request("next", "second-parent", prepare, speculative=False)
+            assert promoted is shared and attempts == 1
+            release.set()
+            assert promoted.result(5) == "verified bytes retained across pause"
+            assert attempts == 2
+    finally:
+        cancel.set()
+        release.set()
+        queue.close()
+
+
+def test_another_demand_never_cancels_preparation_with_a_real_interest() -> None:
+    queue = Preparations[str]()
+    started, finish, canceled = (threading.Event() for _ in range(3))
+
+    def prepare(cancelled: Callable[[], bool]) -> str:
+        started.set()
+        assert finish.wait(5)
+        assert not cancelled()
+        return "shared"
+
+    try:
+        hint = queue.request("same", "hint", prepare, speculative=True, cancel=canceled.set)
+        assert started.wait(5)
+        actual = queue.request("same", "actual", prepare, speculative=False)
+        assert actual is hint
+        with queue.demand("other"):
+            queue.retain(lambda parent: parent != "hint")
+            assert not canceled.is_set()
+            finish.set()
+            assert actual is not None and actual.result(5) == "shared"
+    finally:
+        finish.set()
+        queue.close()
+
+
+def test_demanded_preparation_finishes_before_a_queued_hint_starts() -> None:
+    queue = Preparations[str]()
+    started, finish = threading.Event(), threading.Event()
+
+    def prepare(_: Callable[[], bool]) -> str:
+        started.set()
+        assert finish.wait(5)
+        return "ready"
+
+    try:
+        actual = queue.request("current", "actual", prepare, speculative=False)
+        assert started.wait(5)
+        hint = queue.request("next", "hint", lambda _: "next", speculative=True)
+        assert queue.started() == ["current"]
+        assert hint is not None and not hint.done()
+        finish.set()
+        assert actual is not None and actual.result(5) == "ready"
+        assert hint is not None and hint.result(5) == "next"
+    finally:
+        finish.set()
+        queue.close()
+
+
+def test_parent_fencing_releases_its_early_demand_lease() -> None:
+    queue = Preparations[str]()
+    try:
+        with queue.demand("gone"):
+            hint = queue.request("next", "kept", lambda _: "next", speculative=True)
+            assert hint is not None and not queue.started()
+            queue.retain(lambda parent: parent != "gone")
+            assert hint.result(5) == "next"
+        assert not queue.demands
+    finally:
+        queue.close()
+
+
+def test_abandoning_a_paused_hint_does_not_restart_it() -> None:
+    queue = Preparations[str]()
+    started, cancel, finish = (threading.Event() for _ in range(3))
+    attempts = 0
+
+    def prepare(_: Callable[[], bool]) -> str:
+        nonlocal attempts
+        attempts += 1
+        started.set()
+        assert cancel.wait(5) and finish.wait(5)
+        raise InterruptedError("no remaining consumers")
+
+    try:
+        hint = queue.request("next", "hint", prepare, speculative=True, cancel=cancel.set)
+        assert started.wait(5)
+        with queue.demand("actual"):
+            assert cancel.is_set()
+            queue.retain(lambda interest: interest != "hint")
+            finish.set()
+            assert hint is not None
+            with pytest.raises(InterruptedError, match="no remaining"):
+                hint.result(5)
+        assert attempts == 1
+    finally:
+        cancel.set()
+        finish.set()
+        queue.close()

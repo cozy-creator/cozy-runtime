@@ -382,6 +382,12 @@ class Serving:
     def close(self) -> None:
         self.preparations.close()
 
+    @contextlib.contextmanager
+    def demand(self, call: Call) -> Iterator[None]:
+        """Register a real call before resolving its possibly deferred installation."""
+        with self.preparations.demand((call.parent_request, call.parent_ordinal)):
+            yield
+
     def prefetch(self, parent: AttemptRecord, hint: ModelPrefetch) -> Answer:
         """A model-only hint; never accepts a child execution or chooses a GPU lane."""
         owner = self.worker.fence.record_owner_id
@@ -461,18 +467,44 @@ class Serving:
             call_index=(1 << 32) - 1 if speculative else call.call_index,
         )
         tensorfs = fill.tensorfs_module()
-        token = tensorfs.PullCancellation()
-        # The callee's process starts while its weights download, or while a hinted
-        # download already runs (h3a-087). A slot never reserves a GPU and yields to others.
-        self.worker.prespawns.request(
-            owner, call.parent_request, target, lambda frame: self._progress(call, request, frame)
-        )
+        cancellation_lock = threading.Lock()
+        active_token: _Cancellation | None = None
+
+        def warm() -> None:
+            self.worker.prespawns.request(
+                owner,
+                call.parent_request,
+                target,
+                lambda frame: self._progress(call, request, frame),
+            )
+
+        if not speculative:
+            # The immutable binding may be cached after its old executor was trimmed.
+            # A real call still warms its process while awaiting admission.
+            warm()
+
+        def stop() -> None:
+            with cancellation_lock:
+                if active_token is not None:
+                    active_token.cancel()
 
         def load(cancelled: Callable[[], bool]) -> Prepared:
+            nonlocal active_token
+            # A paused hint resumes with a fresh native cancellation token. The store
+            # retains completed bytes; only this attempt's transfer and holds ended.
+            token = tensorfs.PullCancellation()
+            with cancellation_lock:
+                active_token = token
+                if cancelled():
+                    token.cancel()
             generation = store_gc.generation
             try:
                 if cancelled():
                     raise WorkspaceRefusal("model preparation canceled")
+                # Warming belongs to scheduled work too: a hint held behind an awaited
+                # callee installation must not consume CPU preparing an executor yet.
+                if speculative:
+                    warm()
                 prepared = self._prepare(
                     owner,
                     source,
@@ -489,6 +521,8 @@ class Serving:
                 prepared.generation = generation
                 return prepared
             finally:
+                with cancellation_lock:
+                    active_token = None
                 assert self.worker.workspace is not None
                 self._release_preparation(owner, source.child_request)
 
@@ -497,7 +531,7 @@ class Serving:
             (call.parent_request, request.parent_attempt_ordinal),
             load,
             speculative=speculative,
-            cancel=token.cancel,
+            cancel=stop,
             # A hint's exact selection serves its demand unless the store collected since.
             stale=lambda prepared: prepared.generation != store_gc.generation,
         )
