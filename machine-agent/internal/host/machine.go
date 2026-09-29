@@ -46,6 +46,7 @@ type Machine struct {
 	conn        *grpc.ClientConn
 	launcher    launcher
 	initialized chan struct{} // closed after the process launcher is installed
+	launchMu    sync.Mutex    // normal launches and guarded update acquisition
 
 	mu          sync.Mutex
 	proc        *runtimeProcess
@@ -102,7 +103,8 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	}
 	m := &Machine{grant: g, layout: layout, id: id, claims: c, receipt: rec, hub: newHubClient(g), idle: state,
 		restarts: &restarts{}, log: log, started: now,
-		owned: g.Lifetime == "persistent", ready: make(chan struct{}), wake: make(chan struct{}, 1), initialized: make(chan struct{})}
+		inUpdate: true, // listener liveness is available while startup admission remains held
+		owned:    g.Lifetime == "persistent", ready: make(chan struct{}), wake: make(chan struct{}, 1), initialized: make(chan struct{})}
 	if rec.retained == nil {
 		if err := m.restarts.clear(); err != nil {
 			return err
@@ -142,13 +144,37 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	if err := m.prepareLauncher(); err != nil {
 		return err
 	}
-	close(m.initialized)
+	// The privileged guardian prepares software after the network agent drops root.
+	startup, startupErr := m.launcher.maintain("startup-prepare", []string{g.Lifetime, layout.Store})
+	m.mu.Lock()
+	g.startupPending = startup == "boot_pending"
+	m.mu.Unlock()
+	m.setUpdating(m.startupPending())
+	m.launchMu.Lock() // initial boot shares update/supervisor launch admission
 	defer m.launcher.close()
-	if err := m.tfs.initStore(ctx); err != nil {
-		m.restarts.fail(&launchRefusal{"tensorfs_unavailable", err.Error()})
+	if startupErr != nil {
+		m.restarts.fail(&launchRefusal{"runtime_update_recovery_required", startupErr.Error()})
+	} else if err := m.tfs.initStore(ctx); err != nil {
+		if m.startupPending() {
+			if err := m.rollbackStartup(ctx); err != nil {
+				fmt.Fprintln(m.log, "cozy machine: repair required:", err)
+			}
+		} else {
+			m.restarts.fail(fmt.Errorf("TensorFS initialization failed: %w", err))
+		}
 	} else {
-		m.launchOrIdle()
+		if err := m.launch(); err != nil {
+			if m.startupPending() && !m.manualUpdateActive() {
+				if err := m.rollbackStartup(ctx); err != nil {
+					fmt.Fprintln(m.log, "cozy machine: repair required:", err)
+				}
+			} else {
+				m.restarts.fail(err)
+			}
+		}
 	}
+	m.launchMu.Unlock()
+	close(m.initialized)
 	errs := make(chan error, 1)
 	go func() { errs <- m.supervise(ctx) }()
 	select {
@@ -234,6 +260,8 @@ func (m *Machine) prepareLauncher() error {
 	return nil
 }
 
+// launch is called under launchMu by the supervisor, or while an update owns
+// inUpdate after acquiring that same lock in quiesce.
 func (m *Machine) launch() error {
 	raw, err := m.launcher.maintain("capabilities", nil)
 	if err != nil {
@@ -292,6 +320,7 @@ func mustLeaf(c tls.Certificate) *x509.Certificate {
 // claimRuntime verifies this child's fresh readiness and opens its private session.
 func (m *Machine) claimRuntime(p *runtimeProcess) {
 	payload := m.layout.boot("readiness-payload")
+	var pendingPayload []byte
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -307,7 +336,9 @@ func (m *Machine) claimRuntime(p *runtimeProcess) {
 				p.stop()
 				return
 			}
-			if err := m.attestRuntime(raw); err != nil {
+			if m.startupPending() {
+				pendingPayload = raw
+			} else if err := m.attestRuntime(raw); err != nil {
 				fmt.Fprintln(m.log, "cozy machine: the Runtime's readiness was refused:", err)
 				m.restarts.fail(&launchRefusal{"runtime_readiness_invalid", err.Error()})
 				p.stop()
@@ -332,7 +363,13 @@ func (m *Machine) claimRuntime(p *runtimeProcess) {
 	for {
 		ack, err := m.controlClaim()
 		if err == nil && ack.Accepted {
-
+			if m.startupPending() {
+				if err := m.commitStartup(p, pendingPayload); err != nil {
+					m.restarts.fail(&launchRefusal{"startup_update_readiness_failed", err.Error()})
+					p.stop()
+					return
+				}
+			}
 			ready(ack)
 			return
 		}
@@ -399,6 +436,9 @@ func (m *Machine) runtime(ctx context.Context) (*grpc.ClientConn, error) {
 			if m.restarts.gone() {
 				return nil, refusal(codes.FailedPrecondition, m.restarts.code(), m.runtimeGone())
 			}
+			if !m.restarts.due(time.Now()) {
+				return nil, unavailable("runtime_restarting", m.runtimeGone())
+			}
 			m.poke()
 			select {
 			case <-ctx.Done():
@@ -457,7 +497,13 @@ func (m *Machine) supervise(ctx context.Context) error {
 		m.mu.Lock()
 		p := m.proc
 		m.mu.Unlock()
-		if p != nil && p.exited() {
+		if p != nil && p.exited() && !(m.startupPending() && m.manualUpdateActive()) {
+			if m.startupPending() && !m.manualUpdateActive() {
+				if err := m.rollbackStartup(ctx); err != nil {
+					fmt.Fprintln(m.log, "cozy machine: repair required:", err)
+				}
+				continue
+			}
 			if err := m.relaunchAfter(p); err != nil {
 				return err
 			}
@@ -467,7 +513,9 @@ func (m *Machine) supervise(ctx context.Context) error {
 			busy, err = work.observe(now)
 		}
 
-		if m.preparations() || m.updating() {
+		// Software maintenance is not accepted workload and cannot establish or
+		// renew a rental work obligation. Its own progress guard owns recovery.
+		if m.preparations() {
 			busy, err = true, nil
 		}
 		deadline, observeErr := m.idle.observe(now, busy, err == nil)
@@ -538,6 +586,13 @@ func (m *Machine) relaunchAfter(p *runtimeProcess) error {
 
 // launchOrIdle records a launch failure while the API keeps serving repair and status calls.
 func (m *Machine) launchOrIdle() {
+	m.launchMu.Lock()
+	defer m.launchMu.Unlock()
+	// The supervisor's earlier observations are only a wake-up hint. An update
+	// may have acquired the Runtime, or another launch may have finished, since.
+	if m.updating() || m.running() || !m.restarts.due(time.Now()) || !m.owned && m.idle.releasedNow() {
+		return
+	}
 	if err := m.launch(); err != nil {
 		fmt.Fprintln(m.log, "cozy machine: the Runtime could not be launched:", err)
 		m.restarts.fail(err)

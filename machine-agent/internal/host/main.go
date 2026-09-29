@@ -70,7 +70,7 @@ func startSSH(key string, log io.Writer) error {
 	if out, err := childOutput(exec.Command("/usr/bin/ssh-keygen", "-A"), true); err != nil {
 		return fmt.Errorf("ssh host keys: %v: %s", err, out)
 	}
-	sshd := exec.Command("/usr/sbin/sshd", "-D", "-e")
+	sshd := exec.Command("/usr/sbin/sshd", "-D", "-e", "-f", "/opt/cozy/dev/sshd_config")
 	sshd.Stdout, sshd.Stderr = log, log
 	if err := startChild(sshd); err != nil {
 		return fmt.Errorf("start sshd: %w", err)

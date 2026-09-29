@@ -1,6 +1,7 @@
 package host
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -26,6 +27,68 @@ import (
 // maintain runs one op against the machine rooted at root; p is its current Runtime.
 func maintain(root string, p *runtimeProcess, op string, args []string) (string, error) {
 	switch op {
+	case "update-prepare":
+		if p != nil && !p.exited() || len(args) != 1 {
+			return "", errors.New("update preparation requires a stopped Runtime")
+		}
+		var request pairTransaction
+		if err := json.Unmarshal([]byte(args[0]), &request); err != nil {
+			return "", err
+		}
+		grant := &Grant{Root: root, StoreRoot: request.Store, Lifetime: request.Lifetime}
+		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
+		unlock, err := lockStartupWorker(root)
+		if err != nil {
+			return "", err
+		}
+		defer unlock()
+		var state softwareState
+		if err := m.startupPython(context.Background(), &state, "inspect", m.layout.Store); err != nil {
+			return "", err
+		}
+		if !state.Quiescent || request.Lifetime != "persistent" && state.AcceptedWork {
+			return "", errors.New("Runtime quiescence or unused rental required for software changes")
+		}
+		var status startupStatus
+		if raw, err := os.ReadFile(m.startupPath("status.json")); err == nil {
+			if err := json.Unmarshal(raw, &status); err != nil {
+				return "", err
+			}
+		}
+		status.Workspace = state.Workspace
+		if err := m.preparePair(context.Background(), request.Before, request.After, request.Candidate, request.Previous, status, true); err != nil {
+			if m.transactionPending() {
+				return "recovery_required", err
+			}
+			return "", err
+		}
+		if m.startupPending() {
+			return "boot_pending", nil
+		}
+		return "rolled_back", nil
+	case "startup-prepare":
+		if p != nil && !p.exited() || len(args) != 2 {
+			return "", errors.New("startup preparation requires a stopped Runtime and its machine policy")
+		}
+		grant := &Grant{Root: root, Lifetime: args[0], StoreRoot: args[1]}
+		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
+		if err := m.startupUpdate(context.Background()); err != nil {
+			return "", err
+		}
+		if m.startupPending() {
+			return "boot_pending", nil
+		}
+		return "", nil
+	case "startup-commit":
+		if p == nil || p.exited() || len(args) != 2 || args[0] != p.incarnation {
+			return "", errors.New("startup commit requires the live Runtime incarnation")
+		}
+		return "", startupMaintenance(root, op, args[1])
+	case "startup-rollback":
+		if p != nil && !p.exited() {
+			return "", errors.New("startup rollback requires a stopped candidate")
+		}
+		return "", startupMaintenance(root, op, "")
 	case "capabilities":
 		return probeRuntimeCapabilities(filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker"))
 	case "restart":
@@ -66,7 +129,7 @@ func guardedRestart(root string, p *runtimeProcess) (string, error) {
 	}
 	worker := filepath.Join(root, "run/cozy/worker")
 	if capable, ok := readRestartFact(filepath.Join(worker, "restart-capability.json")); !ok || capable.PID != p.pid || !capable.Guarded {
-		return "", errors.New("the running Runtime has not established guarded restarts; it predates in-place updates")
+		return "", errors.New("the running Runtime has not established guarded restarts; wait for readiness or repair its supervision support")
 	}
 	before, _ := readRestartFact(filepath.Join(worker, "restart-status.json"))
 	if err := syscall.Kill(p.pid, syscall.SIGHUP); err != nil {
@@ -77,6 +140,7 @@ func guardedRestart(root string, p *runtimeProcess) (string, error) {
 		fact, ok := readRestartFact(filepath.Join(worker, "restart-status.json"))
 		if ok && fact.PID == p.pid && (before.PID != p.pid || fact.Sequence > before.Sequence) {
 			if fact.Status == "accepted" {
+				p.stop() // acceptance proves no work; measure shutdown progress
 				<-p.done
 			}
 			return fact.Status, nil
@@ -160,10 +224,10 @@ func installPair(root string, wheels []string) error {
 		"--python", filepath.Join(root, "opt/cozy/python/bin/python"), "--break-system-packages",
 		"--offline", "--no-deps", "--reinstall"}, wheels...)...)
 	cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin", "HOME=" + filepath.Join(root, "tmp")}
-	if out, err := childOutput(cmd, true); err != nil {
+	if out, err := progressChildOutput(cmd, true); err != nil {
 		return fmt.Errorf("install %s: %v: %s", strings.Join(wheels, ", "), err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return syncInstallation(root)
 }
 
 // selectPair keeps these wheels as the installed pair: a new directory that current names on an
@@ -175,7 +239,11 @@ func selectPair(root string, wheels []string) error {
 	}
 	sum := sha256.New()
 	for _, wheel := range slices.Sorted(slices.Values(wheels)) {
-		sum.Write([]byte(filepath.Base(wheel) + "\x00"))
+		digest, err := hashFile(wheel)
+		if err != nil {
+			return err
+		}
+		sum.Write([]byte(filepath.Base(wheel) + "\x00" + digest + "\x00"))
 	}
 	dev := filepath.Dir(dir)
 	named := "pair-" + hex.EncodeToString(sum.Sum(nil))[:16]
@@ -245,7 +313,7 @@ func copyWheel(source, target string) error {
 		return err
 	}
 	defer os.Remove(out.Name())
-	if _, err := io.Copy(out, in); err == nil {
+	if _, err = io.Copy(out, in); err == nil {
 		err = out.Chmod(0o644)
 	}
 	if err == nil {

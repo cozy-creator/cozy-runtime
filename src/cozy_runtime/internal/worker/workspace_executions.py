@@ -30,6 +30,8 @@ from cozy_runtime.internal.worker.workspace import (
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+from .machine_public_reads import RETENTION_REQUIRED
+
 SCHEMA7 = """
 ALTER TABLE workspace_state ADD COLUMN execution_workspace_id TEXT NOT NULL DEFAULT '';
 UPDATE workspace_state SET execution_workspace_id=lower(hex(randomblob(16)));
@@ -1388,9 +1390,7 @@ class Executions:
         with self.workspace.locked() as db:
             return (
                 db.execute(
-                    "SELECT 1 FROM executions WHERE owner=? AND "
-                    "retention_waived=0 AND "
-                    "(state NOT IN ('succeeded','canceled') OR collected=0) LIMIT 1",
+                    f"SELECT 1 FROM executions WHERE owner=? AND {RETENTION_REQUIRED} LIMIT 1",
                     (owner,),
                 ).fetchone()
                 is not None
