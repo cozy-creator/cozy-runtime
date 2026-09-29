@@ -4,6 +4,8 @@ import os
 import socket
 import threading
 
+import pytest
+
 from cozy_runtime.author._executor_requests import Answer, HostRoom, encode
 from cozy_runtime.internal import proctree
 from cozy_runtime.internal.executor_commands import Probe, ReclaimHost
@@ -101,3 +103,60 @@ def test_idle_call_rechecks_eligibility_after_stream_acquisition_without_sending
     finally:
         child.channel.close()
         peer.close()
+
+
+@pytest.mark.parametrize("mode", ["exit", "stalled"])
+def test_idle_reclaim_ends_on_child_exit_or_proven_stalled_progress(mode, monkeypatch):
+    import subprocess
+    import sys
+    import time
+
+    from cozy_runtime.internal import liveness
+    from cozy_runtime.internal.worker.child import ExecutorGone
+
+    # Increase observation resolution; the normal measured-progress rule and its
+    # sample-derived noise floor remain the production implementation.
+    monkeypatch.setattr(liveness, "SAMPLE_SECONDS", 0.05)
+    ours, theirs = socket.socketpair()
+    program = """
+import os, signal, socket, sys
+from cozy_runtime.internal.seam import Channel
+channel = Channel(socket.socket(fileno=int(sys.argv[1])))
+print('ready', flush=True)
+if sys.argv[2] == 'stalled':
+    os.kill(os.getpid(), signal.SIGSTOP)
+channel.recv()
+sys.exit(3)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", program, str(theirs.fileno()), mode],
+        pass_fds=(theirs.fileno(),),
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    theirs.close()
+    executor = Executor(
+        epoch=1,
+        process=proctree.process_identity(process.pid),
+        scope=proctree.ProcessTreeScope("test-idle-reclaim-exit", os.getuid()),
+        channel=Channel(ours),
+        seal_digest="",
+    )
+    try:
+        assert process.stdout.readline().strip() == "ready"
+        started = time.monotonic()
+        with pytest.raises(ExecutorGone) as caught:
+            executor.call_if_idle(ReclaimHost(nbytes=1), eligible=lambda: True)
+        assert not executor._calls.locked()
+        process.wait(timeout=5)
+        if mode == "stalled":
+            assert "wedged during 'reclaim_host'" in str(caught.value)
+            assert "no measurable progress" in str(caught.value)
+            assert time.monotonic() - started > liveness.noise_floor()
+        else:
+            assert process.returncode == 3 and not executor.wedged
+    finally:
+        executor.channel.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
