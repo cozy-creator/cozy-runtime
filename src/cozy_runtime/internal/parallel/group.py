@@ -27,6 +27,7 @@ from cozy_runtime.internal import execution_evidence, liveness, spawn
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 from cozy_runtime.internal.seam import Channel, SeamError
+from cozy_runtime.internal.tiers import Torch
 
 #: NCCL reads this once, at communicator creation. NVLink SHARP multicast needs a privilege
 #: our containers do not have and Ulysses' all-to-all never uses it (pgw#929: CUDA 401 on
@@ -154,7 +155,7 @@ def require_nvls_off(sealed: Mapping[str, str], backend: str) -> None:
         )
 
 
-def shortfall_agreement(torch: Any) -> Callable[[int], int]:
+def shortfall_agreement(torch: Torch) -> Callable[[int], int]:
     """Every rank's largest memory shortfall, over a CPU (gloo) group formed beside the
     device communicator: agreeing on memory never allocates on a card that may be out of it.
     Every rank of the world forms it at the same point, right after the process group."""
