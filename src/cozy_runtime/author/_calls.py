@@ -284,6 +284,9 @@ class PendingCall[R](Awaitable[R]):
         self.progress_sequence = 0
 
     def __await__(self) -> Generator[Any, None, R]:
+        from cozy_runtime.author._activity import observe_await
+
+        observe_await()
         if self.task is None:
             self.task = asyncio.create_task(self.broker.run(self))
         return self.task.__await__()

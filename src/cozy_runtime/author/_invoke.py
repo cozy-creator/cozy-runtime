@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import selectors
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, is_dataclass
@@ -956,25 +955,12 @@ def _call(
     is synchronous, so law 8's one-active-GPU-attempt rule is unchanged by the spelling.
     A granted destination receives the returned Models before the attempt closes.
     """
-    from cozy_runtime.author._activity import EventLoop, observing
+    from cozy_runtime.author._activity import event_loop, observing
 
-    with observing(activity_sink) as activity:
+    with observing(activity_sink):
         if not surface.is_async and not publish_to:
             return surface.fn(**kwargs)
-        # Keep nonstandard policies (including Windows' Proactor subprocess support)
-        # intact. Unsupported observation is unknown; it never changes valid execution.
-        loop: asyncio.AbstractEventLoop
-        if type(asyncio.get_event_loop_policy()) is asyncio.DefaultEventLoopPolicy and hasattr(
-            selectors, "EpollSelector"
-        ):
-            try:
-                loop = EventLoop(activity)
-            except Exception:
-                activity.change(0, unknown=True)
-                loop = asyncio.new_event_loop()
-        else:
-            activity.change(0, unknown=True)
-            loop = asyncio.new_event_loop()
+        loop = event_loop()
         try:
             if surface.is_async:
                 coroutine = surface.fn(**kwargs)

@@ -42,6 +42,39 @@ def observing(emit: Callable[[int, bool, bool, bool], None] | None) -> Iterator[
         _CURRENT.reset(token)
 
 
+def event_loop() -> asyncio.AbstractEventLoop:
+    """The SDK's private loop, preserving unsupported platform/custom policies."""
+    activity = _CURRENT.get()
+    if activity is not None:
+        if type(asyncio.get_event_loop_policy()) is asyncio.DefaultEventLoopPolicy and hasattr(
+            selectors, "EpollSelector"
+        ):
+            try:
+                return EventLoop(activity)
+            except Exception:
+                pass
+        activity.change(0, unknown=True)
+    return asyncio.new_event_loop()
+
+
+def observe_await() -> None:
+    """An author's own unobserved loop cannot turn child waits into execution."""
+    activity = _CURRENT.get()
+    if activity is not None:
+        try:
+            supported = isinstance(asyncio.get_running_loop(), EventLoop)
+        except RuntimeError:
+            supported = False
+        if not supported:
+            activity.change(0, unknown=True)
+
+
+def author_done() -> None:
+    """Freeze an adapter's author clock before framework event-loop shutdown."""
+    if (activity := _CURRENT.get()) is not None:
+        activity.change(-1, finished=True)
+
+
 class Activity:
     def __init__(self, emit: Callable[[int, bool, bool, bool], None] | None) -> None:
         global _BASELINE
@@ -140,6 +173,8 @@ class EventLoop(asyncio.SelectorEventLoop):
     def run_in_executor[*Ts, T](
         self, executor: Executor | None, func: Callable[[*Ts], T], *args: *Ts
     ) -> asyncio.Future[T]:
+        if self.activity.finished:
+            return super().run_in_executor(executor, func, *args)
         if executor is None or isinstance(executor, PythonThreadPoolExecutor):
             call, ticket = self.activity.preparing(functools.partial(func, *args))
             # The SDK pool captures context too. This submission is already observed
@@ -172,7 +207,7 @@ class ThreadPoolExecutor(PythonThreadPoolExecutor):
     def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
         activity = _CURRENT.get()
         call = functools.partial(fn, *args, **kwargs)
-        if activity is None:
+        if activity is None or activity.finished:
             return super().submit(_owned, call)
         observed, ticket = activity.preparing(call)
         try:

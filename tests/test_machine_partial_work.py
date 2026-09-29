@@ -180,7 +180,8 @@ class Machine:
         self.prepared = pb.PreparePackageSetResult()
         self.claim = signed_claims.claim()
 
-    def start(self, exports: tuple[str, ...]) -> None:
+    def start(self, exports: tuple[str, ...], *, entrypoint: str = "nested") -> None:
+        self.entrypoint = entrypoint
         prepared = self.prepared
         installation = prepared.installed_package.installation_id
         self.captured, self.capture_digest = documents.identity(
@@ -206,7 +207,7 @@ class Machine:
             json.loads(path.read_bytes())
             for path in (self.root / "home/job-plans").glob("*/*.json")
         ]
-        self.binding = JobBinding.read(next(row for row in plans if row.get("job") == "nested"))
+        self.binding = JobBinding.read(next(row for row in plans if row.get("job") == entrypoint))
         self.thread.start()
         self.wait("the control address", (self.root / "address").exists, 60)
         worker.serve_stream(iter([pb.RecordOwnerFrame(claim=self.claim)]), lambda _: None)
@@ -225,7 +226,7 @@ class Machine:
     ) -> pb.MachineExecutionSubmit:
         generator = LocalRecordOwner(
             LocalRequest(
-                entrypoint="nested",
+                entrypoint=self.entrypoint,
                 payload={},
                 kind="job",
                 request_id=request,
