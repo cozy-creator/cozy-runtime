@@ -278,24 +278,31 @@ def to_disk(torch: Torch, component: Component, unit: Unit | None) -> None:
 
 def from_disk(torch: Torch, component: Component, unit: Unit | None) -> None:
     """Fill one unit, or with None the whole component, from the store onto the device; then
-    apply the conversions a package made while it was on disk."""
+    apply the conversions a package made while it was on disk. Units dropped one at a time
+    come back one at a time, as `to_disk` sent them."""
     store = component.store
     if store is None:
         raise LookupError(f"{component.name} has no store to refill from")
-    units = component.units if unit is None else (unit,)
+
+    def filled(each: Unit) -> None:
+        for convert in each.pending:
+            for _, module in each.owners():
+                type(module)._apply(module, convert, recurse=False)
+        each.applied, each.pending = each.pending, []
+        each.tier = DEVICE
+
     component.moving = True
     try:
         with torch.inference_mode(False), torch.no_grad():
-            if unit is None:
+            if unit is None and not component.unit_loads:
                 store.load(component.name)
+                for each in component.units:
+                    filled(each)
             else:
-                store.load_unit(component.name, unit)
-            for each in units:
-                for convert in each.pending:
-                    for _, module in each.owners():
-                        type(module)._apply(module, convert, recurse=False)
-                each.applied, each.pending = each.pending, []
-                each.tier = DEVICE
+                for each in component.units if unit is None else (unit,):
+                    if each.tier == DISK:
+                        store.load_unit(component.name, each)
+                        filled(each)
     finally:
         component.moving = False
     measure(component)
