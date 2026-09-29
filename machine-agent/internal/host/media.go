@@ -295,3 +295,9 @@ func (p *parts) Close() error {
 	}
 	return nil
 }
+
+// RefreshKeys proves current rental authority before a new media session.
+func (m *Machine) RefreshKeys(ctx context.Context) error {
+	_, err := m.claims.refreshAuthority(ctx)
+	return err
+}

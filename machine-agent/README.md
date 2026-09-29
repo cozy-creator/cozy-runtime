@@ -69,3 +69,13 @@ manifest are public; the build source remains in this private Runtime repository
 Verify downloaded manifest hashes and `cozy-machine version --json` before
 promotion. Agent and Runtime versions evolve independently through advertised
 capabilities and the supported worker-protocol range.
+
+Rental control authority is refreshed from the owning Hub before every new gRPC
+call, privileged HTTP request, and WebRTC handshake. The worker's latest-attempt
+credential reads `/v1/worker/rental/authorized-keys`; user login credentials never
+reach this endpoint. Existing client transports are revoked when their signer
+leaves the set or its server-declared lease expires. A failed authority read
+refuses new control and clears cached authority. This never cancels durable work
+or changes the agent's private Runtime-owner claim. Standalone machines retain
+locally owned keys. Deploy the Hub authority endpoint before rolling out agents
+that require it; older Hubs do not provide rental authorization fallback.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/capability"
 	"io"
 	"strings"
 	"time"
@@ -83,6 +84,14 @@ var routes = func() map[string]*route {
 }()
 
 func (m *Machine) serveRPC(_ any, stream grpc.ServerStream) (err error) {
+	if _, err := m.claims.refreshAuthority(stream.Context()); err != nil {
+		return err
+	}
+	call, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	scoped := &authorityStream{ServerStream: stream, ctx: call, cancel: cancel, claims: m.claims}
+	stream = scoped
+
 	name, _ := grpc.MethodFromServerStream(stream)
 	r := routes[name]
 	switch {
@@ -115,7 +124,7 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 	if err := stream.RecvMsg(first); err != nil {
 		return err
 	}
-	client, err := m.admitCall(first)
+	client, err := m.admitCall(stream, first)
 	if err != nil {
 		return err
 	}
@@ -202,15 +211,19 @@ func publicReadMethod(name string) bool {
 }
 
 // admitCall verifies the client Claim a message carries.
-func (m *Machine) admitCall(message proto.Message) (*pb.Claim, error) {
+func (m *Machine) admitCall(stream grpc.ServerStream, message proto.Message) (*pb.Claim, error) {
 	var claim *pb.Claim
 	walk(message.ProtoReflect(), func(msg protoMessage) {
 		if c, ok := msg.Interface().(*pb.Claim); ok && claim == nil {
 			claim = c
 		}
 	})
-	if _, err := m.claims.verify(claim); err != nil {
+	key, err := m.claims.verify(claim)
+	if err != nil {
 		return nil, err
+	}
+	if scoped, ok := stream.(*authorityStream); ok {
+		scoped.bind(key)
 	}
 	return proto.Clone(claim).(*pb.Claim), nil
 }
@@ -270,7 +283,7 @@ func recvClaimed[T proto.Message](stream grpc.ServerStream, m *Machine, message 
 	if err := stream.RecvMsg(message); err != nil {
 		return nil, err
 	}
-	return m.admitCall(message)
+	return m.admitCall(stream, message)
 }
 
 func (m *Machine) keepRentalAlive(stream grpc.ServerStream) error {
@@ -318,9 +331,13 @@ func (m *Machine) answerControl(stream grpc.ServerStream) error {
 	claim := first.GetClaim()
 	ack := &pb.ClaimAck{RecordOwnerEpoch: claim.GetRecordOwnerEpoch(), WorkerBootId: m.id.BootID, WorkerId: m.grant.WorkerID,
 		WireMinor: pb.WireMinor}
-	if _, err := m.claims.verify(claim); err != nil {
+	key, err := m.claims.verify(claim)
+	if err != nil {
 		ack.Rejection = pb.ClaimRejection_CLAIM_REJECTION_UNAUTHENTICATED
 		return stream.SendMsg(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
+	}
+	if scoped, ok := stream.(*authorityStream); ok {
+		scoped.bind(key)
 	}
 	m.mu.Lock()
 	runtimeAck := m.runtimeAck
@@ -339,5 +356,49 @@ func (m *Machine) answerControl(stream grpc.ServerStream) error {
 		if err := stream.RecvMsg(&pb.RecordOwnerFrame{}); err != nil {
 			return nil
 		}
+	}
+}
+
+// authorityStream propagates revocation to the forwarded Runtime observer while
+// leaving its already-accepted durable work untouched.
+type authorityStream struct {
+	grpc.ServerStream
+	ctx    context.Context
+	cancel context.CancelFunc
+	claims *claims
+}
+
+func (s *authorityStream) Context() context.Context { return s.ctx }
+func (s *authorityStream) bind(key []byte) {
+	call, stop := s.claims.watchAuthority(s.ctx, capability.KeyID(key))
+	go func() { defer stop(); <-call.Done(); s.cancel() }()
+}
+func (s *authorityStream) RecvMsg(message any) error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	result := make(chan error, 1)
+	go func() { result <- s.ServerStream.RecvMsg(message) }()
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case err := <-result:
+		if s.ctx.Err() != nil {
+			return s.ctx.Err()
+		}
+		return err
+	}
+}
+func (s *authorityStream) SendMsg(message any) error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	result := make(chan error, 1)
+	go func() { result <- s.ServerStream.SendMsg(message) }()
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case err := <-result:
+		return err
 	}
 }

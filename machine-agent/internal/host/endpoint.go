@@ -1,6 +1,7 @@
 package host
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/capability"
 	"google.golang.org/grpc"
 )
 
@@ -22,11 +24,15 @@ import (
 const maxMessageBytes = 16 << 20
 
 type listeners struct {
-	servers []*http.Server
-	failed  chan error
+	cancelAuthority context.CancelFunc
+	servers         []*http.Server
+	failed          chan error
 }
 
 func (l *listeners) close() {
+	if l.cancelAuthority != nil {
+		l.cancelAuthority()
+	}
 	for _, s := range l.servers {
 		_ = s.Close()
 	}
@@ -64,13 +70,15 @@ func (m *Machine) listen() (*listeners, error) {
 			grpcServer.ServeHTTP(w, r)
 			return
 		}
-		routes.ServeHTTP(w, r)
+		m.serveAuthorizedHTTP(routes, w, r)
 	})
 	receiptOnly := http.NewServeMux()
 	receiptOnly.HandleFunc("GET /v1/bootstrap/receipt", m.serveReceipt)
 	receiptOnly.HandleFunc("GET /v1/health", serveHealth)
 	errorLog := log.New(m.log, "cozy machine: ", 0)
-	l := &listeners{failed: make(chan error, 2)}
+	authorityContext, cancelAuthority := context.WithCancel(context.Background())
+	m.startAuthority(authorityContext)
+	l := &listeners{failed: make(chan error, 2), cancelAuthority: cancelAuthority}
 	for _, s := range []struct {
 		listener net.Listener
 		handler  http.Handler
@@ -116,4 +124,46 @@ func serveHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Stop copying output bytes after this reader loses authority; execution remains durable.
+type authorityWriter struct {
+	http.ResponseWriter
+	ctx context.Context
+}
+
+func (w *authorityWriter) Write(data []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.ResponseWriter.Write(data)
+}
+func (w *authorityWriter) Flush() {
+	if w.ctx.Err() != nil {
+		return
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (m *Machine) serveAuthorizedHTTP(routes http.Handler, w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/bootstrap/receipt" && r.URL.Path != "/v1/health" {
+		if _, err := m.claims.refreshAuthority(r.Context()); err != nil {
+			http.Error(w, "rental_authority_unavailable: current rental authority could not be verified", http.StatusServiceUnavailable)
+			return
+		}
+		token, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Cozy-Cap ")
+		grant, err := capability.Verify(token, m.grant.WorkerID, m.claims.authorizedKeys(), time.Now(), "")
+		if err != nil {
+			http.Error(w, "a current machine capability is required", http.StatusForbidden)
+			return
+		}
+		call, cancel := m.claims.watchAuthority(r.Context(), grant.Key)
+		defer cancel()
+		r = r.WithContext(call)
+		w = &authorityWriter{ResponseWriter: w, ctx: call}
+		go func() { <-call.Done(); _ = r.Body.Close() }()
+	}
+	routes.ServeHTTP(w, r)
 }

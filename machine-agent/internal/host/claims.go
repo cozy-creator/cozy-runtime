@@ -25,6 +25,7 @@ const (
 )
 
 type claims struct {
+	authority        *rentalAuthority
 	workerID, bootID string
 	leafDigest       []byte
 	mu               sync.Mutex
