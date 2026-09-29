@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode, urlsplit
 
+from packaging.version import InvalidVersion, Version
+
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.author._model_defaults import default_ladder, reference
 from cozy_runtime.internal import egress, fill
@@ -32,6 +34,9 @@ MAX_METADATA = 1 << 20
 _REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 type Fits = Callable[[Mapping[str, Any]], bool]
+type Note = Callable[[str, int, int], None]
+#: A repository named without a lane serves full precision first when the slot ranks none.
+_FULL_PRECISION = ("bf16", "fp16", "fp32")
 #: One catalog answer as read: a binding row, or a lane's checkpoint.
 type Row = dict[str, Any]
 
@@ -121,6 +126,20 @@ class Catalog:
                 row["slot"]: row for row in rows if isinstance(row, dict) and "slot" in row
             }
         return self.bindings[package].get(slot)
+
+    def lanes(self, model: str, release: str) -> tuple[str, dict[str, Row]]:
+        """A release's lanes by name: the named release, else the newest one not yanked."""
+        org, _, name = model.partition("/")
+        card = self.get(f"/v1/models/{quote(org)}/{quote(name)}") or {}
+        rows = [row for row in card.get("releases", []) if isinstance(row, dict)]
+        if release:
+            rows = [row for row in rows if str(row.get("release", "")).lower() == release.lower()]
+        else:
+            rows = sorted((row for row in rows if not row.get("yanked")), key=_version, reverse=True)
+        if not rows:
+            raise WorkspaceRefusal(f"model catalog has no release {release or '(any)'} of {model}")
+        lanes = {str(row["lane"]): row for row in rows[0].get("lanes") or [] if row.get("lane")}
+        return str(rows[0].get("release", release)), lanes
 
     def resolve(self, model: str, release: str, lane: str) -> dict[str, Any]:
         """One lane's exact checkpoint: its manifest digest and length."""
@@ -229,6 +248,13 @@ def own(worker: Worker, package: str = "", hub: str = "") -> Catalog:
     )
 
 
+def _version(row: Mapping[str, Any]) -> tuple[int, Version | str]:
+    try:
+        return 1, Version(str(row.get("release", "")))
+    except InvalidVersion:
+        return 0, str(row.get("release", ""))
+
+
 def _code(raw: bytes) -> str:
     """The Hub's typed error code, e.g. worker.unauthorized or worker.ended, else ""."""
     try:
@@ -283,6 +309,7 @@ def slot(
     choice: Mapping[str, Any] | None,
     fits: Fits,
     owner: str = "",
+    note: Note | None = None,
 ) -> dict[str, Any]:
     """One slot's exact checkpoint for this machine, in the captured default row shape."""
     base = {"parameter": parameter, "public_origin": catalog.origin}
@@ -303,34 +330,47 @@ def slot(
             "release": choice.get("release", ""),
             "lane": choice.get("lane", ""),
         }
+    degrees = set(declaration.get("sequence_parallel", {}).get("degrees", []))
+
+    def usable(rung: object) -> bool:
+        return (
+            isinstance(rung, dict)
+            and int(rung.get("gpus", 0) or 0) in {0, 1, *degrees}
+            and fits(rung)
+        )
+
     # An explicit repository is the caller's choice: the owner's binding is not read for it.
     ladder = _ladder(catalog, package, declaration, not choice.get("repository"), owner)
+    have: dict[str, Row] = {}
     if choice.get("repository"):
-        rungs = (
-            [{"gpu": "*", "gpus": 0, "lane": choice["lane"]}]
-            if choice.get("lane")
-            else (ladder[2] if ladder else [])
-        )
-        if not rungs:
-            raise WorkspaceRefusal(f"choose a lane for {parameter}: its slot declares none")
-        ladder = str(choice["repository"]), str(choice.get("release", "")), rungs
+        model, release = str(choice["repository"]), str(choice.get("release", ""))
+        if choice.get("lane"):
+            rungs = [{"gpu": "*", "gpus": 0, "lane": choice["lane"]}]
+        else:
+            # No lane named: the repository's own, as the slot's ladder ranks them here, else
+            # full precision, else the smallest.
+            release, have = catalog.lanes(model, release)
+            if not have:
+                raise WorkspaceRefusal(f"{model}@{release} has no lane to serve {parameter}")
+            rungs = [r for r in (ladder[2] if ladder else []) if usable(r) and r.get("lane") in have]
+            if not rungs:
+                lane = next((name for name in _FULL_PRECISION if name in have), None) or min(
+                    have, key=lambda name: (int(have[name].get("bytes") or 0), name)
+                )
+                rungs = [{"gpu": "*", "gpus": 0, "lane": lane}]
+        ladder = model, release, rungs
     if ladder is None:
         raise WorkspaceRefusal(f"{parameter} has no owner binding or authored default")
     model, release, rungs = ladder
     if _REPOSITORY.fullmatch(model) is None or model.startswith("local/"):
         raise WorkspaceRefusal(f"{parameter} names no public catalog repository")
-    degrees = set(declaration.get("sequence_parallel", {}).get("degrees", []))
-    fitting = [
-        rung
-        for rung in rungs
-        if isinstance(rung, dict)
-        and int(rung.get("gpus", 0) or 0) in {0, 1, *degrees}
-        and fits(rung)
-    ]
+    fitting = [rung for rung in rungs if usable(rung)]
     if not fitting:
         raise WorkspaceRefusal(f"{parameter} has no rung for this accelerator")
     # The widest rung this machine holds: the width itself is the declared degree.
     rung = max(fitting, key=lambda candidate: int(candidate.get("gpus", 0) or 0))
+    if have and note is not None:
+        note(f"{parameter}: {model}@{release} lane {rung['lane']} of {', '.join(sorted(have))}", 0, 0)
     resolved = catalog.resolve(model, release, str(rung["lane"]))
     return {
         **base,
