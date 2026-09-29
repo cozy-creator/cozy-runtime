@@ -159,6 +159,7 @@ from cozy_runtime.author._services import (
     VideoJoin,
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
+from cozy_runtime.author._retry import pure, read_whole, retry_state
 from cozy_runtime.author._spread import spread
 from cozy_runtime.author._weights import (
     MAX_WEIGHTS_NEW_BYTES,
@@ -320,6 +321,9 @@ __all__ = [
     "registered_adapters",
     "script_app",
     "sequence_parallel",
+    "pure",
+    "read_whole",
+    "retry_state",
     "spread",
     "upload_checkpoint",
     "uses_components",
