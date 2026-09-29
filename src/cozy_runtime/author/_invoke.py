@@ -142,7 +142,7 @@ class Invocation:
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
-    activity: Callable[[int, bool, bool], None] | None = None
+    activity: Callable[[int, bool, bool, bool], None] | None = None
     calls: _Broker | None = None
     publish_to: str = ""
     """The repository the owner granted this root: each Model it returns is uploaded there."""
@@ -947,7 +947,7 @@ def _call(
     surface: Surface,
     kwargs: Mapping[str, object],
     publish_to: str = "",
-    activity_sink: Callable[[int, bool, bool], None] | None = None,
+    activity_sink: Callable[[int, bool, bool, bool], None] | None = None,
 ) -> object:
     """`def` runs right here on the calling (executor) thread; `async def` runs on a
     PRIVATE event loop created for THIS attempt and closed with it.
@@ -964,7 +964,7 @@ def _call(
         try:
             return surface.fn(**kwargs)
         finally:
-            activity.change(-1)
+            activity.change(-1, finished=True)
     # Keep nonstandard policies (including Windows' Proactor subprocess support)
     # intact. Unsupported observation is unknown; it never changes valid execution.
     loop: asyncio.AbstractEventLoop
@@ -995,7 +995,7 @@ def _call(
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
-        activity.change(-1)
+        activity.change(-1, finished=True)
 
 
 async def _returned(value: object) -> object:
