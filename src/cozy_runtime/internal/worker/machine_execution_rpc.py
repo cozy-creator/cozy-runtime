@@ -284,6 +284,7 @@ class MachineExecutionRPC:
                     if isinstance(exc, ExecutionWorkspaceRefusal) and exc.code in {
                         "hub_access_absent",
                         "hub_access_expired",
+                        "hub_access_principal_conflict",
                     }:
                         # An access refusal is actionable at the controller. Preserve
                         # disposition plus cause instead of losing either to _call.

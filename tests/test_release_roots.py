@@ -503,6 +503,22 @@ def test_a_run_reads_the_hub_it_came_from(
         assert machine.executions.submission_absent(
             OWNER, "expired", machine.executions.workspace_id
         )
+        worker.options = dataclasses.replace(
+            worker.options,
+            hubs=(
+                PublicationAuthority(
+                    expired_origin, access_token="another-account", expires_at=int(time.time()) + 60
+                ),
+            ),
+        )
+        changed = submission(machine, "changed-account")
+        changed.release_root.hub = expired_origin
+        with pytest.raises(Refused, match="another account") as refused:
+            submit(machine, changed)
+        assert refused.value.trailers.get("cozy-error-code") == "execution_submission_refused"
+        assert machine.executions.submission_absent(
+            OWNER, "changed-account", machine.executions.workspace_id
+        )
     finally:
         home.close()
         other.close()
