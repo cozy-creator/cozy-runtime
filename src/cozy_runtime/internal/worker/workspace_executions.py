@@ -292,6 +292,14 @@ class Executions:
         #: told (request, kind) of each non-log event as it is journaled, inside its
         #: transaction: it must not block, take locks or read the journal
         self.changed: Callable[[str, str], None] = lambda request, kind: None
+        # An additive table keeps submission closure readable by older journal
+        # users without changing the existing execution/attempt schema.
+        with self.workspace.locked() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS execution_submission_closures (
+                owner TEXT NOT NULL, submission TEXT NOT NULL, request TEXT NOT NULL,
+                closed_ms INTEGER NOT NULL,
+                PRIMARY KEY(owner,submission), UNIQUE(owner,request)
+            ) STRICT""")
 
     @property
     def workspace_id(self) -> str:
@@ -334,10 +342,56 @@ class Executions:
                 (owner, submission_id, request),
             ).fetchone()
             if row is None:
+                self._require_submission_open(db, owner, submission_id, request)
                 return None
             if (row["submission"], row["request"]) != (submission_id, request):
                 raise WorkspaceRefusal("execution submission identity changed")
             return self._receipt(db, row, workspace_id)
+
+    @staticmethod
+    def _require_submission_open(db: Journal, owner: str, submission: str, request: str) -> None:
+        if db.execute(
+            "SELECT 1 FROM execution_submission_closures "
+            "WHERE owner=? AND (submission=? OR request=?)",
+            (owner, submission, request),
+        ).fetchone():
+            raise ExecutionWorkspaceRefusal(
+                "execution_submission_closed", "submission was closed before acceptance"
+            )
+
+    def close_submission(
+        self, owner: str, submission: str, request: str, expected: str
+    ) -> Receipt | None:
+        """Close under the acceptance transaction; an absent key can never arrive later.
+
+        Existing execution is returned for control/reconciliation, never silently
+        canceled or treated as absent. The key and request mapping is immutable.
+        """
+        Workspace.owner(owner)
+        _id(submission)
+        _id(request)
+        with self.workspace.locked() as db, transaction(db):
+            workspace_id = self.require_workspace_in(db, expected)
+            rows = db.execute(
+                "SELECT * FROM executions WHERE owner=? AND (submission=? OR request=?)",
+                (owner, submission, request),
+            ).fetchall()
+            held = db.execute(
+                "SELECT submission,request FROM execution_submission_closures "
+                "WHERE owner=? AND (submission=? OR request=?)",
+                (owner, submission, request),
+            ).fetchall()
+            for matches in (rows, held):
+                if len(matches) > 1 or any(
+                    (row["submission"], row["request"]) != (submission, request) for row in matches
+                ):
+                    raise WorkspaceRefusal("execution submission identity changed")
+            db.execute(
+                "INSERT INTO execution_submission_closures(owner,submission,request,closed_ms) "
+                "VALUES(?,?,?,?) ON CONFLICT(owner,submission) DO NOTHING",
+                (owner, submission, request, self.clock_ms()),
+            )
+            return self._receipt(db, rows[0], workspace_id) if rows else None
 
     def submission_absent(self, owner: str, request: str, expected: str) -> bool:
         """Only the pinned journal can establish that this submission was not accepted."""
@@ -501,6 +555,7 @@ class Executions:
                 ):
                     raise WorkspaceRefusal("execution submission identity changed")
                 return self._receipt(db, row, workspace_id)
+            self._require_submission_open(db, owner, submission_id, offer.request_id)
             if db.execute(
                 "SELECT 1 FROM attempts WHERE owner=? AND request=?", (owner, offer.request_id)
             ).fetchone():

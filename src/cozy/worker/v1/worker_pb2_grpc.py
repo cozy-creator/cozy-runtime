@@ -45,6 +45,11 @@ class WorkerControlStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionReceipt.FromString,
                 _registered_method=True)
+        self.CloseMachineSubmission = channel.unary_unary(
+                '/cozy.worker.v1.WorkerControl/CloseMachineSubmission',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClose.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClosure.FromString,
+                _registered_method=True)
         self.GetMachineExecution = channel.unary_unary(
                 '/cozy.worker.v1.WorkerControl/GetMachineExecution',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionQuery.SerializeToString,
@@ -123,6 +128,13 @@ class WorkerControlServicer(object):
         """Runtime owns accepted work independently of the caller connection.
         These calls observe/control that authority; they do not establish a second
         RecordOwner or require a client coordinator inside the worker.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CloseMachineSubmission(self, request, context):
+        """Atomically close a submission key against delayed acceptance, returning any existing receipt.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -229,6 +241,11 @@ def add_WorkerControlServicer_to_server(servicer, server):
                     servicer.SubmitMachineExecution,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionReceipt.SerializeToString,
+            ),
+            'CloseMachineSubmission': grpc.unary_unary_rpc_method_handler(
+                    servicer.CloseMachineSubmission,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClose.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClosure.SerializeToString,
             ),
             'GetMachineExecution': grpc.unary_unary_rpc_method_handler(
                     servicer.GetMachineExecution,
@@ -346,6 +363,33 @@ class WorkerControl(object):
             '/cozy.worker.v1.WorkerControl/SubmitMachineExecution',
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionReceipt.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CloseMachineSubmission(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.WorkerControl/CloseMachineSubmission',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClose.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClosure.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1987,6 +2031,11 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionReceipt.FromString,
                 _registered_method=True)
+        self.CloseMachineSubmission = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/CloseMachineSubmission',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClose.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClosure.FromString,
+                _registered_method=True)
         self.GetMachineExecution = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/GetMachineExecution',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionQuery.SerializeToString,
@@ -2207,6 +2256,13 @@ class PodHostServicer(object):
 
     def SubmitMachineExecution(self, request, context):
         """Authenticated forwarding only. Runtime is the sole execution journal/owner.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CloseMachineSubmission(self, request, context):
+        """Atomically close a submission key against delayed acceptance, returning any existing receipt.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -2449,6 +2505,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.SubmitMachineExecution,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionReceipt.SerializeToString,
+            ),
+            'CloseMachineSubmission': grpc.unary_unary_rpc_method_handler(
+                    servicer.CloseMachineSubmission,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClose.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClosure.SerializeToString,
             ),
             'GetMachineExecution': grpc.unary_unary_rpc_method_handler(
                     servicer.GetMachineExecution,
@@ -2732,6 +2793,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/SubmitMachineExecution',
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionReceipt.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CloseMachineSubmission(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/CloseMachineSubmission',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClose.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineSubmissionClosure.FromString,
             options,
             channel_credentials,
             insecure,
