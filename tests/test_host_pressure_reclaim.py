@@ -11,7 +11,9 @@ from cozy_runtime.internal import memory, proctree
 @pytest.mark.parametrize(
     ("high", "maximum", "expected"), [(1200, 1600, 100), (1600, 1200, 100), (1000, 1600, 0)]
 )
-def test_parent_high_and_max_both_bound_host_credit(monkeypatch, high, maximum, expected):
+def test_parent_high_and_max_both_bound_host_credit(
+    monkeypatch: pytest.MonkeyPatch, high: int, maximum: int, expected: int
+) -> None:
     files = {
         "/proc/meminfo": "MemAvailable: 10 kB\n",
         "/proc/self/cgroup": "0::/parent/child\n",
@@ -40,16 +42,16 @@ class Cache:
     last_used: int = 0
     asked: list[int] = field(default_factory=list)
 
-    def state(self):
+    def state(self) -> str:
         return self.status
 
-    def reclaim_host(self, nbytes):
+    def reclaim_host(self, nbytes: int) -> tuple[int, int]:
         self.asked.append(nbytes)
         self.current[0] -= self.relief
         return self.relief, max(0, self.current[0])
 
 
-def test_host_victims_follow_queue_across_devices_and_preserve_ram_when_room_exists():
+def test_host_victims_follow_queue_across_devices_and_preserve_ram_when_room_exists() -> None:
     current = [90]
     policy = memory.Machine(
         {}, lambda _: None, lambda _: None, host_available=lambda: 100 - current[0]
@@ -71,7 +73,7 @@ def test_host_victims_follow_queue_across_devices_and_preserve_ram_when_room_exi
     assert policy.host_reserved == {"copy": 25}
 
 
-def test_claimed_release_without_observed_relief_never_grants_or_retries_forever():
+def test_claimed_release_without_observed_relief_never_grants_or_retries_forever() -> None:
     current = [100]
     policy = memory.Machine(
         {}, lambda _: None, lambda _: None, host_available=lambda: 100 - current[0]
@@ -81,7 +83,7 @@ def test_claimed_release_without_observed_relief_never_grants_or_retries_forever
     assert retained.asked == [25] and not policy.host_reserved
 
 
-def test_reclaim_makes_finite_progress_through_existing_high_debt():
+def test_reclaim_makes_finite_progress_through_existing_high_debt() -> None:
     current = [150]
     policy = memory.Machine(
         {}, lambda _: None, lambda _: None, host_available=lambda: max(0, 100 - current[0])
@@ -92,7 +94,7 @@ def test_reclaim_makes_finite_progress_through_existing_high_debt():
     assert current == [75] and policy.host_reserved == {"copy": 25}
 
 
-def test_ledger_exports_managed_host_storage_separately_from_process_rss():
+def test_ledger_exports_managed_host_storage_separately_from_process_rss() -> None:
     import os
 
     from cozy_runtime.internal.worker.ledger import Ledger

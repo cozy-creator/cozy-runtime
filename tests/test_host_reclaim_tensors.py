@@ -1,6 +1,8 @@
 """Real CPU tensor storage and fill-plane eviction; no CUDA calls or process retirement."""
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -9,7 +11,7 @@ from cozy_runtime.internal import fill, memory, tiers
 torch = pytest.importorskip("torch")
 
 
-def resident(name, elements=32):
+def resident(name: str, elements: int = 32) -> tuple[memory.Planner, memory.Held]:
     owner = memory.Planner(torch, torch.device("cpu"))
     root = torch.nn.Module()
     root.weight = torch.nn.Parameter(torch.ones(elements))
@@ -32,10 +34,10 @@ class Tenant:
     last_used: int = 0
     calls: int = 0
 
-    def state(self):
+    def state(self) -> str:
         return "idle"
 
-    def reclaim_host(self, nbytes):
+    def reclaim_host(self, nbytes: int) -> tuple[int, int]:
         self.calls += 1
         released = self.planner.reclaim_host(nbytes)
         return released, self.planner.host_memory()["managed_host_bytes"]
@@ -46,8 +48,8 @@ class Tenant:
     [(32, 300, 40, 100), (12 * 1024 * 1024, 100 * 1024 * 1024, 1024, 39354880)],
 )
 def test_two_idle_tenants_reclaim_only_pressure_victim_and_remeasure_backing(
-    elements, budget, small, needed
-):
+    elements: int, budget: int, small: int, needed: int
+) -> None:
     first, a = resident("next", elements)
     second, b = resident("later", elements)
     tenants = [Tenant("next", first), Tenant("later", second)]
@@ -71,7 +73,7 @@ def test_two_idle_tenants_reclaim_only_pressure_victim_and_remeasure_backing(
 
 
 @pytest.mark.parametrize("protected", ["mutable", "alias", "compiled", "active"])
-def test_reclaim_preserves_retry_alias_compiled_and_active_state(protected):
+def test_reclaim_preserves_retry_alias_compiled_and_active_state(protected: str) -> None:
     owner, held = resident("model")
     root = held.part.root
     original = root.weight
@@ -87,7 +89,7 @@ def test_reclaim_preserves_retry_alias_compiled_and_active_state(protected):
     assert root.weight is original and not original.is_meta
 
 
-def test_unique_host_accounting_and_clean_device_cache_release_preserve_device_weight():
+def test_unique_host_accounting_and_clean_device_cache_release_preserve_device_weight() -> None:
     owner, held = resident("model")
     unit = held.part.common
     unit.tier = tiers.DEVICE  # CPU device stand-in; reclaim invokes no accelerator API.
@@ -107,7 +109,9 @@ def test_unique_host_accounting_and_clean_device_cache_release_preserve_device_w
     assert backing.numel() == 64
 
 
-def test_executor_reclaim_reply_reports_residency_and_actual_rss_without_device_changes(tmp_path):
+def test_executor_reclaim_reply_reports_residency_and_actual_rss_without_device_changes(
+    tmp_path: Path,
+) -> None:
     import socket
 
     from cozy_runtime.internal.executor import Executor
@@ -117,7 +121,9 @@ def test_executor_reclaim_reply_reports_residency_and_actual_rss_without_device_
     owner, held = resident("model")
     ours, theirs = socket.socketpair()
     executor = Executor(Channel(ours), tmp_path)
-    executor.torch, executor.planner, executor.device_kind = torch, owner, "cpu"
+    executor.torch, executor.planner = torch, owner
+    # The CPU fixture exercises backing reclamation without an accelerator backend.
+    executor.device_kind = cast(Any, "cpu")
     try:
         reply = executor.handle(decode(encode(ReclaimHost(nbytes=128))))
         assert reply["ok"] and reply["managed_released_bytes"] == 128
