@@ -66,9 +66,9 @@ jobs:
         run: |
           uv run --no-project --python 3.12 python - <<'PY'
           import hashlib, json, os, pathlib, urllib.parse, urllib.request
-          filename = "cozy_runtime-0.18.32-cp312-abi3-manylinux_2_28_x86_64.whl"
-          expected = "60d9cf186eb677461bbd34e8731caa622ded671a3d36459d156165ae1146e0e3"
-          with urllib.request.urlopen("https://pypi.org/pypi/cozy-runtime/0.18.32/json", timeout=30) as response:
+          filename = "cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl"
+          expected = "d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db"
+          with urllib.request.urlopen("https://pypi.org/pypi/cozy-runtime/0.18.86/json", timeout=30) as response:
               metadata = json.load(response)
           rows = [row for row in metadata["urls"] if row["filename"] == filename]
           if len(rows) != 1 or rows[0]["digests"]["sha256"] != expected:
@@ -90,8 +90,8 @@ jobs:
         run: |
           set +e
           uv run --script scripts/build-dev-wheel.py \
-            --native-wheel "$RUNNER_TEMP/cozy_runtime-0.18.32-cp312-abi3-manylinux_2_28_x86_64.whl" \
-            --native-sha256 60d9cf186eb677461bbd34e8731caa622ded671a3d36459d156165ae1146e0e3 \
+            --native-wheel "$RUNNER_TEMP/cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl" \
+            --native-sha256 d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db \
             --release-commit "${{ steps.release.outputs.source }}" --reuse-or-build --out dist
           status=$?
           set -e
