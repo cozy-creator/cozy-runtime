@@ -466,6 +466,25 @@ class Executions:
         )
         if kind != "log":
             self.changed(row["request"], kind)
+        if kind == "run.timing":
+            # Cumulative observation, not history: retain one snapshot per attempt.
+            # Its sequence still advances, so already-connected readers see updates.
+            obsolete = db.execute(
+                "SELECT MAX(sequence) FROM execution_events WHERE owner=? AND request=? "
+                "AND ordinal=? AND kind='run.timing' AND sequence<?",
+                (row["owner"], row["request"], row["ordinal"], sequence),
+            ).fetchone()[0]
+            db.execute(
+                "DELETE FROM execution_events WHERE owner=? AND request=? "
+                "AND ordinal=? AND kind='run.timing' AND sequence<?",
+                (row["owner"], row["request"], row["ordinal"], sequence),
+            )
+            if obsolete is not None:
+                db.execute(
+                    "UPDATE executions SET compacted_through=max(compacted_through,?) "
+                    "WHERE owner=? AND request=?",
+                    (obsolete, row["owner"], row["request"]),
+                )
         # Only live progress is lossy. Control, outcomes and authored log records remain.
         if kind == "progress":
             obsolete = db.execute(

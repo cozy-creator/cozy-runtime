@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import selectors
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, is_dataclass
@@ -141,6 +142,7 @@ class Invocation:
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
+    activity: Callable[[int, bool, bool], None] | None = None
     calls: _Broker | None = None
     publish_to: str = ""
     """The repository the owner granted this root: each Model it returns is uploaded there."""
@@ -336,7 +338,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
         inv.calls.bind(ctx, Telemetry(record, ctx))
     token = _current.set(inv.calls)
     try:
-        result = _call(surface, kwargs, inv.publish_to)
+        result = _call(surface, kwargs, inv.publish_to, inv.activity)
         if inv.calls is not None:
             inv.calls.finish()
     finally:
@@ -941,7 +943,12 @@ def _settings_value(schema: object, value: object, what: str) -> Any:
 # ------------------------------------------------------------------------- execution
 
 
-def _call(surface: Surface, kwargs: Mapping[str, object], publish_to: str = "") -> object:
+def _call(
+    surface: Surface,
+    kwargs: Mapping[str, object],
+    publish_to: str = "",
+    activity_sink: Callable[[int, bool, bool], None] | None = None,
+) -> object:
     """`def` runs right here on the calling (executor) thread; `async def` runs on a
     PRIVATE event loop created for THIS attempt and closed with it.
 
@@ -949,9 +956,29 @@ def _call(surface: Surface, kwargs: Mapping[str, object], publish_to: str = "") 
     is synchronous, so law 8's one-active-GPU-attempt rule is unchanged by the spelling.
     A granted destination receives the returned Models before the attempt closes.
     """
+    from cozy_runtime.author._activity import Activity, EventLoop
+
+    activity = Activity(activity_sink)
+    activity.change(1)
     if not surface.is_async and not publish_to:
-        return surface.fn(**kwargs)
-    loop = asyncio.new_event_loop()
+        try:
+            return surface.fn(**kwargs)
+        finally:
+            activity.change(-1)
+    # Keep nonstandard policies (including Windows' Proactor subprocess support)
+    # intact. Unsupported observation is unknown; it never changes valid execution.
+    loop: asyncio.AbstractEventLoop
+    if type(asyncio.get_event_loop_policy()) is asyncio.DefaultEventLoopPolicy and hasattr(
+        selectors, "EpollSelector"
+    ):
+        try:
+            loop = EventLoop(activity)
+        except Exception:
+            activity.change(0, unknown=True)
+            loop = asyncio.new_event_loop()
+    else:
+        activity.change(0, unknown=True)
+        loop = asyncio.new_event_loop()
     try:
         if surface.is_async:
             coroutine = surface.fn(**kwargs)
@@ -968,6 +995,7 @@ def _call(surface: Surface, kwargs: Mapping[str, object], publish_to: str = "") 
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
+        activity.change(-1)
 
 
 async def _returned(value: object) -> object:
