@@ -5932,6 +5932,24 @@ class Worker:
         row.disk = observed
         row.disk_epoch = observed_epochs
         reports = executor_replies.rank_memory_facts(reply.get("rank_memory"))
+        chosen = set(lane.ordinals if ordinals is None else ordinals)
+        # A full snapshot replaces every rank. Rank-selective observations intentionally
+        # retain all prior facts because omitted rows are partial, not zero observations.
+        for ordinal in lane.ordinals if ordinals is None else ():
+            row.held.pop(ordinal, None)
+            row.overhead.pop(ordinal, None)
+        # A full legacy snapshot carries rank 0 in the top-level memory field and
+        # followers in rank_memory. Preserve that established wire shape while still
+        # clearing omitted ranks from the previous full snapshot.
+        if ordinals is None and "0" not in reports and lane.ordinals:
+            leader = executor_replies.memory_facts(reply.get("memory"))
+            reserved = leader.get("reserved_bytes", -1)
+            if type(reserved) is int and reserved >= 0:
+                overhead = leader.get("overhead_bytes", 0)
+                if type(overhead) is int and overhead >= 0:
+                    ordinal = lane.ordinals[0]
+                    row.overhead[ordinal] = overhead
+                    row.held[ordinal] = overhead + reserved
         executor = row.executor()
         if executor is not None and "rank_memory" not in executor.hello.get("memory", ()):
             # Revision-1 peers report process births rather than allocator vectors.
@@ -5958,14 +5976,16 @@ class Worker:
                     continue
                 ordinal = lane.ordinals[rank]
                 entry = lane.entries[ordinal]
+                driver_pid = proctree.host_pid(pid)
+                if driver_pid is None:
+                    continue
                 measured = accel.process_memories_by_device(
-                    {pid}, accel.host_backend_family(), (entry,), allow_subprocess=False
-                )[entry][pid]
+                    {driver_pid}, accel.host_backend_family(), (entry,), allow_subprocess=False
+                )[entry][driver_pid]
                 if measured.state == "present":
                     row.held[ordinal] = measured.bytes
         if "0" in reports:
             row.ledger.observe_memory(reports["0"])
-        chosen = set(lane.ordinals if ordinals is None else ordinals)
         for rank, ordinal in enumerate(lane.ordinals):
             facts = reports.get(str(rank))
             if ordinal not in chosen or not isinstance(facts, dict):
@@ -6498,10 +6518,6 @@ class Worker:
                     exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
                 ) from exc
 
-        attempt.memory_grants = self.memory.attempt_grants(
-            me, self._tenants(set(lane.ordinals)), peak, authorize
-        )
-        attempt.memory_grant = min(attempt.memory_grants)
         executor = row.executor()
         if (
             executor is not None
@@ -6522,6 +6538,10 @@ class Worker:
                 )
             row.ledger.observe_restore(reply, "revision-1 resident placement")
             self._observe_memory(lane, row, reply)
+        attempt.memory_grants = self.memory.attempt_grants(
+            me, self._tenants(set(lane.ordinals)), peak, authorize
+        )
+        attempt.memory_grant = min(attempt.memory_grants)
         lane.touch(attempt.placement_id)
         row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
 

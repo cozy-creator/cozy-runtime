@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import threading
+import contextlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -144,6 +145,25 @@ def test_follower_memory_is_not_copied_from_the_leader() -> None:
     # Missing follower facts retain the prior conservative report, never a guessed zero.
     Worker._observe_memory(lane, row, {"reserved_bytes": 0}, (2,))
     assert row.held == {1: 12, 2: 8}
+    # A full snapshot replaces every rank. An omitted rank is unknown rather than
+    # the previous observation, while rank-selective vacate above keeps untouched ranks.
+    Worker._observe_memory(lane, row, {"rank_memory": {"1": {"reserved_bytes": 4}}})
+    assert row.held == {2: 4}
+
+
+def test_old_namespace_pid_is_translated_for_driver_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cozy_runtime.internal import proctree
+
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda path: "Name:\texecutor\nNSpid:\t420 42\n"
+        if str(path) == "/proc/42/status"
+        else (_ for _ in ()).throw(AssertionError(path)),
+    )
+    assert proctree.host_pid(42) == 420
 
 
 def test_process_facts_do_not_survive_its_generation() -> None:
@@ -296,3 +316,88 @@ def test_old_worker_refuses_start_before_package_or_cuda_initialization(tmp_path
     finally:
         ours.close()
         theirs.close()
+
+
+def test_residency_restore_precedes_fresh_attempt_grant() -> None:
+    from types import SimpleNamespace
+
+    class Ledger:
+        evicted = {"weights": 1}
+
+        def observe_restore(self, _reply: object, _why: str) -> None:
+            pass
+
+        def observe_devices(self, _facts: object) -> None:
+            pass
+
+    class Row:
+        peak: dict[tuple[str, str], int] = {}
+        supervision = None
+        ledger = Ledger()
+
+        def executor(self) -> object:
+            return executor
+
+    class Lane:
+        ordinals = (0,)
+        lane_id = "lane"
+        rows = {"placement": Row()}
+
+        def row(self, _slot: str) -> Row:
+            return self.rows["placement"]
+
+        def touch(self, _slot: str) -> None:
+            pass
+
+        def measure(self, _kind: str) -> dict[int, object]:
+            return {}
+
+        def device_facts(self, _facts: object) -> dict[int, object]:
+            return {}
+
+    events: list[str] = []
+
+    class ExecutorStub:
+        hello = {"memory": ()}
+
+        @contextlib.contextmanager
+        def watched(self, _name: str):
+            yield
+
+        def call(self, _command: object, **_kwargs: object) -> dict[str, object]:
+            events.append("restore")
+            return {"ok": True, "residency": {}}
+
+    executor = ExecutorStub()
+    lane = Lane()
+    declared = SimpleNamespace(weightless=False, entrypoint="generate")
+    slot = SimpleNamespace(bindings={"binding": declared}, lane_id="lane")
+    attempt = SimpleNamespace(
+        spec={"serving": {"entrypoint_binding_digest": "binding"}},
+        placement_id="placement",
+        prepared=None,
+        memory_grants=None,
+        memory_grant=None,
+    )
+    worker = object.__new__(Worker)
+    worker.accepted = SimpleNamespace(mode="serving")
+    worker.lanes = SimpleNamespace(by_id={"lane": lane})
+
+    class Memory:
+        @staticmethod
+        def executor_placement(_capabilities: object) -> str:
+            return "all_resident"
+
+        def attempt_grants(self, _me: object, _tenants: object, _peak: object, authorize):
+            events.append("grant")
+            return authorize()
+
+    worker.memory = Memory()
+    worker._tenants = lambda _ordinals: []
+    worker._grants = lambda _lane, _slot: (17,)
+    worker._room = lambda _lane, _slot: None
+    worker._observe_memory = lambda *_args: None
+
+    Worker._arbitrate_residency(worker, attempt, slot)
+    assert events == ["restore", "grant"]
+    assert attempt.memory_grants == (17,)
