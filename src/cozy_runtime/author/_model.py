@@ -390,15 +390,20 @@ def placeable(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
     return decorate
 
 
-# STOPGAP until memory v3, which deletes it: a device OOM in a decode-only scope (every
-# declared component tiles, as a diffusers VAE does) frees what the scope does not hold and
-# runs the same call once more with tiling on. Nothing else is retried.
+# STOPGAP until memory v3, which deletes it: a device OOM in a scope holding only diffusers'
+# image `AutoencoderKL` (SDXL's decode: one call, one returned frame) frees what the scope
+# does not hold and runs the same call once more tiled. Nothing else is retried: a video
+# VAE's decode streams chunks to its caller, and a second run would deliver them twice.
 def _tiles_after_oom(model: Any, components: tuple[str, ...], exc: Exception) -> list[Any]:
     plane: Any = model._cozy_residency
     held = plane.backend.components if plane is not None and _is_device_oom(exc) else {}
     modules = [held.get(name) for name in components]
-    tileable = all(callable(getattr(m, "enable_tiling", None)) for m in modules)
-    return modules if modules and tileable else []
+    image_vaes = all(
+        any(k.__name__ == "AutoencoderKL" and k.__module__.startswith("diffusers.") for k in
+            type(m).__mro__)
+        for m in modules
+    )
+    return modules if modules and image_vaes else []
 
 
 @contextmanager
