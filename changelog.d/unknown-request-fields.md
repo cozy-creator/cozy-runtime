@@ -1,0 +1,1 @@
+A request field the package's types do not declare, at any depth, is dropped rather than refused, whatever the structs' `forbid_unknown_fields`; the run's root records one `request_fields_ignored` warning naming the fields (`labels[1].foo, style`). Types, required fields and bounds stay strict.

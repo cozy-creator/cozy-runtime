@@ -6853,7 +6853,28 @@ class Worker:
             )
             return
         self._attention_record(attempt)
+        self._ignored_record(attempt, released.reply.ignored)
         self.settle(outcome)
+
+    def _ignored_record(self, attempt: AttemptRecord, ignored: tuple[str, ...]) -> None:
+        """The request fields its types did not declare were dropped, never refused (owner,
+        2026-09-28); the run's root says which, once."""
+        owner = self.fence.record_owner_id
+        executions = self.executions
+        if not ignored or executions is None or not executions.owns(owner, attempt.request_id):
+            return
+        with contextlib.suppress(WorkspaceRefusal):
+            executions.notice(
+                owner,
+                executions.scheduling_root(owner, attempt.request_id)[0],
+                "warning",
+                {
+                    "code": "request_fields_ignored",
+                    "message": f"ignored unknown field{'s' if len(ignored) > 1 else ''} "
+                    f"{', '.join(ignored)} — not in {self.engine._subject(attempt)}'s interface",
+                    "fields": list(ignored),
+                },
+            )
 
     def _attention_record(self, attempt: AttemptRecord) -> None:
         """A request's pin is the run's: whichever of its calls hold attention sites apply

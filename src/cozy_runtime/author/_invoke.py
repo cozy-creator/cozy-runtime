@@ -382,7 +382,12 @@ def run_prepared(
     RETRYABLE and FATAL are RecordOwner projections over these, never observations here.
     """
     record = Attempt(
-        inv.request_id, inv.spool, inv.max_output_bytes, sink=inv.progress, publish=inv.publish
+        inv.request_id,
+        inv.spool,
+        inv.max_output_bytes,
+        sink=inv.progress,
+        publish=inv.publish,
+        ignored=prepared.overlay.ignored,
     )
     try:
         return invoke(prepared, inv, record), SUCCEEDED, record

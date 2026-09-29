@@ -15,12 +15,14 @@ invocation, so the handler sees concrete `T`.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import msgspec
+import msgspec.inspect as mi
 
 from cozy_runtime.author._assets import asset_dec_hook
 from cozy_runtime.author._errors import DefaultResolutionError, InvalidRequest
@@ -62,6 +64,8 @@ class Overlay:
     sources: Mapping[str, str]
     digest: str
     rows: tuple[AdjustmentRow, ...] = ()
+    ignored: tuple[str, ...] = ()
+    """Request fields the type does not declare, dropped before decoding (`labels[1].foo`)."""
 
 
 def marked_fields(payload_type: object) -> dict[str, Node]:
@@ -122,6 +126,7 @@ def resolve(
     model_params: Sequence[str] = (),
 ) -> Overlay:
     """Build the one overlay and the revalidated payload."""
+    wire, ignored = undeclared(payload_type, wire)
     marked = marked_fields(payload_type)
 
     # Layer 1 of the two-layer clamp: API bounds REJECT what the caller actually sent,
@@ -193,8 +198,86 @@ def resolve(
     # ONE whole-request revalidation, cross-field constraints included.
     payload = decode_request(cast("type[Any]", payload_type), merged, "the resolved request")
     return Overlay(
-        payload, dict(sorted(merged.items())), sources, _digest(merged, sources), tuple(rows)
+        payload,
+        dict(sorted(merged.items())),
+        sources,
+        _digest(merged, sources),
+        tuple(rows),
+        ignored,
     )
+
+
+def undeclared(
+    payload_type: object, wire: Mapping[str, object]
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    """The request without the fields its type does not declare, at any depth, and their paths.
+
+    An undeclared field is a warning, never a refusal (owner, 2026-09-28): a newer caller may
+    name fields this package does not know, whatever its structs' `forbid_unknown_fields`.
+    Types, required fields and bounds stay the decoder's, and stay strict.
+    """
+    ignored: list[str] = []
+    kept = _prune(_type_info(payload_type), dict(wire), "", ignored)
+    return cast("dict[str, object]", kept), tuple(sorted(ignored))
+
+
+@functools.lru_cache(maxsize=256)
+def _type_info(payload_type: object) -> mi.Type:
+    return mi.type_info(cast("Any", payload_type))
+
+
+_OBJECTS = (mi.StructType, mi.DataclassType, mi.TypedDictType)
+
+
+def _prune(info: mi.Type, value: object, path: str, ignored: list[str]) -> object:
+    if isinstance(info, mi.Metadata):
+        return _prune(info.type, value, path, ignored)
+    if isinstance(info, mi.UnionType):
+        branch = _branch(info, value)
+        return value if branch is None else _prune(branch, value, path, ignored)
+    if isinstance(info, _OBJECTS) and isinstance(value, dict):
+        fields = {field.encode_name: field.type for field in info.fields}
+        tag = info.tag_field if isinstance(info, mi.StructType) else None
+        kept: dict[object, object] = {}
+        for key, item in value.items():
+            where = f"{path}.{key}" if path else str(key)
+            if key in fields:
+                kept[key] = _prune(fields[key], item, where, ignored)
+            elif key == tag:
+                kept[key] = item
+            else:
+                ignored.append(where)
+        return kept
+    if isinstance(info, (mi.CollectionType, mi.TupleType)) and isinstance(value, list):
+        if isinstance(info, mi.TupleType):
+            items = info.item_types
+        else:
+            items = (info.item_type,) * len(value)
+        return [
+            _prune(items[i], item, f"{path}[{i}]", ignored) if i < len(items) else item
+            for i, item in enumerate(value)
+        ]
+    if isinstance(info, mi.DictType) and isinstance(value, dict):
+        return {k: _prune(info.value_type, v, f"{path}.{k}", ignored) for k, v in value.items()}
+    return value
+
+
+def _branch(info: mi.UnionType, value: object) -> mi.Type | None:
+    """The one member a value decodes as: msgspec admits at most one object-like and one
+    array-like member, besides structs told apart by their tag."""
+    if not isinstance(value, (dict, list)):
+        return None
+    fields = value if isinstance(value, dict) else {}
+    arrays = (mi.CollectionType, mi.TupleType)
+    kinds = (*_OBJECTS, mi.DictType) if isinstance(value, dict) else arrays
+    members = [member.type if isinstance(member, mi.Metadata) else member for member in info.types]
+    candidates = [member for member in members if isinstance(member, kinds)]
+    tagged = [m for m in candidates if isinstance(m, mi.StructType) and m.tag_field is not None]
+    for member in tagged:
+        if member.tag_field in fields and fields[member.tag_field] == member.tag:
+            return member
+    untagged = [member for member in candidates if member not in tagged]
+    return untagged[0] if len(untagged) == 1 else None
 
 
 def decode_request[T](

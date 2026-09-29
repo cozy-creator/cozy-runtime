@@ -158,6 +158,8 @@ class Attempt:
     committed_files: dict[str, FileAsset] = field(default_factory=dict)
     pending_trees: dict[str, Tree] = field(default_factory=dict)
     rows: list[AdjustmentRow] = field(default_factory=list)
+    ignored: tuple[str, ...] = ()
+    """The request fields its type does not declare, dropped before it decoded."""
     ring: EventRing = field(default_factory=EventRing)
     """The BOUNDED observation record (cr-011). It replaced an unbounded list: a 4,096-step
     attempt used to grow one row per step, so the longest attempt — the one whose triage
