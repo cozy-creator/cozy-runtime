@@ -12,6 +12,16 @@ import pytest
 from cozy_runtime.internal import executor, fill, memory, proctree, tiers
 
 
+def test_non_linux_trim_does_not_load_libc(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    def library(*args: object) -> object:
+        pytest.fail("unsupported platform must not load libc")
+
+    monkeypatch.setattr(ctypes, "CDLL", library)
+    assert not proctree.trim_host_allocator()
+
+
 @pytest.mark.parametrize("missing", [False, True])
 def test_allocator_trim_is_optional(missing: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     def library(*args: object) -> object:

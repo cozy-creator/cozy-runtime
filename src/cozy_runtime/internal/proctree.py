@@ -1283,6 +1283,8 @@ def trim_host_allocator() -> bool:
     This is an optional pressure response, not a byte estimate. Callers must measure
     RSS and aggregate host headroom afterward even when libc reports success.
     """
+    if sys.platform != "linux":
+        return False
     try:
         trim = ctypes.CDLL(None).malloc_trim
     except (OSError, AttributeError):
