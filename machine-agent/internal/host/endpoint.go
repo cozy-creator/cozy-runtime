@@ -94,8 +94,8 @@ func (m *Machine) listen() (*listeners, error) {
 	return l, nil
 }
 
-// serveReceipt answers 425 until the envelope is sealed, launching a stopped Runtime as a call
-// would, and 503 once the Runtime cannot start. Any answer tells the Hub the machine is up;
+// serveReceipt observes readiness without waking or launching a Runtime. It answers
+// 425 until the envelope is sealed and 503 once the Runtime cannot start.
 // the sealed envelope tells it the Runtime is ready.
 func (m *Machine) serveReceipt(w http.ResponseWriter, _ *http.Request) {
 	envelope := m.receipt.Envelope()
@@ -108,7 +108,6 @@ func (m *Machine) serveReceipt(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	if envelope == nil {
-		m.poke()
 		http.Error(w, `{"error":{"code":"media.bootstrap_pending","message":"the machine is booting"}}`, http.StatusTooEarly)
 		return
 	}

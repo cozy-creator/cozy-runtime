@@ -311,7 +311,7 @@ func (m *Machine) protocolInfo(stream grpc.ServerStream) error {
 	own := &pb.ProtocolInfoResult{WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor}
 	ctx, cancel := context.WithTimeout(stream.Context(), 10*time.Second)
 	defer cancel()
-	if conn, err := m.runtime(ctx); err == nil {
+	if conn, err := m.liveRuntime(ctx); err == nil {
 		if peer, err := pb.NewRuntimePreparationClient(conn).ProtocolInfo(ctx, &pb.ProtocolInfoRequest{}); err == nil {
 			if shared, ok := sharedRange(peer); ok {
 				own = shared

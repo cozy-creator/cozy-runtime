@@ -155,6 +155,11 @@ func (m *Machine) readPublicLog(ctx context.Context, run, after uint64, wait boo
 		for _, event := range page.Events {
 			log.add(event)
 		}
+		current := &pb.MachineExecutionState{}
+		if err := m.publicRead(map[string]any{"op": "get", "request": state.RequestId, "workspace": list.ExecutionWorkspaceId}, current); err != nil {
+			return nil, err
+		}
+		log.observeState(current)
 		if log.next >= page.HeadSequence || len(page.Events) == 0 {
 			if !wait || log.terminal || len(log.after(after)) > 0 {
 				return log.final(), nil
