@@ -19,9 +19,10 @@ import contextvars
 import functools
 import inspect
 import json
+import logging
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -40,6 +41,7 @@ from cozy_runtime.author._errors import (
     CapabilityError,
     ConformanceError,
     InvalidRequest,
+    _is_device_oom,
 )
 from cozy_runtime.author._loader import (
     Artifact,
@@ -52,6 +54,8 @@ from cozy_runtime.author._loader import (
     Scheduler,
     loading,
 )
+
+_LOG = logging.getLogger(__name__)
 
 PipelineT = TypeVar("PipelineT", covariant=True)
 P = ParamSpec("P")
@@ -386,6 +390,35 @@ def placeable(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
     return decorate
 
 
+# STOPGAP until memory v3, which deletes it: a device OOM in a decode-only scope (every
+# declared component tiles, as a diffusers VAE does) frees what the scope does not hold and
+# runs the same call once more with tiling on. Nothing else is retried.
+def _tiles_after_oom(model: Any, components: tuple[str, ...], exc: Exception) -> list[Any]:
+    plane: Any = model._cozy_residency
+    held = plane.backend.components if plane is not None and _is_device_oom(exc) else {}
+    modules = [held.get(name) for name in components]
+    tileable = all(callable(getattr(m, "enable_tiling", None)) for m in modules)
+    return modules if modules and tileable else []
+
+
+@contextmanager
+def _tiled_retry(model: Any, method: str, modules: list[Any]) -> Iterator[None]:
+    plane: Any = model._cozy_residency
+    plane.shed()
+    if plane.torch is not None and plane.kind == "cuda":
+        plane.torch.cuda.empty_cache()
+    plane.backend.stage_log.append({"method": method, "action": "decode retried tiled after OOM"})
+    _LOG.warning("%s: decode retried tiled after OOM", method)
+    untiled = [m for m in modules if not getattr(m, "use_tiling", False)]
+    for module in untiled:
+        module.enable_tiling()
+    try:
+        yield
+    finally:
+        for module in untiled:
+            module.disable_tiling()
+
+
 def _is_async(fn: Callable[..., object]) -> bool:
     return inspect.iscoroutinefunction(inspect.unwrap(fn))
 
@@ -396,7 +429,15 @@ def _sync_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> R:
         with self._cozy_scope(fn.__name__, components):
-            result = fn(self, *args, **kwargs)
+            tiles: list[Any] = []
+            try:
+                result = fn(self, *args, **kwargs)
+            except Exception as exc:
+                if not (tiles := _tiles_after_oom(self, components, exc)):
+                    raise
+            if tiles:  # outside `except`, so the failed call's frames and tensors are gone
+                with _tiled_retry(self, fn.__name__, tiles):
+                    result = fn(self, *args, **kwargs)
             _refuse_lazy(fn.__name__, result)
             return result
 
@@ -411,7 +452,15 @@ def _async_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     async def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> object:
         with self._cozy_scope(fn.__name__, components):
-            result = await fn(self, *args, **kwargs)  # type: ignore[misc]
+            tiles: list[Any] = []
+            try:
+                result = await fn(self, *args, **kwargs)  # type: ignore[misc]
+            except Exception as exc:
+                if not (tiles := _tiles_after_oom(self, components, exc)):
+                    raise
+            if tiles:
+                with _tiled_retry(self, fn.__name__, tiles):
+                    result = await fn(self, *args, **kwargs)  # type: ignore[misc]
             _refuse_lazy(fn.__name__, result)
             return result
 
