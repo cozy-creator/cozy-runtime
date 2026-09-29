@@ -123,11 +123,8 @@ func validateHubAccess(a hubAccess, now time.Time) error {
 	if got := a.Environment["TENSORHUB_ORIGIN"]; strings.TrimSuffix(got, "/") != strings.TrimSuffix(a.Origin, "/") {
 		return fmt.Errorf("Hub access environment names another origin")
 	}
-	for k := range a.Environment {
-		if k != "TENSORHUB_ORIGIN" && k != "TENSORHUB_PUBLIC_ORIGIN" && k != "TENSORHUB_OBJECT_STORAGE_HOSTS" {
-			return fmt.Errorf("Hub access environment contains unsupported setting %s", k)
-		}
-	}
+	// Project only the settings consumed below. Unknown Hub additions are never
+	// applied to the process environment and do not invalidate an access grant.
 	if a.CA != "" {
 		der, err := base64.RawURLEncoding.DecodeString(a.CA)
 		if err != nil {

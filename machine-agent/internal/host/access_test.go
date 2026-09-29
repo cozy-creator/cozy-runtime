@@ -23,7 +23,7 @@ func TestAccessRefreshIsScopedAndContainsNoWorkerRegistration(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &Machine{grant: &Grant{WorkerID: "local-machine"}, claims: claims, layout: NewLayout(&Grant{Root: t.TempDir()})}
-	access := hubAccess{Origin: "https://example.test", Token: "scoped-credential", ExpiresAt: time.Now().Add(time.Hour).Unix(), Environment: map[string]string{"TENSORHUB_ORIGIN": "https://example.test"}}
+	access := hubAccess{Origin: "https://example.test", Token: "scoped-credential", ExpiresAt: time.Now().Add(time.Hour).Unix(), Environment: map[string]string{"TENSORHUB_ORIGIN": "https://example.test", "FUTURE_HUB_SETTING": "ignored", "PATH": "/untrusted"}}
 	send := func(action string, a hubAccess) *httptest.ResponseRecorder {
 		cap, _ := capability.Mint(key, capability.Grant{Machine: "local-machine", Action: action, Expires: time.Now().Add(time.Hour).Unix()})
 		raw, _ := json.Marshal(a)
@@ -55,6 +55,9 @@ func TestAccessRefreshIsScopedAndContainsNoWorkerRegistration(t *testing.T) {
 	}
 	if len(projected.Hubs) != 1 || projected.Hubs[0]["access_token"] != access.Token || projected.Hubs[0]["worker_token"] != nil {
 		t.Fatalf("bad projection: %s", raw)
+	}
+	if strings.Contains(string(raw), "/untrusted") || strings.Contains(string(raw), "FUTURE_HUB_SETTING") {
+		t.Fatal("unknown settings leaked into Runtime environment")
 	}
 	if info, err := os.Stat(m.accessPath()); err != nil || info.Mode().Perm() != 0600 {
 		t.Fatal("access configuration is not private")
