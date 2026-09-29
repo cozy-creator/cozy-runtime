@@ -19,6 +19,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
 from cozy_runtime.internal import effect_interfaces, source_interfaces
 from cozy_runtime.internal.worker import (
+    call_timing,
     machine_byte_inputs,
     machine_byte_results,
     machine_child_target,
@@ -110,7 +111,7 @@ class _Bundle(msgspec.Struct, frozen=True):
     measurements: _Measurements = _Measurements()
 
 
-class CallRecord(msgspec.Struct, frozen=True, kw_only=True):
+class CallRecord(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     """A settled child call on its root's journal (kind `call`): what it ran, under which
     author label, how its attempt ended and where that attempt's time went. Its GPU grant
     and release are the root's `gpu.*` events keyed `request#attempt`."""
@@ -127,6 +128,10 @@ class CallRecord(msgspec.Struct, frozen=True, kw_only=True):
     called_unix_ms: int
     stages: dict[str, CallTrack]
     steps: dict[str, CallTrack]
+    queued_ms: float | None = None
+    preparation_ms: float | None = None
+    execution_ms: float | None = None
+    execution_started_unix_ms: int | None = None
 
     def bounded(self) -> CallRecord:
         """This record within one event's bound: the longest step series go first."""
@@ -151,6 +156,7 @@ class Calls:
         self.workspace = worker.workspace
         self.executions = worker.executions
         self.journal = JournalCalls(worker.workspace)
+        self.timing = call_timing.Timing(self.executions, self.journal, worker.calls.progress_label)
         self.lock = threading.Lock()
         #: child request -> the parent call that named it last (a resumed parent calls again)
         self.requests: dict[str, pb.ChildCallRequest] = {}
@@ -170,9 +176,16 @@ class Calls:
     ) -> pb.ChildCallResult:
         owner = self.worker.fence.record_owner_id
         if action == "call":
-            call = self.journal.accept(owner, request)
             with self.lock:
+                try:
+                    self.journal.get(owner, parent.request_id, request.call_index)
+                    fresh = False
+                except WorkspaceRefusal:
+                    fresh = True
+                call = self.journal.accept(owner, request)
                 self.requests[call.child_request] = request
+                if fresh:
+                    self.timing.phase(owner, call.child_request, 1, "queued", fresh=True)
         else:
             call = self.journal.get(owner, parent.request_id, request.call_index)
         if call.intent_digest != request.intent_digest:
@@ -187,13 +200,16 @@ class Calls:
         if state is not None and action == "call" and state.state in ("failed", "paused"):
             if parent.attempt > call.plan().parent_attempt:
                 # The parent's next attempt calls again: its paused or failed child resumes.
-                self.executions.control(
+                resumed = self.executions.control(
                     owner,
                     call.child_request,
                     f"parent-resume.{parent.attempt}",
                     state.generation,
                     "resume",
                     worker_boot=self.worker.fence.worker_boot_id,
+                )
+                self.timing.phase(
+                    owner, call.child_request, resumed.attempt_ordinal, "queued", fresh=True
                 )
         elif state is not None and action == "cancel" and state.state in ("queued", "running"):
             self.worker.control_tree(owner, call.child_request, "pause")
@@ -279,6 +295,7 @@ class Calls:
             else:
                 attribution = msgspec.json.decode(data, type=_Bundle).measurements.attribution
         target = call.target()
+        timing = self.timing.phase(owner, request, row.ordinal, "terminal", status=row.state)
         record = CallRecord(
             request=request,
             parent=call.parent_request,
@@ -295,6 +312,7 @@ class Calls:
             stages=attribution.stages,
             steps=attribution.steps,
         )
+        record = msgspec.structs.replace(record, **timing)
         root, _ = self.executions.scheduling_root(owner, request)
         self.executions.record(owner, root, "call", msgspec.to_builtins(record.bounded()))
 
@@ -332,12 +350,24 @@ class Calls:
             if module == source_interfaces.MODULE:
                 self.worker.machine_sources.run(unit, owner, call, request)
                 return False
-            target = machine_child_target.resolve(self.worker, parent, call)
-            self._check_ancestors(owner, parent, target, request.request_canonical_bytes)
-            if target.binding is None:
-                return self.serving.submit(unit, owner, call, target, request)
-            return self._job(owner, parent, call, target, request)
+            self.timing.phase(owner, child, 1, "preparing")
+            with self.serving.demand(call):
+                target = machine_child_target.resolve(self.worker, parent, call)
+                self._check_ancestors(owner, parent, target, request.request_canonical_bytes)
+                submitted = (
+                    self.serving.submit(unit, owner, call, target, request)
+                    if target.binding is None
+                    else self._job(owner, parent, call, target, request)
+                )
+            if submitted:
+                self.timing.phase(owner, child, 1, "queued")
+            else:
+                settled = self.journal.child(owner, child)
+                status = "succeeded" if settled is not None and settled.result else "paused"
+                self.timing.phase(owner, child, 1, "terminal", status=status)
+            return submitted
         except CallFenced:
+            self.timing.phase(owner, child, 1, "terminal", status="paused")
             return False  # its parent moved on: no one reads this call
 
     def _job(
@@ -489,6 +519,7 @@ class Calls:
         if not self.executions.owns(owner, child):
             machine_models.release(self.workspace, owner, child)
         self._record(owner, call, "child_admission_refused", fault_text(exc))
+        self.timing.phase(owner, child, 1, "terminal", status="failed")
 
     def deliver(self, unit: Unit, owner: str, request: str, row: ExecutionRow) -> None:
         """A terminal child settles into its parent's call row: its result's custody moves to

@@ -195,6 +195,8 @@ class _Progress(msgspec.Struct, frozen=True):
     overall_fraction: float | None = None
     unit: str | None = None
     rate: float | None = None
+    call_request: str | None = None
+    call_attempt: int | None = None
 
 
 def _progress_document(frame: Mapping[str, canonical.Json]) -> dict[str, canonical.Json]:
@@ -2435,6 +2437,7 @@ class Worker:
         if action == "resume" and self.stop.is_set():
             raise WorkspaceRefusal("worker is stopping; execution resume is closed")
         executions, owner = self._execution_service(claim)
+        prior = executions.status(owner, request_id)
         state = executions.control(
             owner,
             request_id,
@@ -2445,6 +2448,10 @@ class Worker:
         )
         if action != "resume":
             self.control_tree(owner, request_id, action, state.generation)
+        elif state.attempt_ordinal > prior.attempt_ordinal and self.machine_calls is not None:
+            self.machine_calls.timing.phase(
+                owner, request_id, state.attempt_ordinal, "queued", fresh=True
+            )
         self.execution(owner, request_id)
         self.publish_activity(strict=True)
         return state
@@ -6811,7 +6818,20 @@ class Worker:
         self._record_executor(attempt)
         with self.memory.watch(lane) as seen:
             try:
-                released = self.engine.execute(attempt)
+                if self.machine_calls is not None:
+                    self.machine_calls.timing.phase(
+                        self.fence.record_owner_id, attempt.request_id, attempt.attempt, "running"
+                    )
+                try:
+                    released = self.engine.execute(attempt)
+                finally:
+                    if self.machine_calls is not None:
+                        self.machine_calls.timing.phase(
+                            self.fence.record_owner_id,
+                            attempt.request_id,
+                            attempt.attempt,
+                            "finalizing",
+                        )
             except Exception as exc:
                 self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
                 try:

@@ -186,8 +186,13 @@ class Calls:
                         if len(label) > 120 or not label.isprintable():
                             label = ""
                         pending = self.pending[key] = _Pending(
-                            intent, self.call(attempt, intent, "call"), progress_label=label
+                            intent, pb.ChildCallResult(), progress_label=label
                         )
+                        try:
+                            pending.result = self.call(attempt, intent, "call")
+                        except BaseException:
+                            self.pending.pop(key, None)
+                            raise
                 if pending is None:
                     raise ValueError("parent call has not been activated")
                 canceling = isinstance(request, ChildCancel)
@@ -272,7 +277,7 @@ class Calls:
             return None
         with workspace.locked() as db:
             row = db.execute(
-                "SELECT p.sequence,p.body FROM execution_events p "
+                "SELECT p.sequence,p.ordinal,p.body FROM execution_events p "
                 "JOIN executions e ON e.owner=p.owner AND e.request=p.request "
                 "AND e.ordinal=p.ordinal "
                 "JOIN execution_calls c ON c.owner=e.owner AND c.child_request=e.request "
@@ -292,7 +297,14 @@ class Calls:
             event = msgspec.json.decode(row["body"], type=_ProgressEvent)
         except msgspec.ValidationError:
             return None  # progress is narration; the child's answer stands without it
-        return CallProgress(sequence=row["sequence"], payload=event.payload)
+        return CallProgress(
+            sequence=row["sequence"],
+            payload={
+                "call_request": result.child_request_id,
+                "call_attempt": row["ordinal"],
+                **event.payload,
+            },
+        )
 
     def progress_label(self, parent: str, ordinal: int, index: int) -> str:
         with self.lock:

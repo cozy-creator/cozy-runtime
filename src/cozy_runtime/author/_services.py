@@ -86,6 +86,8 @@ class ProgressFrame:
     total: int | None = None
     overall_fraction: float | None = None
     step_ms: float = 0.0
+    call_request: str | None = None
+    call_attempt: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1298,6 +1300,11 @@ class Telemetry(_Bound):
             valid_timing = False
         if not valid_timing:
             step_ms = 0.0
+        call_request, call_attempt = payload.get("call_request"), payload.get("call_attempt")
+        if not isinstance(call_request, str) or not 0 < len(call_request) <= 255:
+            call_request = None
+        if type(call_attempt) is not int or call_attempt <= 0:
+            call_attempt = None
         self._progress_frame(
             f"{scope.name} / {stage}"[:120],
             stage_fraction=fraction,
@@ -1305,6 +1312,8 @@ class Telemetry(_Bound):
             total=total,
             overall_fraction=overall,
             step_ms=step_ms,
+            call_request=call_request,
+            call_attempt=call_attempt,
             scoped=False,
         )
 
@@ -1369,6 +1378,8 @@ class Telemetry(_Bound):
         total: int | None = None,
         overall_fraction: float | None = None,
         step_ms: float = 0.0,
+        call_request: str | None = None,
+        call_attempt: int | None = None,
         scoped: bool = True,
     ) -> None:
         name = self._stage_name(stage)
@@ -1392,6 +1403,8 @@ class Telemetry(_Bound):
                 total=total,
                 overall_fraction=overall_fraction,
                 step_ms=step_ms,
+                call_request=call_request,
+                call_attempt=call_attempt,
             )
         )
 

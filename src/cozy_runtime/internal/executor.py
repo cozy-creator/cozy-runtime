@@ -4268,6 +4268,8 @@ class Executor:
                             "total": frame.total,
                             "advance": frame.advance,
                             "step_ms": frame.step_ms,
+                            "call_request": frame.call_request,
+                            "call_attempt": frame.call_attempt,
                         }
                     )
                 else:
