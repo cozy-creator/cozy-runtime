@@ -1,0 +1,40 @@
+name: machine-agent
+on:
+  pull_request:
+    paths:
+      - 'machine-agent/**'
+      - '.github/workflows/machine-agent.yaml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Immutable machine-agent version, without machine-v'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  machine-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: machine-agent/go.mod
+          cache-dependency-path: machine-agent/go.sum
+      - uses: astral-sh/setup-uv@v7
+      - name: Install Runtime decoder for public journal integration
+        run: uv sync --locked --no-dev
+      - name: Machine API, lifecycle, and WebRTC tests
+        working-directory: machine-agent
+        run: COZY_RUNTIME_TEST_PYTHON="$GITHUB_WORKSPACE/.venv/bin/python" go test -race -p 2 ./...
+      - name: Build public artifacts
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          MACHINE_VERSION: ${{ inputs.version }}
+        run: machine-agent/scripts/build-release.sh --version "$MACHINE_VERSION" --output "$RUNNER_TEMP/machine-agent"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: machine-agent-${{ inputs.version }}
+          path: ${{ runner.temp }}/machine-agent/*
+          if-no-files-found: error
