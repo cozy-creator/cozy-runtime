@@ -1,0 +1,1 @@
+Classic diffusers `AttnProcessor2_0` sites (SDXL UNet, AutoencoderKL) run through `ClassicSdpa`: the same math via backend dispatch. Auto keeps SDPA (bit-identical); run evidence reports `sdpa` instead of `unobserved`, and a scoped pin such as `unet=sageattention` can serve them.

@@ -667,6 +667,82 @@ def _attention_records(roots: Mapping[str, object]) -> Iterator[tuple[str, str, 
                 yield component, path, module, processor
 
 
+class ClassicSdpa:
+    """Diffusers' `AttnProcessor2_0`, the same math, through the per-site backend contract.
+
+    Classic `Attention` sites (SDXL's UNet, AutoencoderKL) call torch SDPA directly, so no
+    kernel could be selected, pinned or observed on them. `adopt` gives each one this
+    processor. Auto selection keeps SDPA there, bit-identical to before; a pin or a model's
+    attention policy may choose another kernel.
+    """
+
+    _attention_backend: Any = None
+    _parallel_config: Any = None
+
+    def __call__(
+        self,
+        attn: Any,
+        hidden_states: Any,
+        encoder_hidden_states: Any = None,
+        attention_mask: Any = None,
+        temb: Any = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+        shape = hidden_states.shape
+        if hidden_states.ndim == 4:
+            hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        context = hidden_states if encoder_hidden_states is None else encoder_hidden_states
+        batch, length = context.shape[:2]
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, length, batch)
+            attention_mask = attention_mask.view(batch, attn.heads, -1, attention_mask.shape[-1])
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        query = attn.to_q(hidden_states)
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+        key, value = attn.to_k(encoder_hidden_states), attn.to_v(encoder_hidden_states)
+        head_dim = key.shape[-1] // attn.heads
+        query, key, value = (x.view(batch, -1, attn.heads, head_dim) for x in (query, key, value))
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+        hidden_states = attn.to_out[1](attn.to_out[0](hidden_states.flatten(2).to(query.dtype)))
+        if len(shape) == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(shape)
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+        return hidden_states / attn.rescale_output_factor
+
+
+def adopt(roots: Mapping[str, object]) -> None:
+    """Give every classic `AttnProcessor2_0` site its own `ClassicSdpa`. Idempotent."""
+    try:
+        from diffusers.models.attention_processor import AttnProcessor2_0
+    except ImportError:
+        return
+    for _component, _path, module, processor in list(_attention_records(roots)):
+        if type(processor) is AttnProcessor2_0:
+            module.set_processor(ClassicSdpa())
+
+
 def _site_records(roots: Mapping[str, object]) -> Iterator[tuple[str, str, Any, Any]]:
     """Only processors implementing Diffusers' per-site backend selection contract."""
     for record in _attention_records(roots):
@@ -1054,6 +1130,8 @@ def install(
             and _admits(entry.candidate, dtype, head_dim)
             and (degree == 1 or _context_parallel(entry.member))
         ]
+        if not forced and isinstance(processor, ClassicSdpa):
+            offered = [entry for entry in offered if entry.name == "sdpa"] or offered
         if not offered:
             detail = _site_refusal(
                 name if forced else "no available attention kernel", component, dtype, head_dim
@@ -1360,6 +1438,7 @@ def select(
     choose: Callable[[AttentionContext], str | Sequence[str] | None] | None = None,
 ) -> Applied:
     """Select once at preparation; optional model policy and request pins are validated."""
+    adopt(roots)
     scope, name = _pin_parts(pin)
     skipped: dict[str, str] = {}
     ready = pinned(name, device) if name and not scope else available(device, skipped)
