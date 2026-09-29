@@ -1,11 +1,17 @@
 """Centralized policy keeps refusal facts and mechanism callback ordering unchanged."""
 
 from collections.abc import Sequence
+from contextlib import nullcontext
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from cozy_runtime.internal import memory, tiers
+from cozy_runtime.internal.executor_commands import Activate, Command, Restore
 from cozy_runtime.internal.parallel.group import OpReady
+from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
+from cozy_runtime.internal.worker.session import Worker
 from test_machine_memory_policy import Resident
 
 
@@ -58,6 +64,75 @@ def test_machine_admission_reclaims_before_fresh_authorization() -> None:
 
     assert policy.attempt_grants(me, tenants, None, authorize) == (90,)
     assert peer.actions == [("vacate", (0,))]
+
+
+def test_legacy_restore_gets_fresh_authorization_before_staging() -> None:
+    events: list[str] = []
+    quotes = iter(((17,), (23,)))
+
+    def grant(*_args: object) -> tuple[int, ...]:
+        events.append("quote")
+        return next(quotes)
+
+    def call(command: Command, **_kwargs: object) -> dict[str, object]:
+        if isinstance(command, Activate):
+            assert command.construction == "construction"
+            assert command.authorized_device_limit_bytes == 17
+            assert command.memory_grants == (17,)
+            events.append("activate")
+        else:
+            assert isinstance(command, Restore) and command.names == ("weights",)
+            events.append("restore")
+        return {"ok": True}
+
+    executor = SimpleNamespace(
+        hello={"memory": ()},
+        active="construction",
+        call=call,
+        watched=lambda *_: nullcontext(),
+    )
+    row = SimpleNamespace(
+        peak={},
+        executor=lambda: executor,
+        ledger=SimpleNamespace(
+            evicted={"weights": 8},
+            observe_restore=lambda *_: None,
+            observe_devices=lambda *_: None,
+        ),
+    )
+    lane = SimpleNamespace(
+        ordinals=(0,),
+        row=lambda _: row,
+        touch=lambda _: None,
+        measure=lambda _: {},
+        device_facts=lambda _: {},
+    )
+    worker = SimpleNamespace(
+        accepted=SimpleNamespace(mode="serving"),
+        lanes=SimpleNamespace(by_id={"lane": lane}),
+        memory=SimpleNamespace(
+            executor_placement=memory.Machine.executor_placement,
+            attempt_grants=lambda _me, _tenants, _peak, authorize: authorize(),
+        ),
+        _tenants=lambda _: [],
+        _grants=grant,
+        _room=lambda *_: None,
+        _observe_memory=lambda *_: None,
+    )
+    attempt = SimpleNamespace(
+        spec={"serving": {"entrypoint_binding_digest": "binding"}},
+        placement_id="p",
+        prepared=None,
+    )
+    slot = SimpleNamespace(
+        bindings={"binding": SimpleNamespace(weightless=False)},
+        lane_id="lane",
+    )
+    Worker._arbitrate_residency(
+        cast(Worker, worker), cast(AttemptRecord, attempt), cast(AttemptSlot, slot)
+    )
+    assert events == ["quote", "activate", "restore", "quote"]
+    assert attempt.memory_grants == (23,) and attempt.memory_grant == 23
 
 
 @pytest.mark.parametrize("kind", ["unknown", "negative", "zero"])

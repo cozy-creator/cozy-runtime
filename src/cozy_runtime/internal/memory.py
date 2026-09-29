@@ -2208,14 +2208,25 @@ class Machine:
                 for slot, (devices, held) in rows.items()
                 if slot != me.slot
             )
-            if measured is None or (unknown and (ordinal in self.budget or -1 in self.budget)):
+            if measured is None:
                 result[ordinal] = None
                 continue
             free, total = measured
             if unknown:
-                # Without a quota, free physical bytes are usable even when a legacy
-                # neighbour cannot attribute its occupancy. Its missing facts stay missing.
-                result[ordinal] = min(total, free + rows[me.slot][1].get(ordinal, 0))
+                # PID namespaces can hide a legacy neighbour's driver identity. Charge
+                # all observed occupancy outside our reported footprint once, including
+                # foreign use, rather than guessing a per-process value or refusing the
+                # lane. This is a conservative quota, not attribution to any tenant.
+                mine = rows[me.slot][1].get(ordinal, 0)
+                room = min(total, free + mine)
+                if ordinal in self.budget or -1 in self.budget:
+                    occupied_elsewhere = max(total - free - mine, 0)
+                    room = min(
+                        room,
+                        self.budget.get(ordinal, self.budget.get(-1, total))
+                        - occupied_elsewhere,
+                    )
+                result[ordinal] = room
                 continue
             others = sum(
                 held[ordinal]

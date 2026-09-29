@@ -6508,6 +6508,25 @@ class Worker:
             and self.memory.executor_placement(executor.hello.get("memory", ())) == "all_resident"
             and row.ledger.evicted
         ):
+            # Released revision-1 Restore has no grant fields. Activate already accepts
+            # a scalar ceiling and refreshes the active construction's authorization.
+            if executor.active:
+                with executor.watched("restore-grant"):
+                    reply = executor.call(
+                        Activate(
+                            construction=executor.active,
+                            authorized_device_limit_bytes=attempt.memory_grant,
+                            memory_grants=attempt.memory_grants,
+                        ),
+                        timeout=None,
+                        on_request=self._room(lane, attempt.placement_id),
+                    )
+                if not reply.get("ok"):
+                    raise AttemptRefusal(
+                        str(reply.get("code") or "residency_grant_refused"),
+                        str(reply.get("detail") or "executor rejected the restore grant"),
+                        cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+                    )
             with executor.watched("restore"):
                 reply = executor.call(
                     Restore(names=tuple(sorted(row.ledger.evicted))),
@@ -6522,6 +6541,8 @@ class Worker:
                 )
             row.ledger.observe_restore(reply, "revision-1 resident placement")
             self._observe_memory(lane, row, reply)
+            attempt.memory_grants = authorize()
+            attempt.memory_grant = min(attempt.memory_grants)
         lane.touch(attempt.placement_id)
         row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
 

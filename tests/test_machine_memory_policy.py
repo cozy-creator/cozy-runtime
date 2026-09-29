@@ -133,7 +133,8 @@ def test_quote_samples_each_device_once_and_keeps_rank_facts_distinct() -> None:
     assert policy.quote(me, [me, neighbour]) == {0: 40, 1: 20}
     assert samples == [0, 1]
     neighbour.held.pop(1)
-    assert policy.quote(me, [me, neighbour]) == {0: 40, 1: None}
+    assert policy.quote(me, [me, neighbour]) == {0: 40, 1: 10}
+    assert 1 not in neighbour.held
 
 
 def test_prefetch_frontier_retains_exact_representations_and_is_immutable() -> None:
@@ -210,10 +211,23 @@ def test_worker_lane_records_feed_the_same_coherent_quote() -> None:
     policy = Machine({-1: 80}, lambda ordinal: ({0: 40, 1: 50}[ordinal], 100), lambda _: None)
     assert policy.quote(me, [me, other]) == {0: 30, 1: 50}
     neighbour.held.pop(1)
-    assert policy.quote(me, [me, other]) == {0: 30, 1: None}
+    assert policy.quote(me, [me, other]) == {0: 30, 1: 50}
     policy.budget.clear()
     assert policy.quote(me, [me, other]) == {0: 50, 1: 70}
     assert 1 not in neighbour.held  # Physical room did not manufacture a legacy footprint.
+
+
+@pytest.mark.parametrize("free,expected", [(100, 50), (70, 20), (40, -10)])
+def test_unknown_legacy_usage_is_charged_once_against_the_quota(
+    free: int, expected: int
+) -> None:
+    me = Resident("me", {0: 10}, {0: 10})
+    peers = [Resident("old-a", {}, {0: 0}), Resident("old-b", {}, {0: 0})]
+    policy = Machine({-1: 60}, lambda _: (free, 120), lambda _: None)
+    assert policy.quote(me, [me, *peers]) == {0: expected}
+    assert all(not peer.held and not peer.actions for peer in peers)
+    policy.driver = lambda _: None
+    assert policy.quote(me, [me, *peers]) == {0: None}
 
 
 def test_prefetch_frontiers_are_independent_but_do_not_pass_overlapping_groups() -> None:
