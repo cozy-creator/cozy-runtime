@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 # Build immutable public artifacts from private source. This script never publishes.
 set -euo pipefail
-machine_version= machine_output= machine_repository=cozy-creator/cozy
+machine_version= machine_output=
 while (($#)); do
   case "$1" in
     --version) machine_version=${2:?version required}; shift 2 ;;
     --output) machine_output=${2:?output required}; shift 2 ;;
-    --repository) machine_repository=${2:?repository required}; shift 2 ;;
-    *) printf '%s\n' 'usage: build-release.sh --version VERSION --output DIRECTORY [--repository OWNER/REPO]' >&2; exit 2 ;;
+    *) printf '%s\n' 'usage: build-release.sh --version VERSION --output DIRECTORY' >&2; exit 2 ;;
   esac
 done
-[[ $machine_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || { printf '%s\n' 'version must be semantic version without machine-v' >&2; exit 2; }
-[[ $machine_repository =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || exit 2
+[[ $machine_version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || { printf '%s\n' 'version must be the Runtime semantic version' >&2; exit 2; }
 [[ -n $machine_output ]] || exit 2
 machine_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 mkdir -p -- "$machine_output"
@@ -28,9 +26,8 @@ for machine_arch in amd64 arm64; do
     -o "$machine_output/$machine_name" .
   machine_digest=$(sha256sum "$machine_output/$machine_name")
   machine_digest=${machine_digest%% *}
-  machine_url=https://github.com/$machine_repository/releases/download/machine-v$machine_version/$machine_name
-  machine_manifest=$(jq --arg platform "linux-$machine_arch" --arg url "$machine_url" --arg sha "$machine_digest" \
-    '.platforms[$platform]={url:$url,sha256:$sha}' <<<"$machine_manifest")
+  machine_manifest=$(jq --arg platform "linux-$machine_arch" --arg sha "$machine_digest" \
+    '.platforms[$platform]={sha256:$sha}' <<<"$machine_manifest")
 done
 printf '%s\n' "$machine_manifest" >"$machine_output/machine-agent.json"
 printf '%s\n' "$machine_output/machine-agent.json"

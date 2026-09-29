@@ -54,21 +54,13 @@ The native-kernel x86-64 wheel (glibc 2.28+) also contains the agent. A Python-i
 Linux ARM64 wheel (glibc 2.17+) carries the agent without CUDA kernels. macOS and Windows
 continue to install the portable Python wheel.
 
-Standalone artifacts remain available for existing image and client installers.
-Build a standalone release from committed source with
-`scripts/build-release.sh --version VERSION --output /absolute/output`.
-The private repository's `machine-agent` workflow runs the tests and makes the
-same artifacts on manual dispatch. It does not publish or need a public-repo
-credential. The output contains static Linux amd64/arm64 executables and
-`machine-agent.json` with each platform's immutable public URL and SHA-256.
-
-Publish those exact artifacts to **cozy-creator/cozy**, tag **machine-vVERSION**,
-with `gh release create --latest=false`. Refuse an existing tag; never overwrite
-an artifact or change the CLI's latest release. Only binary artifacts and their
-manifest are public; the build source remains in this private Runtime repository.
-Verify downloaded manifest hashes and `cozy-machine version --json` before
-promotion. Agent and Runtime versions evolve independently through advertised
-capabilities and the supported worker-protocol range.
+The Runtime publisher invokes
+`scripts/build-release.sh --version VERSION --output /absolute/output` from
+committed source. Its static Linux amd64/arm64 executables and local
+`machine-agent.json` hash manifest feed the wheel bundler in that same release.
+The machine-agent workflow runs checks only. There is no separate agent release
+selection or publication path; images and clients obtain the executable from
+the Runtime wheel. Capabilities and worker-protocol ranges determine compatibility.
 
 Rental control authority is refreshed from the owning Hub before every new gRPC
 call, privileged HTTP request, and WebRTC handshake. The worker's latest-attempt
