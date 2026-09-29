@@ -12,8 +12,10 @@ The glibc Linux x86-64 and ARM64 `cozy-runtime` PyPI wheels include the `cozy-ma
 executable. `uv pip install cozy-runtime` installs it alongside the Python commands;
 installation does not start a service. The wheel uses the standard scripts
 installation directory and contains the native executable, with no Python launcher
-or first-run binary download. The portable wheel and source distribution remain
-toolchain-free and do not contain the Linux agent.
+or first-run binary download. The portable wheel has no Linux executable. The
+source distribution includes the tracked Go agent source, module, and dependencies'
+checksums; its default Python build remains toolchain-free and does not compile Go.
+Building the agent from that source is an explicit `go build .` in `machine-agent/`.
 
 The personal controller and Tensorhub both connect to this machine API. A local
 machine uses `COZY_MACHINE_LIFETIME=persistent`, a stable locally generated

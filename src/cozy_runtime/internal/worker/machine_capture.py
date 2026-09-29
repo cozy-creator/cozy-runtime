@@ -19,7 +19,7 @@ from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from . import machine_model_defaults
+from . import machine_model_defaults, machine_model_resolve
 
 if TYPE_CHECKING:
     from .session import Worker
@@ -245,6 +245,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         wire_minor=min(WIRE_MINOR, request.claim.wire_minor),
         runtime_builtin=worker.machine_calls.builtins.capture(),
         account=request.account,
+        hub=machine_model_resolve.hub_key(worker, request.hub),
     ).encode()
 
 

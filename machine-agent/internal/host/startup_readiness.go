@@ -58,18 +58,26 @@ func (m *Machine) commitStartup(p *runtimeProcess, payload []byte) error {
 	return nil
 }
 
-func (m *Machine) rollbackStartup(ctx context.Context) error {
+func (m *Machine) rollbackStartup(ctx context.Context, cause error) error {
+	// The caller owns update admission (and boot may already hold launchMu).
+	// Keep that fence through application handoff or the restored launch/error.
+	// An intentional process replacement exits without releasing this process's fence.
+	defer m.setUpdating(false)
+	detail := cause.Error()
+	fmt.Fprintln(m.log, "cozy machine: rolling back startup candidate:", detail)
 	m.stopRuntime()
-	if _, err := m.launcher.maintain("startup-rollback", nil); err != nil {
-		failure := &launchRefusal{"runtime_update_recovery_required", fmt.Sprintf("candidate failed and offline rollback failed: %v", err)}
+	if _, err := m.launcher.maintain("startup-rollback", []string{detail}); err != nil {
+		failure := &launchRefusal{"runtime_update_recovery_required", fmt.Sprintf("candidate failed: %s; offline rollback failed: %v", detail, err)}
 		m.mu.Lock()
-		m.grant.startupPending, m.inUpdate, m.proc = false, false, nil
+		m.grant.startupPending, m.proc = false, nil
 		m.mu.Unlock()
 		m.restarts.fail(failure)
+		m.finishResumedUpdate("failed", failure.Error())
 		return failure
 	}
+	m.finishResumedUpdate("rolled_back", detail)
 	m.mu.Lock()
-	m.grant.startupPending, m.inUpdate = false, false
+	m.grant.startupPending = false
 	m.mu.Unlock()
 	if err := m.restarts.clear(); err != nil {
 		return err

@@ -164,7 +164,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	m.mu.Unlock()
 	m.setUpdating(m.startupPending())
 	if startupErr == nil && (g.bootstrap == nil || g.bootstrap.Incarnation == "") {
-		if err := m.replaceApplication(); err != nil {
+		if err := m.replaceApplication(startup == "rolled_back"); err != nil {
 			if m.startupPending() {
 				return err
 			} // the stable parent restores the failed candidate
@@ -191,7 +191,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 		m.restarts.fail(&launchRefusal{"runtime_update_recovery_required", startupErr.Error()})
 	} else if err := m.tfs.initStore(ctx); err != nil {
 		if m.startupPending() {
-			if err := m.rollbackStartup(ctx); err != nil {
+			if err := m.rollbackStartup(ctx, err); err != nil {
 				fmt.Fprintln(m.log, "cozy machine: repair required:", err)
 			}
 		} else {
@@ -200,7 +200,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	} else {
 		if err := m.launch(); err != nil {
 			if m.startupPending() && !m.manualUpdateActive() {
-				if err := m.rollbackStartup(ctx); err != nil {
+				if err := m.rollbackStartup(ctx, err); err != nil {
 					fmt.Fprintln(m.log, "cozy machine: repair required:", err)
 				}
 			} else {
@@ -551,7 +551,7 @@ func (m *Machine) supervise(ctx context.Context) error {
 		m.mu.Unlock()
 		if p != nil && p.exited() && !(m.startupPending() && m.manualUpdateActive()) {
 			if m.startupPending() && !m.manualUpdateActive() {
-				if err := m.rollbackStartup(ctx); err != nil {
+				if err := m.rollbackStartup(ctx, fmt.Errorf("candidate Runtime exited before readiness: %s; %s", exitText(p.err), m.restarts.reason())); err != nil {
 					fmt.Fprintln(m.log, "cozy machine: repair required:", err)
 				}
 				continue

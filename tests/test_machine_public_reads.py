@@ -86,7 +86,19 @@ def test_public_reads_keep_legacy_request_collisions_in_their_record_namespace(
         )
         numbers[namespace] = receipt.number
         executions.record(namespace, "same-request", "log", {"value": namespace})
+        # These are historical settled rows, not a new admission beside unfinished
+        # foreign-namespace work (which the current G8 boundary correctly refuses).
+        with workspace.locked() as db:
+            db.execute(
+                "UPDATE executions SET state='canceled',retention_waived=1 WHERE owner=?",
+                (namespace,),
+            )
+            db.execute("UPDATE attempts SET state='released' WHERE owner=?", (namespace,))
     assert len(set(numbers.values())) == len(namespaces)
+    with workspace.locked() as db:
+        # Emulate an existing pre-G8 journal, not current admission authority.
+        db.execute("UPDATE executions SET state='queued',retention_waived=0")
+        db.execute("UPDATE attempts SET state='accepted'")
 
     path = workspace.directory / "journal.sqlite3"
     with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:

@@ -288,6 +288,12 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		runtimeStarting(w, "booting")
 		return
 	}
+	if m.updating() {
+		// A resumed rollback can persist its terminal report before exiting
+		// into the restored application. That report does not release admission.
+		http.Error(w, "software maintenance still owns Runtime admission", http.StatusConflict)
+		return
+	}
 	m.mu.Lock()
 	process, ready := m.proc, m.ready
 	m.mu.Unlock()
@@ -410,7 +416,7 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 	}
 	status.State, status.Error = "rolling_back", err.Error()
 	m.saveUpdate(status)
-	if rollback := m.rollbackStartup(ctx); rollback != nil {
+	if rollback := m.rollbackStartup(ctx, err); rollback != nil {
 		fail("failed", fmt.Errorf("%v; rollback failed: %w", err, rollback))
 		return
 	}

@@ -66,8 +66,13 @@ def sparse_control(tensors: list[Any], output: Any, degree: int, live: int) -> d
     colmean = (q[:, 512:576].float().mean(dim=1) * kc[:, 3].float()).sum(dim=-1)
     colmean *= 128**-0.5 * 1.4426950408889634
     omitted = bool((colmean < threshold[:, 8]).all())
-    while (loaded := attention_sol._ready(live, q.device, 0)) is None:
-        time.sleep(0.2)  # the builder process compiles it
+    attention_sol.specialize(live, q.device, -1)
+    while True:
+        with attention_sol.selected(attention_sol.capture(q.device)):
+            loaded = attention_sol._ready(live, q.device, 0)
+        if loaded is not None:
+            break
+        time.sleep(0.2)  # each qualification probe is a new selection after publication
     all_keys = attention_sol._native(q, k, v, None, live, loaded)
     numerator = (output[:, 512:576].float() - all_keys[:, 512:576].float()).norm()
     denominator = all_keys[:, 512:576].float().norm().clamp_min(1e-30)
@@ -146,6 +151,7 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
                 try:
                     with (
                         torch.no_grad(),
+                        attention_sol.selected(attention_sol.capture(device)),
                         attention_sol.observing() as counts,
                         attention_scope(layout),
                     ):

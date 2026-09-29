@@ -162,6 +162,15 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 	if err != nil {
 		return err
 	}
+	if submit, ok := first.(*pb.MachineExecutionSubmit); ok && submit.Hub != "" {
+		peer, err := pb.NewRuntimePreparationClient(conn).ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
+		if err != nil {
+			return err
+		}
+		if peer.GetWireMinor() < 69 {
+			return status.Error(codes.FailedPrecondition, pb.CapabilityUnavailableCode+": this Runtime cannot preserve captured execution Hub scope; update the Runtime")
+		}
+	}
 	m.claims.forRuntime(first, client.GetWireMinor())
 	desc := &grpc.StreamDesc{ServerStreams: r.method.IsStreamingServer(), ClientStreams: r.method.IsStreamingClient()}
 	out, err := conn.NewStream(ctx, desc, r.target)
