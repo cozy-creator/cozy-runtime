@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 
@@ -16,6 +17,7 @@ class _Entry[T]:
     interests: dict[Hashable, bool] = field(default_factory=dict)
     cancel: threading.Event = field(default_factory=threading.Event)
     started: bool = False
+    paused: bool = False
 
 
 class Preparations[T]:
@@ -28,7 +30,33 @@ class Preparations[T]:
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="machine-prepare")
         self.lock = threading.RLock()
         self.entries: dict[Hashable, _Entry[T]] = {}
+        # Real calls register before their callee environment is available. Their
+        # model selection cannot enter this queue yet, but already has priority.
+        self.demands: dict[Hashable, int] = {}
         self.closed = False
+
+    @contextmanager
+    def demand(self, interest: Hashable) -> Iterator[None]:
+        """Give an awaited call priority through installation and model preparation.
+
+        End this lease when the call is submitted, so hints can overlap its compute.
+        Several calls from one parent retain independent leases.
+        """
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("preparation queue is closed")
+            self.demands[interest] = self.demands.get(interest, 0) + 1
+            self._schedule()
+        try:
+            yield
+        finally:
+            with self.lock:
+                remaining = self.demands.get(interest, 0) - 1
+                if remaining > 0:
+                    self.demands[interest] = remaining
+                else:
+                    self.demands.pop(interest, None)
+                self._schedule()
 
     def request(
         self,
@@ -44,7 +72,7 @@ class Preparations[T]:
             if self.closed:
                 raise RuntimeError("preparation queue is closed")
             entry = self.entries.get(key)
-            if entry is not None and entry.cancel.is_set():
+            if entry is not None and entry.cancel.is_set() and not entry.paused:
                 # Its last consumer left. Await its native cancellation before replacing
                 # the transfer, so the same bytes never acquire two writers.
                 if not entry.future.done():
@@ -75,9 +103,11 @@ class Preparations[T]:
 
     def retain(self, active: Callable[[Hashable], bool]) -> None:
         with self.lock:
+            self.demands = {k: v for k, v in self.demands.items() if active(k)}
             for key, entry in list(self.entries.items()):
                 entry.interests = {k: v for k, v in entry.interests.items() if active(k)}
                 if not entry.interests:
+                    entry.paused = False  # abandoned work must not restart
                     entry.cancel.set()
                     entry.stop()
                     if not entry.started:
@@ -100,6 +130,15 @@ class Preparations[T]:
         if self.closed:
             return
         running = [e for e in self.entries.values() if e.started and not e.future.done()]
+        demand = bool(self.demands) or any(
+            any(e.interests.values()) and not e.future.done() for e in self.entries.values()
+        )
+        if demand:
+            for entry in running:
+                if not any(entry.interests.values()) and not entry.cancel.is_set():
+                    entry.paused = True
+                    entry.cancel.set()
+                    entry.stop()
         candidates = sorted(
             (e for e in self.entries.values() if not e.started and not e.future.done()),
             key=lambda e: not any(e.interests.values()),
@@ -107,8 +146,8 @@ class Preparations[T]:
         for entry in candidates:
             if len(running) >= 2:
                 break
-            if not any(entry.interests.values()) and any(
-                not any(e.interests.values()) for e in running
+            if not any(entry.interests.values()) and (
+                demand or any(not any(e.interests.values()) for e in running)
             ):
                 continue
             entry.started = True
@@ -119,7 +158,15 @@ class Preparations[T]:
         try:
             result = entry.load(entry.cancel.is_set)
         except BaseException as exc:
-            entry.future.set_exception(exc)
+            with self.lock:
+                if entry.paused and entry.interests and not self.closed:
+                    # Keep one shared result, and do not overlap the canceled transfer
+                    # with its replacement. The loader has finished releasing its holds.
+                    entry.started = False
+                    entry.paused = False
+                    entry.cancel = threading.Event()
+                else:
+                    entry.future.set_exception(exc)
         else:
             entry.future.set_result(result)
         finally:
