@@ -242,10 +242,13 @@ def test_source_archive_publishes_agent_without_requiring_go(
     assert result.returncode == 0, result.stderr
     (sdist,) = out.glob("*.tar.gz")
     tracked = run("git", "ls-files", "machine-agent", cwd=repo).stdout.splitlines()
-    required = {
-        name for name in tracked if name.endswith(".go") or Path(name).name in {"go.mod", "go.sum"}
-    }
-    assert {"machine-agent/go.mod", "machine-agent/go.sum", "machine-agent/main.go"} <= required
+    required = set(tracked)
+    assert {
+        "machine-agent/go.mod",
+        "machine-agent/go.sum",
+        "machine-agent/main.go",
+        "machine-agent/internal/host/public_read.py",
+    } <= required
     with tarfile.open(sdist) as archive:
         files = {member.name.split("/", 1)[1]: member for member in archive if member.isfile()}
         assert required <= files.keys()
