@@ -541,10 +541,12 @@ class Executor:
         output = Path(command.output)
         if not command.distribution or not output.is_absolute():
             return {"ok": False, "code": "package_prepare_path_invalid", "detail": "paths"}
+        # Worker supervises this executor by observed progress and death. An import
+        # slowed by host pressure is not a package conformance failure after 60 seconds.
         discovered = (
-            discover_installed(command.application)
+            discover_installed(command.application, seconds=None)
             if command.application
-            else discover_distribution(command.distribution)
+            else discover_distribution(command.distribution, seconds=None)
         )
         body = package_interface.build(discovered)
         raw = package_interface.canonical_bytes(body)
