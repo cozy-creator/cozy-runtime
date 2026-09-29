@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author._activity import Activity, EventLoop
+from cozy_runtime.author import ThreadPoolExecutor as SDKThreadPoolExecutor
+from cozy_runtime.author._activity import Activity, EventLoop, observing
 from cozy_runtime.internal.worker.run_timing import Timing
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Calls
@@ -106,6 +107,93 @@ def test_canceled_pool_submission_cannot_hide_an_untracked_thread() -> None:
     finally:
         loop.close()
         activity.change(-1)
+
+
+def test_sdk_pool_preserves_initializer_cancellation_and_reuse_without_idle_execution() -> None:
+    local = threading.local()
+    initialized: list[int] = []
+
+    def initialize(value: int) -> None:
+        local.value = value
+        initialized.append(value)
+
+    with SDKThreadPoolExecutor(max_workers=1, initializer=initialize, initargs=(37,)) as pool:
+        assert pool.submit(lambda: local.value).result() == 37  # outside an invocation
+        with observing(None) as initial:
+            release = threading.Event()
+            first = pool.submit(release.wait)
+            canceled = pool.submit(lambda: 99)
+            assert canceled.cancel()
+            release.set()
+            assert first.result()
+            assert not initial.submitted
+        for _ in range(2):
+            observed: list[tuple[float, bool, bool, bool]] = []
+
+            def collect(
+                _seq: int,
+                active: bool,
+                known: bool,
+                done: bool,
+                rows: list[tuple[float, bool, bool, bool]] = observed,
+            ) -> None:
+                rows.append((time.monotonic(), active, known, done))
+
+            with observing(collect) as activity:
+                loop = EventLoop(activity)
+
+                def work() -> int:
+                    time.sleep(0.04)
+                    return int(local.value)
+
+                async def invoke(loop: EventLoop = loop) -> None:
+                    assert await asyncio.wrap_future(pool.submit(work)) == 37
+                    await asyncio.sleep(0.12)  # the persistent pool is idle here
+                    assert await loop.run_in_executor(pool, work) == 37
+
+                try:
+                    loop.run_until_complete(invoke())
+                finally:
+                    loop.close()
+            assert all(known for _, _, known, _ in observed)
+            assert observed[-1][1:] == (False, True, True)
+            measured = sum(b[0] - a[0] for a, b in itertools.pairwise(observed) if a[1])
+            assert 0.07 <= measured < 0.16, (measured, observed)
+            assert pool.submit(lambda: local.value).result() == 37
+        assert initialized == [37]
+
+
+@pytest.mark.parametrize("escaped", [False, True])
+def test_joined_helpers_are_covered_by_their_owned_callback_but_escaped_work_is_unknown(
+    escaped: bool,
+) -> None:
+    raw_release = threading.Event()
+    raw_threads: list[threading.Thread] = []
+    with SDKThreadPoolExecutor(max_workers=1) as pool:
+        with observing(None) as activity:
+            loop = EventLoop(activity)
+
+            def work() -> None:
+                raw = threading.Thread(target=raw_release.wait)
+                raw_threads.append(raw)
+                raw.start()
+                time.sleep(0.04)
+                if not escaped:
+                    raw_release.set()
+                    raw.join()
+
+            async def invoke() -> None:
+                await asyncio.wrap_future(pool.submit(work))
+                await asyncio.sleep(0.02)
+
+            try:
+                loop.run_until_complete(invoke())
+            finally:
+                raw_release.set()
+                for raw in raw_threads:
+                    raw.join()
+                loop.close()
+        assert activity.known is (not escaped)
 
 
 def test_run_timing_unions_nested_work_and_keeps_one_cumulative_snapshot(tmp_path: Path) -> None:
@@ -325,28 +413,44 @@ def test_real_worker_nested_child_wait_is_not_run_execution(
     if runtime:
         monkeypatch.setattr(fixture, "package", functools.partial(fixture.package, runtime=runtime))
     entered, gate = tmp_path / "entered", tmp_path / "gate"
+    pool = (
+        "pool = None"
+        if runtime
+        else (
+            "from cozy_runtime.author import ThreadPoolExecutor\n"
+            "pool = ThreadPoolExecutor(max_workers=1)"
+        )
+    )
     source = f"""import asyncio, time, msgspec, importlib.metadata, json
 from pathlib import Path
 from cozy_runtime.author import App, Context, Telemetry, invocable
 from cozy_runtime.author._invoke import Invocation
+{pool}
 app=App()
 class Request(msgspec.Struct):
     pass
 class Result(msgspec.Struct):
     value: int
+def work(milliseconds):
+    start, value = time.monotonic(), 3
+    while (time.monotonic() - start) * 1000 < milliseconds:
+        value = (value * 17 + 11) % 1000003
+    return value
 @invocable
 async def leaf(ctx: Context, tel: Telemetry, *, n: int) -> Result:
-    Path({str(entered)!r}).write_text(json.dumps({{
+    background = pool.submit(work, 100) if pool is not None else None
+    metadata = Path({str(entered)!r}).with_suffix(".writing")
+    metadata.write_text(json.dumps({{
         "runtime": importlib.metadata.version("cozy-runtime"),
         "activity": "activity" in Invocation.__dataclass_fields__,
     }}))
+    metadata.replace({str(entered)!r})
     tel.progress(0.25, stage="Ready")
     while not Path({str(gate)!r}).exists():
         await asyncio.sleep(0.01)
-    start = time.monotonic()
-    value = n
-    while time.monotonic() - start < 0.15:
-        value = (value * 17 + 11) % 1000003
+    value = work(150)
+    if background is not None:
+        value += background.result()
     return Result(value)
 app.job(leaf)
 @app.job

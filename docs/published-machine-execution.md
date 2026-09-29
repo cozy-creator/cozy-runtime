@@ -51,3 +51,12 @@ independent work on those pre-existing threads is outside this cooperative measu
 Windows and custom loop policies retain their normal execution behavior. The client
 must not replace unknown execution with admission-to-outcome wall time or advance a
 stale snapshot using its own clock. Timing failures cannot fail accepted execution.
+
+Authors that keep their own background pools can import `ThreadPoolExecutor` from
+`cozy_runtime.author`. It preserves the standard executor's constructor, futures,
+cancellation, initializer, and shutdown behavior. Each submission captures its current
+invocation for timing; only executing callbacks count, so an idle pool can survive many
+calls without adding wait time. Submissions outside an invocation remain ordinary work.
+`asyncio.to_thread` and `run_in_executor` participate automatically. A joined helper
+thread nested inside tracked work is covered by that work's interval; a raw thread that
+continues after its tracked caller becomes idle makes the measurement unknown.

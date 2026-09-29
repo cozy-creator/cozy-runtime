@@ -11,15 +11,43 @@ import contextlib
 import functools
 import selectors
 import threading
-from collections.abc import Callable
-from concurrent.futures import Executor, ThreadPoolExecutor
-from typing import Any, cast
+import weakref
+from collections.abc import Callable, Iterator
+from concurrent.futures import Executor, Future
+from concurrent.futures import ThreadPoolExecutor as PythonThreadPoolExecutor
+from contextvars import ContextVar
+from typing import Any
 
-_INFRASTRUCTURE_THREADS = set(threading.enumerate())
+_REGISTRY_LOCK = threading.Lock()
+_BASELINE: weakref.WeakSet[threading.Thread] | None = None
+_POOL_THREADS: weakref.WeakSet[threading.Thread] = weakref.WeakSet()
+_CURRENT: ContextVar[Activity | None] = ContextVar("cozy_executor_activity", default=None)
+
+
+def _owned[T](call: Callable[[], T]) -> T:
+    with _REGISTRY_LOCK:
+        _POOL_THREADS.add(threading.current_thread())
+    return call()
+
+
+@contextlib.contextmanager
+def observing(emit: Callable[[int, bool, bool, bool], None] | None) -> Iterator[Activity]:
+    activity = Activity(emit)
+    token = _CURRENT.set(activity)
+    activity.change(1)
+    try:
+        yield activity
+    finally:
+        activity.change(-1, finished=True)
+        _CURRENT.reset(token)
 
 
 class Activity:
     def __init__(self, emit: Callable[[int, bool, bool, bool], None] | None) -> None:
+        global _BASELINE
+        with _REGISTRY_LOCK:
+            if _BASELINE is None:
+                _BASELINE = weakref.WeakSet(threading.enumerate())
         self.emit = emit
         self.lock = threading.RLock()
         self.count = 0
@@ -27,8 +55,6 @@ class Activity:
         self.known = True
         self.active = False
         self.finished = False
-        self.baseline = _INFRASTRUCTURE_THREADS
-        self.managed: set[threading.Thread] = set()
         self.submitted: set[object] = set()
         self.unowned: set[threading.Thread] = set()
 
@@ -37,8 +63,11 @@ class Activity:
             if self.finished:
                 return
             self.count += delta
-            if finished:
-                self.unowned.update(set(threading.enumerate()) - self.baseline - self.managed)
+            if self.count == 0 or finished:
+                # A joined helper inside an active callback cannot extend the
+                # measured union. Only uncovered thread work makes it unknown.
+                self.unowned.update(self._outside_threads())
+                unknown |= not self.submitted and bool(self.unowned)
             known = (
                 self.known
                 and not unknown
@@ -57,23 +86,29 @@ class Activity:
                     self.emit(self.sequence, active, known, finished)
 
     def threaded(self, ticket: object, function: Callable[..., Any], *args: Any) -> Any:
+        with _REGISTRY_LOCK:
+            _POOL_THREADS.add(threading.current_thread())
         with self.lock:
-            self.managed.add(threading.current_thread())
             self.unowned.discard(threading.current_thread())
             self.submitted.discard(ticket)
             unknown = not self.submitted and bool(self.unowned)
         self.change(1, unknown=unknown)
+        token = _CURRENT.set(self)
         try:
             return function(*args)
         finally:
+            _CURRENT.reset(token)
             self.change(-1)
 
-    def untracked_threads(self) -> bool:
+    def _outside_threads(self) -> set[threading.Thread]:
+        with _REGISTRY_LOCK:
+            return set(threading.enumerate()) - set(_BASELINE or ()) - set(_POOL_THREADS)
+
+    def preparing[T](self, function: Callable[[], T]) -> tuple[Callable[[], T], object]:
+        ticket = object()
         with self.lock:
-            # A newly submitted pool thread can appear in enumerate() just before
-            # its wrapper registers itself. It is not an unowned author thread.
-            self.unowned.update(set(threading.enumerate()) - self.baseline - self.managed)
-            return not self.submitted and bool(self.unowned)
+            self.submitted.add(ticket)
+        return functools.partial(self.threaded, ticket, function), ticket
 
     def retired(self, ticket: object) -> None:
         with self.lock:
@@ -90,7 +125,7 @@ class _Selector(selectors.DefaultSelector):
     def select(self, timeout: float | None = None) -> Any:
         if timeout == 0:
             return super().select(timeout)
-        self.activity.change(-1, unknown=self.activity.untracked_threads())
+        self.activity.change(-1)
         try:
             return super().select(timeout)
         finally:
@@ -105,16 +140,18 @@ class EventLoop(asyncio.SelectorEventLoop):
     def run_in_executor[*Ts, T](
         self, executor: Executor | None, func: Callable[[*Ts], T], *args: *Ts
     ) -> asyncio.Future[T]:
-        if executor is None or isinstance(executor, ThreadPoolExecutor):
-            ticket = object()
-            func = cast(Callable[[*Ts], T], functools.partial(self.activity.threaded, ticket, func))
-            with self.activity.lock:
-                self.activity.submitted.add(ticket)
+        if executor is None or isinstance(executor, PythonThreadPoolExecutor):
+            call, ticket = self.activity.preparing(functools.partial(func, *args))
+            # The SDK pool captures context too. This submission is already observed
+            # here, so its normal submit path must not count the same callback twice.
+            token = _CURRENT.set(None)
             try:
-                result = super().run_in_executor(executor, func, *args)
+                result = super().run_in_executor(executor, call)
             except BaseException:
                 self.activity.retired(ticket)
                 raise
+            finally:
+                _CURRENT.reset(token)
             result.add_done_callback(lambda _: self.activity.retired(ticket))
             return result
         else:
@@ -122,3 +159,26 @@ class EventLoop(asyncio.SelectorEventLoop):
             # but an idle event loop cannot describe their execution duration.
             self.activity.change(0, unknown=True)
         return super().run_in_executor(executor, func, *args)
+
+
+class ThreadPoolExecutor(PythonThreadPoolExecutor):
+    """Standard thread pool whose submitted work participates in run timing.
+
+    Only executing callbacks count; queued futures and idle pool threads do not.
+    Attribution is captured per submission, so pools can survive and serve many
+    invocations. Outside an invocation this behaves like the standard executor.
+    """
+
+    def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+        activity = _CURRENT.get()
+        call = functools.partial(fn, *args, **kwargs)
+        if activity is None:
+            return super().submit(_owned, call)
+        observed, ticket = activity.preparing(call)
+        try:
+            future = super().submit(observed)
+        except BaseException:
+            activity.retired(ticket)
+            raise
+        future.add_done_callback(lambda _: activity.retired(ticket))
+        return future

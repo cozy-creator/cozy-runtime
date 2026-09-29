@@ -956,46 +956,41 @@ def _call(
     is synchronous, so law 8's one-active-GPU-attempt rule is unchanged by the spelling.
     A granted destination receives the returned Models before the attempt closes.
     """
-    from cozy_runtime.author._activity import Activity, EventLoop
+    from cozy_runtime.author._activity import EventLoop, observing
 
-    activity = Activity(activity_sink)
-    activity.change(1)
-    if not surface.is_async and not publish_to:
-        try:
+    with observing(activity_sink) as activity:
+        if not surface.is_async and not publish_to:
             return surface.fn(**kwargs)
-        finally:
-            activity.change(-1, finished=True)
-    # Keep nonstandard policies (including Windows' Proactor subprocess support)
-    # intact. Unsupported observation is unknown; it never changes valid execution.
-    loop: asyncio.AbstractEventLoop
-    if type(asyncio.get_event_loop_policy()) is asyncio.DefaultEventLoopPolicy and hasattr(
-        selectors, "EpollSelector"
-    ):
-        try:
-            loop = EventLoop(activity)
-        except Exception:
+        # Keep nonstandard policies (including Windows' Proactor subprocess support)
+        # intact. Unsupported observation is unknown; it never changes valid execution.
+        loop: asyncio.AbstractEventLoop
+        if type(asyncio.get_event_loop_policy()) is asyncio.DefaultEventLoopPolicy and hasattr(
+            selectors, "EpollSelector"
+        ):
+            try:
+                loop = EventLoop(activity)
+            except Exception:
+                activity.change(0, unknown=True)
+                loop = asyncio.new_event_loop()
+        else:
             activity.change(0, unknown=True)
             loop = asyncio.new_event_loop()
-    else:
-        activity.change(0, unknown=True)
-        loop = asyncio.new_event_loop()
-    try:
-        if surface.is_async:
-            coroutine = surface.fn(**kwargs)
-            assert asyncio.iscoroutine(coroutine)
-        else:
-            coroutine = _returned(surface.fn(**kwargs))
-        return loop.run_until_complete(_published(coroutine, publish_to))
-    finally:
-        if (broker := _current.get()) is not None:
-            broker.closed = True
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-        if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        loop.close()
-        activity.change(-1, finished=True)
+        try:
+            if surface.is_async:
+                coroutine = surface.fn(**kwargs)
+                assert asyncio.iscoroutine(coroutine)
+            else:
+                coroutine = _returned(surface.fn(**kwargs))
+            return loop.run_until_complete(_published(coroutine, publish_to))
+        finally:
+            if (broker := _current.get()) is not None:
+                broker.closed = True
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
 
 
 async def _returned(value: object) -> object:
