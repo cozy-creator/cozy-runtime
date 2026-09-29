@@ -98,8 +98,9 @@ its policy and entry changes with the wheel installation; rollback restores only
 its own changes and preserves later operator edits. Explicit agent selection
 retains the exact running application binary; bundled selection uses the candidate
 Runtime wheel. The client never rewrites this policy or entry after server commit.
-Rentals may update before first use; any accepted work pins software for every
-later restart and retry, even after all work has been collected.
+Automatic rental updates stop after any accepted work, including after collection,
+so ordinary restarts and retries retain software. Explicit owner maintenance may
+update a used rental once Runtime-owned quiescence is proven.
 
 The existing machine and Runtime-root locks protect admission. The Runtime-owned
 software-update view applies retention rules across all owners, child attempts,
