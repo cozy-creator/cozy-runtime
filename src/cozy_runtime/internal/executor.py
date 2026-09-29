@@ -3492,6 +3492,7 @@ class Executor:
                 }
                 for row in (envelope.adjustments if envelope else ())
             ],
+            "ignored": list(record.ignored),
             "oversize_result_bytes": oversize,
             "metrics": {
                 "handler_ms": round(handler_ms, 3),
@@ -4043,6 +4044,7 @@ class Executor:
             "result_ref": result_ref,
             "result_schema_digest": self._result_schema_digest(surface),
             "adjustments": [],
+            "ignored": list(record.ignored),
             "oversize_result_bytes": oversize,
             "metrics": {
                 "handler_ms": round(handler_ms, 3),
