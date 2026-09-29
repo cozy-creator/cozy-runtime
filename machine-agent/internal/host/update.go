@@ -385,18 +385,7 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		owned := m.updates.active == request.Operation
 		m.updates.mu.Unlock()
 		if owned {
-			// Persist the terminal request before deleting the only prepared candidate.
-			// Observation still publishes terminal status only after cleanup completes.
-			if err := m.writeUpdate(status); err != nil {
-				m.setUpdating(false)
-				return
-			}
-			if status.terminal() {
-				_, _ = m.launcher.maintain("update-cleanup", []string{request.Operation})
-			}
-			if err := os.RemoveAll(m.stagePath()); err != nil {
-				fmt.Fprintln(m.log, "cozy machine: cannot remove completed update files:", err)
-			}
+			m.completeUpdateFiles(status)
 			m.setUpdating(false)
 			m.updates.mu.Lock()
 			m.updates.status, m.updates.active = &status, ""
@@ -430,6 +419,7 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		}
 	}
 	payload, _ := json.Marshal(pairTransaction{Operation: request.Operation, Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned, Agent: request.Agent})
+	legacyGuardian := false
 	if status.State != "waiting_activation" {
 		status.State = "preparing"
 		if err := m.saveUpdate(status); err != nil {
@@ -437,22 +427,33 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 			return
 		}
 		if _, err := m.launcher.maintain("update-stage", []string{string(payload)}); err != nil {
-			fail("failed", err)
-			return
+			if err.Error() != `unknown maintenance op "update-stage"` {
+				fail("failed", err)
+				return
+			}
+			// The stable guardian can outlive the application that requested this
+			// update. Older guardians safely prepare only after guarded shutdown.
+			legacyGuardian = true
+			payload, _ = json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned, Agent: request.Agent})
 		}
 	}
 	waiting := func() error {
-		if status.State == "waiting_activation" {
+		phase := "waiting_activation"
+		if legacyGuardian {
+			phase = "waiting"
+			status.Error = "this machine bootstrap prepares updates only after work drains; active preparation and paused activation require replacing its service or image bootstrap"
+		}
+		if status.State == phase {
 			return nil
 		}
-		status.State = "waiting_activation"
+		status.State = phase
 		return m.saveUpdate(status)
 	}
 	if err := m.quiesce(ctx, waiting); err != nil {
 		fail("failed", err)
 		return
 	}
-	status.State = "installing"
+	status.State, status.Error = "installing", ""
 	if err := m.saveUpdate(status); err != nil {
 		fail("failed", err)
 		if launchErr := m.launch(); launchErr != nil {
@@ -515,6 +516,28 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 	fail("rolled_back", err)
 }
 
+// Both the original request plane and its replacement retain completion ownership
+// until terminal status is durable. The caller holds staging through publication.
+func (m *Machine) completeUpdateFiles(status updateStatus) {
+	for delay := time.Second; ; delay = min(2*delay, 10*time.Second) {
+		if err := m.writeUpdate(status); err != nil {
+			fmt.Fprintln(m.log, "cozy machine: cannot persist completed update; retaining its candidate and retrying:", err)
+			m.updates.mu.Lock()
+			observed := *m.updates.status
+			observed.Error = "cannot persist completed update; retaining its candidate and retrying: " + err.Error()
+			m.updates.status = &observed
+			m.updates.mu.Unlock()
+			time.Sleep(delay)
+			continue
+		}
+		break
+	}
+	_, _ = m.launcher.maintain("update-cleanup", []string{status.Operation})
+	if err := os.RemoveAll(m.stagePath()); err != nil {
+		fmt.Fprintln(m.log, "cozy machine: cannot remove completed update files:", err)
+	}
+}
+
 // quiesce holds the machine for the update once its Runtime accepts a guarded restart. A busy
 // Runtime is asked again; running work is never interrupted.
 func (m *Machine) quiesce(ctx context.Context, onWaiting ...func() error) error {
@@ -525,6 +548,7 @@ func (m *Machine) quiesce(ctx context.Context, onWaiting ...func() error) error 
 		return nil
 	}
 	wait := time.Second
+	recovered := false
 	for {
 		m.launchMu.Lock()
 		m.setUpdating(true)
@@ -542,6 +566,36 @@ func (m *Machine) quiesce(ctx context.Context, onWaiting ...func() error) error 
 			case <-time.After(wait):
 			}
 			continue
+		}
+		if process == nil || process.exited() {
+			// A stopped PID does not prove its accepted work or descendants have
+			// settled. Let the installed Runtime recover its journal and establish
+			// a fresh guarded verdict before changing software under retained work.
+			raw, err := m.launcher.maintain("software-state", nil)
+			var state softwareState
+			if err == nil {
+				err = json.Unmarshal([]byte(raw), &state)
+			}
+			if err != nil {
+				m.launchMu.Unlock()
+				return fmt.Errorf("cannot establish retained Runtime work before activation: %w", err)
+			}
+			if !state.Quiescent {
+				if recovered {
+					m.launchMu.Unlock()
+					return errors.New("the installed Runtime exited while recovering retained work; repair its startup before activating the candidate")
+				}
+				if err := m.launch(); err != nil {
+					m.launchMu.Unlock()
+					return fmt.Errorf("cannot recover the installed Runtime's retained work before activation: %w", err)
+				}
+				recovered = true
+				m.launchMu.Unlock()
+				if err := waiting(); err != nil {
+					return err
+				}
+				continue
+			}
 		}
 		if process != nil && !process.exited() {
 			select {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -173,5 +174,49 @@ func TestResumedExitBeforeCommitStillRollsBack(t *testing.T) {
 	m.updates.mu.Unlock()
 	if launcher.rollbacks.Load() != 1 || result.State != "failed" || !strings.Contains(result.Error, "offline rollback failed") {
 		t.Fatalf("uncommitted resumed exit did not attempt rollback: count=%d status=%+v", launcher.rollbacks.Load(), result)
+	}
+}
+
+func TestResumedCompletionRetriesPersistenceBeforeReadinessAndCleanup(t *testing.T) {
+	m, launcher, _, _ := resumedCompletionMachine(t, true)
+	log := &completionRetryLog{failed: make(chan struct{})}
+	m.log = log
+	if err := os.Mkdir(m.updatePath(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(m.updatePath())
+	if err := os.MkdirAll(m.stagePath(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.launch(); err != nil {
+		t.Fatal(err)
+	}
+	defer launcher.process.stop()
+	awaitCompletionSignal(t, launcher.committed, "candidate did not reach private commit")
+	close(launcher.release)
+	awaitCompletionSignal(t, log.failed, "resumed completion did not observe its persistence failure")
+	if !m.updating() || launcher.cleanups.Load() != 0 {
+		t.Fatal("undurable resumed completion released admission or removed the candidate")
+	}
+	select {
+	case <-m.ready:
+		t.Fatal("resumed readiness preceded durable completion")
+	default:
+	}
+	if _, err := os.Stat(m.stagePath()); err != nil {
+		t.Fatal("resumed completion lost staging before status persisted", err)
+	}
+	if err := os.Remove(m.updatePath()); err != nil {
+		t.Fatal(err)
+	}
+	awaitCompletionSignal(t, launcher.process.claimDone, "resumed persistence did not recover without another restart")
+	if m.updating() || m.grant.bootstrap.Pending || launcher.cleanups.Load() != 1 {
+		t.Fatalf("resumed completion did not settle once: updating=%v pending=%v cleanups=%d", m.updating(), m.grant.bootstrap.Pending, launcher.cleanups.Load())
+	}
+	m.updates.mu.Lock()
+	result := *m.updates.status
+	m.updates.mu.Unlock()
+	if result.State != "succeeded" {
+		t.Fatalf("resumed completion lost its committed result: %+v", result)
 	}
 }

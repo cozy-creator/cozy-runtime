@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -99,18 +98,18 @@ func (m *Machine) finishResumedUpdate(state, detail string) {
 	if m.grant.bootstrap == nil || !m.grant.bootstrap.Pending {
 		return
 	}
-	m.grant.bootstrap.Pending = false
 	m.updates.staging.Lock()
 	defer m.updates.staging.Unlock()
 	m.updates.mu.Lock()
 	current := m.updates.status
 	m.updates.mu.Unlock()
 	if current != nil && !current.terminal() {
-		if err := os.RemoveAll(m.stagePath()); err != nil {
-			fmt.Fprintln(m.log, "cozy machine: update cleanup:", err)
-		}
 		status := *current
 		status.State, status.Error = state, detail
-		m.saveUpdate(status)
+		m.completeUpdateFiles(status)
+		m.updates.mu.Lock()
+		m.updates.status, m.updates.active = &status, ""
+		m.updates.mu.Unlock()
 	}
+	m.grant.bootstrap.Pending = false
 }
