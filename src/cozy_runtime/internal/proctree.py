@@ -96,6 +96,17 @@ class ProcessTreeScope:
     uid: int
 
 
+@dataclass(frozen=True, slots=True)
+class HostPressure:
+    """One measured cgroup pressure fact with bounded inactive-file coverage."""
+
+    scope: str
+    current_bytes: int
+    limit_bytes: int
+    debt_bytes: int
+    reclaimable_file_bytes: int = 0
+
+
 ExecutorScope = CgroupScope | ProcessTreeScope
 
 _PROCESS_SCOPE_TOKEN_BYTES = 32
@@ -1394,3 +1405,105 @@ def available_host_bytes() -> int:
     except (ContainmentUnavailable, OSError, StopIteration, ValueError):
         pass
     return physical
+
+
+def host_pressure() -> HostPressure | None:
+    """Read cgroup pressure after excluding bounded inactive file cache.
+
+    The returned debt is the largest ``max(0, current - bounded inactive_file - limit)``
+    across this process's cgroup ancestors.  ``limit`` is the minimum finite v2
+    ``memory.high``/``memory.max``; v1 uses ``memory.limit_in_bytes``.  Very large finite
+    limits naturally produce zero debt.  Any unreadable finite fact refuses the observation
+    rather than
+    turning uncertainty into permission to reclaim or allocate.
+    """
+    _linux_only("host_pressure")
+
+    def finite(text: str) -> int | None:
+        value = text.strip().lower()
+        if value == "max":
+            return None
+        limit = int(value)
+        if limit < 0:
+            raise ValueError("invalid cgroup memory limit")
+        return limit
+
+    facts: list[HostPressure] = []
+
+    def read_v2(directory: Path) -> None:
+        limits: list[int] = []
+        for name in ("memory.high", "memory.max"):
+            path = directory / name
+            if path.is_file():
+                limit = finite(path.read_text())
+                if limit is not None:
+                    limits.append(limit)
+        if not limits:
+            return
+        limit = min(limits)
+        current = int((directory / "memory.current").read_text().strip())
+        if current < 0:
+            raise ValueError("invalid cgroup memory current")
+        stats = dict(line.split() for line in (directory / "memory.stat").read_text().splitlines())
+        inactive = max(0, min(current, int(stats.get("inactive_file", "0"))))
+        facts.append(
+            HostPressure(
+                str(directory),
+                current,
+                limit,
+                max(current - inactive - limit, 0),
+                inactive,
+            )
+        )
+
+    def read_v1(directory: Path) -> None:
+        limit = finite((directory / "memory.limit_in_bytes").read_text())
+        if limit is None:
+            return
+        current = int((directory / "memory.usage_in_bytes").read_text().strip())
+        if current < 0:
+            raise ValueError("invalid cgroup memory usage")
+        stats = dict(line.split() for line in (directory / "memory.stat").read_text().splitlines())
+        inactive = max(0, min(current, int(stats.get("total_inactive_file", "0"))))
+        facts.append(
+            HostPressure(
+                str(directory),
+                current,
+                limit,
+                max(current - inactive - limit, 0),
+                inactive,
+            )
+        )
+
+    try:
+        if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
+            relative = next(
+                line.split("::", 1)[1]
+                for line in Path("/proc/self/cgroup").read_text().splitlines()
+                if line.startswith("0::")
+            )
+            mount = Path("/sys/fs/cgroup")
+            cgroup = mount / relative.lstrip("/")
+            while cgroup.is_relative_to(mount):
+                read_v2(cgroup)
+                if cgroup == mount:
+                    break
+                cgroup = cgroup.parent
+        else:
+            cgroup = _cgroup_v1_controller_path("memory")
+            mounts = tuple(
+                mount
+                for mount in _cgroup_v1_mounts()
+                if "memory" in mount.controllers and cgroup.is_relative_to(mount.target)
+            )
+            if len(mounts) != 1:
+                raise ContainmentUnavailable("memory cgroup path has no unique v1 mount")
+            v1_mount = mounts[0]
+            while cgroup.is_relative_to(v1_mount.target):
+                read_v1(cgroup)
+                if cgroup == v1_mount.target:
+                    break
+                cgroup = cgroup.parent
+    except (ContainmentUnavailable, OSError, StopIteration, IndexError, ValueError):
+        return None
+    return max(facts, key=lambda fact: fact.debt_bytes, default=None)

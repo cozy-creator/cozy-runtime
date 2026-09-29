@@ -2,10 +2,257 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, RLock
+from time import monotonic, sleep
 
 import pytest
 
 from cozy_runtime.internal import memory, proctree
+
+
+def test_host_pressure_excludes_bounded_inactive_file_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = {
+        "/proc/self/cgroup": "0::/parent/child\n",
+        "/sys/fs/cgroup/parent/child/memory.current": "1100",
+        "/sys/fs/cgroup/parent/child/memory.high": "1000",
+        "/sys/fs/cgroup/parent/child/memory.max": "2000",
+        "/sys/fs/cgroup/parent/child/memory.stat": "inactive_file 200\n",
+        "/sys/fs/cgroup/parent/memory.current": "1300",
+        "/sys/fs/cgroup/parent/memory.high": "1000",
+        "/sys/fs/cgroup/parent/memory.max": "2000",
+        "/sys/fs/cgroup/parent/memory.stat": "inactive_file 100\n",
+        "/sys/fs/cgroup/memory.current": "1300",
+        "/sys/fs/cgroup/memory.high": "max",
+        "/sys/fs/cgroup/memory.max": "max",
+        "/sys/fs/cgroup/memory.stat": "inactive_file 0\n",
+    }
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda path: str(path) == "/sys/fs/cgroup/cgroup.controllers" or str(path) in files,
+    )
+    monkeypatch.setattr(Path, "read_text", lambda path: files[str(path)])
+    pressure = proctree.host_pressure()
+    assert pressure is not None
+    assert pressure.scope.endswith("/parent")
+    assert pressure.current_bytes == 1300
+    assert pressure.limit_bytes == 1000
+    assert pressure.reclaimable_file_bytes == 100
+    assert pressure.debt_bytes == 200
+
+
+def test_host_pressure_v1_max_sentinel_is_unbounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    files = {
+        "/proc/self/cgroup": "7:memory:/parent/child\n",
+        "/sys/fs/cgroup/memory/parent/child/memory.usage_in_bytes": "1300",
+        "/sys/fs/cgroup/memory/parent/child/memory.limit_in_bytes": str(1 << 60),
+        "/sys/fs/cgroup/memory/parent/child/memory.stat": "total_inactive_file 0\n",
+        "/sys/fs/cgroup/memory/parent/memory.usage_in_bytes": "1300",
+        "/sys/fs/cgroup/memory/parent/memory.limit_in_bytes": "1000",
+        "/sys/fs/cgroup/memory/parent/memory.stat": "total_inactive_file 100\n",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes": "1300",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes": str(1 << 60),
+        "/sys/fs/cgroup/memory/memory.stat": "total_inactive_file 0\n",
+    }
+    mount = proctree._CgroupMount(Path("/"), Path("/sys/fs/cgroup/memory"), frozenset({"memory"}))
+    monkeypatch.setattr(Path, "is_file", lambda _: False)
+    monkeypatch.setattr(Path, "read_text", lambda path: files[str(path)])
+    monkeypatch.setattr(
+        proctree,
+        "_cgroup_v1_controller_path",
+        lambda _: Path("/sys/fs/cgroup/memory/parent/child"),
+    )
+    monkeypatch.setattr(proctree, "_cgroup_v1_mounts", lambda: (mount,))
+    pressure = proctree.host_pressure()
+    assert pressure is not None
+    assert pressure.scope.endswith("/parent")
+    assert pressure.debt_bytes == 200
+
+
+def test_unlimited_ancestor_without_counters_does_not_hide_child_debt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = {
+        "/proc/self/cgroup": "0::/child\n",
+        "/sys/fs/cgroup/child/memory.current": "1200",
+        "/sys/fs/cgroup/child/memory.high": "1000",
+        "/sys/fs/cgroup/child/memory.max": "2000",
+        "/sys/fs/cgroup/child/memory.stat": "inactive_file 0\n",
+        "/sys/fs/cgroup/memory/memory.high": "max",
+        "/sys/fs/cgroup/memory/memory.max": "max",
+    }
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda path: str(path) == "/sys/fs/cgroup/cgroup.controllers" or str(path) in files,
+    )
+    monkeypatch.setattr(Path, "read_text", lambda path: files[str(path)])
+    pressure = proctree.host_pressure()
+    assert pressure is not None
+    assert pressure.scope.endswith("/child")
+    assert pressure.debt_bytes == 200
+
+
+@dataclass
+class PressureCache:
+    slot: str
+    held: int
+    pressure: list[proctree.HostPressure]
+    generation: int = 1
+    status: str = "idle"
+    last_used: int = 0
+    calls: list[int] = field(default_factory=list)
+
+    def state(self) -> str:
+        return self.status
+
+    @property
+    def reclaim_generation(self) -> int:
+        return self.generation
+
+    def reclaim_host(self, nbytes: int) -> tuple[int, int]:
+        self.calls.append(nbytes)
+        released = min(10, self.held)
+        self.held -= released
+        fact = self.pressure[0]
+        self.pressure[0] = proctree.HostPressure(
+            fact.scope,
+            fact.current_bytes,
+            fact.limit_bytes,
+            max(fact.debt_bytes - released, 0),
+            fact.reclaimable_file_bytes,
+        )
+        return released, self.held
+
+
+def test_pressure_relief_reclaims_only_until_measured_debt_is_gone() -> None:
+    pressure = [proctree.HostPressure("/worker", 120, 100, 20)]
+    policy = memory.Machine({}, lambda _: None, lambda _: None, host_pressure=lambda: pressure[0])
+    cache = PressureCache("idle", 40, pressure)
+    result = policy.relieve_host_pressure([cache])
+    assert result == {
+        "initial_debt_bytes": 20,
+        "reclaimed_managed_bytes": 20,
+        "attempts": 2,
+        "debt_bytes": 0,
+        "pressure_scope": "/worker",
+        "initial_pressure_scope": "/worker",
+        "generation": "1",
+    }
+    assert cache.calls == [20, 10]
+
+
+def test_zero_progress_victim_does_not_block_later_idle_victim() -> None:
+    pressure = [proctree.HostPressure("/worker", 120, 100, 20)]
+    policy = memory.Machine({}, lambda _: None, lambda _: None, host_pressure=lambda: pressure[0])
+    protected = PressureCache("protected", 0, pressure, last_used=-1)
+    eligible = PressureCache("eligible", 20, pressure)
+    result = policy.relieve_host_pressure([protected, eligible])
+    assert result is not None
+    assert result["reclaimed_managed_bytes"] == 20
+    assert result["debt_bytes"] == 0
+    assert protected.calls == [20]
+    assert eligible.calls == [20, 10]
+
+
+def test_pressure_relief_does_not_touch_cache_when_debt_is_covered() -> None:
+    pressure = [proctree.HostPressure("/worker", 120, 100, 0, 20)]
+    policy = memory.Machine({}, lambda _: None, lambda _: None, host_pressure=lambda: pressure[0])
+    cache = PressureCache("idle", 40, pressure)
+    assert policy.relieve_host_pressure([cache]) is None
+    assert not cache.calls
+
+
+def test_pressure_relief_remeasures_physical_relief_without_logical_release() -> None:
+    pressure = [proctree.HostPressure("/worker", 120, 100, 20)]
+
+    class PhysicalOnly(PressureCache):
+        def reclaim_host(self, nbytes: int) -> tuple[int, int]:
+            self.calls.append(nbytes)
+            fact = self.pressure[0]
+            self.pressure[0] = proctree.HostPressure(fact.scope, 100, 100, 0)
+            return 0, self.held
+
+    policy = memory.Machine({}, lambda _: None, lambda _: None, host_pressure=lambda: pressure[0])
+    cache = PhysicalOnly("idle", 40, pressure)
+    assert policy.relieve_host_pressure([cache]) == {
+        "initial_debt_bytes": 20,
+        "reclaimed_managed_bytes": 0,
+        "attempts": 1,
+        "debt_bytes": 0,
+        "pressure_scope": "/worker",
+        "initial_pressure_scope": "/worker",
+        "generation": "",
+    }
+    assert cache.calls == [20]
+
+
+def test_pressure_schedule_does_not_block_caller_or_duplicate_work() -> None:
+    started, release = Event(), Event()
+
+    class Fake:
+        _host_pressure_schedule_lock = RLock()
+        _host_pressure_scheduled = False
+        control_lock = RLock()
+
+        class Memory:
+            def relieve_host_pressure(self, tenants: object) -> None:
+                started.set()
+                release.wait(5)
+                return None
+
+        memory = Memory()
+
+        def _tenants(self, _: object) -> tuple[object, ...]:
+            return ()
+
+        def _lane(self, _: str, body: object, *, fatal: bool) -> object:
+            return body
+
+    fake = Fake()
+    started_at = monotonic()
+    # Bind the production method to a minimal worker-shaped object.
+    from cozy_runtime.internal.worker.session import Worker
+
+    Worker._schedule_host_pressure_relief(fake)
+    Worker._schedule_host_pressure_relief(fake)
+    assert monotonic() - started_at < 1
+    assert started.wait(1)
+    assert fake._host_pressure_scheduled
+    release.set()
+    for _ in range(100):
+        if not fake._host_pressure_scheduled:
+            break
+        sleep(0.01)
+    assert not fake._host_pressure_scheduled
+
+
+def test_pressure_schedule_resets_after_thread_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Fake:
+        _host_pressure_schedule_lock = RLock()
+        _host_pressure_scheduled = False
+
+        def _lane(self, _: str, body: object, *, fatal: bool) -> object:
+            return body
+
+    class BrokenThread:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("thread start failed")
+
+    from cozy_runtime.internal.worker import session
+
+    monkeypatch.setattr(session.threading, "Thread", BrokenThread)
+    fake = Fake()
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        session.Worker._schedule_host_pressure_relief(fake)
+    assert not fake._host_pressure_scheduled
 
 
 @pytest.mark.parametrize(

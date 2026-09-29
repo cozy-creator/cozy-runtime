@@ -2221,13 +2221,17 @@ class Machine:
         note: Callable[[str], None],
         *,
         host_available: Callable[[], int] | None = None,
+        host_pressure: Callable[[], proctree.HostPressure | None] | None = None,
     ) -> None:
         self.budget = dict(budget)
         self.driver = driver
         self.note = note
         self.queue: tuple[Demand, ...] = ()
         self._host_lock = Lock()
+        #: Serializes only long-running host-reclaim RPCs; never held with _host_lock.
+        self._host_reclaim_lock = Lock()
         self.host_available = host_available
+        self.host_pressure = host_pressure
         self.host_reserved: dict[str, int] = {}
 
     def update_queue(self, demands: Iterable[Demand]) -> None:
@@ -2291,26 +2295,108 @@ class Machine:
 
         if reserve():
             return True
-        for tenant in sorted(tenants, key=lambda tenant: self._reuse(tenant, None)):
-            if tenant.slot == requester or tenant.state() != "idle":
-                continue
-            reclaim = getattr(tenant, "reclaim_host", None)
-            if reclaim is None:
-                continue
-            remaining = math.inf
-            while tenant.state() == "idle":
-                result = reclaim(nbytes)
-                if reserve():
-                    return True
-                if result is None:
-                    break
-                released, held = result
-                # Logical progress permits another bounded step even when usage is
-                # still above high. RSS alone cannot prove more cache was dropped.
-                if released <= 0 or held <= 0 or held >= remaining:
-                    break
-                remaining = held
+        # Normal reservations may race with one another, but only one operation at a
+        # time may ask an idle executor to release host backing.  The reclaim lock is
+        # held across the RPC; the short reservation lock is not.
+        with self._host_reclaim_lock:
+            if reserve():
+                return True
+            for tenant in sorted(tenants, key=lambda tenant: self._reuse(tenant, None)):
+                if tenant.slot == requester or tenant.state() != "idle":
+                    continue
+                reclaim = getattr(tenant, "reclaim_host", None)
+                if reclaim is None:
+                    continue
+                remaining = math.inf
+                while tenant.state() == "idle":
+                    result = reclaim(nbytes)
+                    if reserve():
+                        return True
+                    if result is None:
+                        break
+                    released, held = result
+                    # Logical progress permits another bounded step even when usage is
+                    # still above high. RSS alone cannot prove more cache was dropped.
+                    if released <= 0 or held <= 0 or held >= remaining:
+                        break
+                    remaining = held
         return False
+
+    def relieve_host_pressure(self, tenants: Sequence[HostTenant]) -> dict[str, int | str] | None:
+        """Release idle managed host backing while an exact cgroup debt remains.
+
+        This maintenance pass is intentionally independent of ordinary admission.  It
+        never touches active tenants, and it stops when the pressure fact, executor
+        generation, or managed-held measurement stops advancing.
+        """
+        if self.host_pressure is None or not self._host_reclaim_lock.acquire(blocking=False):
+            return None
+        try:
+            before = self.host_pressure()
+            debt = before.debt_bytes if before is not None else -1
+            if debt <= 0:
+                return None
+            initial_debt = debt
+            initial_scope = before.scope if before is not None else ""
+            reclaimed = attempted = 0
+            after = before
+            generation_used: object | None = None
+            for tenant in sorted(tenants, key=lambda item: self._reuse(item, None)):
+                if tenant.state() != "idle":
+                    continue
+                reclaim = getattr(tenant, "reclaim_host", None)
+                if reclaim is None:
+                    continue
+                generation = getattr(tenant, "reclaim_generation", None)
+                if generation is None:
+                    continue
+                held_before: int | None = None
+                while debt > 0 and tenant.state() == "idle":
+                    if getattr(tenant, "reclaim_generation", None) != generation:
+                        break
+                    attempted += 1
+                    result = reclaim(debt)
+                    after = self.host_pressure()
+                    debt = after.debt_bytes if after is not None else -1
+                    if result is None:
+                        break
+                    released, held = result
+                    if type(released) is not int or type(held) is not int:
+                        break
+                    if (
+                        released <= 0
+                        or held < 0
+                        or (held_before is not None and held >= held_before)
+                    ):
+                        break
+                    reclaimed += released
+                    held_before = held
+                    generation_used = generation
+                    if held == 0 or debt <= 0:
+                        break
+                if debt < 0 or debt <= 0:
+                    break
+            if after is None or debt < 0:
+                return {
+                    "initial_debt_bytes": initial_debt,
+                    "reclaimed_managed_bytes": reclaimed,
+                    "attempts": attempted,
+                    "debt_bytes": -1,
+                    "pressure_scope": "",
+                    "initial_pressure_scope": initial_scope,
+                    "generation": str(generation_used) if generation_used is not None else "",
+                }
+            return {
+                "initial_debt_bytes": initial_debt,
+                "reclaimed_managed_bytes": reclaimed,
+                "attempts": attempted,
+                "debt_bytes": debt,
+                "pressure_scope": after.scope,
+                "initial_pressure_scope": initial_scope,
+                "generation": str(generation_used) if generation_used is not None else "",
+            }
+        finally:
+            self._host_reclaim_lock.release()
 
     def release_host(self, owner: str) -> None:
         """The allocation completed or failed: stop charging its pending promise."""
