@@ -73,6 +73,7 @@ func (m *Machine) serveHubAccess(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			file.Hubs[i] = access
+			file.Hubs[i].Origin = old.Origin
 			replaced = true
 			break
 		}
@@ -135,7 +136,7 @@ func hubAccessPrincipal(token string) string {
 	var kind struct {
 		Type string `json:"typ"`
 	}
-	if json.Unmarshal(header, &kind) != nil || !strings.EqualFold(kind.Type, "delegated-access+jwt") {
+	if json.Unmarshal(header, &kind) != nil || !strings.EqualFold(strings.TrimSpace(kind.Type), "delegated-access+jwt") {
 		return fallback()
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])

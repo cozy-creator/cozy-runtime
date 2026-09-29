@@ -895,7 +895,10 @@ class Worker:
         self.options = options
         self.hub_access_lock = threading.Lock()
         self.hub_access_principals = {
-            origin_key(held.origin): held.principal for held in options.hubs if held.access_token
+            origin_key(held.origin): held.principal
+            for held in options.hubs
+            + (() if options.publication_authority is None else (options.publication_authority,))
+            if held.access_token
         }
         self.host = host
         self.root = Path(options.root)

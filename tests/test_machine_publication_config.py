@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import ssl
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -17,6 +19,28 @@ from cozy_runtime.internal.worker.machine_publication import (
     PublicationRefusal,
     registrations,
 )
+
+
+def execution_token(
+    subject: str = "account-a", nonce: str = "first", issuer: str = "issuer"
+) -> str:
+    """A local transport fixture; production Hub remains the signature verifier."""
+    parts = [
+        {"typ": "delegated-access+jwt", "alg": "EdDSA"},
+        {
+            "iss": issuer,
+            "delegated_sub": subject,
+            "permissions": ["cozy.execution-access"],
+            "jti": nonce,
+        },
+    ]
+    return (
+        ".".join(
+            base64.urlsafe_b64encode(json.dumps(part).encode()).decode().rstrip("=")
+            for part in parts
+        )
+        + ".fixture-signature"
+    )
 
 
 def test_worker_boot_projects_authority_without_inheriting_it(tmp_path: Path) -> None:
@@ -348,7 +372,7 @@ def test_worker_https_renews_and_keeps_worker_and_operation_authority_separate(
                         "hubs": [
                             {
                                 "origin": origin,
-                                "access_token": "old-execution-token",
+                                "access_token": execution_token(),
                                 "expires_at": int(time.time()) + 3600,
                                 "ca": cert_path.name,
                             }
@@ -359,7 +383,9 @@ def test_worker_https_renews_and_keeps_worker_and_operation_authority_separate(
             authority = registrations(path)[0][0]
             client = authority.client(authorization_id)
             # An already-constructed client re-reads the atomically renewed projection.
-            path.write_text(path.read_text().replace("old-execution-token", "new-execution-token"))
+            path.write_text(
+                path.read_text().replace(execution_token(), execution_token(nonce="renewed"))
+            )
         else:
             client = MachinePublicationClient(
                 origin,
@@ -374,7 +400,7 @@ def test_worker_https_renews_and_keeps_worker_and_operation_authority_separate(
             "" if delegated else "worker-test",
             "" if delegated else "A" * 43,
             "",
-            "new-execution-token" if delegated else "",
+            execution_token(nonce="renewed") if delegated else "",
         )
         publication = (
             "/v1/models/org/model",
@@ -384,6 +410,15 @@ def test_worker_https_renews_and_keeps_worker_and_operation_authority_separate(
             "",
         )
         assert observed == [renewal, publication, renewal, publication]
+        if delegated:
+            path.write_text(
+                path.read_text().replace(
+                    execution_token(nonce="renewed"), execution_token("account-b")
+                )
+            )
+            with pytest.raises(PublicationRefusal, match="authority_principal_conflict"):
+                client.request("GET", "/v1/models/org/model")
+            assert observed == [renewal, publication, renewal, publication]
     finally:
         server.shutdown()
         server.server_close()
@@ -410,18 +445,46 @@ def test_scoped_access_renews_without_machine_registration_and_revokes_per_hub(
     from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 
     path = tmp_path / "machine-hubs.json"
-    row = {"origin": origin, "access_token": "scoped-token", "expires_at": int(time.time()) + 60}
+    row = {"origin": origin, "access_token": execution_token(), "expires_at": int(time.time()) + 60}
     path.write_text(json.dumps({"version": 1, "hubs": [row, {"origin": "unreadable"}]}))
-    worker = cast(Worker, SimpleNamespace(options=WorkerOptions(tmp_path, hub_access_path=path)))
+    worker = cast(
+        Worker,
+        SimpleNamespace(
+            options=WorkerOptions(tmp_path, hub_access_path=path),
+            hub_access_lock=threading.Lock(),
+            hub_access_principals={},
+        ),
+    )
     authority = machine_model_resolve.registration(worker, origin)
     assert authority is not None
     assert authority.worker_id == authority.worker_token == ""
-    assert authority.headers() == {"Authorization": "Bearer scoped-token"}
-    assert "scoped-token" not in repr(authority)
-    assert machine_model_defaults.credential(worker, origin) == "bearer scoped-token"
+    assert authority.headers() == {"Authorization": "Bearer " + execution_token()}
+    assert execution_token() not in repr(authority)
+    assert machine_model_defaults.credential(worker, origin) == "bearer " + execution_token()
     assert machine_model_defaults.credential(worker, "https://other.example.test") == ""
-    path.write_text(json.dumps({"version": 1, "hubs": [{**row, "access_token": "renewed-token"}]}))
-    assert machine_model_defaults.credential(worker, origin) == "bearer renewed-token"
+    path.write_text(
+        json.dumps(
+            {"version": 1, "hubs": [{**row, "access_token": execution_token(nonce="renewed")}]}
+        )
+    )
+    assert machine_model_defaults.credential(worker, origin) == "bearer " + execution_token(
+        nonce="renewed"
+    )
+    for token in (
+        execution_token("account-b"),
+        execution_token(issuer="other-issuer"),
+        "opaque-token",
+    ):
+        path.write_text(json.dumps({"version": 1, "hubs": [{**row, "access_token": token}]}))
+        for read in (
+            lambda: machine_model_defaults.credential(worker, origin),
+            lambda: machine_model_resolve.own(worker, hub=origin),
+        ):
+            with pytest.raises(ValueError, match="another account"):
+                read()
+        with pytest.raises(PublicationRefusal, match="authority_principal_conflict"):
+            authority.current()
+        assert machine_model_defaults.credential(worker, "https://other.example.test") == ""
     path.write_text(json.dumps({"version": 1, "hubs": [{**row, "expires_at": 1}]}))
     with pytest.raises(PublicationRefusal, match="authority_expired"):
         machine_model_defaults.credential(worker, origin)
@@ -473,3 +536,47 @@ def test_scoped_plain_http_is_only_explicit_loopback_access(tmp_path: Path) -> N
             PublicationAuthority(origin, "rental", "A" * 43).client(
                 "019aaaab-0000-7000-8000-000000000003"
             )
+
+
+def test_boot_account_binding_survives_projection_replacement_without_blocking_other_hubs(
+    tmp_path: Path,
+) -> None:
+    from cozy_runtime.internal.config import Credentials, RuntimeConfig
+    from cozy_runtime.internal.worker import machine_model_defaults, machine_model_resolve
+    from cozy_runtime.internal.worker.control import InMemoryControlHost
+    from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+
+    origin, other = "https://hub.example.test", "https://other.example.test"
+    path = tmp_path / "machine-hubs.json"
+    original = PublicationAuthority(origin, access_token=execution_token(), expires_at=1)
+    worker = Worker(
+        RuntimeConfig(cozy_home=tmp_path / "home", credentials=Credentials()),
+        WorkerOptions(tmp_path / "worker", hubs=(original,), hub_access_path=path),
+        InMemoryControlHost(),
+    )
+    try:
+        rows = [
+            {
+                "origin": origin + ":443",
+                "access_token": execution_token("account-b"),
+                "expires_at": int(time.time()) + 60,
+            },
+            {
+                "origin": other,
+                "access_token": execution_token("account-c"),
+                "expires_at": int(time.time()) + 60,
+            },
+        ]
+        path.write_text(json.dumps({"version": 1, "hubs": rows}))
+        with pytest.raises(ValueError, match="another account"):
+            machine_model_resolve.registration(worker, origin)
+        assert machine_model_defaults.credential(worker, other) == "bearer " + execution_token(
+            "account-c"
+        )
+        rows[0]["access_token"] = execution_token(nonce="fresh")
+        path.write_text(json.dumps({"version": 1, "hubs": rows}))
+        assert machine_model_defaults.credential(worker, origin) == "bearer " + execution_token(
+            nonce="fresh"
+        )
+    finally:
+        worker.shutdown()

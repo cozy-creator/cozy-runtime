@@ -88,7 +88,7 @@ def access_principal(token: str) -> tuple[str, ...]:
         issuer, subject = claims.get("iss"), claims.get("delegated_sub")
         if (
             not isinstance(header.get("typ"), str)
-            or header["typ"].lower() != "delegated-access+jwt"
+            or header["typ"].strip().lower() != "delegated-access+jwt"
             or not isinstance(issuer, str)
             or not 0 < len(issuer.encode()) <= 2048
             or not isinstance(subject, str)
