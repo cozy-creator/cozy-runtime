@@ -2,7 +2,10 @@ package host
 
 import (
 	"context"
+	pb "github.com/cozy-creator/cozy-runtime/machine-agent/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -34,5 +37,13 @@ func TestUnauthenticatedObservationDoesNotWakeRuntime(t *testing.T) {
 	case <-m.wake:
 		t.Fatal("unauthenticated observation requested a Runtime launch")
 	default:
+	}
+}
+
+func TestAuthenticatedWorkspaceObservationBeforeLauncherIsTransient(t *testing.T) {
+	m := &Machine{grant: &Grant{WorkerID: "machine"}, id: &Identity{BootID: "boot"}, initialized: make(chan struct{})}
+	_, handled, err := m.publicFallback(t.Context(), &pb.MachineExecutionWorkspaceQuery{})
+	if !handled || status.Code(err) != codes.Unavailable {
+		t.Fatalf("initial workspace absence became permanent refusal: handled=%v err=%v", handled, err)
 	}
 }

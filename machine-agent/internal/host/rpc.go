@@ -141,7 +141,15 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 		}
 		defer func() { _ = a.finish(err == nil, time.Now()) }()
 	}
-	if m.phase() != "ready" && publicReadMethod(string(r.method.Name())) {
+	phase := m.phase()
+	if (phase == "starting" || phase == "booting") && publicReadMethod(string(r.method.Name())) {
+		// An authenticated caller may wait for the coordinator it is using.
+		// The journal's read-only workspace does not advertise live mutation
+		// capabilities, so it cannot qualify a new submission during boot.
+		if _, err := m.runtime(ctx); err != nil {
+			return err
+		}
+	} else if phase != "ready" && publicReadMethod(string(r.method.Name())) {
 		if answer, handled, err := m.publicFallback(ctx, first); handled {
 			if err != nil {
 				return err
