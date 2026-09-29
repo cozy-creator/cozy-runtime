@@ -70,9 +70,11 @@ def test_modeled_invoke_refills_disk_weights_and_records_the_invoke_leg(
 ) -> None:
     """A CPU model stands in for a CUDA executor's refill, placement and invoke legs."""
     torch = pytest.importorskip("torch")
+    from torch import nn
+
     from cozy_runtime.author import pure
 
-    class Model(torch.nn.Module):
+    class Model(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.weight = torch.nn.Parameter(torch.empty(2, device="meta"))
