@@ -198,7 +198,9 @@ class ReleaseRoots:
             self.changed.notify_all()
 
     def _installed(self, key: str, hub: str) -> Installation | None:
-        """The placement this machine holds for a Hub's release with the fewest bound Models."""
+        """The placement this machine holds for a Hub's release with the fewest bound Models.
+        One whose environment was built against another machine Runtime (a Runtime update)
+        is prepared again, so its SDK follows this Runtime."""
         package, _, release = key.partition("@")
         with self.worker.control_lock:
             held = [
@@ -209,6 +211,12 @@ class ReleaseRoots:
                 and placement.document.package.release == release
                 and placement.document.package.hub == hub
             ]
+        root = Path(self.worker.options.install_root or "")
+        held = [
+            placement
+            for placement in held
+            if not package_installation.stale(root, placement.installation_id)
+        ]
         if not held:
             return None
         selected = min(held, key=lambda placement: len(placement.document.models))
