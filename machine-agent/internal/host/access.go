@@ -145,6 +145,7 @@ func projectHubAccess(legacy []HubGrant, access hubAccessFile, layout Layout) er
 		Hubs    []json.RawMessage `json:"hubs"`
 	}
 	doc.Version = 1
+	doc.Hubs = make([]json.RawMessage, 0, len(legacy)+len(access.Hubs))
 	replaced := map[string]bool{}
 	for _, a := range access.Hubs {
 		replaced[strings.TrimSuffix(a.Origin, "/")] = true

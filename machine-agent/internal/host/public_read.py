@@ -30,14 +30,24 @@ expected = request.get("workspace", "")
 if expected and expected != workspace:
     raise ValueError("execution_workspace_changed")
 op = request["op"]
-limit = min(max(int(request.get("limit") or 256), 1), 256)
+limit = int(request.get("limit") or (64 if op == "list" else 256))
+after, before = int(request.get("after", 0)), int(request.get("before", 0))
+if not 0 <= after < 1 << 63 or not 0 <= before < 1 << 63:
+    raise ValueError("execution_cursor_invalid")
+if op == "list":
+    limit = min(limit, 256)
+elif not 1 <= limit <= 256:
+    raise ValueError("execution_cursor_invalid")
 if op == "workspace":
     result = pb.MachineExecutionWorkspace(execution_workspace_id=workspace, run_output_log=True)
 elif op == "list":
-    filters, params = ["record_namespace = ?", "run_number > ?"], ["cozy-local-client", request.get("after", 0)]
-    if request.get("before", 0):
+    filters, params = ["record_namespace = ?"], ["cozy-local-client"]
+    if not request.get("newest"):
+        filters.append("run_number > ?")
+        params.append(after)
+    elif before:
         filters.append("run_number < ?")
-        params.append(request["before"])
+        params.append(before)
     states = request.get("states", [])
     if states:
         if len(states) > 32:
@@ -55,6 +65,8 @@ elif op in ("get", "events"):
     if op == "get":
         result = state(row)
     else:
+        if after > row["sequence"]:
+            raise ValueError("execution_cursor_invalid")
         result = pb.MachineExecutionEventPage(head_sequence=row["sequence"], compacted_through=row["compacted_through"], next_after=request.get("after", 0))
         rows = db.execute("SELECT request_id,sequence,attempt_ordinal,at_ms,kind,body_json,invocation_spec_digest,outcome_id,outcome_digest,outcome_json FROM machine_events_v1 WHERE record_namespace=? AND request_id=? AND sequence>? ORDER BY sequence LIMIT ?", ("cozy-local-client", request["request"], request.get("after", 0), limit))
         size = 0

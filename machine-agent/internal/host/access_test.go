@@ -82,3 +82,17 @@ func TestAccessProjectionReplacesLegacyCredentialForSameOrigin(t *testing.T) {
 		t.Fatal("legacy machine registration shadowed access refresh")
 	}
 }
+
+func TestOfflineAccessProjectionHasEmptyList(t *testing.T) {
+	l := NewLayout(&Grant{Root: t.TempDir()})
+	if err := projectHubAccess(nil, hubAccessFile{Version: 1}, l); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(l.boot("machine-hubs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"version":1,"hubs":[]}` {
+		t.Fatalf("invalid offline access document: %s", raw)
+	}
+}

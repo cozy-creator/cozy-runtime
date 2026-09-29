@@ -100,7 +100,7 @@ func TestMachineLockRejectsConcurrentAgentButNotRestart(t *testing.T) {
 
 func TestStandaloneGrantNeedsNoHub(t *testing.T) {
 	key, _, _ := ed25519.GenerateKey(rand.Reader)
-	g, err := ReadGrant([]string{"COZY_MACHINE_LIFETIME=persistent", "COZY_MACHINE_ROOT=" + t.TempDir(), "COZY_WORKER_ID=local-stable", "COZY_WORKER_INTERNAL_PORT=12345", "COZY_AUTHORIZED_KEYS=" + base64.RawURLEncoding.EncodeToString(key)})
+	g, err := ReadGrant([]string{"COZY_MACHINE_LIFETIME=persistent", "COZY_MACHINE_ROOT=" + t.TempDir(), "COZY_WORKER_ID=local-stable", "COZY_WORKER_INTERNAL_PORT=12345", "COZY_AUTHORIZED_KEYS=" + base64.RawURLEncoding.EncodeToString(key), "COZY_WORKER_AUTH_TOKEN=obsolete", "TENSORHUB_ORIGIN=obsolete", "COZY_MACHINE_HUBS_JSON=obsolete"})
 	if err != nil {
 		t.Fatal(err)
 	}

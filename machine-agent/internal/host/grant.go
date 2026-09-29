@@ -120,8 +120,11 @@ func ReadGrant(environ []string) (*Grant, error) {
 	if g.Lifetime != "persistent" && g.Lifetime != "rental" {
 		return nil, fmt.Errorf("COZY_MACHINE_LIFETIME must be persistent or rental")
 	}
-	if g.WorkerToken = env["COZY_WORKER_AUTH_TOKEN"]; g.WorkerToken != "" && len(decode64(g.WorkerToken)) != 32 || g.Lifetime == "rental" && g.WorkerToken == "" {
-		return nil, fmt.Errorf("COZY_WORKER_AUTH_TOKEN must be 32 bytes of unpadded base64url")
+	if g.Lifetime == "rental" {
+		g.WorkerToken = env["COZY_WORKER_AUTH_TOKEN"]
+		if len(decode64(g.WorkerToken)) != 32 {
+			return nil, fmt.Errorf("COZY_WORKER_AUTH_TOKEN must be 32 bytes of unpadded base64url")
+		}
 	}
 	if g.WorkerPort, err = port(env, "COZY_WORKER_INTERNAL_PORT", true); err != nil {
 		return nil, err
@@ -135,17 +138,16 @@ func ReadGrant(environ []string) (*Grant, error) {
 	if g.MediaPort == g.WorkerPort {
 		return nil, fmt.Errorf("the worker and media ports must differ")
 	}
-	own, err := hubGrant(env, g.Lifetime == "rental")
-	if err != nil {
-		return nil, err
+	if g.Lifetime == "rental" {
+		own, err := hubGrant(env, true)
+		if err != nil {
+			return nil, err
+		}
+		g.HubOrigin, g.PublicOrigin, g.HubCA, g.ObjectHosts = own.Origin, own.PublicOrigin, own.CA, own.ObjectHosts
+		g.Hubs, g.Skipped = otherHubs(env["COZY_MACHINE_HUBS_JSON"], g.HubOrigin)
 	}
-	g.HubOrigin, g.PublicOrigin, g.HubCA, g.ObjectHosts = own.Origin, own.PublicOrigin, own.CA, own.ObjectHosts
-	g.Hubs, g.Skipped = otherHubs(env["COZY_MACHINE_HUBS_JSON"], g.HubOrigin)
-	if g.Lifetime == "persistent" {
-		// A copied legacy environment cannot silently restore machine registration
-		// authority. Content access is explicitly attached as a scoped bearer.
-		g.WorkerToken, g.Hubs = "", nil
-	}
+	// Persistent machines never consume copied legacy registration settings.
+	// Content access is explicitly attached as a scoped bearer.
 	g.RepoCacheRoot = env["COZY_REPO_CACHE_ROOT"]
 	if text := env["COZY_RECORD_OWNER_AUTH_JSON"]; text != "" {
 		g.ObservedAuth = &OwnerAuth{}

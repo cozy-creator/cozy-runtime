@@ -78,6 +78,22 @@ db.commit();db.close()
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("wrong workspace: %v", err)
 	}
+	for _, after := range []uint64{3, 1 << 63} {
+		_, _, err = m.publicFallback(context.Background(), &pb.MachineExecutionEventsQuery{Execution: &pb.MachineExecutionQuery{RequestId: "request-1"}, After: after})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("invalid cursor %d: %v", after, err)
+		}
+	}
+	listAnswer, _, err := m.publicFallback(context.Background(), &pb.MachineExecutionListQuery{NewestFirst: true, AfterNumber: 100})
+	if err != nil || len(listAnswer.(*pb.MachineExecutionList).Executions) != 1 {
+		t.Fatalf("newest-first incorrectly used ascending cursor: %v %v", listAnswer, err)
+	}
+	tail, cancelTail := context.WithTimeout(context.Background(), 5*time.Second)
+	_, _, err = m.publicFallback(tail, &pb.MachineExecutionEventsQuery{Execution: &pb.MachineExecutionQuery{RequestId: "request-1"}, After: 2, Wait: true})
+	cancelTail()
+	if err != nil {
+		t.Fatalf("terminal event tail did not settle: %v", err)
+	}
 	snapshot, err := m.Open(1, "text", -1)
 	if err != nil {
 		t.Fatal(err)

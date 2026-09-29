@@ -33,7 +33,7 @@ func readPublic(root, store string, args []string) (string, error) {
 	if err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
-			for _, code := range []string{"execution_not_found", "execution_workspace_changed"} {
+			for _, code := range []string{"execution_not_found", "execution_workspace_changed", "execution_cursor_invalid"} {
 				if strings.Contains(string(exit.Stderr), code) {
 					return "", &launchRefusal{code, "the Runtime journal does not contain the requested execution"}
 				}
@@ -60,7 +60,7 @@ func (m *Machine) publicRead(query map[string]any, answer proto.Message) error {
 			if refused.code == "execution_not_found" {
 				code = codes.NotFound
 			}
-			if refused.code == "execution_workspace_changed" {
+			if refused.code == "execution_workspace_changed" || refused.code == "execution_cursor_invalid" {
 				code = codes.FailedPrecondition
 			}
 			return refusal(code, refused.code, refused.detail)
@@ -90,7 +90,18 @@ func (m *Machine) publicFallback(ctx context.Context, request proto.Message) (pr
 		answer = &pb.MachineExecutionState{}
 	case *pb.MachineExecutionListQuery:
 		query = map[string]any{"op": "list", "after": q.AfterNumber, "before": q.BeforeNumber, "newest": q.NewestFirst, "states": q.States, "limit": q.Limit}
-		answer = &pb.MachineExecutionList{}
+		for {
+			list := &pb.MachineExecutionList{}
+			err := m.publicRead(query, list)
+			if err != nil || !q.Wait || q.NewestFirst || len(list.Executions) > 0 {
+				return list, true, err
+			}
+			select {
+			case <-ctx.Done():
+				return nil, true, ctx.Err()
+			case <-time.After(time.Second):
+			}
+		}
 	case *pb.MachineExecutionEventsQuery:
 		query = map[string]any{"op": "events", "request": q.GetExecution().GetRequestId(), "workspace": q.GetExecution().GetExpectedExecutionWorkspaceId(), "after": q.After, "limit": q.Limit}
 		for {
@@ -98,6 +109,14 @@ func (m *Machine) publicFallback(ctx context.Context, request proto.Message) (pr
 			err := m.publicRead(query, page)
 			if err != nil || !q.Wait || len(page.Events) > 0 {
 				return page, true, err
+			}
+			state := &pb.MachineExecutionState{}
+			if err := m.publicRead(map[string]any{"op": "get", "request": query["request"], "workspace": query["workspace"]}, state); err != nil {
+				return nil, true, err
+			}
+			switch state.State {
+			case "succeeded", "failed", "paused", "canceled":
+				return page, true, nil
 			}
 			select {
 			case <-ctx.Done():
