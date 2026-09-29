@@ -16,8 +16,9 @@ from cozy_runtime.internal.worker.machine_calls import CallRecord
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
+from cozy_runtime.protocol import worker_pb2 as pb
 from test_machine_calls import request, running
-from test_machine_execution import offer
+from test_machine_execution import complete, offer
 
 
 def test_call_phases_use_monotonic_intervals_and_freeze_during_finalization(tmp_path: Path) -> None:
@@ -225,3 +226,80 @@ def test_unrecordable_timing_does_not_refuse_an_accepted_call(tmp_path: Path) ->
     assert executions.status("owner", "parent").state == "running"
     timing.label = lambda *_: "label"
     assert timing.phase("owner", call.child_request, 1, "terminal", status="failed") == {}
+
+
+def test_paused_preexecution_call_resumes_same_attempt_without_offline_time(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
+    calls = Calls(workspace)
+    call = calls.accept("owner", request(running(executions)))
+    clock = [0.0]
+    timing = Timing(executions, calls, lambda *_: "Render", monotonic=lambda: clock[0])
+    timing.phase("owner", call.child_request, 1, "preparing", fresh=True, parent_attempt=1)
+    clock[0] = 30
+    paused = timing.phase("owner", call.child_request, 1, "paused", parent_attempt=1)
+    assert paused["preparation_ms"] == 30000 and not timing.clocks
+    assert executions.row("owner", call.child_request) is None
+    complete(executions, "parent", status=pb.OUTCOME_STATUS_FAILED)
+    executions.control("owner", "parent", "resume", 1, "resume")
+    resumed = calls.accept("owner", request(running(executions)))
+    assert resumed.child_request == call.child_request and resumed.parent_ordinal == 2
+    # The process may also have restarted while paused: the journal snapshot is enough.
+    timing = Timing(executions, calls, lambda *_: "Render", monotonic=lambda: clock[0])
+    clock[0] = 1000
+    timing.phase("owner", call.child_request, 1, "preparing", parent_attempt=2)
+    assert timing.phase("owner", call.child_request, 1, "paused", parent_attempt=1) == {}
+    clock[0] = 1010
+    timing.phase("owner", call.child_request, 1, "running")
+    clock[0] = 1015
+    measured = timing.phase("owner", call.child_request, 1, "terminal", status="succeeded")
+    assert measured["preparation_ms"] == 40000 and measured["execution_ms"] == 5000
+    assert not timing.clocks
+    assert timing.phase("owner", call.child_request, 1, "terminal") == measured
+    assert not timing.clocks
+    # Once a real child attempt exists, its durable ordinal fences older callbacks.
+    executions.submit(
+        "owner",
+        call.child_request,
+        b"d" * 32,
+        offer(call.child_request),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
+    running(executions, call.child_request)
+    complete(executions, call.child_request, status=pb.OUTCOME_STATUS_FAILED)
+    assert timing.phase("owner", call.child_request, 1, "queued", fresh=True) == {}
+    assert not timing.clocks
+    executions.control("owner", call.child_request, "resume", 1, "resume")
+    assert timing.phase("owner", call.child_request, 1, "preparing") == {}
+    assert not timing.clocks
+
+
+def test_finished_clocks_retire_without_losing_durable_measurements(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
+    calls = Calls(workspace)
+    parent = running(executions)
+    timing = Timing(executions, calls, lambda *_: "Render")
+    for index in range(40):
+        incoming = request(parent)
+        incoming.call_index = index
+        call = calls.accept("owner", incoming)
+        timing.phase("owner", call.child_request, 1, "queued", fresh=True)
+        measured = timing.phase("owner", call.child_request, 1, "terminal", status="succeeded")
+        assert not timing.clocks
+        assert timing.phase("owner", call.child_request, 1, "terminal") == measured
+        assert not timing.clocks

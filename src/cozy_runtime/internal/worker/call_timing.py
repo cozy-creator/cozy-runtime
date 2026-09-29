@@ -14,13 +14,24 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
+import msgspec
+
 from cozy_runtime.internal import effect_interfaces, source_interfaces
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
 
-Phase = Literal["queued", "preparing", "running", "finalizing", "terminal"]
+Phase = Literal["queued", "preparing", "running", "finalizing", "paused", "terminal"]
 DURATIONS = {"queued": "queued_ms", "preparing": "preparation_ms", "running": "execution_ms"}
+
+
+class _Snapshot(msgspec.Struct, frozen=True):
+    phase: str = ""
+    at_unix_ms: int = 0
+    execution_started_unix_ms: int = 0
+    queued_ms: float | None = None
+    preparation_ms: float | None = None
+    execution_ms: float | None = None
 
 
 @dataclass
@@ -68,9 +79,18 @@ class Timing:
         *,
         fresh: bool = False,
         status: str = "",
+        parent_attempt: int | None = None,
     ) -> dict[str, Json]:
         try:
-            return self._phase(owner, request, attempt, phase, fresh=fresh, status=status)
+            return self._phase(
+                owner,
+                request,
+                attempt,
+                phase,
+                fresh=fresh,
+                status=status,
+                parent_attempt=parent_attempt,
+            )
         except Exception:
             # Observability cannot refuse an accepted call or abandon its valid outcome.
             # Once an interval is unrecorded, later totals for this attempt are unknown.
@@ -78,6 +98,8 @@ class Timing:
                 clock = self.clocks.get((owner, request))
                 if clock is not None and clock.attempt == attempt:
                     clock.complete = False
+                    if phase in ("paused", "terminal"):
+                        self.clocks.pop((owner, request), None)
             logging.getLogger(__name__).warning("call phase could not be recorded", exc_info=True)
             return {}
 
@@ -90,6 +112,7 @@ class Timing:
         *,
         fresh: bool,
         status: str,
+        parent_attempt: int | None,
     ) -> dict[str, Json]:
         call = self.calls.child(owner, request)
         if call is None or call.target().module in (
@@ -97,19 +120,46 @@ class Timing:
             source_interfaces.MODULE,
         ):
             return {}
+        if parent_attempt is not None and call.parent_ordinal != parent_attempt:
+            return {}  # an older parent's preparation callback arrived after resume
+        row = self.executions.row(owner, request)
+        if row is not None and row.ordinal != attempt:
+            return {}  # the actual execution already belongs to another attempt
+        if phase != "terminal" and (
+            call.result or call.safe_code or (row is not None and row.terminal)
+        ):
+            return {}  # durable settlement wins even if a start callback arrives late
         with self.lock:
             key = (owner, request)
             clock = self.clocks.get(key)
-            if clock is not None and (
-                attempt < clock.attempt or (attempt == clock.attempt and clock.phase == "terminal")
-            ):
-                return clock.measurements() if attempt == clock.attempt else {}
-            if clock is not None and attempt == clock.attempt and phase == clock.phase:
-                return clock.measurements()
+            if clock is not None and attempt < clock.attempt:
+                return {}
             now = self.monotonic()
             if clock is None or clock.attempt != attempt:
-                clock = _Clock(attempt, fresh, since=now)
+                prior = None if fresh else self.executions.last_call_phase(owner, request, attempt)
+                snapshot = msgspec.convert(prior or {}, type=_Snapshot)
+                # A durably paused observation has no running interval to guess. Other
+                # recovered active phases lost their monotonic clock: totals stay unknown.
+                paused = snapshot.phase == "paused"
+                values = (snapshot.queued_ms, snapshot.preparation_ms, snapshot.execution_ms)
+                complete = (
+                    all(value is not None for value in values)
+                    if paused or snapshot.phase == "terminal"
+                    else fresh and prior is None
+                )
+                clock = _Clock(attempt, complete, since=now, at_ms=snapshot.at_unix_ms)
+                if paused or snapshot.phase == "terminal":
+                    clock.phase = "paused" if paused else "terminal"
+                    clock.execution_started_ms = snapshot.execution_started_unix_ms
+                    clock.durations = {
+                        name: (value or 0) / 1000
+                        for name, value in zip(DURATIONS, values, strict=True)
+                    }
+                    if snapshot.phase == "terminal" or phase == "paused":
+                        return clock.measurements()
                 self.clocks[key] = clock
+            elif phase == clock.phase:
+                return clock.measurements()
             elif clock.phase in DURATIONS:
                 clock.durations[clock.phase] += max(now - clock.since, 0.0)
             clock.phase, clock.since = phase, now
@@ -134,4 +184,6 @@ class Timing:
                 document["status"] = status
             root, _ = self.executions.scheduling_root(owner, request)
             self.executions.record(owner, root, "call.phase", document)
+            if phase in ("paused", "terminal"):
+                del self.clocks[key]
             return clock.measurements()
