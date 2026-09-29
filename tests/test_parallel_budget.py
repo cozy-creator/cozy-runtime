@@ -99,3 +99,49 @@ def test_a_follower_fills_only_on_rank_0s_agreement_for_its_own_model(
     finally:
         follower.close()
         leader.close()
+
+
+_JOINER = """
+import socket, sys
+import torch
+from cozy_runtime.internal.parallel.group import RankSpec, join_rank
+from cozy_runtime.internal.seam import Channel
+fd, rank, degree = map(int, sys.argv[1:4])
+channel = Channel(socket.socket(fileno=fd))
+join = channel.recv()
+_, agree = join_rank(torch, RankSpec(rank, degree, int(join["port"]), "gloo"), {})
+channel.send({"reply": "join", "ok": True})
+channel.send({"reply": "agreed", "worst": agree(rank * 1000)})
+channel.recv()
+"""
+
+
+@pytest.mark.parametrize("degree", [2, 4])
+def test_every_gpu_agrees_on_the_largest_shortfall_without_a_device(
+    tmp_path: Path, degree: int
+) -> None:
+    """N4: the memory agreement runs over gloo beside the device communicator, so a card
+    that is out of memory never has to allocate to say so."""
+    torch = pytest.importorskip("torch")
+
+    def launch(argv: list[str], fd: int) -> subprocess.Popen[bytes]:
+        rank = int(argv[argv.index("--rank") + 1])
+        return subprocess.Popen(
+            [sys.executable, "-c", _JOINER, str(fd), str(rank), str(degree)],
+            pass_fds=(fd,),
+            env={**os.environ, "OMP_NUM_THREADS": "1"},
+        )
+
+    group = RankGroup(degree=degree, backend="gloo", root=str(tmp_path), launch=launch)
+    try:
+        group.spawn()
+        group.form(torch, {})
+        assert group.agree is not None
+        assert group.agree(0) == (degree - 1) * 1000
+        assert [reply["worst"] for reply in group.collect("agreed")] == [
+            (degree - 1) * 1000
+        ] * (degree - 1)
+    finally:
+        group.close()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()

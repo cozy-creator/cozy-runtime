@@ -389,6 +389,8 @@ class Executor:
         self.world = int(world)
         self.group: RankGroup | None = None
         self.pg: Any = None
+        #: the group's largest memory shortfall, agreed on the CPU (a world of one: none)
+        self.shortfall: Callable[[int], int] | None = None
         self._device_ready = False
         self._startup_reported = False
         #: the attempt spool while an attempt runs: where a mirrored call's payloads go
@@ -585,6 +587,7 @@ class Executor:
                 self._rank_device(torch),
                 room=owner._ask_room,
                 sharded=lambda key: tuple(key.rsplit("/", 1)) in owner.group_sharded,
+                agree=self.shortfall,
             )
             if before.state == "measured":
                 owner.planner.measure_overhead(before.free_bytes, 0)
@@ -688,7 +691,9 @@ class Executor:
                 self.poisoned = f"join refused: {refused['code']}"
                 return refused
         try:
-            self.pg = join_rank(torch, spec, _SEALED)
+            self.pg, self.shortfall = join_rank(torch, spec, _SEALED)
+            if self.host.planner is not None:
+                self.host.planner.agree = self.shortfall
         except Exception as exc:
             self.poisoned = f"join failed: {type(exc).__name__}"
             return {
@@ -1173,6 +1178,9 @@ class Executor:
                             code="group_unformed",
                         )
                 self.pg = self.group.form(self.torch, _SEALED)
+                self.shortfall = self.group.agree
+                if self.host.planner is not None:
+                    self.host.planner.agree = self.shortfall
                 stage("group_form")
         except GroupRefusal as exc:
             return self._group_refusal(exc)

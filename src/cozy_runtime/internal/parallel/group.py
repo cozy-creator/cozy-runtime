@@ -154,20 +154,38 @@ def require_nvls_off(sealed: Mapping[str, str], backend: str) -> None:
         )
 
 
-def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
+def shortfall_agreement(torch: Any) -> Callable[[int], int]:
+    """Every rank's largest memory shortfall, over a CPU (gloo) group formed beside the
+    device communicator: agreeing on memory never allocates on a card that may be out of it.
+    Every rank of the world forms it at the same point, right after the process group."""
+    dist = torch.distributed
+    group = dist.new_group(backend="gloo")
+
+    def agree(short: int) -> int:
+        worst = torch.tensor([short], dtype=torch.int64)
+        dist.all_reduce(worst, op=dist.ReduceOp.MAX, group=group)
+        return int(worst.item())
+
+    return agree
+
+
+def join_rank(
+    torch: Any, spec: RankSpec, sealed: Mapping[str, str]
+) -> tuple[Any, Callable[[int], int]]:
     """A follower joins rank 0's store and forms its half of the process group.
 
     The caller has already made this rank's device current (`torch.cuda.set_device(r)`)
     through the executor's one explicit init boundary. Returns the group handle every
-    collective is given explicitly.
+    collective is given explicitly, and the group's memory agreement.
     """
     dist = torch.distributed
 
     require_nvls_off(sealed, spec.backend)
     store = dist.TCPStore("127.0.0.1", spec.port, spec.world, is_master=False)
     dist.init_process_group(spec.backend, store=store, rank=spec.rank, world_size=spec.world)
+    agree = shortfall_agreement(torch)
     dist.barrier()
-    return dist.group.WORLD
+    return dist.group.WORLD, agree
 
 
 def _decode[T](
@@ -225,6 +243,8 @@ class RankGroup:
         self.store: Any = None
         self.port = 0
         self.pg: Any = None
+        #: the group's largest memory shortfall, agreed over gloo once the group forms
+        self.agree: Callable[[int], int] | None = None
         self.formed = False
         #: the first fault, latched: a broken group never heals, it is rebuilt
         self.broken = ""
@@ -373,6 +393,7 @@ class RankGroup:
         self.broadcast({"cmd": "join", "port": self.port, "backend": self.backend})
         dist.init_process_group(self.backend, store=self.store, rank=0, world_size=self.degree)
         self.pg = dist.group.WORLD
+        self.agree = shortfall_agreement(torch)
         dist.barrier()
         for follower, reply in zip(self.followers, self.collect("join"), strict=True):
             if not reply.get("ok"):
