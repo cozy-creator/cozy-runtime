@@ -14,7 +14,6 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/canonical"
-	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy-runtime/machine-agent/protocol/cozy/worker/v1"
 )
 
@@ -205,7 +204,7 @@ func revisionOf(sequence uint64, product *pb.RunProduct) (Revision, error) {
 // typeOf is an item's Responses-style type, from its media type.
 func typeOf(mediaType string) string {
 	switch {
-	case mediaType == resultfiles.TreeMediaType:
+	case mediaType == "application/vnd.cozy.tree-manifest":
 		return "tree"
 	case strings.HasPrefix(mediaType, "video/"):
 		return "video"
