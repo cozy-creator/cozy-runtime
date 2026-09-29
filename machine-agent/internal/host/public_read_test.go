@@ -66,7 +66,7 @@ db.execute('INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?)',('request-1',1,1,100
 db.execute('INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?)',('request-1',2,1,200,'outcome',b'{}',bytes(32),'outcome-1',hashlib.sha256(outcome).digest(),outcome))
 db.commit();db.close()
 `
-	if out, err := exec.Command(python, "-I", "-c", setup, l.Store).CombinedOutput(); err != nil {
+	if out, err := childOutput(exec.Command(python, "-I", "-c", setup, l.Store), true); err != nil {
 		t.Fatalf("fixture: %v: %s", err, out)
 	}
 	m := &Machine{layout: l, launcher: &directLauncher{root: root}, restarts: &restarts{}, grant: &Grant{WorkerID: "local-machine"}, id: &Identity{BootID: "boot"}}
@@ -166,7 +166,7 @@ else:
 db.commit();db.close()
 `
 	for _, phase := range []string{"running", "succeeded"} {
-		if out, err := exec.Command(python, "-I", "-c", resume, l.Store, phase).CombinedOutput(); err != nil {
+		if out, err := childOutput(exec.Command(python, "-I", "-c", resume, l.Store, phase), true); err != nil {
 			t.Fatalf("resume fixture: %v %s", err, out)
 		}
 		current, err := m.Open(1, "text", -1)
