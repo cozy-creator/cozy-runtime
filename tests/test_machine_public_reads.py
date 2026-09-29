@@ -67,3 +67,40 @@ def test_supervisor_capability_probe_needs_no_machine_settings_or_cuda() -> None
         check=True,
     )
     assert "machine-supervisor/1" in json.loads(answer.stdout)["capabilities"]
+
+
+def test_public_reads_keep_legacy_request_collisions_in_their_record_namespace(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    namespaces = ("legacy-A", "legacy-B", "cozy-local-client")
+    numbers = {}
+    for namespace in namespaces:
+        receipt = executions.submit(
+            namespace,
+            "submission",
+            b"c" * 32,
+            offer("same-request"),
+            expected_execution_workspace_id=executions.workspace_id,
+        )
+        numbers[namespace] = receipt.number
+        executions.record(namespace, "same-request", "log", {"value": namespace})
+    assert len(set(numbers.values())) == len(namespaces)
+
+    path = workspace.directory / "journal.sqlite3"
+    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+        # Exactly the domain of the agent's authenticated Runtime calls. Historical
+        # identities remain present and are never flattened into that namespace.
+        for namespace in namespaces:
+            assert db.execute(
+                "SELECT run_number FROM machine_runs_v1 WHERE record_namespace=? AND request_id=?",
+                (namespace, "same-request"),
+            ).fetchall() == [(numbers[namespace],)]
+            events = db.execute(
+                "SELECT body_json FROM machine_events_v1 "
+                "WHERE record_namespace=? AND request_id=? AND kind='log' ORDER BY sequence",
+                (namespace, "same-request"),
+            ).fetchall()
+            assert [json.loads(row[0]) for row in events] == [{"value": namespace}]
+        assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 3

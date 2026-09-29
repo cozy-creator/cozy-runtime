@@ -64,14 +64,17 @@ The private directory and WAL permissions are unchanged.
 | View | Public columns |
 | --- | --- |
 | `machine_workspace_v1` | `workspace_id` |
-| `machine_runs_v1` | `workspace_id`, `run_number`, `request_id`, `submission_id`, `attempt_ordinal`, `generation`, `state`, `collected`, `sequence`, `compacted_through`, `accepted_at_ms`, `finished_at_ms`, `worker_id`, `worker_boot_id` |
-| `machine_events_v1` | `workspace_id`, `run_number`, `request_id`, `sequence`, `attempt_ordinal`, `at_ms`, `kind`, `body_json`, `invocation_spec_digest`, `outcome_id`, `outcome_digest`, `outcome_json` |
-| `machine_outputs_v1` | `workspace_id`, `run_number`, `request_id`, `attempt_ordinal`, `slot`, `manifest_json`, `content_bytes`, `state` |
+| `machine_runs_v1` | `workspace_id`, `run_number`, `request_id`, `submission_id`, `attempt_ordinal`, `generation`, `state`, `collected`, `sequence`, `compacted_through`, `accepted_at_ms`, `finished_at_ms`, `worker_id`, `worker_boot_id`, `record_namespace` |
+| `machine_events_v1` | `workspace_id`, `run_number`, `request_id`, `sequence`, `attempt_ordinal`, `at_ms`, `kind`, `body_json`, `invocation_spec_digest`, `outcome_id`, `outcome_digest`, `outcome_json`, `record_namespace` |
+| `machine_outputs_v1` | `workspace_id`, `run_number`, `request_id`, `attempt_ordinal`, `slot`, `manifest_json`, `content_bytes`, `state`, `record_namespace` |
 
 JSON columns are UTF-8 canonical JSON stored as BLOBs. Digests are raw bytes. Outcome
 columns are populated only on outcome events and reconstruct `AttemptOutcome` directly;
 product event bodies are canonical `RunProduct` documents. Readers preserve cursor and
 compaction semantics and end an event page at its first outcome, as the live API does.
-Runs views contain numbered root runs. Accepted boot identity is historical, not proof of
+Runs views contain numbered root runs. Every agent run/event/output query must filter
+`record_namespace` to its authenticated Runtime namespace (`cozy-local-client` in supervisor
+mode), exactly as the live API does. Request IDs alone are not unique across historical
+namespaces. Legacy records remain unchanged and are not remapped during adoption. Accepted boot identity is historical, not proof of
 the currently running process. No capture, offer, preparation, or invocation document is
 exposed by these views.

@@ -24,7 +24,7 @@ def install(db: Journal) -> None:
           (SELECT coalesce(max(v.at_ms),0) FROM execution_events v
            WHERE v.owner=e.owner AND v.request=e.request AND v.kind='outcome')
           ELSE 0 END AS finished_at_ms,
-        e.worker_id, e.accepted_boot AS worker_boot_id
+        e.worker_id, e.accepted_boot AS worker_boot_id, e.owner AS record_namespace
       FROM executions e JOIN execution_numbers n
         ON n.owner=e.owner AND n.request=e.request
       CROSS JOIN workspace_state s;
@@ -35,7 +35,7 @@ def install(db: Journal) -> None:
         coalesce(a.spec,x'') AS invocation_spec_digest,
         coalesce(a.outcome_id,'') AS outcome_id,
         coalesce(a.outcome_digest,x'') AS outcome_digest,
-        coalesce(a.outcome,x'') AS outcome_json
+        coalesce(a.outcome,x'') AS outcome_json, e.owner AS record_namespace
       FROM execution_events e JOIN execution_numbers n
         ON n.owner=e.owner AND n.request=e.request
       LEFT JOIN attempts a ON e.kind='outcome'
@@ -44,7 +44,8 @@ def install(db: Journal) -> None:
     CREATE VIEW IF NOT EXISTS machine_outputs_v1 AS
       SELECT s.execution_workspace_id AS workspace_id, n.number AS run_number,
         b.request AS request_id, b.ordinal AS attempt_ordinal, b.slot,
-        b.manifest_body AS manifest_json, b.content_bytes, b.state
+        b.manifest_body AS manifest_json, b.content_bytes, b.state,
+        b.owner AS record_namespace
       FROM byte_outputs b JOIN execution_numbers n
         ON n.owner=b.owner AND n.request=b.request
       CROSS JOIN workspace_state s;
