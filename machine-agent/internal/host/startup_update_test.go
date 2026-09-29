@@ -474,3 +474,20 @@ func TestCandidatePairUsesCandidateWireRange(t *testing.T) {
 		}
 	}
 }
+
+func TestInstalledPairProbeUsesActualRunningApplication(t *testing.T) {
+	root := t.TempDir()
+	running := filepath.Join(root, "running-agent")
+	m := &Machine{grant: &Grant{Root: root, agentBefore: running}, layout: NewLayout(&Grant{Root: root}), log: io.Discard}
+	executable(t, running, fmt.Sprintf(`echo '{"name":"cozy-machine","wire_minor":%d,"minimum_wire_minor":%d,"capabilities":["hub-access/1","runtime-update/1","machine-bootstrap/1"]}'`, pb.WireMinor, pb.MinCompatibleWireMinor))
+	executable(t, filepath.Join(root, "opt/cozy/python/bin/python"), fmt.Sprintf(`echo '{"runtime":"0.18.87","tensorfs":"0.3.78","wire_minor":%d,"minimum_wire_minor":%d,"capabilities":["machine-supervisor/1","machine-public-reads/1"]}'`, pb.WireMinor, pb.MinCompatibleWireMinor))
+	if _, err := m.startupVerify(context.Background()); err != nil {
+		t.Fatalf("missing installed bundle bricked working repair agent: %v", err)
+	}
+	if err := m.startupSave(startupStatus{State: "boot_pending"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.startupVerify(context.Background()); err == nil {
+		t.Fatal("running repair agent stood in for a missing candidate")
+	}
+}

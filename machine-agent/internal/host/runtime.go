@@ -139,6 +139,13 @@ func (d *directLauncher) maintain(op string, args []string) (string, error) {
 		if hash == args[0] {
 			return "", nil
 		}
+		if _, err := m.readAgentIdentity(context.Background(), selected); err != nil {
+			if m.transactionPending() {
+				return "", err
+			}
+			fmt.Fprintln(d.out, "cozy machine: installed application cannot attach to this bootstrap; retaining repair agent:", err)
+			return "", nil
+		}
 		d.replacement = selected
 		return "replace", nil
 	}

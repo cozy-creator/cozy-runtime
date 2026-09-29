@@ -57,7 +57,13 @@ func (m *Machine) startupVerify(ctx context.Context, overlay ...string) (pairVer
 	if m.grant != nil && m.grant.agentSelection != "" {
 		selection = m.grant.agentSelection
 	}
-	if selection == "bundled" {
+	if len(overlay) == 0 && !m.transactionPending() && m.grant != nil && m.grant.agentBefore != "" {
+		var err error
+		agent, err = m.readAgentIdentity(ctx, m.grant.agentBefore)
+		if err != nil {
+			return pairVersions{}, err
+		}
+	} else if selection == "bundled" {
 		location := filepath.Join(m.layout.Root, "opt/cozy/python")
 		if len(overlay) > 0 {
 			location = overlay[0]

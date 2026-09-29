@@ -182,7 +182,15 @@ func (m *Machine) serveRuntimeState(w http.ResponseWriter, r *http.Request) {
 		}
 		answer["bootstrap"] = map[string]any{"abi": bootstrapABI, "version": m.grant.bootstrap.BootstrapVersion, "update_boundary": "image-or-service-bootstrap"}
 	}
-	answer["agent"] = map[string]any{"version": build.Version, "sha256": digest, "selection": selection, "capabilities": build.Capabilities()}
+	repairFallback := false
+	if selection == "bundled" {
+		bundleHash, err := hashFile(filepath.Join(m.layout.Root, "opt/cozy/python/bin/cozy-machine"))
+		if err != nil || bundleHash != digest {
+			selection = "explicit"
+			repairFallback = true
+		}
+	}
+	answer["agent"] = map[string]any{"version": build.Version, "sha256": digest, "selection": selection, "capabilities": build.Capabilities(), "repair_fallback": repairFallback}
 	var startup startupStatus
 	if raw, err := os.ReadFile(filepath.Join(m.layout.State, "startup-update-status.json")); err == nil && json.Unmarshal(raw, &startup) == nil {
 		answer["startup_update"] = startup
