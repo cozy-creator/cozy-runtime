@@ -481,7 +481,28 @@ def test_a_run_reads_the_hub_it_came_from(
         elsewhere.release_root.hub = "https://elsewhere.example"
         with pytest.raises(Refused, match="no execution access for") as refused:
             submit(machine, elsewhere)
-        assert refused.value.trailers.get("cozy-error-code") == "hub_access_absent"
+        assert refused.value.trailers.get("cozy-error-code") == "execution_submission_refused"
+        assert machine.executions.submission_absent(
+            OWNER, "elsewhere", machine.executions.workspace_id
+        )
+
+        # Expired delegated access is likewise visible and proven unaccepted. Its
+        # underlying typed error cannot replace the submission disposition trailer.
+        expired_origin = "https://expired.example"
+        worker.options = dataclasses.replace(
+            worker.options,
+            hubs=(
+                PublicationAuthority(expired_origin, access_token="expired-access", expires_at=1),
+            ),
+        )
+        expired = submission(machine, "expired")
+        expired.release_root.hub = expired_origin
+        with pytest.raises(Refused, match="execution access has expired") as refused:
+            submit(machine, expired)
+        assert refused.value.trailers.get("cozy-error-code") == "execution_submission_refused"
+        assert machine.executions.submission_absent(
+            OWNER, "expired", machine.executions.workspace_id
+        )
     finally:
         home.close()
         other.close()

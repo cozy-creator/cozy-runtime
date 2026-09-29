@@ -274,13 +274,24 @@ class MachineExecutionRPC:
                 return calls.release_roots.submit(owner, request, context)
             except WorkspaceBusy:
                 raise
-            except WorkspaceRefusal:
-                # Nothing is journaled before the receipt: the refusal is definitive.
+            except WorkspaceRefusal as exc:
+                # Read back acceptance; clients close this key before rerouting it.
                 if executions.submission_absent(
                     request.claim.record_owner_id,
                     request.offer.request_id,
                     request.expected_execution_workspace_id,
                 ):
+                    if isinstance(exc, ExecutionWorkspaceRefusal) and exc.code in {
+                        "hub_access_absent",
+                        "hub_access_expired",
+                    }:
+                        # An access refusal is actionable at the controller. Preserve
+                        # disposition plus cause instead of losing either to _call.
+                        raise ExecutionWorkspaceRefusal(
+                            "execution_submission_refused", f"{exc.code}: {exc}"
+                        ) from exc
+                    # Other typed refusals retain their operation-specific recovery
+                    # code, e.g. release_root_installation_absent asks for reprepare.
                     context.set_trailing_metadata(
                         (("cozy-error-code", "execution_submission_refused"),)
                     )

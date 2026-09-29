@@ -254,10 +254,11 @@ def test_publication_authority_uses_default_verified_https_without_client_key() 
             )
 
 
-@pytest.mark.parametrize("delegated", [False, True])
+@pytest.mark.parametrize("delegated,tls", [(False, True), (True, True), (True, False)])
 def test_worker_https_renews_and_keeps_worker_and_operation_authority_separate(
     tmp_path: Path,
     delegated: bool,
+    tls: bool,
 ) -> None:
     import threading
     from datetime import UTC, datetime, timedelta
@@ -331,12 +332,13 @@ def test_worker_https_renews_and_keeps_worker_and_operation_authority_separate(
     server = HTTPServer(("127.0.0.1", 0), Handler)
     server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_tls.load_cert_chain(cert_path, key_path)
-    server.socket = server_tls.wrap_socket(server.socket, server_side=True)
+    if tls:
+        server.socket = server_tls.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         context = ssl.create_default_context(cafile=str(cert_path))
-        origin = f"https://localhost:{server.server_port}"
+        origin = f"{'https' if tls else 'http'}://localhost:{server.server_port}"
         if delegated:
             path = tmp_path / "machine-hubs.json"
             path.write_text(
@@ -388,8 +390,18 @@ def test_worker_https_renews_and_keeps_worker_and_operation_authority_separate(
         thread.join()
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://hub.example.test",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://[::1]:8080",
+    ],
+)
 def test_scoped_access_renews_without_machine_registration_and_revokes_per_hub(
     tmp_path: Path,
+    origin: str,
 ) -> None:
     from types import SimpleNamespace
     from typing import cast
@@ -398,7 +410,6 @@ def test_scoped_access_renews_without_machine_registration_and_revokes_per_hub(
     from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 
     path = tmp_path / "machine-hubs.json"
-    origin = "https://hub.example.test"
     row = {"origin": origin, "access_token": "scoped-token", "expires_at": int(time.time()) + 60}
     path.write_text(json.dumps({"version": 1, "hubs": [row, {"origin": "unreadable"}]}))
     worker = cast(Worker, SimpleNamespace(options=WorkerOptions(tmp_path, hub_access_path=path)))
@@ -420,3 +431,45 @@ def test_scoped_access_renews_without_machine_registration_and_revokes_per_hub(
     assert machine_model_resolve.registration(worker, origin) is None
     with pytest.raises(PublicationRefusal, match="authority_absent"):
         authority.current()
+
+
+def test_scoped_plain_http_is_only_explicit_loopback_access(tmp_path: Path) -> None:
+    from cozy_runtime.internal.config import ConfigError
+
+    path = tmp_path / "machine-hubs.json"
+    token = {"access_token": "scoped-token", "expires_at": int(time.time()) + 60}
+    for origin in (
+        "http://hub.example.test",
+        "http://192.168.0.1:8080",
+        "http://localhost.evil.test",
+        "http://localhost/path",
+        "http://user:pass@localhost",
+        "http://localhost:0",
+        "http://localhost#fragment",
+        "http://localhost?query",
+        "http://LOCALHOST",
+    ):
+        path.write_text(json.dumps({"version": 1, "hubs": [{"origin": origin, **token}]}))
+        held, skipped = registrations(path)
+        assert not held and skipped
+    for origin in ("http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080"):
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "hubs": [
+                        {
+                            "origin": origin,
+                            "worker_id": "rental",
+                            "worker_token": "A" * 43,
+                        }
+                    ],
+                }
+            )
+        )
+        held, skipped = registrations(path)
+        assert not held and skipped  # Rental grant transport has not changed.
+        with pytest.raises(ConfigError):
+            PublicationAuthority(origin, "rental", "A" * 43).client(
+                "019aaaab-0000-7000-8000-000000000003"
+            )
