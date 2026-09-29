@@ -21,20 +21,22 @@ import (
 // gives it. Only the names read here matter; any other is logged and ignored, so a newer Hub
 // cannot stop an older machine from booting.
 type Grant struct {
-	Lifetime      string // persistent (standalone) or rental (provider-owned allocation)
-	Root          string // COZY_MACHINE_ROOT; the image layout is rooted here
-	StoreRoot     string // COZY_TENSORFS_ROOT; empty keeps <root>/var/lib/tensorfs
-	ListenHost    string
-	WorkerID      string
-	WorkerToken   string
-	WorkerPort    int
-	MediaPort     int // a pre-M6 Hub probes the receipt here; 0 when none was granted
-	WebRTCPort    int // browsers reach media over WebRTC here; 0 when none was granted
-	HubOrigin     string
-	HubCA         []byte // DER
-	PublicOrigin  string
-	ObjectHosts   []string
-	RepoCacheRoot string
+	StartupUpdate  string // auto (published stable pair) or off (explicitly pinned software)
+	startupPending bool
+	Lifetime       string // persistent (standalone) or rental (provider-owned allocation)
+	Root           string // COZY_MACHINE_ROOT; the image layout is rooted here
+	StoreRoot      string // COZY_TENSORFS_ROOT; empty keeps <root>/var/lib/tensorfs
+	ListenHost     string
+	WorkerID       string
+	WorkerToken    string
+	WorkerPort     int
+	MediaPort      int // a pre-M6 Hub probes the receipt here; 0 when none was granted
+	WebRTCPort     int // browsers reach media over WebRTC here; 0 when none was granted
+	HubOrigin      string
+	HubCA          []byte // DER
+	PublicOrigin   string
+	ObjectHosts    []string
+	RepoCacheRoot  string
 	// Hubs are the other Hubs this machine is registered at (COZY_MACHINE_HUBS_JSON): a run
 	// names one, and the machine reads that run's release, index and Models there.
 	Hubs []HubGrant
@@ -67,6 +69,7 @@ type OwnerAuth struct {
 const receiptKeyName = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL"
 
 var grantNames = map[string]bool{
+	"COZY_STARTUP_UPDATE":   true,
 	"COZY_MACHINE_LIFETIME": true, "COZY_MACHINE_ROOT": true, "COZY_TENSORFS_ROOT": true, "COZY_LISTEN_HOST": true,
 	"COZY_WORKER_ID": true, "COZY_WORKER_AUTH_TOKEN": true, "COZY_WORKER_INTERNAL_PORT": true,
 	"COZY_MEDIA_INTERNAL_PORT": true, "COZY_WEBRTC_INTERNAL_PORT": true, "COZY_RECORD_OWNER_AUTH_JSON": true, "COZY_AUTHORIZED_KEYS": true,
@@ -117,6 +120,10 @@ func ReadGrant(environ []string) (*Grant, error) {
 		return nil, fmt.Errorf("COZY_WORKER_ID must be one identifier of at most 256 bytes")
 	}
 	g.Lifetime = cmpOr(env["COZY_MACHINE_LIFETIME"], "rental")
+	g.StartupUpdate = cmpOr(env["COZY_STARTUP_UPDATE"], "auto")
+	if g.StartupUpdate != "auto" && g.StartupUpdate != "off" {
+		return nil, fmt.Errorf("COZY_STARTUP_UPDATE must be auto or off")
+	}
 	if g.Lifetime != "persistent" && g.Lifetime != "rental" {
 		return nil, fmt.Errorf("COZY_MACHINE_LIFETIME must be persistent or rental")
 	}

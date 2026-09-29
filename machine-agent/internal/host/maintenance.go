@@ -26,6 +26,16 @@ import (
 // maintain runs one op against the machine rooted at root; p is its current Runtime.
 func maintain(root string, p *runtimeProcess, op string, args []string) (string, error) {
 	switch op {
+	case "startup-commit":
+		if p == nil || p.exited() || len(args) != 1 || args[0] != p.incarnation {
+			return "", errors.New("startup commit requires the live Runtime incarnation")
+		}
+		return "", startupMaintenance(root, op)
+	case "startup-rollback":
+		if p != nil && !p.exited() {
+			return "", errors.New("startup rollback requires a stopped candidate")
+		}
+		return "", startupMaintenance(root, op)
 	case "capabilities":
 		return probeRuntimeCapabilities(filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker"))
 	case "restart":

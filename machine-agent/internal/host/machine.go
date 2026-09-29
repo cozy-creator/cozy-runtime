@@ -102,7 +102,8 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	}
 	m := &Machine{grant: g, layout: layout, id: id, claims: c, receipt: rec, hub: newHubClient(g), idle: state,
 		restarts: &restarts{}, log: log, started: now,
-		owned: g.Lifetime == "persistent", ready: make(chan struct{}), wake: make(chan struct{}, 1), initialized: make(chan struct{})}
+		inUpdate: true, // listener liveness is available while startup admission remains held
+		owned:    g.Lifetime == "persistent", ready: make(chan struct{}), wake: make(chan struct{}, 1), initialized: make(chan struct{})}
 	if rec.retained == nil {
 		if err := m.restarts.clear(); err != nil {
 			return err
@@ -139,15 +140,33 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 		return err
 	}
 	defer m.conn.Close()
+	if err := m.startupUpdate(ctx); err != nil {
+		return err
+	}
+	m.setUpdating(m.startupPending())
 	if err := m.prepareLauncher(); err != nil {
 		return err
 	}
 	close(m.initialized)
 	defer m.launcher.close()
 	if err := m.tfs.initStore(ctx); err != nil {
-		m.restarts.fail(&launchRefusal{"tensorfs_unavailable", err.Error()})
+		if m.startupPending() {
+			if err := m.rollbackStartup(ctx); err != nil {
+				return err
+			}
+		} else {
+			m.restarts.fail(&launchRefusal{"tensorfs_unavailable", err.Error()})
+		}
 	} else {
-		m.launchOrIdle()
+		if err := m.launch(); err != nil {
+			if m.startupPending() {
+				if err := m.rollbackStartup(ctx); err != nil {
+					return err
+				}
+			} else {
+				m.restarts.fail(err)
+			}
+		}
 	}
 	errs := make(chan error, 1)
 	go func() { errs <- m.supervise(ctx) }()
@@ -292,6 +311,7 @@ func mustLeaf(c tls.Certificate) *x509.Certificate {
 // claimRuntime verifies this child's fresh readiness and opens its private session.
 func (m *Machine) claimRuntime(p *runtimeProcess) {
 	payload := m.layout.boot("readiness-payload")
+	var pendingPayload []byte
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -307,7 +327,9 @@ func (m *Machine) claimRuntime(p *runtimeProcess) {
 				p.stop()
 				return
 			}
-			if err := m.attestRuntime(raw); err != nil {
+			if m.startupPending() {
+				pendingPayload = raw
+			} else if err := m.attestRuntime(raw); err != nil {
 				fmt.Fprintln(m.log, "cozy machine: the Runtime's readiness was refused:", err)
 				m.restarts.fail(&launchRefusal{"runtime_readiness_invalid", err.Error()})
 				p.stop()
@@ -332,7 +354,13 @@ func (m *Machine) claimRuntime(p *runtimeProcess) {
 	for {
 		ack, err := m.controlClaim()
 		if err == nil && ack.Accepted {
-
+			if m.startupPending() {
+				if err := m.commitStartup(p, pendingPayload); err != nil {
+					m.restarts.fail(&launchRefusal{"startup_update_readiness_failed", err.Error()})
+					p.stop()
+					return
+				}
+			}
 			ready(ack)
 			return
 		}
@@ -458,6 +486,12 @@ func (m *Machine) supervise(ctx context.Context) error {
 		p := m.proc
 		m.mu.Unlock()
 		if p != nil && p.exited() {
+			if m.startupPending() {
+				if err := m.rollbackStartup(ctx); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := m.relaunchAfter(p); err != nil {
 				return err
 			}

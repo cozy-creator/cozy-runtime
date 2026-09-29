@@ -54,3 +54,32 @@ manifest are public; the build source remains in this private Runtime repository
 Verify downloaded manifest hashes and `cozy-machine version --json` before
 promotion. Agent and Runtime versions evolve independently through advertised
 capabilities and the supported worker-protocol range.
+
+At boot, `COZY_STARTUP_UPDATE=auto` (the default) makes one attempt to select a
+stable Runtime/TensorFS pair within their installed major versions. Selection
+checks the real interpreter, mandatory dependencies, installed media/model
+extras, and reverse dependencies on the pair; other dependencies are never
+upgraded implicitly. Both native wheels are checked against PyPI's HTTPS
+metadata and SHA-256, staged separately, and probed against the existing base.
+`COZY_STARTUP_UPDATE=off` preserves an explicitly selected installation. Local,
+development and prerelease software also skips automatic discovery.
+An explicit wheel supplied through remote maintenance pins the resulting pair
+while that operation's successful selection remains installed; ordinary
+version-based maintenance does not permanently disable discovery.
+
+The existing machine and Runtime-root locks protect admission. Every owner's
+unfinished or uncollected run in the public journal defers an update; unreadable
+history also defers it. The boot ID, certificate and execution journal are
+preserved. An unavailable index or incompatible candidate leaves the verified
+installed pair in service. Machine-agent executables advance through fresh
+worker images; this mechanism does not replace a running agent binary.
+
+The launcher retains hashed rollback wheels and a fsynced transaction under
+`var/lib/cozy/startup-update`, outside the unprivileged agent's writable state.
+Interrupted installation is repaired offline before launching, even when updates
+are now disabled. Success requires the actual new Runtime's authenticated fresh
+readiness, workspace and unused-submission closure before admitting any work.
+A candidate that fails that boot is rolled back and the prior Runtime relaunched
+in the same boot. Unrepairable rollback refuses to serve instead of declaring
+the installation healthy. `GET /v1/machine/runtime` includes the secrets-free
+`startup_update` report alongside explicit maintenance status.

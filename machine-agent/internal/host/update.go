@@ -58,15 +58,24 @@ type pairVersions struct {
 }
 
 type updateStatus struct {
-	Operation string       `json:"operation"`
-	State     string       `json:"state"` // waiting | installing | starting | rolling_back | succeeded | rolled_back | failed
-	Error     string       `json:"error,omitempty"`
-	From      pairVersions `json:"from"`
-	To        pairVersions `json:"to"`
+	Operation        string       `json:"operation"`
+	State            string       `json:"state"` // waiting | installing | starting | rolling_back | succeeded | rolled_back | failed
+	Error            string       `json:"error,omitempty"`
+	From             pairVersions `json:"from"`
+	To               pairVersions `json:"to"`
+	Pinned           bool         `json:"pinned,omitempty"`            // an explicitly supplied wheel owns this installed pair
+	PreviouslyPinned bool         `json:"previously_pinned,omitempty"` // failed maintenance retains the previous selection
 }
 
 func (s updateStatus) terminal() bool {
 	return s.State == "succeeded" || s.State == "rolled_back" || s.State == "failed"
+}
+
+func (s updateStatus) pins(pair pairVersions) bool {
+	if s.State == "succeeded" {
+		return s.Pinned && s.To == pair
+	}
+	return s.PreviouslyPinned && s.From == pair
 }
 
 type runtimeUpdates struct {
@@ -147,6 +156,10 @@ func (m *Machine) serveRuntimeState(w http.ResponseWriter, r *http.Request) {
 	m.updates.mu.Unlock()
 	answer := map[string]any{"capabilities": []string{UpdateCapability}, "runtime": installed.Runtime,
 		"tensorfs": installed.TensorFS, "update": status}
+	var startup startupStatus
+	if raw, err := os.ReadFile(filepath.Join(m.layout.State, "startup-update-status.json")); err == nil && json.Unmarshal(raw, &startup) == nil {
+		answer["startup_update"] = startup
+	}
 	if err != nil {
 		answer["error"] = err.Error()
 	}
@@ -156,6 +169,10 @@ func (m *Machine) serveRuntimeState(w http.ResponseWriter, r *http.Request) {
 
 func (m *Machine) serveStageWheel(w http.ResponseWriter, r *http.Request) {
 	if !m.maintenance(w, r) {
+		return
+	}
+	if m.startupPending() {
+		http.Error(w, "startup update is awaiting Runtime readiness", http.StatusServiceUnavailable)
 		return
 	}
 	file := r.PathValue("file")
@@ -205,6 +222,10 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 	if !m.maintenance(w, r) {
 		return
 	}
+	if m.startupPending() {
+		http.Error(w, "startup update is awaiting Runtime readiness", http.StatusServiceUnavailable)
+		return
+	}
 	var request updateRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&request); err != nil || !operationName.MatchString(request.Operation) ||
 		request.Runtime == nil && request.TensorFS == nil {
@@ -229,7 +250,9 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	status := updateStatus{Operation: request.Operation, State: "waiting", From: installed}
+	pinned := request.Runtime != nil && request.Runtime.File != "" || request.TensorFS != nil && request.TensorFS.File != ""
+	status := updateStatus{Operation: request.Operation, State: "waiting", From: installed, Pinned: pinned}
+	status.PreviouslyPinned = current != nil && current.pins(installed)
 	m.saveUpdate(status)
 	go m.runUpdate(request, status)
 	w.WriteHeader(http.StatusAccepted)
