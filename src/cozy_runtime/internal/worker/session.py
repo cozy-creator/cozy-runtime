@@ -5610,7 +5610,7 @@ class Worker:
         return min(grant for grant in granted if grant is not None)
 
     def _observe_memory(
-        self, lane: DeviceLane, row: LaneRow, reply: Mapping[str, Any], ordinals: Any = None
+        self, lane: DeviceLane, row: LaneRow, reply: Mapping[str, Any], ordinals: Iterable[int] | None = None
     ) -> None:
         """What a tenant holds on its devices, from the facts its executor reported: its
         non-allocator overhead and its allocator reserve (an older executor: the reserve)."""
