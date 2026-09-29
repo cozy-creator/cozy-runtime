@@ -44,8 +44,15 @@ EXECUTOR_PROTOCOL_REVISION = 1
 #: Additive memory operations are negotiated independently of the command protocol.
 EXECUTOR_MEMORY_CAPABILITIES = frozenset(
     {
-        "plan", "rank_memory", "prepare_commit", "import_only", "vacate_ranks", "host_room",
-        "group_host_credit", "process_memory",
+        "plan",
+        "rank_memory",
+        "prepare_commit",
+        "import_only",
+        "vacate_ranks",
+        "host_room",
+        "group_host_credit",
+        "process_memory",
+        "reclaim_host",
     }
 )
 

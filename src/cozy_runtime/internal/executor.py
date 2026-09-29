@@ -502,6 +502,8 @@ class Executor:
                 return self.probe()
             case executor_commands.Restore():
                 return self.restore(command.names)
+            case executor_commands.ReclaimHost():
+                return self.reclaim_host(command.nbytes)
             case Vacate():
                 return self.vacate(residents=command.residents, ranks=command.ranks)
             case Shutdown():
@@ -919,6 +921,7 @@ class Executor:
                     "operation": operation,
                     "aborted": True,
                     "memory": planner.facts() if planner is not None else {},
+                    "host_memory": planner.host_memory() if planner is not None else {},
                 }
         finally:
             if planner is not None:
@@ -1109,6 +1112,7 @@ class Executor:
                         "sol_calls": {},
                         "working_peak_bytes": 0,
                         "memory": planner.facts() if planner is not None else {},
+                        "host_memory": planner.host_memory() if planner is not None else {},
                         "declined": declined,
                     }
             outcome = classify(exc)
@@ -1129,6 +1133,7 @@ class Executor:
                 "available": exc.available if isinstance(exc, memory.MemoryRefusal) else 0,
                 "rank": self.rank,
                 "memory": planner.facts() if planner is not None else {},
+                "host_memory": planner.host_memory() if planner is not None else {},
             }
         return {
             "ok": True,
@@ -1137,6 +1142,7 @@ class Executor:
             "sol_calls": sol_counts,
             "working_peak_bytes": working,
             "memory": planner.facts() if planner is not None else {},
+            "host_memory": planner.host_memory() if planner is not None else {},
             **({"result": result} if hosted else {}),
             "evidence": execution_evidence.record(
                 self.rank,
@@ -2779,6 +2785,7 @@ class Executor:
             "ok": True,
             "ready": True,
             "memory": planner.facts() if planner is not None else {},
+            "host_memory": planner.host_memory() if planner is not None else {},
             "constructed_model_digest": self.constructed_model_digest,
             "entrypoints": sorted(self.surface_names),
             "plan": plan.seam_document(),
@@ -4386,6 +4393,22 @@ class Executor:
                         raise GroupRefusal(f"a follower refused restore: {reply.get('code')}")
         return {**self.probe(), "restored": report}
 
+    def reclaim_host(self, nbytes: int) -> dict[str, Any]:
+        if self.poisoned or self.world != 1 or nbytes < 0:
+            return {"ok": False, "code": "host_reclaim_unavailable"}
+        before = proctree.rss_bytes(os.getpid())
+        self._synchronize()
+        released = self.planner.reclaim_host(nbytes) if self.planner is not None else 0
+        after = proctree.rss_bytes(os.getpid())
+        return {
+            **self.probe(),
+            "managed_released_bytes": released,
+            "rss_before_bytes": before,
+            "rss_after_bytes": after,
+            "rss_released_bytes": max(0, before - after) if min(before, after) >= 0 else -1,
+            "host_memory": self.planner.host_memory() if self.planner is not None else {},
+        }
+
     def vacate(self, residents: bool = True, ranks: tuple[int, ...] = ()) -> dict[str, Any]:
         """FREE this process's device bytes for another tenant (cr-022), on `ranks` of a
         group (every rank when empty): only the cards the worker needs are given back.
@@ -4476,6 +4499,7 @@ class Executor:
             **device,
             "residency": planner.document(self.active) if planner is not None else {},
             "memory": planner.facts() if planner is not None else {},
+            "host_memory": planner.host_memory() if planner is not None else {},
             "rank_memory": self._rank_memory(),
             "constructions": self.residency_document()["constructions"],
             "rss_bytes": _rss(),

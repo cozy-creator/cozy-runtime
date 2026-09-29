@@ -1342,6 +1342,12 @@ def available_host_bytes() -> int:
                 physical = min(
                     physical, credit(cgroup, "memory.max", "memory.current", "inactive_file")
                 )
+                # memory.high is the kernel's reclaim/throttle boundary, even when
+                # memory.max still has room. Do not promise storage past either.
+                if (cgroup / "memory.high").is_file():
+                    physical = min(
+                        physical, credit(cgroup, "memory.high", "memory.current", "inactive_file")
+                    )
                 if cgroup == mount:
                     break
                 cgroup = cgroup.parent
