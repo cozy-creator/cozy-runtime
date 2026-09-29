@@ -76,11 +76,13 @@ def _asked(text: str) -> int:
 
 
 def _pressure() -> bool:
-    """The host stalled on memory in the last ten seconds (PSI), where the kernel reports it."""
+    """Every runnable task on the host stalled on memory in the last ten seconds and over the
+    last minute (PSI `full`): sustained thrash, not the routine blips of a desktop."""
     try:
-        line = Path("/proc/pressure/memory").read_text().splitlines()[0]
-        return float(line.split("avg10=", 1)[1].split()[0]) > 0
-    except (OSError, IndexError, ValueError):
+        full = Path("/proc/pressure/memory").read_text().splitlines()[1].split()
+        windows = dict(field.split("=", 1) for field in full[1:])
+        return float(windows["avg10"]) > 0 and float(windows["avg60"]) > 0
+    except (OSError, IndexError, KeyError, ValueError):
         return False
 
 
@@ -253,6 +255,8 @@ class Planner:
         self.peak_allocated = 0
         self.working = 0
         self.loads = self.offloads = self.moved = 0
+        #: bytes sent to the store and read back from it this attempt: the disk tier's traffic
+        self.stored = self.refilled = 0
         #: allocator bytes the attempt's weight moves added (negative: gave back)
         self.transition = 0
         self.log: list[str] = []
@@ -384,6 +388,7 @@ class Planner:
         self.asked_room = False
         self.peak = self.peak_allocated = self.working = 0
         self.loads = self.offloads = self.moved = self.transition = 0
+        self.stored = self.refilled = 0
         self.log = []
         self.plans = {}
         self.refusal = None
@@ -423,6 +428,8 @@ class Planner:
             "attempt_stages": self.loads,
             "attempt_evictions": self.offloads,
             "attempt_moved_bytes": self.moved,
+            "attempt_stored_bytes": self.stored,
+            "attempt_refilled_bytes": self.refilled,
             "attempt_activation_peak_bytes": self.working,
             "attempt_absolute_peak_bytes": self.peak_allocated,
             "allocator_delta_bytes": self.transition,
@@ -498,6 +505,7 @@ class Planner:
             with self._moving():
                 tiers.from_disk(self.torch, part, None)
             self.loads += 1
+            self.refilled += part.nbytes
         else:
             self._load_common(held)
             for unit in part.blocks:
@@ -958,6 +966,7 @@ class Planner:
         if part.common.tier == DEVICE:
             return
         if part.common.tier == DISK and not part.unit_loads:
+            self.refilled += part.on(DISK)
             with self._moving():
                 tiers.from_disk(self.torch, part, None)
             return
@@ -972,6 +981,7 @@ class Planner:
             else:
                 tiers.from_disk(self.torch, part, unit)
                 self.moved += unit.nbytes
+                self.refilled += unit.nbytes
         self.loads += 1
 
     def _home(self, part: tiers.Component, unit: tiers.Unit) -> None:
@@ -981,6 +991,7 @@ class Planner:
             if unit.host or not part.unit_loads or self._host_room(unit.nbytes):
                 self.moved += tiers.to_host(self.torch, unit)
             else:
+                self.stored += unit.nbytes
                 tiers.to_disk(self.torch, part, unit)
 
     def _offload(self, held: Held, *, everything: bool = False) -> None:
@@ -997,6 +1008,7 @@ class Planner:
             and not part.unit_loads
             and not self._host_room(sum(unit.nbytes for unit in moving))
         ):
+            self.stored += sum(unit.nbytes for unit in moving)
             with self._moving():
                 tiers.to_disk(self.torch, part, None)
             return
@@ -1031,6 +1043,7 @@ class Planner:
                         unit.host.clear()
                     elif not clean and unit.tier == HOST and held.part.unit_loads:
                         nbytes -= unit.nbytes
+                        self.stored += unit.nbytes
                         tiers.to_disk(self.torch, held.part, unit)
 
     def _enter_unit(self, part: tiers.Component, unit: tiers.Unit) -> None:
