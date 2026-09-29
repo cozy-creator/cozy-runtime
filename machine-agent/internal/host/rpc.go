@@ -11,6 +11,7 @@ import (
 	pb "github.com/cozy-creator/cozy-runtime/machine-agent/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -136,6 +137,7 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 			if err != nil {
 				return err
 			}
+			_ = stream.SendHeader(metadata.Pairs("cozy-snapshot-source", "journal", "cozy-runtime-state", m.phase(), "cozy-runtime-available", "false"))
 			return stream.SendMsg(answer)
 		}
 	}

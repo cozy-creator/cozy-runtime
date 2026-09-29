@@ -60,6 +60,11 @@ func (m *Machine) serveOutput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer snapshot.Close()
+	if m.phase() != "ready" {
+		w.Header().Set("Cozy-Snapshot-Source", "journal")
+		w.Header().Set("Cozy-Runtime-State", m.phase())
+		w.Header().Set("Cozy-Runtime-Available", "false")
+	}
 	w.Header().Set("ETag", `"r`+strconv.FormatUint(snapshot.Rev, 10)+`"`)
 	w.Header().Set("Cache-Control", "private, no-cache")
 	if snapshot.MediaType != "" {

@@ -125,6 +125,7 @@ func (m *Machine) readPublicLog(ctx context.Context, run, after uint64, wait boo
 	}
 	state := list.Executions[0]
 	log := newRunLog(run)
+	log.attempt = state.AttemptOrdinal
 	query := map[string]any{"op": "events", "request": state.RequestId, "workspace": list.ExecutionWorkspaceId, "limit": 256}
 	for {
 		query["after"] = log.next
@@ -135,7 +136,7 @@ func (m *Machine) readPublicLog(ctx context.Context, run, after uint64, wait boo
 		for _, event := range page.Events {
 			log.add(event)
 		}
-		if log.terminal || log.next >= page.HeadSequence || len(page.Events) == 0 {
+		if log.next >= page.HeadSequence || len(page.Events) == 0 {
 			if !wait || log.terminal || len(log.after(after)) > 0 {
 				return log.final(), nil
 			}

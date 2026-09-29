@@ -34,7 +34,7 @@ limit = min(max(int(request.get("limit") or 256), 1), 256)
 if op == "workspace":
     result = pb.MachineExecutionWorkspace(execution_workspace_id=workspace, run_output_log=True)
 elif op == "list":
-    filters, params = ["run_number > ?"], [request.get("after", 0)]
+    filters, params = ["record_namespace = ?", "run_number > ?"], ["cozy-local-client", request.get("after", 0)]
     if request.get("before", 0):
         filters.append("run_number < ?")
         params.append(request["before"])
@@ -46,17 +46,17 @@ elif op == "list":
         params.extend(states)
     order = "DESC" if request.get("newest") else "ASC"
     rows = db.execute("SELECT " + RUN_COLUMNS + " FROM machine_runs_v1 WHERE " + " AND ".join(filters) + " ORDER BY run_number " + order + " LIMIT ?", params + [limit])
-    head = db.execute("SELECT coalesce(max(run_number),0) FROM machine_runs_v1").fetchone()[0]
+    head = db.execute("SELECT coalesce(max(run_number),0) FROM machine_runs_v1 WHERE record_namespace=?", ("cozy-local-client",)).fetchone()[0]
     result = pb.MachineExecutionList(execution_workspace_id=workspace, head_number=head, executions=[state(row) for row in rows])
 elif op in ("get", "events"):
-    row = db.execute("SELECT " + RUN_COLUMNS + " FROM machine_runs_v1 WHERE request_id=?", (request["request"],)).fetchone()
+    row = db.execute("SELECT " + RUN_COLUMNS + " FROM machine_runs_v1 WHERE record_namespace=? AND request_id=?", ("cozy-local-client", request["request"])).fetchone()
     if row is None:
         raise ValueError("execution_not_found")
     if op == "get":
         result = state(row)
     else:
         result = pb.MachineExecutionEventPage(head_sequence=row["sequence"], compacted_through=row["compacted_through"], next_after=request.get("after", 0))
-        rows = db.execute("SELECT request_id,sequence,attempt_ordinal,at_ms,kind,body_json,invocation_spec_digest,outcome_id,outcome_digest,outcome_json FROM machine_events_v1 WHERE request_id=? AND sequence>? ORDER BY sequence LIMIT ?", (request["request"], request.get("after", 0), limit))
+        rows = db.execute("SELECT request_id,sequence,attempt_ordinal,at_ms,kind,body_json,invocation_spec_digest,outcome_id,outcome_digest,outcome_json FROM machine_events_v1 WHERE record_namespace=? AND request_id=? AND sequence>? ORDER BY sequence LIMIT ?", ("cozy-local-client", request["request"], request.get("after", 0), limit))
         size = 0
         for item in rows:
             body = bytes(item["body_json"])

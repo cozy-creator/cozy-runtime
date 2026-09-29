@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,20 +54,20 @@ func (m *Machine) liveRuntime(ctx context.Context) (*grpc.ClientConn, error) {
 }
 
 // request is the query that names run n's execution, asking the Runtime by number.
-func (m *Machine) request(ctx context.Context, conn *grpc.ClientConn, run uint64) (*pb.MachineExecutionQuery, error) {
+func (m *Machine) request(ctx context.Context, conn *grpc.ClientConn, run uint64) (*pb.MachineExecutionQuery, uint64, error) {
 	list, err := pb.NewWorkerControlClient(conn).ListMachineExecutions(ctx, &pb.MachineExecutionListQuery{
 		Claim: m.claims.claim, AfterNumber: run - 1, Limit: 1})
 	switch {
 	case status.Code(err) == codes.Unimplemented:
-		return nil, outputs.ErrUpdateRequired
+		return nil, 0, outputs.ErrUpdateRequired
 	case err != nil:
-		return nil, err
+		return nil, 0, err
 	case len(list.Executions) == 0 || list.Executions[0].Number != run:
-		return nil, outputs.ErrNotFound
+		return nil, 0, outputs.ErrNotFound
 	}
 	state := list.Executions[0]
 	workspace := cmpOr(state.ExecutionWorkspaceId, list.ExecutionWorkspaceId)
-	return &pb.MachineExecutionQuery{Claim: m.claims.claim, RequestId: state.RequestId, ExpectedExecutionWorkspaceId: workspace}, nil
+	return &pb.MachineExecutionQuery{Claim: m.claims.claim, RequestId: state.RequestId, ExpectedExecutionWorkspaceId: workspace}, state.AttemptOrdinal, nil
 }
 
 // runLog is a run's log read from its start, folded into items.
@@ -75,6 +76,7 @@ type runLog struct {
 	entries  []outputs.Entry
 	terminal bool
 	next     uint64
+	attempt  uint64
 }
 
 func newRunLog(run uint64) *runLog { return &runLog{fold: runoutputs.New(strconv.FormatUint(run, 10))} }
@@ -92,12 +94,13 @@ func (m *Machine) read(ctx context.Context, run, after uint64, wait bool) (*runL
 	if err != nil {
 		return m.readPublicLog(ctx, run, after, wait)
 	}
-	request, err := m.request(ctx, conn, run)
+	request, attempt, err := m.request(ctx, conn, run)
 	if err != nil {
 		return nil, err
 	}
 	client := pb.NewWorkerControlClient(conn)
 	l := newRunLog(run)
+	l.attempt = attempt
 	page := func(wait bool) (*pb.MachineExecutionEventPage, error) {
 		answer, err := client.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{
 			Execution: request, After: l.next, Wait: wait})
@@ -151,6 +154,10 @@ func listIndex(index int) uint32 {
 }
 
 func (l *runLog) add(event *pb.MachineExecutionEvent) {
+	if event.AttemptOrdinal > l.attempt {
+		l.attempt, l.terminal = event.AttemptOrdinal, false
+		l.entries = slices.DeleteFunc(l.entries, func(entry outputs.Entry) bool { return entry.Status != "" })
+	}
 	l.next = max(l.next, event.Sequence)
 	switch {
 	case event.Product != nil:
@@ -169,7 +176,7 @@ func (l *runLog) add(event *pb.MachineExecutionEvent) {
 			entry.AppendedFrom = &from
 		}
 		l.entries = append(l.entries, entry)
-	case event.Outcome != nil:
+	case event.Outcome != nil && event.AttemptOrdinal == l.attempt:
 		l.terminal = true
 		l.entries = append(l.entries, outputs.Entry{Seq: event.Sequence, Index: -1, Status: outcomeStatus(event.Outcome)})
 	}
