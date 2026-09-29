@@ -8,6 +8,7 @@ from functools import partial
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 from cozy_runtime.author import DecodedAudioChunk, OutputError, VideoAsset, _codec, fakes
 from cozy_runtime.author._decode import DecodedMediaEvent
@@ -144,3 +145,63 @@ def test_finalization_copies_audio_and_video_packets_and_keeps_source_on_failure
     with pytest.raises(FileExistsError):
         _codec.finalize_mp4(source, destination, max_bytes=1 << 20)
     assert packets(destination) == packets(source)
+
+
+def test_reordered_video_keeps_its_presentation_clock_when_joined(tmp_path: Path) -> None:
+    source = tmp_path / "reordered.mp4"
+    with av.open(str(source), "w") as container:
+        stream = container.add_stream("libx264", rate=24)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        stream.codec_context.max_b_frames = 2
+        stream.codec_context.gop_size = 24
+        for i in range(48):
+            frame = av.VideoFrame.from_ndarray(
+                np.full((48, 64, 3), i * 5, np.uint8), format="rgb24"
+            )
+            frame.pts, frame.time_base = i, Fraction(1, 24)
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    with av.open(str(source)) as container:
+        packets = [p for p in container.demux(video=0) if p.size]
+        assert any(p.pts != p.dts for p in packets)
+    directory = tmp_path / "join"
+    directory.mkdir()
+    join = _codec.FragmentedJoin(
+        directory, audio_channels=0, audio_sample_rate=0, max_bytes=1 << 20
+    )
+    for _ in range(3):
+        join.append(source, lambda _: ())
+    preview = tmp_path / "preview.mp4"
+    preview.write_bytes(b"".join(part.read_bytes() for part, _ in join.parts))
+    join.finish()
+    final = join.parts[0][0]
+    _indexed(final, 144)
+
+    def clocks(path: Path) -> list[tuple[Fraction, Fraction]]:
+        with av.open(str(path)) as container:
+            return [
+                (p.pts * p.time_base, p.dts * p.time_base)
+                for p in container.demux(video=0)
+                if p.size
+            ]
+
+    assert clocks(final) == clocks(preview)
+    assert min(pts for pts, _ in clocks(final)) == 0
+
+    # A valid input may also start after zero. Keep that exact edit-list gap;
+    # the default millisecond movie clock used to round it by four video ticks.
+    shifted = tmp_path / "shifted.mp4"
+    with (
+        av.open(str(source)) as incoming,
+        av.open(str(shifted), "w", options={"movie_timescale": "12288"}) as outgoing,
+    ):
+        track = outgoing.add_stream_from_template(incoming.streams.video[0])
+        for packet in incoming.demux(video=0):
+            if packet.size:
+                packet.pts += 1024
+                packet.dts += 1024
+                packet.stream = track
+                outgoing.mux(packet)
+    indexed = tmp_path / "shifted-indexed.mp4"
+    _codec.finalize_mp4(shifted, indexed, max_bytes=1 << 20)
+    assert clocks(indexed) == clocks(shifted)

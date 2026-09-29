@@ -515,14 +515,22 @@ def finalize_mp4(source: Path, destination: Path, *, max_bytes: int) -> None:
     The destination is new and is removed on failure. The source stays untouched.
     """
     av = _av()
-    with destination.open("x+b") as raw:
-        try:
+    raw = destination.open("x+b")
+    try:
+        with raw:
             with av.open(str(source), "r") as incoming:
+                # Edit-list gaps use the movie clock. Millisecond rounding can move
+                # reordered video by several track ticks, even during packet copy.
+                timescale = math.lcm(*(Fraction(s.time_base).denominator for s in incoming.streams))
                 outgoing = av.open(
                     _BoundedWriter(raw, max_bytes),
                     "w",
                     format="mp4",
-                    options={"fflags": "+bitexact", "use_editlist": "1"},
+                    options={
+                        "fflags": "+bitexact",
+                        "use_editlist": "1",
+                        "movie_timescale": str(min(timescale, (1 << 31) - 1)),
+                    },
                 )
                 try:
                     tracks = {
@@ -541,9 +549,9 @@ def finalize_mp4(source: Path, destination: Path, *, max_bytes: int) -> None:
                 outgoing.close()
             raw.flush()
             os.fsync(raw.fileno())
-        except BaseException:
-            destination.unlink(missing_ok=True)
-            raise
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -1166,8 +1174,8 @@ class FragmentedJoin:
             "fflags": "+bitexact",
             "frag_duration": "1000000",
             "movflags": "+empty_moov+default_base_moof+frag_keyframe+skip_sidx+skip_trailer"
-            + ("+delay_moov" if first and self._aac is not None else ""),
-            "use_editlist": "1" if first and self._aac is not None else "0",
+            + ("+delay_moov" if first else ""),
+            "use_editlist": "1" if first else "0",
         }
         container = self._av.open(str(temporary), "w", format="mp4", options=options)
         try:
