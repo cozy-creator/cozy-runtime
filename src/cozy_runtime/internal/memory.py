@@ -247,6 +247,8 @@ class Planner:
         self.stored = self.refilled = 0
         #: allocator bytes the attempt's weight moves added (negative: gave back)
         self.transition = 0
+        #: weights left the device since the last cap: their bytes sit in the allocator's cache
+        self.dropped = False
         self.log: list[str] = []
         self.plans: dict[str, list[str]] = {}
         self.oom_asked = 0
@@ -289,20 +291,23 @@ class Planner:
         return int(free), int(total)
 
     def allocatable(self) -> int:
-        """Bytes an op may still allocate: inside the grant, and never the driver's headroom
-        (one `overhead` kept free on the device). Negative when the process holds more than
-        its grant, and the plan must give bytes back."""
+        """Bytes the allocator may still reserve: inside the grant, and never the driver's
+        headroom (one `overhead` kept free on the device). Its cache is no credit: holes
+        between live blocks cannot be released, and the cap counts them. Negative when the
+        process holds more than its grant, and the plan must give bytes back."""
         if not self.cuda:
             return 1 << 62
         free, total = self._driver()
-        reserved = self._reserved()
-        granted = (total if self.grant is None else self.grant) - self.overhead - reserved
-        return min(granted, free - self.overhead) + reserved - self._allocated()
+        granted = (total if self.grant is None else self.grant) - self.overhead - self._reserved()
+        return min(granted, free - self.overhead)
 
     def _cap(self) -> None:
         """The allocator stops at the grant, so an overrun is a clean OOM, not a driver fault."""
         if not self.cuda:
             return
+        if self.dropped:
+            tiers.trim(self.torch)
+            self.dropped = False
         free, total = self._driver()
         limit = min(
             (total if self.grant is None else self.grant) - self.overhead,
@@ -754,6 +759,12 @@ class Planner:
     ) -> Plan:
         rungs, area = self._rungs(held, key, tiles)
         estimates = [(rung, *self._estimate(key, rung, area)) for rung in rungs]
+        if self.cuda and self._reserved() > self._allocated():
+            resident = self._need(held.part, len(held.part.blocks))
+            if resident + max(working or 0 for _, working, _ in estimates) > self.allocatable():
+                # The previous op's cache may be all that stands in the way: give it back so
+                # the plan reads what can really be reserved.
+                tiers.trim(self.torch)
         snapshot = (
             sum(x.numel() * x.element_size() for x in leaves if isinstance(x, self.torch.Tensor))
             if retryable
@@ -935,6 +946,7 @@ class Planner:
         for unit in part.blocks[plan.keep :]:
             if unit.tier == DEVICE:
                 self._home(part, unit)
+                self.dropped = True
         self._load_common(held)
         for unit in part.blocks[: plan.keep]:
             self._load(part, unit)
@@ -990,6 +1002,7 @@ class Planner:
             return
         units = part.blocks if held.key in common and not everything else part.units
         moving = [unit for unit in units if unit.tier == DEVICE]
+        self.dropped |= bool(moving)
         if (
             len(moving) == len(part.units)
             and part.store is not None
