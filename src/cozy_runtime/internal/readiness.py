@@ -249,6 +249,7 @@ def receipt_payload(
     worker_internal_port: int,
     media_internal_port: int,
     gpus: list[RuntimeGPU],
+    process_incarnation: str = "",
 ) -> bytes:
     """The bootstrap payload: everything the pod MEASURED about itself.
 
@@ -298,6 +299,7 @@ def receipt_payload(
             "worker_internal_port": worker_internal_port,
             "worker_listener_bound": True,
             "worker_protocol": "cozy.worker.v1",
+            **({"process_incarnation": process_incarnation} if process_incarnation else {}),
         }
     )
 

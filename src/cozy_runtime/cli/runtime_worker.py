@@ -184,6 +184,7 @@ def _run(
             worker_internal_port=config.worker_internal_port,
             media_internal_port=config.media_internal_port,
             gpus=gpus,
+            process_incarnation=config.process_incarnation,
         )
         # Claims open before the payload that tells a claimant to claim.
         worker.mark_claim_ready()
@@ -229,6 +230,8 @@ def _worker_options(
         worker_id=config.worker_id,
         instance_id=boot_id,
         worker_boot_id=boot_id,
+        sole_supervisor=config.control_mode == "supervisor",
+        process_incarnation=config.process_incarnation,
         ownership_required=layout.readiness_envelope.exists(),
         owns_tensorfs_store=True,
         accelerator_backend="cuda" if gpus else "none",

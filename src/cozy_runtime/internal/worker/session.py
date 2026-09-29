@@ -312,6 +312,10 @@ class WorkerOptions:
     """Externally provisioned boot id for fixed pods; local workers mint one in-process."""
     ownership_required: bool = False
     """A retained pod readiness envelope requires existing accepted control history."""
+    sole_supervisor: bool = False
+    """Private machine-agent contract: authentication without durable client ownership."""
+    process_incarnation: str = ""
+    """Identifies this supervised process; execution and checkpoint identities outlive it."""
     owns_tensorfs_store: bool = False
     """The fixed pod owns this Store; local workers may share one and own only their work."""
     #: PROVENANCE, and every one of these is EMPTY when the launch did not supply it (#494g).
@@ -955,7 +959,11 @@ class Worker:
         )
         # ExecutorSupervision already holds the process-lifetime worker-root lease.
         # Restore only under that lease so two processes cannot allocate one stream.
-        self.ownership_path = self.root / "ownership.json" if options.worker_boot_id else None
+        self.ownership_path = (
+            self.root / "ownership.json"
+            if options.worker_boot_id and not options.sole_supervisor
+            else None
+        )
         if self.ownership_path is not None:
             from cozy_runtime.internal.worker import ownership
 
@@ -972,6 +980,13 @@ class Worker:
             self.fence.record_owner_id = identity
             self.fence.control_stream_epoch = stream
             self.fence.record_owner_recorded = stream != 0
+        if options.sole_supervisor:
+            # Keep the existing machine journal namespace on adoption. These fixed wire
+            # fields name records; they do not elect an owner or survive as control history.
+            self.fence.record_owner_epoch = 1
+            self.fence.record_owner_id = "cozy-local-client"
+            self.fence.record_owner_recorded = True
+            self.fence.wire_minor = WIRE_MINOR
         self.supervision.on_change = self.executor_changed
         # One accepted stream at a time may mutate control state. Claims take this through
         # their snapshot, so ownership cannot move in the middle of convergence and a frame
@@ -2075,6 +2090,10 @@ class Worker:
         from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 
         with self.claim_lock:
+            if self.options.sole_supervisor and (
+                not self.claim_ready.is_set() or self.stop.is_set()
+            ):
+                raise WorkspaceRefusal("machine coordinator is not accepting calls")
             if (
                 not self.fence.record_owner_recorded
                 or claim.record_owner_id != self.fence.record_owner_id
@@ -3543,6 +3562,13 @@ class Worker:
                     pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
                     "the worker listener is bound but the readiness barrier is not committed",
                 )
+            if self.options.sole_supervisor and (
+                claim.record_owner_id != "cozy-local-client" or claim.record_owner_epoch != 1
+            ):
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
+                    "private supervisor call names another machine execution namespace",
+                )
             if (
                 self.fence.record_owner_recorded
                 and claim.record_owner_id != self.fence.record_owner_id
@@ -3623,6 +3649,8 @@ class Worker:
 
         Called under `claim_lock` and the existing process-lifetime worker-root lease.
         """
+        if self.options.sole_supervisor:
+            return  # authenticated private framing has no durable ownership history
         if self.ownership_path is not None:
             from cozy_runtime.internal.worker import ownership
 

@@ -130,6 +130,10 @@ class WorkerHostConfig:
     """Worker-only Hub capability; never inherited by a job executor."""
     object_storage_hosts: tuple[str, ...] = ()
     layout: host_paths.Layout = field(default_factory=host_paths.Layout)
+    control_mode: str = "legacy"
+    """The supervisor launch contract; absent keeps supported older Hosts working."""
+    process_incarnation: str = ""
+    """Fresh supervisor-minted child identity, never durable execution ownership."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +466,14 @@ def read_worker_host_config(
         raise ConfigError(
             "worker_host_config", "storage admission must use inherited fd 4", "fix host launch"
         )
+    control_mode = env.get("COZY_RUNTIME_CONTROL_MODE", "legacy")
+    if control_mode not in {"legacy", "supervisor"}:
+        raise ConfigError(
+            "worker_host_config", "unsupported Runtime control contract", "update the host/Runtime"
+        )
+    process_incarnation = (
+        bounded("COZY_RUNTIME_PROCESS_INCARNATION") if control_mode == "supervisor" else ""
+    )
     hub_origin, worker_token = _machine_publication_authority(
         publication_authority_path or layout.machine_publication_authority,
         bounded("COZY_WORKER_ID"),
@@ -480,6 +492,8 @@ def read_worker_host_config(
         control_public_key_ed25519_b64url=public_key_text,
         media_token_sha256=tuple(str(item) for item in token_hashes),
         layout=layout,
+        control_mode=control_mode,
+        process_incarnation=process_incarnation,
         child_base_env=tuple(
             sorted(
                 (name, value) for name, value in env.items() if name in WORKER_CHILD_PLATFORM_ENV
