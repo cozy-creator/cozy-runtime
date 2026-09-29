@@ -1834,7 +1834,10 @@ class Planner:
 
         admitted = reserve()
         if not admitted:
-            self._release_host(nbytes, protected=protected)
+            if self._release_host(nbytes, protected=protected):
+                # The active requester cannot be an idle Worker victim. Return its
+                # own allocator-free pages before asking for observed headroom again.
+                proctree.trim_host_allocator()
             admitted = reserve()
         if not admitted:
             yield False
@@ -1856,7 +1859,9 @@ class Planner:
         refusal.shortfall["resource"] = "ram"
         return refusal
 
-    def _release_host(self, nbytes: int, *, protected: tuple[tiers.Unit, ...] = ()) -> None:
+    def _release_host(self, nbytes: int, *, protected: tuple[tiers.Unit, ...] = ()) -> bool:
+        """Drop eligible local backing; whether references changed is not RSS credit."""
+        released = False
         running = {frame.held.key for frame in self.stack}
         idle = sorted(
             (held for held in self.held.values() if held.key not in running),
@@ -1868,10 +1873,11 @@ class Planner:
                     if unit in protected:
                         continue
                     if nbytes <= 0:
-                        return
+                        return released
                     if clean and unit.tier == DEVICE and unit.host:
                         nbytes -= sum(t.numel() * t.element_size() for t in unit.host.values())
                         unit.host.clear()
+                        released = True
                     elif (
                         not clean
                         and unit.tier == HOST
@@ -1883,6 +1889,8 @@ class Planner:
                         nbytes -= unit.nbytes
                         self.stored += unit.nbytes
                         tiers.to_disk(self.torch, held.part, unit)
+                        released = True
+        return released
 
     def _enter_unit(self, part: tiers.Component, unit: tiers.Unit) -> None:
         """A block's forward is about to run: stream it in if the plan left it out."""
