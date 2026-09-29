@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -43,7 +45,7 @@ def installed(root: Path, identifier: str = "one") -> package_installation.Insta
     return package_installation.open_installation(root, identifier)
 
 
-def worker(describe):
+def worker(describe: Callable[..., bytes]) -> SimpleNamespace:
     value = SimpleNamespace(
         preparation_slot=threading.Lock(), _installed_interfaces={}, _describe_in_slot=describe
     )
@@ -61,7 +63,12 @@ def test_private_replay_imports_real_cpu_app_once(tmp_path: Path) -> None:
     )
     calls = []
 
-    def describe(environment, distribution, *, application):
+    def describe(
+        environment: package_installation.InstalledEnvironment,
+        distribution: str,
+        *,
+        application: str,
+    ) -> bytes:
         calls.append(environment.incarnation)
         return subprocess.check_output(
             [
@@ -106,7 +113,14 @@ def test_private_replay_imports_real_cpu_app_once(tmp_path: Path) -> None:
 
 def test_new_source_and_rebuild_same_path_miss(tmp_path: Path) -> None:
     calls = []
-    held = worker(lambda *a, **k: calls.append(a[0]) or RAW)
+
+    def describe(
+        env: package_installation.InstalledEnvironment, *args: object, **kwargs: object
+    ) -> bytes:
+        calls.append(env)
+        return RAW
+
+    held = worker(describe)
     first = installed(tmp_path)
     held._describe_installed(first, "tiny")
     held._describe_installed(package_installation.open_installation(tmp_path, "one"), "tiny")
@@ -119,10 +133,10 @@ def test_new_source_and_rebuild_same_path_miss(tmp_path: Path) -> None:
 
 
 def test_failures_invalid_documents_and_mutable_environments_are_not_cached(tmp_path: Path) -> None:
-    answers = iter([ValueError("failed"), b"{}", RAW, RAW])
+    answers: Iterator[Exception | bytes] = iter([ValueError("failed"), b"{}", RAW, RAW])
     calls = []
 
-    def describe(*args, **kwargs):
+    def describe(*args: object, **kwargs: object) -> bytes:
         calls.append(1)
         answer = next(answers)
         if isinstance(answer, Exception):
@@ -143,7 +157,14 @@ def test_failures_invalid_documents_and_mutable_environments_are_not_cached(tmp_
 
 def test_distribution_application_and_concurrent_replays(tmp_path: Path) -> None:
     calls = []
-    held = worker(lambda *a, **k: calls.append((a[1], k["application"])) or RAW)
+
+    def describe(
+        env: package_installation.InstalledEnvironment, distribution: str, *, application: str
+    ) -> bytes:
+        calls.append((distribution, application))
+        return RAW
+
+    held = worker(describe)
     env = installed(tmp_path)
     with ThreadPoolExecutor(max_workers=4) as pool:
         assert (
@@ -164,11 +185,13 @@ def test_adopted_external_record_has_no_cache_incarnation(tmp_path: Path) -> Non
     assert env.incarnation is not None
 
 
-def test_supervised_describe_does_not_arm_fixed_alarm(tmp_path: Path, monkeypatch) -> None:
+def test_supervised_describe_does_not_arm_fixed_alarm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from cozy_runtime.internal.executor import Executor
     from cozy_runtime.internal.executor_commands import DescribeInstalled
 
-    monkeypatch.setattr(discovery.signal, "setitimer", lambda *a: pytest.fail("fixed import alarm"))
+    monkeypatch.setattr(signal, "setitimer", lambda *a: pytest.fail("fixed import alarm"))
     monkeypatch.syspath_prepend(str(tmp_path))
     (tmp_path / "supervised_tiny.py").write_text(
         "from cozy_runtime.author import App\napp = App()\n"
@@ -183,22 +206,31 @@ def test_supervised_describe_does_not_arm_fixed_alarm(tmp_path: Path, monkeypatc
     )["ok"]
 
 
-def test_explicit_builder_deadline_remains(monkeypatch) -> None:
+def test_explicit_builder_deadline_remains(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
-    monkeypatch.setattr(discovery.signal, "setitimer", lambda *a: calls.append(a))
+    monkeypatch.setattr(signal, "setitimer", lambda *a: calls.append(a))
     with discovery._wall_clock(60, "tiny:app"):
         pass
     assert [seconds for _, seconds in calls] == [60, 0]
 
 
-def test_sdk_rollback_rebuilds_same_generation_and_misses(tmp_path: Path, monkeypatch) -> None:
+def test_sdk_rollback_rebuilds_same_generation_and_misses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     sdk = {"cozy-runtime": "first"}
     monkeypatch.setattr(package_installation, "machine_sdk", lambda: dict(sdk))
     env = installed(tmp_path)
     calls = []
-    held = worker(lambda *a, **k: calls.append(a[0].incarnation) or RAW)
 
-    def build(directory, generation, python, **kwargs):
+    def describe(
+        env: package_installation.InstalledEnvironment, *args: object, **kwargs: object
+    ) -> bytes:
+        calls.append(env.incarnation)
+        return RAW
+
+    held = worker(describe)
+
+    def build(directory: Path, generation: Path, python: Path, **kwargs: object) -> dict[str, str]:
         (generation / "bin").mkdir(parents=True)
         (generation / "bin/python").touch()
         (generation / "lib/python3.12/site-packages").mkdir(parents=True)
@@ -215,10 +247,19 @@ def test_sdk_rollback_rebuilds_same_generation_and_misses(tmp_path: Path, monkey
     assert len(set(calls)) == 3
 
 
-def test_repair_replaces_record_even_with_same_generation(tmp_path: Path, monkeypatch) -> None:
+def test_repair_replaces_record_even_with_same_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     env = installed(tmp_path)
     calls = []
-    held = worker(lambda *a, **k: calls.append(a[0].incarnation) or RAW)
+
+    def describe(
+        env: package_installation.InstalledEnvironment, *args: object, **kwargs: object
+    ) -> bytes:
+        calls.append(env.incarnation)
+        return RAW
+
+    held = worker(describe)
     held._describe_installed(env, "tiny")
     # A missing record makes installation creation repair the retained uv state.
     (tmp_path / "installations/one/installation.json").unlink()
