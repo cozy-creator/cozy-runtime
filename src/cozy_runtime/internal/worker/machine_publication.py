@@ -144,7 +144,7 @@ def registrations(path: Path) -> tuple[tuple[PublicationAuthority, ...], list[st
     for entry in document.hubs[:64]:
         try:
             hub = msgspec.json.decode(entry, type=_Hub)
-            parse_tensorhub_origin(hub.origin)
+            parse_tensorhub_origin(hub.origin, allow_loopback_http=bool(hub.access_token))
             token = base64.urlsafe_b64decode(hub.worker_token + "=" * (-len(hub.worker_token) % 4))
             valid_access = (
                 bool(hub.access_token)
@@ -365,7 +365,7 @@ class MachinePublicationClient:
         credential: Callable[[], PublicationAuthority] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        parsed = parse_tensorhub_origin(origin)
+        parsed = parse_tensorhub_origin(origin, allow_loopback_http=bool(access_token))
         try:
             valid = str(uuid.UUID(authorization_id)) == authorization_id
         except ValueError:
