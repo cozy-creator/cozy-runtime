@@ -51,6 +51,8 @@ func (l *updateLauncher) maintain(op string, _ []string) (string, error) {
 		return strings.Join(l.pair, "\n"), nil
 	case "restart":
 		return "accepted", nil
+	case "update-stage":
+		return "prepared", nil
 	case "update-prepare":
 		if l.installs.Add(1) == 1 && l.rollback != nil {
 			close(l.rollback)

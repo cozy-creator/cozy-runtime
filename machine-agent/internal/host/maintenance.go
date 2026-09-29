@@ -30,6 +30,39 @@ func maintain(root string, p *runtimeProcess, op string, args []string) (string,
 }
 func maintainWithAgent(root string, p *runtimeProcess, op string, args []string, runningAgent string) (string, error) {
 	switch op {
+	case "update-cleanup":
+		if len(args) != 1 || args[0] == "" {
+			return "", errors.New("cleanup requires update identity")
+		}
+		m := &Machine{layout: NewLayout(&Grant{Root: root})}
+		var prepared preparedPair
+		raw, err := os.ReadFile(m.startupPath("prepared.json"))
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if err := json.Unmarshal(raw, &prepared); err != nil {
+			return "", err
+		}
+		if prepared.Operation == args[0] {
+			m.removePreparedOverlay(prepared.Overlay)
+			return "", os.Remove(m.startupPath("prepared.json"))
+		}
+		return "", nil
+	case "update-stage":
+		if len(args) != 1 {
+			return "", errors.New("candidate staging requires one pair")
+		}
+		var request pairTransaction
+		if err := json.Unmarshal([]byte(args[0]), &request); err != nil {
+			return "", err
+		}
+		grant := &Grant{Root: root, StoreRoot: request.Store, Lifetime: request.Lifetime, agentSelection: request.Agent}
+		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
+		_, err := m.stagePair(context.Background(), request.Before, request.After, request.Candidate, request.Previous, request.Operation)
+		return "prepared", err
 	case "update-prepare":
 		if p != nil && !p.exited() || len(args) != 1 {
 			return "", errors.New("update preparation requires a stopped Runtime")
@@ -53,7 +86,10 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 		if err := m.startupPython(context.Background(), &state, "inspect", m.layout.Store); err != nil {
 			return "", err
 		}
-		if !state.Quiescent {
+		if state.pairVersions != request.Before {
+			return "", errors.New("installed pair changed while candidate awaited activation")
+		}
+		if !state.Quiescent && (p == nil || !p.guardedStopped.Load()) {
 			return "", errors.New("Runtime quiescence required for explicit software changes")
 		}
 		var status startupStatus
@@ -70,7 +106,25 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 		if err := m.snapshotPolicy(&status, &softwarePolicy{mode, request.Agent}); err != nil {
 			return "", err
 		}
-		if err := m.preparePair(context.Background(), request.Before, request.After, request.Candidate, request.Previous, status, request.Pin); err != nil {
+		var prepared preparedPair
+		raw, err := os.ReadFile(m.startupPath("prepared.json"))
+		if err == nil {
+			err = json.Unmarshal(raw, &prepared)
+		}
+		if err != nil || request.Operation == "" || prepared.Operation != request.Operation || prepared.Before != request.Before || prepared.After != request.After {
+			if request.Operation != "" {
+				return "", errors.New("prepared candidate for this update is unavailable")
+			}
+			// Older request planes ask the stable guardian to prepare only after
+			// guarded shutdown. Preserve that safe first-upgrade path.
+			staged, stageErr := m.stagePair(context.Background(), request.Before, request.After, request.Candidate, request.Previous, request.Operation)
+			if stageErr != nil {
+				return "", stageErr
+			}
+			prepared = *staged
+		}
+
+		if err := m.activatePair(context.Background(), &prepared, status, request.Pin); err != nil {
 			if m.transactionPending() {
 				return "recovery_required", err
 			}
@@ -178,6 +232,10 @@ func guardedRestart(root string, p *runtimeProcess) (string, error) {
 			if fact.Status == "accepted" {
 				p.stop() // acceptance proves no work; measure shutdown progress
 				<-p.done
+				if p.err != nil {
+					return "", fmt.Errorf("guarded Runtime shutdown did not complete cleanly: %w", p.err)
+				}
+				p.guardedStopped.Store(true)
 			}
 			return fact.Status, nil
 		}

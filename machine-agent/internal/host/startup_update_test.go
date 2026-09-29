@@ -221,9 +221,10 @@ func TestAutomaticAndExplicitUpdatesShareRecoveryAndCommit(t *testing.T) {
 	for _, mode := range []struct {
 		explicit bool
 		lifetime string
-	}{{false, "persistent"}, {true, "persistent"}, {true, "rental"}} {
+		guarded  bool
+	}{{false, "persistent", false}, {true, "persistent", false}, {true, "rental", false}, {true, "persistent", true}} {
 		explicit := mode.explicit
-		t.Run(fmt.Sprint(explicit)+"/"+mode.lifetime, func(t *testing.T) {
+		t.Run(fmt.Sprint(explicit)+"/"+mode.lifetime+fmt.Sprint(mode.guarded), func(t *testing.T) {
 			root := t.TempDir()
 			m := &Machine{grant: &Grant{Root: root, Lifetime: "persistent"}, layout: NewLayout(&Grant{Root: root}), log: io.Discard}
 			before := pairVersions{Runtime: "0.18.86", TensorFS: "0.3.78"}
@@ -275,10 +276,33 @@ func TestAutomaticAndExplicitUpdatesShareRecoveryAndCommit(t *testing.T) {
  esac`, root, root, root, root, root))
 			if explicit {
 				request, _ := json.Marshal(pairTransaction{Before: before, After: after, Previous: previous, Candidate: candidate, Store: m.layout.Store, Lifetime: mode.lifetime, Pin: true, Agent: "bundled"})
-				answer, err := maintain(root, nil, "update-prepare", []string{string(request)})
+				var stopped *runtimeProcess
+				if mode.guarded {
+					// Paused/retained records are not live work. A live guarded shutdown
+					// authorizes handoff; an unexplained cold exit does not.
+					path := filepath.Join(root, "opt/cozy/python/bin/python")
+					script, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte(strings.ReplaceAll(string(script), `"quiescent":true`, `"quiescent":false`)), 0755); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := maintain(root, nil, "update-prepare", []string{string(request)}); err == nil {
+						t.Fatal("cold retained work authorized activation")
+					}
+					stopped = &runtimeProcess{done: make(chan struct{})}
+					close(stopped.done)
+					stopped.guardedStopped.Store(true)
+					// Old request planes omit update-stage and must still upgrade safely.
+				} else if _, err := maintain(root, nil, "update-stage", []string{string(request)}); err != nil {
+					t.Fatal(err)
+				}
+				answer, err := maintain(root, stopped, "update-prepare", []string{string(request)})
 				if err != nil || answer != "boot_pending" {
 					t.Fatalf("explicit preparation: %s %v", answer, err)
 				}
+
 			} else if err := m.preparePair(context.Background(), before, after, candidate, previous, startupStatus{Workspace: "original"}, false); err != nil {
 				t.Fatal(err)
 			}

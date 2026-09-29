@@ -31,6 +31,7 @@ type runtimeProcess struct {
 	claimDone        chan struct{} // the authenticated readiness attempt has settled
 	startupCommitted bool          // private installation journal committed; read after claimDone
 	err              error
+	guardedStopped   atomic.Bool // the live Worker accepted restart and completed shutdown
 	stopped          atomic.Bool // this daemon asked it to stop
 	stop             func()      // cooperative: EOF on fd 3, then SIGKILL once it stops moving
 	pid              int         // known where this process started it

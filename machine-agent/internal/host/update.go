@@ -65,13 +65,14 @@ type pairVersions struct {
 }
 
 type updateStatus struct {
-	Operation        string       `json:"operation"`
-	State            string       `json:"state"` // waiting | installing | starting | rolling_back | succeeded | rolled_back | failed
-	Error            string       `json:"error,omitempty"`
-	From             pairVersions `json:"from"`
-	To               pairVersions `json:"to"`
-	Pinned           bool         `json:"pinned,omitempty"`            // the caller explicitly selected this installed pair
-	PreviouslyPinned bool         `json:"previously_pinned,omitempty"` // failed maintenance retains the previous selection
+	Operation        string         `json:"operation"`
+	Request          *updateRequest `json:"request,omitempty"`
+	State            string         `json:"state"` // waiting | preparing | waiting_activation | installing | starting | rolling_back | succeeded | rolled_back | failed
+	Error            string         `json:"error,omitempty"`
+	From             pairVersions   `json:"from"`
+	To               pairVersions   `json:"to"`
+	Pinned           bool           `json:"pinned,omitempty"`            // the caller explicitly selected this installed pair
+	PreviouslyPinned bool           `json:"previously_pinned,omitempty"` // failed maintenance retains the previous selection
 }
 
 func (s updateStatus) terminal() bool {
@@ -95,11 +96,17 @@ func (m *Machine) stagePath(names ...string) string {
 	return filepath.Join(append([]string{m.layout.State, "runtime-update"}, names...)...)
 }
 
-// openUpdates reads the last update. One this daemon was part-way through when it stopped
-// failed at the request layer; the shared private journal recovers installation before admission.
+// openUpdates resumes a prepared request after initialization. Interrupted shared
+// installation is recovered by the private journal before Runtime admission.
 func (m *Machine) openUpdates() {
 	var status updateStatus
 	if raw, err := os.ReadFile(m.updatePath()); err == nil && json.Unmarshal(raw, &status) == nil {
+		if status.Request != nil && (status.State == "waiting" || status.State == "preparing" || status.State == "waiting_activation") {
+			m.updates.status, m.updates.active = &status, status.Operation
+			go func() { <-m.initialized; m.runUpdate(*status.Request, status) }()
+			return
+		}
+
 		if !status.terminal() && (m.grant.bootstrap == nil || !m.grant.bootstrap.Pending) {
 			status.State, status.Error = "failed", "the machine restarted during its Runtime update; installation recovery runs before admission"
 			if m.grant.bootstrap != nil && m.grant.bootstrap.CommittedPair != nil && *m.grant.bootstrap.CommittedPair == status.To {
@@ -114,11 +121,14 @@ func (m *Machine) openUpdates() {
 	}
 }
 
-func (m *Machine) saveUpdate(status updateStatus) {
+func (m *Machine) saveUpdate(status updateStatus) error {
 	m.updates.mu.Lock()
 	defer m.updates.mu.Unlock()
+	if err := m.writeUpdate(status); err != nil {
+		return err
+	}
 	m.updates.status = &status
-	_ = m.writeUpdate(status)
+	return nil
 }
 
 // writeUpdate persists a status without publishing it. Admission must succeed
@@ -349,7 +359,7 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pinned := *request.Pin
-	status := updateStatus{Operation: request.Operation, State: "waiting", From: installed, Pinned: pinned}
+	status := updateStatus{Operation: request.Operation, State: "waiting", From: installed, Pinned: pinned, Request: &request}
 	status.PreviouslyPinned = m.explicitlyPinnedPair(installed)
 	if err := m.writeUpdate(status); err != nil {
 		http.Error(w, "cannot record the Runtime update: "+err.Error(), http.StatusServiceUnavailable)
@@ -383,11 +393,19 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		owned := m.updates.active == request.Operation
 		m.updates.mu.Unlock()
 		if owned {
+			// Persist the terminal request before deleting the only prepared candidate.
+			// Observation still publishes terminal status only after cleanup completes.
+			if err := m.writeUpdate(status); err != nil {
+				m.setUpdating(false)
+				return
+			}
+			if status.terminal() {
+				_, _ = m.launcher.maintain("update-cleanup", []string{request.Operation})
+			}
 			if err := os.RemoveAll(m.stagePath()); err != nil {
 				fmt.Fprintln(m.log, "cozy machine: cannot remove completed update files:", err)
 			}
 			m.setUpdating(false)
-			_ = m.writeUpdate(status)
 			m.updates.mu.Lock()
 			m.updates.status, m.updates.active = &status, ""
 			m.updates.mu.Unlock()
@@ -398,31 +416,58 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		fmt.Fprintln(m.log, "cozy machine: Runtime update", status.Operation, state+":", err)
 	}
 	ctx := context.Background()
-	previous, err := m.previousPair(ctx, status.From)
-	if err != nil {
-		fail("failed", err)
-		return
-	}
-	candidate, err := m.candidatePair(ctx, request, previous)
-	if err != nil {
-		fail("failed", err)
-		return
-	}
-	for _, wheel := range candidate {
-		if wheelDistribution(filepath.Base(wheel)) == hostruntime.Distribution {
-			status.To.Runtime = wheelVersion(wheel)
-		} else {
-			status.To.TensorFS = wheelVersion(wheel)
+	var previous, candidate []string
+	var err error
+	if status.State != "waiting_activation" {
+		previous, err = m.previousPair(ctx, status.From)
+		if err != nil {
+			fail("failed", err)
+			return
+		}
+		candidate, err = m.candidatePair(ctx, request, previous)
+		if err != nil {
+			fail("failed", err)
+			return
+		}
+		for _, wheel := range candidate {
+			if wheelDistribution(filepath.Base(wheel)) == hostruntime.Distribution {
+				status.To.Runtime = wheelVersion(wheel)
+			} else {
+				status.To.TensorFS = wheelVersion(wheel)
+			}
 		}
 	}
-	m.saveUpdate(status)
-	if err := m.quiesce(ctx); err != nil {
+	payload, _ := json.Marshal(pairTransaction{Operation: request.Operation, Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned, Agent: request.Agent})
+	if status.State != "waiting_activation" {
+		status.State = "preparing"
+		if err := m.saveUpdate(status); err != nil {
+			fail("failed", err)
+			return
+		}
+		if _, err := m.launcher.maintain("update-stage", []string{string(payload)}); err != nil {
+			fail("failed", err)
+			return
+		}
+	}
+	waiting := func() error {
+		if status.State == "waiting_activation" {
+			return nil
+		}
+		status.State = "waiting_activation"
+		return m.saveUpdate(status)
+	}
+	if err := m.quiesce(ctx, waiting); err != nil {
 		fail("failed", err)
 		return
 	}
 	status.State = "installing"
-	m.saveUpdate(status)
-	payload, _ := json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned, Agent: request.Agent})
+	if err := m.saveUpdate(status); err != nil {
+		fail("failed", err)
+		if launchErr := m.launch(); launchErr != nil {
+			m.restarts.fail(launchErr)
+		}
+		return
+	}
 	answer, err := m.launcher.maintain("update-prepare", []string{string(payload)})
 	if err != nil || answer != "boot_pending" {
 		if err == nil {
@@ -480,20 +525,41 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 
 // quiesce holds the machine for the update once its Runtime accepts a guarded restart. A busy
 // Runtime is asked again; running work is never interrupted.
-func (m *Machine) quiesce(ctx context.Context) error {
+func (m *Machine) quiesce(ctx context.Context, onWaiting ...func() error) error {
+	waiting := func() error {
+		if len(onWaiting) > 0 {
+			return onWaiting[0]()
+		}
+		return nil
+	}
 	wait := time.Second
 	for {
 		m.launchMu.Lock()
 		m.setUpdating(true)
 		m.mu.Lock()
-		process, ready := m.proc, m.ready
+		process, ready, preparing := m.proc, m.ready, m.active > 0
 		m.mu.Unlock()
+		if preparing {
+			m.launchMu.Unlock()
+			if err := waiting(); err != nil {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
 		if process != nil && !process.exited() {
 			select {
 			case <-ready:
 			default:
 				m.setUpdating(false)
 				m.launchMu.Unlock()
+				if err := waiting(); err != nil {
+					return err
+				}
 				select {
 				case <-ready:
 				case <-process.done:
@@ -512,6 +578,9 @@ func (m *Machine) quiesce(ctx context.Context) error {
 		m.setUpdating(false)
 		m.launchMu.Unlock()
 		if err != nil {
+			return err
+		}
+		if err := waiting(); err != nil {
 			return err
 		}
 		select {

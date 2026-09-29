@@ -30,6 +30,7 @@ type softwareState struct {
 }
 
 type pairTransaction struct {
+	Operation           string
 	Pin                 bool
 	Agent               string
 	Before, After       pairVersions
@@ -329,6 +330,11 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 		fmt.Fprintln(m.log, "cozy machine: restored the verified pair after interrupted startup update")
 		return nil
 	}
+	// A durable explicit candidate owns selection across request-plane restarts.
+	var update updateStatus
+	if raw, err := os.ReadFile(m.updatePath()); err == nil && json.Unmarshal(raw, &update) == nil && update.Request != nil && !update.terminal() {
+		return nil
+	}
 	automatic, policyErr := automaticSoftwareUpdates(m.layout.Root)
 	if policyErr != nil {
 		fmt.Fprintln(m.log, "cozy machine: startup update policy deferred:", policyErr)
@@ -425,32 +431,32 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 	return nil
 }
 
-// preparePair is the sole stage/install/recovery engine for automatic and
-// explicit updates. Both finish through the same authenticated readiness gate.
-func (m *Machine) preparePair(ctx context.Context, verified, next pairVersions, candidate, previous []string, status startupStatus, pinned bool) error {
+// stagePair installs and verifies the candidate in a private overlay, leaving
+// the live interpreter untouched until guarded activation.
+func (m *Machine) stagePair(ctx context.Context, verified, next pairVersions, candidate, previous []string, operation ...string) (*preparedPair, error) {
 	if !samePair(candidate, next) || !samePair(previous, verified) {
-		return errors.New("update pair is incomplete")
+		return nil, errors.New("update pair is incomplete")
 	}
 	var private []string
 	for _, path := range candidate {
 		digest, err := hashFile(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		copy, err := m.startupCopyWheel(path, "candidate", digest)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		private = append(private, copy)
 	}
 	candidate = private
 	kept, err := m.startupPrevious(previous)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	additions, err := m.stageDependencies(ctx, candidate)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	complete := append([]string{}, candidate...)
 	for _, wheel := range additions {
@@ -460,27 +466,124 @@ func (m *Machine) preparePair(ctx context.Context, verified, next pairVersions, 
 	// imports the two candidate distributions from it against the actual base deps.
 	overlay, err := os.MkdirTemp(m.startupPath(), "probe-")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer os.RemoveAll(overlay)
+	retained := false
+	defer func() {
+		if !retained {
+			_ = os.RemoveAll(overlay)
+		}
+	}()
 	args := append([]string{"pip", "install", "--no-config", "--offline", "--no-deps", "--target", overlay, "--python", filepath.Join(m.layout.Root, "opt/cozy/python/bin/python")}, complete...)
 	cmd := exec.CommandContext(ctx, filepath.Join(m.layout.Root, "usr/local/bin/uv"), args...)
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + filepath.Join(m.layout.Root, "tmp")}
 	if _, err := progressChildOutput(cmd, true); err != nil {
-		return fmt.Errorf("candidate staging failed: %w", err)
+		return nil, fmt.Errorf("candidate staging failed: %w", err)
 	}
 	probed, err := m.startupVerify(ctx, overlay)
 	if err != nil || probed != next {
-		if !slices.Contains(status.Failed, next) {
-			status.Failed = append(status.Failed, next)
-		}
-		if status.State == "" {
-			status.State = "skipped"
-		}
-		status.Detail = "candidate failed native/dependency preflight"
-		_ = m.startupSave(status)
-		return fmt.Errorf("candidate failed native/dependency preflight: %v", err)
+		return nil, fmt.Errorf("candidate failed native/dependency preflight: %v", err)
 	}
+	// Persist every overlay entry before publishing the prepared manifest.
+	if err := filepath.Walk(overlay, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return f.Sync()
+	}); err != nil {
+		return nil, err
+	}
+	if err := syncDir(m.startupPath()); err != nil {
+		return nil, err
+	}
+	identities := map[string]string{}
+	for _, wheel := range candidate {
+		digest, err := hashFile(wheel)
+		if err != nil {
+			return nil, err
+		}
+		identities[wheel] = digest
+	}
+	prepared := &preparedPair{CandidateHashes: identities, Before: verified, After: next, Candidate: candidate, Previous: kept, Dependencies: additions, Overlay: overlay}
+	if len(operation) > 0 {
+		prepared.Operation = operation[0]
+	}
+	var old preparedPair
+	if raw, err := os.ReadFile(m.startupPath("prepared.json")); err == nil {
+		_ = json.Unmarshal(raw, &old)
+	}
+	raw, _ := json.Marshal(prepared)
+	if err := writeAtomic(m.startupPath("prepared.json"), raw, 0o600); err != nil {
+		return nil, err
+	}
+	retained = true
+	if old.Overlay != overlay {
+		m.removePreparedOverlay(old.Overlay)
+	}
+	return prepared, nil
+}
+
+// preparedPair is separate from the installation journal: preparing it never mutates
+// the running interpreter or starts rollback recovery.
+type preparedPair struct {
+	CandidateHashes map[string]string
+	Operation       string
+	Before, After   pairVersions
+	Candidate       []string
+	Previous        []startupWheel
+	Dependencies    []dependencyWheel
+	Overlay         string
+}
+
+func (m *Machine) removePreparedOverlay(path string) {
+	if filepath.Dir(path) == m.startupPath() && strings.HasPrefix(filepath.Base(path), "probe-") {
+		_ = os.RemoveAll(path)
+	}
+}
+
+func (m *Machine) preparePair(ctx context.Context, verified, next pairVersions, candidate, previous []string, status startupStatus, pinned bool) error {
+	prepared, err := m.stagePair(ctx, verified, next, candidate, previous)
+	if err != nil {
+		return err
+	}
+	return m.activatePair(ctx, prepared, status, pinned)
+}
+
+func (m *Machine) activatePair(ctx context.Context, prepared *preparedPair, status startupStatus, pinned bool) error {
+	verified, next, candidate, kept, additions := prepared.Before, prepared.After, prepared.Candidate, prepared.Previous, prepared.Dependencies
+	if len(candidate) != 2 || len(prepared.CandidateHashes) != 2 {
+		return errors.New("prepared candidate has no complete wheel identities")
+	}
+	for _, wheel := range candidate {
+		digest, err := hashFile(wheel)
+		if err != nil || !sha256Hex.MatchString(prepared.CandidateHashes[wheel]) || digest != prepared.CandidateHashes[wheel] {
+			return errors.New("prepared candidate wheel changed")
+		}
+	}
+	for _, wheel := range additions {
+		digest, err := hashFile(wheel.Path)
+		if err != nil || !sha256Hex.MatchString(wheel.SHA256) || digest != wheel.SHA256 {
+			return errors.New("prepared dependency wheel changed")
+		}
+	}
+
+	complete := append([]string{}, candidate...)
+	for _, wheel := range additions {
+		complete = append(complete, wheel.Path)
+	}
+	probed, err := m.startupVerify(ctx, prepared.Overlay)
+	if err != nil || probed != next {
+		return fmt.Errorf("prepared candidate failed revalidation: %v", err)
+	}
+
 	if m.grant != nil {
 		status.AgentBefore = m.grant.agentBefore
 	}

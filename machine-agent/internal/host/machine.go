@@ -735,6 +735,10 @@ func (m *Machine) preparations() bool {
 
 func (m *Machine) beginPreparation() func() {
 	m.mu.Lock()
+	if m.inUpdate {
+		m.mu.Unlock()
+		return nil
+	}
 	m.active++
 	m.mu.Unlock()
 	return func() {
