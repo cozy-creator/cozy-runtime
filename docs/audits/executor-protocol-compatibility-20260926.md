@@ -5,6 +5,9 @@ Branch: fix/executor-protocol-compatibility-20260926
 Base: e01247e1b196768a07ba942be65b6f176d2b7d02
 Worktree: /home/fidika/cozy/.worktrees/cozy-runtime/executor-protocol-compatibility-20260926
 
+Updated 2026-09-29 for the memory re-audit. The current contract below supersedes
+the original compatibility proposal; the base above identifies that original audit.
+
 The worker launches the package environment's executor over internal.seam's
 length-framed JSON socket. The hello exposes the installed Runtime version for
 diagnosis, while worker.child.require_executor_protocol validates the private
