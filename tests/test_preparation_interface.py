@@ -57,7 +57,7 @@ class ObservedWorker(Worker):
         supervision.on_change = observe
         return supervision
 
-    def _describe_installed(
+    def _describe_in_slot(
         self,
         installed: package_installation.InstalledEnvironment,
         distribution: str,
@@ -65,7 +65,7 @@ class ObservedWorker(Worker):
         application: str = "",
     ) -> bytes:
         self.descriptions.append(installed.installation_id)
-        return super()._describe_installed(installed, distribution, application=application)
+        return super()._describe_in_slot(installed, distribution, application=application)
 
     def assert_describes_reaped(self) -> None:
         for executor in self.describe_executors:
@@ -85,7 +85,9 @@ def _placement(result: pb.PreparePackageSetResult) -> pb.Placement:
 
 @needs_executor
 @pytest.mark.parametrize("metadata", [False, True])
-def test_absent_and_present_interface_share_preparation(metadata: bool) -> None:
+def test_absent_and_present_interface_share_preparation(
+    metadata: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     uv = shutil.which("uv")
     assert uv is not None
     with _workspace() as root:
@@ -97,6 +99,7 @@ def test_absent_and_present_interface_share_preparation(metadata: bool) -> None:
             capture_output=True,
         )
         runtime = next(wheels.glob("cozy_runtime-*.whl"))
+        monkeypatch.setattr(package_installation, "machine_wheels", lambda _: wheels)
         source = root / "source"
         source.mkdir()
         (source / "compat_package.py").write_bytes(SOURCE)

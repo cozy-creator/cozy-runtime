@@ -152,16 +152,22 @@ SUCCEEDED = Outcome("succeeded", "runtime", "ok")
 DEVICE_OOM = "device_out_of_memory"
 
 
-def _is_device_oom(exc: BaseException) -> bool:
-    """A torch device OOM, recognized WITHOUT importing torch.
-
-    This module is the author kernel's and it is deliberately dependency-free — the
-    worker imports it and the worker has no torch. The identity is therefore
-    structural: the class's own module and name, which `torch.cuda.OutOfMemoryError` has had
-    since it was split out of `RuntimeError`.
-    """
-    kind = type(exc)
-    return kind.__name__ == "OutOfMemoryError" and kind.__module__.split(".")[0] == "torch"
+def is_device_oom(exc: BaseException) -> bool:
+    """A device allocation failure: torch's, an asynchronous one, or cuBLAS/cuDNN's."""
+    name, text = type(exc).__name__, str(exc)
+    torch_error = type(exc).__module__.split(".")[0] == "torch"
+    if torch_error and name == "OutOfMemoryError":
+        return "DefaultCPUAllocator" not in text
+    if torch_error and name == "AcceleratorError":
+        return getattr(exc, "error_code", None) == 2 or "out of memory" in text
+    return isinstance(exc, RuntimeError) and any(
+        mark in text
+        for mark in (
+            "CUDA error: out of memory",
+            "CUBLAS_STATUS_ALLOC_FAILED",
+            "CUDNN_STATUS_ALLOC_FAILED",
+        )
+    )
 
 
 def classify(exc: BaseException | None) -> Outcome:
@@ -181,7 +187,7 @@ def classify(exc: BaseException | None) -> Outcome:
         return Outcome("failed", "runtime", exc.code, exc.message, exc.fields, _trace(exc))
     if isinstance(exc, AuthorError):
         return Outcome("failed", "author", exc.code, exc.message, exc.fields, _trace(exc))
-    if _is_device_oom(exc):
+    if is_device_oom(exc):
         return Outcome(
             "failed", "runtime", DEVICE_OOM, str(exc).splitlines()[0][:400], (), _trace(exc)
         )

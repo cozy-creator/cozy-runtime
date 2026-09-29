@@ -18,7 +18,7 @@ from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
-from cozy_runtime.internal.seam import Channel
+from cozy_runtime.internal.seam import EXECUTOR_MEMORY_CAPABILITIES, Channel
 
 MODULE = "request_isolation_fixture"
 SOURCE = """
@@ -71,7 +71,16 @@ def host(tmp_path: Path) -> Iterator[tuple[Executor, dict[str, Any]]]:
     with left, right:
         executor = Executor(Channel(left), tmp_path / "root")
         (tmp_path / "root").mkdir()
-        started = executor.start(msgspec.convert({**binding, "devices": devices}, Start))
+        started = executor.start(
+            msgspec.convert(
+                {
+                    **binding,
+                    "devices": devices,
+                    "memory_capabilities": sorted(EXECUTOR_MEMORY_CAPABILITIES),
+                },
+                Start,
+            )
+        )
         assert started["ok"], started
         yield executor, {"devices": devices, "binding": binding, "budgets": {}}
     sys.modules.pop(MODULE, None)

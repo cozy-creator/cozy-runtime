@@ -49,6 +49,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -58,6 +59,7 @@ from cozy_runtime.author._executor_requests import (
     Answer,
     DeviceRoom,
     Handler,
+    HostRoom,
     ModelPrefetch,
     Request,
     Room,
@@ -68,6 +70,7 @@ from cozy_runtime.internal import (
     canonical,
     child_env,
     execution_evidence,
+    executor_replies,
     fill,
     hostfacts,
     job_plan,
@@ -81,6 +84,7 @@ from cozy_runtime.internal import (
     tolerant,
     weights_sink,
 )
+from cozy_runtime.internal import memory as policy
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.executor_commands import (
     Activate,
@@ -90,11 +94,14 @@ from cozy_runtime.internal.executor_commands import (
     DescribeInstalled,
     Load,
     ModelLoad,
+    ReclaimHost,
     Restore,
     Start,
     Unload,
+    Vacate,
 )
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.seam import EXECUTOR_MEMORY_CAPABILITIES
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -124,7 +131,6 @@ from cozy_runtime.internal.worker import (
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
     DEVICE_SHORTFALL_CODES,
-    GROUP_FAULT_CODES,
     ORIGIN,
     STATUS,
     AttemptEngine,
@@ -155,7 +161,6 @@ from cozy_runtime.internal.worker.lanes import (
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority, origin_key
-from cozy_runtime.internal.worker.memory import MemoryManager
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,
@@ -364,6 +369,8 @@ class WorkerOptions:
     was provisioned and a placement naming artifacts this worker does not already hold
     reports a typed fault rather than guessing a directory."""
     worker_tls_certificate_digest: str = ""
+    #: `gpu.budget` by device ordinal: the bytes this machine's Runtime may hold there
+    gpu_budget: tuple[tuple[int, int], ...] = ()
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     claim_ready: bool = True
@@ -789,6 +796,7 @@ def executor_load_command(
     construction: str,
     devices: str,
     authorized_device_limit_bytes: int = 0,
+    memory_grants: tuple[int, ...] = (),
     sequence_parallel_degree: int = 1,
     parameter_names: Sequence[Sequence[str]] = (),
     attention_pin: str = "",
@@ -847,6 +855,7 @@ def executor_load_command(
         construction=construction,
         devices=devices,
         authorized_device_limit_bytes=int(authorized_device_limit_bytes),
+        memory_grants=memory_grants,
         sequence_parallel_degree=sequence_parallel_degree,
         attention_pin=attention_pin,
     )
@@ -911,8 +920,11 @@ class Worker:
         #: what keeps one slot's reclaim from freezing a sibling's serving executor.
         #: The primary keeps the seat's own uid.
         self._slot_uids: dict[str, int] = {}
-        #: (store, manifest, component) this worker already read into the page cache
-        self._pages_warmed: set[tuple[str, str, str]] = set()
+        #: Reads completed for this queue frontier, not a promise of kernel cache residency.
+        self._pages_warmed: dict[tuple[str, str, tuple[str, str, str]], tuple[object, ...]] = {}
+        self._page_warm_targets: dict[str, dict[tuple[str, str, str], tuple[str, ...]]] = {}
+        self._memory_waiting: tuple[tuple[str, str], ...] = ()
+        self._page_warm_frontier: tuple[policy.Demand, ...] = ()
         #: per placement: bindings digests of superseded documents -> {binding: construction}
         #: whose offers are still accepted when the binding and its construction are unchanged
         self._superseded: dict[str, dict[str, dict[str, str]]] = {}
@@ -952,7 +964,13 @@ class Worker:
         #: resident executor generation — nothing device-scoped lives on the worker any more.
         self.lanes = LaneSet.from_envelope(options.devices, worker_pid=os.getpid())
         #: every device byte of this machine, across every executor, package and rank
-        self.memory = MemoryManager(self.lanes, self.note, self._end_tenant)
+        self.memory = policy.Machine(
+            dict(options.gpu_budget),
+            self._driver,
+            lambda text: self.note("residency", text),
+            host_available=proctree.available_host_bytes,
+            host_pressure=proctree.host_pressure,
+        )
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         # Before any executor starts: an older executor reads the image kernel site once.
         self.machine_kernels = machine_kernels.boot(
@@ -1027,8 +1045,10 @@ class Worker:
         # Captured machine executions persist their immutable receipt and restore this
         # same inventory after restart, independent of their code's publication origin.
         self.prepared_installations: dict[tuple[str, str, bytes], Placement] = {}
-        #: a published installation's described interface, by (installation, distribution)
-        self._published_interfaces: dict[tuple[str, str], bytes] = {}
+        #: Successful interfaces of owned environment incarnations, shared by all prepares.
+        self._installed_interfaces: dict[
+            tuple[str, tuple[int, int, int, int], Path, str, str], bytes
+        ] = {}
         self.local_operations: dict[tuple[str, str], Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
@@ -1065,6 +1085,8 @@ class Worker:
         self._published_latch = ""
         self.boot = observe.BootRecord()
         self.monitor = observe.SilenceMonitor(self.boot.ring, busy=self.read_device_work)
+        self._host_pressure_schedule_lock = threading.Lock()
+        self._host_pressure_scheduled = False
         #: thread name -> kernel thread id of each `_lane`-wrapped thread (read by `pollers`)
         self.lane_threads: dict[str, int] = {}
         self.supervisor = Supervisor(
@@ -1443,9 +1465,9 @@ class Worker:
         row.supervision = supervision
         row.ledger.observe_devices(lane.device_facts(measured))
         tenants = sorted(
-            slot
-            for slot, _lane, _row in self.memory.tenants(set(lane.ordinals))
-            if slot != placement.placement_id
+            tenant.slot
+            for tenant in self._tenants(set(lane.ordinals))
+            if tenant.slot != placement.placement_id
         )
         self.note(
             "materialization",
@@ -1580,7 +1602,16 @@ class Worker:
         """A HOSTED placement's executor was published or cleared: move ITS row only."""
         lane = self.lanes.lane_of(placement_id)
         if lane is not None:
-            lane.row(placement_id).ledger.begin_generation(executor.pid if executor else 0)
+            self._memory_generation_changed(lane.row(placement_id), executor)
+
+    def _memory_generation_changed(self, row: LaneRow, executor: child.Executor | None) -> None:
+        """Supervision calls this only after an old process is reclaimed or a new one bound."""
+        old = row.memory_generation
+        new = (executor.pid, executor.epoch) if executor is not None else None
+        if old is not None and old != new:
+            self.memory.release_host_prefix(f"executor:{old[0]}:{old[1]}:")
+        row.sync_memory_generation()
+        row.ledger.begin_generation(executor.pid if executor else 0)
 
     def _lane_dispatchable(self, lane: DeviceLane) -> bool:
         """Whether THIS lane has a placement that takes offers (job mode: the envelope)."""
@@ -1912,9 +1943,33 @@ class Worker:
         *,
         application: str = "",
     ) -> bytes:
-        """Import package code only inside a dedicated preparation executor."""
+        """Describe an owned environment incarnation once, in an isolated executor.
+
+        Installation validation/refresh precedes this call. Adopted mutable environments
+        have no incarnation and must be rediscovered. The record is replaced on every
+        rebuild, including repairs and SDK rollbacks to a previously used venv path.
+        """
+        from cozy_runtime.internal import package_interface
+
+        key = (
+            (
+                installed.installation_id,
+                installed.incarnation,
+                installed.generation,
+                distribution,
+                application,
+            )
+            if installed.incarnation is not None
+            else None
+        )
         with self.preparation_slot:
-            return self._describe_in_slot(installed, distribution, application=application)
+            if key is not None and key in self._installed_interfaces:
+                return self._installed_interfaces[key]
+            raw = self._describe_in_slot(installed, distribution, application=application)
+            package_interface.parse(raw, "installed package interface")
+            if key is not None:
+                self._installed_interfaces[key] = raw
+            return raw
 
     def _describe_in_slot(
         self,
@@ -1974,18 +2029,6 @@ class Worker:
         finally:
             supervision.close()
 
-    def _describe_published(
-        self, installed: package_installation.InstalledEnvironment, distribution: str
-    ) -> bytes:
-        """A published installation is content-keyed and immutable: describe it once."""
-        key = (installed.installation_id, distribution)
-        raw = self._published_interfaces.get(key)
-        if raw is None:
-            raw = self._published_interfaces[key] = self._describe_installed(
-                installed, distribution
-            )
-        return raw
-
     def _prepare_local_in(
         self, request: pb.PrepareLocalPackageRequest
     ) -> pb.PreparePackageSetResult:
@@ -2033,7 +2076,7 @@ class Worker:
         published: list[package_installation.InstalledEnvironment] = []
         result = package_prepare.prepare_package_set(
             machine_release_catalog.complete(self, request),
-            describe=self._describe_published,
+            describe=self._describe_installed,
             python_root=self.config.managed_python_root,
             cancel=self.stop.is_set,
             progress=lambda message: self.note("python", message),
@@ -2115,8 +2158,8 @@ class Worker:
             shutil.rmtree(self.config.cozy_home / "job-plans" / identifier, ignore_errors=True)
             for key in [key for key in self.prepared_installations if key[1] == identifier]:
                 del self.prepared_installations[key]
-            for described in [key for key in self._published_interfaces if key[0] == identifier]:
-                del self._published_interfaces[described]
+            for described in [key for key in self._installed_interfaces if key[0] == identifier]:
+                del self._installed_interfaces[described]
             self.note("installation", f"collected superseded {installed.package} {identifier}")
 
     def host_facts(self) -> hostfacts.HostFacts:
@@ -2482,6 +2525,16 @@ class Worker:
     ) -> None:
         """One scheduling pass's observations, journaled on the roots they concern."""
         self.prespawns.reconcile(roots, view, installations)
+        # The broker invokes this callback while serializing its changes. Copy only
+        # queue hints here: no control-lock acquisition, executor I/O or GPU mutation.
+        queued = [
+            (key, want)
+            for key, want in self.gpu.wants.items()
+            if want.root in roots and key not in view.get("grants", {})
+        ]
+        queued.sort(key=lambda row: (roots[row[1].root], row[1].root))
+        self._memory_waiting = tuple(want.template for _, want in queued if want.template[0])
+        self._refresh_memory_queue()
         if self.executions is None:
             return
         owner = self.fence.record_owner_id
@@ -2496,6 +2549,131 @@ class Worker:
                 self.executions.record(owner, root, event, body)
             if event == "gpu.wait":
                 self._gpu_waiting(owner, root, body, view)
+
+    def _refresh_memory_queue(self) -> None:
+        """Project known queued representations into memory hints, never GPU grants.
+
+        A template with no local placement remains with normal artifact preparation.
+        Reading these immutable placement identities is a performance hint: a raced
+        removal only loses a saving and is revalidated before a background read.
+        """
+        positions: dict[tuple[str, str], int] = {}
+        for position, template in enumerate(self._memory_waiting):
+            positions.setdefault(template, position)
+        placements = [self.placement, *(h.placement for h in list(self.hosted.values()))]
+        live = {p.placement_id for p in placements if p is not None}
+        self._page_warm_targets = {
+            key: value for key, value in self._page_warm_targets.items() if key in live
+        }
+        demands: list[policy.Demand] = []
+        for placement in placements:
+            if placement is None:
+                continue
+            template = (placement.installation_id, documents.spell(placement.bindings_digest))
+            lane = self.lanes.lane_of(placement.placement_id)
+            if template not in positions or lane is None:
+                continue
+            row = lane.rows.get(placement.placement_id)
+            demands.append(
+                policy.Demand(
+                    placement.placement_id,
+                    template[1],
+                    template[0],
+                    lane.ordinals,
+                    positions[template],
+                    row.load_seconds if row is not None else None,
+                )
+            )
+        self.memory.update_queue(demands)
+        frontier = self.memory.prefetch_frontier()
+        self._page_warm_frontier = frontier
+        # Queue positions and measured load costs do not change the stored bytes.
+        live_items = {item for targets in self._page_warm_targets.values() for item in targets}
+        self._pages_warmed = {
+            key: value for key, value in self._pages_warmed.items() if key[2] in live_items
+        }
+        if frontier:
+            self.supervisor.spawn("memory-prefetch", lambda _: self._prefetch_pages())
+
+    def _prefetch_tier(
+        self, demand: policy.Demand, item: tuple[str, str, str]
+    ) -> tuple[object, ...] | None:
+        lane = self.lanes.lane_of(demand.tenant)
+        if lane is None or len(lane.ordinals) != 1:
+            # Component tier reports are currently local-rank facts. A group without
+            # every rank's component facts stays with ordinary demand loading.
+            return None
+        row = lane.rows.get(demand.tenant)
+        if row is None or (current := row.executor()) is None:
+            return None
+        generation = (current.pid, current.epoch)
+        # A speculative reader never resets admission facts. The lane owner publishes
+        # replacement generations; until then there is no trustworthy tier to prefetch.
+        if row.memory_generation != generation:
+            return None
+        disk = row.disk
+        keys = self._page_warm_targets.get(demand.tenant, {}).get(item, ())
+        keys = tuple(key for key in keys if disk.get(key, 0) > 0)
+        if not keys:
+            return None
+        return (
+            demand.tenant,
+            generation,
+            tuple((key, row.disk_revision.get(key, 0)) for key in keys),
+        )
+
+    def _prefetch_pages(self) -> None:
+        """Bounded speculative store reads of the current queue frontier, with no GPU work."""
+        frontier = self._page_warm_frontier
+        warmed = self._pages_warmed
+        for demand in frontier:
+            for item in self._page_warm_targets.get(demand.tenant, ()):
+                key = (demand.artifact, demand.representation, item)
+                tier = self._prefetch_tier(demand, item)
+                if tier is None or warmed.get(key) == tier:
+                    continue
+                token = f"prefetch:{demand.tenant}:{item!r}"
+
+                def wanted(
+                    demand: policy.Demand = demand,
+                    item: tuple[str, str, str] = item,
+                    tier: tuple[object, ...] | None = tier,
+                ) -> bool:
+                    return (
+                        not self.stop.is_set()
+                        and any(
+                            (d.tenant, d.artifact, d.representation)
+                            == (demand.tenant, demand.artifact, demand.representation)
+                            for d in self._page_warm_frontier
+                        )
+                        and self._prefetch_tier(demand, item) == tier
+                        and not any(
+                            attempt.state in {"preparing", "entering", "accepted"}
+                            for attempt in list(self.engine.live.values())
+                        )
+                    )
+
+                if not wanted():
+                    return
+                try:
+                    report = page_warm.warm_component(
+                        *item,
+                        reserve=partial(self.memory.reserve_host, token),
+                        release=partial(self.memory.release_host, token),
+                        wanted=wanted,
+                    )
+                except Exception as exc:
+                    self.note(
+                        "memory-prefetch", f"{demand.tenant!r}: {type(exc).__name__}: {exc}"[:256]
+                    )
+                    continue
+                if report.get("skipped"):
+                    self.note("memory-prefetch", f"{demand.tenant!r}: {report['skipped']}"[:256])
+                elif wanted():
+                    self._pages_warmed[key] = tier
+                    self.note(
+                        "memory-prefetch", f"{demand.tenant!r} {page_warm.describe(report)}"[:256]
+                    )
 
     def _record_executor(self, attempt: AttemptRecord) -> None:
         """The SDK the attempt's executor loaded, as it stated in its hello, on the execution's
@@ -2639,6 +2817,7 @@ class Worker:
             )
             return False
         members = list(evidence.members) if evidence is not None else [dead.pid]
+        self.memory.release_host_prefix(f"executor:{dead.pid}:{dead.epoch}:")
         self.note(
             "recovery",
             f"{placement_id!r}: reclaimed executor epoch {dead.epoch} (pids {members}): "
@@ -3413,7 +3592,7 @@ class Worker:
         observed through the session. Only this slot's row moves: a hosted placement on the
         same or another lane keeps its facts (cr-066).
         """
-        self._primary_row().begin_generation(executor.pid if executor is not None else 0)
+        self._memory_generation_changed(self._primary_lane().row(self._primary_slot()), executor)
 
     def read_device_process(self, pid: int) -> int:
         """NVML bytes for one executor pid; -1 remains UNREADABLE/ABSENT here.
@@ -5215,9 +5394,9 @@ class Worker:
             jit_pod_scope=f"{self.fence.worker_boot_id}-orchestration",
             kernel_cache=self.config.kernel_cache,
         )
-        supervision.on_change = lambda executor: self.lanes.orchestration.row(
-            ""
-        ).ledger.begin_generation(executor.pid if executor else 0)
+        supervision.on_change = lambda executor: self._memory_generation_changed(
+            self.lanes.orchestration.row(""), executor
+        )
         supervision.on_invalidate = lambda why: self._orchestration_unavailable(why)
         supervision.on_exit = lambda executor: self._executor_died(
             self.lanes.orchestration, executor, ""
@@ -5550,24 +5729,46 @@ class Worker:
             return f"executor_activation_failed: {exc}"[:200]
         return executor
 
-    def _start_executor(self, tenant: Tenant, executor: child.Executor) -> str:
-        """`start` the process OFF the device lock: every rank spawned, joined, imported and
-        warmed. Returns a latch, or "" once the process is started."""
+    def _start_executor(
+        self, tenant: Tenant, executor: child.Executor, *, initialize: bool = False
+    ) -> str:
+        """Import ahead of demand; device initialization occurs only under device ownership."""
         lane = tenant.lane
         placement_id = tenant.placement.placement_id
         first = next(iter(tenant.bindings.values()), None)
         if first is None:
             return "prepare refused: every binding"
+        import_only = (
+            not initialize
+            and any(not binding.weightless for binding in tenant.bindings.values())
+            and "import_only" in executor.hello.get("memory", ())
+        )
         command = Start(
             devices=lane.devices,
             sequence_parallel_degree=_rank_degree(lane, tenant.bindings.values()),
             application=first.application,
             package_interface=first.interface_path,
+            import_only=import_only,
+            memory_capabilities=tuple(sorted(EXECUTOR_MEMORY_CAPABILITIES)),
         )
         began = time.perf_counter()
         self.monitor.start(f"start:{placement_id}", "load")
         try:
-            reply = executor.call(command, timeout=None)
+            with contextlib.nullcontext() if import_only else lane.device:
+                if not import_only and any(
+                    not binding.weightless for binding in tenant.bindings.values()
+                ):
+                    grants = self._grants(lane, tenant.slot)
+                    command = msgspec.structs.replace(
+                        command,
+                        authorized_device_limit_bytes=min(grants),
+                        memory_grants=grants,
+                    )
+                reply = executor.call(
+                    command, timeout=None, on_request=self._room(lane, tenant.slot)
+                )
+        except LaneRefusal as exc:
+            reply = {"ok": False, "code": exc.code, "detail": exc.detail}
         except ExecutorGone as exc:
             self.monitor.end(f"start:{placement_id}", "executor_gone")
             reply = {"ok": False, "code": "executor_gone_during_start", "detail": str(exc)}
@@ -5599,6 +5800,13 @@ class Worker:
             return "prepare refused: every binding"
         self.monitor.end(f"start:{placement_id}", "started")
         executor.started = dict(reply)
+        if import_only and not reply.get("started", False):
+            row = lane.row(tenant.slot)
+            row.sync_memory_generation()
+            row.held = dict.fromkeys(lane.ordinals, 0)
+            row.overhead = dict.fromkeys(lane.ordinals, 0)
+        else:
+            self._observe_memory(lane, lane.row(tenant.slot), reply)
         stages = reply.get("stages") or ()
         self.note(
             "boot",
@@ -5671,24 +5879,203 @@ class Worker:
             return tenant
         return self._tenant(tenant.placement.placement_id)
 
-    def _ceiling(self, lane: DeviceLane, slot: str) -> int:
-        """What a load or activation may hold: the whole device. The device lock is the
-        reservation (`memory.py`); the executor verifies against its own allocator. A lane
-        with an unreadable device refuses typed."""
-        measured = lane.measure(accel.host_backend_family())
-        unreadable = [
-            repr(entry)
-            for entry, ordinal in zip(lane.entries, lane.ordinals, strict=True)
-            if measured[ordinal].state != "measured"
-        ]
-        if unreadable:
-            raise LaneRefusal(
-                "device_capacity_unreadable",
-                f"{lane.lane_id}: the driver could not report free bytes for "
-                f"{', '.join(unreadable)} (NVML nvmlDeviceGetMemoryInfo, else nvidia-smi)",
+    def _driver(self, ordinal: int) -> tuple[int, int] | None:
+        """Free and total bytes of one GPU as its driver reports them, or None."""
+        lane = next((lane for lane in self.lanes.lanes if ordinal in lane.ordinals), None)
+        if lane is None:
+            return None
+        reading = accel.device_memory(
+            lane.entries[lane.ordinals.index(ordinal)], accel.host_backend_family()
+        )
+        return (reading.free_bytes, reading.total_bytes) if reading.state == "measured" else None
+
+    def _tenants(self, ordinals: set[int] | None) -> list[_Tenant]:
+        """Every model-bearing tenant with a device among `ordinals`, each once."""
+        found: dict[str, _Tenant] = {}
+        for lane in self.lanes.lanes:
+            if ordinals is None or ordinals & set(lane.ordinals):
+                for slot, row in lane.rows.items():
+                    if (
+                        row.model_bearing
+                        and row.supervision is not None
+                        and row.supervision.current is not None
+                    ):
+                        found.setdefault(slot, _Tenant(slot, lane, row, self))
+        return list(found.values())
+
+    def _grant(self, lane: DeviceLane, slot: str) -> int:
+        """What a load or an attempt of `slot` may hold on each of its devices: the memory
+        policy's grant, the smallest over the lane's devices. An unreadable device refuses."""
+        return min(self._grants(lane, slot), default=0)
+
+    def _grants(self, lane: DeviceLane, slot: str) -> tuple[int, ...]:
+        """One authorization per rank; unknown or overcommitted devices refuse dispatch."""
+        me = _Tenant(slot, lane, lane.row(slot), self)
+        tenants = self._tenants(set(lane.ordinals))
+        grants = self.memory.grants(me, tenants, lane.lane_id, lane.entries, refuse=LaneRefusal)
+        lane.row(slot).ledger.observe_devices(
+            lane.device_facts(lane.measure(accel.host_backend_family()))
+        )
+        return grants
+
+    @staticmethod
+    def _observe_memory(
+        lane: DeviceLane,
+        row: LaneRow,
+        reply: Mapping[str, object],
+        ordinals: Iterable[int] | None = None,
+    ) -> None:
+        """What a tenant holds on its devices, from the facts its executor reported: its
+        non-allocator overhead and its allocator reserve (an older executor: the reserve)."""
+        row.sync_memory_generation()
+        residency = reply.get("residency")
+        disk = residency.get("disk") if isinstance(residency, Mapping) else None
+        observed = (
+            {
+                key: n
+                for key, n in disk.items()
+                if isinstance(key, str) and type(n) is int and n >= 0
+            }
+            if isinstance(disk, Mapping)
+            else {}
+        )
+        epochs = residency.get("disk_epoch") if isinstance(residency, Mapping) else None
+        observed_epochs = (
+            {
+                key: n
+                for key, n in epochs.items()
+                if isinstance(key, str) and type(n) is int and n >= 0
+            }
+            if isinstance(epochs, Mapping)
+            else {}
+        )
+        for key in observed.keys() | row.disk.keys():
+            if observed.get(key) != row.disk.get(key) or observed_epochs.get(
+                key
+            ) != row.disk_epoch.get(key):
+                row.disk_revision[key] = row.disk_revision.get(key, 0) + 1
+        row.disk = observed
+        row.disk_epoch = observed_epochs
+        reports = executor_replies.rank_memory_facts(reply.get("rank_memory"))
+        executor = row.executor()
+        if executor is not None and "rank_memory" not in executor.hello.get("memory", ()):
+            # Revision-1 peers report process births rather than allocator vectors.
+            # Attribute actual driver bytes to each verified birth, never copy rank 0
+            # onto the other devices or substitute a guessed context allowance.
+            processes = reply.get("processes")
+            for process in processes if isinstance(processes, list) else ():
+                if not isinstance(process, dict):
+                    continue
+                rank, pid, ticks = (process.get(key) for key in ("rank", "pid", "started_ticks"))
+                if not all(type(value) is int for value in (rank, pid, ticks)):
+                    continue
+                if not (isinstance(rank, int) and isinstance(pid, int) and isinstance(ticks, int)):
+                    continue
+                if not 0 <= rank < len(lane.ordinals):
+                    continue
+                identity = proctree.ProcessIdentity(pid=pid, started_ticks=ticks)
+                owned = (
+                    proctree.cgroup_contains(executor.scope, identity)
+                    if isinstance(executor.scope, proctree.CgroupScope)
+                    else proctree.process_scope_contains(executor.scope, identity)
+                )
+                if not owned or proctree.process_state(identity) in (None, "Z"):
+                    continue
+                ordinal = lane.ordinals[rank]
+                entry = lane.entries[ordinal]
+                measured = accel.process_memories_by_device(
+                    {pid}, accel.host_backend_family(), (entry,), allow_subprocess=False
+                )[entry][pid]
+                if measured.state == "present":
+                    row.held[ordinal] = measured.bytes
+        if "0" in reports:
+            row.ledger.observe_memory(reports["0"])
+        chosen = set(lane.ordinals if ordinals is None else ordinals)
+        for rank, ordinal in enumerate(lane.ordinals):
+            facts = reports.get(str(rank))
+            if ordinal not in chosen or not isinstance(facts, dict):
+                continue
+            reserved = facts.get("reserved_bytes", -1)
+            if reserved < 0:
+                continue
+            if "overhead_bytes" in facts:
+                overhead = facts["overhead_bytes"]
+                if overhead >= 0:
+                    row.overhead[ordinal] = overhead
+            row.held[ordinal] = row.overhead.get(ordinal, 0) + reserved
+
+    def _reclaim_host(self, tenant: _Tenant, nbytes: int) -> tuple[int, int] | None:
+        executor = tenant.row.executor()
+        if executor is None or "reclaim_host" not in executor.hello.get("memory", ()):
+            return None
+
+        def eligible() -> bool:
+            return (
+                tenant.row.executor() is executor
+                and not executor.poisoned
+                and executor.alive()
+                and not any(
+                    attempt.executor is executor and attempt.state in ON_DEVICE | {"preparing"}
+                    for attempt in list(self.engine.live.values())
+                )
             )
-        lane.row(slot).ledger.observe_devices(lane.device_facts(measured))
-        return min(memory.total_bytes for memory in measured.values())
+
+        def observe(reply: dict[str, Any]) -> None:
+            # Publish residency epochs before another call can refill this generation.
+            if reply.get("ok") and tenant.row.executor() is executor:
+                self._observe_memory(tenant.lane, tenant.row, reply)
+                tenant.row.ledger.observe_memory(reply.get("memory"))
+
+        before = proctree.rss_bytes(executor.pid)
+        try:
+            reply = executor.call_if_idle(
+                ReclaimHost(nbytes=nbytes), eligible=eligible, on_reply=observe
+            )
+        except child.ExecutorGone:
+            return None
+        after = proctree.rss_bytes(executor.pid)
+        if reply.get("ok"):
+            self.memory.note(
+                f"host reclaim {tenant.slot!r}: managed_released_bytes="
+                f"{reply.get('managed_released_bytes', 0)}, rss_before_bytes={before}, "
+                f"rss_after_bytes={after}; grants use freshly observed aggregate headroom; "
+                f"retained={json.dumps(reply.get('host_reclaim', {}), sort_keys=True)}"
+            )
+        facts = reply.get("host_memory", {})
+        if not isinstance(facts, dict):
+            return None
+        released, held = reply.get("managed_released_bytes"), facts.get("managed_host_bytes")
+        if (
+            reply.get("ok")
+            and type(released) is int
+            and type(held) is int
+            and min(released, held) >= 0
+        ):
+            return released, held
+        return None
+
+    def _vacate(self, tenant: _Tenant, ordinals: tuple[int, ...]) -> bool:
+        """Ask one idle tenant to take its weights off `ordinals` (its process stays)."""
+        lane, row = tenant.lane, tenant.row
+        executor = row.executor()
+        if executor is None:
+            return False
+        ranks = tuple(lane.ordinals.index(ordinal) for ordinal in ordinals) if lane.group else ()
+        try:
+            with executor.watched("vacate"):
+                reply = executor.call(
+                    Vacate(ranks=ranks), timeout=None, on_request=self._room(lane, tenant.slot)
+                )
+        except child.ExecutorGone:
+            return False
+        if not reply.get("ok"):
+            return False
+        emptied = ordinals if ranks else lane.ordinals
+        # A vacate may retain scratch/allocator bytes. Only the rank's own reply can
+        # establish its remaining footprint; never optimistically replace it by overhead.
+        self._observe_memory(lane, row, reply, emptied)
+        row.ledger.observe_vacate(reply, "vacated for a co-tenant")
+        return True
 
     def _load_construction(
         self,
@@ -5704,19 +6091,17 @@ class Worker:
         placement_id = tenant.placement.placement_id
         first = group[0]
         label = key.removeprefix("sha256:")[:12]
+        if executor.started.get("imported") and not executor.started.get("started", True):
+            failure = self._start_executor(tenant, executor, initialize=True)
+            if failure:
+                raise AttemptRefusal(
+                    "executor_start_refused", failure, cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT
+                )
         if not first.weightless:
-            # Idle tenants of every device give room for the weights first. Bindings of one
-            # construction share its weights, so they are counted once.
-            declared = max(binding.logical_weight_bytes for binding in group)
             lane.touch(slot)
-            self.memory.make_room(
-                lane,
-                slot,
-                {ordinal: declared for ordinal in lane.ordinals},
-                f"load of {label} for {placement_id!r} declaring {declared} B",
-            )
         try:
-            authorized = 0 if first.weightless else self._ceiling(lane, slot)
+            grants = () if first.weightless else self._grants(lane, slot)
+            authorized = min(grants, default=0)
         except LaneRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
@@ -5726,6 +6111,7 @@ class Worker:
             construction=key,
             devices=lane.devices,
             authorized_device_limit_bytes=authorized,
+            memory_grants=grants,
             sequence_parallel_degree=_rank_degree(lane, tenant.bindings.values()),
             parameter_names=_parameter_names_by_model(group),
             attention_pin=attention_pin,
@@ -5734,17 +6120,16 @@ class Worker:
         began = time.perf_counter()
         self.monitor.start(subject, "load")
         try:
-            with self.memory.watch(lane, sample=False) as seen:
-                reply = executor.call(
-                    command,
-                    timeout=None,
-                    on_progress=lambda frame: self.monitor.advance(
-                        subject, int(frame.get("position", 0) or 0)
-                    ),
-                    on_request=self._room(lane, slot),
-                )
+            reply = executor.call(
+                command,
+                timeout=None,
+                on_progress=lambda frame: self.monitor.advance(
+                    subject, int(frame.get("position", 0) or 0)
+                ),
+                on_request=self._room(lane, slot),
+            )
             if reply.get("ok") and not first.weightless:
-                self.memory.moved(lane, slot, seen)
+                self._observe_memory(lane, lane.row(slot), reply)
         except ExecutorGone as exc:
             self.monitor.end(subject, "executor_gone")
             reply = {"ok": False, "code": "executor_gone_during_prepare", "detail": str(exc)}
@@ -5764,6 +6149,7 @@ class Worker:
                 else CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
             )
         self.monitor.end(subject, "filled")
+        lane.row(slot).load_seconds = took / 1000
         facts = dict(reply.get("facts") or {})
         try:
             resolved = PreparedModel.from_reply(reply)
@@ -5834,7 +6220,7 @@ class Worker:
         The executor reports `poisoned` on every refused load: empty when the load was
         refused before it touched the process (a plan, fit or device-shortfall refusal on one
         rank), so its other constructions keep serving and the next request tries again. An
-        older executor that does not report it is treated as poisoned. A capacity refusal
+        executor that does not report its state is treated as poisoned. A capacity refusal
         is never held against the binding: the card was short for this attempt, and the
         next one prepares afresh even when the process had to be replaced.
         """
@@ -5856,7 +6242,7 @@ class Worker:
             detail = (
                 f"{shortfall['resource']} shortfall at {shortfall['scope']}: "
                 f"needed {shortfall['needed_bytes']} B, "
-                f"{shortfall['available_bytes']} B free (measured) - {detail}"
+                f"{shortfall['available_bytes']} B available - {detail}"
             )[:1024]
         for line in prepare_diagnostics.activity_lines(reply.get("traceback")):
             self.note("boot", f"load traceback {label}: {line}")
@@ -5911,23 +6297,28 @@ class Worker:
         label = key.removeprefix("sha256:")[:12]
         built = executor.loaded.get(key)
         try:
-            authorized = (
-                0
+            grants = (
+                ()
                 if built is not None and built.facts.get("weightless")
-                else self._ceiling(tenant.lane, tenant.slot)
+                else self._grants(tenant.lane, tenant.slot)
             )
+            authorized = min(grants, default=0)
         except LaneRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
             ) from exc
         try:
-            with executor.watched("activate"), self.memory.watch(tenant.lane, sample=False) as seen:
+            with executor.watched("activate"):
                 reply = executor.call(
-                    Activate(construction=key, authorized_device_limit_bytes=authorized),
+                    Activate(
+                        construction=key,
+                        authorized_device_limit_bytes=authorized,
+                        memory_grants=grants,
+                    ),
                     timeout=None,
                     on_request=self._room(tenant.lane, tenant.slot),
                 )
-            self.memory.moved(tenant.lane, tenant.slot, seen)
+            self._observe_memory(tenant.lane, tenant.row(), reply)
         except ExecutorGone as exc:
             raise AttemptRefusal(
                 "executor_absent",
@@ -5949,10 +6340,6 @@ class Worker:
                 # The ledger prices THIS construction now; its baseline moves to where the
                 # activation left the device, so parking a neighbour is never a "leak".
                 row.ledger.observe_construction(loaded.facts)
-            row.ledger.observe_restore(
-                {**reply, "restored": {"restored_bytes": reply.get("restored_bytes", 0)}},
-                f"activated {label}",
-            )
         parked = [str(name).removeprefix("sha256:")[:12] for name in reply.get("parked") or ()]
         self.note(
             "residency",
@@ -6060,54 +6447,62 @@ class Worker:
         )
 
     def _warm_pages(self, tenant: Tenant) -> None:
-        """Read every desired construction's stored bytes once, in the background (h3a-018).
-
-        A construction loads on its first attempt, from the store. Measured on an H100 pod,
-        that read runs at 23-33 GB/s when its pages are cached and at 0.73 GB/s when they
-        are not. The read here is the same store stream the fill performs, into host
-        buffers that are dropped, so the first load of each construction finds its pages
-        warm. It moves no device byte, holds no lane lock, and decides nothing; a component
-        already warmed by this worker is not read again.
-        """
+        """Warm new construction stores once; later reads follow measured queue tiers."""
         placement_id = tenant.placement.placement_id
-        work = []
+        work: dict[tuple[str, str, str], list[str]] = {}
         for binding in tenant.bindings.values():
             for model in binding.model_bindings():
                 for name in model.components:
                     item = (model.store, model.snapshot_for(name), name)
-                    if item not in self._pages_warmed:
-                        self._pages_warmed.add(item)
-                        work.append(item)
-        if not work:
-            return
+                    key = f"{binding.construction_key()}#{model.model_binding_path}/{name}"
+                    if key not in work.setdefault(item, []):
+                        work[item].append(key)
+        previous = self._page_warm_targets.get(placement_id, {})
+        self._page_warm_targets[placement_id] = {item: tuple(keys) for item, keys in work.items()}
+        constructions: dict[str, list[tuple[str, str, str]]] = {}
+        lane = self.lanes.lane_of(placement_id)
+        row = lane.rows.get(placement_id) if lane is not None else None
+        for item, keys in work.items():
+            for key in keys:
+                if key not in previous.get(item, ()) and (row is None or key not in row.disk):
+                    construction = key.split("#", 1)[0]
+                    if item not in constructions.setdefault(construction, []):
+                        constructions[construction].append(item)
+        for construction, items in constructions.items():
+            read = partial(self._warm_construction_pages, placement_id, construction, tuple(items))
 
-        def run() -> None:
-            for store, manifest, name in work:
-                try:
-                    report = page_warm.warm_component(store, manifest, name)
-                except Exception as exc:
-                    self._pages_warmed.discard((store, manifest, name))
-                    self.note(
-                        "residency",
-                        f"{placement_id!r} page warm of {name!r} failed: "
-                        f"{type(exc).__name__}: {exc}"[:256],
-                    )
-                    continue
-                if report.get("skipped"):
-                    self.note(
-                        "residency",
-                        f"{placement_id!r} page warm skipped {name!r}: {report['skipped']}"[:256],
-                    )
-                    continue
-                self.note("residency", f"{placement_id!r} {page_warm.describe(report)}"[:256])
+            def warm_pages(_: Unit, read: Callable[[], None] = read) -> None:
+                read()
 
-        # A LANE like every other worker thread (cr-061's fence): `run` reports every
-        # failure it can see; the wrap turns the one it cannot into WORKER_PHASE_FAILED.
-        threading.Thread(
-            target=self._lane(f"page-warm:{placement_id}", run, fatal=False),
-            name=f"page-warm:{placement_id}",
-            daemon=True,
-        ).start()
+            self.supervisor.spawn(f"page-warm:{placement_id}:{construction}", warm_pages)
+        self._refresh_memory_queue()
+
+    def _warm_construction_pages(
+        self, placement_id: str, construction: str, items: tuple[tuple[str, str, str], ...]
+    ) -> None:
+        """One activation read per construction, before any executor tier report exists."""
+        token = f"page-warm:{placement_id}:{construction}"
+        for item in items:
+
+            def wanted(item: tuple[str, str, str] = item) -> bool:
+                keys = self._page_warm_targets.get(placement_id, {}).get(item, ())
+                return not self.stop.is_set() and any(
+                    key.startswith(construction + "#") for key in keys
+                )
+
+            if not wanted():
+                return
+            try:
+                report = page_warm.warm_component(
+                    *item,
+                    reserve=partial(self.memory.reserve_host, token),
+                    release=partial(self.memory.release_host, token),
+                    wanted=wanted,
+                )
+                detail = report.get("skipped") or page_warm.describe(report)
+                self.note("page-warm", f"{placement_id!r} {detail}"[:256])
+            except Exception as exc:
+                self.note("page-warm", f"{placement_id!r}: {type(exc).__name__}: {exc}"[:256])
 
     def _finish_activation(self) -> None:
         """Publish the activation edge, or its typed failure when the executor was lost.
@@ -6155,9 +6550,10 @@ class Worker:
     # ------------------------------------------------------ residency arbitration
 
     def _arbitrate_residency(self, attempt: AttemptRecord, slot: AttemptSlot) -> None:
-        """Make room for THIS attempt on every device of its lane, then refill what an
-        eviction took from it (`memory.py`). The caller holds the lane's devices, so every
-        other tenant there is idle and none is mid-load."""
+        """Project serving facts into Machine admission, then record its authorization.
+
+        The caller holds the lane's device leases; policy owns reclaim and grant decisions.
+        """
         serving = attempt.spec.get("serving")
         if serving is None or self.accepted.mode != "serving":
             return
@@ -6165,117 +6561,139 @@ class Worker:
         if declared is None or declared.weightless:
             return
         lane = self.lanes.by_id[slot.lane_id]
-        tenant = attempt.placement_id
-        why = f"attempt {attempt.request_id}#{attempt.attempt}"
-        prepared = attempt.prepared
-        shape = (prepared.entrypoint, prepared.cell()) if prepared else (declared.entrypoint, "")
-        attempt.room = self.memory.admit(lane, tenant, shape, why)
-        row = lane.row(tenant)
-        self._restore_residency(lane, tenant, row, why)
-        row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
+        row = lane.row(attempt.placement_id)
+        me = _Tenant(attempt.placement_id, lane, row, self)
+        peak = row.peak.get(_shape(attempt))
 
-    def _restore_residency(self, lane: DeviceLane, slot: str, row: LaneRow, why: str) -> None:
-        """Refill what an eviction took from `slot`, now that room was made for it. What
-        does not fit stays absent and the attempt stages it."""
-        missing = row.ledger.missing_resident()
+        def authorize() -> tuple[int, ...]:
+            try:
+                return self._grants(lane, attempt.placement_id)
+            except LaneRefusal as exc:
+                raise AttemptRefusal(
+                    exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+                ) from exc
+
+        attempt.memory_grants = self.memory.attempt_grants(
+            me, self._tenants(set(lane.ordinals)), peak, authorize
+        )
+        attempt.memory_grant = min(attempt.memory_grants)
         executor = row.executor()
-        if not (missing or row.emptied) or executor is None:
-            return
-        kind = accel.host_backend_family()
-        memory = lane.memory(kind)
-        try:
-            with executor.watched("restore"), self.memory.watch(lane, sample=False) as seen:
-                reply = executor.call(Restore(names=tuple(sorted(missing))), timeout=None)
-            self.memory.moved(lane, slot, seen)
-        except ExecutorGone as exc:
-            row.ledger.device_unreadable(f"the executor died while restoring: {exc}")
-            self.note("residency", f"{slot!r} died while restoring: {exc}"[:256])
-            return
-        if not reply.get("ok", True):
-            self.note(
-                "residency",
-                f"{slot!r} refused to restore: {reply.get('code')}: {reply.get('detail', '')}"[
-                    :256
-                ],
-            )
-            return
-        gained = row.ledger.observe_restore(reply, why)
-        row.ledger.device_process = self.read_device_process(executor.pid)
-        restored = (reply.get("restored") or {}).get("restored") or {}
-        held = (reply.get("restored") or {}).get("held") or {}
-        if not held:
-            row.emptied.clear()
-        if gained or restored:
-            after = lane.memory(kind)
-            # THE OTHER HALF OF A SWAP, MEASURED RATHER THAN INFERRED (cr-100). `restore_ms`
-            # is the whole re-fill, `fill_ms` the host->device leg inside it, and
-            # `read_bytes` what the block layer actually served — a warm page cache reads
-            # ~0 there, so "the re-stage was warm" stops being an assumption. Nothing here
-            # decides anything: a duration that starts governing behaviour is the next
-            # measurement to be enforced outside its conditions.
-            report = reply.get("restored") or {}
-            took = float(report.get("restore_ms", 0.0))
-            fill_ms = float(report.get("fill_ms", 0.0))
-            read = int(report.get("read_bytes", -1))
-            # THE SWAP'S OWN LEGS (cr-103), beside the total they explain — the same
-            # treatment `prepare` got. "9018 ms outside the fill leg" named a duration and
-            # attributed none of it, which is how a restore stayed unexplained across two
-            # issues; these four legs say which part of the re-stage spent it.
-            legs = dict(report.get("legs") or {})
-            objects = int(legs.pop("objects", 0))
-            destinations = int(legs.pop("destinations", 0))
-            copy_ms = float(legs.get("copy_ms", 0))
-            # MS PER OBJECT, OUTSIDE THE COPY. The arithmetic says ~7 GB from page cache
-            # over PCIe 4.0 x16 is ~1.5 s and from NVMe ~3.5 s, and the measured restore
-            # was 9.7 s — so if what is left over scales with the OBJECT COUNT rather than
-            # with bytes, the fix is batching and not faster I/O. That is one division and
-            # it decides which, so it is printed rather than left to be inferred.
-            per_object = (
-                f", {(took - copy_ms) / objects:.2f} ms/object outside the copy" if objects else ""
-            )
-            self.note(
-                "residency",
-                f"{lane.lane_id}: {slot!r} restored {gained} B "
-                f"({', '.join(sorted(restored))}) in {took:.0f} ms — fill leg "
-                f"{fill_ms / 1000:.3f} s, {took - fill_ms:.0f} ms outside it"
-                + (
-                    " ["
-                    + ", ".join(f"{name} {int(ms)}ms" for name, ms in legs.items())
-                    + f" over {objects} object(s), {destinations} destination(s)"
-                    + per_object
-                    + "]"
-                    if legs
-                    else ""
+        if (
+            executor is not None
+            and self.memory.executor_placement(executor.hello.get("memory", ())) == "all_resident"
+            and row.ledger.evicted
+        ):
+            # Released revision-1 Restore has no grant fields. Activate already accepts
+            # a scalar ceiling and refreshes the active construction's authorization.
+            if executor.active:
+                with executor.watched("restore-grant"):
+                    reply = executor.call(
+                        Activate(
+                            construction=executor.active,
+                            authorized_device_limit_bytes=attempt.memory_grant,
+                            memory_grants=attempt.memory_grants,
+                        ),
+                        timeout=None,
+                        on_request=self._room(lane, attempt.placement_id),
+                    )
+                if not reply.get("ok"):
+                    raise AttemptRefusal(
+                        str(reply.get("code") or "residency_grant_refused"),
+                        str(reply.get("detail") or "executor rejected the restore grant"),
+                        cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+                    )
+            with executor.watched("restore"):
+                reply = executor.call(
+                    Restore(names=tuple(sorted(row.ledger.evicted))),
+                    timeout=None,
+                    on_request=self._room(lane, attempt.placement_id),
                 )
-                + ", "
-                + (
-                    "block-device reads unreadable"
-                    if read < 0
-                    else f"{read} B read from the block layer "
-                    f"({'cold' if read > gained // 2 else 'warm page cache'})"
+            if not reply.get("ok"):
+                raise AttemptRefusal(
+                    str(reply.get("code") or "residency_restore_failed"),
+                    str(reply.get("detail") or "executor could not restore its resident weights"),
+                    cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
                 )
-                + f" — for {why}; the driver reports "
-                f"{memory.free_bytes} -> {after.free_bytes} B free",
-            )
-        if held:
-            self.note(
-                "residency",
-                f"{slot!r} left {sorted(held)} absent: "
-                + "; ".join(f"{name}: {reason}" for name, reason in sorted(held.items()))[:300],
-            )
+            row.ledger.observe_restore(reply, "revision-1 resident placement")
+            self._observe_memory(lane, row, reply)
+            attempt.memory_grants = authorize()
+            attempt.memory_grant = min(attempt.memory_grants)
+        lane.touch(attempt.placement_id)
+        row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
 
     def _room(self, lane: DeviceLane, slot: str) -> Handler:
         """Answer an executor that asks for room mid-load or mid-call (released executors'
         rank 0 does): idle tenants of every device of its lane give theirs back."""
 
+        origin = lane.row(slot).executor()
+
         def answer(request: Request) -> Answer:
+            if origin is None or lane.row(slot).executor() is not origin:
+                return refuse("executor_replaced", "memory request no longer owns this generation")
+            if isinstance(request, HostRoom):
+                token = f"executor:{origin.pid}:{origin.epoch}:{slot}:{request.reservation}"
+                if not request.reservation or request.nbytes < 0:
+                    return refuse(
+                        "host_room_invalid", "host credit requires a token and nonnegative bytes"
+                    )
+                if request.release:
+                    self.memory.release_host(token)
+                    return Answer(ok=True)
+                if self.memory.reserve_host(
+                    token, request.nbytes, requester=slot, tenants=self._tenants(None)
+                ):
+                    return Answer(ok=True)
+                return refuse(
+                    "host_shortfall", f"{request.nbytes} B of host backing cannot be reserved"
+                )
             if not isinstance(request, DeviceRoom):
-                return refuse("no_durable_exchange", "device_room only")
-            need = request.free_bytes
-            why = f"its executor needs {need} B free"
-            self.memory.make_room(lane, slot, {ordinal: need for ordinal in lane.ordinals}, why)
+                return refuse("no_durable_exchange", "device_room or host_room only")
+            if request.free_bytes < 0 or request.grant_bytes < 0:
+                return refuse("device_room_invalid", "memory requests must be nonnegative")
+            if request.rank_memory:
+                self._observe_memory(lane, lane.row(slot), {"rank_memory": request.rank_memory})
+            me = _Tenant(slot, lane, lane.row(slot), self)
+            tenants = self._tenants(set(lane.ordinals))
+            if any(rank < 0 or rank >= len(lane.ordinals) for rank in request.ranks):
+                return refuse("device_room_invalid", "a requested rank is outside the lane")
+            ordinals = (
+                [lane.ordinals[rank] for rank in request.ranks]
+                if request.ranks
+                else list(lane.ordinals)
+            )
+            needs = {need.rank: need for need in request.rank_needs}
+            if len(needs) != len(request.rank_needs) or any(
+                rank < 0
+                or rank >= len(lane.ordinals)
+                or need.free_bytes < 0
+                or need.grant_bytes < 0
+                for rank, need in needs.items()
+            ):
+                return refuse(
+                    "device_room_invalid", "rank needs must be unique, in range and nonnegative"
+                )
+            if needs:
+                ordinals = [lane.ordinals[rank] for rank in needs]
+            vector: dict[int, tuple[int, int | None, bool]] = {}
+            for ordinal in ordinals:
+                need = needs.get(lane.ordinals.index(ordinal))
+                vector[ordinal] = (
+                    need.free_bytes if need is not None else request.free_bytes,
+                    (need.grant_bytes if need is not None else request.grant_bytes) or None,
+                    need.measured if need is not None else request.measured,
+                )
+            self.memory.room_vector(me, vector, tenants)
             try:
-                return Room(ok=True, authorized_device_limit_bytes=self._ceiling(lane, slot))
+                grants = self._grants(lane, slot)
+                return Room(
+                    ok=True,
+                    authorized_device_limit_bytes=min(grants),
+                    memory_grants=grants,
+                    memory_free=tuple(
+                        reading[0] if (reading := self._driver(ordinal)) is not None else -1
+                        for ordinal in lane.ordinals
+                    ),
+                )
             except LaneRefusal as exc:
                 return refuse(exc.code, exc.detail)
 
@@ -6606,38 +7024,26 @@ class Worker:
         attempt.cancel_started = math.inf
 
     def stage(self, attempt: AttemptRecord) -> bool:
-        """VALIDATE -> FETCH -> HYDRATE -> JOURNAL -> ACCEPT, or a typed terminal."""
-        key = f"{attempt.request_id}#{attempt.attempt}"
+        """Validate and hydrate outside control; fence and journal acceptance together."""
         with self.control_lock:
             if self._admission_refused(attempt):
                 return False
             try:
-                self._bind_attempt_slot(attempt)
+                slot = self._bind_attempt_slot(attempt)
             except AttemptRefusal as exc:
-                self.note("attempt", f"{key} refused: {exc.code}")
-                self.terminate(
-                    attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
-                )
-                return False
-        # Fetch and hydrate move bytes; the control plane keeps answering meanwhile. The
-        # slot bound above is re-bound under the lock at device entry.
+                return self._admission_failed(attempt, exc)
         try:
-            self.engine.stage(attempt)
-        except AttemptRefusal as exc:
-            self.note("attempt", f"{key} refused: {exc.code}")
-            self.terminate(
-                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
+            accepted = self.engine.stage(
+                attempt, commit=lambda finish: self._commit_admission(attempt, slot, finish)
             )
-            return False
-        if attempt.canceling and self.engine.claim_staged(attempt):
-            # cancelled while it hydrated: nothing reached the device
+        except AttemptRefusal as exc:
+            return self._admission_failed(attempt, exc)
+        if accepted and attempt.canceling and self.engine.claim_staged(attempt):
             self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
         return attempt.state == "staged"
 
     def enter(self, attempt: AttemptRecord) -> bool:
-        """DEVICE ENTRY for a claimed staged attempt: LOAD/ACTIVATE -> RESOLVE -> PLAN, or a
-        typed terminal. The lane's device lock is held by the caller."""
-        key = f"{attempt.request_id}#{attempt.attempt}"
+        """Resolve and arbitrate outside control, under the caller's device lease."""
         with self.control_lock:
             if self._entry_refused(attempt):
                 return False
@@ -6647,16 +7053,109 @@ class Worker:
                 if self._entry_refused(attempt):
                     return False
                 slot = self._bind_attempt_slot(attempt)
-                self.engine.enter(
-                    attempt, before_plan=lambda: self._arbitrate_residency(attempt, slot)
-                )
-        except AttemptRefusal as exc:
-            self.note("attempt", f"{key} refused at device entry: {exc.code}")
-            self.terminate(
-                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
+            return self.engine.enter(
+                attempt,
+                before_plan=lambda: self._arbitrate_residency(attempt, slot),
+                commit=lambda finish: self._commit_admission(attempt, slot, finish),
             )
-            return False
-        return True
+        except AttemptRefusal as exc:
+            return self._admission_failed(attempt, exc)
+
+    def _admission_failed(self, attempt: AttemptRecord, exc: AttemptRefusal) -> bool:
+        """Complete outside lifecycle/control holds; a cancellation keeps its own outcome."""
+        if attempt.state not in ("outcome", "closed"):
+            self.note("attempt", f"{attempt.request_id}#{attempt.attempt} refused: {exc.code}")
+            if attempt.canceling:
+                self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
+            else:
+                self.terminate(
+                    attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
+                )
+        return False
+
+    def _commit_admission(
+        self, attempt: AttemptRecord, prepared_slot: AttemptSlot, finish: Callable[[], None]
+    ) -> bool:
+        """Revalidate immutable routing and process identity, then commit without device I/O.
+
+        Lock order is control -> attempt transition -> lifecycle. A busy lifecycle is
+        waited outside both outer locks, then every fence is checked again. Refusals unwind
+        all holds before their terminal can reconcile or retire a process.
+        """
+
+        def finish_owned() -> bool:
+            if attempt.state in ("outcome", "closed", "released", "finalizing"):
+                return False
+            staged = bool(attempt.accepted_at) and "job" not in attempt.spec
+            deadline = attempt.deadline_ms or int(attempt.spec.get("deadline_unix_ms", 0))
+            if not attempt.canceling and deadline and time.time() * 1000 > deadline:
+                attempt.canceling = "deadline"
+            if attempt.canceling:
+                raise AttemptRefusal(
+                    "cancelled_before_commit",
+                    "the attempt was cancelled during preparation",
+                    cause=CAUSE.CAUSE_CODE_CLIENT_CANCEL,
+                )
+            if "job" not in attempt.spec and self._placement_by_id(attempt.placement_id) is None:
+                raise AttemptRefusal(
+                    "unknown_placement",
+                    "the prepared placement left this worker",
+                    cause=CAUSE.CAUSE_CODE_UNKNOWN_PLACEMENT,
+                )
+            if not staged:
+                dispatchable = (
+                    self._placement_dispatchable(attempt.placement_id)
+                    if "job" not in attempt.spec
+                    else self.accepted.mode == "serving" or self.dispatchable()
+                )
+                if not dispatchable or self.accepted.posture == pb.Posture.POSTURE_DRAINING:
+                    raise AttemptRefusal(
+                        "placement_not_dispatchable",
+                        "admission changed during preparation",
+                        cause=CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
+                    )
+            current = self._bind_attempt_slot(attempt)
+            if (
+                current.supervision is not prepared_slot.supervision
+                or current.ledger is not prepared_slot.ledger
+                or current.devices != prepared_slot.devices
+                or current.job_binding != prepared_slot.job_binding
+                or current.job_resource_caps != prepared_slot.job_resource_caps
+                or (
+                    attempt.executor is not None
+                    and current.supervision.current is not attempt.executor
+                )
+            ):
+                raise AttemptRefusal(
+                    "executor_replaced_before_acceptance",
+                    "the prepared slot or executor changed before its commit",
+                    cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                )
+            if "job" not in attempt.spec:
+                self.engine._resolve_declared_binding(attempt)
+            finish()
+            return True
+
+        while True:
+            with self.control_lock, attempt.transition_lock:
+                if attempt.state in ("outcome", "closed", "released", "finalizing"):
+                    return False
+                executor = attempt.executor
+                if executor is None:
+                    return finish_owned()  # Queue acceptance deliberately binds no executor.
+                with prepared_slot.supervision.try_hold(executor) as owned:
+                    if owned is True:
+                        return finish_owned()
+                    if owned is False:
+                        raise AttemptRefusal(
+                            "executor_replaced_before_acceptance",
+                            "the prepared executor changed before its commit",
+                            cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                        )
+            # A retire/spawn may perform slow I/O. Wait without controlling other calls,
+            # and release this hold before restarting the normal lock acquisition order.
+            with prepared_slot.supervision.hold(executor):
+                pass
 
     def _entry_refused(self, attempt: AttemptRecord) -> bool:
         """An ACCEPTED attempt's device-entry fences, under the control lock: TRUE once
@@ -6699,40 +7198,23 @@ class Worker:
         return done
 
     def admit(self, attempt: AttemptRecord) -> bool:
-        """FETCH -> HYDRATE -> LOAD -> CHOOSE -> ACCEPT, or a typed terminal. Never a silence."""
-        # Desired-state convergence and executor rebuilds take this same lock. Recheck the
-        # offer's immutable routing facts under it, then hold it through the acceptance:
-        # a queued offer cannot be accepted on the far side of a change to ITS placement
-        # merely because it was admitted earlier. The construction the attempt needs
-        # is loaded between the two holds, under the lane's device lock alone, so a load
-        # never stalls the control plane.
-        key = f"{attempt.request_id}#{attempt.attempt}"
+        """Prepare under device ownership, keeping control responsive until a fenced commit."""
         with self.control_lock:
             if self._admission_refused(attempt):
                 return False
         try:
             self._ensure_construction(attempt)
-        except AttemptRefusal as exc:
-            self.note("attempt", f"{key} refused: {exc.code}")
-            self.terminate(
-                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
-            )
-            return False
-        with self.control_lock:
-            if self._admission_refused(attempt):
-                return False
-            try:
+            with self.control_lock:
+                if self._admission_refused(attempt):
+                    return False
                 slot = self._bind_attempt_slot(attempt)
-                self.engine.prepare_and_accept(
-                    attempt, before_plan=lambda: self._arbitrate_residency(attempt, slot)
-                )
-            except AttemptRefusal as exc:
-                self.note("attempt", f"{key} refused: {exc.code}")
-                self.terminate(
-                    attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
-                )
-                return False
-        return True
+            return self.engine.prepare_and_accept(
+                attempt,
+                before_plan=lambda: self._arbitrate_residency(attempt, slot),
+                commit=lambda finish: self._commit_admission(attempt, slot, finish),
+            )
+        except AttemptRefusal as exc:
+            return self._admission_failed(attempt, exc)
 
     def _admission_refused(self, attempt: AttemptRecord) -> bool:
         """The queued offer's own facts, re-read under the control lock: TRUE once refused.
@@ -6816,49 +7298,58 @@ class Worker:
         A terminal built here is one the device phase itself produced (cancelled before
         dispatch, the executor died, the worker faulted) and is sent at once."""
         self._record_executor(attempt)
-        with self.memory.watch(lane) as seen:
+        try:
+            if self.machine_calls is not None:
+                self.machine_calls.timing.phase(
+                    self.fence.record_owner_id, attempt.request_id, attempt.attempt, "running"
+                )
             try:
+                released = self.engine.execute(attempt)
+            finally:
                 if self.machine_calls is not None:
                     self.machine_calls.timing.phase(
-                        self.fence.record_owner_id, attempt.request_id, attempt.attempt, "running"
+                        self.fence.record_owner_id, attempt.request_id, attempt.attempt, "finalizing"
                     )
-                try:
-                    released = self.engine.execute(attempt)
-                finally:
-                    if self.machine_calls is not None:
-                        self.machine_calls.timing.phase(
-                            self.fence.record_owner_id,
-                            attempt.request_id,
-                            attempt.attempt,
-                            "finalizing",
-                        )
-            except Exception as exc:
-                self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
-                try:
-                    released = self.engine.abandon(
-                        attempt, f"the worker faulted while running this attempt: {exc}"
-                    )
-                except Exception as inner:
-                    self.note("attempt", f"even ABANDONED could not be built: {inner}")
-                    self.terminate(
-                        attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}"
-                    )
-                    return None
+        except Exception as exc:
+            self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
+            try:
+                released = self.engine.abandon(
+                    attempt, f"the worker faulted while running this attempt: {exc}"
+                )
+            except Exception as inner:
+                self.note("attempt", f"even ABANDONED could not be built: {inner}")
+                self.terminate(attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}")
+                return None
         if not isinstance(released, Released):
             self.settle(released)
             return None
-        prepared = attempt.prepared
-        if attempt.placement_id in lane.rows and prepared is not None:
-            outcome = released.reply.outcome
-            code = outcome.code if outcome is not None else ""
-            self.memory.settle(
+        if attempt.placement_id in lane.rows:
+            row = lane.row(attempt.placement_id)
+            reply = released.reply
+            self._observe_memory(
                 lane,
-                attempt.placement_id,
-                (prepared.entrypoint, prepared.cell()),
-                seen,
-                ok=outcome is not None and outcome.terminal == "succeeded",
-                forget=code in DEVICE_SHORTFALL_CODES or code in GROUP_FAULT_CODES,
+                row,
+                {
+                    "memory": reply.memory,
+                    "rank_memory": reply.rank_memory,
+                    "residency": reply.residency,
+                },
             )
+            outcome = reply.outcome
+            peaks = {
+                ordinal: int(facts["peak_bytes"])
+                for rank, ordinal in enumerate(lane.ordinals)
+                if (facts := reply.rank_memory.get(str(rank))) is not None
+                and int(facts.get("peak_bytes", 0)) > 0
+            }
+            shape = _shape(attempt)
+            if outcome is not None and outcome.terminal == "succeeded" and peaks:
+                previous = row.peak.setdefault(shape, {})
+                for ordinal, peak in peaks.items():
+                    previous[ordinal] = max(previous.get(ordinal, 0), peak)
+            elif outcome is not None and outcome.code in DEVICE_SHORTFALL_CODES:
+                # Failed on the device: the next call of this shape measures afresh.
+                row.peak.pop(shape, None)
         return released
 
     def finish(self, released: Released) -> None:
@@ -7061,12 +7552,45 @@ class Worker:
                 from . import machine_compute
 
                 machine_compute.park_if_idle(self)
+                self._schedule_host_pressure_relief()
                 # Observation follows authentication, independently of the dispatch
                 # barrier. Only the current stream is eligible, after its snapshot.
                 if self.fence.control_stream_epoch in self.attached_streams:
                     self.send(pb.WorkerFrame(observed_state=self.observed_state()))
             except Exception as exc:  # one tick's failure is that tick's
                 self.note("report", f"tick faulted: {fault_text(exc)}"[:400])
+
+    def _schedule_host_pressure_relief(self) -> None:
+        """Queue optional reclaim without delaying the reporter heartbeat."""
+        with self._host_pressure_schedule_lock:
+            if self._host_pressure_scheduled:
+                return
+            self._host_pressure_scheduled = True
+
+        def run() -> None:
+            try:
+                # Take this small state snapshot under control protection.  The memory
+                # policy owns the snapshot after this point and performs no worker RPC
+                # while the control lock is held.
+                with self.control_lock:
+                    tenants = tuple(self._tenants(None))
+                result = self.memory.relieve_host_pressure(tenants)
+                if result is not None and result.get("attempts", 0):
+                    self.note("host-pressure", json.dumps(result, sort_keys=True)[:400])
+            finally:
+                with self._host_pressure_schedule_lock:
+                    self._host_pressure_scheduled = False
+
+        try:
+            threading.Thread(
+                target=self._lane("host-pressure", run, fatal=False),
+                daemon=True,
+                name="host-pressure",
+            ).start()
+        except BaseException:
+            with self._host_pressure_schedule_lock:
+                self._host_pressure_scheduled = False
+            raise
 
     def publish_activity(self, *, strict: bool = False) -> None:
         """Tell the pod supervisor what this worker is doing (`worker/activity.py`).
@@ -7463,3 +7987,70 @@ class Worker:
 
 #: Written when the worker FAILS: the next boot fails what it held instead of running it.
 FAILED_MARKER = "worker-failed.json"
+
+
+def _shape(attempt: AttemptRecord) -> tuple[str, str]:
+    """What a call's measured peak is kept by: its entrypoint and request shape cell."""
+    prepared = attempt.prepared
+    return (prepared.entrypoint, prepared.cell()) if prepared is not None else ("", "")
+
+
+@dataclass(eq=False)
+class _Tenant:
+    """One lane row as the Worker's memory policy sees it."""
+
+    slot: str
+    lane: DeviceLane
+    row: LaneRow
+    worker: Worker
+
+    @property
+    def ordinals(self) -> tuple[int, ...]:
+        return tuple(self.lane.ordinals)
+
+    @property
+    def held(self) -> dict[int, int]:
+        """Reported footprints of this generation; missing rank facts remain unknown."""
+        self.row.sync_memory_generation()
+        return self.row.held
+
+    @property
+    def overhead(self) -> dict[int, int]:
+        return self.row.overhead
+
+    @property
+    def last_used(self) -> int:
+        return self.row.last_used
+
+    @property
+    def reclaim_generation(self) -> tuple[int, int] | None:
+        current = self.row.supervision.current if self.row.supervision is not None else None
+        return (current.pid, current.epoch) if current is not None else None
+
+    def state(self) -> str:
+        current = self.row.supervision.current if self.row.supervision is not None else None
+        if current is None or current.poisoned or not current.alive():
+            return "dead"
+        if current._calls.locked() or any(
+            attempt.executor is current and attempt.state in ON_DEVICE | {"preparing"}
+            for attempt in list(self.worker.engine.live.values())
+        ):
+            return "active"
+        return "idle"
+
+    def reclaim_host(self, nbytes: int) -> tuple[int, int] | None:
+        return self.worker._reclaim_host(self, nbytes)
+
+    def vacate(self, ordinals: tuple[int, ...]) -> bool:
+        return self.worker._vacate(self, ordinals)
+
+    def end(self, why: str) -> bool:
+        current = self.row.supervision.current if self.row.supervision is not None else None
+        if current is None:
+            return True
+        if not self.worker._end_tenant(self.slot, current, why):
+            return False
+        self.row.sync_memory_generation()
+        self.row.held = dict.fromkeys(self.ordinals, 0)
+        self.row.overhead = dict.fromkeys(self.ordinals, 0)
+        return True

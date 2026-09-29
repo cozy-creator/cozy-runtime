@@ -89,14 +89,13 @@ def test_each_model_keeps_its_kernel_and_decode_cost(decode: bool, staged: bool)
     plan = choose(source, staged=staged)
     rows = plan.document()["model_deliveries"]
     assert plan.delivery == ("float" if decode else "native")
-    assert plan.materialization == (("staged_decode" if staged else "aot_decode") if decode else "")
+    assert plan.materialization == ("staged_decode" if decode else "")
     assert rows["base"]["kernels"] == source["base"]["kernels"]
     assert rows["base"]["route_costs"]["encoded_gemm"] == "none"
     assert rows["lora"]["route_costs"] == {"verbatim": "none"}
     if decode:
-        assert rows["base"]["route_costs"]["decoded_float"] == (
-            "per_transition" if staged else "per_generation"
-        )
+        # Initial residency is a snapshot; the Planner may evict these bytes later.
+        assert rows["base"]["route_costs"]["decoded_float"] == "per_transition"
 
 
 def test_observational_fields_do_not_change_attempt_identity() -> None:

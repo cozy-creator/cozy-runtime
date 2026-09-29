@@ -131,13 +131,27 @@ def test_defaults_must_name_actual_injected_models(
         static_interface.build(root)
 
 
-def test_artifact_reader_uses_the_same_ladder_refusals(tmp_path: Path) -> None:
+@pytest.mark.parametrize("vector", VECTORS["invalid"], ids=lambda row: row["name"])
+def test_artifact_reader_validates_known_ladder_fields(
+    tmp_path: Path, vector: dict[str, Any]
+) -> None:
     body = static_interface.build(project(tmp_path, invocable=True))
-    for vector in VECTORS["invalid"]:
-        invalid = deepcopy(body)
-        invalid["entrypoints"][0]["models"][0]["default_ladder"] = vector["ladder"]
-        with pytest.raises(ConformanceError, match="model_defaults"):
-            package_interface.read_bytes(package_interface.canonical_bytes(invalid))
+    body["entrypoints"][0]["models"][0]["default_ladder"] = vector["ladder"]
+    raw = package_interface.canonical_bytes(body)
+    if vector["name"] == "unknown_field":
+        # Readers ignore additive fields; the author-surface test still refuses them.
+        parsed = package_interface.parse(raw)
+        rung = parsed.entrypoints[0].models[0].default_ladder
+        assert isinstance(rung, tuple) and len(rung) == 1
+        assert (rung[0].gpu, rung[0].lane) == ("H100", vector["ladder"][0]["lane"])
+        return
+    structural = vector["name"] in {"not_array", "missing_gpu", "gpu_bool"}
+    expected = "malformed_package_interface" if structural else "model_defaults"
+    with pytest.raises(ConformanceError) as refused:
+        package_interface.read_bytes(raw)
+    assert refused.value.code == expected
+    if structural:
+        assert "default_ladder" in str(refused.value)
 
 
 def test_defaults_do_not_open_other_fixed_point_locations(tmp_path: Path) -> None:

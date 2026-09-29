@@ -107,6 +107,8 @@ func (l *completionLauncher) maintain(op string, _ []string) (string, error) {
 		return strings.Join(l.previous, "\n"), nil
 	case "restart":
 		return "accepted", nil
+	case "update-stage":
+		return "prepared", nil
 	case "update-prepare":
 		return "boot_pending", nil
 	case "capabilities":
