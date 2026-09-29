@@ -28,7 +28,7 @@ from packaging.utils import canonicalize_name
 
 from cozy_runtime.internal import host_paths
 from cozy_runtime.internal.config import package_install_environment
-from cozy_runtime.internal.package_environment import EnvironmentRefusal
+from cozy_runtime.internal.package_environment import EnvironmentRefusal, wheel_name_version
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 MAX_SOURCE_BYTES = 1 << 30
@@ -377,22 +377,30 @@ def _build(
         exact, runtime = _split_runtime(
             requirements.read_bytes() if requirements.is_file() else b""
         )
-        floating = bool(runtime)
 
         def hashed(name: str, rows: bytes) -> None:
             (directory / name).write_bytes(rows)
             run(*pip, "--require-hashes", "--no-deps", "--requirements", str(directory / name))
 
-        wheels = sorted(str(path) for path in (directory / "wheels").glob("*.whl"))
+        # A captured closure carries the SDK its author's environment held as wheels; like
+        # a lock's pin, that is the fallback, and the SDK floats to this machine's Runtime.
+        wheels, sdk = [], []
+        for path in sorted((directory / "wheels").glob("*.whl")):
+            named = wheel_name_version(path.name)
+            (sdk if named is not None and named[0] in SDK else wheels).append(str(path))
+        floating = bool(runtime or sdk)
         if requirements.is_file():
             hashed(".exact-requirements.txt", exact)
         if wheels:
             run(*pip, "--no-deps", *wheels)
-        elif not requirements.is_file():
+        elif not requirements.is_file() and not sdk:
             run(*pip, f"{package.rsplit('/', 1)[-1]}=={release}")
 
         def as_locked() -> None:
-            hashed(".runtime-requirements.txt", runtime)
+            if runtime:
+                hashed(".runtime-requirements.txt", runtime)
+            if sdk:
+                run(*pip, "--no-deps", *sdk)
 
     site = _site(generation)
     if floating:

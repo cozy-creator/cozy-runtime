@@ -227,3 +227,79 @@ def test_a_published_installation_follows_the_machines_runtime(tmp_path: Path) -
     assert _runtime(again.python) == expected
     assert not package_installation.stale(root, "published")
     assert install().generation == again.generation
+
+
+def _published_wheel(name: str, version: str) -> Path:
+    """One release's native wheel for this machine, as a caller's environment would hold it."""
+    url = f"https://pypi.org/pypi/{name}/{version}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            files = json.loads(r.read())["urls"]
+    except (urllib.error.URLError, TimeoutError) as exc:
+        pytest.skip(f"PyPI is unreachable: {exc}")
+    row = next(
+        f
+        for f in files
+        if f["filename"].endswith(".whl")
+        and "manylinux" in f["filename"]
+        and "x86_64" in f["filename"]
+        and ("cp312" in f["filename"] or "abi3" in f["filename"])
+    )
+    path = CACHE / "wheels" / row["filename"]
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(row["url"], timeout=300) as r:
+            path.write_bytes(r.read())
+    return path
+
+
+def test_a_captured_closure_floats_its_sdk_wheels_to_the_machines_runtime(
+    tmp_path: Path,
+) -> None:
+    """A child captured from its caller's environment carries that environment's SDK as wheels
+    (run 1621: qwen-image-2's closure held cozy-runtime 0.18.73). Its installation floats them
+    to this machine's Runtime within the package's bounds; the captured wheels are the lock."""
+    project = tmp_path / "project"
+    _source(project)
+    environment = package_install_environment()
+    export = ["uv", "export", "--frozen", "--no-dev", "--no-emit-project", "--project"]
+    exported = subprocess.run(
+        [
+            *export,
+            str(project),
+            "--no-emit-package",
+            "cozy-runtime",
+            "--no-emit-package",
+            "tensorfs",
+        ],
+        env=environment,
+        capture_output=True,
+        check=True,
+    ).stdout
+    locked = (CACHE / f"uv-{LOCKED}.lock").read_text()
+    tensorfs = locked.split('name = "tensorfs"\nversion = "', 1)[1].split('"', 1)[0]
+    dist = tmp_path / "dist"
+    subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(dist), str(project)],
+        env=environment,
+        capture_output=True,
+        check=True,
+    )
+    (package,) = dist.glob("*.whl")
+    mine, published = importlib.metadata.version("cozy-runtime"), _published().releases
+    expected = mine if mine in published else max(published, key=Version)
+
+    installed = package_installation.install(
+        tmp_path / "installs",
+        package="local/bound-probe",
+        release="1.0.0",
+        python=PYTHON,
+        installation_id="captured",
+        requirements=exported,
+        wheels=(
+            package,
+            _published_wheel("cozy-runtime", LOCKED),
+            _published_wheel("tensorfs", tensorfs),
+        ),
+    )
+    assert _runtime(installed.python) == expected
