@@ -57,7 +57,7 @@ class ObservedWorker(Worker):
         supervision.on_change = observe
         return supervision
 
-    def _describe_installed(
+    def _describe_in_slot(
         self,
         installed: package_installation.InstalledEnvironment,
         distribution: str,
@@ -65,7 +65,7 @@ class ObservedWorker(Worker):
         application: str = "",
     ) -> bytes:
         self.descriptions.append(installed.installation_id)
-        return super()._describe_installed(installed, distribution, application=application)
+        return super()._describe_in_slot(installed, distribution, application=application)
 
     def assert_describes_reaped(self) -> None:
         for executor in self.describe_executors:
