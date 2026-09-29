@@ -5975,7 +5975,7 @@ class Worker:
                 if not owned or proctree.process_state(identity) in (None, "Z"):
                     continue
                 ordinal = lane.ordinals[rank]
-                entry = lane.entries[ordinal]
+                entry = lane.entries[rank]
                 measured = accel.process_memories_by_device(
                     {pid}, accel.host_backend_family(), (entry,), allow_subprocess=False
                 )[entry][pid]
