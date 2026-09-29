@@ -25,6 +25,7 @@ from cozy_runtime.internal.worker import (
     machine_child_target,
     machine_lanes,
     machine_models,
+    run_timing,
     triage,
     workspace_memo,
 )
@@ -157,6 +158,7 @@ class Calls:
         self.executions = worker.executions
         self.journal = JournalCalls(worker.workspace)
         self.timing = call_timing.Timing(self.executions, self.journal, worker.calls.progress_label)
+        self.run_timing = run_timing.Timing(self.executions)
         self.lock = threading.Lock()
         #: child request -> the parent call that named it last (a resumed parent calls again)
         self.requests: dict[str, pb.ChildCallRequest] = {}

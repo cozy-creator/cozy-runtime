@@ -3482,6 +3482,13 @@ class Worker:
 
     def emit_progress(self, request_id: str, attempt: int, frame: dict[str, Any]) -> None:
         """The LOSSY lane. Bounded per watch, oldest-first shed, worker-owned sequence."""
+        if self.machine_calls is not None:
+            timing = self.machine_calls.run_timing
+            owner = self.fence.record_owner_id
+            if frame.get("kind") == "execution_activity":
+                timing.observe(owner, request_id, attempt, frame)
+                return
+            timing.snapshot(owner, request_id, attempt)
         key = (request_id, attempt)
         # A load's positions are liveness for the monitor and watches; its start is history.
         if self.executions is not None and not (
@@ -6819,6 +6826,9 @@ class Worker:
         with self.memory.watch(lane) as seen:
             try:
                 if self.machine_calls is not None:
+                    self.machine_calls.run_timing.begin(
+                        self.fence.record_owner_id, attempt.request_id, attempt.attempt
+                    )
                     self.machine_calls.timing.phase(
                         self.fence.record_owner_id, attempt.request_id, attempt.attempt, "running"
                     )
@@ -6826,6 +6836,9 @@ class Worker:
                     released = self.engine.execute(attempt)
                 finally:
                     if self.machine_calls is not None:
+                        self.machine_calls.run_timing.end(
+                            self.fence.record_owner_id, attempt.request_id, attempt.attempt
+                        )
                         self.machine_calls.timing.phase(
                             self.fence.record_owner_id,
                             attempt.request_id,

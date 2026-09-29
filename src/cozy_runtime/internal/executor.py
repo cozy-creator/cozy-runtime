@@ -3346,6 +3346,7 @@ class Executor:
                             cancel=lambda: _cancelled(self.root, command.request_id),
                             models=self.models,
                             progress=progress,
+                            activity=self._activity_sink(command.request_id),
                             # cr-012: the inputs the WORKER already fetched, verified and spooled.
                             # Every value is a path inside this attempt's own spool: this process is
                             # `sandbox.refuse_network` rejects ungranted network access.
@@ -4005,6 +4006,7 @@ class Executor:
                     started_monotonic=time.monotonic(),
                 ),
                 progress=self._progress_sink(command.request_id),
+                activity=self._activity_sink(command.request_id),
             ),
         )
         handler_ms = (time.perf_counter() - started) * 1000
@@ -4249,6 +4251,21 @@ class Executor:
             return tolerant.read(frame, into, ("progress", "observation"))[0]
         except msgspec.ValidationError as exc:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
+
+    def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool], None]:
+        def activity(sequence: int, active: bool, known: bool) -> None:
+            self.channel.send(
+                {
+                    "event": "progress",
+                    "request_id": request_id,
+                    "kind": "execution_activity",
+                    "sequence": sequence,
+                    "active": active,
+                    "known": known,
+                }
+            )
+
+        return activity
 
     def _progress_sink(self, request_id: str) -> Any:
         """The lossy lane's sink for one attempt — the same one `invoke` installs."""
