@@ -256,6 +256,7 @@ class Planner:
         #: allocator bytes the attempt's weight moves added (negative: gave back)
         self.transition = 0
         self.log: list[str] = []
+        self.plans: dict[str, list[str]] = {}
         self.oom_asked = 0
         #: the typed refusal this attempt ended on, for the reply's shortfall numbers
         self.refusal: MemoryRefusal | None = None
@@ -384,6 +385,7 @@ class Planner:
         self.peak = self.peak_allocated = self.working = 0
         self.loads = self.offloads = self.moved = self.transition = 0
         self.log = []
+        self.plans = {}
         self.refusal = None
         if self.cuda:
             self.torch.cuda.reset_peak_memory_stats(self.device)
@@ -427,6 +429,7 @@ class Planner:
             "overhead_bytes": self.overhead,
             "grant_bytes": self.grant if self.grant is not None else -1,
             "log": list(self.log[-8:]),
+            "plans": {op: list(seen) for op, seen in self.plans.items()},
             "poisoned": "",
         }
 
@@ -618,6 +621,10 @@ class Planner:
                 record.ok = max(record.ok, frame.working)
                 if record.fail > record.ok:
                     record.fail = 0
+                seen = self.plans.setdefault(f"{held.key.rsplit('/', 1)[-1]}.{method}", [])
+                shape = f"{plan.rung or 'untiled'} {plan.keep}/{len(held.part.blocks)} blocks"
+                if shape not in seen:
+                    seen.append(shape)
                 return out
             finally:
                 self._sample()
