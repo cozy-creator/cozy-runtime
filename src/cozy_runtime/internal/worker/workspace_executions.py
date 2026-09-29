@@ -732,6 +732,20 @@ class Executions:
         with self.workspace.locked() as db, transaction(db):
             self._event(db, self._row(db, owner, request), kind, canonical_json.encode(document))
 
+    def last_call_phase(self, owner: str, request: str, attempt: int) -> dict[str, Json] | None:
+        """The latest observation of an inactive call, read only when its clock reopens."""
+        root, _ = self.scheduling_root(owner, request)
+        with self.workspace.locked() as db:
+            row = db.execute(
+                "SELECT body FROM execution_events WHERE owner=? AND request=? "
+                "AND kind='call.phase' "
+                "AND json_extract(CAST(body AS TEXT),'$.request')=? "
+                "AND json_extract(CAST(body AS TEXT),'$.attempt')=? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (owner, root, request, attempt),
+            ).fetchone()
+        return cast(dict[str, Json], canonical_json.decode(row[0])) if row is not None else None
+
     def active(self, owner: str) -> bool:
         with self.workspace.locked() as db:
             return (

@@ -345,12 +345,13 @@ class Calls:
             or parent.state != "running"
             or parent.canceling
         ):
+            self.timing.phase(owner, child, 1, "paused", parent_attempt=call.parent_ordinal)
             return False  # nobody awaits it: a restarted or finished parent
         try:
             if module == source_interfaces.MODULE:
                 self.worker.machine_sources.run(unit, owner, call, request)
                 return False
-            self.timing.phase(owner, child, 1, "preparing")
+            self.timing.phase(owner, child, 1, "preparing", parent_attempt=call.parent_ordinal)
             with self.serving.demand(call):
                 target = machine_child_target.resolve(self.worker, parent, call)
                 self._check_ancestors(owner, parent, target, request.request_canonical_bytes)
@@ -360,14 +361,23 @@ class Calls:
                     else self._job(owner, parent, call, target, request)
                 )
             if submitted:
-                self.timing.phase(owner, child, 1, "queued")
+                self.timing.phase(owner, child, 1, "queued", parent_attempt=call.parent_ordinal)
             else:
                 settled = self.journal.child(owner, child)
-                status = "succeeded" if settled is not None and settled.result else "paused"
-                self.timing.phase(owner, child, 1, "terminal", status=status)
+                if settled is not None and settled.result:
+                    self.timing.phase(
+                        owner,
+                        child,
+                        1,
+                        "terminal",
+                        status="succeeded",
+                        parent_attempt=call.parent_ordinal,
+                    )
+                else:
+                    self.timing.phase(owner, child, 1, "paused", parent_attempt=call.parent_ordinal)
             return submitted
         except CallFenced:
-            self.timing.phase(owner, child, 1, "terminal", status="paused")
+            self.timing.phase(owner, child, 1, "paused", parent_attempt=call.parent_ordinal)
             return False  # its parent moved on: no one reads this call
 
     def _job(
