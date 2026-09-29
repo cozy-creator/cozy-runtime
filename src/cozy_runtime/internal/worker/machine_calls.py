@@ -279,6 +279,7 @@ class Calls:
         call = self.journal.child(owner, request)
         if call is None:
             return
+        timing = self.timing.phase(owner, request, row.ordinal, "terminal", status=row.state)
         body = self._terminal(owner, request)
         attribution = _Attribution()
         if body.HasField("triage_bundle"):
@@ -295,7 +296,6 @@ class Calls:
             else:
                 attribution = msgspec.json.decode(data, type=_Bundle).measurements.attribution
         target = call.target()
-        timing = self.timing.phase(owner, request, row.ordinal, "terminal", status=row.state)
         record = CallRecord(
             request=request,
             parent=call.parent_request,
