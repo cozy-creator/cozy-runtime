@@ -165,6 +165,9 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	m.setUpdating(m.startupPending())
 	if startupErr == nil && (g.bootstrap == nil || g.bootstrap.Incarnation == "") {
 		if err := m.replaceApplication(); err != nil {
+			if m.startupPending() {
+				return err
+			} // the stable parent restores the failed candidate
 			startupErr = err
 		}
 	}

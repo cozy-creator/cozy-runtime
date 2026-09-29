@@ -66,3 +66,20 @@ func TestApplicationRetentionUsesRunningInode(t *testing.T) {
 		t.Fatalf("retained pathname replacement: %s %v", raw, err)
 	}
 }
+
+func TestUnsupportedInstalledBundleCannotReplaceRepairAgent(t *testing.T) {
+	root := t.TempDir()
+	m := &Machine{layout: NewLayout(&Grant{Root: root}), log: io.Discard}
+	executable(t, filepath.Join(root, "opt/cozy/python/bin/cozy-machine"), `echo '{"name":"cozy-machine","wire_minor":68,"minimum_wire_minor":64,"capabilities":["hub-access/1","runtime-update/1"]}'`)
+	d := &directLauncher{root: root, out: io.Discard}
+	answer, err := d.maintain("agent-replace", []string{"running-repair-agent"})
+	if err != nil || answer != "" || d.replacement != "" {
+		t.Fatalf("unsupported installed bundle displaced repair agent: %q %v", answer, err)
+	}
+	if err = m.startupSave(startupStatus{State: "boot_pending"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = d.maintain("agent-replace", []string{"running-repair-agent"}); err == nil {
+		t.Fatal("uncommitted unsupported application was not refused")
+	}
+}
