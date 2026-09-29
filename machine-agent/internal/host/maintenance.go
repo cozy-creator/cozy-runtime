@@ -53,7 +53,11 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 		if err := m.startupPython(context.Background(), &state, "inspect", m.layout.Store); err != nil {
 			return "", err
 		}
-		if !state.Quiescent {
+		guarded, err := consumeGuardedUpdateProof(root)
+		if err != nil {
+			return "", err
+		}
+		if !state.Quiescent && !guarded {
 			return "", errors.New("Runtime quiescence required for explicit software changes")
 		}
 		var status startupStatus
@@ -145,10 +149,63 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 const restartAnswerBound = time.Minute
 
 type restartFact struct {
-	PID      int    `json:"pid"`
-	Sequence int    `json:"sequence"`
-	Status   string `json:"status"` // accepted | busy
-	Guarded  bool   `json:"supports_guarded_restart"`
+	PID         int    `json:"pid"`
+	Sequence    int    `json:"sequence"`
+	Status      string `json:"status"` // accepted | busy
+	Guarded     bool   `json:"supports_guarded_restart"`
+	Incarnation string `json:"incarnation"`
+}
+
+type guardedUpdateProof struct {
+	PID         int    `json:"pid"`
+	Incarnation string `json:"incarnation"`
+	Sequence    int    `json:"sequence"`
+}
+
+func guardedUpdateProofPath(root string) string {
+	return filepath.Join(root, "run/cozy/worker", "guarded-update-proof.json")
+}
+
+func writeGuardedUpdateProof(root string, p *runtimeProcess, sequence int) error {
+	if p == nil || p.pid <= 0 || p.incarnation == "" || sequence <= 0 {
+		return errors.New("guarded restart proof has incomplete process identity")
+	}
+	raw, err := json.Marshal(guardedUpdateProof{PID: p.pid, Incarnation: p.incarnation, Sequence: sequence})
+	if err != nil {
+		return err
+	}
+	return writeAtomic(guardedUpdateProofPath(root), raw, 0o400)
+}
+
+func consumeGuardedUpdateProof(root string) (bool, error) {
+	raw, err := os.ReadFile(guardedUpdateProofPath(root))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var proof guardedUpdateProof
+	if err := json.Unmarshal(raw, &proof); err != nil || proof.PID <= 0 || proof.Incarnation == "" || proof.Sequence <= 0 {
+		return false, errors.New("guarded restart proof is invalid")
+	}
+	fact, ok := readRestartFact(filepath.Join(root, "run/cozy/worker", "restart-status.json"))
+	if !ok || fact.Status != "accepted" || fact.PID != proof.PID || fact.Sequence != proof.Sequence ||
+		fact.Incarnation == "" || fact.Incarnation != proof.Incarnation {
+		return false, errors.New("guarded restart proof is stale or not Runtime-issued")
+	}
+	if err := os.Remove(guardedUpdateProofPath(root)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func clearGuardedUpdateProof(root string) error {
+	err := os.Remove(guardedUpdateProofPath(root))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func readRestartFact(path string) (restartFact, bool) {
@@ -178,6 +235,9 @@ func guardedRestart(root string, p *runtimeProcess) (string, error) {
 			if fact.Status == "accepted" {
 				p.stop() // acceptance proves no work; measure shutdown progress
 				<-p.done
+				if err := writeGuardedUpdateProof(root, p, fact.Sequence); err != nil {
+					return "", fmt.Errorf("record guarded update proof: %w", err)
+				}
 			}
 			return fact.Status, nil
 		}

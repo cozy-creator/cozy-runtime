@@ -202,6 +202,38 @@ func TestBrokenInstalledProbeAndReportDoNotPreventRepair(t *testing.T) {
 	}
 }
 
+func TestExplicitUpdateUsesOnlyFreshGuardedProofToCrossRetainedV1State(t *testing.T) {
+	root := t.TempDir()
+	layout := NewLayout(&Grant{Root: root})
+	executable(t, filepath.Join(root, "opt/cozy/python/bin/python"), `case "$4" in inspect) echo '{"runtime":"0.18.86","tensorfs":"0.3.78","eligible":true,"quiescent":false,"accepted_work":true}' ;; *) exit 1 ;; esac`)
+	request, _ := json.Marshal(pairTransaction{
+		Before: pairVersions{Runtime: "0.18.86", TensorFS: "0.3.78"},
+		After:  pairVersions{Runtime: "0.18.87", TensorFS: "0.3.78"},
+		Store:  layout.Store,
+	})
+	if _, err := maintain(root, nil, "update-prepare", []string{string(request)}); err == nil || !strings.Contains(err.Error(), "quiescence required") {
+		t.Fatalf("caller without proof crossed retained state: %v", err)
+	}
+	proof := &runtimeProcess{pid: 1234, incarnation: "fresh", done: make(chan struct{})}
+	if err := os.MkdirAll(filepath.Dir(guardedUpdateProofPath(root)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := json.Marshal(restartFact{PID: 1234, Sequence: 1, Status: "accepted", Guarded: true, Incarnation: "fresh"})
+	if err := writeAtomic(filepath.Join(root, "run/cozy/worker", "restart-status.json"), status, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGuardedUpdateProof(root, proof, 1); err != nil {
+		t.Fatal(err)
+	}
+	_, err := maintain(root, nil, "update-prepare", []string{string(request)})
+	if err == nil || strings.Contains(err.Error(), "quiescence required") {
+		t.Fatalf("fresh guardian proof did not cross only the retained-state gate: %v", err)
+	}
+	if _, err := os.Stat(guardedUpdateProofPath(root)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("guardian proof was not consumed: %v", err)
+	}
+}
+
 func TestUsedRentalDefersUpdateBeforeProbing(t *testing.T) {
 	previous := build.Version
 	build.Version = "0.1.2"

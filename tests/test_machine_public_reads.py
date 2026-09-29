@@ -164,3 +164,41 @@ def test_software_update_view_checks_native_work_and_waived_retention(tmp_path: 
         assert db.execute("SELECT quiescent FROM machine_software_update_v1").fetchone()[0]
         db.execute("UPDATE attempts SET state='running'")
         assert not db.execute("SELECT quiescent FROM machine_software_update_v1").fetchone()[0]
+
+
+def test_software_update_v2_separates_retained_custody_from_active_writers(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    executions.submit(
+        "owner",
+        "submission",
+        b"c" * 32,
+        offer("request"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
+    with workspace.locked() as db:
+        db.execute("UPDATE executions SET state='paused',collected=0,retention_waived=0")
+        db.execute("UPDATE attempts SET state='outcome'")
+        db.execute(
+            "INSERT INTO native_calls(owner,parent_request,call_index,parent_ordinal,parent_spec,"
+            "intent_digest,service_id,operation,accepted,native_owner,state) "
+            "VALUES('owner','request',0,0,x'',x'','native','operation',x'','owner','complete')"
+        )
+        db.execute(
+            "INSERT INTO holds(id,owner,transaction_id,native_digest,state) "
+            "VALUES('hold','owner','transaction',x'','held')"
+        )
+        db.execute(
+            "INSERT INTO weights(id,owner,request,ordinal,spec,slot,declaration_digest,"
+            "declaration,epoch,state) VALUES('weight','owner','request',1,x'', 'model',"
+            "x'',x'',1,'receipt')"
+        )
+        row = db.execute("SELECT * FROM machine_software_update_v2").fetchone()
+        assert row["quiescent"] and row["retention_required"]
+        db.execute("UPDATE native_calls SET state='executing'")
+        assert not db.execute("SELECT quiescent FROM machine_software_update_v2").fetchone()[0]
+        db.execute("UPDATE native_calls SET state='complete'")
+        db.execute("UPDATE weights SET state='intent'")
+        assert not db.execute("SELECT quiescent FROM machine_software_update_v2").fetchone()[0]

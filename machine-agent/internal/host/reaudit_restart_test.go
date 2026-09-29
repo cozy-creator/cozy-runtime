@@ -1,13 +1,56 @@
 package host
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestGuardedUpdateProofIsOneShotAndInvalidProofsAreRejected(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Dir(guardedUpdateProofPath(root)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := &runtimeProcess{pid: 1234, incarnation: "incarnation-a", done: make(chan struct{})}
+	status, _ := json.Marshal(restartFact{PID: 1234, Sequence: 7, Status: "accepted", Guarded: true, Incarnation: "incarnation-a"})
+	if err := writeAtomic(filepath.Join(root, "run/cozy/worker", "restart-status.json"), status, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGuardedUpdateProof(root, p, 7); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := consumeGuardedUpdateProof(root); err != nil || !ok {
+		t.Fatalf("fresh proof was not consumed: %v %v", ok, err)
+	}
+	if ok, err := consumeGuardedUpdateProof(root); err != nil || ok {
+		t.Fatalf("proof was reusable: %v %v", ok, err)
+	}
+	if err := writeGuardedUpdateProof(root, p, 8); err != nil {
+		t.Fatal(err)
+	}
+	status, _ = json.Marshal(restartFact{PID: 1234, Sequence: 8, Status: "accepted", Guarded: true, Incarnation: "incarnation-a"})
+	if err := writeAtomic(filepath.Join(root, "run/cozy/worker", "restart-status.json"), status, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearGuardedUpdateProof(root); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := consumeGuardedUpdateProof(root); err != nil || ok {
+		t.Fatalf("new process did not clear the stale proof: %v %v", ok, err)
+	}
+	raw, _ := json.Marshal(guardedUpdateProof{PID: 1234, Incarnation: "", Sequence: 8})
+	if err := writeAtomic(guardedUpdateProofPath(root), raw, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := consumeGuardedUpdateProof(root); err == nil || ok {
+		t.Fatalf("invalid proof was accepted: %v %v", ok, err)
+	}
+}
 
 func TestPreReadyCrashLoopPersistsUntilRepair(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "restarts.json")

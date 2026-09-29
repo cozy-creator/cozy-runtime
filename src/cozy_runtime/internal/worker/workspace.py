@@ -715,6 +715,16 @@ class Workspace:
                 is not None
             )
 
+    def software_update_state(self) -> tuple[bool, bool]:
+        """Return active-work quiescence separately from retained terminal custody."""
+        with self.locked() as db:
+            row = db.execute(
+                "SELECT quiescent,retention_required FROM machine_software_update_v2"
+            ).fetchone()
+            if row is None:
+                raise WorkspaceRefusal("Runtime software-update state is unavailable")
+            return bool(row[0]), bool(row[1])
+
     def retained_outcomes(self, owner: str) -> list[pb.AttemptOutcome]:
         self.recover(owner)
         with self.locked() as db:

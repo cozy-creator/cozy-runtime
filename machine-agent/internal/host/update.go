@@ -503,6 +503,19 @@ func (m *Machine) quiesce(ctx context.Context) error {
 				continue
 			}
 		}
+		// The Runtime cannot see authenticated machine-native preparation RPCs that are
+		// still crossing this agent. Admission is fenced above; wait for those writers to
+		// drain before asking the guardian for its per-incarnation restart proof.
+		if m.preparations() {
+			m.setUpdating(false)
+			m.launchMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
 		answer, err := m.launcher.maintain("restart", nil)
 		if err == nil && answer == "accepted" {
 			m.stopRuntime() // the Runtime exited; the guardian's report settles it here

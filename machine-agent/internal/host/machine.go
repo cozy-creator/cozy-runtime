@@ -326,6 +326,11 @@ func (m *Machine) loadRuntimeCapabilities() error {
 }
 
 func (m *Machine) launch() error {
+	// A guarded-update witness belongs to exactly the stopped incarnation that created it.
+	// Any ordinary/new launch consumes the opportunity rather than inheriting it.
+	if err := clearGuardedUpdateProof(m.layout.Root); err != nil {
+		return err
+	}
 	if err := m.loadRuntimeCapabilities(); err != nil {
 		return err
 	}

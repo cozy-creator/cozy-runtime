@@ -4121,14 +4121,25 @@ class Worker:
                 for attempt in list(self.engine.history.values())
             )
             preparing = self.preparation_lock.locked()
-            accepted = not (active_executions or active_attempts or preparing)
+            software_quiescent = True
+            if self.workspace is not None:
+                try:
+                    software_quiescent, _retention_required = self.workspace.software_update_state()
+                except Exception as exc:
+                    self.note("restart_refused", f"software-update state unavailable: {exc}")
+                    software_quiescent = False
+            accepted = not (
+                active_executions or active_attempts or preparing or not software_quiescent
+            )
             self.restart_sequence += 1
             document = {
                 "sequence": self.restart_sequence,
                 "status": "accepted" if accepted else "busy",
+                "incarnation": os.environ.get("COZY_RUNTIME_PROCESS_INCARNATION", ""),
                 "active_executions": active_executions,
                 "active_attempts": active_attempts,
                 "preparing": preparing,
+                "software_quiescent": software_quiescent,
             }
             try:
                 self._publish_restart_fact("restart-status.json", document)

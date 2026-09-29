@@ -28,6 +28,20 @@ def install(db: Journal) -> None:
           OR EXISTS(SELECT 1 FROM weights WHERE state='intent')
           OR EXISTS(SELECT 1 FROM input_tree_intakes WHERE state<>'released')) AS quiescent
       FROM workspace_state;
+    CREATE VIEW IF NOT EXISTS machine_software_update_v2 AS
+      SELECT execution_workspace_id AS workspace_id,
+        (EXISTS(SELECT 1 FROM executions) OR EXISTS(SELECT 1 FROM attempts)
+         OR EXISTS(SELECT 1 FROM native_calls)) AS accepted_work,
+        EXISTS(SELECT 1 FROM executions WHERE {RETENTION_REQUIRED}) AS retention_required,
+        NOT (EXISTS(SELECT 1 FROM executions WHERE state IN (
+              'queued','running','pausing','canceling'))
+          OR EXISTS(SELECT 1 FROM attempts WHERE state IN ('accepted','running'))
+          OR EXISTS(SELECT 1 FROM native_calls WHERE state IN (
+              'accepted','resolved','executing','failed','stopped','releasing'))
+          OR EXISTS(SELECT 1 FROM holds WHERE state IN ('retaining','releasing'))
+          OR EXISTS(SELECT 1 FROM weights WHERE state='intent')
+          OR EXISTS(SELECT 1 FROM input_tree_intakes WHERE state<>'released')) AS quiescent
+      FROM workspace_state;
     CREATE VIEW IF NOT EXISTS machine_workspace_v1 AS
       SELECT execution_workspace_id AS workspace_id FROM workspace_state;
     CREATE VIEW IF NOT EXISTS machine_runs_v1 AS
