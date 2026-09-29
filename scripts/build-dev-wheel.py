@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -59,11 +60,15 @@ def native_inputs(commit: str) -> None:
     def config(value: dict[str, object]) -> object:
         project, tool = value["project"], value["tool"]
         assert isinstance(project, dict) and isinstance(tool, dict)
+        hatch = copy.deepcopy(tool["hatch"])
+        # Source-archive selection cannot affect the wheel or its native extension.
+        # Keep shared build settings and all wheel-specific settings in the comparison.
+        hatch["build"]["targets"].pop("sdist", None)
         return (
             value["build-system"],
             project["requires-python"],
             tool["scikit-build"],
-            tool["hatch"],
+            hatch,
         )
 
     if changed.returncode or added.stdout or config(old) != config(new):

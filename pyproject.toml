@@ -52,17 +52,19 @@ testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
 [build-system]
-# ONE package, two wheel files per release (cr-094). The in-tree shim delegates to
+# ONE package, three wheel files per release. The in-tree shim delegates to
 # hatchling — the toolchain-free default producing the py3-none-any wheel and the sdist —
 # and, only when COZY_RUNTIME_BUILD_KERNELS=1, to scikit-build-core, which compiles
 # `native/` into `cozy_runtime/_kernels/_C.abi3.so` and tags the wheel cp312-abi3.
+# The release publisher adds the Go executable to that wheel and the ARM64 wheel.
 requires = ["hatchling"]
 build-backend = "dual_build_backend"
 backend-path = ["scripts"]
 
-# The Go agent is a separately released binary, not Python source-distribution input.
+# The public source archive includes the Go agent; default Python builds never compile it.
+# Local dotenv files are not distribution source. VCS ignores also exclude task/output trees.
 [tool.hatch.build.targets.sdist]
-exclude = ["/machine-agent"]
+exclude = ["**/.env", "**/.env.*"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cozy_runtime", "src/cozy"]

@@ -12,8 +12,10 @@ The glibc Linux x86-64 and ARM64 `cozy-runtime` PyPI wheels include the `cozy-ma
 executable. `uv pip install cozy-runtime` installs it alongside the Python commands;
 installation does not start a service. The wheel uses the standard scripts
 installation directory and contains the native executable, with no Python launcher
-or first-run binary download. The portable wheel and source distribution remain
-toolchain-free and do not contain the Linux agent.
+or first-run binary download. The portable wheel has no Linux executable. The
+source distribution includes the tracked Go agent source, module, and dependencies'
+checksums; its default Python build remains toolchain-free and does not compile Go.
+Building the agent from that source is an explicit `go build .` in `machine-agent/`.
 
 The personal controller and Tensorhub both connect to this machine API. A local
 machine uses `COZY_MACHINE_LIFETIME=persistent`, a stable locally generated
@@ -64,8 +66,9 @@ credential. The output contains static Linux amd64/arm64 executables and
 
 Publish those exact artifacts to **cozy-creator/cozy**, tag **machine-vVERSION**,
 with `gh release create --latest=false`. Refuse an existing tag; never overwrite
-an artifact or change the CLI's latest release. Only binary artifacts and their
-manifest are public; the build source remains in this private Runtime repository.
+an artifact or change the CLI's latest release. The standalone release contains binary
+artifacts and their manifest; the Runtime PyPI source archive also publishes the Go
+agent source. Repository visibility is independent of that public source distribution.
 Verify downloaded manifest hashes and `cozy-machine version --json` before
 promotion. Agent and Runtime versions evolve independently through advertised
 capabilities and the supported worker-protocol range.
