@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -147,9 +148,12 @@ func TestOpaqueAccessDoesNotInventAccountContinuity(t *testing.T) {
 	}
 }
 
-func TestAccessProjectionReplacesLegacyCredentialForSameOrigin(t *testing.T) {
+func TestAccessProjectionCannotResurrectLegacyRegistration(t *testing.T) {
 	l := NewLayout(&Grant{Root: t.TempDir()})
-	err := projectHubAccess([]HubGrant{{Origin: "https://example.test", WorkerID: "om-old", WorkerToken: "old"}}, hubAccessFile{Version: 1, Hubs: []hubAccess{{Origin: "https://example.test", Token: "new", ExpiresAt: 100}}}, l)
+	if err := writeAtomic(l.boot("machine-hubs.json"), []byte(`{"version":1,"hubs":[{"origin":"https://example.test","worker_id":"om-old","worker_token":"retired"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := projectHubAccess(hubAccessFile{Version: 1, Hubs: []hubAccess{{Origin: "https://example.test", Token: "new", ExpiresAt: 100}}}, l)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +165,7 @@ func TestAccessProjectionReplacesLegacyCredentialForSameOrigin(t *testing.T) {
 
 func TestOfflineAccessProjectionHasEmptyList(t *testing.T) {
 	l := NewLayout(&Grant{Root: t.TempDir()})
-	if err := projectHubAccess(nil, hubAccessFile{Version: 1}, l); err != nil {
+	if err := projectHubAccess(hubAccessFile{Version: 1}, l); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(l.boot("machine-hubs.json"))
@@ -170,5 +174,65 @@ func TestOfflineAccessProjectionHasEmptyList(t *testing.T) {
 	}
 	if string(raw) != `{"version":1,"hubs":[]}` {
 		t.Fatalf("invalid offline access document: %s", raw)
+	}
+}
+
+func TestForgetAccessRefusesRetainedWorkAndAllowsAccountSwitchAfterReset(t *testing.T) {
+	public, key, _ := ed25519.GenerateKey(rand.Reader)
+	claims, _ := newClaims("local-machine", "boot", make([]byte, 32), []ed25519.PublicKey{public})
+	launcher := &idleMutationLauncher{before: false, after: false, answer: "accepted"}
+	m := &Machine{grant: &Grant{WorkerID: "local-machine", Lifetime: "persistent"}, claims: claims, layout: NewLayout(&Grant{Root: t.TempDir()}), launcher: launcher, restarts: &restarts{}, log: io.Discard}
+	old := hubAccess{Origin: "https://example.test", Token: accessToken(t, "issuer", "old-account", "old"), ExpiresAt: 1, Environment: map[string]string{"TENSORHUB_ORIGIN": "https://example.test"}}
+	file := hubAccessFile{Version: 1, Hubs: []hubAccess{old}}
+	before, _ := json.Marshal(file)
+	if err := writeAtomic(m.accessPath(), before, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := projectHubAccess(file, m.layout); err != nil {
+		t.Fatal(err)
+	}
+	request := func(action string) *httptest.ResponseRecorder {
+		token, _ := capability.Mint(key, capability.Grant{Machine: "local-machine", Action: action, Expires: time.Now().Add(time.Hour).Unix()})
+		r := httptest.NewRequest(http.MethodDelete, "/v1/hubs/access", strings.NewReader(`{"origin":"https://example.test"}`))
+		r.Header.Set("Authorization", "Cozy-Cap "+token)
+		w := httptest.NewRecorder()
+		m.serveForgetHubAccess(w, r)
+		return w
+	}
+	if w := request(capability.Maintenance); w.Code != 403 {
+		t.Fatal("wrong scope", w.Code)
+	}
+	if w := request(hubAccessAction); w.Code != 409 || !strings.Contains(w.Body.String(), "machine_busy") {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	after, _ := os.ReadFile(m.accessPath())
+	if !bytes.Equal(before, after) || launcher.restarts != 0 {
+		t.Fatal("busy reset mutated retained access")
+	}
+	launcher.before, launcher.after = true, true
+	// The fixture refuses relaunch: removal remains durable and the endpoint reports
+	// that failure honestly. A real-process proof covers successful 204/relaunch.
+	if w := request(hubAccessAction); w.Code != 503 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	held, err := readHubAccess(m.accessPath())
+	if err != nil || len(held.Hubs) != 0 {
+		t.Fatal(held, err)
+	}
+	projection, _ := os.ReadFile(m.layout.boot("machine-hubs.json"))
+	if strings.Contains(string(projection), old.Token) {
+		t.Fatal("projection retained old account")
+	}
+	next := old
+	next.Token = accessToken(t, "issuer", "new-account", "new")
+	next.ExpiresAt = time.Now().Add(time.Hour).Unix()
+	token, _ := capability.Mint(key, capability.Grant{Machine: "local-machine", Action: hubAccessAction, Expires: time.Now().Add(time.Hour).Unix()})
+	raw, _ := json.Marshal(next)
+	r := httptest.NewRequest(http.MethodPost, "/v1/hubs/access", bytes.NewReader(raw))
+	r.Header.Set("Authorization", "Cozy-Cap "+token)
+	w := httptest.NewRecorder()
+	m.serveHubAccess(w, r)
+	if w.Code != 200 {
+		t.Fatal("reset did not permit account switch", w.Code, w.Body.String())
 	}
 }

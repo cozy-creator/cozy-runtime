@@ -68,9 +68,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	for _, name := range g.Ignored {
 		fmt.Fprintf(log, "cozy machine: ignoring %s, which this machine does not read\n", name)
 	}
-	for _, line := range g.Skipped {
-		fmt.Fprintf(log, "cozy machine: ignoring %s\n", line)
-	}
+
 	layout := NewLayout(g)
 	unlock, err := lockMachine(layout.State)
 	if err != nil {
