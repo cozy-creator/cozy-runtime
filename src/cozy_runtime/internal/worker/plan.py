@@ -166,6 +166,7 @@ class AttemptPlan:
     are not the same plan however identical their placement."""
     model_deliveries: tuple[tuple[str, CrossedDelivery], ...] = ()
     """Each model's resolved delivery and its cost under this attempt's placement."""
+
     def document(self) -> dict[str, Json]:
         document: dict[str, Json] = {
             "delivery": self.delivery,
@@ -528,6 +529,8 @@ class PlanChooser:
         declared: DeclaredBinding,
         prepared_model: PreparedModel,
         prepared: PreparedRequest,
+        *,
+        placement: str = "component_staged",
     ) -> AttemptPlan:
         ledger = self.ledger
         if ledger.unreconciled:
@@ -547,7 +550,6 @@ class PlanChooser:
         }
         absent = sum(ledger.evicted.values())
         weights = sum(nominal.values()) or declared.logical_weight_bytes
-        placement = "component_staged"
         rung = self._delivery(prepared_model, placement)
         return AttemptPlan(
             delivery=rung.delivery,

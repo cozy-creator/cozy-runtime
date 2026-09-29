@@ -389,7 +389,19 @@ def install_spread(
             calls["0"] = calls.get("0", 0) + 1
             for rank, index, args, _payloads in sent:
                 result = wire.recv_tensor(rank, group.pg, device)
-                reply = _accept(name, group, rank, group.reply_one(rank, "run"))
+                frame = group.reply_one(rank, "run")
+                try:
+                    reply = _accept(name, group, rank, frame)
+                except memory.MemoryRefusal as exc:
+                    # A consumed empty tensor answer plus a reusable control refusal
+                    # is a decline. Never discard a tensor that was already answered.
+                    reason = memory.Planner.spread_decline(exc)
+                    if result is not None or reason is None:
+                        raise
+                    declined[str(rank)] = reason
+                    log["declined"][str(rank)] = reason
+                    queue.append((index, args))
+                    continue
                 if result is None:
                     declined[str(rank)] = (reply.declined or "declined")[:300]
                     log["declined"][str(rank)] = declined[str(rank)]

@@ -411,6 +411,7 @@ class Executor:
         self.pg: Any = None
         self._device_ready = False
         self._startup_reported = False
+        self.worker_memory: frozenset[str] = frozenset()
         #: the attempt spool while an attempt runs: where a mirrored call's payloads go
         self._attempt_spool: Path | None = None
         #: rank 0 only: the attempt whose cancel marker the mirror reads before each call
@@ -499,6 +500,8 @@ class Executor:
                 if command.end_attempt and self.host.planner is not None:
                     self.host.planner.end()
                 return self.probe()
+            case executor_commands.Restore():
+                return self.restore(command.names)
             case Vacate():
                 return self.vacate(residents=command.residents, ranks=command.ranks)
             case Shutdown():
@@ -605,7 +608,11 @@ class Executor:
                 torch,
                 self._rank_device(torch),
                 room=owner._ask_room,
-                host_room=owner._ask_host_room if self.world == 1 else None,
+                host_room=(
+                    owner._ask_host_room
+                    if self.world == 1 and "host_room" in owner.worker_memory
+                    else None
+                ),
                 grouped=self.world > 1,
                 process_bytes=owner._process_bytes,
                 sharded=lambda key: tuple(key.rsplit("/", 1)) in owner.group_sharded,
@@ -661,9 +668,12 @@ class Executor:
             ),
             Room,
         )
-        if answer.ok and answer.memory_grants:
+        if answer.ok:
             self._grant(answer.authorized_device_limit_bytes, answer.memory_grants)
-            return answer.memory_grants[self.rank]
+            if answer.memory_grants:
+                return answer.memory_grants[self.rank]
+            scalar = answer.authorized_device_limit_bytes
+            return None if isinstance(scalar, UnsetType) else scalar
         return None
 
     def _ask_group_room(
@@ -1144,18 +1154,7 @@ class Executor:
     def _declines(self, exc: Exception) -> str | None:
         """Why a spread call is declined rather than failed: no room without evicting, or
         the device ran out inside the call (the planner already freed what it took)."""
-        if (
-            isinstance(exc, memory.MemoryRefusal)
-            and exc.reusable
-            and exc.code
-            in (
-                memory.SPARED,
-                "device_out_of_memory",
-                "host_shortfall",
-            )
-        ):
-            return f"{exc.code}: {exc.message}"[:300]
-        return None
+        return memory.Planner.spread_decline(exc)
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
         """A group that could not form or hold is THIS process's poison: the worker
@@ -1334,13 +1333,7 @@ class Executor:
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if not EXECUTOR_MEMORY_CAPABILITIES.issubset(command.memory_capabilities):
-            return {
-                "ok": False,
-                "code": "worker_memory_upgrade_required",
-                "detail": "the Worker must supply the current memory contract before startup; "
-                "update the machine Runtime",
-            }
+        self.host.worker_memory = frozenset(command.memory_capabilities)
         if self.started or (command.import_only and self.imported):
             return self._start_reply([], reused=True)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
@@ -4373,6 +4366,25 @@ class Executor:
         """No author computation may still mutate GPU or output state when a terminal is
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
+
+    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Answer the revision-1 restore operation through the current planner."""
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        active = self.constructions.get(self.active)
+        report: dict[str, object] = {"restored": {}, "held": {}, "restored_bytes": 0}
+        if self.group is not None:
+            self.group.broadcast(executor_commands.encode(executor_commands.Restore(names=names)))
+        try:
+            if active is not None and self.planner is not None:
+                report = self.planner.restore_resident(active.memory_key, names)
+            self._synchronize()
+        finally:
+            if self.group is not None:
+                for reply in self.group.collect("restore"):
+                    if not reply.get("ok"):
+                        raise GroupRefusal(f"a follower refused restore: {reply.get('code')}")
+        return {**self.probe(), "restored": report}
 
     def vacate(self, residents: bool = True, ranks: tuple[int, ...] = ()) -> dict[str, Any]:
         """FREE this process's device bytes for another tenant (cr-022), on `ranks` of a

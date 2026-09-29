@@ -421,6 +421,11 @@ class Ledger:
         self._rebaseline(read, f"vacated ({why})", f"{freed} B freed")
         return freed
 
+    def observe_restore(self, reply: Mapping[str, object], why: str) -> None:
+        """A revision-1 executor restored bytes; rebase against its actual probe."""
+        probe = msgspec.convert({**reply, "memory": memory_facts(reply.get("memory"))}, Probe)
+        self._rebaseline(probe, f"restored ({why})", "executor restore reply")
+
     def _rebaseline(self, probe: Probe, what: str, moved: str) -> None:
         before = self.device_allocated
         self._observe(probe)

@@ -52,7 +52,6 @@ from cozy_runtime.internal.child_env import (
 from cozy_runtime.internal.executor_commands import Command, Hello
 from cozy_runtime.internal.executor_replies import rank_memory_facts
 from cozy_runtime.internal.seam import (
-    EXECUTOR_MEMORY_CAPABILITIES,
     EXECUTOR_PROTOCOL_REVISION,
     Channel,
     SeamError,
@@ -140,8 +139,6 @@ def require_executor_protocol(hello: dict[str, Any]) -> None:
         type(revision) is int
         and revision == EXECUTOR_PROTOCOL_REVISION
         and isinstance(hello.get("native_interfaces"), dict)
-        and isinstance(hello.get("memory"), (list, tuple))
-        and all(name in hello["memory"] for name in EXECUTOR_MEMORY_CAPABILITIES)
     ):
         return
     # Reject before device initialization. Package versions and build hashes do not gate it.

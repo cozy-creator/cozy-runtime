@@ -64,6 +64,10 @@ class Vacate(Command, frozen=True, kw_only=True, tag="vacate"):
     ranks: tuple[int, ...] = ()
 
 
+class Restore(Command, frozen=True, kw_only=True, tag="restore"):
+    names: tuple[str, ...] = ()
+
+
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
     construction: str
 
@@ -318,6 +322,7 @@ type KnownCommand = (
     | Join
     | DescribeInstalled
     | Vacate
+    | Restore
     | Unload
     | Activate
     | Attention

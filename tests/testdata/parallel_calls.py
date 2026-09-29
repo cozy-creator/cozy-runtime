@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import socket
 from pathlib import Path
@@ -14,7 +15,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from cozy_runtime.author import Model, placeable, uses_components
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
-from cozy_runtime.internal import attention
+from cozy_runtime.internal import attention, memory
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.executor_commands import decode
@@ -271,6 +272,8 @@ def main() -> None:
     parser.add_argument("--h3", action="store_true")
     parser.add_argument("--hosted", action="store_true")
     parser.add_argument("--spread", action="store_true")
+    parser.add_argument("--spread-decline", action="store_true")
+    parser.add_argument("--spread-wire-refusal", action="store_true")
     args = parser.parse_args()
     args.h3 = args.h3 or args.hosted or args.spread
     torch.set_num_threads(1)
@@ -314,8 +317,39 @@ def main() -> None:
             if args.h3 and reply.get("ok"):
                 refused = executor._install_group(torch, model, (HOSTED_CAPACITY,) * executor.world)
                 assert refused is None, refused
+                if args.spread_decline and args.rank == 1:
+                    ordinary_scope = model._cozy_scope
+                    pending = [True]
+
+                    @contextlib.contextmanager
+                    def refuse_once(
+                        *values: Any,
+                        _pending: list[bool] = pending,
+                        _ordinary_scope: Any = ordinary_scope,
+                        **named: Any,
+                    ) -> Any:
+                        if _pending[0]:
+                            _pending[0] = False
+                            raise memory.MemoryRefusal(
+                                "device_shortfall",
+                                "measured follower minimum",
+                                20,
+                                10,
+                                reusable=True,
+                            )
+                        with _ordinary_scope(*values, **named):
+                            yield
+
+                    object.__setattr__(model, "_cozy_scope", refuse_once)
         elif name == "run":
             reply = executor.run(command)
+            if args.spread_wire_refusal and reply.get("declined"):
+                reply = {
+                    "ok": False,
+                    "reusable": True,
+                    "code": "device_shortfall",
+                    "detail": reply["declined"],
+                }
         else:
             raise AssertionError(name)
         channel.send({**reply, "reply": name})
