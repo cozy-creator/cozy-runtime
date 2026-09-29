@@ -214,3 +214,5 @@ func Serve(t testing.TB, host string, m *Machine) Server {
 	})
 	return s
 }
+
+func (m *Machine) RefreshKeys(ctx context.Context) error { return ctx.Err() }
