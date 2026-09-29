@@ -178,7 +178,7 @@ def test_startup_reclaims_measured_context_without_requesting_extra_free_bytes(
 
 
 @pytest.mark.parametrize("room", [3, 8])
-def test_optional_cache_uses_grant_and_retries_only_reusable_capacity(
+def test_optional_cache_selects_once_before_the_request(
     monkeypatch: pytest.MonkeyPatch, room: int
 ) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
@@ -188,23 +188,36 @@ def test_optional_cache_uses_grant_and_retries_only_reusable_capacity(
 
     def run(cache: bool) -> str:
         calls.append(cache)
-        if cache:
-            raise memory.MemoryRefusal(memory.SHORTFALL, "operation working exceeds room")
         return "image"
 
     assert held.part.root._cozy_optional_cache(8, run) == "image"
-    assert calls == ([True, False] if room == 8 else [False])
+    assert calls == [room == 8]
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_explicit_cache_mode_is_not_changed_by_current_room(
+    monkeypatch: pytest.MonkeyPatch, requested: bool
+) -> None:
+    owner = memory.Planner(torch, torch.device("cpu"))
+    held = owner.adopt("c", "model", pure(torch.nn.Identity()), None, tiers.HOST)
+    monkeypatch.setattr(owner, "allocatable", lambda: 0 if requested else 100)
+    calls = []
+    result = owner.optional_cache(held, 8, lambda mode: calls.append(mode), requested=requested)
+    assert result is None
+    assert calls == [requested]
 
 
 @pytest.mark.parametrize(
     "fault",
     [
+        memory.MemoryRefusal(memory.SHORTFALL, "reusable capacity refusal"),
+        memory.MemoryRefusal(DEVICE_OOM, "reusable operation OOM"),
         memory.MemoryRefusal(DEVICE_OOM, "poisoned", reusable=False),
         memory.MemoryRefusal("host_shortfall", "host fault"),
         torch.OutOfMemoryError("outside managed operation"),
     ],
 )
-def test_optional_cache_does_not_retry_unrestorable_or_unrelated_faults(
+def test_optional_cache_never_restarts_the_request_after_a_fault(
     fault: BaseException,
 ) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))

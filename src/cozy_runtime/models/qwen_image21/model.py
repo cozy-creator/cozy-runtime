@@ -310,6 +310,8 @@ class QwenImage21Model(Model[QwenImage21Graph]):
         reference_images: list[Any] | None = None,
         reference_latents: torch.Tensor | None = None,
         image_pad_mask: torch.Tensor | None = None,
+        use_kv_cache: bool | None = None,
+        on_cache_mode: Callable[[bool], None] | None = None,
     ) -> Any:
         transformer = self.graph.components["transformer"]
         device = next(transformer.parameters()).device
@@ -330,6 +332,8 @@ class QwenImage21Model(Model[QwenImage21Graph]):
             return values
 
         def run(use_kv_cache: bool) -> Any:
+            if on_cache_mode is not None:
+                on_cache_mode(use_kv_cache)
             with pipeline.transformer_retry_state(), torch.inference_mode():
                 return pipeline(
                     image=reference_images,
@@ -346,10 +350,15 @@ class QwenImage21Model(Model[QwenImage21Graph]):
 
         cancel()
         # The prefix KV cache (text, vision and reference tokens, every layer) grows by
-        # ~2 GiB per 1 MP reference. It is an exact speedup: when the card cannot hold it,
-        # recompute the prefix each step instead, slower but the same image.
+        # ~2 GiB per 1 MP reference. Cached and recomputed attention have different
+        # sequence layouts and can round differently. Select before sampling, report
+        # the choice, and preserve it through every step and transactional retry.
+        if not transformer.config.causal_condition:
+            if use_kv_cache is True:
+                raise ValueError("prefix KV caching requires a causal-condition model")
+            use_kv_cache = False
         if device.type != "cuda":
-            return run(use_kv_cache=True)
+            return run(use_kv_cache=True if use_kv_cache is None else use_kv_cache)
         choose = getattr(transformer, "_cozy_optional_cache", None)
         if not callable(choose):
             raise CapabilityError(
@@ -357,7 +366,7 @@ class QwenImage21Model(Model[QwenImage21Graph]):
                 code="memory_planner_unavailable",
             )
         prefix = embeds.shape[1] + (0 if reference_latents is None else reference_latents.shape[1])
-        return choose(prefix_cache_bytes(transformer, prefix), run)
+        return choose(prefix_cache_bytes(transformer, prefix), run, requested=use_kv_cache)
 
     @uses_components("vae")
     def decode(self, latents: Any, *, width: int, height: int) -> Any:

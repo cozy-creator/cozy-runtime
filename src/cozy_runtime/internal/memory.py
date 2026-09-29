@@ -507,27 +507,33 @@ class Planner:
         )
         return True, host, device
 
-    def optional_cache[T](self, held: Held, nbytes: int, run: Callable[[bool], T]) -> T:
-        """Try a declared exact cache only inside current grant room; one typed fallback.
+    def optional_cache[T](
+        self,
+        held: Held,
+        nbytes: int,
+        run: Callable[[bool], T],
+        *,
+        requested: bool | None = None,
+    ) -> T:
+        """Choose once before sampling; a cache can change floating-point results.
 
-        The adapter owns recreating the request's generator and transient cache containers.
-        A poisoned operation or an allocation outside a managed operation never retries here.
+        Explicit modes are authored semantics. Automatic selection uses current room.
+        Managed operations may recover within that mode, but a refusal must never replay
+        the whole request with a different mode or repeat its step/output callbacks.
         """
         if nbytes < 0 or self.held.get(held.key) is not held:
             raise ValueError("optional cache requires owned component and nonnegative bytes")
-        if nbytes > self.allocatable() and self._reserved() > self._allocated():
-            tiers.trim(self.torch)
-        if nbytes > self.allocatable():
-            self._ask_room(nbytes, [], measured=False)
-        if nbytes <= self.allocatable():
-            try:
-                return run(True)
-            except MemoryRefusal as exc:
-                if not exc.reusable or self.unusable or exc.code not in (SHORTFALL, DEVICE_OOM):
-                    raise
-                self.refusal = None
-        self.log.append(f"{held.key}: omitted optional {nbytes} B cache within device grant")
-        return run(False)
+        if requested is None:
+            if nbytes > self.allocatable() and self._reserved() > self._allocated():
+                tiers.trim(self.torch)
+            if nbytes > self.allocatable():
+                self._ask_room(nbytes, [], measured=False)
+            enabled = nbytes <= self.allocatable()
+        else:
+            enabled = requested
+        mode = "enabled" if enabled else "disabled"
+        self.log.append(f"{held.key}: selected request cache mode {mode} ({nbytes} B)")
+        return run(enabled)
 
     def select_decode_mode(
         self, held: Held, candidates: tuple[int, ...], probe: Callable[[int], None]
