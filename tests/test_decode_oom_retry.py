@@ -13,7 +13,7 @@ from test_staged_demand_pull import ENVELOPE, SCOPES, Device, device, plane
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("diffusers")
-from testdata.decode_oom import Card  # noqa: E402
+from testdata.decode_oom import Card, StreamingVAE  # noqa: E402
 
 __all__ = ["device"]
 
@@ -25,6 +25,14 @@ class Decoder(Model[object]):
     def decode_video(self, latents: Any) -> Any:
         with torch.inference_mode():
             return self.video_vae.decode(latents).sample
+
+
+class Streamer(Model[object]):
+    video_vae: Any
+
+    @uses_components("video_vae")
+    def decode_video(self, latents: Any, on_chunk: Any) -> None:
+        self.video_vae.decode(latents, on_chunk)
 
 
 def test_a_decode_oom_sheds_retries_tiled_and_leaves_the_executor_serving(
@@ -48,3 +56,19 @@ def test_a_decode_oom_sheds_retries_tiled_and_leaves_the_executor_serving(
     # The same executor serves the next request: nothing poisoned, the scope released.
     assert not residency.poisoned and model._cozy_active is None
     assert torch.equal(model.decode_video(latents), first)
+
+
+def test_a_streaming_video_decode_is_never_run_twice(device: Device) -> None:
+    """H3's `decode_video` hands chunks out as it decodes: an OOM there stays the run's
+    failure, since a second run would deliver the first chunks twice."""
+    residency, backend = plane(device, ("ref2va_dit",))
+    vae = StreamingVAE()
+    backend.parked["video_vae"] = vae
+    model = Streamer.for_test(video_vae=vae)
+    object.__setattr__(model, "_cozy_residency", residency)
+    residency.open_attempt("component_staged", ENVELOPE, dict(SCOPES), tuple(SCOPES))
+    chunks: list[Any] = []
+    with pytest.raises(torch.OutOfMemoryError):
+        model.decode_video(torch.zeros(1, 4, 2, 4, 4), chunks.append)
+    assert len(chunks) == 1 and not vae.use_tiling
+    assert not any(row.get("action") == "decode retried tiled after OOM" for row in backend.stage_log)
