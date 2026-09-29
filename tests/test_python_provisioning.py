@@ -559,7 +559,7 @@ def test_cli_and_local_worker_share_one_managed_interpreter_root(
         ),
         stop=threading.Event(),
         note=lambda *a: None,
-        _describe_published=lambda *a, **k: b"",
+        _describe_installed=lambda *a, **k: b"",
     )
     with pytest.raises(package_prepare.PreparationRefusal, match="selected"):
         Worker._prepare_published(
