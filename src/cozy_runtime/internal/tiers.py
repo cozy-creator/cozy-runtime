@@ -42,6 +42,10 @@ class Store(Protocol):
 
     def unit_loads(self, name: str, keys: frozenset[str]) -> bool: ...
 
+    def transient(self, name: str) -> int:
+        """Bytes a whole fill of `name` holds beyond the component while it arrives."""
+        ...
+
 
 @dataclass(eq=False)
 class Unit:

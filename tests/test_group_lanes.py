@@ -252,25 +252,17 @@ def _pressed_ledger() -> Ledger:
             "device_total_bytes": 8 * GiB,
         }
     )
-    ledger.activations_by_cell["height=512,width=512"] = 512 << 20
     return ledger
 
 
-@pytest.mark.parametrize("measured", [False, True])
-def test_a_call_whose_need_does_not_fit_is_staged_with_its_measured_headroom(
-    measured: bool,
-) -> None:
-    """What the memory manager could not make room for runs one declared scope at a time."""
+def test_the_plan_leaves_memory_to_the_executor() -> None:
+    """Weights may move within any attempt (the executor's planner places them before each
+    op), so the plan names the staged placement and prices no headroom of its own."""
     ledger = _pressed_ledger()
-    if not measured:
-        ledger.activations_by_cell.clear()
     prepared = PreparedRequest.unresolved("serve", {"width": 512, "height": 512})
-    chooser = PlanChooser(ledger)
-    model = PreparedModel(delivery_rung="verbatim")
-    plan = chooser.choose(_binding(), model, prepared, fits=False)
-    assert plan.placement == "component_staged"
-    assert plan.headroom_bytes == (512 << 20 if measured else 0)
-    assert chooser.choose(_binding(), model, prepared).placement == "all_resident"
+    plan = PlanChooser(ledger).choose(_binding(), PreparedModel(delivery_rung="verbatim"), prepared)
+    assert plan.placement == "component_staged" and plan.headroom_bytes == 0
+    assert plan.model_weight_bytes == 1 << 30
 
 
 def _placement(placement_id: str, lane_id: str = "") -> Placement:

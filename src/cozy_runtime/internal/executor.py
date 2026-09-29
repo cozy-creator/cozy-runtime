@@ -743,14 +743,14 @@ class Executor:
         started_us = execution_evidence.now_us()
         homes = any(rank == self.rank for rank in self.group_hosted.values())
         planner = self.host.planner
-        assert planner is not None
         # A spread call rank 0 waits on over the group: a header always answers it.
         answered = False
         try:
             spool = Path(command["spool"])
             if self._run_entry is None or self._run_entry[0] != spool:
                 self._run_entry = (spool, 0)
-                planner.begin(None)
+                if planner is not None:
+                    planner.begin(None)
                 held = attention.observed(
                     {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
                 )
@@ -772,7 +772,7 @@ class Executor:
                         (key, root) not in self.group_components for root in components
                     ):
                         raise GroupRefusal("mirrored scope names no prepared component")
-                    if spread and (homes or command.get("spare")):
+                    if planner is not None and spread and (homes or command.get("spare")):
                         # An optional call: taken on room alone, declined rather than evict.
                         stack.enter_context(planner.sparing())
                     stack.enter_context(models[key]._cozy_scope(scope["method"], components))
@@ -811,11 +811,11 @@ class Executor:
                     wire.send_tensor(output, 0, self.pg)
                 elif hosted:
                     module = str(command.get("module", ""))
-                    owned = planner.held.get(f"{name[0]}/{name[1]}")
+                    owned = planner.held.get(f"{name[0]}/{name[1]}") if planner else None
                     call = component.get_submodule(module)
                     output = (
                         planner.run(owned, f"hosted:{module}", call, args, kwargs)
-                        if owned is not None
+                        if planner is not None and owned is not None
                         else call(*args, **kwargs)
                     )
                     result = wire.marshal(
@@ -825,7 +825,7 @@ class Executor:
                     component(*args, **kwargs)
                 accel.synchronize(self.torch, self.device_kind)
             self._attempt_spool = spool
-            working = planner.peak_allocated
+            working = planner.peak_allocated if planner is not None else 0
         except Exception as exc:
             if spread and not answered:
                 declined = self._declines(exc)
@@ -934,7 +934,10 @@ class Executor:
                 )
         hosted = mirror.hosting_plan(
             placeable=tuple(getattr(type(model), "__placeable__", ())),
-            sizes={name: int(self.backend.component_memory[name].settled) for name in roots},
+            sizes={
+                name: int(getattr(self.backend, "component_bytes", {}).get(name, 0))
+                for name in roots
+            },
             sharded={name[1] for name in owner.group_sharded if name[0] == self._group_model_key},
             scopes=component_use(type(model)),
             capacity=capacity,

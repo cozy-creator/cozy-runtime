@@ -39,7 +39,6 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         *,
         check: bool = False,
         fail: bool = False,
-        expected_stages: int = 0,
         step: int | None = None,
     ) -> Any:
         assert in_gated_call()
@@ -66,13 +65,11 @@ class ModelCalls(Model[object]):
     def sample(self, state: Any, *, on_step: Any, cancel: Any) -> Any:
         # Rich mutable state and callbacks are deliberately not rank-wire values.
         with torch.no_grad():
-            self.block(state.value, check=True, expected_stages=state.expected_stages)
+            self.block(state.value, check=True)
             for step in range(2):
                 assert not cancel()
                 with attention_scope(AttentionLayout(29, 9, step, 1, ("blocks.0",))):
-                    result = self.block(
-                        state.value, expected_stages=state.expected_stages, step=step
-                    )
+                    result = self.block(state.value, step=step)
                 assert _ACTIVE_LAYOUT.get() is None
                 degree = torch.distributed.get_world_size()
                 torch.testing.assert_close(
@@ -88,90 +85,19 @@ class ModelCalls(Model[object]):
             self.block(torch.ones(1), fail=True)
 
 
-def collective_model(root: Path | None = None) -> ModelCalls:
+def collective_model() -> ModelCalls:
     overlay, spare = torch.nn.Module(), torch.nn.Module()
     overlay.weight = torch.nn.Parameter(torch.ones(1))
     spare.weight = torch.nn.Parameter(torch.full((1,), 5.0))
     model = ModelCalls.for_test(block=Collective(), overlay=overlay, spare=spare)
-    if root is not None:
-        fill_residency(root, model)
 
     def check_scope(module: Any, args: Any, kwargs: Any) -> Any:
         assert model._cozy_active is not None
         assert model._cozy_active[1] == ("block", "overlay")
-        residency: Any = model._cozy_residency
-        if residency is not None:
-            assert residency.placement == "component_staged"
-            assert residency.headroom == 37
-            assert residency.scope_headrooms == {"sample": 11, "fail_before_collective": 13}
-            assert set(residency.backend.components) == {"block", "overlay"}
-            # Multiple DiT forwards retain their weights; a per-call open_attempt would
-            # erase the first call's two stages and this accumulated observation.
-            assert residency.attempt_stages == kwargs.get("expected_stages", 0)
         return (args[0].to(model.overlay.weight.device) + model.overlay.weight, *args[1:]), kwargs
 
     model.block.register_forward_pre_hook(check_scope, with_kwargs=True)
     return model
-
-
-def fill_residency(root: Path, model: ModelCalls) -> None:
-    """Materialize three real native TensorFS components, then park the two used by DiT."""
-    import tensorfs
-
-    from cozy_runtime.author._loader import census
-    from cozy_runtime.internal.encoding import SPEC_PLAIN
-    from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, _Holder
-    from cozy_runtime.internal.residency import ComponentResidency
-
-    root.mkdir(parents=True, exist_ok=True)
-    store = tensorfs.Store.ensure(str(root / "store"))
-    values = {"block": 2.0, "overlay": 1.0, "spare": 5.0}
-    target = Tensor("f32", (1,), SPEC_PLAIN, {"value": Part("f32", (1,))})
-    writer = store.begin_derived(
-        weights_transaction_id("parallel-test", "create", "sha256:" + "1" * 64, "model"),
-        1,
-        *Derivation(
-            sources={},
-            targets={name: Target(add={"weight": target}) for name in values},
-            configs={"model": NativeConfig("add")},
-            order=tuple((name, "weight") for name in values),
-        ).native_arguments(4096),
-        work_fingerprint="sha256:" + "2" * 64,
-    )
-    for name, value in values.items():
-        writer.add_part(name, "weight", "value", io.BytesIO(struct.pack("<f", value)))
-    writer.add_config("model", io.BytesIO(b"{}"))
-    receipt = writer.commit()
-    manifest = "sha256:" + receipt["manifest"]["sha256"]
-    checkpoint = Checkpoint(root / "store", manifest)
-    backend = StreamingFillBackend.for_script(
-        checkpoint,
-        [row for name in values for row in checkpoint.rows(name)],
-        release="parallel-test/1",
-        store="fixture",
-        snapshot=manifest,
-        device="cuda",
-        encoded_leaves="refuse",
-        window_bytes=1 << 20,
-        slots=2,
-        readers=1,
-        inflight=1,
-    )
-    holder = _Holder({name: getattr(model, name) for name in values})
-    walked = census(holder)
-    backend.expect(
-        {name: [d.key for d in walked.destinations if d.component == name] for name in values}
-    )
-    backend.resident_budget = 12
-    backend.hold_lease = True
-    live = backend.materialize(holder, walked)
-    for destination in walked.destinations:
-        backend.fill(destination.key, destination.spec, live[destination.key])
-    backend.commit()
-    backend.evict("block")
-    backend.evict("overlay")
-    residency = ComponentResidency(backend, torch)
-    object.__setattr__(model, "_cozy_residency", residency)
 
 
 class H3Calls(Model[object]):
@@ -348,7 +274,6 @@ def main() -> None:
     parser.add_argument("--rank-fd", type=int)
     parser.add_argument("--leader")
     parser.add_argument("--h3", action="store_true")
-    parser.add_argument("--staged", action="store_true")
     parser.add_argument("--hosted", action="store_true")
     parser.add_argument("--spread", action="store_true")
     args = parser.parse_args()
@@ -365,9 +290,8 @@ def main() -> None:
         if args.spread
         else h3_model()
         if args.h3
-        else collective_model(args.root / f"rank-{args.rank}" if args.staged else None)
+        else collective_model()
     )
-    executor.residency = model._cozy_residency
     executor._group_model_key = "fixture"
     roots = (
         {"dit": model.dit, "text_encoder": model.text_encoder, "vae": model.vae}

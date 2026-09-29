@@ -662,21 +662,27 @@ class ResidentWeights:
     """
 
     def __init__(self) -> None:
-        self._verdicts: weakref.WeakKeyDictionary[Any, tuple[tuple[int, ...], str]] = (
-            weakref.WeakKeyDictionary()
-        )
+        #: id of a live weight -> the shape, dtype and write count it was verified at; its
+        #: entry leaves when the weight is collected, before its id can name another object
+        self._verdicts: dict[int, tuple[tuple[int, ...], str, int]] = {}
 
     @staticmethod
-    def _fill(tensor: Any) -> tuple[Any, tuple[tuple[int, ...], str]]:
-        return tensor, (tuple(tensor.shape), str(tensor.dtype))
+    def _fill(tensor: Any) -> tuple[tuple[int, ...], str, int]:
+        """A write in place bumps the version; moving the data between device and host keeps
+        it. An inference tensor keeps no version: its writes are its own."""
+        try:
+            version = int(tensor._version)
+        except RuntimeError:
+            version = -1
+        return tuple(tensor.shape), str(tensor.dtype), version
 
     def verified(self, tensor: Any) -> bool:
-        storage, fill = self._fill(tensor)
-        return self._verdicts.get(storage) == fill
+        return self._verdicts.get(id(tensor)) == self._fill(tensor)
 
     def record(self, tensor: Any) -> None:
-        storage, fill = self._fill(tensor)
-        self._verdicts[storage] = fill
+        if id(tensor) not in self._verdicts:
+            weakref.finalize(tensor, self._verdicts.pop, id(tensor), None)
+        self._verdicts[id(tensor)] = self._fill(tensor)
 
 
 @dataclass(frozen=True, slots=True)
