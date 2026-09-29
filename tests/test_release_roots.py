@@ -112,6 +112,15 @@ class Catalog:
                             {"slot": SLOT, "model": PACKAGE, "release": RELEASE, "ladder": ladder}
                         ]
                     }
+                elif url.path == f"/v1/models/{PACKAGE}":
+                    # Its newest release holds full precision beside a smaller lane.
+                    lanes = [{"lane": "fp8", "bytes": 1}, {"lane": LANE, "bytes": 2}]
+                    body = {
+                        "releases": [
+                            {"release": "0.9.0", "lanes": [{"lane": "fp8", "bytes": 1}]},
+                            {"release": RELEASE, "lanes": lanes},
+                        ]
+                    }
                 elif url.path == "/v1/models/resolve":
                     query = parse_qs(url.query)
                     # The Hub folds names: any spelling of the model resolves to its own.
@@ -342,6 +351,23 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
         )
         submit(machine, chosen)
         assert [urlsplit(path).path for path in catalog.reads] == ["/v1/models/resolve"]
+        # Run 1587: a repository named with no lane, for a slot that ranks none, runs its
+        # newest release's full-precision lane, and says which it picked.
+        forget()
+        catalog.reads.clear()
+        bare = submission(machine, "bare")
+        bare.release_root.models.add(parameter="model", repository=PACKAGE)
+        submit(machine, bare)
+        assert [urlsplit(path).path for path in catalog.reads] == [
+            f"/v1/models/{PACKAGE}",
+            "/v1/models/resolve",
+        ]
+        picked = [
+            canonical_json.decode(event.body)["models"][0]
+            for event in machine.executions.events(OWNER, "bare").events
+            if event.kind == "resolved"
+        ]
+        assert [(row["release"], row["lane"]) for row in picked] == [(RELEASE, LANE)]
         assert [
             canonical_json.decode(event.body)["models"][0]["repository"]
             for event in machine.executions.events(OWNER, "chosen").events
