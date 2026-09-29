@@ -79,6 +79,9 @@ func (m *Machine) prepare(stream grpc.ServerStream, message proto.Message,
 		return status.Error(codes.FailedPrecondition, "this machine's idle release is already committed")
 	}
 	done := m.beginPreparation()
+	if done == nil {
+		return status.Error(codes.Unavailable, "Runtime activation is waiting for preparations to drain")
+	}
 	defer done()
 	conn, err := m.runtime(ctx)
 	if err != nil {

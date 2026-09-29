@@ -34,5 +34,5 @@ func Revision() (string, bool) {
 
 // Capabilities name implemented agent contracts, independently of release numbers.
 func Capabilities() []string {
-	return []string{"hub-access/1", "runtime-update/1", "machine-bootstrap/1"}
+	return []string{"hub-access/1", "runtime-update/1", "runtime-update/2", "machine-bootstrap/1"}
 }
