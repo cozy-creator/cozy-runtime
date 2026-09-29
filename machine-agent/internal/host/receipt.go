@@ -102,8 +102,6 @@ func (r *receipt) seal(raw []byte, workerPort int, observed *OwnerAuth, webrtc m
 		return errors.New("the readiness key was spent; this boot signs nothing again")
 	}
 	sum := hex.EncodeToString(mac(r.key, payload))
-	clear(r.key)
-	r.key = nil
 	body, err := json.Marshal(envelope{Payload: payload, HMAC: sum})
 	if err != nil || len(body) > maxReceiptBytes {
 		return fmt.Errorf("the readiness envelope exceeds %d bytes", maxReceiptBytes)
@@ -111,6 +109,8 @@ func (r *receipt) seal(raw []byte, workerPort int, observed *OwnerAuth, webrtc m
 	if err := writeAtomic(r.path, body, 0o444); err != nil {
 		return err
 	}
+	clear(r.key)
+	r.key = nil
 	r.sealed, r.retained = body, payload
 	return nil
 }

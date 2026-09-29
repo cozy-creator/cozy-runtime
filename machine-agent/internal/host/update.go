@@ -79,9 +79,10 @@ func (s updateStatus) terminal() bool {
 }
 
 type runtimeUpdates struct {
-	mu     sync.Mutex
-	status *updateStatus
-	active string // held through cleanup, even after the installer has finished
+	staging sync.Mutex // uploads, admission and cleanup; never needed for observation
+	mu      sync.Mutex
+	status  *updateStatus
+	active  string // held through cleanup, even after the installer has finished
 }
 
 var (
@@ -212,9 +213,16 @@ func (m *Machine) serveStageWheel(w http.ResponseWriter, r *http.Request) {
 	}
 	// Staging belongs to the next accepted update. Do not acknowledge an upload
 	// while that update owns the directory or is still cleaning it up.
+	m.updates.staging.Lock()
+	defer m.updates.staging.Unlock()
+	if m.updating() {
+		http.Error(w, "software maintenance still owns Runtime admission", http.StatusConflict)
+		return
+	}
 	m.updates.mu.Lock()
-	defer m.updates.mu.Unlock()
-	if m.updates.active != "" || m.updates.status != nil && !m.updates.status.terminal() {
+	busy := m.updates.active != "" || m.updates.status != nil && !m.updates.status.terminal()
+	m.updates.mu.Unlock()
+	if busy {
 		http.Error(w, "the machine is running a Runtime update; stage wheels after it finishes", http.StatusConflict)
 		return
 	}
@@ -271,10 +279,12 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "an update requires operation, a boolean pin decision, and a Runtime or TensorFS", http.StatusBadRequest)
 		return
 	}
+	m.updates.staging.Lock()
+	defer m.updates.staging.Unlock()
 	m.updates.mu.Lock()
-	defer m.updates.mu.Unlock()
 	current := m.updates.status
 	busy := m.updates.active != "" || current != nil && !current.terminal()
+	m.updates.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case current != nil && current.Operation == request.Operation:
@@ -286,6 +296,12 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if m.startupPending() {
 		runtimeStarting(w, "booting")
+		return
+	}
+	if m.updating() {
+		// A resumed rollback can persist its terminal report before exiting
+		// into the restored application. That report does not release admission.
+		http.Error(w, "software maintenance still owns Runtime admission", http.StatusConflict)
 		return
 	}
 	m.mu.Lock()
@@ -311,7 +327,9 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cannot record the Runtime update: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	m.updates.mu.Lock()
 	m.updates.status, m.updates.active = &status, request.Operation
+	m.updates.mu.Unlock()
 	go m.runUpdate(request, status)
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(status)
@@ -331,16 +349,20 @@ func (m *Machine) installedPair() (pairVersions, error) {
 // runUpdate performs one update to its end, then records it.
 func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 	defer func() {
+		m.updates.staging.Lock()
+		defer m.updates.staging.Unlock()
 		m.updates.mu.Lock()
-		defer m.updates.mu.Unlock()
-		if m.updates.active == request.Operation {
+		owned := m.updates.active == request.Operation
+		m.updates.mu.Unlock()
+		if owned {
 			if err := os.RemoveAll(m.stagePath()); err != nil {
 				fmt.Fprintln(m.log, "cozy machine: cannot remove completed update files:", err)
 			}
 			m.setUpdating(false)
-			m.updates.status = &status
 			_ = m.writeUpdate(status)
-			m.updates.active = ""
+			m.updates.mu.Lock()
+			m.updates.status, m.updates.active = &status, ""
+			m.updates.mu.Unlock()
 		}
 	}()
 	fail := func(state string, err error) {
@@ -401,16 +423,27 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		m.mu.Unlock()
 		select {
 		case <-ready:
+		case <-p.done:
+		}
+		// Exit may race the reply to a durable readiness commit. Let that
+		// incarnation finish its claim before deciding whether rollback is needed.
+		<-p.claimDone
+		select {
+		case <-ready:
 			status.State, status.Error = "succeeded", ""
 			_ = m.restarts.clear()
 			return
-		case <-p.done:
+		default:
+			if p.startupCommitted {
+				fail("failed", fmt.Errorf("Runtime installation committed but authenticated readiness failed: %s", m.restarts.reason()))
+				return
+			}
 			err = fmt.Errorf("candidate exited before authenticated readiness: %s", exitText(p.err))
 		}
 	}
 	status.State, status.Error = "rolling_back", err.Error()
 	m.saveUpdate(status)
-	if rollback := m.rollbackStartup(ctx); rollback != nil {
+	if rollback := m.rollbackStartup(ctx, err); rollback != nil {
 		fail("failed", fmt.Errorf("%v; rollback failed: %w", err, rollback))
 		return
 	}

@@ -1111,7 +1111,7 @@ class Worker:
                 self.workspace,
                 self.authorize_workspace,
                 self.resolutions,
-                allow_private_egress=machine_model_defaults.local_development(self),
+                private_egress_allowed=lambda: machine_model_defaults.local_development(self),
             )
             if self.workspace is not None
             else None
@@ -1992,6 +1992,9 @@ class Worker:
         def mark_verified(digest: str, length: int, path: Path) -> None:
             self.verified_artifacts.record(digest, length, path)
 
+        authority = machine_model_resolve.registration(
+            self, machine_model_resolve.hub_key(self, request.hub)
+        )
         materialized: list[package_installation.InstalledEnvironment] = []
         result = package_prepare.prepare_local_package(
             request,
@@ -2009,7 +2012,7 @@ class Worker:
             dependency_python=self.options.environment_python,
             dependency_cache=self.config.dependency_cache,
             hub=package_installation.HubIndex(authority.origin, authority.ca)
-            if (authority := machine_model_resolve.registration(self, "")) is not None
+            if authority is not None
             else None,
         )
         installed = materialized[0]
@@ -2331,6 +2334,7 @@ class Worker:
         publication_authorization_id: str = "",
         arguments: dict[str, Any] | None = None,
         owner_memo: bool = False,
+        source_credentials: Sequence[pb.SourceCredential] = (),
     ) -> workspace_executions.Receipt:
         """Authenticated root intake; accepted execution never depends on the caller's stream."""
         with self.control_lock:
@@ -2403,6 +2407,7 @@ class Worker:
                     publication_authorization_id=publication_authorization_id,
                     owner_memo=owner_memo,
                 )
+            self.machine_sources.hold(owner, offer.request_id, source_credentials)
             self.execution(owner, offer.request_id)
             self.publish_activity(strict=True)
             return receipt

@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import grpc
 import pytest
@@ -506,6 +506,9 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         assert documents.read(refused.outcome_canonical_bytes, pb.AttemptOutcomeBody)[
             "safe_message"
         ]
+        # Durable terminal publication precedes the engine's lane/custody close.
+        # No observer or external acknowledgement is needed for that eventual close.
+        settle(lambda: worker.engine.history[("refused", 1)].state == "closed")
         assert worker.engine.history[("refused", 1)].state == "closed"
         assert (
             worker.submit_execution(
@@ -679,9 +682,16 @@ def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 @pytest.mark.parametrize("origin", ["private", "published", "published-sdk"])
-def test_real_executor_and_next_queued_root_finish_without_control_stream(origin: str) -> None:
+def test_real_executor_and_next_queued_root_finish_without_control_stream(
+    origin: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from conftest import image_python
-    from cozy_runtime.internal import child_env, package_interface, static_interface
+    from cozy_runtime.internal import (
+        child_env,
+        package_installation,
+        package_interface,
+        static_interface,
+    )
     from cozy_runtime.internal.config import Credentials, RuntimeConfig
     from cozy_runtime.internal.worker.control import GrpcControlHost
     from cozy_runtime.internal.worker.plan import JobBinding
@@ -693,6 +703,9 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream(origin
     from test_job_preparation_isolation import package
     from test_publish_derivation import _download_set, _SimpleIndex
 
+    # Published fixtures use the same SDK-wheel directory a real installed machine has.
+    sdk_wheels = image_python().parent.parent.parent / "wheels"
+    monkeypatch.setattr(package_installation, "machine_wheels", lambda _: sdk_wheels)
     with tempfile.TemporaryDirectory(prefix="cz-machine.") as raw:
         root = Path(raw)
         environment, preparation = package(root, "offline")
@@ -1011,8 +1024,105 @@ def serve(payload: Request) -> Result:
                         with pytest.raises(grpc.RpcError) as wrong_capture:
                             client.SubmitMachineExecution(invalid, timeout=5)
                         assert wrong_capture.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                if identifier == "first":
+                    from cozy_runtime.internal.worker.machine_publication import (
+                        PublicationAuthority,
+                    )
+
+                    worker.options = dataclasses.replace(
+                        worker.options,
+                        hubs=(
+                            PublicationAuthority(
+                                "https://selected.example",
+                                worker_id="fixture",
+                                worker_token="fixture",
+                            ),
+                        ),
+                    )
+                    submission.hub = "https://selected.example"
+                    submission.source_credentials.append(
+                        pb.SourceCredential(
+                            provider=pb.NATIVE_SOURCE_OPERATION_CIVITAI,
+                            credential="initial-fixture-credential",
+                        )
+                    )
+                    original_execution = worker.execution
+
+                    def observe_admission(
+                        owner: str,
+                        request_id: str,
+                        execute: Callable[[str, str], Any] = original_execution,
+                    ) -> Any:
+                        if request_id == "first":
+                            assert worker.executions is not None and worker.executions.owns(
+                                owner, request_id
+                            )
+                            assert (
+                                worker.machine_sources.credentials[(owner, request_id)][
+                                    pb.NATIVE_SOURCE_OPERATION_CIVITAI
+                                ]
+                                == "initial-fixture-credential"
+                            )
+                        return execute(owner, request_id)
+
+                    monkeypatch.setattr(worker, "execution", observe_admission)
                 receipt = client.SubmitMachineExecution(submission, timeout=30)
                 assert client.SubmitMachineExecution(submission, timeout=30) == receipt
+                if identifier == "first":
+                    assert worker.executions is not None
+                    retained = worker.executions.preparation("owner", identifier)
+                    assert retained["hub"] == "https://selected.example"
+                    monkeypatch.setattr(worker, "execution", original_execution)
+
+                    class WaitingSource:
+                        pokes = 0
+
+                        def poke(self) -> None:
+                            self.pokes += 1
+
+                    waiting = WaitingSource()
+                    with worker.machine_sources.lock:
+                        worker.machine_sources.waiting["scope-replay-proof"] = cast(Any, waiting)
+                    # Receipt reconciliation needs its durable scope, not a fresh
+                    # content bearer, and accepts harmless origin normalization.
+                    held_options = worker.options
+                    worker.options = dataclasses.replace(worker.options, hubs=())
+                    try:
+                        alias = pb.MachineExecutionSubmit()
+                        alias.CopyFrom(submission)
+                        alias.hub = "https://SELECTED.example:443"
+                        assert client.SubmitMachineExecution(alias, timeout=5) == receipt
+                        alias.hub = "https://another.example"
+                        alias.source_credentials[0].credential = "rejected-fixture-credential"
+                        before_pokes = waiting.pokes
+                        with pytest.raises(
+                            grpc.RpcError, match="changed its Hub scope"
+                        ) as changed_hub:
+                            client.SubmitMachineExecution(alias, timeout=5)
+                        assert changed_hub.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                        assert "cozy-error-code" not in dict(changed_hub.value.trailing_metadata())
+                        assert worker.executions.preparation("owner", identifier) == retained
+                        assert waiting.pokes == before_pokes
+                        assert (
+                            worker.machine_sources.credentials[("owner", identifier)][
+                                pb.NATIVE_SOURCE_OPERATION_CIVITAI
+                            ]
+                            == "initial-fixture-credential"
+                        )
+                        alias.hub = submission.hub
+                        alias.source_credentials[0].credential = "renewed-fixture-credential"
+                        assert client.SubmitMachineExecution(alias, timeout=5) == receipt
+                        assert waiting.pokes > before_pokes
+                        assert (
+                            worker.machine_sources.credentials[("owner", identifier)][
+                                pb.NATIVE_SOURCE_OPERATION_CIVITAI
+                            ]
+                            == "renewed-fixture-credential"
+                        )
+                    finally:
+                        worker.options = held_options
+                        with worker.machine_sources.lock:
+                            del worker.machine_sources.waiting["scope-replay-proof"]
                 if identifier == "first":
                     invalid.CopyFrom(submission)
                     invalid.payload_canonical_bytes = b"null"

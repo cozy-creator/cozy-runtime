@@ -3407,7 +3407,11 @@ type MachineExecutionSubmit struct {
 	// The account that owns the run. Unpublished code (local/) has no org, so the org-relative
 	// Model defaults of it and of every unpublished callee resolve under this account. Empty:
 	// such a default is refused. A published package's org is its own.
-	Account       string `protobuf:"bytes,15,opt,name=account,proto3" json:"account,omitempty"`
+	Account string `protobuf:"bytes,15,opt,name=account,proto3" json:"account,omitempty"`
+	// Wire 69: explicit Hub scope for a captured root and its descendants. This selects
+	// an existing scoped grant; no authority is conferred by the URL. Retained before
+	// acceptance and immutable on replay. Release-root submissions use ReleaseRoot.hub.
+	Hub           string `protobuf:"bytes,16,opt,name=hub,proto3" json:"hub,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3529,6 +3533,13 @@ func (x *MachineExecutionSubmit) GetOwnerMemo() bool {
 func (x *MachineExecutionSubmit) GetAccount() string {
 	if x != nil {
 		return x.Account
+	}
+	return ""
+}
+
+func (x *MachineExecutionSubmit) GetHub() string {
+	if x != nil {
+		return x.Hub
 	}
 	return ""
 }
@@ -6535,8 +6546,11 @@ type PrepareLocalPackageCall struct {
 	state           protoimpl.MessageState  `protogen:"open.v1"`
 	Claim           *Claim                  `protobuf:"bytes,1,opt,name=claim,proto3" json:"claim,omitempty"`
 	LocalPackageSet *DesiredLocalPackageSet `protobuf:"bytes,2,opt,name=local_package_set,json=localPackageSet,proto3" json:"local_package_set,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Wire 69: select this machine's scoped Hub grant for account-index dependencies.
+	// Empty never borrows an attached persistent-machine grant; a rental may use its own.
+	Hub           string `protobuf:"bytes,3,opt,name=hub,proto3" json:"hub,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PrepareLocalPackageCall) Reset() {
@@ -6581,6 +6595,13 @@ func (x *PrepareLocalPackageCall) GetLocalPackageSet() *DesiredLocalPackageSet {
 		return x.LocalPackageSet
 	}
 	return nil
+}
+
+func (x *PrepareLocalPackageCall) GetHub() string {
+	if x != nil {
+		return x.Hub
+	}
+	return ""
 }
 
 type PreparePrivatePlacementCall struct {
@@ -8984,8 +9005,10 @@ type PrepareLocalPackageRequest struct {
 	PythonRequires string `protobuf:"bytes,8,opt,name=python_requires,json=pythonRequires,proto3" json:"python_requires,omitempty"`
 	PythonVersion  string `protobuf:"bytes,9,opt,name=python_version,json=pythonVersion,proto3" json:"python_version,omitempty"`
 	SourceArchive  string `protobuf:"bytes,10,opt,name=source_archive,json=sourceArchive,proto3" json:"source_archive,omitempty"` // filename in files; extracted project for ordinary uv sync
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Wire 69: the explicit scoped Hub selected by PrepareLocalPackageCall.
+	Hub           string `protobuf:"bytes,11,opt,name=hub,proto3" json:"hub,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PrepareLocalPackageRequest) Reset() {
@@ -9070,6 +9093,13 @@ func (x *PrepareLocalPackageRequest) GetPythonVersion() string {
 func (x *PrepareLocalPackageRequest) GetSourceArchive() string {
 	if x != nil {
 		return x.SourceArchive
+	}
+	return ""
+}
+
+func (x *PrepareLocalPackageRequest) GetHub() string {
+	if x != nil {
+		return x.Hub
 	}
 	return ""
 }
@@ -22475,7 +22505,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\n" +
 	"request_id\x18\x02 \x01(\tR\trequestId\x124\n" +
 	"\x16execution_workspace_id\x18\x03 \x01(\tR\x14executionWorkspaceId\x12A\n" +
-	"\areceipt\x18\x04 \x01(\v2'.cozy.worker.v1.MachineExecutionReceiptR\areceipt\"\xfd\x05\n" +
+	"\areceipt\x18\x04 \x01(\v2'.cozy.worker.v1.MachineExecutionReceiptR\areceipt\"\x8f\x06\n" +
 	"\x16MachineExecutionSubmit\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12#\n" +
 	"\rsubmission_id\x18\x02 \x01(\tR\fsubmissionId\x12%\n" +
@@ -22491,7 +22521,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\frelease_root\x18\r \x01(\v2\x1b.cozy.worker.v1.ReleaseRootR\vreleaseRoot\x12\x1d\n" +
 	"\n" +
 	"owner_memo\x18\x0e \x01(\bR\townerMemo\x12\x18\n" +
-	"\aaccount\x18\x0f \x01(\tR\aaccountJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\x99\x05\n" +
+	"\aaccount\x18\x0f \x01(\tR\aaccount\x12\x10\n" +
+	"\x03hub\x18\x10 \x01(\tR\x03hubJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\x99\x05\n" +
 	"\vReleaseRoot\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12\x1e\n" +
@@ -22771,10 +22802,11 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0epython_version\x18\t \x01(\tR\rpythonVersion\x12+\n" +
 	"\x11package_interface\x18\n" +
 	" \x01(\fR\x10packageInterface\x12\x10\n" +
-	"\x03hub\x18\v \x01(\tR\x03hubJ\x04\b\a\x10\bR'supports_model_materialization_recovery\"\x9a\x01\n" +
+	"\x03hub\x18\v \x01(\tR\x03hubJ\x04\b\a\x10\bR'supports_model_materialization_recovery\"\xac\x01\n" +
 	"\x17PrepareLocalPackageCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12R\n" +
-	"\x11local_package_set\x18\x02 \x01(\v2&.cozy.worker.v1.DesiredLocalPackageSetR\x0flocalPackageSet\"\xd9\x01\n" +
+	"\x11local_package_set\x18\x02 \x01(\v2&.cozy.worker.v1.DesiredLocalPackageSetR\x0flocalPackageSet\x12\x10\n" +
+	"\x03hub\x18\x03 \x01(\tR\x03hub\"\xd9\x01\n" +
 	"\x1bPreparePrivatePlacementCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12^\n" +
 	"\x15private_placement_set\x18\x02 \x01(\v2*.cozy.worker.v1.DesiredPrivatePlacementSetR\x13privatePlacementSetJ\x04\b\x03\x10\x04R'supports_model_materialization_recovery\"\xb4\x03\n" +
@@ -22937,7 +22969,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\aversion\x18\x02 \x01(\tR\aversion\"\xb2\x01\n" +
 	"\x17PreparePackageSetResult\x12H\n" +
 	"\rplacement_set\x18\x01 \x01(\v2#.cozy.worker.v1.DesiredPlacementSetR\fplacementSet\x12M\n" +
-	"\x11installed_package\x18\x02 \x01(\v2 .cozy.worker.v1.InstalledPackageR\x10installedPackage\"\xae\x03\n" +
+	"\x11installed_package\x18\x02 \x01(\v2 .cozy.worker.v1.InstalledPackageR\x10installedPackage\"\xc0\x03\n" +
 	"\x1aPrepareLocalPackageRequest\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\x12<\n" +
 	"\apackage\x18\x02 \x01(\v2\".cozy.worker.v1.DevelopmentPackageR\apackage\x126\n" +
@@ -22947,7 +22979,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0fpython_requires\x18\b \x01(\tR\x0epythonRequires\x12%\n" +
 	"\x0epython_version\x18\t \x01(\tR\rpythonVersion\x12%\n" +
 	"\x0esource_archive\x18\n" +
-	" \x01(\tR\rsourceArchiveJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\x10environment_rootR\x06wheels\"r\n" +
+	" \x01(\tR\rsourceArchive\x12\x10\n" +
+	"\x03hub\x18\v \x01(\tR\x03hubJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\x10environment_rootR\x06wheels\"r\n" +
 	"\x10LocalPackageFile\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\fR\x06digest\x12\x1a\n" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x12\x16\n" +

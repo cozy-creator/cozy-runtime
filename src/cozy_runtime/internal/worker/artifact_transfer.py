@@ -39,10 +39,10 @@ class NativeArtifactTransfers:
         workspace: Workspace,
         owner: Callable[[], str],
         *,
-        allow_private_egress: bool = False,
+        private_egress_allowed: Callable[[], bool] = lambda: False,
     ) -> None:
         self.workspace, self.owner = workspace, owner
-        self.allow_private_egress = allow_private_egress
+        self.private_egress_allowed = private_egress_allowed
         self.lock = threading.Lock()
         self.closures: OrderedDict[tuple[str, bool], _Closure] = OrderedDict()
 
@@ -166,7 +166,9 @@ class NativeArtifactTransfers:
             host = urlparse(grant.url).hostname or ""
             receipt = egress.put_from(
                 grant.url,
-                egress.EgressPolicy(allowed_hosts=(host,), allow_private=self.allow_private_egress),
+                egress.EgressPolicy(
+                    allowed_hosts=(host,), allow_private=self.private_egress_allowed()
+                ),
                 cast(BinaryIO, reader),
                 expected_length=grant.length,
                 media_type="application/octet-stream",

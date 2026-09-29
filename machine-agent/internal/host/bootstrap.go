@@ -316,7 +316,7 @@ func RunBootstrap(ctx context.Context, grant *Grant, log io.Writer) error {
 
 func recoverCandidateApplication(m *Machine, direct *directLauncher, processes *guardianProcesses, state *bootstrapChild, cause error, log io.Writer) {
 	processes.stop("")()
-	_, err := direct.maintain("startup-rollback", nil)
+	_, err := direct.maintain("startup-rollback", []string{fmt.Sprintf("candidate request plane exited before readiness: %v", cause)})
 	state.Pending = false
 	state.RolledBack = err == nil
 	if err != nil {
