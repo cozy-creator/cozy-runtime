@@ -719,16 +719,6 @@ class Planner:
         if self.observe_process():
             self._cap()
         reserved, allocated = self._reserved(), self._allocated()
-        host_backings: dict[tuple[str, int], int] = {}
-        for held in self.held.values():
-            for unit in held.part.units:
-                tensors = list(unit.host.values())
-                if unit.tier == HOST:
-                    tensors.extend(tensor for *_, tensor in unit.slots())
-                for tensor in tensors:
-                    if tensor.device.type == "cpu":
-                        storage = tensor.untyped_storage()
-                        host_backings[tiers._backing(tensor)] = storage.nbytes()
         return {
             "overhead_bytes": self.overhead,
             "reserved_bytes": reserved,
@@ -744,7 +734,9 @@ class Planner:
             "driver_observations": self.driver_observations,
             "peak_allocated_bytes": self.peak_allocated,
             "working_bytes": self.working,
-            "host_bytes": sum(host_backings.values()),
+            "host_bytes": sum(self._host_backings().values()),
+            "host_resident_bytes": sum(self._host_backings(cached=False).values()),
+            "host_cached_bytes": sum(self._host_backings(resident=False).values()),
             "disk_weight_bytes": sum(h.part.on(DISK) for h in self.held.values() if not h.hosted),
         }
 
@@ -893,6 +885,78 @@ class Planner:
         if self.cuda:
             tiers.trim(self.torch)
         return {"freed": freed, "held": retained, "freed_bytes": before - self._allocated()}
+
+    def reclaim_host(self, nbytes: int) -> int:
+        """Drop only reproducible idle backing; return managed bytes released.
+
+        This is not RSS credit: other references or the allocator can retain those
+        pages. The Worker must remeasure aggregate headroom before granting storage.
+        """
+        if nbytes <= 0 or self.stack or self.scopes or self.group_phase:
+            return 0
+        before = self._host_backings()
+        for held in sorted(self.held.values(), key=lambda held: held.last_used):
+            self._pin_state(held)
+            if held.compiled or _compiled(held.part.root):
+                continue
+            part = held.part
+            for unit in part.units:
+                if unit.readonly and not unit.mutable and unit.tier == DEVICE:
+                    unit.host.clear()
+                    unit.seen.clear()
+            if self._released_host_bytes(before) >= nbytes:
+                break
+            if part.store is None:
+                continue
+            if part.unit_loads:
+                for unit in part.units:
+                    if (
+                        unit.tier == HOST
+                        and unit.readonly
+                        and not unit.mutable
+                        and tiers.store_safe(unit)
+                    ):
+                        tiers.to_disk(self.torch, part, unit)
+                        self.stored += unit.nbytes
+                    if self._released_host_bytes(before) >= nbytes:
+                        break
+            elif any(unit.tier == HOST for unit in part.units) and all(
+                unit.tier in (HOST, DISK)
+                and unit.readonly
+                and not unit.mutable
+                and tiers.store_safe(unit)
+                for unit in part.units
+            ):
+                self.stored += sum(unit.nbytes for unit in part.units if unit.tier == HOST)
+                tiers.to_disk(self.torch, part, None)
+            if self._released_host_bytes(before) >= nbytes:
+                break
+        return self._released_host_bytes(before)
+
+    def _host_backings(self, *, cached: bool = True, resident: bool = True) -> dict[int, int]:
+        found: dict[int, int] = {}
+        for held in self.held.values():
+            for unit in held.part.units:
+                tensors = list(unit.host.values()) if cached else []
+                if resident and unit.tier == HOST:
+                    tensors.extend(tensor for *_, tensor in unit.slots())
+                for tensor in tensors:
+                    if tensor.device.type == "cpu":
+                        storage = tensor.untyped_storage()
+                        found[storage.data_ptr()] = storage.nbytes()
+        return found
+
+    def host_memory(self) -> dict[str, int]:
+        """Deduplicated managed CPU storage, separate from the process's total RSS."""
+        return {
+            "managed_host_bytes": sum(self._host_backings().values()),
+            "resident_host_bytes": sum(self._host_backings(cached=False).values()),
+            "cached_host_bytes": sum(self._host_backings(resident=False).values()),
+        }
+
+    def _released_host_bytes(self, before: dict[int, int]) -> int:
+        after = self._host_backings()
+        return sum(size for identity, size in before.items() if identity not in after)
 
     # ------------------------------------------------------------------ the op
 
@@ -2047,6 +2111,10 @@ class Tenant(Protocol):
         """Its weights leave these devices; `held` is updated from the reply."""
         ...
 
+    def reclaim_host(self, nbytes: int) -> tuple[int, int] | None:
+        """Return managed bytes released and remaining, or None when unavailable."""
+        ...
+
     def end(self, why: str) -> bool:
         """Kill and reap its process; its devices' bytes return to the driver."""
         ...
@@ -2110,12 +2178,13 @@ class Machine:
                 frontier.append(demand)
         return tuple(frontier)
 
-    def reserve_host(self, owner: str, nbytes: int) -> bool:
-        """Reserve incremental copy/cache bytes against observed room and outstanding claims.
+    def reserve_host(
+        self, owner: str, nbytes: int, *, requester: str = "", tenants: Sequence[Tenant] = ()
+    ) -> bool:
+        """Reserve against fresh aggregate room, reclaiming safe idle cache if needed.
 
-        Use one owner token per copy. Release its promise when allocation completes;
-        cgroup-aware MemAvailable then reflects the actual backing. Unknown availability
-        refuses new storage.
+        Victims release progressively, without holding the reservation lock across RPC.
+        A peer's claimed release never grants credit: only observed headroom does.
         """
         if nbytes < 0:
             raise ValueError("host reservation must be nonnegative")
@@ -2123,13 +2192,39 @@ class Machine:
             return True
         if self.host_available is None:
             return False
-        with self._host_lock:
-            available = self.host_available()
-            reserved = sum(self.host_reserved.values())
-            if available < 0 or nbytes > available - reserved:
-                return False
-            self.host_reserved[owner] = self.host_reserved.get(owner, 0) + nbytes
+
+        def reserve() -> bool:
+            assert self.host_available is not None
+            with self._host_lock:
+                available = self.host_available()
+                reserved = sum(self.host_reserved.values())
+                if available < 0 or nbytes > available - reserved:
+                    return False
+                self.host_reserved[owner] = self.host_reserved.get(owner, 0) + nbytes
+                return True
+
+        if reserve():
             return True
+        for tenant in sorted(tenants, key=lambda tenant: self._reuse(tenant, None)):
+            if tenant.slot == requester or tenant.state() != "idle":
+                continue
+            reclaim = getattr(tenant, "reclaim_host", None)
+            if reclaim is None:
+                continue
+            remaining = math.inf
+            while tenant.state() == "idle":
+                result = reclaim(nbytes)
+                if reserve():
+                    return True
+                if result is None:
+                    break
+                released, held = result
+                # Logical progress permits another bounded step even when usage is
+                # still above high. RSS alone cannot prove more cache was dropped.
+                if released <= 0 or held <= 0 or held >= remaining:
+                    break
+                remaining = held
+        return False
 
     def release_host(self, owner: str) -> None:
         """The allocation completed or failed: stop charging its pending promise."""
@@ -2223,8 +2318,7 @@ class Machine:
                     occupied_elsewhere = max(total - free - mine, 0)
                     room = min(
                         room,
-                        self.budget.get(ordinal, self.budget.get(-1, total))
-                        - occupied_elsewhere,
+                        self.budget.get(ordinal, self.budget.get(-1, total)) - occupied_elsewhere,
                     )
                 result[ordinal] = room
                 continue
@@ -2421,13 +2515,17 @@ class Machine:
                 return victim, act
         return None
 
-    def _reuse(self, tenant: Tenant, ordinal: int) -> tuple[float, float, int, str]:
+    def _reuse(self, tenant: Tenant, ordinal: int | None) -> tuple[float, float, int, str]:
         """Farthest next use first; among ties, discard the cheapest measured reload.
 
         Missing demand means no predicted reuse. Missing cost is not a free reload.
         Last use breaks prediction ties, so an empty queue retains a deterministic policy.
         """
-        demands = [d for d in self.queue if d.tenant == tenant.slot and ordinal in d.devices]
+        demands = [
+            d
+            for d in self.queue
+            if d.tenant == tenant.slot and (ordinal is None or ordinal in d.devices)
+        ]
         next_use = min((d.next_use for d in demands), default=math.inf)
         costs = [d.load_seconds for d in demands if d.next_use == next_use]
         cost = max((math.inf if c is None else c for c in costs), default=math.inf)

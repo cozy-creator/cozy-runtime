@@ -248,44 +248,75 @@ class Executor:
         # originate on different worker lanes; serializing here prevents their frames and
         # replies from corrupting each other even if a caller violates the higher-level lane.
         with self._calls:
-            name = command.__struct_config__.tag
-            deadline = time.monotonic() + total_timeout if total_timeout is not None else None
-            self.channel.send(executor_commands.encode(command))
-            while True:
-                try:
-                    remaining = None if deadline is None else max(deadline - time.monotonic(), 0)
-                    frame = self.channel.recv(timeout, total_timeout=remaining)
-                except SeamError as exc:
-                    raise ExecutorGone(f"seam: {exc}") from exc
-                if frame is None:
-                    raise ExecutorGone(
-                        self.wedged
-                        or f"the executor died during {name!r} (exit status {self.exit_status})",
-                        self.exit_status,
-                    )
-                if frame.get("event") == "progress":
-                    if on_progress is not None:
-                        try:
-                            on_progress(frame)
-                        except Exception as exc:  # the lossy lane sheds; the call goes on
-                            _LOG.warning("dropped an executor progress frame: %r", exc)
-                    continue
-                if frame.get("event") == "request":
-                    answer, handoff = respond(frame, on_request)
+            return self._exchange(command, timeout, total_timeout, on_progress, on_request)
+
+    def call_if_idle(
+        self,
+        command: Command,
+        *,
+        eligible: Callable[[], bool],
+        on_reply: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Never wait behind another command or reclaim a replaced/active generation."""
+        if not self._calls.acquire(blocking=False):
+            return {"ok": False, "code": "executor_busy"}
+        try:
+            if not eligible():
+                return {"ok": False, "code": "executor_busy"}
+            reply = self._exchange(command, None, None, None, None)
+            if on_reply is not None:
+                on_reply(reply)
+            return reply
+        finally:
+            self._calls.release()
+
+    def _exchange(
+        self,
+        command: Command,
+        timeout: float | None,
+        total_timeout: float | None,
+        on_progress: Callable[[dict[str, Any]], None] | None,
+        on_request: Handler | None,
+    ) -> dict[str, Any]:
+        """One transaction while the caller owns _calls."""
+        name = command.__struct_config__.tag
+        deadline = time.monotonic() + total_timeout if total_timeout is not None else None
+        self.channel.send(executor_commands.encode(command))
+        while True:
+            try:
+                remaining = None if deadline is None else max(deadline - time.monotonic(), 0)
+                frame = self.channel.recv(timeout, total_timeout=remaining)
+            except SeamError as exc:
+                raise ExecutorGone(f"seam: {exc}") from exc
+            if frame is None:
+                raise ExecutorGone(
+                    self.wedged
+                    or f"the executor died during {name!r} (exit status {self.exit_status})",
+                    self.exit_status,
+                )
+            if frame.get("event") == "progress":
+                if on_progress is not None:
                     try:
-                        self.channel.send(answer)
-                        if handoff is not None:
-                            self.channel.send_descriptor(handoff)
-                    finally:
-                        if handoff is not None:
-                            handoff.close()
-                    continue
-                if "reply" not in frame and frame.get("event") is not None:
-                    # An event kind from a newer executor that this worker does not consume.
-                    continue
-                if frame.get("reply") != name:
-                    raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
-                return frame
+                        on_progress(frame)
+                    except Exception as exc:  # the lossy lane sheds; the call goes on
+                        _LOG.warning("dropped an executor progress frame: %r", exc)
+                continue
+            if frame.get("event") == "request":
+                answer, handoff = respond(frame, on_request)
+                try:
+                    self.channel.send(answer)
+                    if handoff is not None:
+                        self.channel.send_descriptor(handoff)
+                finally:
+                    if handoff is not None:
+                        handoff.close()
+                continue
+            if "reply" not in frame and frame.get("event") is not None:
+                # An event kind from a newer executor that this worker does not consume.
+                continue
+            if frame.get("reply") != name:
+                raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
+            return frame
 
     @contextlib.contextmanager
     def watched(self, what: str) -> Iterator[None]:

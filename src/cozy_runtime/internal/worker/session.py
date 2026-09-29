@@ -94,6 +94,7 @@ from cozy_runtime.internal.executor_commands import (
     DescribeInstalled,
     Load,
     ModelLoad,
+    ReclaimHost,
     Restore,
     Start,
     Unload,
@@ -5864,11 +5865,11 @@ class Worker:
         )
         return (reading.free_bytes, reading.total_bytes) if reading.state == "measured" else None
 
-    def _tenants(self, ordinals: set[int]) -> list[_Tenant]:
+    def _tenants(self, ordinals: set[int] | None) -> list[_Tenant]:
         """Every model-bearing tenant with a device among `ordinals`, each once."""
         found: dict[str, _Tenant] = {}
         for lane in self.lanes.lanes:
-            if ordinals & set(lane.ordinals):
+            if ordinals is None or ordinals & set(lane.ordinals):
                 for slot, row in lane.rows.items():
                     if (
                         row.model_bearing
@@ -5978,6 +5979,55 @@ class Worker:
                 if overhead >= 0:
                     row.overhead[ordinal] = overhead
             row.held[ordinal] = row.overhead.get(ordinal, 0) + reserved
+
+    def _reclaim_host(self, tenant: _Tenant, nbytes: int) -> tuple[int, int] | None:
+        executor = tenant.row.executor()
+        if executor is None or "reclaim_host" not in executor.hello.get("memory", ()):
+            return None
+
+        def eligible() -> bool:
+            return (
+                tenant.row.executor() is executor
+                and not executor.poisoned
+                and executor.alive()
+                and not any(
+                    attempt.executor is executor and attempt.state in ON_DEVICE | {"preparing"}
+                    for attempt in list(self.engine.live.values())
+                )
+            )
+
+        def observe(reply: dict[str, Any]) -> None:
+            # Publish residency epochs before another call can refill this generation.
+            if reply.get("ok") and tenant.row.executor() is executor:
+                self._observe_memory(tenant.lane, tenant.row, reply)
+                tenant.row.ledger.observe_memory(reply.get("memory"))
+
+        before = proctree.rss_bytes(executor.pid)
+        try:
+            reply = executor.call_if_idle(
+                ReclaimHost(nbytes=nbytes), eligible=eligible, on_reply=observe
+            )
+        except child.ExecutorGone:
+            return None
+        after = proctree.rss_bytes(executor.pid)
+        if reply.get("ok"):
+            self.memory.note(
+                f"host reclaim {tenant.slot!r}: managed_released_bytes="
+                f"{reply.get('managed_released_bytes', 0)}, rss_before_bytes={before}, "
+                f"rss_after_bytes={after}; grants use freshly observed aggregate headroom"
+            )
+        facts = reply.get("host_memory", {})
+        if not isinstance(facts, dict):
+            return None
+        released, held = reply.get("managed_released_bytes"), facts.get("managed_host_bytes")
+        if (
+            reply.get("ok")
+            and type(released) is int
+            and type(held) is int
+            and min(released, held) >= 0
+        ):
+            return released, held
+        return None
 
     def _vacate(self, tenant: _Tenant, ordinals: tuple[int, ...]) -> bool:
         """Ask one idle tenant to take its weights off `ordinals` (its process stays)."""
@@ -6564,7 +6614,9 @@ class Worker:
                 if request.release:
                     self.memory.release_host(token)
                     return Answer(ok=True)
-                if self.memory.reserve_host(token, request.nbytes):
+                if self.memory.reserve_host(
+                    token, request.nbytes, requester=slot, tenants=self._tenants(None)
+                ):
                     return Answer(ok=True)
                 return refuse(
                     "host_shortfall", f"{request.nbytes} B of host backing cannot be reserved"
@@ -7912,6 +7964,9 @@ class _Tenant:
         ):
             return "active"
         return "idle"
+
+    def reclaim_host(self, nbytes: int) -> tuple[int, int] | None:
+        return self.worker._reclaim_host(self, nbytes)
 
     def vacate(self, ordinals: tuple[int, ...]) -> bool:
         return self.worker._vacate(self, ordinals)

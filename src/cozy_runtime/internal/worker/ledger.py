@@ -40,6 +40,9 @@ from cozy_runtime.internal.executor_replies import Metrics, memory_facts
 #: real producer exists for it; a row nothing writes is not a ledger entry, it is decoration.
 CLASSES = (
     "host_available",
+    "host_managed",
+    "host_resident",
+    "host_cached",
     "pinned_registered",
     "active_weights",
     "activations_scratch",
@@ -56,6 +59,18 @@ CLASSES = (
 #: How each class's number is produced. This table IS the "declares how it was measured"
 #: requirement — one sentence per counter, naming the interface, never the intent.
 METHODS: dict[str, tuple[str, str]] = {
+    "host_managed": (
+        "measured",
+        "unique CPU backing held by managed weights and cached copies; not total process RSS",
+    ),
+    "host_resident": (
+        "measured",
+        "unique CPU backing storage bound to host-tier managed tensors; may overlap host_cached",
+    ),
+    "host_cached": (
+        "measured",
+        "unique CPU backing storage retained as managed weight cache; may overlap host_resident",
+    ),
     "pinned_registered": (
         "measured",
         "the staging ring's page-locked PEAK, the bytes actually handed to the driver; "
@@ -94,7 +109,8 @@ METHODS: dict[str, tuple[str, str]] = {
     ),
     "host_available": (
         "measured",
-        "the LIVE host budget: cgroup memory.max minus memory.current when this process is "
+        "the LIVE host budget: effective cgroup memory.high/max minus memory.current "
+        "plus bounded inactive file cache when this process is "
         "in a bounded cgroup, else /proc/meminfo MemAvailable - re-read every time it is "
         "reported, because a host budget fixed at boot is a claim about a machine nobody "
         "else is on",
@@ -486,6 +502,9 @@ class Ledger:
     def counters(self) -> list[Counter]:
         values = {
             "host_available": (read_host_available(), -1, -1),
+            "host_managed": (self.planner_memory.get("host_bytes", -1), -1, -1),
+            "host_resident": (self.planner_memory.get("host_resident_bytes", -1), -1, -1),
+            "host_cached": (self.planner_memory.get("host_cached_bytes", -1), -1, -1),
             "pinned_registered": (self.registered, -1, -1),
             "active_weights": (self.weights_bytes, -1, -1),
             "activations_scratch": (

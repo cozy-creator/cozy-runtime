@@ -64,6 +64,10 @@ class Vacate(Command, frozen=True, kw_only=True, tag="vacate"):
     ranks: tuple[int, ...] = ()
 
 
+class ReclaimHost(Command, frozen=True, kw_only=True, tag="reclaim_host"):
+    nbytes: int
+
+
 class Restore(Command, frozen=True, kw_only=True, tag="restore"):
     names: tuple[str, ...] = ()
 
@@ -323,6 +327,7 @@ type KnownCommand = (
     | DescribeInstalled
     | Vacate
     | Restore
+    | ReclaimHost
     | Unload
     | Activate
     | Attention
