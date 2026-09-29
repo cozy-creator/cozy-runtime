@@ -27,6 +27,7 @@ type rentalAuthority struct {
 	mu         sync.Mutex
 	fetch      func(context.Context) ([]ed25519.PublicKey, time.Duration, error)
 	timer      *time.Timer
+	expiresAt  time.Time
 	generation uint64
 }
 
@@ -155,10 +156,12 @@ func (c *claims) refreshAuthority(ctx context.Context) (time.Duration, error) {
 		a.timer.Stop()
 	}
 	c.replaceKeys(keys)
+	a.expiresAt = time.Now().Add(lease)
 	a.timer = time.AfterFunc(lease, func() {
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		if a.generation == generation {
+			a.expiresAt = time.Time{}
 			c.replaceKeys(nil)
 		}
 	})
@@ -197,9 +200,9 @@ func (c *claims) checkAuthority() error {
 		return nil
 	}
 	c.authority.mu.Lock()
-	initialized := c.authority.timer != nil
+	leaseValid := !c.authority.expiresAt.IsZero() && time.Now().Before(c.authority.expiresAt)
 	c.authority.mu.Unlock()
-	if !initialized && len(c.authorizedKeys()) == 0 {
+	if !leaseValid {
 		return status.Error(codes.Unavailable, "rental_authority_unavailable: no current rental authority lease")
 	}
 	return nil

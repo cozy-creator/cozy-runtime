@@ -83,6 +83,9 @@ func TestRentalAuthorityLeaseEndsWithoutFurtherRequests(t *testing.T) {
 	if len(c.authorizedKeys()) != 0 {
 		t.Fatal("expired keys retained")
 	}
+	if status.Code(c.checkAuthority()) != codes.Unavailable {
+		t.Fatal("expired lease still admitted calls")
+	}
 }
 
 func TestRevocationClosesRealControlStreamAndRefusesNewRPC(t *testing.T) {
@@ -95,6 +98,9 @@ func TestRevocationClosesRealControlStreamAndRefusesNewRPC(t *testing.T) {
 		}
 		return []ed25519.PublicKey{key}, time.Hour, nil
 	}}
+	if _, err := c.refreshAuthority(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	m := &Machine{grant: &Grant{WorkerID: "worker", Lifetime: "rental"}, id: &Identity{BootID: "boot"}, claims: c, log: io.Discard}
 	listener := bufconn.Listen(1 << 20)
 	defer listener.Close()
@@ -161,6 +167,12 @@ func TestRentalMaintenanceHTTPChecksCurrentAuthority(t *testing.T) {
 		w := httptest.NewRecorder()
 		m.serveAuthorizedHTTP(handler, w, r)
 		return w.Code
+	}
+	if code := request(); code != http.StatusServiceUnavailable {
+		t.Fatal("bootstrap keys bypassed the Hub lease", code)
+	}
+	if _, err := c.refreshAuthority(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	if code := request(); code != http.StatusAccepted {
 		t.Fatal(code)
