@@ -632,7 +632,7 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
                 executions=SimpleNamespace(
                     capture_root=lambda *_: "root",
                     capture=lambda *_: {"model_defaults": []},
-                    prepared=lambda *_: SimpleNamespace(hub=""),
+                    prepared=lambda *_: SimpleNamespace(hub="", account="cozytest"),
                 ),
                 lanes=SimpleNamespace(entries=()),
                 resolutions=machine_model_resolve.Resolutions(),
@@ -683,6 +683,12 @@ def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
             expected
         ]
         assert catalog.reads == []
+        # An unpublished callee has no org and no binding: its default names the run's account.
+        catalog.reads.clear()
+        assert machine_model_defaults.select(worker, "owner", call, child("local/other"), {}) == [
+            expected
+        ]
+        assert [urlsplit(path).path for path in catalog.reads] == ["/v1/models/resolve"]
         # A supplied Model is never resolved.
         catalog.reads.clear()
         assert (

@@ -53,6 +53,7 @@ class Preparation(msgspec.Struct, frozen=True, omit_defaults=True):
     wire_minor: int | msgspec.UnsetType = msgspec.UNSET
     runtime_builtin: Builtin | None = None
     hub: str = ""  # the Hub its run came from, as `hub_key` spells it; "": the default
+    account: str = ""  # the account owning the run: whose org-relative Models local/ code names
 
     def encode(self) -> bytes:
         return canonical.write(msgspec.to_builtins(self))
@@ -243,6 +244,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         # The minor this root and its descendants run under, whatever later streams say.
         wire_minor=min(WIRE_MINOR, request.claim.wire_minor),
         runtime_builtin=worker.machine_calls.builtins.capture(),
+        account=request.account,
     ).encode()
 
 

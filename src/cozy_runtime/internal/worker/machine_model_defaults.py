@@ -255,20 +255,23 @@ def select(
     )
     # A slot the capture left open is resolved here, at the Hub its run came from.
     open_slots = any(parameter not in defaults for parameter in missing)
-    catalog = (
-        machine_model_resolve.own(worker, package, worker.executions.prepared(owner, root).hub)
-        if open_slots
-        else None
-    )
+    prepared = worker.executions.prepared(owner, root) if open_slots else None
+    catalog = machine_model_resolve.own(worker, package, prepared.hub) if prepared else None
     fits = fitter(worker)
     selected: list[dict[str, Json]] = []
     for parameter in missing:
         default = defaults.get(parameter)
         if default is None:
-            assert catalog is not None
+            assert catalog is not None and prepared is not None
             selected.append(
                 machine_model_resolve.slot(
-                    catalog, package, declared[parameter], parameter, None, catalog_fits(fits)
+                    catalog,
+                    package,
+                    declared[parameter],
+                    parameter,
+                    None,
+                    catalog_fits(fits),
+                    prepared.account,
                 )
             )
             continue
