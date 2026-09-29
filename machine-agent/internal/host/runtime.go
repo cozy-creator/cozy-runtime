@@ -357,6 +357,35 @@ func (g *guardianLauncher) close() {
 	_ = waitChild(g.cmd)
 }
 
+type guardianProcesses struct {
+	mu      sync.Mutex
+	current *runtimeProcess
+}
+
+func (g *guardianProcesses) set(p *runtimeProcess) {
+	g.mu.Lock()
+	g.current = p
+	g.mu.Unlock()
+}
+
+// stop selects a process before its returned action may be scheduled. An old
+// stop command must never follow current into a replacement Runtime. Empty
+// incarnation selects the current process for launch replacement or shutdown.
+func (g *guardianProcesses) stop(incarnation string) func() {
+	g.mu.Lock()
+	p := g.current
+	if p != nil && incarnation != "" && p.incarnation != incarnation {
+		p = nil
+	}
+	g.mu.Unlock()
+	return func() {
+		if p != nil && !p.exited() {
+			p.stop()
+			<-p.done
+		}
+	}
+}
+
 // RunGuardian is the guardian process: it launches the Runtime at args[1], with its own
 // environment, on "launch", stops it on "stop", runs a maintenance op on the machine rooted at
 // args[2] as root, and stops the Runtime and exits when its control pipe closes. It adopts the
@@ -377,17 +406,7 @@ func RunGuardian(args []string) int {
 	}
 	direct := &directLauncher{path: args[1], root: args[2], env: os.Environ(), out: os.Stderr}
 	adoptOrphans()
-	var mu sync.Mutex
-	var current *runtimeProcess
-	stop := func() {
-		mu.Lock()
-		p := current
-		mu.Unlock()
-		if p != nil && !p.exited() {
-			p.stop()
-			<-p.done
-		}
-	}
+	processes := &guardianProcesses{}
 	scanner := bufio.NewScanner(control)
 	for scanner.Scan() {
 		var c guardianCommand
@@ -396,15 +415,13 @@ func RunGuardian(args []string) int {
 		}
 		switch c.Op {
 		case "launch":
-			stop()
+			processes.stop("")()
 			p, err := direct.launch(c.Incarnation)
 			if err != nil {
 				report(guardianStatus{Phase: "refused", Incarnation: c.Incarnation, Error: err.Error()})
 				continue
 			}
-			mu.Lock()
-			current = p
-			mu.Unlock()
+			processes.set(p)
 			report(guardianStatus{Phase: "started", Incarnation: p.incarnation})
 			go func() {
 				<-p.done
@@ -416,12 +433,8 @@ func RunGuardian(args []string) int {
 				report(guardianStatus{Phase: "exited", Incarnation: p.incarnation, Error: exitText(p.err), ExitCode: code})
 			}()
 		case "stop":
-			mu.Lock()
-			matches := current != nil && current.incarnation == c.Incarnation
-			mu.Unlock()
-			if matches {
-				go stop()
-			}
+			stop := processes.stop(c.Incarnation)
+			go stop()
 		default:
 			go func(c guardianCommand) {
 				answer, err := direct.maintain(c.Op, c.Args)
@@ -437,7 +450,7 @@ func RunGuardian(args []string) int {
 			}(c)
 		}
 	}
-	stop()
+	processes.stop("")()
 	return 0
 }
 
