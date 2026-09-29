@@ -177,7 +177,6 @@ class Measurement(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True)
     classes: tuple[Counter, ...]
     unreadable: tuple[str, ...] = ()
     unreconciled: str = ""
-    activation_scopes_by_cell: dict[str, dict[str, int]] = {}
 
 
 class _Pinned(msgspec.Struct, frozen=True):
@@ -194,13 +193,8 @@ class ConstructionFacts(msgspec.Struct, frozen=True, kw_only=True):
     device_free_bytes: int = -1
     device_total_bytes: int = -1
     resident: dict[str, int] = {}
-    constructed: dict[str, int] | msgspec.UnsetType = msgspec.UNSET
-    """Absent: the construction holds everything it built."""
-    parked: tuple[str, ...] = ()
     evicted: dict[str, int] = {}
     gpu_name: str = ""
-    declared_scopes: dict[str, tuple[str, ...]] = {}
-    paging: dict[str, dict[str, int]] = {}
     pinned: _Pinned = msgspec.field(default_factory=_Pinned)
 
 
@@ -227,16 +221,8 @@ class _Freed(msgspec.Struct, frozen=True):
     freed_bytes: int = 0
 
 
-class _Refilled(msgspec.Struct, frozen=True):
-    restored_bytes: int = 0
-
-
 class VacateReply(Probe, frozen=True, kw_only=True):
     vacated: _Freed = msgspec.field(default_factory=_Freed)
-
-
-class RestoreReply(Probe, frozen=True, kw_only=True):
-    restored: _Refilled = msgspec.field(default_factory=_Refilled)
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,12 +272,6 @@ class Ledger:
     activations_peak: int = 0
     #: the device this generation was BUILT on, named by the process that owns it
     accelerator: str = ""
-    #: shape cell -> the activation peak its successful serves measured. A property of the
-    #: model and the shape, so it outlives the executor generation.
-    activations_by_cell: dict[str, int] = field(default_factory=dict)
-    #: shape cell -> component-use method -> measured scratch peak while that method's
-    #: declared component set was resident. Staged admission prices matching pairs only.
-    activation_scopes_by_cell: dict[str, dict[str, int]] = field(default_factory=dict)
     #: set when an attempt staged or evicted: the activation basis moved under it
     activations_moved: bool = False
     #: attempts closed since the device baseline was last measured. Zero means the next
@@ -308,28 +288,8 @@ class Ledger:
     #: per-component RESIDENT device bytes, by component name. The staging plane's own
     #: arithmetic, and the input the chooser's rung prices are computed from.
     resident: dict[str, int] = field(default_factory=dict)
-    #: WHAT THE CONSTRUCTION FILLED, kept whole for the life of the generation (cr-097).
-    #: `resident` follows the device and a vacate empties it; this does not move, so the
-    #: worker can tell "this generation never held it" from "the lane took it away" and
-    #: ask for it back. A generation that legitimately parked a component never had it
-    #: here, so a restore can never contradict the construction's own ceiling.
-    constructed: dict[str, int] = field(default_factory=dict)
     #: components this generation knows about but is not holding right now, with their size
     evicted: dict[str, int] = field(default_factory=dict)
-    #: components CONSTRUCTION parked, because the deployment's resident ceiling did not
-    #: hold them (cr-008b). It is a fact about the generation that exists, not a rung the
-    #: attempt ladder chose — so a plan may deepen BELOW it and may never claim to be above
-    #: it. Found by cr-008c's cross: a generation with a parked UNet was reporting
-    #: `all_resident` because the headroom arithmetic fit, which made the plan's placement
-    #: disagree with the generation it was planning for.
-    parked: tuple[str, ...] = ()
-    #: method -> the component set that method DECLARES it may touch, reported by the
-    #: construction that read the class. A scope holds its whole set resident at once, so
-    #: this is what a staged rung must raise; pricing the largest single component instead
-    #: under-charged every multi-component scope (codex audit, adopted 2026-08-25).
-    declared_scopes: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    #: Runtime-derived block working sets; nominal checkpoint bytes remain separate.
-    paging: dict[str, dict[str, int]] = field(default_factory=dict)
     #: every re-baselining and its size, so a moved line is visible rather than assumed
     baseline_notes: list[str] = field(default_factory=list)
     reconciliations: list[Reconciliation] = field(default_factory=list)
@@ -392,11 +352,7 @@ class Ledger:
         self.devices.clear()
         self.unreadable.clear()
         self.resident.clear()
-        self.constructed.clear()
         self.evicted.clear()
-        self.parked = ()
-        self.declared_scopes.clear()
-        self.paging.clear()
         self.baseline_notes.clear()
         self.residency_delta = 0
         self.unreconciled = ""
@@ -410,17 +366,8 @@ class Ledger:
         self.device_allocated = self.device_baseline
         self.device_reserved = read.reserved_bytes
         self.resident = dict(read.resident)
-        self.constructed = dict(
-            read.resident if read.constructed is msgspec.UNSET else read.constructed
-        )
-        self.parked = read.parked
-        # Parked components WITH their sizes, from the construction that parked them: what
-        # the next attempt may have to stage in is priced from the first plan, not from
-        # the first probe.
         self.evicted = dict(read.evicted)
         self.accelerator = read.gpu_name
-        self.declared_scopes = dict(read.declared_scopes)
-        self.paging = {name: dict(layout) for name, layout in read.paging.items()}
         self.device_free = read.device_free_bytes
         self.device_total = read.device_total_bytes
         self.registered = read.pinned.registered_bytes
@@ -431,53 +378,10 @@ class Ledger:
         # generation, never reconstructed from device state. A successful construction
         # replaces the new generation's unknown facts; it never repairs the old numbers.
 
-    def observe_attempt(
-        self,
-        metrics: Metrics,
-        resident_moved: bool = False,
-        cell: str = "",
-        succeeded: bool = False,
-    ) -> None:
-        """What one attempt's kernel allocated ON TOP of the resident weights.
-
-        A residency-aware executor supplies `activation_peak_bytes` from a fresh allocator
-        high-water mark inside each component-use scope, which survives staging. Without it,
-        `peak_allocated - the post-fill baseline` holds only while the resident set stands
-        still. Only a succeeding serve is banked per cell: a failed one died climbing, so
-        its peak is a lower bound, not a measurement.
-        """
-        scopes = {method: value for method, value in metrics.activation_peaks.items() if value > 0}
-        direct = max(scopes.values(), default=metrics.activation_peak_bytes)
-        if direct > 0:
-            measured = direct
-        elif resident_moved:
-            self.activations_moved = True
-            if "activations_scratch" not in self.unreadable:
-                self.unreadable.append("activations_scratch")
-            return
-        else:
-            peak = metrics.peak_vram_bytes
-            measured = peak - self.device_baseline if peak and self.device_baseline >= 0 else 0
-        if measured <= 0:
-            return
-        self.activations_peak = max(self.activations_peak, measured)
-        if cell and succeeded:
-            self.activations_by_cell[cell] = max(self.activations_by_cell.get(cell, 0), measured)
-            held = self.activation_scopes_by_cell.setdefault(cell, {})
-            for method, value in scopes.items():
-                held[method] = max(held.get(method, 0), value)
-
-    def activations_for(self, cell: str) -> int:
-        """The activation peak this shape cell's successful serves measured, else 0."""
-        return self.activations_by_cell.get(cell, 0)
-
-    def activation_scopes_for(self, cell: str) -> dict[str, int]:
-        """Per component-use method, the scratch peak measured at exactly this cell."""
-        return dict(self.activation_scopes_by_cell.get(cell) or {})
-
-    def measured_scopes(self, cell: str) -> frozenset[str]:
-        """The methods a staged call may keep other components beside: measured here."""
-        return frozenset(self.activation_scopes_by_cell.get(cell) or ())
+    def observe_attempt(self, metrics: Metrics) -> None:
+        """What one attempt's ops took beyond the weights they ran with (the executor's
+        memory planner measures it per op, on a frame stack)."""
+        self.activations_peak = max(self.activations_peak, metrics.activation_peak_bytes)
 
     def observe_residency(self, residency: Mapping[str, object]) -> None:
         """The attempt's DECLARED residency transition, from the plane that performed it."""
@@ -511,19 +415,6 @@ class Ledger:
         self._rebaseline(read, f"vacated ({why})", f"{freed} B freed")
         return freed
 
-    def observe_restore(self, reply: Mapping[str, object], why: str) -> int:
-        """This generation took back bytes the lane had vacated (cr-097).
-
-        The mirror of `observe_vacate` and it moves the baseline the same way, for the same
-        reason: the next attempt reconciles against where the device IS, not against the
-        construction's fill or against the hole the vacate left. Returns the bytes the
-        executor reports restored.
-        """
-        read = msgspec.convert(reply, RestoreReply)
-        gained = read.restored.restored_bytes
-        self._rebaseline(read, f"restored ({why})", f"{gained} B refilled")
-        return gained
-
     def _rebaseline(self, probe: Probe, what: str, moved: str) -> None:
         before = self.device_allocated
         self._observe(probe)
@@ -532,11 +423,6 @@ class Ledger:
             self.device_baseline = self.device_allocated
             self.baseline_notes.append(f"{what}: {shift:+d} B allocator, {moved}")
             del self.baseline_notes[:-8]
-
-    def missing_resident(self) -> dict[str, int]:
-        """What the construction filled and the device no longer holds (cr-097): the exact
-        set a restore asks for. Empty for a generation that holds everything it built."""
-        return {name: size for name, size in self.constructed.items() if name not in self.resident}
 
     def observe_device_free(self, free: int, total: int) -> None:
         """The driver's view of the whole device, read by the WORKER through NVML now.
@@ -618,10 +504,6 @@ class Ledger:
             classes=tuple(self.counters()),
             unreadable=tuple(sorted(self.unreadable)),
             unreconciled=self.unreconciled,
-            activation_scopes_by_cell={
-                cell: dict(scopes)
-                for cell, scopes in sorted(self.activation_scopes_by_cell.items())
-            },
         )
 
     def rows(self) -> dict[str, Json]:
@@ -636,10 +518,6 @@ class Ledger:
                 "out_of_allocator": self.out_of_allocator,
                 "allocatable": self.allocatable,
                 "activations_peak": self.activations_peak,
-                "activation_scopes_by_cell": {
-                    cell: dict(scopes)
-                    for cell, scopes in sorted(self.activation_scopes_by_cell.items())
-                },
                 "free": self.device_free,
             },
             "devices": {

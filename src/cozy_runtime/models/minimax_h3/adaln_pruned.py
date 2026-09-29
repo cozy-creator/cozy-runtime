@@ -22,7 +22,7 @@ from diffusers import MiniMaxH3Transformer3DModel
 from torch import nn
 from torch.nn import functional as F
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author import ConformanceError, pure
 
 from .turbo import (
     ATTENTION_KWARG,
@@ -207,6 +207,7 @@ class AdaLNPrunedMiniMaxH3Transformer(MiniMaxH3Transformer3DModel):  # type: ign
                 site.register_forward_hook(_LoRAHook(self, path))
         self._lora_hooks_installed = True
 
+    @pure
     def _arm(
         self,
         module: nn.Module,
@@ -314,6 +315,7 @@ class AdaLNPrunedMiniMaxH3Transformer(MiniMaxH3Transformer3DModel):  # type: ign
             if isinstance(head, _SelectableHead):
                 head._armed = None
 
+    @pure
     def _disarm(self, module: nn.Module, args: tuple[Any, ...], output: Any) -> None:
         del module, args, output
         self._release()

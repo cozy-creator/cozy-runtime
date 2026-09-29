@@ -64,16 +64,11 @@ _Envelope = _Tensor | _Component | _Tuple | _Output
 
 
 class Scope(msgspec.Struct, frozen=True):
-    """One component scope active on the leader, as a follower re-enters it. The residency
-    facts are present exactly when the leader's model has a residency plane."""
+    """One component scope active on the leader, as a follower re-enters it."""
 
     model: str
     method: str
     components: tuple[str, ...]
-    placement: str | msgspec.UnsetType = msgspec.UNSET
-    headroom_bytes: int | msgspec.UnsetType = msgspec.UNSET
-    scope_headroom_bytes: dict[str, int] | msgspec.UnsetType = msgspec.UNSET
-    measured_scopes: list[str] | msgspec.UnsetType = msgspec.UNSET
 
 
 class RunCommand(msgspec.Struct, frozen=True, tag_field="cmd", tag="run"):

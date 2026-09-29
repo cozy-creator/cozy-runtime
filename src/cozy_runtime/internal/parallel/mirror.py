@@ -116,10 +116,6 @@ def _hosted(
             except BaseException:
                 group._break(f"hosted component {name!r} failed")
                 raise
-            residency = prepared[name][0]._cozy_residency
-            if residency is not None:
-                (scope,) = command.scopes
-                residency.observe_remote(scope.method, reply.working_peak_bytes)
             return wire.unmarshal(reply.result, results, device=device)
         finally:
             payloads.clear()
@@ -149,7 +145,8 @@ def install_spread(
     followers = tuple(range(1, group.degree))
 
     def spread(method: str, arguments: Iterator[tuple[Any, ...]], spare: bool) -> Iterator[Any]:
-        local = getattr(component, method)
+        op = getattr(component, "_cozy_op", None)
+        local = op(method) if op is not None else getattr(component, method)
         if prepared[name][0]._cozy_active is None:
             # Outside a component scope no follower may stage it: run here.
             yield from (local(*args) for args in arguments)
@@ -358,22 +355,7 @@ def _command(
         for key, (_model, root) in prepared.items()
         if key[0] in active and key[1] in active[key[0]][1]
     }
-    scopes = []
-    for key, (method, components) in active.items():
-        residency = models[key]._cozy_residency
-        scopes.append(
-            wire.Scope(key, method, components)
-            if residency is None
-            else wire.Scope(
-                key,
-                method,
-                components,
-                placement=residency.placement,
-                headroom_bytes=residency.headroom,
-                scope_headroom_bytes=residency.scope_headrooms,
-                measured_scopes=sorted(residency.measured),
-            )
-        )
+    scopes = [wire.Scope(key, method, components) for key, (method, components) in active.items()]
     payloads = wire.TensorSpool(directory / payloads_dir, references)
     command = wire.RunCommand(
         component=name,

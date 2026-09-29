@@ -86,13 +86,11 @@ class LaneRow:
     supervision: child.ExecutorSupervision | None = None
     #: the lane clock at this tenant's latest admission or load: LRU victim order
     last_used: int = 0
-    #: ordinal -> what this tenant holds there beyond its process's context, as the driver
-    #: measured its own loads, restores and calls (`memory.py`); cleared when it is evicted
+    #: ordinal -> what this tenant holds there (its overhead plus its allocator reserve), as
+    #: its executor last reported it (`memory.Machine`)
     held: dict[int, int] = field(default_factory=dict)
-    #: (entrypoint, shape cell) -> ordinal -> the most it held there during a successful call
-    peak: dict[tuple[str, str], dict[int, int]] = field(default_factory=dict)
-    #: ordinals an eviction emptied since the tenant last restored or ran: what it restores
-    emptied: set[int] = field(default_factory=set)
+    #: ordinal -> its process's non-allocator bytes there: context, modules, communicators
+    overhead: dict[int, int] = field(default_factory=dict)
 
     def resident_bytes(self) -> int:
         return sum(self.ledger.resident.values())

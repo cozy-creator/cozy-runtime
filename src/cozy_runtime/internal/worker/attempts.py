@@ -325,8 +325,8 @@ class AttemptRecord:
     spec: dict[str, Any]
     grant: grants.BoundGrant = dataclasses_field(default_factory=grants.BoundGrant)
     plan: AttemptPlan | None = None
-    #: the memory manager made room for this call's measured need on every device
-    room: bool = True
+    #: the device bytes the memory policy granted this attempt's executor (0: none)
+    memory_grant: int = 0
     declared: DeclaredBinding | None = None
     #: what THIS worker's prepare resolved for that binding — never what it declared
     prepared_model: PreparedModel | None = None
@@ -1360,7 +1360,7 @@ class AttemptEngine:
         if before_plan is not None:
             before_plan()
         try:
-            plan = slot.chooser.choose(declared, loaded.prepared_model, prepared, fits=attempt.room)
+            plan = slot.chooser.choose(declared, loaded.prepared_model, prepared)
         except PlanRefusal as exc:
             raise AttemptRefusal(
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
@@ -1858,6 +1858,7 @@ class AttemptEngine:
             entrypoint=attempt.declared.entrypoint,
             deadline_s=seconds,
             spool=str(spool),
+            memory_grant_bytes=attempt.memory_grant,
             placement=attempt.plan.placement,
             headroom_bytes=attempt.plan.headroom_bytes,
             scope_headroom_bytes=dict(attempt.plan.scope_headroom_bytes),
@@ -1897,14 +1898,8 @@ class AttemptEngine:
             )
         attempt.attention_applied = reply.attention_applied
         attempt.capture_result = reply.capture
-        # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
-        # whatever came back, success or fault: a failed attempt's activation peak is
-        # exactly the number an operator needs, and dropping it on the failure path would
-        # leave the ledger blind in the one case that matters.
-        # THIS attempt's transitions, not the generation's history. Reading the cumulative
-        # counters made every attempt after the first staged one claim its activation basis
-        # had moved, on attempts that never touched a component.
-        cell = attempt.plan.shape_cell if attempt.plan else ""
+        # What this attempt's ops took beyond their weights. Recorded from whatever came back,
+        # success or fault: a failed attempt's peak is exactly the number an operator needs.
         executor = attempt.executor
         if executor is None:
             self.absorb(attempt, reply, apply_ledger=False)
@@ -1916,19 +1911,7 @@ class AttemptEngine:
             with supervision.hold(executor) as owned:
                 self.absorb(attempt, reply, apply_ledger=owned)
                 if owned:
-                    moved = bool(
-                        attempt.residency.get("attempt_stages")
-                        or attempt.residency.get("attempt_evictions")
-                    )
-                    terminal = reply.outcome.terminal if reply.outcome else ""
-                    ledger = self.ledger_for(attempt)
-                    ledger.observe_attempt(
-                        reply.metrics,
-                        resident_moved=moved,
-                        cell=cell,
-                        succeeded=terminal == "succeeded",
-                    )
-                    terminal = reply.outcome.terminal if reply.outcome else ""
+                    self.ledger_for(attempt).observe_attempt(reply.metrics)
                 else:
                     attempt.confess(
                         "unavailable",

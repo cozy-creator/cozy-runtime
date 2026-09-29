@@ -250,6 +250,9 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     entrypoint: str
     construction: str = ""
     attention_kernel: str = ""
+    #: The device bytes this process may hold for the attempt (the worker's grant); 0 when
+    #: the worker grants none. Older workers send the four placement fields instead.
+    memory_grant_bytes: int = 0
     placement: str = "all_resident"
     headroom_bytes: int = 0
     scope_headroom_bytes: dict[str, int] = {}

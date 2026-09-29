@@ -120,6 +120,8 @@ class AttemptReply(msgspec.Struct, frozen=True, kw_only=True):
     #: Sealed environment names the package changed; the executor restored them.
     env_changed: tuple[str, ...] = ()
     residency: dict[str, Json] = {}
+    #: This process's device bytes after the attempt (`memory.Planner.facts`).
+    memory: dict[str, int] = {}
     #: Undecoded here: the worker reads each row alone, so an unreadable row costs itself,
     #: never the reply and its result.
     observations: tuple[object, ...] = ()

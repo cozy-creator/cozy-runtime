@@ -18,15 +18,15 @@ from __future__ import annotations
 import functools
 import math
 import re
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
 from cozy_runtime.author._errors import DEVICE_OOM, RuntimeFailure
 from cozy_runtime.internal import proctree, tiers
-from cozy_runtime.internal.tiers import DEVICE, DISK, HOST
+from cozy_runtime.internal.tiers import DEVICE, DISK, HOST, Device, Module, Tensor, Torch
 
 SHORTFALL = "device_shortfall"
 SPARED = "device_spared"
@@ -84,7 +84,7 @@ def _pressure() -> bool:
         return False
 
 
-def _leaves(value: Any) -> Iterator[Any]:
+def _leaves(value: object) -> Iterator[object]:
     if isinstance(value, (list, tuple)):
         for item in value:
             yield from _leaves(item)
@@ -95,20 +95,20 @@ def _leaves(value: Any) -> Iterator[Any]:
         yield value
 
 
-def _plain(value: Any) -> bool:
+def _plain(value: object) -> bool:
     """A scalar, or a builtin list, tuple or dict holding only plain values: state a
     snapshot copies. Subclasses (a frozen config) are someone else's contract."""
     kind = type(value)
     if kind in _SCALAR:
         return True
-    if kind is list or kind is tuple:
+    if isinstance(value, (list, tuple)) and kind in (list, tuple):
         return all(_plain(item) for item in value)
-    if kind is dict:
+    if isinstance(value, dict) and kind is dict:
         return all(type(key) in _SCALAR and _plain(item) for key, item in value.items())
     return False
 
 
-def _copy(value: Any) -> Any:
+def _copy(value: object) -> object:
     if isinstance(value, list):
         return [_copy(item) for item in value]
     if isinstance(value, tuple):
@@ -118,18 +118,19 @@ def _copy(value: Any) -> Any:
     return value
 
 
-def _put_back(owner: Any, name: str, saved: Any) -> None:
+def _put_back(owner: Module, name: str, saved: object) -> None:
     """Restore a changed attribute, in place for a container another object may share."""
     current = vars(owner).get(name)
     if type(current) is type(saved) and current == saved:
         return
-    if type(current) is dict and type(saved) is dict:
+    copied = _copy(saved)
+    if type(current) is dict and isinstance(current, dict) and isinstance(copied, dict):
         current.clear()
-        current.update(_copy(saved))
-    elif type(current) is list and type(saved) is list:
-        current[:] = _copy(saved)
+        current.update(copied)
+    elif type(current) is list and isinstance(current, list) and isinstance(copied, list):
+        current[:] = copied
     else:
-        setattr(owner, name, _copy(saved))
+        setattr(owner, name, copied)
 
 
 # --------------------------------------------------------------------------- records
@@ -184,7 +185,7 @@ class Held:
     #: a scope declaring it is open
     whole: bool = False
     last_used: int = 0
-    ops: dict[str, Callable[..., Any]] = field(default_factory=dict)
+    ops: dict[str, Callable[..., object]] = field(default_factory=dict)
 
 
 @dataclass(eq=False)
@@ -206,10 +207,10 @@ class Plan:
 
 @dataclass(eq=False)
 class Snapshot:
-    tensors: list[tuple[Any, Any]]
-    rng: list[tuple[Any, Any]]
-    attrs: list[tuple[Any, str, Any]]
-    custom: tuple[Callable[[Any], None], Any] | None
+    tensors: list[tuple[Tensor, Tensor]]
+    rng: list[tuple[object, object]]
+    attrs: list[tuple[Module, str, object]]
+    custom: tuple[Callable[[object], None], object] | None
 
 
 class Planner:
@@ -217,8 +218,8 @@ class Planner:
 
     def __init__(
         self,
-        torch: Any,
-        device: Any,
+        torch: Torch,
+        device: Device,
         *,
         room: Callable[[int, int, bool], int | None] | None = None,
         sharded: Callable[[str], bool] = lambda key: False,
@@ -244,10 +245,17 @@ class Planner:
         self.clock = 0
         self.spare = False
         self.asked_room = False
+        self.room_asks = 0
         self.peak = 0
         self.peak_allocated = 0
+        self.working = 0
+        self.loads = self.offloads = self.moved = 0
+        #: allocator bytes the attempt's weight moves added (negative: gave back)
+        self.transition = 0
         self.log: list[str] = []
         self.oom_asked = 0
+        #: the typed refusal this attempt ended on, for the reply's shortfall numbers
+        self.refusal: MemoryRefusal | None = None
         if self.cuda:
             attach = getattr(torch._C, "_cuda_attach_out_of_memory_observer", None)
             if attach is not None:
@@ -258,10 +266,17 @@ class Planner:
     def _observe_oom(self, device: int, asked: int, total: int, free: int) -> None:
         self.oom_asked = int(asked)
 
-    def measure_overhead(self, free_before: int, reserved_before: int) -> None:
+    def checkpoint(self) -> tuple[int, int, int]:
+        """Driver free, allocator reserve and room requests now: the start of a measurement."""
+        if not self.cuda:
+            return 0, 0, self.room_asks
+        return self._driver()[0], self._reserved(), self.room_asks
+
+    def measure_overhead(self, free_before: int, reserved_before: int, asks: int = 0) -> None:
         """Non-allocator bytes this process took since `free_before` was read: called only at
-        controlled points (init, warm, a communicator join) with no room request in flight."""
-        if not self.cuda or free_before <= 0:
+        controlled points (init, warm, a communicator join), and discarded when a room
+        request moved other tenants' bytes in between."""
+        if not self.cuda or free_before <= 0 or self.room_asks != asks:
             return
         free, _ = self._driver()
         grown = free_before - free - (self._reserved() - reserved_before)
@@ -315,7 +330,7 @@ class Planner:
     # ------------------------------------------------------------------ components
 
     def adopt(
-        self, construction: str, name: str, root: Any, store: tiers.Store | None, tier: str
+        self, construction: str, name: str, root: Module, store: tiers.Store | None, tier: str
     ) -> Held:
         """Take a constructed component under management: units, hooks, op wrappers."""
         key = f"{construction}/{name}"
@@ -337,7 +352,7 @@ class Planner:
             root.__dict__["_cozy_op"] = functools.partial(self.op, held)
         return held
 
-    def op(self, held: Held, method: str) -> Callable[..., Any]:
+    def op(self, held: Held, method: str) -> Callable[..., object]:
         """A method the package spreads, run as a planned op. It never tiles: another GPU may
         run the same call, and its output must not depend on which one did."""
         if method not in held.ops:
@@ -363,8 +378,10 @@ class Planner:
         if grant is not None:
             self.grant = grant
         self.asked_room = False
-        self.peak = self.peak_allocated = 0
+        self.peak = self.peak_allocated = self.working = 0
+        self.loads = self.offloads = self.moved = self.transition = 0
         self.log = []
+        self.refusal = None
         if self.cuda:
             self.torch.cuda.reset_peak_memory_stats(self.device)
             self._cap()
@@ -381,6 +398,35 @@ class Planner:
             tiers.trim(self.torch)
         return self.facts()
 
+    def document(self, construction: str) -> dict[str, object]:
+        """The attempt's residency facts for one generation, in the shape readers of the
+        executor's `residency` reply know."""
+        mine = [
+            held
+            for held in self.held.values()
+            if held.construction.split("#", 1)[0] == construction and not held.hosted
+        ]
+        return {
+            "placement": "planned",
+            "resident": {h.key: h.part.on(DEVICE) for h in mine if h.part.on(DEVICE)},
+            "evicted": {
+                h.key: h.part.nbytes - h.part.on(DEVICE)
+                for h in mine
+                if h.part.nbytes > h.part.on(DEVICE)
+            },
+            "hosted": sorted(h.key for h in self.held.values() if h.hosted),
+            "attempt_stages": self.loads,
+            "attempt_evictions": self.offloads,
+            "attempt_moved_bytes": self.moved,
+            "attempt_activation_peak_bytes": self.working,
+            "attempt_absolute_peak_bytes": self.peak_allocated,
+            "allocator_delta_bytes": self.transition,
+            "overhead_bytes": self.overhead,
+            "grant_bytes": self.grant if self.grant is not None else -1,
+            "log": list(self.log[-8:]),
+            "poisoned": "",
+        }
+
     def facts(self) -> dict[str, int]:
         return {
             "overhead_bytes": self.overhead,
@@ -388,6 +434,7 @@ class Planner:
             "allocated_bytes": self._allocated(),
             "peak_bytes": self.peak + self.overhead,
             "peak_allocated_bytes": self.peak_allocated,
+            "working_bytes": self.working,
             "host_bytes": sum(
                 tensor.numel() * tensor.element_size()
                 for held in self.held.values()
@@ -407,6 +454,8 @@ class Planner:
             held = self.held.get(f"{construction}/{name}")
             if held is None or held.hosted:
                 continue
+            # A package may have replaced a forward since (a cache hook): it is an op again.
+            tiers.wrap(held.part.root, functools.partial(self.run, held))
             units = held.part.units if held.whole else (held.part.common,)
             need = sum(unit.nbytes for unit in units if unit.tier != DEVICE)
             if not need:
@@ -418,13 +467,14 @@ class Planner:
             if chosen is None:
                 self.scopes.pop()
                 available = self.allocatable() + sum(self._evictable(v) for v in victims)
-                raise MemoryRefusal(
+                self.refusal = MemoryRefusal(
                     SPARED if self.spare else SHORTFALL,
                     f"{held.key}: {method}() needs {need} B of it on the device before it "
                     f"runs, and {available} B can be made allocatable",
                     need,
                     available,
                 )
+                raise self.refusal
             for victim in chosen:
                 self._offload(victim)
             self._load_common(held)
@@ -445,7 +495,14 @@ class Planner:
         finally:
             self.spare = False
 
-    def vacate(self) -> dict[str, Any]:
+    def trim(self) -> dict[str, object]:
+        """Only the allocator's cache goes back to the driver."""
+        before = self._reserved()
+        if self.cuda:
+            tiers.trim(self.torch)
+        return {"freed": {}, "held": {}, "freed_bytes": before - self._reserved()}
+
+    def vacate(self) -> dict[str, object]:
         """The Worker hands this device to another tenant: every weight leaves it."""
         freed: dict[str, int] = {}
         before = self._allocated()
@@ -464,14 +521,29 @@ class Planner:
         self,
         held: Held,
         method: str,
-        fn: Callable[..., Any],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
+        fn: Callable[..., object],
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
         *,
         tiles: bool = True,
-    ) -> Any:
+    ) -> object:
         """Plan, run, measure; after an OOM put the op's state back and run it again at the
         floor of the same rung, then of the next, when its state can be put back."""
+        try:
+            return self._run(held, method, fn, args, kwargs, tiles)
+        except MemoryRefusal as exc:
+            self.refusal = exc
+            raise
+
+    def _run(
+        self,
+        held: Held,
+        method: str,
+        fn: Callable[..., object],
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        tiles: bool,
+    ) -> object:
         if not self.cuda or held.hosted or any(frame.held is held for frame in self.stack):
             return fn(*args, **kwargs)
         torch = self.torch
@@ -508,6 +580,7 @@ class Planner:
             else:
                 self._sample()
                 assert frame is not None
+                self.working = max(self.working, frame.working)
                 record = self.records.setdefault((key, plan.rung), Record())
                 record.ok = max(record.ok, frame.working)
                 if record.fail > record.ok:
@@ -609,7 +682,7 @@ class Planner:
         self,
         held: Held,
         key: OpKey,
-        leaves: list[Any],
+        leaves: list[object],
         retryable: bool,
         floor: int | None,
         tiles: bool,
@@ -638,7 +711,7 @@ class Planner:
         self,
         held: Held,
         key: OpKey,
-        leaves: list[Any],
+        leaves: list[object],
         retryable: bool,
         floor: int | None,
         tiles: bool,
@@ -743,6 +816,7 @@ class Planner:
         own = sum(self._evictable(v) for v in victims)
         slack = self._reserved() - self._allocated()
         before = self.grant
+        self.room_asks += 1
         grant = self.room(
             max(need - own - slack, 0) + self.overhead,
             self._allocated() - own + need + self.overhead,
@@ -808,27 +882,44 @@ class Planner:
             self._load(part, unit)
         self._cap()
 
+    @contextmanager
+    def _moving(self) -> Iterator[None]:
+        """Count what a weight move changes on the allocator: the attempt's transition."""
+        before = self._allocated()
+        try:
+            yield
+        finally:
+            self.transition += self._allocated() - before
+
     def _load_common(self, held: Held) -> None:
         part = held.part
         if part.common.tier == DEVICE:
             return
         if part.common.tier == DISK and not part.unit_loads:
-            tiers.from_disk(self.torch, part, None)
+            with self._moving():
+                tiers.from_disk(self.torch, part, None)
             return
         self._load(part, part.common)
 
     def _load(self, part: tiers.Component, unit: tiers.Unit) -> None:
-        if unit.tier == HOST:
-            tiers.to_device(self.torch, unit, self.device)
-        elif unit.tier == DISK:
-            tiers.from_disk(self.torch, part, unit)
+        if unit.tier == DEVICE:
+            return
+        with self._moving():
+            if unit.tier == HOST:
+                self.moved += tiers.to_device(self.torch, unit, self.device)
+            else:
+                tiers.from_disk(self.torch, part, unit)
+                self.moved += unit.nbytes
+        self.loads += 1
 
     def _home(self, part: tiers.Component, unit: tiers.Unit) -> None:
         """Send a device unit to host memory when the host has room, else to the store."""
-        if unit.host or not part.unit_loads or self._host_room(unit.nbytes):
-            tiers.to_host(self.torch, unit)
-        else:
-            tiers.to_disk(self.torch, part, unit)
+        self.offloads += 1
+        with self._moving():
+            if unit.host or not part.unit_loads or self._host_room(unit.nbytes):
+                self.moved += tiers.to_host(self.torch, unit)
+            else:
+                tiers.to_disk(self.torch, part, unit)
 
     def _offload(self, held: Held, *, everything: bool = False) -> None:
         """Move a victim's unpinned device units off the device."""
@@ -844,7 +935,8 @@ class Planner:
             and not part.unit_loads
             and not self._host_room(sum(unit.nbytes for unit in moving))
         ):
-            tiers.to_disk(self.torch, part, None)
+            with self._moving():
+                tiers.to_disk(self.torch, part, None)
             return
         for unit in moving:
             self._home(part, unit)
@@ -908,7 +1000,7 @@ class Planner:
             return
         root = held.part.root
         ratio = _spatial_ratio(root) or 1
-        edits: dict[str, Any] = {"use_tiling": True}
+        edits: dict[str, object] = {"use_tiling": True}
         if hasattr(root, "tile_sample_min_size"):
             edits |= {"tile_sample_min_size": rung, "tile_latent_min_size": rung // ratio}
         for axis in ("height", "width"):
@@ -928,7 +1020,7 @@ class Planner:
 
     # ------------------------------------------------------------------ retry safety
 
-    def _retryable(self, held: Held, leaves: list[Any]) -> bool:
+    def _retryable(self, held: Held, leaves: list[object]) -> bool:
         """An op can run again only if a snapshot can put back all it may change: no
         gradients, collectives or compiled graph; no hook, forward override or stateful
         diffusers hook but the Runtime's own or ones marked pure; plain arguments."""
@@ -960,15 +1052,15 @@ class Planner:
         )
         return all(isinstance(leaf, plain) for leaf in leaves)
 
-    def _arm(self, held: Held, leaves: list[Any]) -> Snapshot:
+    def _arm(self, held: Held, leaves: list[object]) -> Snapshot:
         torch = self.torch
         root = held.part.root
         tensors = [(x, x.clone()) for x in leaves if isinstance(x, torch.Tensor)]
-        rng: list[tuple[Any, Any]] = [
+        rng: list[tuple[object, object]] = [
             (None, torch.get_rng_state()),
             (self.device, torch.cuda.get_rng_state(self.device)),
         ]
-        attrs: list[tuple[Any, str, Any]] = []
+        attrs: list[tuple[Module, str, object]] = []
         generators = [x for x in leaves if isinstance(x, torch.Generator)]
         for module in root.modules():
             for name, value in vars(module).items():
@@ -999,12 +1091,12 @@ class Planner:
             restore(state)
 
 
-def _hook_fns(module: Any) -> Iterator[Any]:
+def _hook_fns(module: Module) -> Iterator[object]:
     yield from module._forward_hooks.values()
     yield from module._forward_pre_hooks.values()
 
 
-def _spatial_ratio(vae: Any) -> int | None:
+def _spatial_ratio(vae: Module) -> int | None:
     ratio = getattr(vae, "spatial_compression_ratio", None)
     if isinstance(ratio, int) and ratio > 0:
         return ratio
@@ -1019,11 +1111,20 @@ class Tenant(Protocol):
     """One executor as the Worker's memory policy sees it: a process over some devices."""
 
     slot: str
-    ordinals: tuple[int, ...]
-    #: bytes it holds per device: non-allocator overhead plus allocator reserve
-    held: dict[int, int]
-    overhead: dict[int, int]
-    last_used: int
+
+    @property
+    def ordinals(self) -> tuple[int, ...]: ...
+
+    @property
+    def held(self) -> dict[int, int]:
+        """Bytes it holds per device: non-allocator overhead plus allocator reserve."""
+        ...
+
+    @property
+    def overhead(self) -> dict[int, int]: ...
+
+    @property
+    def last_used(self) -> int: ...
 
     def state(self) -> str:
         """`active` (it holds its devices), `idle`, or `dead`."""
@@ -1064,7 +1165,7 @@ class Machine:
         limit = min(self.budget.get(ordinal, self.budget.get(-1, total)), total - foreign)
         return limit - others
 
-    def admit(self, me: Tenant, tenants: list[Tenant], planned: bool) -> dict[int, int | None]:
+    def admit(self, me: Tenant, tenants: Sequence[Tenant], planned: bool) -> dict[int, int | None]:
         """Before a call: dead tenants on its devices end. An executor that does not plan its
         own memory (older than this policy) gets every idle tenant on its devices vacated."""
         for tenant in tenants:
@@ -1081,7 +1182,7 @@ class Machine:
         ordinal: int,
         free_wanted: int,
         grant_wanted: int | None,
-        tenants: list[Tenant],
+        tenants: Sequence[Tenant],
         *,
         measured: bool,
     ) -> int | None:
@@ -1117,7 +1218,7 @@ class Machine:
                 tenant.end(f"it could not vacate GPU {ordinal} for {me.slot!r}")
 
     def _victim(
-        self, me: Tenant, ordinal: int, tenants: list[Tenant], tried: set[str], measured: bool
+        self, me: Tenant, ordinal: int, tenants: Sequence[Tenant], tried: set[str], measured: bool
     ) -> tuple[Tenant, str] | None:
         present = [
             t for t in tenants if t is not me and ordinal in t.ordinals and t.state() != "active"
