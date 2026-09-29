@@ -4,7 +4,7 @@ name: Publish to PyPI
 # this workflow is the single release procedure. Manual run for an existing tag:
 #   gh workflow run publish.yaml -R cozy-creator/cozy-runtime -f release_tag=vX.Y.Z
 # Two jobs because each bills at least one minute: `build` runs every refusal and builds
-# all three files; `publish` holds the PyPI OIDC token and runs no project code.
+# the release files; `publish` holds the PyPI OIDC token and runs no project code.
 # Success means PyPI's JSON API lists exactly the built files: lock dependents after the
 # simple index lists them too. No lint or fence steps (owner, 2026-09-28: no CI).
 on:
@@ -48,6 +48,10 @@ jobs:
         with:
           # A tag-scoped cache is never restored by another tag.
           save-cache: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: source/machine-agent/go.mod
+          cache-dependency-path: source/machine-agent/go.sum
       - run: uv python install 3.12
       - id: release
         name: Verify immutable unpublished release identity
@@ -55,16 +59,16 @@ jobs:
       - run: uv sync --locked
         working-directory: source
 
-      # ONE package, TWO wheel files (cr-094): same source and version, the second tagged
+      # One Python source build plus the kernel wheel (cr-094): the latter is tagged
       # cp312-abi3 and carrying `cozy_runtime/_kernels/_C.abi3.so`. The recipe lives in the
       # scripts so a developer can run the very same build on a box with no CUDA toolkit.
       - name: Fetch the pinned public native donor
         run: |
           uv run --no-project --python 3.12 python - <<'PY'
           import hashlib, json, os, pathlib, urllib.parse, urllib.request
-          filename = "cozy_runtime-0.18.32-cp312-abi3-manylinux_2_28_x86_64.whl"
-          expected = "60d9cf186eb677461bbd34e8731caa622ded671a3d36459d156165ae1146e0e3"
-          with urllib.request.urlopen("https://pypi.org/pypi/cozy-runtime/0.18.32/json", timeout=30) as response:
+          filename = "cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl"
+          expected = "d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db"
+          with urllib.request.urlopen("https://pypi.org/pypi/cozy-runtime/0.18.86/json", timeout=30) as response:
               metadata = json.load(response)
           rows = [row for row in metadata["urls"] if row["filename"] == filename]
           if len(rows) != 1 or rows[0]["digests"]["sha256"] != expected:
@@ -86,8 +90,8 @@ jobs:
         run: |
           set +e
           uv run --script scripts/build-dev-wheel.py \
-            --native-wheel "$RUNNER_TEMP/cozy_runtime-0.18.32-cp312-abi3-manylinux_2_28_x86_64.whl" \
-            --native-sha256 60d9cf186eb677461bbd34e8731caa622ded671a3d36459d156165ae1146e0e3 \
+            --native-wheel "$RUNNER_TEMP/cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl" \
+            --native-sha256 d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db \
             --release-commit "${{ steps.release.outputs.source }}" --reuse-or-build --out dist
           status=$?
           set -e
@@ -96,8 +100,13 @@ jobs:
           elif [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-      # The pure wheel is first-class, not a fallback: every platform that is not
-      # linux/x86 installs it, and it is the only artifact a macOS or Windows box sees.
+      # Build the Go binaries before stamping Python provenance dirties the checkout.
+      - name: Build the standalone Linux machine agents
+        working-directory: source
+        run: |
+          version=$(uv run --no-project --python 3.12 python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          machine-agent/scripts/build-release.sh --version "$version" --output "$RUNNER_TEMP/machine-agent"
+      # The pure wheel remains the portable macOS/Windows/source-build artifact.
       - name: Build (sdist + pure-py wheel)
         working-directory: source
         env:
@@ -105,11 +114,17 @@ jobs:
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --out-dir dist
-      # cr-095: a release that silently carried ONE wheel is the regression this refuses.
+      - name: Bundle cozy-machine into the Linux wheels
+        working-directory: source
+        run: uv run --script scripts/bundle-machine-agent.py --dist dist --agents "$RUNNER_TEMP/machine-agent"
+      - name: Verify wheel selection and installed agent commands
+        working-directory: source
+        run: uv run --script scripts/verify-machine-wheels.py --dist dist
+      # cr-095: a release silently missing a platform file is refused.
       # Everything visible in dist/ is uploaded, so the set is exact; the digests travel to
       # `publish` outside the artifact.
       - id: dist
-        name: Release carries exactly the sdist and BOTH wheels
+        name: Release carries the sdist, portable wheel and two Linux wheels
         working-directory: source
         run: |
           uv run --no-project --python 3.12 python - <<'PY'
@@ -119,6 +134,7 @@ jobs:
               f"cozy_runtime-{v}.tar.gz",
               f"cozy_runtime-{v}-py3-none-any.whl",
               f"cozy_runtime-{v}-cp312-abi3-manylinux_2_28_x86_64.whl",
+              f"cozy_runtime-{v}-py3-none-manylinux_2_17_aarch64.whl",
           }
           dist = pathlib.Path("dist")
           # uv writes dist/.gitignore; hidden files are neither uploaded nor published.
