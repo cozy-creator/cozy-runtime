@@ -1554,7 +1554,10 @@ class Planner:
         placement, an actual replay must make the additional room the failure requested.
         """
         part = held.part
-        stream = max((tiers.load_demand(self.torch, unit).peak for unit in part.blocks[plan.keep :]), default=0)
+        stream = max(
+            (tiers.load_demand(self.torch, unit).peak for unit in part.blocks[plan.keep :]),
+            default=0,
+        )
         placement = self._need(part, plan.keep) - stream
         needed = max(plan.needed or 0, target + placement)
         victims = [] if self.spare else self._victims(held)

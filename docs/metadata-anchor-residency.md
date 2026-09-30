@@ -38,6 +38,9 @@ remains before additional aliases/buffers. This is a lower-bound owner census, n
 instantiated partition or measured speedup. The large text embeddings cannot be replaced
 with small metadata stand-ins.
 
-Pending-DISK dtype conversion accounting is a separate prerequisite under review. This
-branch stays out of inference candidates until its real production callback/load path is
-integrated and tested. No GPU qualification or performance gain is claimed.
+The separately reviewed accounting and pending-DISK dtype commits are included as
+explicit dependencies. A real TensorFS CPU-store test uses production Planner.adopt
+interception and tiers.from_disk: an8B anchor settles at16B, a48B remainder at96B,
+and the common load sequence quotes160B transient peak before either arrives. The
+real anchor tensor remains unchanged while the remainder fills. No GPU qualification
+or performance gain is claimed; this remains a draft for independent review.

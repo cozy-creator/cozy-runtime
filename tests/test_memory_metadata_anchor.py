@@ -410,3 +410,97 @@ def test_initial_parked_alias_refill_refuses_before_loader_or_binding_mutation(w
     assert failure.value.code == "memory_capability"
     assert root.first is before[0] and root.second is before[1]
     assert held.part.common.tier == tiers.DISK and not held.part.moving
+
+
+def test_production_anchor_refill_uses_real_store_and_pending_dtype_demand(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+    import math
+    import struct
+
+    tensorfs = pytest.importorskip("tensorfs")
+    root = pure(Network())
+    originals = {key: value.detach().clone() for key, value in root.state_dict().items()}
+    native = tensorfs.Store.init(tmp_path / "store")
+    encoding = next(digest for name, digest in tensorfs.seed_digests() if name == "plain/1")
+    rows = {
+        key: {
+            "logical_dtype": "f32",
+            "shape": list(value.shape),
+            "encoding": encoding,
+            "parts": {"value": {"dtype": "f32", "shape": list(value.shape)}},
+        }
+        for key, value in originals.items()
+    }
+    writer = native.begin_derived(
+        "sha256:" + "85" * 32,
+        1,
+        {},
+        {"network": {"drop": [], "add": rows}},
+        {},
+        [("network", key) for key in rows],
+        8192,
+        work_fingerprint="sha256:" + "86" * 32,
+    )
+    for key, value in originals.items():
+        raw = struct.pack("<" + "f" * value.numel(), *value.flatten().tolist())
+        writer.add_part("network", key, "value", io.BytesIO(raw))
+    receipt = writer.commit()
+    manifest = "sha256:" + receipt["manifest"]["sha256"]
+    header = native.manifest(manifest)["header"]
+
+    class NativeStore(Store):
+        def __init__(self) -> None:
+            super().__init__(root, "network")
+            self.reads: list[str] = []
+
+        def load_unit(self, name: str, unit: tiers.Unit) -> None:
+            with native.acquire_cozytensors(manifest) as lease:
+                for path, module in unit.owners():
+                    module.to_empty(device="cpu", recurse=False)
+                    for slot, tensor in list(module._parameters.items()):
+                        if tensor is None:
+                            continue
+                        key = f"{path}.{slot}" if path else slot
+                        data = bytearray(math.prod(tensor.shape) * 4)
+                        lease.read_part_into(header, name, key, "value", 0, data)
+                        value = (
+                            torch.frombuffer(data, dtype=torch.float32)
+                            .reshape(tensor.shape)
+                            .clone()
+                        )
+                        tiers._bind(module, slot, True, value)
+                        self.reads.append(key)
+
+        def drop_unit(self, unit: tiers.Unit) -> None:
+            for _, module in unit.owners():
+                module.to_empty(device="meta", recurse=False)
+
+    store = NativeStore()
+    root.to("meta")
+    owner = memory.Planner(torch, torch.device("cpu"))
+    owner.cuda = True  # only enables production hook installation; no CUDA operation runs
+    held = owner.adopt("c", "network", root, store, tiers.DISK, forward_only=True)
+    part = held.part
+    assert part.anchor is not None and part.anchor is not part.common
+    key = memory.OpKey(held.kind, "forward", ())
+    owner.records[key] = memory.Record(ok=999)
+    # Calls the interception installed by actual Planner.adopt, not a manually supplied hook.
+    root.double()
+    assert key not in owner.records and held.conversion_epoch > 0
+    assert root.marker.weight.dtype == torch.float32 and root.marker.weight.is_meta
+    assert tiers.load_sequence(torch, part.common_units) == tiers.LoadDemand(112, 160)
+    assert owner._need(part, 0) == 160
+    tiers.from_disk(torch, part, part.anchor)
+    assert root.device == torch.device("cpu") and root.dtype == torch.float64
+    assert part.anchor.nbytes == 16 and owner._need(part, 0) == 144
+    marker = root.marker.weight
+    tiers.from_disk(torch, part, part.common)
+    assert part.common.nbytes == 96 and owner._need(part, 0) == 48
+    assert root.marker.weight is marker
+    assert set(store.reads) == {"marker.weight", "marker.bias", "other.weight", "other.bias"}
+    assert torch.equal(root.other.weight, originals["other.weight"].double())
+    assert torch.equal(root.marker.weight, originals["marker.weight"].double())
+    assert all(unit.tier == tiers.DISK for unit in part.blocks)
+    owner._validate_component(held)
