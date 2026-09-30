@@ -177,6 +177,8 @@ class Frame:
     overlap_consumers: dict[tiers.Unit, tiers.HostTransfer] = field(default_factory=dict)
     overlap_drain: set[tiers.Unit] = field(default_factory=set)
     overlap_depth: dict[tiers.Unit, int] = field(default_factory=dict)
+    overlap_entry: object = None
+    overlap_joined: bool = False
 
 
 @dataclass(slots=True)
@@ -1390,11 +1392,29 @@ class Planner:
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> object:
-        if any(frame.held is held for frame in self.stack):
-            self._overlap_retire(pending_only=True)
-            for parent in self.stack:
-                parent.overlap_enabled = parent.overlap_learnable = False
-        if not self.cuda or held.hosted or any(frame.held is held for frame in self.stack):
+        active = next((frame for frame in reversed(self.stack) if frame.held is held), None)
+        if active is not None:
+            forward = tiers.original(getattr(held.part.root, "forward", None))
+            transparent = (
+                not active.overlap_joined
+                and getattr(active.overlap_entry, "__self__", None) is held.part.root
+                and getattr(active.overlap_entry, "__func__", None)
+                is self.torch.nn.Module._call_impl
+                and getattr(fn, "__self__", None) is held.part.root
+                and getattr(fn, "__func__", fn) is getattr(forward, "__func__", forward)
+            )
+            if not transparent:
+                self._overlap_retire(pending_only=True)
+                for parent in self.stack:
+                    parent.overlap_enabled = parent.overlap_learnable = False
+            previous = active.overlap_joined
+            active.overlap_joined = True
+            try:
+                self._ready(held.key)
+                return fn(*args, **kwargs)
+            finally:
+                active.overlap_joined = previous
+        if not self.cuda or held.hosted:
             self._ready(held.key)
             return fn(*args, **kwargs)
         # A nested callee may fill/reclaim. Retire only unbound hints here; a parent
@@ -1488,6 +1508,7 @@ class Planner:
                         snapshot = self._arm(held, leaves)
                     self._sample()
                     frame = Frame(held, self._allocated())
+                    frame.overlap_entry = tiers.original(fn)
                     self._overlap_frame(frame, key, retryable and not replayed)
                     self.stack.append(frame)
                     self._ready(held.key)

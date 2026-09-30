@@ -443,3 +443,72 @@ def test_nested_whole_scope_retires_shared_backend_borrow_before_fill(
         owner.enter("construction", "nested", ("whole",))
     assert fills == ["whole"] and not owner.unusable
     assert not frame.overlap_enabled and not frame.overlap_learnable
+
+
+@pytest.mark.parametrize("route", ["call", "forward", "encode", "decode", "recursive", "exception"])
+def test_production_root_call_wrapper_learns_then_overlaps(
+    policy: Any, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    import functools
+
+    owner, held, _, _, _, _ = policy
+    owner.stack.clear()
+    held.overlap_key, held.overlap_order = None, ()
+
+    state = {"recursive": False, "fail": False}
+    frames: list[memory.Frame] = []
+
+    class Root(torch.nn.Module):  # type: ignore[name-defined, misc]  # optional Torch test base
+        def forward(self) -> Any:
+            if route == "recursive" and not state["recursive"]:
+                state["recursive"] = True
+                try:
+                    return self()
+                finally:
+                    state["recursive"] = False
+            value = torch.ones(1, 2)
+            for block in self.blocks:
+                value = block(value)
+            frames.append(owner.stack[-1])
+            if state["fail"]:
+                raise ValueError("joined body failed")
+            return value
+
+        def encode(self) -> Any:
+            return self.forward()
+
+        def decode(self) -> Any:
+            return self.forward()
+
+    held.part.root.__class__ = Root
+    tiers.install(held.part, owner._enter_unit, owner._leave_unit)
+    tiers.wrap(held.part.root, functools.partial(owner.run, held))
+    monkeypatch.setattr(owner, "_plan", lambda *_: memory.Plan(0, []))
+    monkeypatch.setattr(owner, "_apply", lambda *_: None)
+    monkeypatch.setattr(owner, "_arm", lambda *_: None)
+    call = (
+        held.part.root
+        if route in ("call", "recursive", "exception")
+        else getattr(held.part.root, route)
+    )
+    with torch.no_grad():
+        first = call()
+        if route in ("call", "forward", "exception"):
+            assert held.overlap_order == held.part.blocks
+        else:
+            assert held.overlap_order == ()
+        if route == "exception":
+            state["fail"] = True
+            monkeypatch.setattr(owner, "_rollback", lambda *_: None)
+            with pytest.raises(ValueError, match="joined body failed"):
+                call()
+            assert not frames[-1].overlap_joined
+            assert held.overlap_order == ()
+        else:
+            second = call()
+            assert torch.equal(first, second)
+        if route in ("call", "forward", "exception"):
+            assert owner.overlap["hits"] == 2
+        else:
+            assert owner.overlap.get("hits", 0) == 0
+    assert not owner.stack and not owner._host_transfers

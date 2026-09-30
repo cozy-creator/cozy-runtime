@@ -55,3 +55,15 @@ History deliberately does not cross Model scope closure. A public pipeline that 
 a new scope around every denoise step may therefore remain cold; a broader scope with
 repeated matching component operations can learn and reuse order. Eligibility is
 structural, not model-specific, and the experiment promises no uniform pipeline gain.
+
+## Production wrapper correction
+
+The first isolated candidate07ad721e passed its CPU tests but those tests entered
+Planner.run directly. They missed that production tiers.wrap adapts both Module's
+_call_impl and forward: treating the second entry as authored recursion disabled
+learning on every ordinary root(...) call. A real wrapped-root regression reproduced
+that failure before the follow-up correction. Only the exact canonical Module
+_call_impl → current bound root.forward gateway may now join once without invalidating
+lookahead. Deeper recursion and unknown same-component encode/decode joins disable it;
+the join flag is restored even when the body raises. Both root(...) and direct
+root.forward() are tested through the actual adapters, with positive second-call hits.
