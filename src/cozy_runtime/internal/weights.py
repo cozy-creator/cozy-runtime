@@ -23,7 +23,7 @@ from typing import Any
 import msgspec
 import tensorfs
 
-from cozy_runtime.author._errors import RuntimeFailure
+from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.internal import accel, canonical, plane, weight_policy
 from cozy_runtime.internal.derive import placing
@@ -1449,7 +1449,6 @@ class WeightResidency:
         the plane budget and runs the block again, while its inputs are untouched."""
         weights = self.weights
         torch = weights.torch
-        oom = accel.oom_error(torch, weights.kind)
 
         def run(*args: Any, **kwargs: Any) -> Any:
             self._observe(component, region.index)
@@ -1462,7 +1461,9 @@ class WeightResidency:
                     bind(torch, region, lease)
                     try:
                         return forward(*args, **kwargs)
-                    except oom as exc:
+                    except Exception as exc:
+                        if not is_device_oom(exc):
+                            raise
                         need = _requested(exc) or region.span
                 finally:
                     if lease.slot is not None:
@@ -1535,7 +1536,6 @@ class WeightResidency:
         The mode is recorded in the run's outputs."""
         root = self.components[name].root
         weights = self.weights
-        oom = accel.oom_error(weights.torch, weights.kind)
         per_pixel: list[int] = []
         scale = 2 ** (len(root.config.block_out_channels) - 1)
 
@@ -1556,8 +1556,8 @@ class WeightResidency:
             failed = False
             try:
                 out = decode(z, *args, **kwargs)
-            except oom:
-                if mode == "tiled":
+            except Exception as exc:
+                if mode == "tiled" or not is_device_oom(exc):
                     raise
                 failed = True
             if failed:  # outside `except`, so the failed call's frames are gone

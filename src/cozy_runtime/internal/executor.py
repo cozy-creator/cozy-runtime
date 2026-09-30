@@ -1020,7 +1020,7 @@ class Executor:
                 )
         # Every rank may take a spread call. A rank homing a placeable component takes one
         # only beside everything it holds (measured room), so it never gives up the
-        # component it hosts for a clip (`Executor.run`, `ComponentResidency.sparing`).
+        # component it hosts for a clip (`Executor.run`, `WeightResidency.sparing`).
         sparing = sorted(set(owner.group_hosted.values()))
         if self.rank == 0:
             assert self.group is not None
