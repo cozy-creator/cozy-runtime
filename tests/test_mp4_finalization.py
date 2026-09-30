@@ -162,7 +162,8 @@ def test_every_join_revision_is_indexed_without_changing_packets_or_previous_rev
             saved.video, attempt="parent", input_id="finished", max_decoded_bytes=8 << 20
         )
         with decoder.stream_audio(hydrated) as stream:
-            assert sum(e.sample_count for e in stream if isinstance(e, DecodedAudioChunk)) == written
+            actual_samples = sum(e.sample_count for e in stream if isinstance(e, DecodedAudioChunk))
+            assert actual_samples == written
     again = join.finish()
     assert again.video._local is not None and again.video._local.read_bytes() == final.read_bytes()
     assert again.submitted_audio_samples == saved.submitted_audio_samples
