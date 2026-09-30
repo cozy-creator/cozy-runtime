@@ -1,16 +1,16 @@
 name: ci
 # On demand, before a release (lint, types, fences, wheel, pytest, handoff proof):
 #   gh workflow run ci.yaml -R cozy-creator/cozy-runtime --ref <branch>
-# Every gate after the sync runs even when an earlier one is red, so one dispatch reports all
-# of them; the job still fails on any red gate. Nothing runs on push: publish.yaml's build job
-# runs the whole-tree syntax/undefined-name lint and the fences on every release.
+# Every gate runs even when another is red; the final checks job requires all of them.
+# Tests keep real process/cgroup isolation on independent runners. Nothing runs on push:
+# publish.yaml's build job runs the syntax/undefined-name lint and fences on every release.
 on:
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  checks:
+  quality:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -48,36 +48,61 @@ jobs:
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$a"
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$b"
           cmp "$a"/*.whl "$b"/*.whl
-      - name: Full test suite under delegated processes
-        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+  # Checked-in timings balance contiguous groups while preserving test order. Refresh with
+  # `uv run pytest --store-durations --durations-path .github/test-durations.json` on a delegated host.
+  # New tests are always collected; missing timings use the measured suite average.
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/master' && matrix.group == 1 }}
+      - run: uv python install 3.12
+      - run: uv sync --locked
+      # Restore before the cross-version tests, which are included in the full suite.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/cozy-runtime-tests
+          key: cross-version-seam-${{ hashFiles('tests/test_cross_version_seam.py') }}
+      - name: Full test suite shard under delegated processes
+        env:
+          TEST_GROUP: ${{ matrix.group }}
         run: |
           sudo systemd-run --wait --pipe --collect \
-            --unit="cozy-runtime-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --unit="cozy-runtime-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TEST_GROUP}" \
             --uid="$(id -u)" --gid="$(id -g)" \
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
             --setenv="UV_CACHE_DIR=$UV_CACHE_DIR" \
             --setenv="UV_PYTHON_INSTALL_DIR=$(uv python dir)" \
-            .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main(["--durations=40", "--junitxml=pytest-results.xml"]))'
-      # Older Runtimes' executors against this worker; their locked environments are cached.
-      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/cozy-runtime-tests
-          key: cross-version-seam-${{ hashFiles('tests/test_cross_version_seam.py') }}
-      - name: Supervised child-call integration and cross-version seam
-        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
-        run: |
-          sudo systemd-run --wait --pipe --collect \
-            --unit="cozy-runtime-seam-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --uid="$(id -u)" --gid="$(id -g)" \
-            --property=Delegate=yes --working-directory="$PWD" \
-            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
-            .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main(["tests/test_machine_call_locking.py", "tests/test_cross_version_seam.py", "-q", "-rs"]))'
+            .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main(sys.argv[1:]))' \
+            --splits 4 --group "$TEST_GROUP" --durations-path .github/test-durations.json \
+            --store-durations --durations=20 --junitxml=pytest-results.xml
       - name: Test timing receipt
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-timing
-          path: pytest-results.xml
+          name: pytest-timing-${{ matrix.group }}
+          path: |
+            pytest-results.xml
+            .github/test-durations.json
           if-no-files-found: error
+          include-hidden-files: true
+  checks:
+    if: ${{ always() }}
+    needs: [quality, tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every gate and test group
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TEST_RESULT: ${{ needs.tests.result }}
+        run: test "$QUALITY_RESULT" = success && test "$TEST_RESULT" = success

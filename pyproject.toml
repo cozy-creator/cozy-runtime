@@ -36,6 +36,8 @@ dev = [
     "tensorfs>=0.3.78,<0.4",
     "types-protobuf>=6.30",
     "av>=18.1,<19",
+    # CI partitions this unchanged suite across independent delegated runners.
+    "pytest-split>=0.11.0",
 ]
 
 [project.scripts]
