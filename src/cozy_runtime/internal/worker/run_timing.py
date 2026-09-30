@@ -1,7 +1,7 @@
 """One run's measured union of cooperative executor work.
 
-Activity messages stay in memory. Existing progress and execution boundaries publish
-bounded cumulative snapshots; no selector wakeup creates a retained event of its own.
+Activity messages stay in memory. Progress, execution boundaries, and the worker's
+two-second reporter publish bounded cumulative snapshots.
 """
 
 from __future__ import annotations
@@ -114,6 +114,15 @@ class Timing:
                 run = self.runs[key]
                 run.advance(self.monotonic())
                 self._snapshot(key, run)
+
+    def sample(self) -> None:
+        """Refresh each active run's measured total between model progress events."""
+        with self.lock:
+            now = self.monotonic()
+            for key, run in self.runs.items():
+                with contextlib.suppress(Exception):
+                    run.advance(now)
+                    self._snapshot(key, run)
 
     def end(self, owner: str, request: str, attempt: int) -> None:
         with contextlib.suppress(Exception), self.lock:

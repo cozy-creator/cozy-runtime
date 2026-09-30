@@ -7082,6 +7082,8 @@ class Worker:
         """The ObservedWorkerState tick, and the liveness SAMPLE that rides it."""
         while not self.stop.wait(REPORT_SECONDS):
             try:
+                if self.machine_calls is not None:
+                    self.machine_calls.run_timing.sample()
                 for subject in list(self.monitor.cursors):
                     self.monitor.sample(subject)
                 self.publish_activity()
