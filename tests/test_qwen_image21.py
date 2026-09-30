@@ -247,13 +247,6 @@ from cozy_runtime.models.qwen_image21.model import _StagedPipeline
 
 pipeline = object.__new__(_StagedPipeline)
 pipeline.set_progress_bar_config(disable=True)
-try:
-    with pipeline.progress_bar(total=0):
-        raise ValueError("author failure")
-except ValueError as exc:
-    assert str(exc) == "author failure"
-else:
-    raise AssertionError("progress swallowed author failure")
 for _ in range(2):
     frames = []
     with observing(lambda *frame: frames.append(frame)) as activity:
@@ -262,6 +255,14 @@ for _ in range(2):
     assert frames[-1][1:] == (False, True, True), (
         frames, [(type(t).__module__, type(t).__qualname__) for t in activity.unowned]
     )
+
+try:
+    with pipeline.progress_bar(total=0):
+        raise ValueError("author failure")
+except ValueError as exc:
+    assert str(exc) == "author failure"
+else:
+    raise AssertionError("progress swallowed author failure")
 
 frames = []
 with observing(lambda *frame: frames.append(frame)):
