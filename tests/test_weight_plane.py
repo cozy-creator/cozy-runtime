@@ -174,6 +174,13 @@ def test_the_pinned_tier_holds_every_part_where_the_layout_says(tmp_path: Path) 
         f"blocks.{i}" for i in range(BLOCKS)
     ]
     assert_pinned(weights, component, values)
+    # A CPU executor computes on its tier in place, exactly as on ordinary tensors.
+    x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(3)).half()
+    reference = Stack()
+    reference.load_state_dict(values)
+    with torch.inference_mode():
+        expected = reference(x)
+    assert same(run(model, x, passes=1), [expected])
     # Below its block floor a component moves to the sub-block grain: each projection is
     # a region, and the blocks' own `norm`s join `common`.
     fine = model.backend.refine("stack")

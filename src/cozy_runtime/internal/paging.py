@@ -7,7 +7,9 @@ as a unit and the executor hooks once per call (`weights.py`).
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
+from itertools import chain
 from typing import Any
 
 
@@ -112,12 +114,17 @@ def _split(root: Any, path: str, limit: int) -> list[str]:
     children = [
         f"{path}.{name}" if path else name
         for name, child in module.named_children()
-        if next(child.parameters(), None) is not None
+        if next(_tensors(child), None) is not None
     ]
     if not children or (path and _bytes(module) <= limit):
         return [path]
     return [unit for child in children for unit in _split(root, child, limit)]
 
 
+def _tensors(module: Any) -> Iterator[Any]:
+    """Parameters and buffers: an encoded leaf holds its stored roles as buffers."""
+    return chain(module.parameters(), module.buffers())
+
+
 def _bytes(module: Any) -> int:
-    return sum(int(t.numel() * t.element_size()) for t in module.parameters())
+    return sum(int(t.numel() * t.element_size()) for t in _tensors(module))

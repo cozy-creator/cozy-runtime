@@ -1988,6 +1988,8 @@ class Executor:
                 exc if isinstance(exc, GroupRefusal) else GroupRefusal(str(exc))
             )
         stage("admission")
+        # An older Worker sends no `Budget`: its assigned ceiling bounds every stage instead.
+        weights.ceiling = int(agreed) if isinstance(agreed, int) else -1
         artifact = Artifact(
             reference.snapshot,
             tensor_schema_of(rows),
@@ -2165,6 +2167,7 @@ class Executor:
         # stages stream from the host tier like any request's, and teach the residency the
         # blocks' execution order.
         warm_ms = 0.0
+        refused = None
         if self.rank == 0:
             try:
                 warm_ms = self._warm_model(model)
@@ -2172,17 +2175,24 @@ class Executor:
                 cause = exc.__cause__
                 short = cause if isinstance(cause, ResidencyRefusal) else None
                 oom = cause is not None and is_device_oom(cause)
-                if short is None and not oom:
-                    backend.poison(())
-                    self.poisoned = f"warm failed: {exc}"[:200]
-                return {
+                refused = {
                     "ok": False,
                     "code": short.code if short else "device_out_of_memory" if oom else exc.code,
                     "shortfall": short.shortfall if short else None,
                     "detail": str(exc)[:900],
                     "traceback": prepare_diagnostics.exception_trace(exc),
-                    "state": backend.state,
                 }
+                capacity = short is not None or oom
+        if refused is not None:
+            # Outside `except`, so the failed warm's frames hold no view of a weight set. A
+            # capacity refusal gives this construction's weight sets back and the process
+            # keeps serving; a group's followers hold their half, so it is replaced.
+            if capacity and self.world == 1:
+                backend.close()
+            else:
+                backend.poison(())
+                self.poisoned = f"warm failed: {refused['detail']}"[:200]
+            return {**refused, "state": backend.state}
         stage("warm")
         weights.measure_context()
         if "sol-attn" in applied.totals():
@@ -3806,14 +3816,18 @@ class Executor:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         chosen = set(ranks) if ranks else set(range(self.world))
         followers = sorted(rank for rank in chosen if 0 < rank < self.world)
-        freed = 0
-        with self._followers(followers, Vacate(residents=residents), "vacate") as refused:
+
+        def own() -> int:
+            freed = 0
             if (self.rank > 0 or 0 in chosen) and self.weights is not None and residents:
                 freed = self.weights.vacate()
             if self.torch is not None:
                 accel.release_cached(self.torch, self.device_kind)
+            return freed
+
+        freed, refused = self._followers(followers, Vacate(residents=residents), "vacate", own)
         if refused:
-            return refused[0]
+            return refused
         return {
             **self.probe(),
             "vacated": {"freed": {}, "held": {}, "freed_bytes": freed},
@@ -3830,40 +3844,56 @@ class Executor:
         """The Worker's plane budgets for every rank of this process: lowering unmaps now."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        freed = 0
-        with self._followers(range(1, self.world), command, "budget") as refused:
-            if self.weights is not None:
-                freed = self.weights.set_budget(command.vram_bytes, command.pinned_bytes)
+        weights = self.weights
+        freed, refused = self._followers(
+            range(1, self.world),
+            command,
+            "budget",
+            lambda: weights.set_budget(command.vram_bytes, command.pinned_bytes) if weights else 0,
+        )
         if refused:
-            return refused[0]
+            return refused
         return {"ok": True, "freed_bytes": freed, "plane": self._plane_facts()}
 
     def prefetch(self, command: Prefetch) -> dict[str, Any]:
         """Fill one construction's host tier now, before its attempt holds the device."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        filling = 0
-        with self._followers(range(1, self.world), command, "prefetch") as refused:
-            if self.weights is not None and command.construction in self.constructions:
-                child = self.constructions[command.construction]
-                for member in child.model_executors or [child]:
-                    filling += self.weights.prefetch(member._group_model_key)
+
+        def own() -> int:
+            child = self.constructions.get(command.construction)
+            if self.weights is None or child is None:
+                return 0
+            members = child.model_executors or [child]
+            return sum(self.weights.prefetch(member._group_model_key) for member in members)
+
+        filling, refused = self._followers(range(1, self.world), command, "prefetch", own)
         if refused:
-            return refused[0]
+            return refused
         return {"ok": True, "filling_bytes": filling}
 
-    @contextlib.contextmanager
-    def _followers(self, ranks: Any, command: Any, what: str) -> Iterator[list[dict[str, Any]]]:
-        """Send `command` to follower `ranks` around rank 0's own half; a refusal lands in
-        the yielded list."""
-        refused: list[dict[str, Any]] = []
+    def _followers(
+        self, ranks: Any, command: Any, what: str, own: Callable[[], int]
+    ) -> tuple[int, dict[str, Any] | None]:
+        """Send `command` to follower `ranks`, run rank 0's own half (`own`), then read every
+        follower's reply, so the channel stays in step whatever `own` raises. Returns its
+        result and the group's refusal, if any."""
         ranks = sorted(ranks) if self.group is not None else []
         frame = executor_commands.encode(command)
         try:
             for rank in ranks:
                 self.group.send_one(rank, frame)  # type: ignore[union-attr]
-            yield refused
-            for rank in ranks:
+        except GroupRefusal as exc:
+            return 0, self._group_refusal(exc, closing=False)
+        failure: BaseException | None = None
+        result = 0
+        try:
+            result = own()
+        except BaseException as exc:
+            failure = exc
+        refused = None
+        for rank in ranks:
+            try:
                 reply = self.group.reply_one(rank, what)  # type: ignore[union-attr]
                 if not reply.get("ok"):
                     raise GroupRefusal(
@@ -3871,8 +3901,12 @@ class Executor:
                         f"{reply.get('detail', '')}"[:600],
                         code="group_broken",
                     )
-        except GroupRefusal as exc:
-            refused.append(self._group_refusal(exc, closing=False))
+            except GroupRefusal as exc:
+                refused = self._group_refusal(exc, closing=False)
+                break  # the group is broken: no later reply is owed
+        if failure is not None:
+            raise failure
+        return result, refused
 
     def _active_residency(self) -> dict[str, Any]:
         child = self.constructions.get(self.active)

@@ -52,6 +52,8 @@ class HostTiers:
             self.held[key] = Held(request.memfd, _resident(request.memfd), self.clock)
             self._trim()
             return Answer(ok=True)
+        if request.memfd >= 0:  # an ask carries none; one that does is not kept
+            os.close(request.memfd)
         row = self.held.get(key)
         if row is None:
             return Tier(ok=True, held=False)

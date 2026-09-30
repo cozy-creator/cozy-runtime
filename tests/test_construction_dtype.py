@@ -130,8 +130,8 @@ def test_native_checkpoint_registers_the_dtype_selected_constructor(
             backend=backend,
         )
         model = loader.construct(Pipeline, factory=Pipeline)
-        # Registered, not moved: a stage binds the bytes.
-        assert model.components["linear"].weight.is_meta
+        # A CPU executor binds the registered bytes in place, in the selected dtype.
+        assert torch.equal(model.components["linear"].weight, source)
         assert loader.records()[0].filled_bytes == width * 6
         component = backend.components["linear"]
         (region,) = component.regions
