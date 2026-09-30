@@ -1,8 +1,8 @@
 """Real tiny Qwen modules: staged execution agrees with the upstream pipeline."""
 
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +13,21 @@ pytest.importorskip("tokenizers")
 
 
 def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Path) -> None:
+    # Repeated invocations share one executor's observer state, independently of
+    # unrelated Worker/server threads created by other tests in pytest's process.
+    code = (
+        "import pathlib, runpy, sys; "
+        "runpy.run_path(sys.argv[1])['_staged_qwen_proof'](pathlib.Path(sys.argv[2]))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(Path(__file__).resolve()), str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _staged_qwen_proof(tmp_path: Path) -> None:
     import base64
     import zlib
 
@@ -26,6 +41,7 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Pat
     )
 
     from cozy_runtime.author import Config
+    from cozy_runtime.author._activity import observing
     from cozy_runtime.models.qwen_image21.model import (
         QwenImage21Model,
         build_processor,
@@ -164,20 +180,29 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Pat
         torch.testing.assert_close(actual_buffers[name], expected_buffer, rtol=0, atol=0)
     assert {value.dtype for value in encoder.parameters()} == {torch.bfloat16}
     model = QwenImage21Model.for_test(graph=graph, processor=processor)
-    embeds, mask = model.encode("a person in a blue jacket")
-    assert embeds.shape[-1] == 16
-    latents = model.denoise(
-        embeds,
-        mask,
-        width=32,
-        height=32,
-        steps=2,
-        seed=44,
-        on_step=lambda i: None,
-        cancel=lambda: None,
-    )
-    actual = model.decode(latents, width=32, height=32)
-    model.harness.assert_scopes("encode", "denoise", "decode")
+    frames: list[tuple[int, bool, bool, bool]] = []
+
+    def observed(sequence: int, active: bool, known: bool, finished: bool) -> None:
+        frames.append((sequence, active, known, finished))
+
+    for _ in range(2):
+        frames.clear()
+        with observing(observed):
+            embeds, mask = model.encode("a person in a blue jacket")
+            assert embeds.shape[-1] == 16
+            latents = model.denoise(
+                embeds,
+                mask,
+                width=32,
+                height=32,
+                steps=2,
+                seed=44,
+                on_step=lambda i: None,
+                cancel=lambda: None,
+            )
+            actual = model.decode(latents, width=32, height=32)
+        assert frames[-1][1:] == (False, True, True), frames
+    model.harness.assert_scopes("encode", "denoise", "decode", "encode", "denoise", "decode")
     pipe = QwenImage21Pipeline(
         **{**graph.components, "text_encoder": upstream_encoder},
         processor=processor,
@@ -222,6 +247,13 @@ from cozy_runtime.models.qwen_image21.model import _StagedPipeline
 
 pipeline = object.__new__(_StagedPipeline)
 pipeline.set_progress_bar_config(disable=True)
+try:
+    with pipeline.progress_bar(total=0):
+        raise ValueError("author failure")
+except ValueError as exc:
+    assert str(exc) == "author failure"
+else:
+    raise AssertionError("progress swallowed author failure")
 for _ in range(2):
     frames = []
     with observing(lambda *frame: frames.append(frame)) as activity:
