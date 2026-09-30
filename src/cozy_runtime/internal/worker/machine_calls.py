@@ -498,7 +498,13 @@ class Calls:
                 installation_id=target.installation_id,
                 job_descriptor_id=target.binding.job_descriptor_id,
                 orchestration=not bool(
-                    target.declaration.get("models") or target.declaration.get("weights_outputs")
+                    target.declaration.get(
+                        "accelerator",
+                        bool(
+                            target.declaration.get("models")
+                            or target.declaration.get("weights_outputs")
+                        ),
+                    )
                 ),
             ),
         )
