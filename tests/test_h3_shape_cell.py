@@ -1,10 +1,9 @@
 """H3's shape cell names what sizes its memory: clip length and reference count.
 
-Staged admission (#756) keeps components beside a scope only when that scope's peak was
-measured at the request's exact cell. H3's cell used to be `-` for every length and reference
-count, so a first 15 s request after 10 s ones could run on a 10 s peak. This drives the real
-`prepare` path over an H3-shaped entrypoint (bounded `duration_s` with a frames table, an
-`Assets[Mixed]` parameter, a preflight) and hands the cells to the real ledger.
+The Worker admits a call up to the peak measured at its entrypoint and exact cell. H3's cell
+used to be `-` for every length and reference count, so a first 15 s request after 10 s ones
+could run on a 10 s peak. This drives the real `prepare` path over an H3-shaped entrypoint
+(bounded `duration_s` with a frames table, an `Assets[Mixed]` parameter, a preflight).
 """
 
 from __future__ import annotations
@@ -32,8 +31,6 @@ from cozy_runtime.author import (
     prepare,
 )
 from cozy_runtime.author._assets import GrantedInput
-from cozy_runtime.internal.executor_replies import Metrics
-from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import shape_cell
 
 #: Stands in for H3's `official.frames_for` table (whole seconds onto its frame grid).
@@ -132,22 +129,6 @@ def test_length_and_reference_count_are_the_cell(tmp_path: Path) -> None:
     assert _cell(tmp_path, seconds=10, references=2, prompt="another prompt") == ten
 
 
-def test_a_longer_first_request_is_unmeasured_so_staging_frees_the_card(tmp_path: Path) -> None:
-    """The #756 hand-off: a 10 s serve's peaks never let a first 15 s request keep neighbours."""
-    ten = _cell(tmp_path, seconds=10, references=2)
-    fifteen = _cell(tmp_path, seconds=15, references=2)
-    ledger = Ledger(worker_pid=1)
-    ledger.begin_generation(1)
-    ledger.device_free = 60 << 30
-    peaks = {"condition_text": 2 << 30, "sample_ref2va_turbo": 5 << 30}
-    ledger.observe_attempt(
-        msgspec.convert({"activation_peaks": peaks}, Metrics), cell=ten, succeeded=True
-    )
-    assert ledger.measured_scopes(ten) == frozenset(peaks)
-    assert ledger.measured_scopes(fifteen) == frozenset()
-    assert ledger.measured_scopes(_cell(tmp_path, seconds=10, references=5)) == frozenset()
-
-
 def test_an_invocable_payload_carries_its_segment_length_into_the_cell(tmp_path: Path) -> None:
     """Run 1560: `long_form` calls `motion_segment_turbo(payload=..., assets=...)`, so the
     length sits one level below the request. Its 6 s and 12 s segments were one cell, and the
@@ -157,15 +138,6 @@ def test_an_invocable_payload_carries_its_segment_length_into_the_cell(tmp_path:
     twelve = _cell(tmp_path, seconds=12, references=5, entrypoint="motion_segment_turbo")
     assert six == f"assets=5,frames={FRAMES[6]},steps=8"
     assert twelve == f"assets=5,frames={FRAMES[12]},steps=8"
-    ledger = Ledger(worker_pid=1)
-    ledger.begin_generation(1)
-    ledger.device_free = 7 << 30
-    ledger.observe_attempt(
-        msgspec.convert({"activation_peaks": {"sample_ref2va_turbo": 3 << 30}}, Metrics),
-        cell=six,
-        succeeded=True,
-    )
-    assert ledger.measured_scopes(twelve) == frozenset()
 
 
 class Twice(msgspec.Struct):

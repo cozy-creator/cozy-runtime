@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import atexit
 import functools
+import importlib.metadata
+import json
 import shutil
 import tempfile
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 
 @functools.cache
@@ -40,11 +43,21 @@ def image_python() -> Path:
     uv = shutil.which("uv")
     assert uv is not None
     wheels = root / "wheels"
-    subprocess.run(
-        [uv, "build", "--wheel", "--out-dir", str(wheels), str(Path(__file__).parent.parent)],
-        check=True,
-        capture_output=True,
-    )
+    # A development cohort must be installed from its actual wheel, not rebuilt as
+    # the public project version while the test runner still reports a local version.
+    installed = importlib.metadata.distribution("cozy-runtime")
+    direct = json.loads(installed.read_text("direct_url.json") or "{}")
+    url = urlparse(direct.get("url", ""))
+    local = Path(unquote(url.path)) if url.scheme == "file" else None
+    if local is not None and local.suffix == ".whl" and local.is_file():
+        wheels.mkdir()
+        shutil.copyfile(local, wheels / local.name)
+    else:
+        subprocess.run(
+            [uv, "build", "--wheel", "--out-dir", str(wheels), str(Path(__file__).parent.parent)],
+            check=True,
+            capture_output=True,
+        )
     runtime_wheel = next(wheels.glob("cozy_runtime-*.whl"))
     subprocess.run(
         [uv, "pip", "install", "--python", str(python), str(runtime_wheel)],

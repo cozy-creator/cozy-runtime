@@ -7,9 +7,9 @@ package interface says comes from the object package.toml named.
 
 Execution containment is a TIER-INDEPENDENT property of the caller, not of this module:
 the trusted build runs `describe` in a disposable container of the already-built release
-image with no GPU, no weights, no network and no credentials (tensorhub-build.md). What
-this module owns is the bound the runtime needs regardless of tier — a wall-clock ceiling
-on author top-level code — and the refusal set around the one import.
+image with no GPU, no weights, no network and no credentials (tensorhub-build.md).
+Discovery offers an explicit builder wall-clock ceiling. Runtime-supervised discovery
+disables that ceiling and uses the executor progress/death watcher instead.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ class Discovered:
     bindings: Mapping[str, Mapping[str, object]]
 
 
-def discover(project: Path, *, seconds: float = IMPORT_SECONDS) -> Discovered:
+def discover(project: Path, *, seconds: float | None = IMPORT_SECONDS) -> Discovered:
     """Import the one configured export inside this environment and freeze it."""
     project = project.resolve()
     application = read_application(project)
@@ -98,7 +98,7 @@ def assert_locked_environment(project: Path) -> str:
     return f"{name} {version} in {sys.executable}"
 
 
-def discover_installed(application: str, *, seconds: float = IMPORT_SECONDS) -> Discovered:
+def discover_installed(application: str, *, seconds: float | None = IMPORT_SECONDS) -> Discovered:
     """Freeze one package interface-named export from the installed package environment.
 
     A materialized rental has an immutable venv, not a copied source tree or package.toml.
@@ -109,7 +109,9 @@ def discover_installed(application: str, *, seconds: float = IMPORT_SECONDS) -> 
     return _discover(application, Path("/"), {}, seconds=seconds, add=None)
 
 
-def discover_distribution(distribution: str, *, seconds: float = IMPORT_SECONDS) -> Discovered:
+def discover_distribution(
+    distribution: str, *, seconds: float | None = IMPORT_SECONDS
+) -> Discovered:
     """Discover one installed wheel through its single standard ``cozy.application`` entry."""
 
     try:
@@ -134,7 +136,7 @@ def _discover(
     project: Path,
     bindings: Mapping[str, Mapping[str, object]],
     *,
-    seconds: float,
+    seconds: float | None,
     add: Path | None,
 ) -> Discovered:
     if application.count(":") != 1 or not all(part.strip() for part in application.split(":")):
@@ -217,10 +219,14 @@ def _no_path() -> Iterator[None]:
 
 
 @contextmanager
-def _wall_clock(seconds: float, application: str) -> Iterator[None]:
-    """A ceiling on author top-level code. POSIX main thread only; elsewhere the builder's
+def _wall_clock(seconds: float | None, application: str) -> Iterator[None]:
+    """An optional ceiling on author top-level code. POSIX main thread only; elsewhere the builder's
     container bound is the one that holds, and this is a no-op rather than a false promise."""
-    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+    if (
+        seconds is None
+        or not hasattr(signal, "SIGALRM")
+        or threading.current_thread() is not threading.main_thread()
+    ):
         yield
         return
 
