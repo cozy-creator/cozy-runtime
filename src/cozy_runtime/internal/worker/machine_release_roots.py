@@ -100,6 +100,7 @@ class _Prepared:
     edges: list[tuple[str, str]]
     placement_set: bytes = b""  # a served root's prepared placement, as its set's exact bytes
     hub: str = ""  # the Hub the root's run came from, as `hub_key` spells it
+    model_choices: tuple[pb.ModelChoice, ...] = ()
 
 
 @dataclass
@@ -417,8 +418,32 @@ class ReleaseRoots:
             False,
             prepared.installation_id,
         )
+        scope = _Prepared(
+            key,
+            target,
+            declared,
+            dict(prepared.placement),
+            [],
+            installed,
+            edges,
+            hub=hub,
+            model_choices=tuple(root.models),
+        )
+        _, _, _, choices = self._capture(scope)
+        selected_root = pb.ReleaseRoot()
+        selected_root.CopyFrom(root)
+        selected_root.ClearField("models")
+        selected_root.models.extend(
+            choice
+            for (callee, entrypoint, _), choice in choices.items()
+            if (callee, entrypoint) == (target.installation_id, target.entrypoint)
+        )
+        if root.job and any(choice.adapters for choice in selected_root.models):
+            raise WorkspaceRefusal(
+                "model_adapters_require_serving: target a serving child's qualified model slot"
+            )
         models = self._resolve(
-            root,
+            selected_root,
             declaration,
             machine_source_models.credentials(request.source_credentials),
             lambda stage, done, total: self._note(job, stage, done, total),
@@ -434,7 +459,15 @@ class ReleaseRoots:
                 ),
             )
             return _Prepared(
-                key, target, declared, dict(prepared.placement), models, installed, edges, hub=hub
+                key,
+                target,
+                declared,
+                dict(prepared.placement),
+                models,
+                installed,
+                edges,
+                hub=hub,
+                model_choices=scope.model_choices,
             )
         serving = worker.machine_calls.serving
         call = Call(
@@ -471,7 +504,16 @@ class ReleaseRoots:
         )
         self._register(target, ready.placement, placement_set)
         return _Prepared(
-            key, target, declared, ready.placement, models, installed, edges, placement_set, hub
+            key,
+            target,
+            declared,
+            ready.placement,
+            models,
+            installed,
+            edges,
+            placement_set,
+            hub,
+            scope.model_choices,
         )
 
     def _resolve(
@@ -534,11 +576,33 @@ class ReleaseRoots:
             }
             resolved = {parameter: dict(row.result()) for parameter, row in resolving.items()}
         # A provider source is made here, in order: headers first, only its profile's members.
-        return [
+        rows = [
             machine_source_models.slot(self.worker, given[parameter], credentials, note)
             if parameter in sourced
             else resolved[parameter]
             for parameter in parameters
+        ]
+        from . import machine_model_overrides
+
+        def check() -> None:
+            if self.worker.stop.is_set():
+                raise WorkspaceRefusal("machine stopped during model preparation")
+
+        return [
+            machine_model_overrides.apply(
+                self.worker,
+                row,
+                given[parameter],
+                package=root.package,
+                hub=root.hub,
+                owner=root.owner,
+                credentials=credentials,
+                note=note,
+                check=check,
+            )
+            if parameter in given and given[parameter].adapters
+            else row
+            for row, parameter in zip(rows, parameters, strict=True)
         ]
 
     def _pin(self, choice: pb.ModelChoice) -> dict[str, Json]:
@@ -580,7 +644,9 @@ class ReleaseRoots:
         with worker.control_lock:
             worker.prepared_installations[stored.prepared_key] = stored
 
-    def _capture(self, prepared: _Prepared) -> tuple[bytes, bytes, dict[str, Installation]]:
+    def _capture(
+        self, prepared: _Prepared
+    ) -> tuple[bytes, bytes, dict[str, Installation], dict[tuple[str, str, str], pb.ModelChoice]]:
         """The callable inventory this machine would have been sent: installed and deferred."""
         installed = prepared.installed
         names: dict[str, tuple[str, str]] = {}  # key -> (field prefix, capture name)
@@ -637,14 +703,20 @@ class ReleaseRoots:
             )
         )
         packages.sort(key=lambda row: row.installation_id)
+        model_choices = sorted(prepared.model_choices, key=lambda choice: choice.parameter)
         capture = pb.MachineExecutionCapture(
             root_installation_id=prepared.target.installation_id,
             installed_packages=packages,
             deferred_installations=rows,
             bindings=bindings,
+            model_choices=model_choices,
         )
+        from . import machine_model_choices
+
+        known = {names[key][1]: interface for key, interface in interfaces.items()}
+        choices = machine_model_choices.resolve(capture, prepared.target.entrypoint, known)
         raw, digest = documents.identity(capture)
-        return raw, digest, {key: held for key, held in installed.items() if key in keys}
+        return raw, digest, {key: held for key, held in installed.items() if key in keys}, choices
 
     def _accept(
         self, owner: str, request: pb.MachineExecutionSubmit, prepared: _Prepared
@@ -710,7 +782,7 @@ class ReleaseRoots:
                 # `--upload-to`: Runtime sends this weights output to the named repository.
                 output.url = "model://" + root.weights_destination
         offer.grant.inputs.sort(key=lambda entry: entry.input_id)
-        capture, capture_digest, installed = self._capture(prepared)
+        capture, capture_digest, installed, _ = self._capture(prepared)
         installations = {
             held.installation_id: Installation(
                 placement
@@ -727,6 +799,7 @@ class ReleaseRoots:
             runtime_builtin=worker.machine_calls.builtins.capture(),
             hub=prepared.hub,
             account=root.owner or request.account,
+            entrypoint=root.entrypoint,
         )
         worker.machine_sources.hold(owner, offer.request_id, request.source_credentials)
         receipt = worker.submit_execution(

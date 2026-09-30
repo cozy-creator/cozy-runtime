@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import sys
+import math
 import time
 from collections.abc import Callable, Sequence
 from functools import partial
 from typing import Any, Literal
 
 from cozy_runtime.author import (
+    AdapterCompatibility,
     AttentionContext,
     Context,
     DerivedCache,
@@ -89,6 +91,10 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
     float32 round-off. 7 and 8 match one rank on CPU Gloo ranks (`test_parallel_calls`) and
     have not yet run on GPUs (h3a-019).
     """
+
+    __adapter_compatibility__ = (
+        AdapterCompatibility("lora", "", ("fl2va_dit", "ref2va_dit"), -math.inf, math.inf),
+    )
 
     pipe: OfficialH3Pipeline
 

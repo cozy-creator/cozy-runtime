@@ -54,6 +54,7 @@ class Preparation(msgspec.Struct, frozen=True, omit_defaults=True):
     runtime_builtin: Builtin | None = None
     hub: str = ""  # the Hub its run came from, as `hub_key` spells it; "": the default
     account: str = ""  # the account owning the run: whose org-relative Models local/ code names
+    entrypoint: str = ""
 
     def encode(self) -> bytes:
         return canonical.write(msgspec.to_builtins(self))
@@ -237,9 +238,16 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         raise WorkspaceRefusal(
             "internal_callable: an internal callable cannot be an execution root"
         )
+    from . import machine_model_choices
+
+    if capture.model_choices:
+        if root_callable is None:
+            raise WorkspaceRefusal("model overrides require an exact root callable")
+        machine_model_choices.resolve(capture, root_callable.name, interfaces)
     assert worker.machine_calls is not None
     return Preparation(
         installations=installations,
+        entrypoint=root_callable.name if root_callable is not None else "",
         state=state_identity(state),
         # The minor this root and its descendants run under, whatever later streams say.
         wire_minor=min(WIRE_MINOR, request.claim.wire_minor),

@@ -142,6 +142,7 @@ class Preparation(msgspec.Struct, frozen=True):
     hub: str = ""
     #: the account owning the run, whose org-relative Models its unpublished code names
     account: str = ""
+    entrypoint: str = ""
 
     @classmethod
     def read(cls, raw: bytes) -> Preparation:

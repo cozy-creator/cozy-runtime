@@ -158,6 +158,12 @@ class _SelectableHead(nn.Linear):  # type: ignore[misc]
         return cast(torch.Tensor, self._armed.source(hidden_states, self._armed.step))
 
 
+def _projection_base(module: object) -> object:
+    """Public PEFT wrappers keep the model-owned selectable head as their base layer."""
+    get_base = getattr(module, "get_base_layer", None)
+    return get_base() if callable(get_base) else module
+
+
 class AdaLNPrunedMiniMaxH3Transformer(MiniMaxH3Transformer3DModel):  # type: ignore[misc]
     """Official MiniMax-H3 transformer with only its exact modulation source replaced."""
 
@@ -294,7 +300,7 @@ class AdaLNPrunedMiniMaxH3Transformer(MiniMaxH3Transformer3DModel):  # type: ign
             block.adaln_proj._armed = _Armed(source.adaln_proj)
         self.norm_out._armed = _Armed(overlay.norm_out)
         for name in ("proj_out", "audio_proj_out"):
-            head = getattr(self, name)
+            head = _projection_base(getattr(self, name))
             if not isinstance(head, _SelectableHead):
                 raise ConformanceError(
                     f"{name} is {type(head).__name__}, which cannot serve a turbo head",
@@ -310,7 +316,7 @@ class AdaLNPrunedMiniMaxH3Transformer(MiniMaxH3Transformer3DModel):  # type: ign
             block.adaln_proj._armed = None
         self.norm_out._armed = None
         for name in ("proj_out", "audio_proj_out"):
-            head = getattr(self, name)
+            head = _projection_base(getattr(self, name))
             if isinstance(head, _SelectableHead):
                 head._armed = None
 

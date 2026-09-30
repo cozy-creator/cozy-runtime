@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch import Tensor
+    from peft.tuners.lora.layer import Linear as PeftLinear
 
 import pytest
 import tensorfs
@@ -144,3 +149,99 @@ def test_graph_cannot_bypass_a_models_adapter_opt_in(tmp_path: Path) -> None:
             Model,
             tensorfs.parse_header(header(store, result))["configs"][lora_composition.GRAPH_CONFIG],
         )
+
+
+def test_extra_peft_preserves_real_h3_turbo_residual_and_selectable_heads() -> None:
+    pytest.importorskip("diffusers")
+    from types import SimpleNamespace
+    from cozy_runtime.author import AdapterRef
+    from cozy_runtime.internal.lora_contract import FORMAT, Graph, Linear
+    from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
+    from cozy_runtime.models.minimax_h3.turbo import TurboOverlay, TurboSchedule
+
+    torch.manual_seed(419)
+    times = (0.0, 0.25, 0.75)
+    keys = [(row, tag) for row in range(3) for tag in range(3)]
+    dit = AdaLNPrunedMiniMaxH3Transformer(
+        table_timesteps=times,
+        table_block_keys=keys,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        hidden_size=16,
+        num_layers=1,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=2,
+        audio_in_channels=2,
+        patch_size=(1, 1, 1),
+        text_dim=4,
+        freq_dim=8,
+        time_embed_hidden_dim=16,
+        time_embed_dim=8,
+        rope_freq_dim=2,
+    ).eval()
+    dit.install_lora_consumers()
+    overlay = TurboOverlay(
+        hidden_size=16,
+        inner_dim=16,
+        ffn_dim=32,
+        num_layers=1,
+        num_refiner_layers=1,
+        video_out=2,
+        audio_out=2,
+        rank=1,
+        alpha=1,
+        schedule=TurboSchedule((0.75, 0.0), (0.25, 0.0)),
+        table_timesteps=times,
+        table_block_keys=keys,
+        block_table_dtype=torch.float32,
+        final_table_dtype=torch.float32,
+    )
+    with torch.no_grad():
+        for parameter in overlay.parameters():
+            parameter.fill_(0.125)
+    paths = ("transformer_blocks.0.attn.to_q", "proj_out", "audio_proj_out")
+    originals = {
+        path: {key: value.clone() for key, value in dit.get_submodule(path).state_dict().items()}
+        for path in paths
+    }
+    graph = Graph(
+        FORMAT,
+        tuple(Linear("ref2va_dit", path, "adapter_0", 1, 1.0, 0.5, "f32") for path in paths),
+        (AdapterRef("sha256:" + "12" * 32, 0.5, "lora", "ref2va_dit", "adapter"),),
+    )
+    lora_composition.composer(graph)(SimpleNamespace(components={"ref2va_dit": dit}))
+    with torch.no_grad():
+        for path in paths:
+            layer = dit.get_submodule(path)
+            layer.lora_A["adapter_0"].weight.fill_(0.25)
+            layer.lora_B["adapter_0"].weight.fill_(-0.5)
+    x = torch.randn(7, 16)
+    q = dit.transformer_blocks[0].attn.to_q
+    plain = torch.nn.functional.linear(
+        x, originals[paths[0]]["weight"], originals[paths[0]].get("bias")
+    )
+
+    def extra(layer: PeftLinear) -> Tensor:
+        return layer.lora_B["adapter_0"](layer.lora_A["adapter_0"](x)) * 0.5
+
+    with torch.no_grad():
+        assert torch.equal(q(x), plain + extra(q))
+        dit._engage(overlay, 0)
+        turbo = plain.clone()
+        overlay.get_submodule(paths[0]).accumulate(x, turbo)
+        assert torch.equal(q(x), turbo + extra(q))
+        for path in ("proj_out", "audio_proj_out"):
+            layer = dit.get_submodule(path)
+            expected = getattr(overlay, path)(x, 0) + extra(layer)
+            assert torch.equal(layer(x), expected)
+        dit._release()
+        assert torch.equal(q(x), plain + extra(q))
+        assert dit._arming is None
+        for path in paths:
+            layer = dit.get_submodule(path)
+            for key, before in originals[path].items():
+                assert torch.equal(layer.base_layer.state_dict()[key], before)
+        assert dit.proj_out.base_layer._armed is None
+        assert dit.audio_proj_out.base_layer._armed is None
+    assert not torch.cuda.is_initialized()

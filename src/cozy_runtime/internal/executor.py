@@ -2420,9 +2420,22 @@ class Executor:
         )
         from cozy_runtime.internal.lora_composition import bind as bind_adapters
 
-        artifact = bind_adapters(
-            artifact, model_cls, model_config.adapter_graph(config_checkpoint.header.get("configs"))
-        )
+        from cozy_runtime.internal.lora_contract import read as read_adapter_graph
+
+        adapter_graphs = [
+            (checkpoint.manifest_id, data)
+            for checkpoint in checkpoints.values()
+            if (data := model_config.adapter_graph(checkpoint.header.get("configs")))
+        ]
+        if adapter_graphs:
+            manifest, data = adapter_graphs[0]
+            graph = read_adapter_graph(data)
+            if any(read_adapter_graph(other) != graph for _, other in adapter_graphs[1:]):
+                raise CapabilityError(
+                    "one model slot selects different prepared adapter graphs",
+                    code="adapter_graph_conflict",
+                )
+            artifact = bind_adapters(replace(artifact, variant=manifest), model_cls, data)
         seen = Observations()
         registry = ModelRegistry(
             release=binding.release,

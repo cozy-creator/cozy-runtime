@@ -248,13 +248,29 @@ def catalog_fits(fits: Callable[[Selector], bool]) -> Callable[[Mapping[str, obj
 
 
 def select(
-    worker: Worker, owner: str, call: Call, target: Target, arguments: Mapping[str, object]
+    worker: Worker,
+    owner: str,
+    call: Call,
+    target: Target,
+    arguments: Mapping[str, object],
+    *,
+    model_choices: Mapping[str, pb.ModelChoice] | None = None,
 ) -> list[dict[str, Json]]:
     """Each omitted Model argument's checkpoint here: its captured default's widest fitting
     rung, or this machine's own Hub's answer for a slot the capture left open."""
     declared = {
         model["path"].rpartition(".")[2]: model for model in target.declaration.get("models", [])
     }
+    from . import machine_model_overrides
+
+    if model_choices is None:
+        model_choices = machine_model_overrides.captured(worker, owner, call, target)
+    for parameter, explicit in model_choices.items():
+        if arguments.get(parameter) is not None and machine_model_overrides.has_base(explicit):
+            raise WorkspaceRefusal(
+                f"model_override_conflict: {parameter} already receives an owned ModelArtifact; "
+                "use an adapter-only override to retain that base"
+            )
     missing = sorted(parameter for parameter in declared if arguments.get(parameter) is None)
     if not missing:
         return []
@@ -272,7 +288,14 @@ def select(
     }
     for parameter in missing:
         default = defaults.get(parameter)
-        if default is not None and default.unavailable_code:
+        if (
+            default is not None
+            and default.unavailable_code
+            and not (
+                parameter in model_choices
+                and machine_model_overrides.has_base(model_choices[parameter])
+            )
+        ):
             raise WorkspaceRefusal("captured Model default is unavailable for " + parameter)
     placement = target.prepared_installation.get("placement", {})
     package = str(
@@ -285,6 +308,22 @@ def select(
     fits = fitter(worker)
     selected: list[dict[str, Json]] = []
     for parameter in missing:
+        choice = model_choices.get(parameter)
+        if choice is not None and machine_model_overrides.has_base(choice):
+            hub, account, credentials = machine_model_overrides.context(worker, owner, call)
+            selected.append(
+                machine_model_overrides.checkpoint(
+                    worker,
+                    choice,
+                    declared[parameter],
+                    package=package,
+                    hub=hub,
+                    owner=account,
+                    credentials=credentials,
+                    note=lambda *_: None,
+                )
+            )
+            continue
         default = defaults.get(parameter)
         if default is None:
             assert catalog is not None and prepared is not None

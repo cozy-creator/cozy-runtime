@@ -8,7 +8,7 @@ import hashlib
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -36,6 +36,7 @@ from . import (
     machine_lanes,
     machine_model_defaults,
     machine_models,
+    machine_model_overrides,
     package_prepare,
     store_gc,
 )
@@ -450,7 +451,10 @@ class Serving:
         *,
         speculative: bool,
     ) -> Future[Prepared] | None:
-        defaults = machine_model_defaults.select(self.worker, owner, call, target, models)
+        choices = machine_model_overrides.captured(self.worker, owner, call, target)
+        defaults = machine_model_defaults.select(
+            self.worker, owner, call, target, models, model_choices=choices
+        )
         identity = hashlib.sha256(
             canonical_json.encode(
                 {
@@ -460,6 +464,7 @@ class Serving:
                     "entrypoint": target.entrypoint,
                     "models": msgspec.to_builtins(models),
                     "defaults": defaults,
+                    "overrides": {name: documents.body(choice) for name, choice in choices.items()},
                 }
             )
         ).hexdigest()
@@ -516,6 +521,7 @@ class Serving:
                     defaults=defaults,
                     cancellation=token,
                     retention_prefix="preparation/",
+                    model_choices=choices,
                 )
                 # Consumers acquire their own holds at actual admission. Shared
                 # preparation retains only immutable binding metadata on completion.
@@ -757,6 +763,7 @@ class Serving:
         defaults: list[dict[str, object]] | None = None,
         cancellation: _Cancellation | None = None,
         retention_prefix: str = "input/",
+        model_choices: Mapping[str, pb.ModelChoice] | None = None,
     ) -> Prepared:
         worker, workspace = self.worker, self.worker.workspace
         assert workspace is not None
@@ -767,11 +774,12 @@ class Serving:
             _, model_arguments = arguments(target, request.request_canonical_bytes)
         native: list[pb.NativeModelBinding] = []
         if defaults is None:
+            if model_choices is None:
+                model_choices = machine_model_overrides.captured(worker, owner, call, target)
             with self.phase(call, request, "Selecting model"):
                 defaults = machine_model_defaults.select(
-                    worker, owner, call, target, model_arguments
+                    worker, owner, call, target, model_arguments, model_choices=model_choices
                 )
-        selected = [msgspec.convert(row, _Default, strict=True) for row in defaults]
         access = contextlib.ExitStack()
         try:
             for model in target.declaration["models"]:
@@ -798,6 +806,54 @@ class Serving:
                         retention=retention,
                     )
                 )
+            if model_choices:
+                hub, account, credentials = machine_model_overrides.context(worker, owner, call)
+                package = str((prepared.get("package") or prepared["development"])["package"])
+
+                def check_adapter_preparation() -> None:
+                    if worker.stop.is_set() or (
+                        cancellation is not None and cancellation.cancelled
+                    ):
+                        raise WorkspaceRefusal("model preparation canceled")
+
+                selected_defaults = {str(row["parameter"]): dict(row) for row in defaults}
+                for parameter, choice in model_choices.items():
+                    if not choice.adapters:
+                        continue
+                    original = next(
+                        (
+                            row
+                            for row in native
+                            if row.slot == target.entrypoint + ".models." + parameter
+                        ),
+                        None,
+                    )
+                    if original is not None:
+                        base: dict[str, Json] = {
+                            "parameter": parameter,
+                            "repository": original.model,
+                            "manifest": documents.body(original.manifest),
+                            "native": True,
+                        }
+                    else:
+                        base = selected_defaults[parameter]
+                    selected_defaults[parameter] = machine_model_overrides.apply(
+                        worker,
+                        base,
+                        choice,
+                        package=package,
+                        hub=hub,
+                        owner=account,
+                        credentials=credentials,
+                        note=lambda *_: None,
+                        check=check_adapter_preparation,
+                        native_base=original is not None,
+                    )
+                    if original is not None:
+                        native.remove(original)
+                defaults = list(selected_defaults.values())
+            selected = [msgspec.convert(row, _Default, strict=True) for row in defaults]
+
             # The existing immutable preparation registry already owns this work.
             # Reusing its exact checkpoint bindings does not reuse an inference result.
             expected = {

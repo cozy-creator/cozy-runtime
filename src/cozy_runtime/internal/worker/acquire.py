@@ -527,13 +527,11 @@ class Acquirer:
                         snapshots=snapshots,
                         logical_weight_bytes=sum(logical.values()),
                         sequence_parallel_degrees=degrees,
-                        prepared_adapters=bool(
+                        prepared_adapters=any(
                             model_config.adapter_graph(
-                                fill.Checkpoint(
-                                    self.tensorfs_root,
-                                    next(iter(snapshots.values()), reference_manifest),
-                                ).header.get("configs")
+                                fill.Checkpoint(self.tensorfs_root, snapshot).header.get("configs")
                             )
+                            for snapshot in set(snapshots.values())
                         ),
                         # The manifest is identity; lane remains the human repo pointer the
                         # desired download set carried beside it.

@@ -166,7 +166,9 @@ def test_unused_or_overridden_defaults_do_not_touch_catalog_or_storage(
     monkeypatch.setattr(fill, "tensorfs_module", forbidden)
     empty_peer = cast(Worker, SimpleNamespace())
     call = cast(Call, SimpleNamespace(parent_request="root"))
-    assert defaults.select(empty_peer, "owner", call, target(), {"model": {}, "adapter": {}}) == []
+    assert defaults.select(
+        empty_peer, "owner", call, target(), {"model": {}, "adapter": {}}, model_choices={}
+    ) == []
     defaults.materialize(empty_peer, [], ExitStack())
     worker = peer(captured())
     selected = defaults.select(worker, "owner", call, target(), {"model": {}, "adapter": None})
