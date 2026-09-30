@@ -1652,19 +1652,41 @@ class Planner:
     ) -> Plan:
         """Keep the most blocks that fit; the floor streams every legal block."""
         needed = self._need(held.part, self._minimum_keep(held)) + working
-        available = self.allocatable() + sum(self._evictable(v) for v in victims)
+
+        def quote() -> dict[Held, int] | None:
+            # Ordinary byte enumeration runs no authored code or transfers. Whole-store
+            # callbacks, pending Torch casts and group host-credit checks stay uncached.
+            part = held.part
+            if (
+                self.grouped
+                or self.group_phase
+                or (part.on(DISK) and not part.unit_loads)
+                or any(unit.tier == DISK and unit.pending for unit in part.units)
+            ):
+                return None
+            return {victim: self._evictable(victim) for victim in victims}
+
+        credits = quote()
+        available = self.allocatable() + sum(
+            self._evictable(v) if credits is None else credits[v] for v in victims
+        )
         keeps = [self._minimum_keep(held)] if floor else self._keeps(held)
         if ceiling is not None:
             keeps = [keep for keep in keeps if keep <= ceiling]
         for keep in keeps:
             needed = self._need(held.part, keep) + working
-            chosen = self._room_from(victims, needed)
+            chosen = self._room_from(victims, needed, credits=credits)
             minimum = keep == self._minimum_keep(held)
-            if chosen is None and self._ask_room(needed, victims, measured=measured and minimum):
-                chosen = self._room_from(victims, needed)
+            if chosen is None and self._ask_room(
+                needed, victims, measured=measured and minimum, credits=credits
+            ):
+                credits = quote()
+                chosen = self._room_from(victims, needed, credits=credits)
             if chosen is not None:
                 return Plan(keep, chosen, needed=needed)
-            available = self.allocatable() + sum(self._evictable(v) for v in victims)
+            available = self.allocatable() + sum(
+                self._evictable(v) if credits is None else credits[v] for v in victims
+            )
         if self.spare:
             raise MemoryRefusal(
                 SPARED, f"{held.key}: declined, {needed} B do not fit {available} B"
@@ -1733,7 +1755,9 @@ class Planner:
         )
         return max(placement.peak, placement.resident + stream) - drop
 
-    def _room_from(self, victims: list[Held], need: int) -> list[Held] | None:
+    def _room_from(
+        self, victims: list[Held], need: int, *, credits: Mapping[Held, int] | None = None
+    ) -> list[Held] | None:
         """The fewest victims, in order, whose bytes make `need` allocatable; None if all can't."""
         room = self.allocatable()
         chosen: list[Held] = []
@@ -1741,7 +1765,7 @@ class Planner:
             if room >= need:
                 break
             chosen.append(victim)
-            room += self._evictable(victim)
+            room += self._evictable(victim) if credits is None else credits[victim]
         return chosen if room >= need else None
 
     def _ask_room(
@@ -1751,12 +1775,13 @@ class Planner:
         *,
         measured: bool,
         force: bool = False,
+        credits: Mapping[Held, int] | None = None,
     ) -> bool:
         """Ask once per concrete demand and grant; an infeasible rich plan cannot consume
         a later minimum request. True when asked, so the caller measures again."""
         if self.room is None or self.spare:
             return False
-        own = sum(self._evictable(v) for v in victims)
+        own = sum(self._evictable(v) if credits is None else credits[v] for v in victims)
         before = self.grant
         # Physical free excludes already-consumed context bytes. The total grant must
         # still cover them and every reserved segment, including unreleasable cache holes.
