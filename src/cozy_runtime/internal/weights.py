@@ -12,6 +12,7 @@ streamed one per slot, from cached views. A torch OOM at a block boundary lowers
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -191,6 +192,8 @@ class Weights:
         self.activation: dict[str, int] = {}
         self.oom_retries = 0
         self.modes: dict[str, str] = {}
+        #: the CUDA context and library workspaces outside torch and the plane, measured once
+        self.context_bytes = -1
 
     def tick(self) -> int:
         self.clock += 1
@@ -272,6 +275,15 @@ class Weights:
             if component is not None and 0 <= int(index) < len(component.regions):
                 unbind(component.regions[int(index)])
 
+    def measure_context(self) -> None:
+        """What the driver charges this process beyond torch's segments and the plane's maps:
+        the CUDA context and library workspaces the Worker must leave room for."""
+        row = accel.process_memory(os.getpid(), self.kind)
+        if row.state == "present":
+            reserved = accel.allocation(self.torch, self.kind)["reserved_bytes"]
+            mapped = max(plane.stats(self.plane).device(self.index).committed, 0)
+            self.context_bytes = max(row.bytes - reserved - mapped, 0)
+
     def resident_bytes(self, component: Component) -> int:
         return plane.stats(self.plane).ready(component.key, self.index)
 
@@ -330,6 +342,7 @@ class Weights:
             leased_bytes=device.leased_bytes + device.held_bytes,
             pinned_budget_bytes=held.host.budget,
             pinned_bytes=held.host.used,
+            context_bytes=self.context_bytes,
             resident=resident,
             streamed={
                 component.name: Streamed(
@@ -1069,6 +1082,7 @@ class WeightResidency:
         self.per_item: dict[str, int] = {}
         self.batch: dict[str, int] = {}
         self.baseline = -1
+        self.derived_at_open = 0
         #: The scheduler's turn (W4, `stage/1`): called before a stage plans, returns the
         #: plane budget the Worker granted for it, or None to keep the current one; and its
         #: sink for each stage's measured facts at exit.
@@ -1105,6 +1119,7 @@ class WeightResidency:
         placement rung and headroom; the plane has no rungs, so they are ignored.)"""
         self.peaks.clear()
         self.last_shortfall = None
+        self.derived_at_open = self._derived()
 
     def admit(self, method: str, components: tuple[str, ...]) -> None:
         self._require_clean(method)
@@ -1280,6 +1295,9 @@ class WeightResidency:
             ),
             "attempt_activation_peak_bytes": max(self.peaks.values(), default=0),
             "attempt_activation_peaks": dict(self.peaks),
+            # torch bytes this attempt's bindings moved: decoded resident weights and derived
+            # leaf roles kept or dropped, the ledger's declared transition
+            "allocator_delta_bytes": self._derived() - self.derived_at_open,
             "poisoned": self.poisoned,
             "refusals": self.refusals[-8:],
         }
@@ -1363,6 +1381,14 @@ class WeightResidency:
                     tag=method,
                 )
         weights.drain()
+
+    def _derived(self) -> int:
+        return sum(
+            int(t.numel() * t.element_size())
+            for c in self.components.values()
+            for r in c.regions
+            for t in r.derived
+        )
 
     def _refinable(self, name: str, method: str) -> str:
         """`name`, when it can still move to the sub-block grain: at a stage's start, never

@@ -2175,6 +2175,7 @@ class Executor:
                     "state": backend.state,
                 }
         stage("warm")
+        weights.measure_context()
         if "sol-attn" in applied.totals():
             frozen = attention._baked_in(dict(backend.roots))
             if frozen:
