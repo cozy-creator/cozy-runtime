@@ -7,17 +7,20 @@ same rules. Activations come first: the plane gets what the driver has free afte
 
 from __future__ import annotations
 
-import math
-from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import Literal
 
-#: Slots in flight when nothing is measured yet: the block computing and the next one arriving.
+#: Slots when nothing is measured yet: the block computing and the next one arriving.
 DEFAULT_WINDOW = 2
-MAX_WINDOW = 8
+MAX_WINDOW = 6
 #: Allocator fragmentation between the plane's budget and torch's activations. Small because a
 #: torch OOM at a block boundary lowers the budget and retries (§4, activations first).
 MARGIN = 64 << 20
+#: The event model's fixed costs: one copy's issue, and one block's acquire/release hook.
+COPY_OVERHEAD_S = 20e-6
+HOOK_S = 15e-6
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,15 +42,15 @@ class Layout:
 
 @dataclass(frozen=True, slots=True)
 class Residence:
-    """One component's placement for one stage: which blocks stay resident and the streamed
-    tail's window. Block numbers are address-order indexes into `Layout.blocks`."""
+    """One component's placement for one stage: the blocks that stay resident, the ones
+    streamed through `window` slots (both address-order indexes into `Layout.blocks`)."""
 
     resident: tuple[int, ...]
     streamed: tuple[int, ...]
     window: int
 
     def vram_bytes(self, layout: Layout) -> int:
-        """What this placement holds on the device: common, the prefix and the slot ring."""
+        """What this placement holds on the device: common, the resident set and the slots."""
         slots = self.window * max((layout.blocks[i] for i in self.streamed), default=0)
         return layout.common + sum(layout.blocks[i] for i in self.resident) + slots
 
@@ -74,12 +77,50 @@ def floor(layout: Layout, window: int, activation: int = 0) -> int:
     return layout.common + max(window, 1) * layout.largest + activation
 
 
-def window(block_bytes: int, link_bps: float, compute_s: float) -> int:
-    """Slots so the copy of block i+W-1 finishes while blocks i..i+W-2 compute."""
-    if block_bytes <= 0 or link_bps <= 0 or compute_s <= 0:
-        return DEFAULT_WINDOW
-    ahead = math.ceil(block_bytes / link_bps / compute_s)
-    return min(max(ahead + 1, DEFAULT_WINDOW), MAX_WINDOW)
+@dataclass(frozen=True, slots=True)
+class Costs:
+    """A stage's measured streaming costs: GPU seconds per use of each block (address index),
+    from the plane's per-region timing, and the achieved host-to-device rate. Empty or zero is
+    unmeasured, never a constant stand-in."""
+
+    compute: Mapping[int, float] = field(default_factory=dict)
+    link_bps: float = 0.0
+
+
+def simulate(
+    sizes: Sequence[int],
+    compute: Sequence[float],
+    streamed: Sequence[bool],
+    window: int,
+    link_bps: float,
+    passes: int = 4,
+) -> float:
+    """Seconds per steady pass of one stage over its blocks in execution order (C2's model).
+
+    One copy stream and `window` slots, issued in order: streamed use k starts copying at the
+    later of the previous copy's end and the release of the use `window` before it, and takes
+    `COPY_OVERHEAD_S + bytes / link`. A block starts after the previous one and, when streamed,
+    after its copy; it holds the GPU for its compute plus `HOOK_S`. Copies run ahead across pass
+    boundaries. The mean of passes 2..`passes` (the only pass when `passes` is 1).
+    """
+    released: list[float] = []
+    copied = clock = 0.0
+    starts = []
+    for _ in range(passes):
+        starts.append(clock)
+        for size, seconds, stream in zip(sizes, compute, streamed, strict=True):
+            if stream:
+                use = len(released)
+                begin = max(copied, released[use - window] if use >= window else 0.0)
+                copied = begin + COPY_OVERHEAD_S + size / link_bps
+                clock = max(clock, copied)
+            clock += seconds + HOOK_S
+            if stream:
+                released.append(clock)
+    starts.append(clock)
+    spans = [b - a for a, b in pairwise(starts)]
+    steady = spans[1:] or spans
+    return sum(steady) / len(steady)
 
 
 def residence(
@@ -87,35 +128,124 @@ def residence(
     budget: int,
     *,
     order: Sequence[int] = (),
-    window_size: int = DEFAULT_WINDOW,
+    costs: Costs | None = None,
     cyclic: bool = True,
 ) -> Residence:
-    """The largest resident prefix that fits `budget` beside the slot ring.
+    """The fastest placement of one component that fits `budget`.
 
-    `order` is the blocks' execution order once observed (address order before). A cyclic stage
-    (a denoise loop) keeps a fixed prefix in that order: the tail's refill for the next step
-    then overlaps the prefix's compute, and nothing resident is ever evicted by the loop itself.
-    A run-once stage gains nothing from a partial prefix within the request, so it is resident
-    whole when it fits and streamed whole otherwise. Raises `BelowFloor` when even the floor
-    does not fit.
+    `order` is the blocks' execution order once observed (address order before). For a cyclic
+    stage (a denoise loop) every window up to `MAX_WINDOW` is tried with three resident sets --
+    streamed blocks spread evenly by compute, a streamed tail, and the most compute per byte
+    streamed first -- and C2's event model (`simulate`) picks the fastest. Spread wins wherever
+    it matters: a streamed tail idles the copy stream during a resident prefix (SDXL, +17-37%).
+    Unmeasured costs place a spread set at `DEFAULT_WINDOW`. A run-once stage is resident whole
+    when it fits and streamed whole otherwise. Raises `BelowFloor` below common + one slot.
     """
     count = len(layout.blocks)
-    walk = tuple(order) if sorted(order) == list(range(count)) else tuple(range(count))
+    walk = list(order) if sorted(order) == list(range(count)) else list(range(count))
     if layout.total <= budget:
-        return Residence(resident=walk, streamed=(), window=0)
-    need = floor(layout, window_size)
-    if not layout.blocks or need > budget:
+        return Residence(resident=tuple(walk), streamed=(), window=0)
+    if not layout.blocks or floor(layout, 1) > budget:
+        need = floor(layout, 1)
         raise BelowFloor(need, budget, "the stage's weights do not fit the plane budget")
+    sizes = [layout.blocks[i] for i in walk]
+    costs = costs or Costs()
+    known = [costs.compute[i] for i in walk if i in costs.compute]
+    measured = costs.link_bps > 0 and bool(known)
+    # A block not yet timed (it never ran under a cursor) takes the mean of those that were.
+    typical = sum(known) / len(known) if known else 1.0
+    compute = [costs.compute.get(i, typical) for i in walk] if measured else [1.0] * count
     if not cyclic:
-        return Residence(resident=(), streamed=walk, window=window_size)
-    room = budget - layout.common - window_size * layout.largest
-    kept = 0
-    for index in walk:
-        if layout.blocks[index] > room:
+        width = _widest(layout, budget, (DEFAULT_WINDOW, 1))
+        return Residence(resident=(), streamed=tuple(walk), window=width)
+    best: tuple[float, int, int, Residence] | None = None
+    widths = range(1, MAX_WINDOW + 1) if measured else (DEFAULT_WINDOW, 1)
+    picks = (_spread(compute), _tail(count), _dense(sizes, compute))
+    for width in widths:
+        for pick in picks:
+            streamed = _fit(layout, budget, width, sizes, pick)
+            if streamed is None:
+                continue
+            placed = Residence(
+                resident=tuple(i for p, i in enumerate(walk) if p not in streamed),
+                streamed=tuple(i for p, i in enumerate(walk) if p in streamed),
+                window=width,
+            )
+            flags = [p in streamed for p in range(count)]
+            seconds = simulate(sizes, compute, flags, width, costs.link_bps) if measured else 0.0
+            rank = (seconds, sum(sizes[p] for p in streamed), width, placed)
+            if best is None or rank[:3] < best[:3]:
+                best = rank
+        if best is not None and not measured:
             break
-        room -= layout.blocks[index]
-        kept += 1
-    return Residence(resident=walk[:kept], streamed=walk[kept:], window=window_size)
+    assert best is not None  # the window-1 floor fits, so streaming everything does
+    return best[3]
+
+
+def _fit(
+    layout: Layout,
+    budget: int,
+    width: int,
+    sizes: Sequence[int],
+    pick: Callable[[int], list[int]],
+) -> frozenset[int] | None:
+    """The fewest streamed positions `pick` chooses (bisected) so common, the rest and `width`
+    slots of the largest streamed block fit `budget`; None when none do."""
+    total = sum(sizes)
+
+    def fits(count: int) -> frozenset[int] | None:
+        chosen = pick(count)
+        slot = max(sizes[p] for p in chosen)
+        held = layout.common + total - sum(sizes[p] for p in chosen) + width * slot
+        return frozenset(chosen) if held <= budget else None
+
+    low, high = 1, len(sizes)
+    found = fits(high)
+    if found is None:
+        return None
+    while low < high:
+        middle = (low + high) // 2
+        if (chosen := fits(middle)) is not None:
+            found, high = chosen, middle
+        else:
+            low = middle + 1
+    return found
+
+
+def _spread(compute: Sequence[float]) -> Callable[[int], list[int]]:
+    """`count` positions spaced evenly by cumulative compute."""
+    total, ends, running = sum(compute), [], 0.0
+    for seconds in compute:
+        running += seconds
+        ends.append(running - seconds / 2)
+
+    def pick(count: int) -> list[int]:
+        chosen: list[int] = []
+        taken: set[int] = set()
+        for j in range(count):
+            target = (j + 0.5) * total / count
+            position = min(
+                (p for p in range(len(ends)) if p not in taken), key=lambda p: abs(ends[p] - target)
+            )
+            chosen.append(position)
+            taken.add(position)
+        return chosen
+
+    return pick
+
+
+def _tail(count_all: int) -> Callable[[int], list[int]]:
+    return lambda count: list(range(count_all - count, count_all))
+
+
+def _dense(sizes: Sequence[int], compute: Sequence[float]) -> Callable[[int], list[int]]:
+    """The positions whose compute best hides their own copy, first."""
+    ranked = sorted(range(len(sizes)), key=lambda p: -compute[p] / max(sizes[p], 1))
+    return lambda count: ranked[:count]
+
+
+def _widest(layout: Layout, budget: int, widths: Sequence[int]) -> int:
+    return next(w for w in widths if floor(layout, w) <= budget)
 
 
 def stage(
@@ -123,23 +253,18 @@ def stage(
     budget: int,
     *,
     orders: Mapping[str, Sequence[int]] | None = None,
-    windows: Mapping[str, int] | None = None,
+    costs: Mapping[str, Costs] | None = None,
     cyclic: Collection[str] = (),
 ) -> dict[str, Residence]:
     """Every declared component's residence for one stage, inside one plane budget.
 
-    Each component first gets its floor; what is left goes to cyclic components' prefixes
-    first (they repeat, so every resident byte saves a copy per step), then to run-once ones,
-    which are resident only when whole. Components outside the stage are not counted: they
-    are evictable, lower priority, and the plane unmaps them as this stage's wants arrive.
+    Each component first gets its window-1 floor; what is left goes to cyclic components first
+    (they repeat, so every resident byte saves a copy per pass), then to run-once ones, which
+    are resident only when whole. Components outside the stage are not counted: they are
+    evictable, lower priority, and the plane unmaps them as this stage's wants arrive.
     """
-    orders, windows = orders or {}, windows or {}
-    width = {name: windows.get(name, DEFAULT_WINDOW) for name in layouts}
-    need = {name: floor(layout, width[name]) for name, layout in layouts.items()}
-    if sum(need.values()) > budget:
-        # Serial streaming (one slot, no overlap) is slower, never refused.
-        width = dict.fromkeys(layouts, 1)
-        need = {name: floor(layout, 1) for name, layout in layouts.items()}
+    orders, costs = orders or {}, costs or {}
+    need = {name: floor(layout, 1) for name, layout in layouts.items()}
     if sum(need.values()) > budget:
         raise BelowFloor(
             sum(need.values()),
@@ -154,19 +279,12 @@ def stage(
             layout,
             need[name] + spare,
             order=orders.get(name, ()),
-            window_size=width[name],
+            costs=costs.get(name),
             cyclic=name in cyclic,
         )
         spare -= max(chosen.vram_bytes(layout) - need[name], 0)
         placed[name] = chosen
     return placed
-
-
-def stall_s(streamed_bytes: int, link_bps: float, overlap_s: float) -> float:
-    """Predicted stall per step: the copy time the compute cannot hide."""
-    if link_bps <= 0:
-        return math.inf if streamed_bytes else 0.0
-    return max(0.0, streamed_bytes / link_bps - overlap_s)
 
 
 def decode_mode(free: int, evictable: int, untiled_bytes: int) -> Literal["untiled", "tiled"]:

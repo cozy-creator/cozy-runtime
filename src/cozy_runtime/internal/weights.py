@@ -191,8 +191,10 @@ class Weights:
         if pinned >= 0:
             self.pinned = pinned
             self._pin(pinned)
+        if vram < 0:  # the VRAM budget stays as it is
+            return 0
         self.budget = vram
-        freed = self._apply(vram) if vram >= 0 else 0
+        freed = self._apply(vram)
         if vram == 0:
             accel.release_cached(self.torch, self.kind)
         return freed
@@ -1236,6 +1238,7 @@ class WeightResidency:
                     for name, c in components.items()
                     if c.observed
                 },
+                costs=_costs(weights, components, method),
                 cyclic={name for name, c in components.items() if c.last_passes != 1},
             )
         except weight_policy.BelowFloor as exc:
@@ -1445,6 +1448,29 @@ class WeightResidency:
             raise ResidencyRefusal(
                 "residency_poisoned", f"{what}() against a poisoned weight plane: {self.poisoned}"
             )
+
+
+def _costs(
+    weights: Weights, components: Mapping[str, Component], tag: str
+) -> dict[str, weight_policy.Costs]:
+    """Each component's measured streaming costs for the stage `tag`: GPU seconds per use of
+    each block from the plane's per-region timing, and the achieved pinned-to-device rate."""
+    held = plane.stats(weights.plane)
+    device = held.device(weights.index)
+    link = device.host_copy_bytes * 1e9 / device.host_copy_ns if device.host_copy_ns else 0.0
+    out: dict[str, weight_policy.Costs] = {}
+    for name, component in components.items():
+        compute = {
+            row.region - 1: row.compute_ns / row.uses / 1e9
+            for row in held.regions
+            if row.ws == component.key
+            and row.tag == tag
+            and row.device == weights.index
+            and row.uses
+            and row.region > 0
+        }
+        out[name] = weight_policy.Costs(compute=compute, link_bps=link)
+    return out
 
 
 def _stage_totals(weights: Weights, tag: str) -> tuple[int, int, int]:

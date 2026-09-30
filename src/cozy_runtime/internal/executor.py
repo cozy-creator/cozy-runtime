@@ -3807,6 +3807,12 @@ class Executor:
         except GroupRefusal as exc:
             refused.append(self._group_refusal(exc, closing=False))
 
+    def _active_residency(self) -> dict[str, Any]:
+        child = self.constructions.get(self.active)
+        if child is None or child.residency is None:
+            return {}
+        return dict(child.residency.document())
+
     def process_incarnations(self) -> list[dict[str, Any]]:
         """The actual rank births, including a follower that vanished before this probe."""
         ranks = [(self.rank, os.getpid())]
