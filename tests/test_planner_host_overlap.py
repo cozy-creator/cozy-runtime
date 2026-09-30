@@ -424,6 +424,11 @@ def test_nested_whole_scope_retires_shared_backend_borrow_before_fill(
     owner.cuda = True
     sibling.part.store = held.part.store
     sibling.part.store.transient = lambda _: 0
+    # This fixture exercises real staging-borrow custody, with refill itself replaced
+    # below. Its one plain F32 meta slot needs an explicit metadata-only store seam.
+    backend.load_schema = lambda name, unit: tiers.RefillSchema(
+        tuple(tensor.dtype for *_, tensor in unit.slots())
+    )
     fills: list[str] = []
 
     def refill(torch_arg: Any, part: tiers.Component, unit: tiers.Unit | None) -> None:
