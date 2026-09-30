@@ -834,6 +834,9 @@ def test_a_submitted_exact_width_is_the_group_and_leaves_the_rest_free(
     machine cannot form is refused typed."""
     downloaded = machine.hold_activations(monkeypatch)
     machine.serving("A", "h3", gpus=2)
+    # Establish the first holder before checking which cards remain available.
+    # Independent preparation units may otherwise register B's demand first.
+    machine.await_granted("A")
     machine.serving("B", "h3", gpus=2)
     machine.serving("C", "h3", gpus=3)
     machine.serving("D", "h3", gpus=8)
