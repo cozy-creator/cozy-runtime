@@ -559,9 +559,12 @@ def test_cli_and_local_worker_share_one_managed_interpreter_root(
         ),
         stop=threading.Event(),
         note=lambda *a: None,
-        _describe_installed=lambda *a, **k: b"",
+        _describe_published=lambda *a, **k: b"",
     )
     with pytest.raises(package_prepare.PreparationRefusal, match="selected"):
-        Worker._prepare_published(cast(Worker, worker), pb.PreparePackageSetRequest())
+        Worker._prepare_published(
+            cast(Worker, worker),
+            pb.PreparePackageSetRequest(locked_requirements=b"cozy-runtime==0.18.89\n"),
+        )
     assert calls == [config.managed_python_root / "managed"]
     assert not (install_root / "python").exists()
