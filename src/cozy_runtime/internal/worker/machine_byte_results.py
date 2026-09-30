@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Iterator, Sequence
-from typing import Any
+
+import msgspec
 
 from cozy_runtime.author._call_results import result_at
 from cozy_runtime.protocol import documents
@@ -14,6 +15,35 @@ from .workspace import Workspace, WorkspaceRefusal
 
 #: The suffix of a list output's slot: `references.*` grants `references.0`, `references.1`, ...
 LIST = ".*"
+
+
+class _Bound(msgspec.Struct, frozen=True):
+    max_bytes: int | None = None
+
+
+class _Field(msgspec.Struct, frozen=True):
+    name: str
+    type: _Schema | str
+    asset_bound: _Bound = _Bound()
+
+
+class _Map(msgspec.Struct, frozen=True):
+    key: _Schema | str
+    value: _Schema | str
+
+
+class _Schema(
+    msgspec.Struct, frozen=True, rename={"tuple_": "tuple", "list_": "list", "map_": "map"}
+):
+    """Only output-slot declarations consumed here, with producer additions ignored."""
+
+    asset: str = ""
+    input: str = ""
+    fields: tuple[_Field, ...] | None = None
+    tuple_: tuple[_Schema | str, ...] | None = None
+    list_: _Schema | str | None = None
+    union: tuple[_Schema | str, ...] | None = None
+    map_: _Map | None = None
 
 
 def slot_of(output_id: str, slots: Collection[str]) -> str | None:
@@ -40,43 +70,61 @@ def expand(fields: Sequence[tuple[str, int]], produced: Collection[str]) -> list
     return result
 
 
-def paths(schema: Any, path: str = "", bound: int = 256 << 20) -> Iterator[tuple[str, int]]:
+def paths(schema: object, path: str = "", bound: int = 256 << 20) -> Iterator[tuple[str, int]]:
     if not isinstance(schema, dict):
         return
-    if schema.get("asset") or schema.get("input") == "tree":
+    try:
+        declared = msgspec.convert(schema, _Schema, strict=True)
+    except msgspec.ValidationError as exc:
+        raise WorkspaceRefusal("native byte result has an invalid output schema") from exc
+    yield from _paths(declared, path, bound)
+
+
+def _paths(schema: _Schema | str, path: str, bound: int) -> Iterator[tuple[str, int]]:
+    if isinstance(schema, str):
+        return
+    if schema.asset or schema.input == "tree":
         if not path:
             raise WorkspaceRefusal("native byte result needs a named result field")
         yield path, bound
-    elif "fields" in schema:
-        for field in schema["fields"]:
-            size = field.get("asset_bound", {}).get("max_bytes", bound)
-            yield from paths(
-                field["type"],
-                path + "." + field["name"] if path else field["name"],
-                min(bound, size),
+    elif schema.fields is not None:
+        for field in schema.fields:
+            size = field.asset_bound.max_bytes
+            yield from _paths(
+                field.type,
+                path + "." + field.name if path else field.name,
+                min(bound, size) if size is not None else bound,
             )
-    elif "tuple" in schema:
-        for index, member in enumerate(schema["tuple"]):
-            yield from paths(member, path + "." + str(index) if path else str(index), bound)
-    elif "list" in schema and isinstance(schema["list"], dict) and schema["list"].get("asset"):
+    elif schema.tuple_ is not None:
+        for index, member in enumerate(schema.tuple_):
+            yield from _paths(member, path + "." + str(index) if path else str(index), bound)
+    elif isinstance(schema.list_, _Schema) and schema.list_.asset:
         # A list output: its items `path.0`, `path.1`, ... are granted by one `path.*` slot.
         if not path:
             raise WorkspaceRefusal("native byte result needs a named result field")
         yield path + LIST, bound
-    elif "union" in schema or "list" in schema or "map" in schema:
+    elif schema.union is not None or schema.list_ is not None or schema.map_ is not None:
         # These shapes need output slots only known after executing the program. The
         # existing fixed-slot grant protocol cannot promise their cardinality.
-        def has_assets(node: Any) -> bool:
-            if isinstance(node, dict):
-                return (
-                    bool(node.get("asset"))
-                    or node.get("input") == "tree"
-                    or any(has_assets(v) for v in node.values())
-                )
-            return isinstance(node, list) and any(has_assets(v) for v in node)
-
-        if has_assets(schema):
+        if _has_assets(schema):
             raise WorkspaceRefusal("dynamic native result fields require fixed output slots")
+
+
+def _has_assets(schema: _Schema | str) -> bool:
+    if isinstance(schema, str):
+        return False
+    return (
+        bool(schema.asset)
+        or schema.input == "tree"
+        or any(_has_assets(field.type) for field in schema.fields or ())
+        or any(_has_assets(member) for member in schema.tuple_ or ())
+        or any(_has_assets(member) for member in schema.union or ())
+        or (schema.list_ is not None and _has_assets(schema.list_))
+        or (
+            schema.map_ is not None
+            and (_has_assets(schema.map_.key) or _has_assets(schema.map_.value))
+        )
+    )
 
 
 def retain(
@@ -84,8 +132,8 @@ def retain(
     owner: str,
     parent: str,
     index: int,
-    value: Any,
-    schema: Any,
+    value: object,
+    schema: object,
     outputs: Sequence[pb.OutputEntry],
     *,
     capture: bool = False,
@@ -112,7 +160,7 @@ def retain(
             )
         ):
             raise WorkspaceRefusal("typed child output lacks its exact native result entry")
-        if node is not None and node.get("size_bytes") != entry.native_tree.content_bytes:
+        if isinstance(node, dict) and node.get("size_bytes") != entry.native_tree.content_bytes:
             raise WorkspaceRefusal("typed child output length differs from native custody")
         machine_models.retain_bytes(
             workspace, owner, parent, f"call.{index}.output/{path}", entry.native_tree
@@ -124,7 +172,7 @@ def grants(
     owner: str,
     parent: str,
     index: int,
-    schema: Any,
+    schema: object,
     *,
     capture: bool = False,
 ) -> list[pb.ChildByteResultGrant]:

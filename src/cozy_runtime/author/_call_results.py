@@ -20,13 +20,24 @@ from cozy_runtime.author._assets import (
     file_state,
 )
 from cozy_runtime.author._capture import ExecutionObservation
+from cozy_runtime.author._executor_requests import ByteGrant
 from cozy_runtime.author._media import admits, normalize
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _ASSETS = {kind.kind: kind for kind in (FileAsset, ImageAsset, AudioAsset, VideoAsset)}
 
 
-def result_at(value: Any, path: str) -> Any:
+class ByteResult(msgspec.Struct, frozen=True):
+    """Consumed fields of a native result; producer additions remain readable."""
+
+    asset_ref: str
+    kind: str
+    digest: str
+    size_bytes: int
+    media_type: str = ""
+
+
+def result_at(value: object, path: str) -> object:
     for part in path.split(".") if path else ():
         if isinstance(value, list) and part.isdigit() and str(int(part)) == part:
             value = value[int(part)]
@@ -40,7 +51,7 @@ def result_at(value: Any, path: str) -> Any:
 def decode(
     value: Any,
     result_type: object,
-    grants: list[dict[str, Any]],
+    grants: list[ByteGrant],
     *,
     request_id: str,
     guard: Callable[[], None],
@@ -51,7 +62,6 @@ def decode(
     """Every native result leaf is replaced from the separately verified host grant."""
     if len(grants) > 32:
         raise ValueError("native result grant inventory exceeds its bound")
-    kind: Any
     handles: dict[str, Asset | Tree] = {}
     for grant in grants:
         output_id = grant.get("output_id")
@@ -67,15 +77,16 @@ def decode(
         else:
             if not isinstance(node, dict):
                 raise ValueError("native result field is not an asset record")
-            kind = node.get("kind")
+            declared = msgspec.convert(node, ByteResult, strict=True)
+            kind = declared.kind
             required = {"asset_ref", "kind", "digest", "size_bytes"}
             if kind in _ASSETS:
                 required.add("media_type")
             if not required <= set(node) or (kind not in _ASSETS and kind != "tree"):
                 raise ValueError("native result field has an invalid asset shape")
-            digest, size = node["digest"], node["size_bytes"]
-            media_type = node.get("media_type", "")
-            if node["asset_ref"] != digest:
+            digest, size = declared.digest, declared.size_bytes
+            media_type = declared.media_type
+            if declared.asset_ref != digest:
                 raise ValueError("native result reference differs from its byte identity")
         if (
             kind != grant.get("kind")
