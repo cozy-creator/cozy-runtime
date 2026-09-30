@@ -1030,6 +1030,7 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
     from types import SimpleNamespace
 
     from cozy_runtime.internal.worker.attempts import AttemptRecord
+    from cozy_runtime.internal.worker.calls import Calls as Transport
     from cozy_runtime.internal.worker.machine_calls import Calls as Dispatcher
     from cozy_runtime.internal.worker.machine_child_target import Target
     from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
@@ -1054,7 +1055,14 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
         parents.append(selected)
         selected = calls.accept("owner", request(parent)).child_request
     dispatcher = Dispatcher(
-        cast(Worker, SimpleNamespace(workspace=workspace, executions=executions))
+        cast(
+            Worker,
+            SimpleNamespace(
+                workspace=workspace,
+                executions=executions,
+                calls=Transport(lambda *_: pb.ChildCallResult(), workspace=workspace),
+            ),
+        )
     )
     target = cast(
         Target,
