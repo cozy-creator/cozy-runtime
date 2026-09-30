@@ -90,17 +90,21 @@ def test_real_private_prepares_reuse_and_rebuild_interface(metadata: bool, memoi
             )
 
         installed = install()
-        worker = Worker(
-            _config(root / "home"),
-            WorkerOptions(
-                root=root / "worker",
-                python=str(python),
-                artifact_cache=root / "artifacts",
-                install_root=install_root,
-                tensorfs_root=root / "store",
-            ),
-            InMemoryControlHost(),
-        )
+
+        def start() -> Worker:
+            return Worker(
+                _config(root / "home"),
+                WorkerOptions(
+                    root=root / "worker",
+                    python=str(python),
+                    artifact_cache=root / "artifacts",
+                    install_root=install_root,
+                    tensorfs_root=root / "store",
+                ),
+                InMemoryControlHost(),
+            )
+
+        worker = start()
         request = pb.PrepareLocalPackageRequest(
             install_root=str(install_root),
             operation_id="cache-replay",
@@ -132,11 +136,23 @@ def test_real_private_prepares_reuse_and_rebuild_interface(metadata: bool, memoi
             )
             assert package_interface.parse(alternate).application == "cache_probe:alternate"
             assert imports() == described + 1
-            # A genuine discovery failure is never cached.
+            # A restarted Runtime reads what the first described beside the installation.
+            worker.shutdown()
+            worker = start()
+            assert prepare() == replies[0]
+            assert (
+                worker._describe_installed(
+                    installed, "cache-probe", application="cache_probe:alternate"
+                )
+                == alternate
+            )
+            assert imports() == described + 1
+            # A genuine discovery failure is never kept.
             for _ in range(2):
                 with pytest.raises(PreparationRefusal, match="interface_failed"):
                     worker._describe_installed(installed, "missing-distribution")
-            assert len(worker._installed_interfaces) == described + 1
+            kept = install_root / "installations/captured/described"
+            assert len(list(kept.glob("*.json"))) == described + 1
             record_path = install_root / "installations/captured/installation.json"
             record_path.unlink()
             repaired = install()
