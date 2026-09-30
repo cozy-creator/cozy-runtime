@@ -97,6 +97,21 @@ class ProcessTreeScope:
 
 
 @dataclass(frozen=True, slots=True)
+class HostReclaimSample:
+    """Cumulative kernel activity at one finite-limit cgroup incarnation."""
+
+    scope: str
+    device: int
+    inode: int
+    limit_bytes: int
+    high: int | None
+    refault_file: int
+    maximum: int | None = None
+    high_limit: int | None = None
+    max_limit: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class HostPressure:
     """Kernel-limit excess, with reclaimable file bytes reported separately."""
 
@@ -105,6 +120,7 @@ class HostPressure:
     limit_bytes: int
     debt_bytes: int
     reclaimable_file_bytes: int = 0
+    reclaim_samples: tuple[HostReclaimSample, ...] = ()
 
 
 ExecutorScope = CgroupScope | ProcessTreeScope
@@ -1448,13 +1464,20 @@ def host_pressure() -> HostPressure | None:
         return limit
 
     facts: list[HostPressure] = []
+    samples: list[HostReclaimSample] = []
 
     def read_v2(directory: Path) -> None:
+        try:
+            identity = directory.stat()
+        except OSError:
+            identity = None
         limits: list[int] = []
+        configured: dict[str, int | None] = {}
         for name in ("memory.high", "memory.max"):
             path = directory / name
             if path.is_file():
                 limit = finite(path.read_text())
+                configured[name] = limit
                 if limit is not None:
                     limits.append(limit)
         if not limits:
@@ -1465,6 +1488,38 @@ def host_pressure() -> HostPressure | None:
             raise ValueError("invalid cgroup memory current")
         stats = dict(line.split() for line in (directory / "memory.stat").read_text().splitlines())
         inactive = max(0, min(current, int(stats.get("inactive_file", "0"))))
+        # Optional observations must not disable ordinary debt maintenance on older
+        # kernels. Never manufacture a zero counter for unavailable evidence.
+        try:
+            events = dict(
+                line.split() for line in (directory / "memory.events").read_text().splitlines()
+            )
+            high = int(events["high"]) if "high" in events else None
+            maximum = int(events["max"]) if "max" in events else None
+            refault = int(stats["workingset_refault_file"])
+            after_identity = directory.stat()
+            if (
+                identity is not None
+                and (identity.st_dev, identity.st_ino)
+                == (after_identity.st_dev, after_identity.st_ino)
+                and (high is not None or maximum is not None)
+                and all(value >= 0 for value in (high, maximum, refault) if value is not None)
+            ):
+                samples.append(
+                    HostReclaimSample(
+                        str(directory),
+                        identity.st_dev,
+                        identity.st_ino,
+                        limit,
+                        high,
+                        refault,
+                        maximum,
+                        configured.get("memory.high"),
+                        configured.get("memory.max"),
+                    )
+                )
+        except (OSError, KeyError, ValueError):
+            pass
         facts.append(
             HostPressure(
                 str(directory),
@@ -1525,4 +1580,14 @@ def host_pressure() -> HostPressure | None:
                 cgroup = cgroup.parent
     except (ContainmentUnavailable, OSError, StopIteration, IndexError, ValueError):
         return None
-    return max(facts, key=lambda fact: fact.debt_bytes, default=None)
+    chosen = max(facts, key=lambda fact: fact.debt_bytes, default=None)
+    if chosen is None:
+        return None
+    return HostPressure(
+        chosen.scope,
+        chosen.current_bytes,
+        chosen.limit_bytes,
+        chosen.debt_bytes,
+        chosen.reclaimable_file_bytes,
+        tuple(samples),
+    )

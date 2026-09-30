@@ -3,6 +3,7 @@
 import ctypes
 import os
 import sys
+import threading
 import weakref
 from types import SimpleNamespace
 from typing import Any, cast
@@ -72,7 +73,8 @@ def test_executor_trims_after_reclaim_and_measures_actual_relief(
     monkeypatch.setattr(proctree, "rss_bytes", rss)
     monkeypatch.setattr(proctree, "trim_host_allocator", trim)
     owner = SimpleNamespace(
-        poisoned=False, world=1,
+        poisoned=False,
+        world=1,
         _synchronize=lambda: events.append("sync"),
         planner=SimpleNamespace(
             reclaim_host=reclaim, host_memory=lambda: {}, host_reclaim_status=lambda: {}
@@ -103,6 +105,13 @@ def test_real_64_mib_reclaim_trims_free_pages_and_preserves_live_aliases() -> No
     refs = [weakref.ref(weight) for weight in root.parameters()]
     backend = fill.StreamingFillBackend.__new__(fill.StreamingFillBackend)
     backend.torch = torch
+    backend._staging_ring = None
+    backend._live_ring = None
+    backend._staging_lock = threading.Lock()
+    backend._staging_busy = False
+    backend._staging_borrow = None
+    backend._staging_poisoned = ""
+    backend.staging_started = backend.staging_drained = lambda: None
     backend.components = {"model": root}
     backend.parked = {}
     backend.replaced = {}

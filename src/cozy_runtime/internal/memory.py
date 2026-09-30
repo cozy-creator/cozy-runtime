@@ -2957,6 +2957,10 @@ class Machine:
         self._host_lock = Lock()
         #: Serializes host-reclaim RPCs; the reservation lock never spans an RPC.
         self._host_reclaim_lock = Lock()
+        self._host_reclaim_samples: dict[
+            tuple[str, int, int, int, int | None, int | None],
+            tuple[int | None, int | None, int],
+        ] = {}
         self.host_available = host_available
         self.host_pressure = host_pressure
         self.host_reserved: dict[str, int] = {}
@@ -3174,19 +3178,89 @@ class Machine:
                     remaining = held
         return False
 
-    def relieve_host_pressure(self, tenants: Sequence[HostTenant]) -> dict[str, int | str] | None:
-        """Release idle managed host backing while an exact cgroup debt remains.
+    def _host_refault_growth(self, fact: proctree.HostPressure | None) -> str:
+        previous = self._host_reclaim_samples
+        current = {}
+        scope = ""
+        for sample in fact.reclaim_samples if fact is not None else ():
+            key = (
+                sample.scope,
+                sample.device,
+                sample.inode,
+                sample.limit_bytes,
+                sample.high_limit,
+                sample.max_limit,
+            )
+            counters = (sample.high, sample.maximum, sample.refault_file)
+            current[key] = counters
+            old = previous.get(key)
+            if old is None:
+                continue
+            # Each event counter stays distinct: a reset in one cannot be hidden
+            # by growth in another. Availability changes establish a new baseline.
+            if any(
+                (new is None) != (prior is None)
+                or (new is not None and prior is not None and new < prior)
+                for new, prior in zip(counters, old, strict=True)
+            ):
+                continue
+            if counters[2] > old[2] and any(
+                new is not None and prior is not None and new > prior
+                for new, prior in zip(counters[:2], old[:2], strict=True)
+            ):
+                scope = sample.scope
+        self._host_reclaim_samples = current
+        return scope
 
-        This maintenance pass is intentionally independent of ordinary admission.  It
-        never touches active tenants, and it stops when the pressure fact, executor
-        generation, or managed-held measurement stops advancing.
+    def relieve_host_pressure(self, tenants: Sequence[HostTenant]) -> dict[str, int | str] | None:
+        """Release idle backing for measured debt or fresh reclaim/refault churn.
+
+        Churn with active work permits one idle generation's finite managed cache
+        evacuation even when kernel reclaim keeps instantaneous debt at zero. This
+        is not admission credit. State, incarnation and decreasing-held checks bound
+        each episode; ordinary debt maintenance retains its existing stop condition.
         """
         if self.host_pressure is None or not self._host_reclaim_lock.acquire(blocking=False):
             return None
         try:
             before = self.host_pressure()
+            churn_scope = self._host_refault_growth(before)
+            churn = bool(churn_scope) and any(tenant.state() == "active" for tenant in tenants)
+            witness = (
+                next(
+                    (sample for sample in before.reclaim_samples if sample.scope == churn_scope),
+                    None,
+                )
+                if before is not None
+                else None
+            )
+
+            def same_pressure(fact: proctree.HostPressure | None) -> bool:
+                return (
+                    fact is not None
+                    and witness is not None
+                    and any(
+                        sample.scope == witness.scope
+                        and sample.device == witness.device
+                        and sample.inode == witness.inode
+                        and sample.limit_bytes == witness.limit_bytes
+                        and sample.high_limit == witness.high_limit
+                        and sample.max_limit == witness.max_limit
+                        and all(
+                            (new is None and prior is None)
+                            or (new is not None and prior is not None and new >= prior)
+                            for new, prior in (
+                                (sample.high, witness.high),
+                                (sample.maximum, witness.maximum),
+                            )
+                        )
+                        and sample.refault_file >= witness.refault_file
+                        for sample in fact.reclaim_samples
+                    )
+                )
+
             debt = before.debt_bytes if before is not None else -1
-            if debt <= 0:
+            if debt < 0 or (debt == 0 and not churn):
                 return None
             initial_debt = debt
             initial_scope = before.scope if before is not None else ""
@@ -3202,13 +3276,40 @@ class Machine:
                 generation = getattr(tenant, "reclaim_generation", None)
                 if generation is None:
                     continue
+                reclaim = functools.partial(reclaim, expected_generation=generation)
                 held_before: int | None = None
-                while debt > 0 and tenant.state() == "idle":
+                victim_reclaimed = 0
+                if churn:
+                    # Zero-sized reclaim reports held bytes without dropping managed
+                    # backing (the existing RPC can still drain/trim idle allocators).
+                    # It does not infer RSS credit or invent a maximum request size.
+                    attempted += 1
+                    result = reclaim(0)
+                    after = self.host_pressure()
+                    self._host_refault_growth(after)
+                    debt = after.debt_bytes if after is not None else -1
+                    if debt < 0 or not same_pressure(after):
+                        break
+                    if result is None:
+                        continue
+                    released, held = result
+                    if (
+                        type(released) is not int
+                        or type(held) is not int
+                        or released != 0
+                        or held <= 0
+                    ):
+                        continue
+                    held_before = held
+                while (debt > 0 or churn) and tenant.state() == "idle":
                     if getattr(tenant, "reclaim_generation", None) != generation:
                         break
+                    if churn and not any(item.state() == "active" for item in tenants):
+                        break
                     attempted += 1
-                    result = reclaim(debt)
+                    result = reclaim(held_before if churn and held_before is not None else debt)
                     after = self.host_pressure()
+                    self._host_refault_growth(after)
                     debt = after.debt_bytes if after is not None else -1
                     if result is None:
                         break
@@ -3222,11 +3323,25 @@ class Machine:
                     ):
                         break
                     reclaimed += released
+                    victim_reclaimed += released
                     held_before = held
                     generation_used = generation
-                    if held == 0 or debt <= 0:
+                    if (
+                        held == 0
+                        or debt < 0
+                        or (churn and not same_pressure(after))
+                        or (debt == 0 and not churn)
+                    ):
                         break
-                if debt <= 0:
+                # A churn episode evacuates one idle generation, not all cached
+                # models. A later fresh counter interval can justify another pass.
+                if victim_reclaimed and churn:
+                    self.note(
+                        f"host refault relief: scope={churn_scope}, slot={tenant.slot}, "
+                        f"generation={generation}, managed_released_bytes={victim_reclaimed}"
+                    )
+                    break
+                if debt < 0 or (debt == 0 and not churn):
                     break
             if after is None or debt < 0:
                 return {
