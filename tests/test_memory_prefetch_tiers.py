@@ -207,14 +207,14 @@ def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(
     worker.placement = None
     worker.lanes = lanes
     worker.stop = threading.Event()
-    worker.engine = cast(AttemptEngine, SimpleNamespace(live={}))
+    worker.engine = cast(AttemptEngine, SimpleNamespace(live={}, history={}))
     worker.memory = memory.Machine(
         {}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30
     )
     worker.memory.optional_host_available = lambda: 1 << 30
     worker._page_warm_targets = {}
     worker._pages_warmed = {}
-    worker._page_warm_frontier = ()
+    worker._page_warm_frontier = cast(tuple[memory.Demand, ...], ())
     worker.placement = cast(
         Placement,
         SimpleNamespace(
@@ -248,6 +248,12 @@ def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(
         assert worker._page_warm_targets == {"tenant": {item: (key,)}}
         assert len(notes) == 1 and "2048 B" in notes[-1][1]
         assert not worker.memory.host_reserved
+        # An accepted/granted hint for a known representation still uses its measured
+        # tiers, rather than rereading every immutable component as if it were new.
+        worker._first_use_waiting = (("known#1", template),)
+        worker._refresh_memory_queue()
+        assert [d.tenant for d in worker._page_warm_frontier] == ["tenant"]
+        assert len(notes) == 1
         # Only queue position and measured preparation time change.
         worker._memory_waiting = (("unprepared", "other"), template)
         row.load_seconds = 99
@@ -270,6 +276,8 @@ def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(
         observe()
         worker._refresh_memory_queue()
         assert len(notes) == 3
+        # The first-use projection above was only for the still-undispatched request.
+        worker._first_use_waiting = ()
         # Same byte count on a new process epoch is not old generation evidence.
         executor.epoch = 2
         worker._refresh_memory_queue()

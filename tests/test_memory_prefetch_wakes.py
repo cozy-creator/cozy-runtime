@@ -137,6 +137,7 @@ def execute_to_transport(worker: Worker, tmp_path: Path, running: Any) -> None:
         poke=lambda: None,
     )
     engine = SimpleNamespace(
+        history={},
         live={"older": attempt},
         supervision_for=lambda _: SimpleNamespace(owns=lambda _: True),
         _command=lambda *_: {},
@@ -282,3 +283,20 @@ def test_shutdown_or_removed_queue_does_not_restart_optional_work(
         assert not worker.supervisor.keys("memory-prefetch")
     finally:
         finish(worker)
+
+
+def test_first_use_projection_failure_cannot_undo_durable_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker, _notes, _scheduler, _view = accepted_queue(tmp_path, monkeypatch)
+
+    def unavailable() -> None:
+        raise RuntimeError("optional scheduling unavailable")
+
+    monkeypatch.setattr(worker, "_refresh_memory_queue", unavailable)
+    attempt = SimpleNamespace(request_id="next", attempt=1)
+    worker._dispatched(cast(Any, attempt))
+    assert worker.executions is not None
+    row = worker.executions.row("owner", "next")
+    assert row is not None and row.dispatched
+    assert not worker._first_use_waiting

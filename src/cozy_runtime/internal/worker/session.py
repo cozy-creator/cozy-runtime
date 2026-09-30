@@ -2356,6 +2356,12 @@ class Worker:
             self.executions.dispatched(
                 self.fence.record_owner_id, attempt.request_id, attempt.attempt
             )
+        key = f"{attempt.request_id}#{attempt.attempt}"
+        self._first_use_waiting = tuple(item for item in self._first_use_waiting if item[0] != key)
+        # This optional projection cannot undo a successfully journaled dispatch.
+        # wanted() still checks the durable row if a scheduling callback fails.
+        with contextlib.suppress(Exception):
+            self._refresh_memory_queue()
 
     def reconcile_executions(self) -> None:
         """BOOT, once per process: rebuild live work from the journal. A dead process's
@@ -2554,15 +2560,20 @@ class Worker:
         self.prespawns.reconcile(roots, view, installations)
         # The broker invokes this callback while serializing its changes. Copy only
         # queue hints here: no control-lock acquisition, executor I/O or GPU mutation.
-        queued = [
-            (key, want)
-            for key, want in self.gpu.wants.items()
-            if want.root in roots and key not in view.get("grants", {})
-        ]
-        queued.sort(key=lambda row: (roots[row[1].root], row[1].root))
-        self._memory_waiting = tuple(want.template for _, want in queued if want.template[0])
+        known = [(key, want) for key, want in self.gpu.wants.items() if want.root in roots]
+        known.sort(key=lambda row: (roots[row[1].root], row[1].root))
+        self._memory_waiting = tuple(
+            want.template
+            for key, want in known
+            if want.template[0] and key not in view.get("grants", {})
+        )
+        # A device grant does not dispatch the request: its immutable pages can still
+        # be useful during startup. This callback only copies hints; the reader checks
+        # the durable owner/attempt/preparation again outside the scheduler lock.
         self._first_use_waiting = tuple(
-            (key, want.template) for key, want in queued if want.template[0]
+            (key, want.template)
+            for key, want in known
+            if want.template[0] and self._first_use_pending(key)
         )
         self._memory_templates = frozenset(
             want.template
@@ -2585,6 +2596,13 @@ class Worker:
             if event == "gpu.wait":
                 self._gpu_waiting(owner, root, body, view)
 
+    def _first_use_pending(self, key: str) -> bool:
+        request, separator, ordinal = key.rpartition("#")
+        if not separator or not ordinal.isdecimal():
+            return False
+        attempt = self.engine.history.get((request, int(ordinal)))
+        return attempt is None or not attempt.executions
+
     def _refresh_memory_queue(self) -> None:
         """Project known queued representations into memory hints, never GPU grants.
 
@@ -2592,8 +2610,15 @@ class Worker:
         Reading these immutable placement identities is a performance hint: a raced
         removal only loses a saving and is revalidated before a background read.
         """
+        self._first_use_waiting = tuple(
+            (key, template)
+            for key, template in self._first_use_waiting
+            if self._first_use_pending(key)
+        )
+        first_use = {template for _, template in self._first_use_waiting}
         positions: dict[tuple[str, str], int] = {}
-        for position, template in enumerate(self._memory_waiting):
+        templates = (*(template for _, template in self._first_use_waiting), *self._memory_waiting)
+        for position, template in enumerate(templates):
             positions.setdefault(template, position)
         placements = [self.placement, *(h.placement for h in list(self.hosted.values()))]
         live = {p.placement_id for p in placements if p is not None}
@@ -2601,16 +2626,30 @@ class Worker:
             key: value for key, value in self._page_warm_targets.items() if key in live
         }
         demands: list[policy.Demand] = []
-        known = set()
+        known: set[tuple[str, str]] = set()
         for placement in placements:
             if placement is None:
                 continue
             template = (placement.installation_id, documents.spell(placement.bindings_digest))
-            known.add(template)
             lane = self.lanes.lane_of(placement.placement_id)
             if template not in positions or lane is None:
                 continue
             row = lane.rows.get(placement.placement_id)
+            # Placement existence alone says nothing about first-use readiness. Once
+            # all known components have current tier facts, preserve ordinary tier-aware
+            # preparation (including no reads for already-resident weights).
+            if template in first_use:
+                targets = self._page_warm_targets.get(placement.placement_id, {})
+                current = row.executor() if row is not None else None
+                if (
+                    not targets
+                    or row is None
+                    or current is None
+                    or row.memory_generation != (current.pid, current.epoch)
+                    or any(key not in row.disk for keys in targets.values() for key in keys)
+                ):
+                    continue
+            known.add(template)
             demands.append(
                 policy.Demand(
                     placement.placement_id,
@@ -2674,13 +2713,42 @@ class Worker:
             tuple((key, row.disk_revision.get(key, 0)) for key in keys),
         )
 
+    @staticmethod
+    def _preparation_reads_tracked(
+        lane: DeviceLane,
+        slot: str,
+        supervision: child.ExecutorSupervision,
+        expected: child.Executor | None = None,
+    ) -> bool:
+        executor = supervision.current
+        row = lane.rows.get(slot)
+        return bool(
+            len(lane.ordinals) == 1
+            and executor is not None
+            and row is not None
+            and (expected is None or executor is expected)
+            and row.executor() is executor
+            and executor.alive()
+            and not executor.poisoned
+            and {"store_read_gate", "store_read_prepare"} <= set(executor.hello.get("memory", ()))
+        )
+
+    def _entry_reads_tracked(self, attempt: AttemptRecord) -> bool:
+        if "serving" not in attempt.spec or "job" in attempt.spec or attempt.slot is None:
+            return False
+        lane = self.lanes.by_id.get(attempt.lane_id)
+        return lane is not None and self._preparation_reads_tracked(
+            lane, attempt.placement_id, attempt.slot.supervision
+        )
+
     def _prefetch_blocked(self) -> str:
         if self.stop.is_set():
             return "worker stopping"
         if not self.memory.optional_store_wanted():
             return "foreground store demand"
         if any(
-            attempt.state in {"preparing", "entering", "accepted"}
+            attempt.state in {"preparing", "accepted"}
+            or (attempt.state == "entering" and not self._entry_reads_tracked(attempt))
             for attempt in list(self.engine.live.values())
         ):
             return "foreground preparation"
@@ -2694,6 +2762,10 @@ class Worker:
     def _wake_memory_prefetch(self) -> None:
         """An eligibility edge pokes the existing coalesced unit, never a timer or RPC."""
         try:
+            # The running edge follows the durable dispatch callback. Reconcile a broker
+            # snapshot that raced that callback before AttemptRecord.executions advanced.
+            if any(not self._first_use_pending(key) for key, _ in self._first_use_waiting):
+                self._refresh_memory_queue()
             if (
                 self._memory_prefetch_deferred
                 and self._page_warm_frontier
@@ -2822,6 +2894,7 @@ class Worker:
                 blocked = self._prefetch_blocked()
                 if (
                     blocked
+                    or template not in self._memory_templates
                     or (owner, boot) != (self.fence.record_owner_id, self.fence.worker_boot_id)
                     or (key, template) not in self._first_use_waiting
                     or demand not in self._page_warm_frontier
@@ -5370,6 +5443,7 @@ class Worker:
                 verified_cache=self.verified_artifacts,
                 held_manifests=self.held_manifests,
                 on_observation=lambda value: self._observe_acquisition(placement, value),
+                store_read=partial(self.memory.store_demand, "acquire:" + placement.placement_id),
             )
 
             acquired = acquirer.acquire(placement.document)
@@ -5855,10 +5929,6 @@ class Worker:
                 raise
 
     def _prepare_generation(self, tenant: Tenant) -> tuple[str, bool]:
-        with self._store_phase("prepare:" + tenant.placement.placement_id, tenant.supervision):
-            return self._prepare_generation_body(tenant)
-
-    def _prepare_generation_body(self, tenant: Tenant) -> tuple[str, bool]:
         """ONE placement's PROCESS: spawn or keep its executor and START it (proto-061 D2).
 
         Process identity is (environment, lane). Nothing here fills: `start` brings every
@@ -5881,22 +5951,38 @@ class Worker:
             and executor.sealed_devices == tenant.lane.devices
         ):
             executor.ready_bindings = set(wanted)
-            self._load_weightless(tenant, executor)
+            guard = (
+                contextlib.nullcontext()
+                if self._preparation_reads_tracked(
+                    tenant.lane, tenant.slot, tenant.supervision, executor
+                )
+                else self._store_phase("prepare:" + placement_id, tenant.supervision)
+            )
+            with guard:
+                self._load_weightless(tenant, executor)
             self.note(
                 "boot",
                 f"{placement_id!r} reused started epoch {executor.epoch} pid {executor.pid} "
                 f"({len(wanted)} binding(s), {len(executor.loaded)} construction(s) built)",
             )
             return ("", True) if wanted else ("prepare refused: every binding", False)
-        owned = self._own_executor(tenant)
+        # Until the actual child hello exists, initialization coverage is unknown.
+        with self._store_phase("prepare:" + placement_id, tenant.supervision):
+            owned = self._own_executor(tenant)
         if isinstance(owned, str):
             return owned, False
-        started = self._start_executor(tenant, owned)
-        if started:
-            return started, False
-        owned.ready_bindings = set(wanted)
-        self._load_weightless(tenant, owned)
-        self._warm_pages(tenant)
+        guard = (
+            contextlib.nullcontext()
+            if self._preparation_reads_tracked(tenant.lane, tenant.slot, tenant.supervision, owned)
+            else self._store_phase("prepare:" + placement_id, tenant.supervision)
+        )
+        with guard:
+            started = self._start_executor(tenant, owned)
+            if started:
+                return started, False
+            owned.ready_bindings = set(wanted)
+            self._load_weightless(tenant, owned)
+            self._warm_pages(tenant)
         wanted -= set(tenant.failed_bindings)
         return ("", False) if wanted else ("prepare refused: every binding", False)
 
@@ -7347,9 +7433,15 @@ class Worker:
         with self.control_lock:
             if self._entry_refused(attempt):
                 return False
-        with self._store_phase(
-            f"enter:{attempt.request_id}:{attempt.attempt}", self.engine.supervision_for(attempt)
-        ):
+        guard = (
+            contextlib.nullcontext()
+            if self._entry_reads_tracked(attempt)
+            else self._store_phase(
+                f"enter:{attempt.request_id}:{attempt.attempt}",
+                self.engine.supervision_for(attempt),
+            )
+        )
+        with guard:
             return self._enter_prepared(attempt)
 
     def _enter_prepared(self, attempt: AttemptRecord) -> bool:

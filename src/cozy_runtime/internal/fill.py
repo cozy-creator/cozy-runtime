@@ -632,10 +632,17 @@ class Checkpoint:
     verified per object in Python; none of that survives, and none of it needs to.
     """
 
-    def __init__(self, root: str | Path, manifest_id: str) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        manifest_id: str,
+        *,
+        store_read: Callable[[], contextlib.AbstractContextManager[None]] = contextlib.nullcontext,
+    ) -> None:
         self.root = str(root)
         self.manifest_id = manifest_id
-        with store_refusals(f"opening manifest {manifest_id[:23]}"):
+        self.store_read = store_read
+        with self.store_read(), store_refusals(f"opening manifest {manifest_id[:23]}"):
             self.store = store(self.root)
             header = self.store.manifest(manifest_id)["header"]
             if header is None:
@@ -781,6 +788,7 @@ class Checkpoint:
         if not names:
             return {}
         with (
+            self.store_read(),
             store_refusals(f"reading model assets from {self.manifest_id[:23]}"),
             self.acquire() as lease,
         ):

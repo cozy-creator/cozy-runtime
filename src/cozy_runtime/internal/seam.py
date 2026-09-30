@@ -51,6 +51,7 @@ EXECUTOR_MEMORY_CAPABILITIES = frozenset(
         "vacate_ranks",
         "host_room",
         "store_read_gate",
+        "store_read_prepare",
         "group_host_credit",
         "process_memory",
         "reclaim_host",

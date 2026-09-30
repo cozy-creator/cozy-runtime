@@ -14,7 +14,7 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
@@ -22,10 +22,10 @@ from typing import Annotated, Literal
 
 import msgspec
 
-from cozy_runtime.internal import model_config
 from cozy_runtime.internal import (
     base_observation,
     fill,
+    model_config,
     package_environment,
     package_installation,
     package_interface,
@@ -252,11 +252,13 @@ class Acquirer:
         verified_cache: VerifiedArtifactCache | None = None,
         held_manifests: HeldManifests | None = None,
         on_observation: ObservationCallback | None = None,
+        store_read: Callable[[], AbstractContextManager[None]] = nullcontext,
     ) -> None:
         self.cache_root = cache_root
         self.install_root = install_root
         self.selection_root = selection_root
         self.tensorfs_root = tensorfs_root
+        self.store_read = store_read
         self.python = python
         self.base = base or package_environment.observe_base(python)
         self.installed_environment = installed_environment
@@ -397,7 +399,8 @@ class Acquirer:
         if not placement.models:
             return 0
         try:
-            store = fill.open_store(self.tensorfs_root)
+            with self.store_read():
+                store = fill.open_store(self.tensorfs_root)
             manifests = {
                 (documents.spell(model.manifest.digest), model.manifest.length)
                 for model in placement.models
@@ -405,13 +408,12 @@ class Acquirer:
             for manifest_digest, manifest_length in sorted(manifests):
                 # TensorFS owns model materialization. A cache miss asks the owner to
                 # ensure this exact selection again, including manifest and header.
-                manifest_raw = bytes(store.manifest(manifest_digest)["manifest"])
-                _verify_bytes(manifest_raw, manifest_digest, manifest_length)
-                # This worker moves no model bytes (cr-090): the store is filled by
-                # TensorFS's one transport before the placement is acquired. The leg ends
-                # on TensorFS's verified walk over the manifest's runtime closure; the
-                # same walk is the residency fact `held_manifests` reports.
-                self.held_manifests.hold(store, manifest_digest)
+                with self.store_read():
+                    manifest_raw = bytes(store.manifest(manifest_digest)["manifest"])
+                    _verify_bytes(manifest_raw, manifest_digest, manifest_length)
+                    # TensorFS filled the store before placement acquisition. Its
+                    # verified walk establishes the held_manifests residency fact.
+                    self.held_manifests.hold(store, manifest_digest)
             return len(manifests)
         except AcquisitionRefusal:
             raise
@@ -503,7 +505,8 @@ class Acquirer:
                     for row in slot.components
                 }
                 try:
-                    logical = fill.logical_weight_bytes(self.tensorfs_root, snapshots)
+                    with self.store_read():
+                        logical = fill.logical_weight_bytes(self.tensorfs_root, snapshots)
                 except Exception as exc:
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,

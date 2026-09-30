@@ -242,7 +242,9 @@ def test_prepare_reads_header_and_assets_without_a_closure_lease(tmp_path: Path)
         cold.assets()
 
 
-def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -> None:
+def test_binding_reads_config_only_from_the_cozytensors_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store_root, manifest_id, manifest_length, store = _snapshot(tmp_path, include_asset=True)
     acquirer = _acquirer(tmp_path, store_root)
     body = {
@@ -293,8 +295,25 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         installation_id="local-" + "33" * 16,
     )
 
+    from functools import partial
+
+    from cozy_runtime.internal import memory
+
+    machine = memory.Machine({}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30)
+    acquirer.store_read = partial(machine.store_demand, "acquire:metadata")
+    logical_weight_bytes = fill.logical_weight_bytes
+    observed: list[str] = []
+
+    def logical(*args: Any) -> Any:
+        assert not machine.optional_store_wanted()
+        observed.extend(machine._store_demands)
+        return logical_weight_bytes(*args)
+
+    monkeypatch.setattr(fill, "logical_weight_bytes", logical)
     assert acquirer._models(placement) == 1
     bindings, documents_count = acquirer._bindings(placement)
+    assert len(observed) == 1 and observed[0].startswith("acquire:metadata:")
+    assert machine.optional_store_wanted()
 
     (model,) = bindings[binding_digest].model_bindings()
     assert tensorfs.parse_header(bytes(store.manifest(manifest_id)["header"]))["configs"] == {
@@ -501,3 +520,64 @@ def test_job_model_identity_mismatch_is_not_a_cache_miss(tmp_path: Path) -> None
     assert invalid.value.code == "job_model_manifest_unavailable"
     assert invalid.value.cause == pb.CAUSE_CODE_LOCAL_SAFETY
     assert attempt.model_leases == []
+
+
+def test_parallel_acquirer_native_reads_have_independent_demand_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    from functools import partial
+
+    from cozy_runtime.internal import memory
+
+    root, manifest, length, native = _snapshot(tmp_path, include_asset=True)
+    acquirer = _acquirer(tmp_path, root)
+    machine = memory.Machine({}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30)
+    acquirer.store_read = partial(machine.store_demand, "acquire:placement")
+    entered = [threading.Event(), threading.Event()]
+    finish = [threading.Event(), threading.Event()]
+    errors = []
+
+    class Store:
+        def manifest(self, *args: Any) -> Any:
+            assert not machine.optional_store_wanted()
+            return native.manifest(*args)
+
+        def acquire_cozytensors(self, *args: Any) -> Any:
+            assert not machine.optional_store_wanted()
+            index = int(threading.current_thread().name.rpartition("-")[2])
+            held = native.acquire_cozytensors(*args)
+            entered[index].set()
+            assert finish[index].wait(5)
+            return held
+
+    monkeypatch.setattr(fill, "open_store", lambda _: Store())
+    placement = pb.Placement(
+        models=[pb.Model(manifest=pb.Ref(digest=documents.raw(manifest), length=length))]
+    )
+
+    def run() -> None:
+        try:
+            assert acquirer._models(placement) == 1
+        except BaseException as exc:
+            errors.append(exc)
+
+    readers = [threading.Thread(target=run, name=f"reader-{i}") for i in range(2)]
+    for reader in readers:
+        reader.start()
+    try:
+        assert all(event.wait(5) for event in entered), errors
+        assert len(machine._store_demands) == 2
+        assert all(token.startswith("acquire:placement:") for token in machine._store_demands)
+        finish[0].set()
+        readers[0].join(5)
+        assert not readers[0].is_alive() and len(machine._store_demands) == 1
+        with machine.optional_store_read() as admitted:
+            assert not admitted
+    finally:
+        for event in finish:
+            event.set()
+        for reader in readers:
+            reader.join(5)
+    assert not errors and all(not reader.is_alive() for reader in readers)
+    assert machine.optional_store_wanted()

@@ -361,3 +361,161 @@ def test_phase_exception_cannot_pin_a_healthy_successor(initial: str) -> None:
     if initial == "none-poisoned":
         machine.release_store_prefix("executor:456:5:")
     assert not machine._store_demands
+
+
+@pytest.mark.parametrize("include_asset", [True, False])
+def test_startup_checkpoint_header_and_assets_hold_native_read_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, include_asset: bool
+) -> None:
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from cozy_runtime.author._executor_requests import Answer, StoreRead
+    from cozy_runtime.internal.executor import Executor
+    from test_model_runtime_closure import _ASSET, _snapshot
+
+    root, manifest, _, native = _snapshot(tmp_path, include_asset=include_asset)
+    machine = policy()
+    events: list[str] = []
+
+    def exchange(request: StoreRead, _reply: object) -> Answer:
+        events.append("end" if request.release else "begin")
+        if request.release:
+            machine.end_store_read(request.reservation)
+            return Answer(ok=True)
+        return Answer(ok=machine.begin_store_read(request.reservation))
+
+    owner = cast(
+        Any,
+        SimpleNamespace(
+            world=1, host=SimpleNamespace(worker_memory={"store_read_gate"}), _durable=exchange
+        ),
+    )
+
+    class Lease:
+        def __init__(self, held: Any) -> None:
+            self.held = held
+
+        def __enter__(self) -> Any:
+            self.held.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            assert not machine.optional_store_wanted()
+            self.held.__exit__(*args)
+            events.append("released")
+
+        def read_asset(self, *args: Any, **kwargs: Any) -> Any:
+            assert not machine.optional_store_wanted()
+            events.append("asset")
+            return self.held.read_asset(*args, **kwargs)
+
+    class Store:
+        def manifest(self, *args: Any) -> Any:
+            assert not machine.optional_store_wanted()
+            events.append("header")
+            return native.manifest(*args)
+
+        def acquire_cozytensors(self, *args: Any) -> Any:
+            assert not machine.optional_store_wanted()
+            events.append("acquire")
+            return Lease(native.acquire_cozytensors(*args))
+
+    monkeypatch.setattr(fill, "store", lambda _: Store())
+    checkpoint = fill.Checkpoint(root, manifest, store_read=lambda: Executor._store_read(owner))
+    assert events == ["begin", "header", "end"]
+    assert machine.optional_store_wanted()
+    if include_asset:
+        assert checkpoint.model_assets() == {"tokenizer/vocab.txt": _ASSET}
+        assert events[3:] == ["begin", "acquire", "asset", "released", "end"]
+    else:
+        with pytest.raises(fill.FillRefusal):
+            checkpoint.model_assets()
+        assert events[3:] == ["begin", "acquire", "end"]
+    assert machine.optional_store_wanted()
+    assert not machine._store_demands
+
+
+@pytest.mark.parametrize("kind", ["covered", "old", "group", "replaced", "poisoned", "gone"])
+def test_startup_guard_requires_actual_current_single_rank_coverage(kind: str) -> None:
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from cozy_runtime.internal.worker.session import Worker
+
+    capabilities = {"store_read_gate", "store_read_prepare"}
+    executor = SimpleNamespace(
+        hello={"memory": capabilities if kind != "old" else {"store_read_gate"}},
+        poisoned="fault" if kind == "poisoned" else "",
+        alive=lambda: kind != "gone",
+    )
+    supervision = SimpleNamespace(current=executor)
+    lane = SimpleNamespace(
+        ordinals=(0, 1) if kind == "group" else (0,),
+        rows={
+            "slot": SimpleNamespace(executor=lambda: object() if kind == "replaced" else executor)
+        },
+    )
+    assert Worker._preparation_reads_tracked(
+        cast(Any, lane), "slot", cast(Any, supervision), cast(Any, executor)
+    ) == (kind == "covered")
+    # A healthy successor's hello cannot authorize the old command's read coverage.
+    assert not Worker._preparation_reads_tracked(
+        cast(Any, lane), "slot", cast(Any, supervision), cast(Any, object())
+    )
+
+
+@pytest.mark.parametrize("covered", [False, True])
+def test_generation_start_keeps_unknown_spawn_guard_then_uses_covered_reads(
+    covered: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from cozy_runtime.internal.worker.session import Worker
+
+    machine = policy()
+    worker = Worker.__new__(Worker)
+    worker.memory = machine
+    monkeypatch.setattr(worker, "note", lambda *_: None)
+    executor = SimpleNamespace(
+        started={},
+        poisoned="",
+        alive=lambda: True,
+        hello={
+            "memory": {"store_read_gate", "store_read_prepare"} if covered else {"store_read_gate"}
+        },
+    )
+    supervision = SimpleNamespace(current=None)
+    lane = SimpleNamespace(
+        ordinals=(0,), rows={"slot": SimpleNamespace(executor=lambda: supervision.current)}
+    )
+    tenant = SimpleNamespace(
+        placement=SimpleNamespace(placement_id="slot"),
+        supervision=supervision,
+        bindings={"binding": object()},
+        failed_bindings={},
+        lane=lane,
+        slot="slot",
+    )
+    seen = []
+
+    def own(_tenant: Any) -> Any:
+        assert not machine.optional_store_wanted()
+        supervision.current = executor
+        return executor
+
+    def start(_tenant: Any, _executor: Any) -> str:
+        seen.append(machine.optional_store_wanted())
+        with machine.store_demand("native-header"):
+            assert not machine.optional_store_wanted()
+        seen.append(machine.optional_store_wanted())
+        return ""
+
+    monkeypatch.setattr(worker, "_own_executor", own)
+    monkeypatch.setattr(worker, "_start_executor", start)
+    monkeypatch.setattr(worker, "_load_weightless", lambda *_: None)
+    monkeypatch.setattr(worker, "_warm_pages", lambda *_: None)
+    assert worker._prepare_generation(cast(Any, tenant)) == ("", False)
+    assert seen == [covered, covered]
+    assert machine.optional_store_wanted()

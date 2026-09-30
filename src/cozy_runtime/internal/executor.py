@@ -2397,7 +2397,10 @@ class Executor:
         )
         vmap = reference.snapshot_map()
         checkpoints = {
-            name: Checkpoint(reference.store, vmap.get(name, reference.snapshot)) for name in names
+            name: Checkpoint(
+                reference.store, vmap.get(name, reference.snapshot), store_read=self._store_read
+            )
+            for name in names
         }
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
@@ -2435,7 +2438,11 @@ class Executor:
                 if checkpoint.manifest_id == reference.snapshot
             ),
             None,
-        ) or Checkpoint(reference.store, reference.snapshot)
+        )
+        if config_checkpoint is None:
+            config_checkpoint = Checkpoint(
+                reference.store, reference.snapshot, store_read=self._store_read
+            )
         config_bytes = model_config.construction_config(config_checkpoint.header.get("configs"))
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
@@ -2581,7 +2588,6 @@ class Executor:
             unnormalized=model_config.unnormalized(config_checkpoint.header.get("configs")),
         )
         from cozy_runtime.internal.lora_composition import bind as bind_adapters
-
         from cozy_runtime.internal.lora_contract import read as read_adapter_graph
 
         adapter_graphs = [

@@ -81,7 +81,9 @@ def queued(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Worker, Acc
     worker.fence = cast(Any, SimpleNamespace(record_owner_id="owner", worker_boot_id="boot"))
     worker.stop = threading.Event()
     # An older request is executing. Starting/preparing demand, in contrast, gets priority.
-    worker.engine = cast(Any, SimpleNamespace(live={"older": SimpleNamespace(state="running")}))
+    worker.engine = cast(
+        Any, SimpleNamespace(live={"older": SimpleNamespace(state="running")}, history={})
+    )
     worker.memory = memory.Machine(
         {}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30
     )
@@ -322,3 +324,103 @@ def test_accepted_broker_template_reaches_native_store_before_grant(
     row = executions.row("owner", "next")
     assert row is not None and not row.dispatched and row.desired == "run"
     assert not worker.hosted
+
+
+def test_granted_first_use_survives_new_placement_until_durable_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cozy_runtime.internal.worker.gpu_scheduler import Demand
+    from test_memory_prefetch_wakes import accepted_queue
+
+    worker, notes, scheduler, _ = accepted_queue(tmp_path, monkeypatch)
+    template = worker._memory_waiting[0]
+    roots = {"next": 2}
+    assert scheduler.sync(roots, [Demand("next#1", "next", 1)]) == {"next#1": (0,)}
+    granted = scheduler.view()
+    worker._gpu_observed([], roots, granted, {})
+    assert worker._memory_waiting == ()
+    assert list(worker._first_use_waiting) == [("next#1", template)]
+    # Assignment happens before imports. No tier reports or page targets exist yet.
+    worker.placement = cast(
+        Placement,
+        SimpleNamespace(
+            placement_id="new",
+            installation_id=template[0],
+            bindings_digest=documents.raw(template[1]),
+        ),
+    )
+    worker.lanes = cast(
+        Any, SimpleNamespace(lane_of=lambda _: SimpleNamespace(ordinals=(0,), rows={}))
+    )
+    worker._refresh_memory_queue()
+    frontier = worker._page_warm_frontier
+    assert len(frontier) == 1 and frontier[0].tenant == "queued:next#1"
+    worker._prefetch_pages()
+    assert len(notes) == 1 and "2048 B" in notes[0]
+    assert scheduler.view() == granted
+    assert worker.executions is not None
+    row = worker.executions.row("owner", "next")
+    assert row is not None and not row.dispatched
+    attempt = SimpleNamespace(request_id="next", attempt=1, executions=0)
+    worker.engine.history[("next", 1)] = cast(Any, attempt)
+    worker._dispatched(cast(Any, attempt))
+    dispatched = worker.executions.row("owner", "next")
+    assert dispatched is not None and dispatched.dispatched
+    assert len(worker._first_use_waiting) == len(worker._page_warm_frontier) == 0
+    # A scheduler observation racing the transition cannot keep running work at the
+    # head of the first-use frontier. The ordinary running edge reconciles the hint.
+    worker._gpu_observed([], roots, granted, {})
+    attempt.executions = 1
+    worker._wake_memory_prefetch()
+    assert len(worker._first_use_waiting) == len(worker._page_warm_frontier) == 0
+    worker._gpu_observed([], roots, granted, {})
+    assert not worker._first_use_waiting
+    assert scheduler.view() == granted
+
+
+@pytest.mark.parametrize("phase", ["entering", "preparing", "accepted"])
+@pytest.mark.parametrize("coverage", ["new", "old", "group", "job", "replaced"])
+def test_only_current_covered_serving_entry_relaxes_preparation_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, coverage: str
+) -> None:
+    worker, _, notes = queued(tmp_path, monkeypatch)
+    current = SimpleNamespace(
+        alive=lambda: True,
+        poisoned="",
+        hello={
+            "memory": {"store_read_gate", "store_read_prepare"}
+            if coverage != "old"
+            else {"store_read_gate"}
+        },
+    )
+    supervision = SimpleNamespace(current=current)
+    lane = SimpleNamespace(
+        ordinals=(0, 1) if coverage == "group" else (0,),
+        rows={
+            "new": SimpleNamespace(executor=lambda: object() if coverage == "replaced" else current)
+        },
+    )
+    worker.lanes = cast(Any, SimpleNamespace(by_id={"lane": lane}, lane_of=lambda _: None))
+    attempt = SimpleNamespace(
+        state=phase,
+        spec={"job": {}} if coverage == "job" else {"serving": {}},
+        slot=SimpleNamespace(supervision=supervision),
+        lane_id="lane",
+        placement_id="new",
+        executor=None,
+    )
+    worker.engine.live = {"entering": cast(Any, attempt)}
+    allowed = phase == "entering" and coverage == "new"
+    assert (worker._prefetch_blocked() == "") == allowed
+    worker._prefetch_pages()
+    assert any("2048 B" in note for note in notes) == allowed
+    if phase == "entering":
+        worker.control_lock = threading.RLock()
+        monkeypatch.setattr(worker.engine, "supervision_for", lambda _: supervision, raising=False)
+        monkeypatch.setattr(worker, "_entry_refused", lambda _: False)
+        monkeypatch.setattr(
+            worker, "_enter_prepared", lambda _: worker.memory.optional_store_wanted()
+        )
+        attempt.request_id, attempt.attempt = "next", 1
+        assert worker.enter(cast(Any, attempt)) == allowed
+        assert worker.memory.optional_store_wanted()
