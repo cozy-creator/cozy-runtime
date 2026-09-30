@@ -98,7 +98,7 @@ class ProcessTreeScope:
 
 @dataclass(frozen=True, slots=True)
 class HostPressure:
-    """One measured cgroup pressure fact with bounded inactive-file coverage."""
+    """Kernel-limit excess, with reclaimable file bytes reported separately."""
 
     scope: str
     current_bytes: int
@@ -1424,12 +1424,17 @@ def _host_room(*, reclaimable: bool) -> int:
 
 
 def host_pressure() -> HostPressure | None:
-    """Read cgroup pressure after excluding bounded inactive file cache.
+    """Read actual cgroup-limit excess, independently of admission's cache credit.
 
-    The returned debt is the largest ``max(0, current - bounded inactive_file - limit)``
+    The returned debt is the largest ``max(0, current - limit)``
     across this process's cgroup ancestors.  ``limit`` is the minimum finite v2
     ``memory.high``/``memory.max``; v1 uses ``memory.limit_in_bytes``.  Very large finite
     limits naturally produce zero debt. An unreadable finite fact yields no observation.
+
+    The kernel charges file pages to memory.high too. Subtracting inactive_file here
+    can hide active reclaim/refault stalls while idle managed backing remains cached.
+    Those pages still supply admission credit through available_host_bytes(); this observation
+    lets Machine prefer releasing safe idle backing when the kernel limit is exceeded.
     """
     _linux_only("host_pressure")
 
@@ -1465,7 +1470,7 @@ def host_pressure() -> HostPressure | None:
                 str(directory),
                 current,
                 limit,
-                max(current - inactive - limit, 0),
+                max(current - limit, 0),
                 inactive,
             )
         )
@@ -1484,7 +1489,7 @@ def host_pressure() -> HostPressure | None:
                 str(directory),
                 current,
                 limit,
-                max(current - inactive - limit, 0),
+                max(current - limit, 0),
                 inactive,
             )
         )
