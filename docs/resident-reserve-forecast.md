@@ -1,0 +1,11 @@
+# Private whole-resident reserve forecast experiment
+
+A successful call's allocated working high-water is not its allocator reservation growth. In the observed SDXL case, the historical allocated bound was 341,086,208 bytes while a cold full-resident forward grew reserve by at least 461,373,440 bytes. The warm 6 GiB call had 385,155,072 bytes of additional reserve allowance and internally handled allocator OOMs before returning a different numerical result. These observations motivate a forecast; they do not prove an executed cuDNN plan or guarantee future allocation fit.
+
+The experiment preserves `Record.ok` and adds a separate maximum observed `Record.reserve`. Existing `_sample` reads reserved high-water once, updates eligible active frames before resetting peaks, and records peak reserve minus entry reserve without subtracting logical loaded weight bytes. Only a successful, retryable, whole-resident outer call can publish that observation. Any nested managed call/scope, transfer (including overlap), or conversion invalidates attribution. Group, compiled, hosted, spare, mutable, pending-conversion and gradient-enabled paths are excluded.
+
+Only an exact operation record can influence a whole-keep candidate: the forecast is the larger of allocated working demand and reserve growth, never their sum. Partial/streamed candidates retain their existing demand. No allocator cache holes become admission credit, no grant grows, no fixed margin or backend mode changes, and no automatic retry is triggered by hidden native OOM counters. Existing legal victim selection and fresh allocator/driver checks remain authoritative.
+
+`reserve_growth_bytes` and `reserve_forecast_bytes` in eligible successful operation telemetry expose measured growth and retained forecast. These are not disk/PCIe traffic and not a fixed numerical-path guarantee. A different allocator layout can require more reserve, and a backend may still silently choose another plan. Failed calls do not publish successful reserve observations. Conversion invalidates the operation's records as before.
+
+This isolated CPU-tested source experiment is not installed or GPU-qualified. Its feature commit must be compared against the same base; the branch's separate fresh-master/R20 merge is not an isolated performance delta and not release authorization.

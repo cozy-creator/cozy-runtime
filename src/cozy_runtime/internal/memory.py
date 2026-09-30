@@ -129,6 +129,8 @@ class Record:
     fail_keep: int = 0
     #: allocatable plus own reserve at failure; greater capacity permits a fresh proof
     fail_capacity: int = 0
+    #: successful additional reserve high-water, only for attributable whole-resident calls
+    reserve: int = 0
 
 
 # --------------------------------------------------------------------------- the planner
@@ -166,6 +168,8 @@ class Frame:
     base: int
     working: int = 0
     loaded: int = 0
+    reserve_base: int | None = None
+    reserve_growth: int = 0
     overlap_key: OpKey | None = None
     overlap_expected: tuple[tiers.Unit, ...] = ()
     overlap_visits: list[tiers.Unit] = field(default_factory=list)
@@ -401,11 +405,12 @@ class Planner:
         if self.observe_process():
             self._cap()
         peak = self._allocator_scalar("allocated_bytes", "peak", "max_memory_allocated")
-        self.peak = max(
-            self.peak, self._allocator_scalar("reserved_bytes", "peak", "max_memory_reserved")
-        )
+        reserved_peak = self._allocator_scalar("reserved_bytes", "peak", "max_memory_reserved")
+        self.peak = max(self.peak, reserved_peak)
         self.peak_allocated = max(self.peak_allocated, peak)
         for frame in self.stack:
+            if frame.reserve_base is not None:
+                frame.reserve_growth = max(frame.reserve_growth, reserved_peak - frame.reserve_base)
             pending = sum(
                 transfer.source_bytes
                 for transfer in self._host_transfers
@@ -481,6 +486,7 @@ class Planner:
 
     def _converted(self, held: Held) -> None:
         """A real package dtype conversion invalidates old working-memory observations."""
+        self._invalidate_reserve()
         self._overlap_retire(held=held, clear=True)
         self._validate_component(held)
         for unit in held.part.units:
@@ -934,6 +940,7 @@ class Planner:
     def _enter_scope(self, construction: str, method: str, components: tuple[str, ...]) -> None:
         if not self.cuda:
             return
+        self._invalidate_reserve()
         self._overlap_retire(pending_only=True)
         for frame in self.stack:
             frame.overlap_enabled = frame.overlap_learnable = False
@@ -1445,6 +1452,7 @@ class Planner:
                 and getattr(fn, "__func__", fn) is getattr(forward, "__func__", forward)
             )
             if not transparent:
+                self._invalidate_reserve()
                 self._overlap_retire(pending_only=True)
                 for parent in self.stack:
                     parent.overlap_enabled = parent.overlap_learnable = False
@@ -1455,6 +1463,7 @@ class Planner:
                 return fn(*args, **kwargs)
             finally:
                 active.overlap_joined = previous
+        self._invalidate_reserve()
         if not self.cuda or held.hosted:
             self._ready(held.key)
             return fn(*args, **kwargs)
@@ -1549,6 +1558,13 @@ class Planner:
                         snapshot = self._arm(held, leaves)
                     self._sample()
                     frame = Frame(held, self._allocated())
+                    if (
+                        retryable
+                        and plan.keep == len(held.part.blocks)
+                        and self._reserve_eligible(held)
+                        and all(unit.tier == DEVICE for unit in held.part.units if unit.nbytes)
+                    ):
+                        frame.reserve_base = self._reserved()
                     frame.overlap_entry = tiers.original(fn)
                     self._overlap_frame(frame, key, retryable and not replayed)
                     self.stack.append(frame)
@@ -1588,6 +1604,12 @@ class Planner:
                     self.working = max(self.working, frame.working)
                     record = self.records.setdefault(key, Record())
                     record.ok = max(record.ok, frame.working)
+                    if frame.reserve_base is not None:
+                        record.reserve = max(record.reserve, frame.reserve_growth)
+                        counts["reserve_growth_bytes"] = max(
+                            counts.get("reserve_growth_bytes", 0), frame.reserve_growth
+                        )
+                        counts["reserve_forecast_bytes"] = record.reserve
                     self._overlap_learn(frame, key)
                     if record.fail and (
                         frame.working >= record.fail or plan.keep >= record.fail_keep
@@ -1715,6 +1737,28 @@ class Planner:
 
     # ------------------------------------------------------------------ planning
 
+    def _invalidate_reserve(self) -> None:
+        for frame in self.stack:
+            frame.reserve_base = None
+
+    def _reserve_eligible(self, held: Held) -> bool:
+        """Only a plain outer operation can attribute allocator reserve to its own work."""
+        return (
+            self.cuda
+            and not self.stack
+            and not self.grouped
+            and not self.group_phase
+            and not self.spare
+            and not held.compiled
+            and not held.hosted
+            and not self.sharded(held.key)
+            and not self._host_transfers
+            and not self.torch.is_grad_enabled()
+            and all(
+                unit.readonly and not unit.mutable and not unit.pending for unit in held.part.units
+            )
+        )
+
     def _estimate(self, key: OpKey) -> tuple[int | None, bool]:
         """Working bytes for the same authored mode, exact or scaled from known shapes."""
         record = self.records.get(key)
@@ -1748,9 +1792,14 @@ class Planner:
             and self.allocatable() + self._reserved() <= record.fail_capacity
             else None
         )
+        reserve = (
+            record.reserve
+            if record is not None and retryable and not floor and self._reserve_eligible(held)
+            else 0
+        )
         if self.cuda and self._reserved() > self._allocated():
             resident = self._need(held.part, len(held.part.blocks))
-            if resident + (working or 0) > self.allocatable():
+            if resident + max(working or 0, reserve) > self.allocatable():
                 # The previous op's cache may be all that stands in the way: give it back so
                 # the plan reads what can really be reserved.
                 tiers.trim(self.torch)
@@ -1761,7 +1810,13 @@ class Planner:
             if retryable and working is None:
                 return self._max_room(held, victims)
             return self._fit(
-                held, working or 0, victims, floor=False, ceiling=ceiling, measured=measured
+                held,
+                working or 0,
+                victims,
+                floor=False,
+                ceiling=ceiling,
+                measured=measured,
+                reserve=reserve,
             )
         except MemoryRefusal as exc:
             if exact or self.spare or exc.code != SHORTFALL:
@@ -1801,6 +1856,7 @@ class Planner:
         floor: bool,
         ceiling: int | None = None,
         measured: bool = True,
+        reserve: int = 0,
     ) -> Plan:
         """Keep the most blocks that fit; the floor streams every legal block."""
         needed = self._need(held.part, self._minimum_keep(held)) + working
@@ -1826,7 +1882,8 @@ class Planner:
         if ceiling is not None:
             keeps = [keep for keep in keeps if keep <= ceiling]
         for keep in keeps:
-            needed = self._need(held.part, keep) + working
+            demand = max(working, reserve) if keep == len(held.part.blocks) else working
+            needed = self._need(held.part, keep) + demand
             chosen = self._room_from(victims, needed, credits=credits)
             minimum = keep == self._minimum_keep(held)
             if chosen is None and self._ask_room(
@@ -2061,6 +2118,7 @@ class Planner:
     @contextmanager
     def _moving(self) -> Iterator[None]:
         """Count what a weight move changes on the allocator: the attempt's transition."""
+        self._invalidate_reserve()
         before = self._allocated()
         try:
             yield
@@ -2401,6 +2459,7 @@ class Planner:
             depth = frame.overlap_depth.get(unit, 0)
             frame.overlap_depth[unit] = depth + 1
             if depth:
+                self._invalidate_reserve()
                 self._overlap_retire(pending_only=True)
                 frame.overlap_enabled = frame.overlap_learnable = False
                 return
