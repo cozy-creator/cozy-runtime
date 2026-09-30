@@ -132,11 +132,15 @@ def holding(worker: Worker) -> list[str]:
         held += [f"preparation:{key}" for key in calls.serving.preparations.started()]
     if worker.preparation_lock.locked():
         held.append("preparation_lock")
+    # A reclaimed replica stays ACTIVATING until its next grant: demand eligibility, not
+    # work. Its actual revival is held by `_activating` and its supervised unit.
     placements = [worker.placement, *(h.placement for h in tuple(worker.hosted.values()))]
     held += [
         f"activating:{p.placement_id}"
         for p in placements
-        if p and p.serving == pb.SERVING_STATE_ACTIVATING
+        if p
+        and p.serving == pb.SERVING_STATE_ACTIVATING
+        and (p.placement_id not in worker._dead_replicas or p.placement_id in worker._activating)
     ]
     return held
 
