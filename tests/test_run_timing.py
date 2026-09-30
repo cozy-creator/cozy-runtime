@@ -526,7 +526,7 @@ async def nested(ctx: Context, payload: Request) -> Result:
             "        return (await leaf(n=3)).value\n    return asyncio.run(nested())\n"
         )
         source += (
-            '\nfrom cozy_runtime.author import script_app\n'
+            "\nfrom cozy_runtime.author import script_app\n"
             'app = script_app("prepare_nested")\napp.job(leaf)\n'
         )
     with machine(monkeypatch, source) as pod:
