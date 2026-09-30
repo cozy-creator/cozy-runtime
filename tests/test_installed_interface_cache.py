@@ -1,277 +1,193 @@
-"""Owned installation replays reuse metadata without reimporting package code."""
+"""Real uv environments and preparation executors exercise interface reuse and repair."""
 
 from __future__ import annotations
 
 import json
-import os
-import signal
+import shutil
 import subprocess
 import sys
-import threading
-from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from pathlib import Path
-from types import MethodType, SimpleNamespace
 
 import pytest
 
-from cozy_runtime.internal import discovery, package_installation, package_interface
-from cozy_runtime.internal.worker import package_prepare
-from cozy_runtime.internal.worker.session import Worker
+from cozy_runtime.internal import package_installation, package_interface, static_interface
+from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.package_prepare import PreparationRefusal
+from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import worker_pb2 as pb
+from test_device_lanes import _config, _workspace, needs_executor
+from test_publish_derivation import _closure_rows, _image_python
+from test_unpublished_exact_dependencies import _wheel
 
-RAW = b'{"format":"cozy.package.interface/1","application":"tiny:app","entrypoints":[],"jobs":[]}'
-
-
-def installed(root: Path, identifier: str = "one") -> package_installation.InstalledEnvironment:
-    directory = root / "installations" / identifier
-    generation = directory / "venv"
-    (generation / "bin").mkdir(parents=True, exist_ok=True)
-    (generation / "bin/python").touch()
-    (generation / "lib/python3.12/site-packages").mkdir(parents=True, exist_ok=True)
-    (directory / "source").mkdir(exist_ok=True)
-    # The production record writer atomically replaces the record even if the path and
-    # contents of the environment happen to match a previous SDK incarnation.
-    package_installation._write_record(
-        directory,
-        generation,
-        {
-            "package": "test/tiny",
-            "release": "1.0",
-            "machine": package_installation.machine_sdk(),
-        },
-    )
-    return package_installation.open_installation(root, identifier)
+ROOT = Path(__file__).resolve().parent.parent
 
 
-def worker(describe: Callable[..., bytes]) -> SimpleNamespace:
-    value = SimpleNamespace(
-        preparation_slot=threading.Lock(), _installed_interfaces={}, _describe_in_slot=describe
-    )
-    value._describe_installed = MethodType(Worker._describe_installed, value)
-    return value
+@needs_executor
+@pytest.mark.parametrize("metadata,memoized", [(False, False), (True, False), (True, True)])
+def test_real_private_prepares_reuse_and_rebuild_interface(metadata: bool, memoized: bool) -> None:
+    uv = shutil.which("uv")
+    assert uv is not None
+    with _workspace() as root:
+        wheels = root / "wheels"
+        subprocess.run(
+            [uv, "build", "--wheel", "--out-dir", str(wheels), str(ROOT)],
+            check=True,
+            capture_output=True,
+        )
+        runtime = next(wheels.glob("cozy_runtime-*.whl"))
+        python = _image_python(uv, root, runtime)
+        counter = root / "imports"
+        # Observe the actual process alarm. Supervised preparation must not arm
+        # a fixed deadline; builder discovery remains explicitly bounded.
+        source = (
+            "import signal\nfrom pathlib import Path\nfrom cozy_runtime.author import App\n"
+            f"with Path({str(counter)!r}).open('a') as stream: stream.write('imported\\n')\n"
+            "assert signal.getitimer(signal.ITIMER_REAL)[0] == 0\n"
+            "app = App()\nalternate = App()\n"
+        ).encode()
+        if memoized:
+            source += (
+                b"from cozy_runtime.author import Context, invocable\n"
+                b"import msgspec\nclass Result(msgspec.Struct):\n    value: int\n"
+                b"@invocable(memoize=True)\n"
+                b"async def measure(ctx: Context, *, value: int) -> Result:\n"
+                b"    return Result(value)\n"
+                b"app.job(measure)\n"
+            )
+        resources = {
+            "cache_probe-1.0.dist-info/entry_points.txt": (
+                b"[cozy.application]\ndefault=cache_probe:app\n"
+            )
+        }
+        if metadata:
+            authored = root / "source"
+            authored.mkdir()
+            (authored / "cache_probe.py").write_bytes(source)
+            (authored / "package.toml").write_text('[application]\nobject="cache_probe:app"\n')
+            resources["cache_probe-1.0.dist-info/package-interface.json"] = (
+                package_interface.canonical_bytes(static_interface.build(authored))
+            )
+        project = _wheel(
+            wheels,
+            "cache_probe",
+            ("cozy-runtime>=0.18",),
+            source,
+            resources=resources,
+        )
+        requirements = ("\n".join(_closure_rows(uv)) + "\n").encode()
+        install_root = root / "installs"
 
+        def install() -> package_installation.InstalledEnvironment:
+            return package_installation.install(
+                install_root,
+                installation_id="captured",
+                package="local/cache-probe",
+                release="1.0",
+                python=python,
+                wheels=(runtime, project),
+                requirements=requirements,
+            )
 
-def test_private_replay_imports_real_cpu_app_once(tmp_path: Path) -> None:
-    env = installed(tmp_path)
-    counter = tmp_path / "imports"
-    (env.site_packages / "tiny.py").write_text(
-        "from cozy_runtime.author import App\n"
-        f"from pathlib import Path\nPath({str(counter)!r}).open('a').write('imported\\n')\n"
-        "app = App()\n"
-    )
-    calls = []
-
-    def describe(
-        environment: package_installation.InstalledEnvironment,
-        distribution: str,
-        *,
-        application: str,
-    ) -> bytes:
-        calls.append(environment.incarnation)
-        return subprocess.check_output(
-            [
-                sys.executable,
-                "-c",
-                "from cozy_runtime.internal.discovery import discover_installed; "
-                "from cozy_runtime.internal import package_interface; import sys; "
-                "sys.stdout.buffer.write(package_interface.canonical_bytes("
-                "package_interface.build(discover_installed('tiny:app', seconds=None))))",
-            ],
-            env={
-                **os.environ,
-                "PYTHONPATH": os.pathsep.join(
-                    [str(environment.site_packages), str(Path(__file__).parents[1] / "src")]
-                ),
-            },
+        installed = install()
+        worker = Worker(
+            _config(root / "home"),
+            WorkerOptions(
+                root=root / "worker",
+                python=str(python),
+                artifact_cache=root / "artifacts",
+                install_root=install_root,
+                tensorfs_root=root / "store",
+            ),
+            InMemoryControlHost(),
+        )
+        request = pb.PrepareLocalPackageRequest(
+            install_root=str(install_root),
+            operation_id="cache-replay",
+            files=[pb.LocalPackageFile(filename=project.name)],
+            package=pb.DevelopmentPackage(
+                package=installed.package,
+                release=installed.release,
+                installation_id=installed.installation_id,
+            ),
         )
 
-    held = worker(describe)
-    request = pb.PrepareLocalPackageRequest(
-        install_root=str(tmp_path),
-        operation_id="request",
-        files=[pb.LocalPackageFile(filename="source.tar")],
-        package=pb.DevelopmentPackage(package="test/tiny", release="1.0", installation_id="one"),
+        def prepare(_: int = 0) -> bytes:
+            return bytes(worker.prepare_local_package(request).installed_package.package_interface)
+
+        def imports() -> int:
+            return len(counter.read_text().splitlines()) if counter.exists() else 0
+
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                replies = list(pool.map(prepare, range(4)))
+            assert len(set(replies)) == 1
+            assert package_interface.parse(replies[0]).application == "cache_probe:app"
+            described = 0 if metadata and not memoized else 1
+            assert imports() == described
+            if memoized:
+                assert json.loads(replies[0])["jobs"][0]["invocable"]["operation_identity"]
+            alternate = worker._describe_installed(
+                installed, "cache-probe", application="cache_probe:alternate"
+            )
+            assert package_interface.parse(alternate).application == "cache_probe:alternate"
+            assert imports() == described + 1
+            # A genuine discovery failure is never cached.
+            for _ in range(2):
+                with pytest.raises(PreparationRefusal, match="interface_failed"):
+                    worker._describe_installed(installed, "missing-distribution")
+            assert len(worker._installed_interfaces) == described + 1
+            record_path = install_root / "installations/captured/installation.json"
+            record_path.unlink()
+            repaired = install()
+            assert repaired.generation == installed.generation
+            assert repaired.incarnation != installed.incarnation
+            assert prepare() == replies[0]
+            assert imports() == 2 * described + 1
+            # Real uv rebuilds revisit the same generation path after an SDK record
+            # changes. Its replaced record must invalidate the earlier metadata.
+            generations = []
+            incarnations = []
+            for _ in range(2):
+                record = json.loads(record_path.read_bytes())
+                record["machine"] = {"cozy-runtime": "0.0.0-old"}
+                record_path.write_text(json.dumps(record))
+                refreshed = package_installation.refresh(install_root, "captured")
+                generations.append(refreshed.generation)
+                incarnations.append(refreshed.incarnation)
+                assert prepare() == replies[0]
+            assert generations[0] == generations[1]
+            assert incarnations[0] != incarnations[1]
+            assert imports() == 4 * described + 1
+            # Adopted environments are mutable, so each description imports.
+            adopted = package_installation.open_existing_environment(
+                refreshed.python, "mutable", package=installed.package, release=installed.release
+            )
+            assert adopted.incarnation is None
+            for _ in range(2):
+                actual = worker._describe_installed(adopted, "cache-probe")
+                assert package_interface.parse(actual).application == "cache_probe:app"
+            assert imports() == 4 * described + 3
+        finally:
+            worker.shutdown()
+
+
+def test_explicit_builder_deadline_still_bounds_import(tmp_path: Path) -> None:
+    (tmp_path / "slow.py").write_text(
+        "import time\ntime.sleep(1)\nfrom cozy_runtime.author import App\napp=App()\n"
     )
-    for _ in range(2):
-        result = package_prepare.prepare_local_package(
-            request,
-            artifact_cache=tmp_path / "artifacts",
-            install_root=tmp_path,
-            python=Path(sys.executable),
-            describe=held._describe_installed,
-            verified=lambda *_: None,
-        )
-        assert (
-            package_interface.parse(result.installed_package.package_interface).application
-            == "tiny:app"
-        )
-    assert len(calls) == 1
-    assert counter.read_text() == "imported\n"
-
-
-def test_new_source_and_rebuild_same_path_miss(tmp_path: Path) -> None:
-    calls = []
-
-    def describe(
-        env: package_installation.InstalledEnvironment, *args: object, **kwargs: object
-    ) -> bytes:
-        calls.append(env)
-        return RAW
-
-    held = worker(describe)
-    first = installed(tmp_path)
-    held._describe_installed(first, "tiny")
-    held._describe_installed(package_installation.open_installation(tmp_path, "one"), "tiny")
-    rebuilt = installed(tmp_path)
-    assert rebuilt.generation == first.generation
-    assert rebuilt.incarnation != first.incarnation
-    held._describe_installed(rebuilt, "tiny")
-    held._describe_installed(installed(tmp_path, "new-source"), "tiny")
-    assert len(calls) == 3
-
-
-def test_failures_invalid_documents_and_mutable_environments_are_not_cached(tmp_path: Path) -> None:
-    answers: Iterator[Exception | bytes] = iter([ValueError("failed"), b"{}", RAW, RAW])
-    calls = []
-
-    def describe(*args: object, **kwargs: object) -> bytes:
-        calls.append(1)
-        answer = next(answers)
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
-
-    held = worker(describe)
-    env = installed(tmp_path)
-    with pytest.raises(ValueError, match="failed"):
-        held._describe_installed(env, "tiny")
-    with pytest.raises(package_interface.StalePackageInterface):
-        held._describe_installed(env, "tiny")
-    for _ in range(2):
-        held._describe_installed(replace(env, incarnation=None), "tiny")
-    assert len(calls) == 4
-    assert held._installed_interfaces == {}
-
-
-def test_distribution_application_and_concurrent_replays(tmp_path: Path) -> None:
-    calls = []
-
-    def describe(
-        env: package_installation.InstalledEnvironment, distribution: str, *, application: str
-    ) -> bytes:
-        calls.append((distribution, application))
-        return RAW
-
-    held = worker(describe)
-    env = installed(tmp_path)
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        assert (
-            list(pool.map(lambda _: held._describe_installed(env, "tiny"), range(8))) == [RAW] * 8
-        )
-    held._describe_installed(env, "other")
-    held._describe_installed(env, "tiny", application="tiny:alternate")
-    assert calls == [("tiny", ""), ("other", ""), ("tiny", "tiny:alternate")]
-
-
-def test_adopted_external_record_has_no_cache_incarnation(tmp_path: Path) -> None:
-    env = installed(tmp_path)
-    record_path = tmp_path / "installations/one/installation.json"
-    record = json.loads(record_path.read_bytes())
-    record["generation"] = str(tmp_path / "external")
-    record_path.write_text(json.dumps(record))
-    assert package_installation.open_installation(tmp_path, "one").incarnation is None
-    assert env.incarnation is not None
-
-
-def test_supervised_describe_does_not_arm_fixed_alarm(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from cozy_runtime.internal.executor import Executor
-    from cozy_runtime.internal.executor_commands import DescribeInstalled
-
-    monkeypatch.setattr(signal, "setitimer", lambda *a: pytest.fail("fixed import alarm"))
-    monkeypatch.syspath_prepend(str(tmp_path))
-    (tmp_path / "supervised_tiny.py").write_text(
-        "from cozy_runtime.author import App\napp = App()\n"
+    (tmp_path / "package.toml").write_text('[application]\nobject="slow:app"\n')
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; "
+            "from cozy_runtime.internal.discovery import discover; "
+            f"discover(Path({str(tmp_path)!r}), seconds=0.01)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    executor = Executor.__new__(Executor)
-    assert executor.describe_installed(
-        DescribeInstalled(
-            distribution="unused",
-            application="supervised_tiny:app",
-            output=str(tmp_path / "interface.json"),
-        )
-    )["ok"]
-
-
-def test_explicit_builder_deadline_remains(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = []
-    monkeypatch.setattr(signal, "setitimer", lambda *a: calls.append(a))
-    with discovery._wall_clock(60, "tiny:app"):
-        pass
-    assert [seconds for _, seconds in calls] == [60, 0]
-
-
-def test_sdk_rollback_rebuilds_same_generation_and_misses(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    sdk = {"cozy-runtime": "first"}
-    monkeypatch.setattr(package_installation, "machine_sdk", lambda: dict(sdk))
-    env = installed(tmp_path)
-    calls = []
-
-    def describe(
-        env: package_installation.InstalledEnvironment, *args: object, **kwargs: object
-    ) -> bytes:
-        calls.append(env.incarnation)
-        return RAW
-
-    held = worker(describe)
-
-    def build(directory: Path, generation: Path, python: Path, **kwargs: object) -> dict[str, str]:
-        (generation / "bin").mkdir(parents=True)
-        (generation / "bin/python").touch()
-        (generation / "lib/python3.12/site-packages").mkdir(parents=True)
-        return dict(sdk)
-
-    monkeypatch.setattr(package_installation, "_build", build)
-    generations = []
-    for version in ("second", "third", "second"):
-        sdk["cozy-runtime"] = version
-        env = package_installation.refresh(tmp_path, env.installation_id)
-        generations.append(env.generation)
-        held._describe_installed(env, "tiny")
-    assert generations[0] == generations[2]
-    assert len(set(calls)) == 3
-
-
-def test_repair_replaces_record_even_with_same_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    env = installed(tmp_path)
-    calls = []
-
-    def describe(
-        env: package_installation.InstalledEnvironment, *args: object, **kwargs: object
-    ) -> bytes:
-        calls.append(env.incarnation)
-        return RAW
-
-    held = worker(describe)
-    held._describe_installed(env, "tiny")
-    # A missing record makes installation creation repair the retained uv state.
-    (tmp_path / "installations/one/installation.json").unlink()
-    monkeypatch.setattr(package_installation, "_build", lambda *a, **k: {})
-    repaired = package_installation.install(
-        tmp_path,
-        package=env.package,
-        release=env.release,
-        python=Path(sys.executable),
-        installation_id=env.installation_id,
-    )
-    assert repaired.generation == env.generation
-    assert repaired.incarnation is not None
-    held._describe_installed(repaired, "tiny")
-    assert len(set(calls)) == 2
+    assert done.returncode != 0
+    assert "import_timeout" in done.stderr or "0.01" in done.stderr
