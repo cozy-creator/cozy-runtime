@@ -49,6 +49,9 @@ class Store:
     def unit_loads(self, name: str, keys: frozenset[str]) -> bool:
         return not self.whole
 
+    def load_schema(self, name: str, unit: tiers.Unit) -> tiers.RefillSchema:
+        return tiers.RefillSchema(tuple(tensor.dtype for *_, tensor in unit.slots()))
+
     def transient(self, name: str) -> int:
         return 0
 

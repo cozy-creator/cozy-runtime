@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import memory, proctree
+from cozy_runtime.internal import memory, proctree, tiers
 
 
 @pytest.mark.parametrize(
@@ -94,6 +94,9 @@ def test_modeled_invoke_refills_disk_weights_and_records_the_invoke_leg(
 
         def unit_loads(self, name: str, keys: frozenset[str]) -> bool:
             return False
+
+        def load_schema(self, name: str, unit: tiers.Unit) -> tiers.RefillSchema:
+            return tiers.RefillSchema(tuple(tensor.dtype for *_, tensor in unit.slots()))
 
         def transient(self, name: str) -> int:
             return 0
