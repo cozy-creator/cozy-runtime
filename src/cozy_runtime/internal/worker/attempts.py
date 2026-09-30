@@ -266,6 +266,7 @@ class AttemptRefusal(Exception):
         cause: pb.CauseCode,
         drop: bool = False,
         origin: pb.CauseOrigin = ORIGIN.CAUSE_ORIGIN_WORKER,
+        preparation_memory: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
@@ -276,6 +277,7 @@ class AttemptRefusal(Exception):
         #: A caller-supplied address is the caller's typed error; a platform-produced one
         #: stays platform-fatal, and the two must never render as the same terminal.
         self.origin = origin
+        self.preparation_memory = dict(preparation_memory or {})
 
 
 @dataclass(frozen=True, slots=True)
