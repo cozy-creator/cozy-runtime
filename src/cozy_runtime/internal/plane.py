@@ -99,9 +99,9 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
 
 class Event(msgspec.Struct, frozen=True, kw_only=True):
     kind: str
-    ws: str | int = ""
-    region: int = -1
-    device: int = -1
+    ws: str | None = None
+    region: int | None = None
+    device: int | None = None
     bytes: int = 0
     ns: int = 0
     detail: str = ""
@@ -115,7 +115,10 @@ def open_plane(device: int) -> Any:
     """One plane per executor process (phase 1), over this rank's device."""
     if _plane is None:
         raise Unavailable("this TensorFS build carries no weight plane")
-    return _plane.Plane(devices=[device])
+    try:
+        return _plane.Plane(devices=[device])
+    except _plane.PlaneError as exc:  # no CUDA driver here (CPU or MPS executor)
+        raise Unavailable(f"the weight plane cannot open device {device}: {exc}") from exc
 
 
 def stats(plane: Any) -> Stats:

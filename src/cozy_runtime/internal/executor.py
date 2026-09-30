@@ -2693,6 +2693,8 @@ class Executor:
 
         if self.residency is not None:
             self.residency.open_attempt()
+        if self.host.weights is not None:
+            self.host.weights.modes.clear()
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
@@ -2780,6 +2782,11 @@ class Executor:
         self._emit_attention(
             record, attention.observed(self._attention_roots()), "attention.restored"
         )
+        # THE MODES THIS ATTEMPT RAN IN (weight-plane.md principle 7): decode tiling and batch
+        # layout, each decided before its stage and recorded with the run.
+        plane_facts = self._plane_facts()
+        for stage, mode in sorted((plane_facts or {}).get("modes", {}).items()):
+            record.emit("confession", "weights.mode", mode, stage=stage)
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = self.host._attempt_spool = None
         self.host._attempt_request = ""
@@ -2804,6 +2811,8 @@ class Executor:
         working_peak = _working_peak(peak_vram, allocated_at_start, residency_document)
         if self.group is not None:
             working_peak = max(working_peak, *self.group.working_peaks.values(), 0)
+        if plane_facts is not None:
+            plane_facts["activation_peak_bytes"] = working_peak
         # step 3: the lease releases here, and nothing after this line touches the device.
         # DEVICE RELEASE IS THIS REPLY (cr-079): the handler registered its outputs as raw
         # host frames, so `device_lease_ms` is device time and the encode is the worker's.
@@ -2880,6 +2889,7 @@ class Executor:
             ],
             "ignored": list(record.ignored),
             "oversize_result_bytes": oversize,
+            "plane": plane_facts,
             "metrics": {
                 "handler_ms": round(handler_ms, 3),
                 "device_lease_ms": round(lease_ms, 3),

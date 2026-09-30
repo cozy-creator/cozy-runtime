@@ -252,7 +252,7 @@ class Weights:
         self._evicted(
             (event.ws, event.region)
             for event in plane.events(self.plane)
-            if event.kind == "evicted"
+            if event.kind == "evicted" and event.ws is not None and event.region is not None
         )
 
     def _evicted(self, pairs: Any) -> None:
@@ -983,6 +983,23 @@ def _restore_derived(held: Mapping[tuple[Any, str], Any], device: Any) -> None:
 # -------------------------------------------------------------------------- the stages
 
 
+class StageExit(msgspec.Struct, frozen=True, kw_only=True):
+    """One stage's measured facts at scope exit, for the scheduler's cost book (W4)."""
+
+    method: str
+    components: tuple[str, ...]
+    passes: dict[str, int]
+    wall_ns: int
+    #: torch's peak above its bytes at stage entry: activations and decode scratch
+    growth_bytes: int
+    #: the plane's streaming facts for this stage: late copies, the GPU wait on them, bytes
+    late: int
+    stall_ns: int
+    streamed_bytes: int
+    resident_blocks: dict[str, int]
+    window: dict[str, int]
+
+
 class WeightResidency:
     """The author `Residency` on the plane: `admit`/`release` per component-use scope (a
     stage), one wrapper per block. Installed on a constructed generation as
@@ -1010,8 +1027,12 @@ class WeightResidency:
         self.batch: dict[str, int] = {}
         self.baseline = -1
         #: The scheduler's turn (W4, `stage/1`): called before a stage plans, returns the
-        #: plane budget the Worker granted for it, or None to keep the current one.
+        #: plane budget the Worker granted for it, or None to keep the current one; and its
+        #: sink for each stage's measured facts at exit.
         self.turn: Callable[[str, tuple[str, ...]], int | None] | None = None
+        self.exit: Callable[[StageExit], None] | None = None
+        self.entered_ns = 0
+        self.stage_mark = (0, 0, 0)
         self._mismatch = plane.error("ScheduleMismatch") if plane.available() else Exception
         self._shortfall_error = plane.error("Shortfall") if plane.available() else Exception
         for component in self.components.values():
@@ -1056,6 +1077,9 @@ class WeightResidency:
             bind(weights.torch, component, component.regions[0], component.common.slot)
         self.baseline = accel.allocated(weights.torch, weights.kind)
         accel.reset_peak(weights.torch, weights.kind)
+        self.entered_ns = time.perf_counter_ns()
+        if self.exit is not None:
+            self.stage_mark = _stage_totals(weights, method)
 
     def release(self, method: str, components: tuple[str, ...]) -> None:
         if self.active is None:
@@ -1075,6 +1099,7 @@ class WeightResidency:
             # first when another stage wants the room.
             weights.plane.want(component.ws, weights.index, list(component.resident), priority=idle)
         weights.drain()
+        peak = 0
         if self.baseline >= 0:
             peak = max(accel.peak_allocated(weights.torch, weights.kind) - self.baseline, 0)
             self.peaks[method] = max(self.peaks.get(method, 0), peak)
@@ -1083,6 +1108,31 @@ class WeightResidency:
             self.per_item[method] = max(self.per_item.get(method, 0), item)
         self.baseline = -1
         self.active = None
+        if self.exit is not None:
+            late, stall, streamed = (
+                now - then
+                for now, then in zip(_stage_totals(weights, method), self.stage_mark, strict=True)
+            )
+            placed = {name: self.components[name] for name in local}
+            self.exit(
+                StageExit(
+                    method=method,
+                    components=local,
+                    passes={name: c.last_passes for name, c in placed.items()},
+                    wall_ns=time.perf_counter_ns() - self.entered_ns,
+                    growth_bytes=peak,
+                    late=late,
+                    stall_ns=stall,
+                    streamed_bytes=streamed,
+                    resident_blocks={
+                        name: len(c.residence.resident) if c.residence else 0
+                        for name, c in placed.items()
+                    },
+                    window={
+                        name: c.residence.window if c.residence else 0 for name, c in placed.items()
+                    },
+                )
+            )
 
     # -- the executor's and the package's calls
 
@@ -1201,13 +1251,28 @@ class WeightResidency:
             component = components[name]
             close_cursor(component)
             component.residence = residence
+            before = set(component.resident)
             component.resident = (0, *(index + 1 for index in residence.resident))
+            if name in resume and (stale := sorted(before - set(component.resident))):
+                # A re-plan inside the stage: what left the prefix leaves the device, so the
+                # cursor's slots have the room the lower budget promised them.
+                weights.plane.drop(component.ws, weights.index, stale)
+                for index in stale:
+                    unbind(component.regions[index])
             try:
                 weights.plane.want(
                     component.ws, weights.index, list(component.resident), priority=priority
                 )
             except self._shortfall_error as exc:
                 raise self._shortfall(method, need, budget, str(exc)) from None
+            # The resident set binds for the whole stage, ordered after its fills on the
+            # compute stream: code that reads a resident weight outside its block's forward
+            # sees real bytes, exactly as when the component was simply on the device.
+            stream = weights.stream()
+            for index in component.resident:
+                lease = weights.plane.acquire(component.ws, weights.index, index, stream)
+                bind(weights.torch, component, component.regions[index], None)
+                lease.release()
             if residence.streamed and component.observed:
                 order = component.order
                 start = order.index(resume[name]) if name in resume else 0
@@ -1380,6 +1445,20 @@ class WeightResidency:
             raise ResidencyRefusal(
                 "residency_poisoned", f"{what}() against a poisoned weight plane: {self.poisoned}"
             )
+
+
+def _stage_totals(weights: Weights, tag: str) -> tuple[int, int, int]:
+    """The plane's cumulative (late, stall ns, streamed bytes) for stages tagged `tag`."""
+    rows = [
+        row
+        for row in plane.stats(weights.plane).stages
+        if row.tag == tag and row.device == weights.index
+    ]
+    return (
+        sum(row.late for row in rows),
+        sum(row.stall_ns for row in rows),
+        sum(row.streamed_bytes for row in rows),
+    )
 
 
 def _versions(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[int, ...]:
