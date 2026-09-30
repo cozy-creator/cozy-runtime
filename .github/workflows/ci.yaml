@@ -48,8 +48,17 @@ jobs:
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$a"
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$b"
           cmp "$a"/*.whl "$b"/*.whl
-      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
-        run: uv run pytest
+      - name: Full test suite under delegated processes
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: |
+          sudo systemd-run --wait --pipe --collect \
+            --unit="cozy-runtime-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            --setenv="UV_CACHE_DIR=$UV_CACHE_DIR" \
+            --setenv="UV_PYTHON_INSTALL_DIR=$(uv python dir)" \
+            .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main([]))'
       # Older Runtimes' executors against this worker; their locked environments are cached.
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         uses: actions/cache@v4
