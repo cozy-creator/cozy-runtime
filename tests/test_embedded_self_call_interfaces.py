@@ -12,6 +12,8 @@ import msgspec
 import pytest
 
 from cozy_runtime.internal import package_interface, static_interface
+from cozy_runtime.internal.executor_commands import CallInterface
+from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR, _wheel_rows
@@ -129,6 +131,25 @@ def test_real_installed_root_keeps_self_exports_and_calls_child(
             entrypoint="double",
         )
         pod.captured, pod.capture_digest = documents.identity(capture)
+        original_bindings = pod.worker.calls.bindings
+        observed_roots: set[str] = set()
+
+        def bindings(attempt: AttemptRecord) -> tuple[CallInterface, ...]:
+            rows = original_bindings(attempt)
+            indexed = {(row.module, row.export): row for row in rows}
+            assert len(indexed) == len(rows), "an export has multiple executor bindings"
+            if attempt.request_id in {"first", "reused"}:
+                ordinary = indexed["prepare_nested", "ordinary"]
+                child = indexed["prepare_nested", "child"]
+                dependency = indexed["prepare_dependency", "double"]
+                assert ordinary.self_call and ordinary.kind == "entrypoint"
+                assert child.self_call and child.kind == "job"
+                assert not dependency.self_call and dependency.kind == "job"
+                assert dependency.interface_document is not None
+                observed_roots.add(attempt.request_id)
+            return rows
+
+        monkeypatch.setattr(pod.worker.calls, "bindings", bindings)
         executor_pids: set[int] = set()
         for request in ("first", "reused"):
             pod.submit(request)
@@ -153,6 +174,7 @@ def test_real_installed_root_keeps_self_exports_and_calls_child(
                 "SELECT child_request FROM execution_calls WHERE parent_request='" + request + "'"
             )
             assert len(calls) == 2
+        assert observed_roots == {"first", "reused"}
         assert executor_pids
         pod.wait(
             "child attempts to close",
