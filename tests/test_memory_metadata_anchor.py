@@ -504,3 +504,47 @@ def test_production_anchor_refill_uses_real_store_and_pending_dtype_demand(
     assert torch.equal(root.marker.weight, originals["marker.weight"].double())
     assert all(unit.tier == tiers.DISK for unit in part.blocks)
     owner._validate_component(held)
+
+
+def test_post_operation_contract_failure_rolls_back_managed_rng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = pure(Network())
+    owner, held = adopted(root)
+    for unit in held.part.units:
+        unit.tier = tiers.DEVICE
+    owner.cuda = True
+    monkeypatch.setattr(owner, "_allocated", lambda: 0)
+    monkeypatch.setattr(owner, "_reserved", lambda: 0)
+    monkeypatch.setattr(owner, "allocatable", lambda: 10000)
+    monkeypatch.setattr(owner, "_cap", lambda: None)
+    monkeypatch.setattr(owner, "_sample", lambda: None)
+    arm, rollback = owner._arm, owner._rollback
+
+    def cpu_arm(*args: Any) -> memory.Snapshot:
+        owner.cuda = False
+        try:
+            return arm(*args)
+        finally:
+            owner.cuda = True
+
+    def cpu_rollback(*args: Any) -> None:
+        owner.cuda = False
+        try:
+            rollback(*args)
+        finally:
+            owner.cuda = True
+
+    monkeypatch.setattr(owner, "_arm", cpu_arm)
+    monkeypatch.setattr(owner, "_rollback", cpu_rollback)
+    before = torch.get_rng_state().clone()
+
+    def invalid_forward() -> Any:
+        value = torch.rand(1)
+        root.extra = torch.nn.Linear(2, 2)  # violates the positively declared immutable graph
+        return value
+
+    with torch.no_grad(), pytest.raises(memory.MemoryRefusal, match="geometry changed"):
+        owner.run(held, "forward", invalid_forward, (), {})
+    assert torch.equal(torch.get_rng_state(), before)
+    assert owner.unusable and not owner.stack

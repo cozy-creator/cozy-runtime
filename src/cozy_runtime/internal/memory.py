@@ -1333,6 +1333,7 @@ class Planner:
                     entered = True
                     with self._traffic(counts, "invoke"):
                         out = fn(*args, **kwargs)
+                    self._validate_active(held)
                 except BaseException as exc:
                     oom = is_oom(exc)
                     if oom:
@@ -1357,7 +1358,6 @@ class Planner:
                     if not oom:
                         raise
                 else:
-                    self._validate_active(held)
                     self._sample()
                     assert frame is not None
                     self.working = max(self.working, frame.working)
