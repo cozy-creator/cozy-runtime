@@ -63,7 +63,7 @@ def test_custom_wrapper_cannot_claim_peft_output_contract() -> None:
     pytest.importorskip("peft")
     from cozy_runtime.internal import attention
 
-    class Custom(torch.nn.Module):
+    class Custom:
         # Even upstream module spelling plus the same method is insufficient authority.
         __module__ = "peft.tuners.lora.layer"
 
