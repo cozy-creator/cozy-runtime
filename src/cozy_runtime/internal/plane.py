@@ -126,12 +126,13 @@ def available() -> bool:
     return _plane is not None
 
 
-def open_plane(device: int) -> Any:
-    """One plane per executor process (phase 1), over this rank's device."""
+def open_plane(device: int | None) -> Any:
+    """One plane per executor process (phase 1), over this rank's device; `None` opens the
+    host tier alone (no CUDA), which fills pinned memory before any device is granted."""
     if _plane is None:
         raise Unavailable("this TensorFS build carries no weight plane")
     try:
-        return _plane.Plane(devices=[device])
+        return _plane.Plane(devices=[] if device is None else [device])
     except _plane.PlaneError as exc:  # no CUDA driver here (CPU or MPS executor)
         raise Unavailable(f"the weight plane cannot open device {device}: {exc}") from exc
 

@@ -1,14 +1,16 @@
-"""The executor's weights on the real weight plane, on the card (weight-plane.md §4).
+"""The executor's weights on the real weight plane (weight-plane.md §4).
 
-Real: a TensorFS store holding a block model's weights, `tensorfs.plane` on device 0, the
-runtime's `PlaneBackend` and `WeightResidency`, torch on CUDA. The model is small and exact:
-a stack of declared no-split blocks whose forward reads every weight, so any byte streamed
-wrong changes the output. Run it under the shared GPU lock: it holds the whole card.
+Real: a TensorFS store holding a block model's weights, `tensorfs.plane`, the runtime's
+`PlaneBackend` and `WeightResidency`, torch. The model is small and exact: a stack of
+declared no-split blocks whose forward reads every weight, so any byte streamed wrong changes
+the output. The host tier runs without a card; the rest needs device 0 and holds the whole
+card, so run it under the shared GPU lock.
 """
 
 from __future__ import annotations
 
 import io
+import mmap
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -28,10 +30,8 @@ from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights  # noqa: E402
 from cozy_runtime.internal.weights_sink import weights_transaction_id  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not plane.available(),
-    reason="the weight plane on a CUDA card",
-)
+pytestmark = pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
+on_card = pytest.mark.skipif(not torch.cuda.is_available(), reason="a CUDA card")
 
 HIDDEN = 2048
 BLOCKS = 8
@@ -63,7 +63,7 @@ class Stack(torch.nn.Module):  # type: ignore[misc,name-defined]
         return x
 
 
-def write_checkpoint(root: Path) -> Checkpoint:
+def write_checkpoint(root: Path) -> tuple[Checkpoint, dict[str, Any]]:
     """Sane fp16 weights (a fixed seed, small values) in a real TensorFS store."""
     generator = torch.Generator().manual_seed(7)
     values: dict[str, Any] = {"embed": torch.rand(HIDDEN, generator=generator) + 0.5}
@@ -85,14 +85,15 @@ def write_checkpoint(root: Path) -> Checkpoint:
             targets={"stack": Target(add=tensors)},
             configs={"stack": NativeConfig("add")},
             order=tuple(("stack", key) for key in values),
-        ).native_arguments(4096),
+        ).native_arguments(1 << 30),
         work_fingerprint="sha256:" + "2" * 64,
     )
     for key, value in values.items():
         writer.add_part("stack", key, "value", io.BytesIO(value.half().numpy().tobytes()))
     writer.add_config("stack", io.BytesIO(b"{}"))
     receipt = writer.commit()
-    return Checkpoint(root / "store", "sha256:" + receipt["manifest"]["sha256"])
+    manifest = "sha256:" + receipt["manifest"]["sha256"]
+    return Checkpoint(root / "store", manifest), {k: v.half() for k, v in values.items()}
 
 
 def load(weights: Weights, checkpoint: Checkpoint, key: str, *, reverse: bool = False) -> Any:
@@ -142,9 +143,28 @@ def tight(model: Any) -> int:
 def card(tmp_path: Path) -> Any:
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
-    return SimpleNamespace(weights=weights, checkpoint=write_checkpoint(tmp_path))
+    return SimpleNamespace(weights=weights, checkpoint=write_checkpoint(tmp_path)[0])
 
 
+def test_the_pinned_tier_holds_every_part_where_the_layout_says(tmp_path: Path) -> None:
+    weights = Weights(torch, torch.device("cpu"), "cpu")
+    weights.set_budget(-1, pinned=1 << 30)
+    checkpoint, values = write_checkpoint(tmp_path)
+    component = load(weights, checkpoint, "host").backend.components["stack"]
+    assert [region.path for region in component.regions] == [""] + [
+        f"blocks.{i}" for i in range(BLOCKS)
+    ]
+    weights.plane.want(component.ws, "pinned").wait()
+    held = mmap.mmap(component.ws.host_fd, component.ws.nbytes, prot=mmap.PROT_READ)
+    for region in component.regions:
+        for weight in region.weights:
+            ((offset, _, _),) = weight.parts.values()
+            start = region.offset + offset
+            expected = values[weight.row.name].numpy().tobytes()
+            assert held[start : start + len(expected)] == expected, weight.row.name
+
+
+@on_card
 def test_streamed_blocks_are_bit_identical_to_resident(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "exact")
@@ -161,6 +181,7 @@ def test_streamed_blocks_are_bit_identical_to_resident(card: Any) -> None:
     assert same(resident, streamed)
 
 
+@on_card
 def test_the_execution_order_is_learned_then_streamed(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "reverse", reverse=True)
@@ -173,6 +194,7 @@ def test_the_execution_order_is_learned_then_streamed(card: Any) -> None:
     assert same(resident, run(model, x))
 
 
+@on_card
 def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "oom")
@@ -190,6 +212,7 @@ def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> Non
     assert same(reference, retried)
 
 
+@on_card
 def test_an_idle_construction_gives_room_and_returns_from_the_pinned_tier(card: Any) -> None:
     weights = card.weights
     first = load(weights, card.checkpoint, "first")

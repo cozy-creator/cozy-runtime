@@ -164,7 +164,7 @@ class Weights:
         self.device = device
         self.kind = kind
         self.index = int(device.index or 0)
-        self.plane = plane.open_plane(self.index)
+        self.plane = plane.open_plane(self.index if device.type == "cuda" else None)
         #: the Worker's budgets; -1: none given, each stage derives one from the driver
         self.budget = -1
         self.pinned = -1
