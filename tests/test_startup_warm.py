@@ -77,16 +77,20 @@ def _interface(degrees: tuple[int, ...] = ()) -> bytes:
 
 
 #: Every process of the package environment loads this first: each call that would reach the
-#: CUDA driver is appended to `LOG` with its pid; the lazy init is refused, the count is zero.
+#: CUDA driver is appended to `LOG` with its pid. Refusing, the lazy init raises and the count
+#: is zero; recording only (a real card), both reach the driver.
 GUARD = """import importlib.abc, os, sys
 
 LOG = {log!r}
+REFUSE = {refuse!r}
 
 
-def _attempt(name, answer):
+def _attempt(name, real, answer):
     def attempt(*args, **kwargs):
         with open(LOG, "a") as log:
             log.write(f"{{os.getpid()}} {{name}}\\n")
+        if not REFUSE:
+            return real(*args, **kwargs)
         if answer is None:
             raise RuntimeError(f"{{name}}: this test environment reaches no CUDA driver")
         return answer
@@ -112,8 +116,10 @@ class _Guard(importlib.abc.MetaPathFinder):
 
             def exec_module(self, module):
                 real.exec_module(module)
-                module._cuda_init = _attempt("_cuda_init", None)
-                module._cuda_getDeviceCount = _attempt("_cuda_getDeviceCount", 0)
+                module._cuda_init = _attempt("_cuda_init", module._cuda_init, None)
+                module._cuda_getDeviceCount = _attempt(
+                    "_cuda_getDeviceCount", module._cuda_getDeviceCount, 0
+                )
 
         spec.loader = Loader()
         return spec
@@ -123,10 +129,12 @@ sys.meta_path.insert(0, _Guard())
 """
 
 
-def _install(root: Path, installation: str = INSTALLATION) -> None:
+def _install(
+    root: Path, installation: str = INSTALLATION, *, refuse: bool = True, package: Path = MARCO
+) -> None:
     """A package environment as the worker records one: its own venv, whose path reaches this
-    interpreter's packages (torch, the runtime) and the marco-polo package it serves, and whose
-    every process records its CUDA driver attempts (`GUARD`) in `cuda-attempts.log`."""
+    interpreter's packages (torch, the runtime) and the package it serves (marco-polo), and
+    whose every process records its CUDA driver attempts (`GUARD`) in `cuda-attempts.log`."""
     home = root / "installations" / installation
     venv = home / "venv"
     subprocess.run(
@@ -135,10 +143,10 @@ def _install(root: Path, installation: str = INSTALLATION) -> None:
     )
     (site,) = (venv / "lib").glob("python*/site-packages")
     (site / "startup_warm_cuda_guard.py").write_text(
-        GUARD.format(log=str(home / "cuda-attempts.log"))
+        GUARD.format(log=str(home / "cuda-attempts.log"), refuse=refuse)
     )
     (site / "startup_warm_fixture.pth").write_text(
-        f"import site; site.addsitedir({sysconfig.get_paths()['purelib']!r})\n{MARCO}\n"
+        f"import site; site.addsitedir({sysconfig.get_paths()['purelib']!r})\n{package}\n"
         "import startup_warm_cuda_guard\n"
     )
     (home / "installation.json").write_text(
@@ -217,12 +225,13 @@ class Warm(Machine):
     """The scheduler harness's worker, with a package environment, a store and an artifact
     cache: what a machine preparing a serving child actually holds."""
 
-    def __init__(self, root: Path, devices: str) -> None:
+    def __init__(self, root: Path, devices: str, kernel_cache: Path | None = None) -> None:
         self.worker = Worker(
             replace(
                 _config(root / "home"),
                 record_owner_public_key=signed_claims.PUBLIC_KEY,
                 object_storage_hosts=("127.0.0.1",),
+                kernel_cache=kernel_cache,
             ),
             WorkerOptions(
                 **signed_claims.IDENTITY,
