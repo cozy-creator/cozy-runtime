@@ -282,16 +282,14 @@ def test_scope_minimum_reclaims_sibling_blocks_without_evicting_common(
     monkeypatch.setattr(owner, "allocatable", lambda: 24 - allocated())
     monkeypatch.setattr(owner, "_cap", lambda: None)
     monkeypatch.setattr(owner, "_home", lambda part, unit: setattr(unit, "tier", tiers.HOST))
-    monkeypatch.setattr(
-        owner, "_load_common", lambda held: setattr(held.part.common, "tier", tiers.DEVICE)
-    )
+    monkeypatch.setattr(owner, "_load", lambda part, unit: setattr(unit, "tier", tiers.DEVICE))
     owner.enter("c", "render", ("first", "last"))
     assert first.part.common.tier == second.part.common.tier == tiers.DEVICE
     assert [unit.tier for unit in first.part.blocks] == [tiers.HOST, tiers.DEVICE]
     assert allocated() == 20
 
 
-def test_replay_reclaims_sibling_common_even_at_minimum_block_residency(
+def test_replay_cannot_reclaim_the_only_scope_metadata_backing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     owner = memory.Planner(torch, torch.device("cpu"))
@@ -341,11 +339,12 @@ def test_replay_reclaims_sibling_common_even_at_minimum_block_residency(
             raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 4 B")
         return value + 1
 
-    with torch.no_grad():
-        result = owner.run(held, "decode", decode, (torch.ones(1),), {})
-        assert torch.equal(result, torch.tensor([2.0]))
-    assert calls == [8, 24]  # Full measured gain before a second body invocation.
-    assert other.part.common.tier == tiers.HOST
+    with torch.no_grad(), pytest.raises(memory.MemoryRefusal, match="no smaller placement"):
+        owner.run(held, "decode", decode, (torch.ones(1),), {})
+    # There is no operation-only remainder: the sibling's real metadata backing
+    # cannot disappear just because a replay wants more room.
+    assert calls == [8]
+    assert other.part.common.tier == tiers.DEVICE
     assert owner.room_asks == 0
 
 

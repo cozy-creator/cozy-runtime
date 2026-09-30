@@ -13,6 +13,7 @@ import pytest
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker.call_timing import Timing
 from cozy_runtime.internal.worker.machine_calls import CallRecord
+from cozy_runtime.internal.worker.run_timing import Timing as RunTiming
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
@@ -191,7 +192,7 @@ def test_worker_execution_boundary_excludes_preparation_and_postprocessing(
         return outcome
 
     worker = SimpleNamespace(
-        machine_calls=SimpleNamespace(timing=timing),
+        machine_calls=SimpleNamespace(timing=timing, run_timing=RunTiming(executions)),
         fence=SimpleNamespace(record_owner_id="owner"),
         memory=SimpleNamespace(),
         _store_phase=lambda *_: nullcontext(),

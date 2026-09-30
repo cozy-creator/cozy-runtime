@@ -15,6 +15,7 @@ things a package author touches, minus the codec plane (cr-017). Per-service fak
 """
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import App, Registration, RegistrationError
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef, SourceArtifact
 from cozy_runtime.author._assets import (
@@ -299,6 +300,7 @@ __all__ = [
     "Surface",
     "Telemetry",
     "TensorSpec",
+    "ThreadPoolExecutor",
     "Tree",
     "UnsupportedInput",
     "VideoAsset",

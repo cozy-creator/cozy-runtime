@@ -30,3 +30,36 @@ Creator routing in this increment is limited to explicit same-machine selection.
 Existing default and cross-machine published orchestration remains in place. Durable
 external delegation and default placement policy remain followups in cr170/cl259;
 package publication alone must not choose an execution coordinator.
+
+## Execution duration
+
+`run.timing` records the elapsed union of cooperative author execution across a root
+and its children. Model installation, preparation, GPU admission, and periods when all
+author event loops are blocked do not count. Synchronous author work and callbacks in
+`asyncio.to_thread` / `run_in_executor` do count, including work concurrent with another
+call's queue wait. This is elapsed executor work, not a CPU/GPU utilization meter.
+
+The observation lives at the shared invocation boundary. Selector transitions stay on
+the private executor channel; ordinary progress and execution boundaries publish a
+cumulative snapshot. The journal keeps only the latest snapshot per root attempt,
+preserving settled attempts across retry and never adding their paused gaps.
+
+Older executors, a lost activity observation, an interrupted clock, new untracked Python
+threads, and unsupported event-loop policies report unknown execution duration.
+Threads already present at the executor's first author call form its baseline;
+independent work on those pre-existing threads is outside this cooperative measurement.
+Windows and custom loop policies retain their normal execution behavior. The client
+must not replace unknown execution with admission-to-outcome wall time or advance a
+stale snapshot using its own clock. Timing failures cannot fail accepted execution.
+
+Authors that keep their own background pools can import `ThreadPoolExecutor` from
+`cozy_runtime.author`. It preserves the standard executor's constructor, futures,
+cancellation, initializer, and shutdown behavior. Each submission captures its current
+invocation for timing; only executing callbacks count, so an idle pool can survive many
+calls without adding wait time. Submissions outside an invocation remain ordinary work.
+`asyncio.to_thread` and `run_in_executor` participate automatically. A joined helper
+thread nested inside tracked work is covered by that work's interval; a raw thread that
+continues after its tracked caller becomes idle makes the measurement unknown.
+The plain-script adapter uses the same observed loop and ends its author clock before
+framework shutdown. A synchronous script can still create its own event loop; managed
+child waits on an unobserved loop make its execution duration unknown.

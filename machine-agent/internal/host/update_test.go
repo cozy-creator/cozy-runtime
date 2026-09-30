@@ -41,6 +41,8 @@ func (*updateLauncher) launch(string) (*runtimeProcess, error) {
 func (*updateLauncher) close() {}
 func (l *updateLauncher) maintain(op string, _ []string) (string, error) {
 	switch op {
+	case "software-state":
+		return `{"quiescent":true}`, nil
 	case "pair":
 		if l.pairReady != nil {
 			<-l.pairReady
@@ -402,10 +404,13 @@ func TestNativeUpdateDefaultsLegacyPinIntent(t *testing.T) {
 			}
 			body += "}"
 			reply := updateCall(server.Client(), http.MethodPost, server.URL+"/v1/machine/runtime/update", token, strings.NewReader(body))
-
 			if reply.code != http.StatusAccepted || reply.status.Pinned != (decision == "true") {
 				close(gate)
 				t.Fatalf("pin intent changed: %+v", reply)
+			}
+			if reply.status.Request == nil || reply.status.Request.Agent != "explicit" {
+				close(gate)
+				t.Fatalf("legacy request changed the running agent selection: %+v", reply.status.Request)
 			}
 			close(gate)
 			awaitUpdate(t, server, token, "pin-proof")

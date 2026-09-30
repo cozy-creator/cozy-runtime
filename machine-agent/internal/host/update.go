@@ -265,26 +265,22 @@ func (m *Machine) stageWheel(file string, body io.Reader) (string, int64, error)
 	return digest, size, os.Rename(temp.Name(), filepath.Join(dir, file))
 }
 
-// Selection reports the running application, including a retained repair fallback.
+// Report the running application, including a retained repair fallback.
 func (m *Machine) runningAgentSelection(digest string) (string, bool) {
 	selection := "explicit"
 	if bundledAgentPolicy(m.layout.Root) {
 		selection = "bundled"
 	}
-	if m.grant.bootstrap != nil {
-		if m.startupPending() {
-			selection = m.grant.bootstrap.Selection
-		}
+	if m.grant.bootstrap != nil && m.startupPending() {
+		selection = m.grant.bootstrap.Selection
 	}
-	repairFallback := false
 	if selection == "bundled" {
 		bundleHash, err := hashFile(filepath.Join(m.layout.Root, "opt/cozy/python/bin/cozy-machine"))
 		if err != nil || bundleHash != digest {
-			selection = "explicit"
-			repairFallback = true
+			return "explicit", true
 		}
 	}
-	return selection, repairFallback
+	return selection, false
 }
 
 func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
@@ -297,21 +293,17 @@ func (m *Machine) serveUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "an update requires operation, valid agent selection, and a Runtime or TensorFS", http.StatusBadRequest)
 		return
 	}
-	// runtime-update/1 clients omit selection intent. Preserve the current agent
-	// and keep their default-latest Runtime/TensorFS request unpinned.
+	// Older clients omit selection intent. Preserve their unpinned update and
+	// the currently running agent instead of requiring synchronized upgrades.
 	if request.Pin == nil {
 		pin := false
 		request.Pin = &pin
 	}
 	if request.Agent == "" {
-		digest, err := hashFile("/proc/self/exe")
-		if err != nil {
-			// The v1 request carries no agent intent. Keep the daemon's
-			// current policy if executable identity cannot be read; the
-			// v2 response still reports the identity when available.
-			request.Agent = m.transactionAgent()
-		} else {
+		if digest, err := hashFile("/proc/self/exe"); err == nil {
 			request.Agent, _ = m.runningAgentSelection(digest)
+		} else {
+			request.Agent = m.transactionAgent()
 		}
 		if request.Agent != "bundled" && request.Agent != "explicit" {
 			request.Agent = "explicit"
@@ -393,18 +385,7 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		owned := m.updates.active == request.Operation
 		m.updates.mu.Unlock()
 		if owned {
-			// Persist the terminal request before deleting the only prepared candidate.
-			// Observation still publishes terminal status only after cleanup completes.
-			if err := m.writeUpdate(status); err != nil {
-				m.setUpdating(false)
-				return
-			}
-			if status.terminal() {
-				_, _ = m.launcher.maintain("update-cleanup", []string{request.Operation})
-			}
-			if err := os.RemoveAll(m.stagePath()); err != nil {
-				fmt.Fprintln(m.log, "cozy machine: cannot remove completed update files:", err)
-			}
+			m.completeUpdateFiles(status)
 			m.setUpdating(false)
 			m.updates.mu.Lock()
 			m.updates.status, m.updates.active = &status, ""
@@ -438,6 +419,7 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		}
 	}
 	payload, _ := json.Marshal(pairTransaction{Operation: request.Operation, Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned, Agent: request.Agent})
+	legacyGuardian := false
 	if status.State != "waiting_activation" {
 		status.State = "preparing"
 		if err := m.saveUpdate(status); err != nil {
@@ -445,22 +427,33 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 			return
 		}
 		if _, err := m.launcher.maintain("update-stage", []string{string(payload)}); err != nil {
-			fail("failed", err)
-			return
+			if err.Error() != `unknown maintenance op "update-stage"` {
+				fail("failed", err)
+				return
+			}
+			// The stable guardian can outlive the application that requested this
+			// update. Older guardians safely prepare only after guarded shutdown.
+			legacyGuardian = true
+			payload, _ = json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned, Agent: request.Agent})
 		}
 	}
 	waiting := func() error {
-		if status.State == "waiting_activation" {
+		phase := "waiting_activation"
+		if legacyGuardian {
+			phase = "waiting"
+			status.Error = "this machine bootstrap prepares updates only after work drains; active preparation and paused activation require replacing its service or image bootstrap"
+		}
+		if status.State == phase {
 			return nil
 		}
-		status.State = "waiting_activation"
+		status.State = phase
 		return m.saveUpdate(status)
 	}
 	if err := m.quiesce(ctx, waiting); err != nil {
 		fail("failed", err)
 		return
 	}
-	status.State = "installing"
+	status.State, status.Error = "installing", ""
 	if err := m.saveUpdate(status); err != nil {
 		fail("failed", err)
 		if launchErr := m.launch(); launchErr != nil {
@@ -523,6 +516,28 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 	fail("rolled_back", err)
 }
 
+// Both the original request plane and its replacement retain completion ownership
+// until terminal status is durable. The caller holds staging through publication.
+func (m *Machine) completeUpdateFiles(status updateStatus) {
+	for delay := time.Second; ; delay = min(2*delay, 10*time.Second) {
+		if err := m.writeUpdate(status); err != nil {
+			fmt.Fprintln(m.log, "cozy machine: cannot persist completed update; retaining its candidate and retrying:", err)
+			m.updates.mu.Lock()
+			observed := *m.updates.status
+			observed.Error = "cannot persist completed update; retaining its candidate and retrying: " + err.Error()
+			m.updates.status = &observed
+			m.updates.mu.Unlock()
+			time.Sleep(delay)
+			continue
+		}
+		break
+	}
+	_, _ = m.launcher.maintain("update-cleanup", []string{status.Operation})
+	if err := os.RemoveAll(m.stagePath()); err != nil {
+		fmt.Fprintln(m.log, "cozy machine: cannot remove completed update files:", err)
+	}
+}
+
 // quiesce holds the machine for the update once its Runtime accepts a guarded restart. A busy
 // Runtime is asked again; running work is never interrupted.
 func (m *Machine) quiesce(ctx context.Context, onWaiting ...func() error) error {
@@ -533,6 +548,7 @@ func (m *Machine) quiesce(ctx context.Context, onWaiting ...func() error) error 
 		return nil
 	}
 	wait := time.Second
+	recovered := false
 	for {
 		m.launchMu.Lock()
 		m.setUpdating(true)
@@ -550,6 +566,36 @@ func (m *Machine) quiesce(ctx context.Context, onWaiting ...func() error) error 
 			case <-time.After(wait):
 			}
 			continue
+		}
+		if process == nil || process.exited() {
+			// A stopped PID does not prove its accepted work or descendants have
+			// settled. Let the installed Runtime recover its journal and establish
+			// a fresh guarded verdict before changing software under retained work.
+			raw, err := m.launcher.maintain("software-state", nil)
+			var state softwareState
+			if err == nil {
+				err = json.Unmarshal([]byte(raw), &state)
+			}
+			if err != nil {
+				m.launchMu.Unlock()
+				return fmt.Errorf("cannot establish retained Runtime work before activation: %w", err)
+			}
+			if !state.Quiescent {
+				if recovered {
+					m.launchMu.Unlock()
+					return errors.New("the installed Runtime exited while recovering retained work; repair its startup before activating the candidate")
+				}
+				if err := m.launch(); err != nil {
+					m.launchMu.Unlock()
+					return fmt.Errorf("cannot recover the installed Runtime's retained work before activation: %w", err)
+				}
+				recovered = true
+				m.launchMu.Unlock()
+				if err := waiting(); err != nil {
+					return err
+				}
+				continue
+			}
 		}
 		if process != nil && !process.exited() {
 			select {

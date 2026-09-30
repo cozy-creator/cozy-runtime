@@ -2599,9 +2599,23 @@ class Executor:
         self.memory_key = self._group_model_key
         if planner is not None:
             for name, root in backend.components.items():
-                planner.adopt(self.memory_key, name, root, backend, tiers.DEVICE)
+                planner.adopt(
+                    self.memory_key,
+                    name,
+                    root,
+                    backend,
+                    tiers.DEVICE,
+                    forward_only=getattr(type(model), "__encoded_leaves__", "refuse") == "accept",
+                )
             for name, root in backend.parked.items():
-                planner.adopt(self.memory_key, name, root, backend, tiers.DISK)
+                planner.adopt(
+                    self.memory_key,
+                    name,
+                    root,
+                    backend,
+                    tiers.DISK,
+                    forward_only=getattr(type(model), "__encoded_leaves__", "refuse") == "accept",
+                )
             object.__setattr__(model, "_cozy_residency", _Scopes(planner, self.memory_key))
         record = registry.generations()[0].record
         # THE CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
@@ -3327,6 +3341,7 @@ class Executor:
                             cancel=lambda: _cancelled(self.root, command.request_id),
                             models=self.models,
                             progress=progress,
+                            activity=self._activity_sink(command.request_id),
                             # cr-012: the inputs the WORKER already fetched, verified and spooled.
                             # Every value is a path inside this attempt's own spool: this process is
                             # `sandbox.refuse_network` rejects ungranted network access.
@@ -4088,6 +4103,7 @@ class Executor:
                     started_monotonic=time.monotonic(),
                 ),
                 progress=self._progress_sink(command.request_id),
+                activity=self._activity_sink(command.request_id),
             ),
         )
         handler_ms = (time.perf_counter() - started) * 1000
@@ -4332,6 +4348,22 @@ class Executor:
             return tolerant.read(frame, into, ("progress", "observation"))[0]
         except msgspec.ValidationError as exc:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
+
+    def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool, bool], None]:
+        def activity(sequence: int, active: bool, known: bool, finished: bool) -> None:
+            self.channel.send(
+                {
+                    "event": "progress",
+                    "request_id": request_id,
+                    "kind": "execution_activity",
+                    "sequence": sequence,
+                    "active": active,
+                    "known": known,
+                    "finished": finished,
+                }
+            )
+
+        return activity
 
     def _progress_sink(self, request_id: str) -> Any:
         """The lossy lane's sink for one attempt — the same one `invoke` installs."""

@@ -18,6 +18,7 @@ from __future__ import annotations
 import functools
 import math
 import re
+import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -149,6 +150,8 @@ class Held:
     whole: bool = False
     last_used: int = 0
     readonly_lost_reason: str = ""
+    forward_only: bool = False
+    scope_anchor: bool = False
     conversion_epoch: int = 0
     ops: dict[str, Callable[..., object]] = field(default_factory=dict)
 
@@ -166,7 +169,6 @@ class Plan:
     keep: int
     evict: list[Held]
     #: its victims include the scope's other components' common units
-    deep: bool = False
     #: concrete net room target; None means a measured recovery needs every movable byte
     needed: int | None = None
 
@@ -222,7 +224,6 @@ class Planner:
         self.last_seq: dict[str, list[str]] = {}
         self.clock = 0
         self.spare = False
-        self.deep = False
         self.room_requests: set[tuple[int, int, bool, int | None]] = set()
         self.room_asks = 0
         self.peak = 0
@@ -240,6 +241,7 @@ class Planner:
         self.log: list[str] = []
         self.plans: dict[str, list[str]] = {}
         self.operations: dict[str, dict[str, int]] = {}
+        self.anchor_validation_calls = self.anchor_validation_ns = 0
         self.oom_asked = 0
         #: the typed refusal this attempt ended on, for the reply's shortfall numbers
         self.refusal: MemoryRefusal | None = None
@@ -367,7 +369,14 @@ class Planner:
     # ------------------------------------------------------------------ components
 
     def adopt(
-        self, construction: str, name: str, root: Module, store: tiers.Store | None, tier: str
+        self,
+        construction: str,
+        name: str,
+        root: Module,
+        store: tiers.Store | None,
+        tier: str,
+        *,
+        forward_only: bool = False,
     ) -> Held:
         """Take a constructed component under management: units, hooks, op wrappers."""
         key = f"{construction}/{name}"
@@ -391,11 +400,25 @@ class Planner:
             kind=f"{type(root).__module__}.{type(root).__qualname__}:{name}:{part.nbytes}",
             compiled=_compiled(root),
             whole=bool(getattr(root, "_cozy_read_whole", False)),
+            forward_only=forward_only,
         )
         self.held[key] = held
         root.__dict__["_cozy_select_decode_mode"] = functools.partial(self.select_decode_mode, held)
         root.__dict__["_cozy_optional_cache"] = functools.partial(self.optional_cache, held)
         self._pin_state(held)
+        if (
+            held.forward_only
+            and not held.whole
+            and not held.compiled
+            and part.unit_loads
+            and self._state_contract(held, [])
+            and all(
+                unit.readonly and not unit.mutable and (unit.tier != DISK or tiers.store_safe(unit))
+                for unit in part.units
+            )
+        ):
+            tiers.split_common(part)
+            held.scope_anchor = part.anchor is not None
         if self.cuda:
             tiers.install(part, self._enter_unit, self._leave_unit)
             tiers.wrap(root, functools.partial(self.run, held))
@@ -410,6 +433,7 @@ class Planner:
 
     def _converted(self, held: Held) -> None:
         """A real package dtype conversion invalidates old working-memory observations."""
+        self._validate_component(held)
         for unit in held.part.units:
             tiers.load_demand(self.torch, unit)
         self.records = {
@@ -635,6 +659,7 @@ class Planner:
         self.log = []
         self.plans = {}
         self.operations = {}
+        self.anchor_validation_calls = self.anchor_validation_ns = 0
         self.refusal = None
         self.preparation_failure = ""
         if self.cuda:
@@ -696,6 +721,40 @@ class Planner:
             "log": list(self.log[-8:]),
             "plans": {op: list(seen) for op, seen in self.plans.items()},
             "operations": {op: dict(counts) for op, counts in self.operations.items()},
+            "anchor_validation": {
+                "calls": self.anchor_validation_calls,
+                "ns": self.anchor_validation_ns,
+            },
+            "scope_backing": {
+                h.key: {
+                    "metadata_anchor_bytes": (h.part.anchor or h.part.common).nbytes,
+                    "operation_common_bytes": (
+                        h.part.common.nbytes
+                        if h.part.anchor is not None and h.part.anchor is not h.part.common
+                        else 0
+                    ),
+                    "operation_common_device_bytes": (
+                        h.part.common.nbytes
+                        if h.part.anchor is not None
+                        and h.part.anchor is not h.part.common
+                        and h.part.common.tier == DEVICE
+                        else 0
+                    ),
+                    "anchor_only_scope": h.scope_anchor and not h.whole and not h.compiled,
+                    "scope_minimum_bytes": sum(
+                        unit.nbytes
+                        for unit in (
+                            h.part.units
+                            if h.whole or h.compiled
+                            else tuple(
+                                set(self._scope_common(h))
+                                | {unit for unit in h.part.units if unit.mutable}
+                            )
+                        )
+                    ),
+                }
+                for h in mine
+            },
             "poisoned": self.unusable,
         }
 
@@ -754,12 +813,56 @@ class Planner:
             "disk_weight_bytes": sum(h.part.on(DISK) for h in self.held.values() if not h.hosted),
         }
 
+    def _validate_component(self, held: Held) -> None:
+        if held.part.anchor is None:
+            return
+        began = time.perf_counter_ns()
+        try:
+            tiers.validate_anchor(held.part)
+        except RuntimeFailure as exc:
+            self.unusable = f"{held.key}: {exc}"
+            raise MemoryRefusal(exc.code, self.unusable, reusable=False) from None
+        finally:
+            self.anchor_validation_calls += 1
+            self.anchor_validation_ns += time.perf_counter_ns() - began
+
+    def _validate_active(self, held: Held) -> None:
+        active = {held.key}
+        active.update(
+            f"{construction}/{name}" for construction, names in self.scopes for name in names
+        )
+        for key in active:
+            if (component := self.held.get(key)) is not None:
+                self._refresh_constraints(component)
+
+    def _refresh_constraints(self, held: Held) -> None:
+        """Refresh mutable/whole/compiled and alias facts at quote and movement boundaries."""
+        self._validate_component(held)
+        held.compiled = _compiled(held.part.root)
+        held.whole = held.whole or bool(getattr(held.part.root, "_cozy_read_whole", False))
+        self._pin_state(held)
+        held.scope_anchor = (
+            held.part.anchor is not None
+            and held.forward_only
+            and self._state_contract(held, [])
+            and all(unit.readonly and not unit.mutable for unit in held.part.common_units)
+        )
+
+    def _scope_common(self, held: Held) -> tuple[tiers.Unit, ...]:
+        """Scope metadata is real backing; unknown effects retain every common unit."""
+        part = held.part
+        if held.scope_anchor and part.anchor is not None:
+            return (part.anchor,)
+        return part.common_units
+
     def enter(self, construction: str, method: str, components: tuple[str, ...]) -> None:
         """Pin every declared component's minimum before any optional operation residency.
 
         Common units keep `.device` valid; blocks arrive with managed operations. Components
         explicitly read outside operations (`read_whole`) must fit whole.
         """
+        if self.unusable:
+            raise MemoryRefusal("device_fault", self.unusable, reusable=False)
         before = len(self.scopes)
         self.scopes.append((construction, frozenset(components)))
         try:
@@ -774,19 +877,26 @@ class Planner:
         if not self.cuda:
             return
         self._cap()
-        for name in components:
-            held = self.held.get(f"{construction}/{name}")
-            if held is None or held.hosted:
-                continue
+        scoped = [
+            held
+            for name in components
+            if (held := self.held.get(f"{construction}/{name}")) is not None and not held.hosted
+        ]
+        # Refresh every sibling before any transfer can quote it as an optional victim.
+        for held in scoped:
             # A package may have replaced a forward since (a cache hook): it is an op again.
             tiers.wrap(held.part.root, functools.partial(self.run, held))
-            held.compiled = _compiled(held.part.root)
+            self._refresh_constraints(held)
+        for held in scoped:
             part = held.part
             whole = tiers.load_sequence(self.torch, part.units, whole=not part.unit_loads).peak
             if part.on(DISK) and part.store is not None:
                 whole += part.store.transient(part.name)
-            whole_only = held.whole or (bool(part.on(DISK)) and not part.unit_loads)
-            common = tiers.load_sequence(self.torch, (part.common,)).peak
+            whole_only = (
+                held.whole or held.compiled or (bool(part.on(DISK)) and not part.unit_loads)
+            )
+            scope_units = self._scope_common(held)
+            common = tiers.load_sequence(self.torch, scope_units).peak
             required = whole if whole_only else common
             if required > self.allocatable() and self._reserved() > self._allocated():
                 # Cached segments can put signed reserve room below zero even when
@@ -804,11 +914,84 @@ class Planner:
                 self._refuse_scope(held, method, required, victims)
             for victim in chosen:
                 self._offload(victim, target=required)
-            if whole_only:
-                self._stage_whole(held, [])
+            units = part.units if whole_only else scope_units
+            if whole_only and part.on(DISK) == part.nbytes and part.store is not None:
+                self._place_scope(held, method, functools.partial(self._refill_whole, held))
             else:
-                self._load_common(held)
+                for unit in units:
+                    if unit.tier != DEVICE:
+                        self._place_scope(held, method, functools.partial(self._load, part, unit))
             self._cap()
+
+    def _place_scope(
+        self,
+        held: Held,
+        method: str,
+        place: Callable[[], None],
+    ) -> None:
+        """Recover an atomic transfer before the authored scope body starts.
+
+        A group keeps its existing all-rank preparation/recovery authority. A spare
+        operation never acquires another tenant's room. Neither replays its placement here.
+        """
+        if self.grouped or self.spare:
+            place()
+            return
+
+        counts = self.operations.setdefault(f"{held.key}.scope:{method}", {"calls": 0})
+        counts["calls"] += 1
+        before = self.allocatable()
+        while True:
+            self.oom_asked = 0
+            try:
+                with self._traffic(counts, "placement"):
+                    place()
+            except BaseException as exc:
+                if not is_oom(exc):
+                    raise
+                asked = max(self.oom_asked, _asked(str(exc)), 1)
+                self.oom_asked = 0
+                text = (str(exc).splitlines() or [type(exc).__name__])[0][:300]
+                exc.__traceback__ = None
+                counts["placement_ooms"] = counts.get("placement_ooms", 0) + 1
+            else:
+                return
+
+            # Compare one atomic transfer with itself, not an entire partially staged
+            # component. A previous successful unit may have reused reserved cache pages.
+            # Also do not credit a failed allocation growing R, then trim undoing that
+            # same growth: the recovery must improve on the pre-attempt high-water room.
+            before = max(before, self.allocatable())
+            # Tier moves either committed or restored their original bindings. No
+            # application body or RNG draw is replayed; release unused allocator pages
+            # and ask the existing Machine policy for a measured extra allocation.
+            try:
+                tiers.trim(self.torch)
+                self._cap()
+            except Exception as exc:
+                self.unusable = f"{held.key}: scope placement recovery failed: {type(exc).__name__}"
+                self.refusal = MemoryRefusal("device_fault", self.unusable, reusable=False)
+                raise self.refusal from None
+            target = max(before, 0) + asked
+            if self.allocatable() < target:
+                self._ask_room(target, [], measured=True)
+            after = self.allocatable()
+            if after < target:
+                self.refusal = MemoryRefusal(
+                    DEVICE_OOM,
+                    f"{held.key} scope {method}: no placement retry: {text}; "
+                    f"needed {target - before} B of extra room, gained {after - before} B",
+                    target - before,
+                    max(after - before, 0),
+                )
+                raise self.refusal from None
+            self._refresh_constraints(held)
+            counts["placement_retries"] = counts.get("placement_retries", 0) + 1
+            counts["placement_gain_bytes"] = counts.get("placement_gain_bytes", 0) + after - before
+            self.log.append(
+                f"{held.key} scope {method}: retrying placement after gaining {after - before} B"
+            )
+            before = after
 
     def restore_resident(self, construction: str, names: tuple[str, ...]) -> dict[str, object]:
         """A revision-1 Worker's explicit restore, without evicting another component."""
@@ -837,15 +1020,18 @@ class Planner:
             self._offload(victim)
         part = held.part
         if part.on(DISK) == part.nbytes and part.store is not None:
-            with self._moving():
-                tiers.from_disk(self.torch, part, None)
-            self.loads += 1
-            self.refilled += part.nbytes
+            self._refill_whole(held)
         else:
             self._load_common(held)
             for unit in part.blocks:
                 self._load(part, unit)
         self._cap()
+
+    def _refill_whole(self, held: Held) -> None:
+        with self._moving():
+            tiers.from_disk(self.torch, held.part, None)
+        self.loads += 1
+        self.refilled += held.part.nbytes
 
     def _refuse_scope(self, held: Held, method: str, need: int, victims: list[Held]) -> NoReturn:
         available = self.allocatable() + sum(self._evictable(v) for v in victims)
@@ -1132,6 +1318,7 @@ class Planner:
         if not self.cuda or held.hosted or any(frame.held is held for frame in self.stack):
             self._ready(held.key)
             return fn(*args, **kwargs)
+        self._validate_active(held)
         torch = self.torch
         leaves = list(_leaves((args, kwargs)))
         key = OpKey(
@@ -1165,6 +1352,12 @@ class Planner:
                 # later declaration cannot validate an old host/checkpoint copy.
                 unit.host.clear()
                 unit.seen.clear()
+        held.scope_anchor = (
+            held.part.anchor is not None
+            and held.forward_only
+            and readonly
+            and all(unit.readonly and not unit.mutable for unit in held.part.common_units)
+        )
         counts = self.operations.setdefault(f"{held.key}.{method}", {"calls": 0})
         counts["calls"] += 1
         counts["total_blocks"] = len(held.part.blocks)
@@ -1215,6 +1408,7 @@ class Planner:
                     entered = True
                     with self._traffic(counts, "invoke"):
                         out = fn(*args, **kwargs)
+                    self._validate_active(held)
                 except BaseException as exc:
                     oom = is_oom(exc)
                     if oom:
@@ -1340,12 +1534,7 @@ class Planner:
             f"{plan.keep}/{len(held.part.blocks)} blocks resident"
         )
         self.log.append(numbers)
-        before = self.deep
-        self.deep = True
-        try:
-            reclaim = not self.spare and any(self._evictable(v) for v in self._victims(held))
-        finally:
-            self.deep = before
+        reclaim = not self.spare and any(self._evictable(v) for v in self._victims(held))
         smaller = (snapshot is not None or not entered) and (
             plan.keep > self._minimum_keep(held) or reclaim
         )
@@ -1413,62 +1602,43 @@ class Planner:
                 # The previous op's cache may be all that stands in the way: give it back so
                 # the plan reads what can really be reserved.
                 tiers.trim(self.torch)
-        for deep in (False, True):
-            # The second pass also takes the common units of the scope's other components:
-            # the last room there is, before a refusal.
-            self.deep = deep
-            victims = [] if self.spare else self._victims(held)
-            try:
-                if floor or (not retryable and not exact):
-                    plan = self._fit(held, working or 0, victims, floor=True, measured=measured)
-                elif retryable and working is None:
-                    plan = self._max_room(held, victims)
-                else:
-                    plan = self._fit(
-                        held, working or 0, victims, floor=False, ceiling=ceiling, measured=measured
-                    )
-            except MemoryRefusal as exc:
-                if deep and not exact and not self.spare and exc.code == SHORTFALL:
-                    # A different input shape supplies a forecast, not a refusal proof.
-                    # Try the legal floor once under the same cap; an OOM for this exact
-                    # key still supplies a hard lower bound and normal replay gain gates.
-                    record = self.records.get(key)
-                    failure_floor = record.fail if record is not None else 0
-                    plan = self._fit(held, failure_floor, victims, floor=True)
-                    self.log.append(
-                        f"{held.key}.{key.method}: forecast exceeded room; attempting floor"
-                    )
-                elif deep or self.spare:
-                    raise
-                else:
-                    continue
-            finally:
-                self.deep = False
-            plan.deep = deep
+        victims = [] if self.spare else self._victims(held)
+        try:
+            if floor or (not retryable and not exact):
+                return self._fit(held, working or 0, victims, floor=True, measured=measured)
+            if retryable and working is None:
+                return self._max_room(held, victims)
+            return self._fit(
+                held, working or 0, victims, floor=False, ceiling=ceiling, measured=measured
+            )
+        except MemoryRefusal as exc:
+            if exact or self.spare or exc.code != SHORTFALL:
+                raise
+            # An inexact shape forecast is not a refusal proof. Metadata pins stay
+            # intact while the legal floor gets the same ordinary admission/retry path.
+            record = self.records.get(key)
+            failure_floor = record.fail if record is not None else 0
+            plan = self._fit(held, failure_floor, victims, floor=True)
+            self.log.append(f"{held.key}.{key.method}: forecast exceeded room; attempting floor")
             return plan
-        raise AssertionError("unreachable")
 
     def _replay_room(self, held: Held, plan: Plan, target: int) -> None:
-        """Price the failed allocation's full gain, including reclaimable sibling common units.
+        """Price the failed allocation's full gain against legally reclaimable sibling cache.
 
         Working-memory samples are lower bounds. Even when that bound fits the same
         placement, an actual replay must make the additional room the failure requested.
         """
-        before, self.deep = self.deep, True
-        try:
-            part = held.part
-            stream = max(
-                (tiers.load_demand(self.torch, unit).peak for unit in part.blocks[plan.keep :]),
-                default=0,
-            )
-            placement = self._need(part, plan.keep) - stream
-            needed = max(plan.needed or 0, target + placement)
-            victims = [] if self.spare else self._victims(held)
-            chosen = self._room_from(victims, needed)
-            plan.evict = victims if chosen is None else chosen
-            plan.needed, plan.deep = needed, True
-        finally:
-            self.deep = before
+        part = held.part
+        stream = max(
+            (tiers.load_demand(self.torch, unit).peak for unit in part.blocks[plan.keep :]),
+            default=0,
+        )
+        placement = self._need(part, plan.keep) - stream
+        needed = max(plan.needed or 0, target + placement)
+        victims = [] if self.spare else self._victims(held)
+        chosen = self._room_from(victims, needed)
+        plan.evict = victims if chosen is None else chosen
+        plan.needed = needed
 
     def _fit(
         self,
@@ -1556,7 +1726,7 @@ class Planner:
             return tiers.load_sequence(
                 self.torch, part.units, whole=True
             ).peak + part.store.transient(part.name)
-        placement = tiers.load_sequence(self.torch, (part.common, *part.blocks[:keep]))
+        placement = tiers.load_sequence(self.torch, (*part.common_units, *part.blocks[:keep]))
         drop = sum(unit.nbytes for unit in part.blocks[keep:] if unit.tier == DEVICE)
         stream = max(
             (tiers.load_demand(self.torch, unit).peak for unit in part.blocks[keep:]), default=0
@@ -1614,18 +1784,19 @@ class Planner:
         for construction, names in self.scopes:
             for name in names:
                 key = f"{construction}/{name}"
-                if not self.deep:
-                    common.add(key)
+                common.add(key)
                 held = self.held.get(key)
                 if held is not None and held.whole:
                     whole.add(key)
         return whole, common
 
     def _evictable(self, victim: Held) -> int:
+        self._refresh_constraints(victim)
         whole, common = self._pinned()
         if victim.key in whole or victim.compiled:
             return 0
-        units = victim.part.blocks if victim.key in common else victim.part.units
+        protected = set(self._scope_common(victim)) if victim.key in common else set()
+        units = tuple(unit for unit in victim.part.units if unit not in protected)
         whole_store = units == victim.part.units and self._whole_store(victim.part)
         return sum(
             unit.nbytes
@@ -1695,14 +1866,10 @@ class Planner:
 
     def _apply(self, held: Held, plan: Plan) -> None:
         self._cap()
-        self.deep = plan.deep
-        try:
-            for victim in plan.evict:
-                if plan.needed is not None and self.allocatable() >= plan.needed:
-                    break
-                self._offload(victim, target=plan.needed)
-        finally:
-            self.deep = False
+        for victim in plan.evict:
+            if plan.needed is not None and self.allocatable() >= plan.needed:
+                break
+            self._offload(victim, target=plan.needed)
         part = held.part
         for unit in part.blocks[plan.keep :]:
             if unit.tier == DEVICE:
@@ -1728,14 +1895,15 @@ class Planner:
 
     def _load_common(self, held: Held) -> None:
         part = held.part
-        if part.common.tier == DEVICE:
+        if all(unit.tier == DEVICE for unit in part.common_units):
             return
-        if part.common.tier == DISK and not part.unit_loads:
+        if any(unit.tier == DISK for unit in part.common_units) and not part.unit_loads:
             self.refilled += part.on(DISK)
             with self._moving():
                 tiers.from_disk(self.torch, part, None)
             return
-        self._load(part, part.common)
+        for unit in part.common_units:
+            self._load(part, unit)
 
     def _load(self, part: tiers.Component, unit: tiers.Unit) -> None:
         if unit.tier == DEVICE:
@@ -1771,12 +1939,15 @@ class Planner:
 
     def _offload(self, held: Held, *, everything: bool = False, target: int | None = None) -> None:
         """Move a victim's unpinned device units off the device."""
+        self._refresh_constraints(held)
         part = held.part
         whole, common = self._pinned()
-        held.compiled = _compiled(held.part.root)
         if held.compiled or (held.key in whole and not everything):
             return
-        units = part.blocks if held.key in common and not everything else part.units
+        protected = (
+            set(self._scope_common(held)) if held.key in common and not everything else set()
+        )
+        units = tuple(unit for unit in part.units if unit not in protected)
         moving = [unit for unit in units if unit.tier == DEVICE and not unit.mutable]
         if units == part.units and self._whole_store(part):
             needed = sum(tiers.host_copy_bytes(unit) for unit in moving)
@@ -1947,6 +2118,8 @@ class Planner:
         if provider is None:
             return
         state = tuple(provider())
+        if not state:
+            return
         identities = {id(tensor) for tensor in state}
         storages = {
             tensor.untyped_storage().data_ptr()
