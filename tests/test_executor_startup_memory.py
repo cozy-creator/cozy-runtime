@@ -141,7 +141,8 @@ def test_start_waits_for_active_work_before_vacating_its_memory(
 
     class ObservedLock:
         def acquire(self) -> bool:
-            waiting.set()
+            if threading.current_thread() is starter:
+                waiting.set()
             return lock.acquire()
 
         def release(self) -> None:
