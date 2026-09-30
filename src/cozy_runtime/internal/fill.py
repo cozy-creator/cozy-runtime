@@ -1204,6 +1204,8 @@ class StreamingFillBackend:
         self._live_ring: StagingRing | None = None
         self._staging_ring: StagingRing | None = None
         self.staging_released: Callable[[], None] = lambda: None
+        self.staging_started: Callable[[], None] = lambda: None
+        self.staging_drained: Callable[[], None] = lambda: None
         self.device = self.torch.device(device)
         self.device_str = str(self.torch.empty(0, device=self.device).device)
         #: The BACKEND this generation is filled on. Memory metering and reclaim go through
@@ -1918,6 +1920,29 @@ class StreamingFillBackend:
         self._commit_enqueued()
         self.state = "ready"
 
+    def prepare_staging(self) -> None:
+        """Materialize prepaid group staging without reading weights or submitting copies."""
+        if self._staging_ring is not None:
+            return
+        if self.staging_host is None:
+            raise RuntimeFailure("group staging requires host admission", code="host_shortfall")
+        with self.staging_host(self.slot_bytes, self.slots) as slots:
+            ring = StagingRing(
+                self.torch,
+                self.device,
+                window_bytes=self.slot_bytes,
+                slots=slots,
+                inflight=self.inflight,
+                fence=self.fence,
+            )
+            self._staging_ring = ring
+            self.pinned = {
+                "allocated_bytes": ring.allocated_bytes,
+                "pageable_bytes": ring.allocated_bytes - ring.registered_bytes,
+                "registered_bytes": ring.registered_bytes,
+                "in_flight_peak_bytes": 0,
+            }
+
     def _commit_enqueued(self) -> None:
         """Move whatever is enqueued right now, fence it, and clear the queue.
 
@@ -1928,6 +1953,9 @@ class StreamingFillBackend:
         started = time.perf_counter_ns()
         if not self.enqueued:
             return
+        if self._live_ring is not None:
+            raise RuntimeFailure("staging drain is unproved", code="device_fault")
+        self.staging_started()
         allowance = (
             self.staging_host(self.slot_bytes, self.slots)
             if self._staging_ring is None and self.staging_host is not None
@@ -1948,6 +1976,8 @@ class StreamingFillBackend:
             else:
                 # A new destination may reuse memory freed by intervening compute.
                 ring.stream.wait_stream(self.torch.cuda.current_stream(self.device))
+            ring.waits = 0
+            ring.in_flight_peak = 0
             self._live_ring = ring
             try:
                 for tensor in self.enqueued.values():
@@ -1983,6 +2013,7 @@ class StreamingFillBackend:
                     # until generation retirement proves that no device can use them.
                     raise RuntimeFailure("staging drain failed", code="device_fault") from None
                 self._live_ring = None
+                self.staging_drained()
         self.stats["stream_ms"] = (time.perf_counter_ns() - started) // 1_000_000
         # The tfs-018-comparable leg: reserve device destinations, read, copy, fence. It
         # deliberately EXCLUDES the meta construction, which those arms have no analogue
@@ -2063,6 +2094,7 @@ class StreamingFillBackend:
             return 0
         ring = self._staging_ring
         size = ring.allocated_bytes
+        self.staging_started()
         try:
             ring.close()
         except BaseException:
@@ -2070,13 +2102,16 @@ class StreamingFillBackend:
             raise RuntimeFailure("staging drain failed", code="device_fault") from None
         self._staging_ring = None
         self.staging_released()
+        self.staging_drained()
         return size
 
     def close(self) -> None:
         """End the generation's read leases after every fill/move has completed."""
-        if self._live_ring is None:
-            self.release_staging()
-            self.leases.release()
+        if self._live_ring is not None:
+            raise RuntimeFailure("staging drain is unproved", code="device_fault")
+        self.release_staging()
+        self.leases.release()
+        self.staging_drained()
 
     # -- component staging (cr-008b) ---------------------------------------------
 

@@ -2037,6 +2037,20 @@ class Executor:
     def _own_fill_backend(self, backend: Any) -> None:
         self.backend = backend
         self.host._staging_quarantine[id(backend)] = backend
+        backend.staging_started = lambda: self.host._staging_quarantine.__setitem__(
+            id(backend), backend
+        )
+        backend.staging_drained = lambda: self.host._staging_quarantine.pop(id(backend), None)
+
+    def _release_construction_staging(self) -> None:
+        """All rank fills drained: end preparation promises before operation admission."""
+        for token, size in self._construction_staging_tokens:
+            self._durable(HostRoom(reservation=token, nbytes=size, release=True), Answer)
+        self._construction_staging_tokens.clear()
+        if self.host.planner is not None:
+            self.host.planner.construction_staging_credit = (
+                self._previous_construction_staging_credit
+            )
 
     def _reserve_construction_staging(
         self, demands: tuple[tuple[int, int, int], ...]
@@ -2059,12 +2073,17 @@ class Executor:
         self._construction_staging_drained = False
         planner = self.host.planner
         previous = planner.construction_staging_credit if planner is not None else None
+        self._previous_construction_staging_credit = previous
+        succeeded = False
         try:
-            return self._prepare_first_body(
+            reply = self._prepare_first_body(
                 command, optional_attention_scope=optional_attention_scope
             )
+            succeeded = bool(reply.get("ok"))
+            return reply
         finally:
             planner = self.host.planner
+            backend = getattr(self, "backend", None)
             if self._construction_staging_tokens:
                 if self.group is not None and (
                     not self._construction_staging_drained or self.group.broken
@@ -2076,16 +2095,22 @@ class Executor:
                         self.poisoned = "construction staging followers not reaped"
                         if planner is not None:
                             planner.unusable = self.poisoned
-                if planner is None or not planner.unusable:
-                    for token, size in self._construction_staging_tokens:
-                        self._durable(
-                            HostRoom(reservation=token, nbytes=size, release=True), Answer
-                        )
+            if not succeeded and backend is not None and backend._live_ring is None:
+                try:
+                    backend.close()
+                except RuntimeFailure as exc:
+                    if planner is not None and exc.code == "device_fault":
+                        planner.unusable = str(exc)
+                    raise
+            if self._construction_staging_tokens and (planner is None or not planner.unusable):
+                self._release_construction_staging()
             if planner is not None:
                 planner.construction_staging_credit = previous
             backend = getattr(self, "backend", None)
             if backend is not None and backend._live_ring is None:
                 self.host._staging_quarantine.pop(id(backend), None)
+                if not succeeded and planner is not None:
+                    planner.staging_unbacked.pop(self._group_model_key, None)
 
     def _prepare_first_body(
         self, command: Load, *, optional_attention_scope: bool = False
@@ -2499,6 +2524,10 @@ class Executor:
             return self._group_refusal(
                 exc if isinstance(exc, GroupRefusal) else GroupRefusal(str(exc))
             )
+        if self.world > 1:
+            # Even parked-only construction owns actual staging before warm can enter
+            # a broad Model scope outside the mirrored operation readiness round.
+            backend.prepare_staging()
         stage("admission")
         artifact = Artifact(
             reference.snapshot,
@@ -2761,6 +2790,7 @@ class Executor:
                                 f"{_gpu(0)} built {ours!r}, {follower.gpu} built {other!r}",
                             )
                         )
+            self._release_construction_staging()
             refused = self._agree_attention(applied)
             if refused is not None:
                 return refused

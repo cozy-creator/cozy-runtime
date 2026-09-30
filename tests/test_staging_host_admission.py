@@ -289,6 +289,7 @@ def test_real_fill_boundary_holds_credit_through_close(
     backend.store_read = contextlib.nullcontext
     backend._live_ring = None
     backend._staging_ring = None
+    backend.staging_started = backend.staging_drained = lambda: None
     events = []
 
     class Ring:
@@ -334,6 +335,8 @@ def test_real_fill_boundary_holds_credit_through_close(
     assert events == ["finish", "finish"]
     if not fail_close:
         ring = backend._staging_ring
+        ring.waits = 9
+        ring.in_flight_peak = 7
         backend.enqueued = {"again": object()}
 
         def unexpected(*_: Any) -> Any:
@@ -342,6 +345,7 @@ def test_real_fill_boundary_holds_credit_through_close(
         backend.staging_host = unexpected
         backend._commit_enqueued()
         assert backend._staging_ring is ring and events == ["finish"] * 4
+        assert backend.stats["waits"] == 0 and backend.pinned["in_flight_peak_bytes"] == 0
 
 
 def test_first_construction_failed_drain_survives_child_and_registry_gc(
@@ -432,6 +436,7 @@ def test_idle_staging_release_reports_logical_bytes_without_physical_credit(
     owner, machine = policy(16)
     backend: Any = object.__new__(fill.StreamingFillBackend)
     backend._live_ring = None
+    backend.staging_started = backend.staging_drained = lambda: None
     backend._staging_ring = fill.StagingRing(
         fake_torch(), "cpu", window_bytes=16, slots=1, inflight=0
     )
@@ -473,6 +478,230 @@ def test_store_gate_retained_only_when_device_drain_is_unproved(
                 )
         assert len(requests) == (1 if fault else 2)
         assert bool(executor.poisoned) == fault
+    finally:
+        ours.close()
+        theirs.close()
+
+
+def test_real_group_fill_drain_releases_construction_before_warm_host_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+    from cozy_runtime.author._executor_requests import Answer
+    from cozy_runtime.internal.parallel.group import OpReady
+    from cozy_runtime.internal.seam import Channel
+
+    def launch(argv: list[str], fd: int) -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            [sys.executable, "-c", FOLLOWER, str(fd), "ready", json.dumps(PLAN)],
+            pass_fds=(fd,),
+            env=os.environ.copy(),
+        )
+
+    group = RankGroup(degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    ours, theirs = socket.socketpair()
+    leader = Executor(Channel(ours), tmp_path, world=2)
+    leader.group = group
+    owner, machine = policy(32, grouped=True)
+    leader.planner = owner
+    leader._construction_staging_tokens = []
+    leader._previous_construction_staging_credit = None
+
+    def durable(request: Any, kind: Any) -> Answer:
+        if request.release:
+            machine.release_host(request.reservation)
+            return Answer(ok=True)
+        return Answer(ok=machine.reserve_host(request.reservation, request.nbytes))
+
+    monkeypatch.setattr(leader, "_durable", durable)
+    try:
+        group.spawn()
+        owner.construction_staging_credit = group.agree_plan(
+            model="base",
+            plan=PLAN,
+            staging=(16, 4),
+            reserve_staging=leader._reserve_construction_staging,
+        )
+        assert owner.construction_staging_credit == 16 and sum(machine.host_reserved.values()) == 32
+        [reply] = group.collect("filled")
+        assert reply["ok"]
+        statuses = [
+            OpReady(operation=group.operation_sequence, rank=rank, ok=False, host_needed=16)
+            for rank in range(2)
+        ]
+        with leader._group_host_room(statuses) as credits:
+            assert not credits  # redundant construction promise would deny the warm round
+        leader._release_construction_staging()
+        assert owner.__dict__["construction_staging_credit"] is None and not machine.host_reserved
+        with leader._group_host_room(statuses) as credits:
+            assert credits == (16, 16)
+        assert not machine.host_reserved
+    finally:
+        group.close()
+        ours.close()
+        theirs.close()
+
+
+def test_repeated_preallocation_fit_refusal_removes_only_drained_phantom_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+    from cozy_runtime.internal.seam import Channel
+
+    ours, theirs = socket.socketpair()
+    host = Executor(Channel(ours), tmp_path)
+    owner, _ = policy(32)
+    host.planner = owner
+    try:
+        for number in range(3):
+            child = host._construction_child(str(number))
+            child._group_model_key = f"model-{number}"
+
+            def body(*_: Any, selected: Executor = child, **__: Any) -> dict[str, Any]:
+                key = selected._group_model_key
+                owner.staging_unbacked[key] = 16
+                selected._own_fill_backend(SimpleNamespace(_live_ring=None, close=lambda: None))
+                return {"ok": False, "code": "model_fit_refused"}
+
+            monkeypatch.setattr(child, "_prepare_first_body", body)
+            assert not child._prepare_first(cast(Any, None))["ok"]
+            assert owner.host_needed() == 0 and not host._staging_quarantine
+    finally:
+        ours.close()
+        theirs.close()
+
+
+def test_parked_group_scope_before_operation_reuses_prepaid_actual_ring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cozy_runtime.internal import accel
+    from test_scope_placement_recovery import setup, subject
+
+    owner, held, store, _ = setup(monkeypatch, gain=0)
+    owner.grouped = True
+    owner.construction_staging_credit = 16
+    backend: Any = object.__new__(fill.StreamingFillBackend)
+    backend.torch = fake_torch()
+    backend.device = "cpu"
+    backend.kind = "cpu"
+    backend.slot_bytes = 16
+    backend.slots = 16
+    backend.inflight = 8
+    backend.fence = True
+    backend._staging_ring = backend._live_ring = None
+    backend.staging_started = backend.staging_drained = lambda: None
+    backend.staging_host = owner.staging_host
+    backend.prepare_staging()
+    ring = backend._staging_ring
+    assert len(backend.torch.calls) == 1 and len(ring.buffers) == 1
+    assert held.part.common.tier == "disk"  # no weight read happened during ring preparation
+    owner.construction_staging_credit = None  # all-rank construction promise released
+    assert owner._group_host_credit is None
+    backend.store_read = contextlib.nullcontext
+    backend.stats = {}
+    backend.decoded = {}
+    backend.leaf_sites = {}
+    backend.forensics = None
+    monkeypatch.setattr(accel, "synchronize", lambda *_: None)
+    monkeypatch.setattr(backend, "_stream", lambda _: 0)
+    monkeypatch.setattr(backend, "_reconcile_leaves", lambda: None)
+    monkeypatch.setattr(backend, "_mark", lambda *_, **__: None)
+
+    def unfunded(*_: Any, **__: Any) -> Any:
+        pytest.fail("scope before mirrored readiness requested another allocation")
+
+    backend.staging_host = unfunded
+    load = store.load_unit
+    store.calls = 1  # helper normally injects failure on its first load; this arm tests success
+
+    def fill_unit(name: str, unit: Any) -> None:
+        backend.enqueued = {"weight": SimpleNamespace(record_stream=lambda _: None)}
+        backend._commit_enqueued()
+        load(name, unit)
+
+    monkeypatch.setattr(store, "load_unit", fill_unit)
+    model = subject(owner, held)
+    model.render()
+    assert model.bodies == ["authored body"] and held.part.common.tier == "device"
+    assert backend._staging_ring is ring and len(backend.torch.calls) == 1
+    ring.close()
+
+
+def test_successful_construction_later_failed_refill_survives_unload_and_gc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gc
+    import socket
+    import weakref
+    from cozy_runtime.internal import accel
+    from cozy_runtime.internal.executor_commands import Unload
+    from cozy_runtime.internal.seam import Channel
+
+    ours, theirs = socket.socketpair()
+    host = Executor(Channel(ours), tmp_path)
+    child = host._construction_child("c")
+    backend: Any = object.__new__(fill.StreamingFillBackend)
+    backend.enqueued = {"first": object()}
+    backend.staging_host = lambda q, s: contextlib.nullcontext(1)
+    backend.slot_bytes = 16
+    backend.slots = 1
+    backend.inflight = 0
+    backend.fence = True
+    backend.torch = SimpleNamespace(cuda=SimpleNamespace(current_stream=lambda _: Stream()))
+    backend.device = "cpu"
+    backend.kind = "cpu"
+    backend.stats = {}
+    backend.decoded = {}
+    backend.leaf_sites = {}
+    backend.forensics = None
+    backend.store_read = contextlib.nullcontext
+    backend._live_ring = backend._staging_ring = None
+
+    class Lease:
+        def release(self) -> None:
+            pytest.fail("unproved DMA lease released")
+
+    backend.leases = Lease()
+
+    class Ring:
+        allocated_bytes = registered_bytes = window_bytes = 16
+        in_flight_peak = waits = 0
+
+        def __init__(self, *_: Any, **__: Any) -> None:
+            self.stream = Stream()
+            self.fail = False
+
+        def track(self, tensor: Any) -> None:
+            pass
+
+        def finish(self) -> None:
+            if self.fail:
+                raise RuntimeError("delayed DMA fault")
+
+    monkeypatch.setattr(fill, "StagingRing", Ring)
+    monkeypatch.setattr(accel, "synchronize", lambda *_: None)
+    backend._stream = lambda ring: 1
+    backend._reconcile_leaves = lambda: None
+    backend._mark = lambda *_, **__: None
+    child._own_fill_backend(backend)
+    host.constructions["c"] = child
+    monkeypatch.setattr(host, "_synchronize", lambda: None)
+    try:
+        backend._commit_enqueued()
+        assert not host._staging_quarantine
+        backend._staging_ring.fail = True
+        backend.enqueued = {"refill": object()}
+        with pytest.raises(RuntimeFailure, match="staging drain failed"):
+            backend._commit_enqueued()
+        references = [weakref.ref(value) for value in (backend, backend._live_ring, backend.leases)]
+        with pytest.raises(RuntimeFailure, match="staging drain is unproved"):
+            host.unload(Unload(construction="c"))
+        assert "c" not in host.constructions
+        del child, backend
+        gc.collect()
+        assert len(host._staging_quarantine) == 1 and all(
+            reference() is not None for reference in references
+        )
     finally:
         ours.close()
         theirs.close()
