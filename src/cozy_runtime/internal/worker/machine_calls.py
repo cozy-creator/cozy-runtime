@@ -178,16 +178,18 @@ class Calls:
     ) -> pb.ChildCallResult:
         owner = self.worker.fence.record_owner_id
         if action == "call":
+            # Journal access may drain progress and call _journal_changed, which
+            # takes this map's lock. Keep all journal and timing work outside it.
+            try:
+                self.journal.get(owner, parent.request_id, request.call_index)
+                fresh = False
+            except WorkspaceRefusal:
+                fresh = True
+            call = self.journal.accept(owner, request)
             with self.lock:
-                try:
-                    self.journal.get(owner, parent.request_id, request.call_index)
-                    fresh = False
-                except WorkspaceRefusal:
-                    fresh = True
-                call = self.journal.accept(owner, request)
                 self.requests[call.child_request] = request
-                if fresh:
-                    self.timing.phase(owner, call.child_request, 1, "queued", fresh=True)
+            if fresh:
+                self.timing.phase(owner, call.child_request, 1, "queued", fresh=True)
         else:
             call = self.journal.get(owner, parent.request_id, request.call_index)
         if call.intent_digest != request.intent_digest:
