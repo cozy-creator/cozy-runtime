@@ -3236,10 +3236,11 @@ class Machine:
             )
 
             def same_pressure(fact: proctree.HostPressure | None) -> bool:
-                return (
-                    fact is not None
-                    and witness is not None
-                    and any(
+                nonlocal witness
+                if fact is None or witness is None:
+                    return False
+                for sample in fact.reclaim_samples:
+                    if (
                         sample.scope == witness.scope
                         and sample.device == witness.device
                         and sample.inode == witness.inode
@@ -3255,9 +3256,12 @@ class Machine:
                             )
                         )
                         and sample.refault_file >= witness.refault_file
-                        for sample in fact.reclaim_samples
-                    )
-                )
+                    ):
+                        # Advance every observation, not just the initial witness:
+                        # a reset can still remain above the episode's first count.
+                        witness = sample
+                        return True
+                return False
 
             debt = before.debt_bytes if before is not None else -1
             if debt < 0 or (debt == 0 and not churn):
@@ -3279,6 +3283,7 @@ class Machine:
                 reclaim = functools.partial(reclaim, expected_generation=generation)
                 held_before: int | None = None
                 victim_reclaimed = 0
+                episode_valid = True
                 if churn:
                     # Zero-sized reclaim reports held bytes without dropping managed
                     # backing (the existing RPC can still drain/trim idle allocators).
@@ -3311,6 +3316,7 @@ class Machine:
                     after = self.host_pressure()
                     self._host_refault_growth(after)
                     debt = after.debt_bytes if after is not None else -1
+                    episode_valid = not churn or same_pressure(after)
                     if result is None:
                         break
                     released, held = result
@@ -3326,12 +3332,7 @@ class Machine:
                     victim_reclaimed += released
                     held_before = held
                     generation_used = generation
-                    if (
-                        held == 0
-                        or debt < 0
-                        or (churn and not same_pressure(after))
-                        or (debt == 0 and not churn)
-                    ):
+                    if held == 0 or debt < 0 or not episode_valid or (debt == 0 and not churn):
                         break
                 # A churn episode evacuates one idle generation, not all cached
                 # models. A later fresh counter interval can justify another pass.
@@ -3341,7 +3342,7 @@ class Machine:
                         f"generation={generation}, managed_released_bytes={victim_reclaimed}"
                     )
                     break
-                if debt < 0 or (debt == 0 and not churn):
+                if not episode_valid or debt < 0 or (debt == 0 and not churn):
                     break
             if after is None or debt < 0:
                 return {

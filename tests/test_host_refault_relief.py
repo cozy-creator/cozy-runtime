@@ -36,7 +36,7 @@ class Cache:
 
     def reclaim_host(
         self, nbytes: int, *, expected_generation: object | None = None
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int] | None:
         self.calls.append(nbytes)
         released = min(nbytes, 10, self.held) if self.progress else 0
         self.held -= released
@@ -311,3 +311,29 @@ def test_sampler_reads_max_only_finite_limit_and_counter(monkeypatch: pytest.Mon
     (sample,) = observed.reclaim_samples
     assert sample.high is None and sample.maximum == 12
     assert sample.high_limit is None and sample.max_limit == 100
+
+
+@pytest.mark.parametrize("failed_reply", [False, True])
+def test_episode_reset_above_initial_witness_stops_before_more_reclaim(failed_reply: bool) -> None:
+    policy, observed, active, idle = setup()
+    observed[0] = fact(2, 2)
+    later = Cache("later", last_used=1)
+
+    class ResetCache(Cache):
+        def reclaim_host(
+            self, nbytes: int, *, expected_generation: object | None = None
+        ) -> tuple[int, int] | None:
+            self.calls.append(nbytes)
+            if nbytes == 0:
+                observed[0] = fact(10, 10)
+                return 0, self.held
+            observed[0] = fact(8, 8)  # reset, although still above initial2
+            if failed_reply:
+                return None
+            self.held -= 10
+            return 10, self.held
+
+    changing = ResetCache("idle")
+    policy.relieve_host_pressure([active, changing, later])
+    assert changing.calls == [0, 40]
+    assert not later.calls
