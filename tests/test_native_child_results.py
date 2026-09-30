@@ -641,7 +641,7 @@ def test_native_grant_reader_ignores_fields_unused_by_its_kind(tmp_path: Path) -
     assert result.report.read_bytes() == (result.bundle.path / "payload").read_bytes() == data
 
 
-@pytest.mark.parametrize("kind,mime", [("audio", "audio/wav"), ("video", "image/png")])
+@pytest.mark.parametrize("kind,mime", [("audio", "audio/wav"), ("image", "audio/wav"), ("video", "image/png")])
 def test_encoded_png_refuses_a_wrong_kind_or_media_family(
     tmp_path: Path, kind: str, mime: str
 ) -> None:
