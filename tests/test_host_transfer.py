@@ -477,3 +477,24 @@ def test_overlapping_staging_slots_cannot_corrupt_sources(device: Torch) -> None
             owned=owned,
         )
     assert transfer is None and not owned and lease.releases == 1 and device.allocations == 0
+
+
+@pytest.mark.parametrize("kind", ["inference", "data"])
+def test_immutable_authority_must_revoke_even_when_versions_cannot_observe_write(
+    device: Torch, kind: str
+) -> None:
+    with torch.inference_mode(kind == "inference"):
+        item = unit()
+    version = tiers._transfer_version(item.module.scalar)
+    immutable = [True]
+    transfer, owned, leases = prepare(device, item, valid=lambda: immutable[0])
+    assert transfer is not None
+    # The provider revokes custody BEFORE allowing a writer. A version check alone
+    # cannot prove immutability for either of these supported Torch behaviors.
+    immutable[0] = False
+    with torch.inference_mode():
+        item.module.scalar.data.add_(1)
+    assert tiers._transfer_version(item.module.scalar) == version
+    assert not transfer.publish()
+    assert item.module.scalar.item() == 3.5 and item.tier == tiers.HOST
+    assert not owned and leases[0].releases == 1
