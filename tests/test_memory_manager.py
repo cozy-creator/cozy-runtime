@@ -1,9 +1,9 @@
-"""The machine's memory manager over the real Worker (darkness runs 1513 and 1514).
+"""The Worker's memory policy (`worker/memory.py`) over real objects.
 
-A real `Worker` with four devices, real execution units and real executor processes, as
-`test_gpu_scheduler` drives them. The only fake is the driver: each device's free bytes are
-its total less what every live tenant holds there (`LaneRow.held`), so an eviction or a
-reclaim moves them exactly as NVML would.
+The arithmetic runs on a real LaneSet, real Ledgers and executor replies decoded exactly as
+the Worker decodes them; nothing reads a driver. The reclaim legs at the end drive a real
+Worker with real executor processes, as `test_gpu_scheduler` does, over its four-device
+envelope.
 """
 
 from __future__ import annotations
@@ -19,9 +19,27 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import accel, proctree
+from cozy_runtime.internal import accel, proctree, weight_policy
+from cozy_runtime.internal.executor_replies import AttemptReply, decode
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
-from cozy_runtime.internal.worker.memory import Watch
+from cozy_runtime.internal.worker.lanes import LaneSet
+from cozy_runtime.internal.worker.ledger import Ledger
+from cozy_runtime.internal.worker.memory import (
+    Budget,
+    MemoryManager,
+    floor_bytes,
+    growth,
+    pinned_split,
+    reach,
+    weights,
+)
+from cozy_runtime.internal.worker.plan import (
+    PLANE_PLACEMENT,
+    DeclaredBinding,
+    PlanChooser,
+    PreparedModel,
+    PreparedRequest,
+)
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
 from test_gpu_scheduler import Machine
@@ -33,29 +51,152 @@ TOTAL = 80 * GiB
 SHAPE = ("segment", "frames=362")
 
 
-def held_on(machine: Machine, ordinal: int) -> int:
-    """What the live tenants of `ordinal` hold, as the driver would count it."""
-    return sum(
-        row.held.get(ordinal, 0)
-        for lane in machine.worker.lanes.lanes
-        if ordinal in lane.ordinals
-        for row in lane.rows.values()
-        if row.supervision is not None and row.supervision.current is not None
+def test_growth_is_a_shapes_own_else_the_least_larger_measured_one() -> None:
+    bank = {("s", "frames=242,width=512"): 30, ("s", "frames=362,width=768"): 50}
+    assert growth(("s", "frames=242,width=512"), bank) == 30
+    assert growth(("s", "frames=121,width=512"), bank) == 30
+    assert growth(("s", "frames=300,width=512"), bank) == 50
+    assert growth(("s", "frames=500,width=512"), bank) is None, "nothing measured covers it"
+    assert growth(("s", "frames=121"), bank) is None, "other axes describe another shape"
+    assert growth(("t", "frames=121,width=512"), bank) is None, "another entrypoint"
+
+
+def test_an_attempt_banks_what_its_executor_reports_and_a_device_failure_forgets_it() -> None:
+    lanes = LaneSet.from_envelope("0", worker_pid=os.getpid())
+    lane = lanes.lanes[0]
+    row = lane.row("p")
+    row.emptied.add(0)
+    manager = MemoryManager(lanes, lambda *_: None, lambda *_: False)
+    planed = decode(
+        {
+            "ok": True,
+            "plane": {"activation_peak_bytes": 3 * GiB, "committed_bytes": 5 * GiB, "late": 2},
+            "metrics": {"activation_peak_bytes": 9 * GiB},
+        },
+        AttemptReply,
     )
+    manager.settle(lane, "p", SHAPE, planed, ok=True, forget=False)
+    assert row.activation[SHAPE] == 3 * GiB, "the plane's own measurement, not the metric"
+    assert row.ledger.plane is not None and row.ledger.plane.committed_bytes == 5 * GiB
+    assert not row.emptied, "a call that ran holds its devices again"
+    older = decode(
+        {"ok": True, "metrics": {"activation_peak_bytes": GiB, "activation_peaks": {"d": 4 * GiB}}},
+        AttemptReply,
+    )
+    row.ledger.observe_attempt(older.metrics, cell=SHAPE[1], succeeded=True)
+    manager.settle(lane, "p", SHAPE, older, ok=True, forget=False)
+    assert row.activation[SHAPE] == 4 * GiB, "an older executor's per-scope peak, the most seen"
+    manager.settle(lane, "p", SHAPE, older, ok=False, forget=False)
+    assert row.activation[SHAPE] == 4 * GiB, "a failure measures nothing"
+    manager.settle(lane, "p", SHAPE, older, ok=False, forget=True)
+    assert SHAPE not in row.activation, "a device failure makes the shape unmeasured again"
+
+
+def test_activations_come_first_and_torch_cache_is_reused_not_counted_twice() -> None:
+    usable = reach(6 * GiB, 2 * GiB, GiB, 3 * GiB)
+    assert usable == 9 * GiB, "free, what the plane maps, and the cache the growth reuses"
+    # 6 free + 2 mapped, less the 2 GiB the growth needs beyond torch's 1 GiB cache
+    assert weight_policy.plane_budget(usable, 3 * GiB) == 6 * GiB - weight_policy.MARGIN
+    assert reach(6 * GiB, 2 * GiB, 5 * GiB, 3 * GiB) == 11 * GiB, "torch keeps the rest"
+    assert reach(6 * GiB, -1, 0, 0) == 6 * GiB, "an unreadable plane maps nothing"
+    assert Budget(vram={0: 5 * GiB, 1: 4 * GiB}).plane_bytes == 4 * GiB, "the tightest GPU"
+    assert Budget().plane_bytes == -1, "the executor derives its own"
+
+
+def test_the_refusal_floor_is_window_one_over_a_stage_or_its_largest_component() -> None:
+    ledger = Ledger(worker_pid=os.getpid())
+    ledger.begin_generation(1)
+    ledger.observe_construction(
+        {
+            "filled_bytes": 7 * GiB,
+            "layouts": {
+                "text_encoder": {"common": GiB // 8, "blocks": [GiB // 8] * 15},
+                "unet": {"common": GiB // 4, "blocks": [GiB // 4, GiB // 2, GiB // 4]},
+                "vae": {"common": GiB // 2},
+            },
+        }
+    )
+    assert weights(ledger) == 15 * GiB // 4 and weights(ledger, ("unet",)) == 5 * GiB // 4
+    layouts = ledger.layouts
+    assert floor_bytes(layouts, ("unet",), GiB, 300 << 20) == 3 * GiB // 4 + GiB + (300 << 20)
+    assert floor_bytes(layouts, ("text_encoder", "unet"), 0, 0) == GiB
+    assert floor_bytes(layouts, (), 0, -1) == 3 * GiB // 4, "components in turn; context unread"
+    ledger.begin_generation(2)
+    ledger.observe_construction({"filled_bytes": 7 * GiB})
+    assert weights(ledger) == 7 * GiB, "an older executor's filled bytes"
+
+
+def test_the_pinned_tier_takes_half_the_host_most_recently_used_first() -> None:
+    three = [("a", 8 * GiB, 0), ("b", 8 * GiB, 0), ("c", 8 * GiB, 0)]
+    assert pinned_split(20 * GiB, three) == {"a": 8 * GiB, "b": 2 * GiB, "c": 0}
+    # What the tier pins counts toward the half; the idle tenant's share shrinks, and the
+    # one about to run rises by at most half of what is free now.
+    split = pinned_split(4 * GiB, [("a", 8 * GiB, 0), ("b", 8 * GiB, 8 * GiB)])
+    assert split == {"a": 2 * GiB, "b": 4 * GiB}
+    assert pinned_split(-1, [("a", GiB, 0)]) == {"a": 0}
+
+
+def test_a_plane_document_is_telemetry_and_a_new_generation_forgets_it() -> None:
+    ledger = Ledger(worker_pid=os.getpid())
+    ledger.begin_generation(1)
+    ledger.observe_plane(
+        {
+            "committed_bytes": 3 * GiB,
+            "resident": {"unet": 3 * GiB},
+            "h2d_gbps": "fast",
+            "from_a_newer_executor": 1,
+        }
+    )
+    assert ledger.plane is not None
+    assert (ledger.plane.committed_bytes, ledger.plane.h2d_gbps) == (3 * GiB, 0.0)
+    ledger.observe_plane(None)
+    assert ledger.plane is not None and ledger.plane.budget_bytes == -1, "unreadable, not 0"
+    ledger.device_reserved, ledger.device_allocated = 3 * GiB, GiB
+    assert ledger.slack == 2 * GiB
+    ledger.begin_generation(2)
+    assert ledger.slack == 0 and ledger.plane is None
+
+
+def test_a_plane_tenant_plans_weight_plane_whatever_room_it_was_given() -> None:
+    ledger = Ledger(worker_pid=os.getpid())
+    ledger.begin_generation(1)
+    ledger.observe_construction({"resident": {"unet": GiB}, "parked": ["vae"]})
+    binding = DeclaredBinding(
+        entrypoint_binding_digest="sha256:" + "0" * 64,
+        entrypoint="serve",
+        model_class="M",
+        model_binding_path="serve.models.m",
+        model_parameter_name="m",
+        release="r",
+        logical_weight_bytes=GiB,
+    )
+    chooser, model = PlanChooser(ledger), PreparedModel(delivery_rung="verbatim")
+    prepared = PreparedRequest.unresolved("serve", {"width": 512})
+    assert chooser.choose(binding, model, prepared, fits=False).placement == "component_staged"
+    ledger.observe_construction({"layouts": {"unet": {"common": GiB // 2, "blocks": [GiB]}}})
+    ledger.observe_plane({"resident": {"unet": GiB // 2}})
+    plan = chooser.choose(binding, model, prepared, fits=False)
+    assert (plan.placement, plan.resident_bytes) == (PLANE_PLACEMENT, GiB // 2)
+    assert plan.model_weight_bytes == 3 * GiB // 2, "the plane's weight sets, whole"
+
+
+def test_the_view_reads_no_driver() -> None:
+    lanes = LaneSet.from_envelope("0,1", worker_pid=os.getpid())
+    lanes.lanes[1].row("p").model_bearing = True
+    lanes.lanes[1].touch("p")
+    view = MemoryManager(lanes, lambda *_: None, lambda *_: False).view()
+    assert view.devices == {}, "no admission has read a device yet"
+    assert [(t.tenant, t.gpus, t.active, t.plane) for t in view.tenants] == [
+        ("p", (1,), False, None)
+    ]
 
 
 @pytest.fixture
 def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
-    box: list[Machine] = []
-
-    def device_memory(entry: str, kind: str) -> accel.DeviceMemory:
-        used = held_on(box[0], int(entry)) if box else 0
-        return accel.DeviceMemory("measured", TOTAL - used, TOTAL)
-
-    monkeypatch.setattr(accel, "device_memory", device_memory)
+    measured = accel.DeviceMemory("measured", TOTAL, TOTAL)
+    monkeypatch.setattr(accel, "device_memory", lambda entry, kind: measured)
     with tempfile.TemporaryDirectory(prefix="cz-mem.", dir="/tmp") as root:
         made = Machine(Path(root), "0,1,2,3", "boot-one")
-        box.append(made)
         try:
             yield made
         finally:
@@ -77,136 +218,8 @@ def long_form(machine: Machine, monkeypatch: pytest.MonkeyPatch) -> tuple[str, l
     machine.warm()
     worker = machine.worker
     lanes = {worker._lane_of(p).lane_id: p for p in worker.hosted}
-    qwen = [lanes[f"lane-{o}"] for o in range(4)]
-    h3 = lanes["lane-0+1+2+3"]
-    for placement in qwen:
-        lane = worker._lane_of(placement)
-        lane.row(placement).held = {lane.ordinals[0]: 33 * GiB}
-    group = worker._lane_of(h3)
-    group.row(h3).held = dict.fromkeys(range(4), 20 * GiB)
     assert machine.granted(shot) == [0, 1, 2, 3]
-    return h3, qwen
-
-
-def vacated(machine: Machine) -> list[str]:
-    return [e.step.split("'")[1] for e in machine.worker.activity if " vacated for " in e.step]
-
-
-@needs_executor
-def test_a_group_evicts_the_idle_tenant_of_every_device_it_needs(
-    machine: Machine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """1513: the group's measured need does not fit beside the idle Qwen on ANY of its four
-    cards, so all four go, and only they: every process stays, warm."""
-    h3, qwen = long_form(machine, monkeypatch)
-    worker = machine.worker
-    before = machine.executors()
-    group = worker._lane_of(h3)
-    group.row(h3).peak[SHAPE] = dict.fromkeys(range(4), 61 * GiB)
-    assert worker.memory.admit(group, h3, SHAPE, "segment 2")
-    assert sorted(vacated(machine)) == sorted(qwen)
-    assert all(accel.device_memory(str(o), "cuda").free_bytes >= 41 * GiB for o in range(4))
-    assert machine.executors() == before, "vacated, not killed"
-    assert group.row(h3).held == dict.fromkeys(range(4), 20 * GiB), "the requester kept its own"
-
-
-@needs_executor
-def test_a_need_that_fits_moves_nothing_and_lru_order_is_kept(
-    machine: Machine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Everything that fits stays hot. A shape never measured has the whole of its devices:
-    idle tenants leave least recently used first, and the requester is never one."""
-    h3, qwen = long_form(machine, monkeypatch)
-    worker = machine.worker
-    group = worker._lane_of(h3)
-    group.row(h3).peak[SHAPE] = dict.fromkeys(range(4), 40 * GiB)
-    assert worker.memory.admit(group, h3, SHAPE, "fits")
-    assert vacated(machine) == []
-    for placement in (qwen[2], qwen[0], qwen[3], qwen[1]):
-        worker._lane_of(placement).touch(placement)
-    assert worker.memory.admit(group, h3, ("segment", "frames=500"), "unmeasured")
-    assert vacated(machine) == [qwen[2], qwen[0], qwen[3], qwen[1]]
-    assert h3 not in vacated(machine)
-
-
-@needs_executor
-def test_a_dead_groups_memory_is_reclaimed_before_its_devices_are_admitted_again(
-    machine: Machine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """1514: a broken group keeps nothing. The next tenant on its card kills and reaps it
-    before running, so its measured need finds the room instead of an OOM."""
-    h3, qwen = long_form(machine, monkeypatch)
-    worker = machine.worker
-    group = worker._lane_of(h3)
-    dead = worker.hosted[h3].supervision.current
-    assert dead is not None and dead.alive()
-    group.row(h3).held = dict.fromkeys(range(4), 62 * GiB)
-    dead.poisoned = "failed/group_broken"
-    lane = worker._lane_of(qwen[0])
-    lane.row(qwen[0]).peak[SHAPE] = {0: 40 * GiB}
-    assert worker.memory.admit(lane, qwen[0], SHAPE, "reference")
-    assert worker.hosted[h3].supervision.current is None
-    assert not dead.alive()
-    assert not os.path.exists(f"/proc/{dead.pid}"), "killed AND reaped"
-    assert vacated(machine) == [], "the dead tenant was ended, nobody idle was evicted"
-    ended = [e.step for e in worker.activity if f"{h3!r}: reclaimed executor epoch" in e.step]
-    assert len(ended) == 1, [e.step for e in worker.activity]
-
-
-@needs_executor
-def test_true_overload_stages_and_crashes_nothing(
-    machine: Machine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A need no eviction can meet evicts every idle tenant, says so in numbers, and
-    returns: the attempt runs staged (the plan's rule), nothing is killed."""
-    h3, qwen = long_form(machine, monkeypatch)
-    worker = machine.worker
-    before = machine.executors()
-    group = worker._lane_of(h3)
-    group.row(h3).peak[SHAPE] = dict.fromkeys(range(4), 200 * GiB)
-    assert not worker.memory.admit(group, h3, SHAPE, "segment 3")
-    assert sorted(vacated(machine)) == sorted(qwen)
-    assert machine.executors() == before
-    short = [e.step for e in worker.activity if "no idle tenant is left" in e.step]
-    assert short and "needs 193273528320 B free" in short[-1], short
-
-
-@needs_executor
-def test_a_calls_peak_is_what_the_driver_saw_and_a_device_failure_forgets_it(
-    machine: Machine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    h3, _qwen = long_form(machine, monkeypatch)
-    worker = machine.worker
-    group = worker._lane_of(h3)
-    row = group.row(h3)
-    free = TOTAL - 53 * GiB
-    seen = Watch(
-        before=dict.fromkeys(range(4), free),
-        low={0: free - 30 * GiB, 1: free - 41 * GiB, 2: free - 30 * GiB, 3: free - 30 * GiB},
-        after=dict.fromkeys(range(4), free - GiB),
-    )
-    worker.memory.settle(group, h3, SHAPE, seen, ok=True, forget=False)
-    assert row.peak[SHAPE] == {0: 50 * GiB, 1: 61 * GiB, 2: 50 * GiB, 3: 50 * GiB}
-    assert row.held == dict.fromkeys(range(4), 21 * GiB), "what the call left stays counted"
-    assert worker.memory.need(group, h3, SHAPE) == {
-        0: 29 * GiB,
-        1: 40 * GiB,
-        2: 29 * GiB,
-        3: 29 * GiB,
-    }
-    worker.memory.settle(group, h3, SHAPE, seen, ok=False, forget=True)
-    assert SHAPE not in row.peak and worker.memory.need(group, h3, SHAPE) is None
-
-
-def test_an_unmeasured_shape_is_bounded_only_by_a_larger_measured_one() -> None:
-    from cozy_runtime.internal.worker.memory import bound
-
-    peaks = {("s", "frames=242,width=512"): {0: 30}, ("s", "frames=362,width=768"): {0: 50}}
-    assert bound(("s", "frames=121,width=512"), peaks) == {0: 30}
-    assert bound(("s", "frames=300,width=512"), peaks) == {0: 50}
-    assert bound(("s", "frames=500,width=512"), peaks) is None, "nothing measured covers it"
-    assert bound(("s", "frames=121"), peaks) is None, "other axes describe another shape"
-    assert bound(("t", "frames=121,width=512"), peaks) is None, "another entrypoint"
+    return lanes["lane-0+1+2+3"], [lanes[f"lane-{o}"] for o in range(4)]
 
 
 @needs_executor
@@ -252,27 +265,6 @@ def test_an_executor_that_exits_after_its_withdrawal_is_reaped(
     while hosted.supervision.current is not None or os.path.exists(f"/proc/{executor.pid}"):
         assert time.monotonic() < bound, [e.step for e in worker.activity][-5:]
         time.sleep(0.05)
-
-
-@needs_executor
-def test_a_group_that_can_name_its_ranks_gives_back_only_the_cards_a_call_needs(
-    machine: Machine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A reference on card 3 needs H3's bytes there, not on cards 0-2: an executor that
-    says it can vacate ranks gives back GPU 3 alone, and restores it before it next runs."""
-    h3, qwen = long_form(machine, monkeypatch)
-    worker = machine.worker
-    group = worker._lane_of(h3)
-    executor = worker.hosted[h3].supervision.current
-    assert executor is not None
-    executor.hello["memory"] = ["vacate_ranks"]
-    lane = worker._lane_of(qwen[3])
-    lane.row(qwen[3]).peak[SHAPE] = {3: 70 * GiB}
-    assert worker.memory.admit(lane, qwen[3], SHAPE, "a reference")
-    steps = [e.step for e in worker.activity if " vacated " in e.step]
-    assert len(steps) == 1 and f"{h3!r}" in steps[0] and "vacated GPU 3 for " in steps[0], steps
-    assert group.row(h3).held == dict.fromkeys(range(3), 20 * GiB)
-    assert group.row(h3).emptied == {3}
 
 
 _EXITS_IN_SCOPE = """

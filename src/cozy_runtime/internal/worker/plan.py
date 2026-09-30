@@ -526,15 +526,20 @@ class DeclaredBinding:
         )
 
 
+#: A plane executor's placement: its resident prefix and streamed tail, inside its budget.
+PLANE_PLACEMENT = "weight_plane"
+
+
 class PlanChooser:
     """ONE AttemptPlan from the request shape, the binding and the tenant's residency.
 
-    Nothing is priced here: the memory manager already made room for this call on every
-    device it needs (`memory.py`), and says whether the call's measured need fits. The rung
-    follows: `all_resident` when it fits and the construction holds everything it built,
-    else `component_staged`: one declared scope resident at a time, blocks paged, inside
-    whatever every idle tenant's eviction left. The executor's admission of each scope is
-    the check that bytes exist. No I/O.
+    Nothing is priced here: the memory manager already granted this call its devices
+    (`memory.py`). A plane executor's placement is `weight_plane`: it keeps what its budget
+    holds resident and streams the rest, so no rung is walked. An older executor's rung
+    follows whether the call's measured need fits: `all_resident` when it fits and the
+    construction holds everything it built, else `component_staged`: one declared scope
+    resident at a time, blocks paged, inside whatever every idle tenant's eviction left. The
+    executor's admission of each scope is the check that bytes exist. No I/O.
     """
 
     def __init__(self, ledger: Ledger) -> None:
@@ -557,16 +562,24 @@ class PlanChooser:
                 pb.ResourceShortfall(resource="vram", scope="ledger", evidence_class="measured"),
             )
         cell = prepared.cell()
-        resident = dict(ledger.resident)
+        plane = ledger.plane
+        resident = dict(ledger.resident if plane is None else plane.resident)
         nominal = {**ledger.evicted, **resident}
         nominal.update({name: row["total_bytes"] for name, row in ledger.paging.items()})
+        nominal.update({name: layout.total for name, layout in ledger.layouts.items()})
         absent = sum(max(size - resident.get(name, 0), 0) for name, size in nominal.items())
         weights = sum(nominal.values()) or declared.logical_weight_bytes
         parked = [name for name in ledger.parked if name not in resident]
         headroom = ledger.activations_for(cell)
         scopes = ledger.activation_scopes_for(cell)
         measured = ledger.measured_scopes(cell) & set(ledger.declared_scopes)
-        placement = "all_resident" if fits and not absent and not parked else "component_staged"
+        placement = (
+            PLANE_PLACEMENT
+            if plane is not None
+            else "all_resident"
+            if fits and not absent and not parked
+            else "component_staged"
+        )
         rung = self._delivery(prepared_model, placement)
         return AttemptPlan(
             delivery=rung.delivery,

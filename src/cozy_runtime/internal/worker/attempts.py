@@ -104,6 +104,7 @@ from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorS
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.machine_publication import output_destination
 from cozy_runtime.internal.worker.plan import (
+    PLANE_PLACEMENT,
     AttemptPlan,
     DeclaredBinding,
     JobBinding,
@@ -327,6 +328,8 @@ class AttemptRecord:
     plan: AttemptPlan | None = None
     #: the memory manager made room for this call's measured need on every device
     room: bool = True
+    #: the plane budget the memory manager granted a plane executor; -1: it derives it
+    plane_budget_bytes: int = -1
     declared: DeclaredBinding | None = None
     #: what THIS worker's prepare resolved for that binding — never what it declared
     prepared_model: PreparedModel | None = None
@@ -1851,7 +1854,8 @@ class AttemptEngine:
                 ),
             )
         assert attempt.declared is not None and attempt.plan is not None
-        return Invoke(
+        plan = attempt.plan
+        invoke = Invoke(
             construction=attempt.declared.construction_key(),
             capture=attempt.spec.get("capture"),
             attention_kernel=str(attempt.spec.get("attention_kernel") or ""),
@@ -1859,10 +1863,7 @@ class AttemptEngine:
             entrypoint=attempt.declared.entrypoint,
             deadline_s=seconds,
             spool=str(spool),
-            placement=attempt.plan.placement,
-            headroom_bytes=attempt.plan.headroom_bytes,
-            scope_headroom_bytes=dict(attempt.plan.scope_headroom_bytes),
-            measured_scopes=tuple(attempt.plan.measured_scopes),
+            plane_budget_bytes=attempt.plane_budget_bytes,
             # cr-012: the VERIFIED inputs, by their stable identity. Paths into this
             # attempt's own spool and nothing else — no URL, no credential and no fetch
             # reaches the executor. What the executor CAN still do is dial one of its own,
@@ -1872,6 +1873,16 @@ class AttemptEngine:
             trees=trees,
             max_input_bytes=attempt.declared.max_input_bytes,
             max_output_bytes=max_output_bytes,
+        )
+        if plan.placement == PLANE_PLACEMENT:
+            return invoke
+        # Placement and headroom drive only executors before the plane.
+        return msgspec.structs.replace(
+            invoke,
+            placement=plan.placement,
+            headroom_bytes=plan.headroom_bytes,
+            scope_headroom_bytes=dict(plan.scope_headroom_bytes),
+            measured_scopes=tuple(plan.measured_scopes),
         )
 
     def release(

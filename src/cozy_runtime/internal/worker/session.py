@@ -96,6 +96,7 @@ from cozy_runtime.internal.executor_commands import (
     Unload,
 )
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.lora_contract import CAPABILITY as LORA_CAPABILITY
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -115,7 +116,6 @@ from cozy_runtime.internal.worker import (
     machine_slots,
     model_source_prepare,
     observe,
-    page_warm,
     prespawn,
     store_gc,
     triage,
@@ -156,7 +156,8 @@ from cozy_runtime.internal.worker.lanes import (
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority, origin_key
-from cozy_runtime.internal.worker.memory import MemoryManager
+from cozy_runtime.internal.worker.memory import MemoryManager, StageNeed, plane_capable
+from cozy_runtime.internal.worker.memory import Shortfall as MemoryShortfall
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,
@@ -912,8 +913,6 @@ class Worker:
         #: what keeps one slot's reclaim from freezing a sibling's serving executor.
         #: The primary keeps the seat's own uid.
         self._slot_uids: dict[str, int] = {}
-        #: (store, manifest, component) this worker already read into the page cache
-        self._pages_warmed: set[tuple[str, str, str]] = set()
         #: per placement: bindings digests of superseded documents -> {binding: construction}
         #: whose offers are still accepted when the binding and its construction are unchanged
         self._superseded: dict[str, dict[str, dict[str, str]]] = {}
@@ -4625,7 +4624,6 @@ class Worker:
                 f"{len(stale)} to unload; epoch {executor.epoch} pid {executor.pid} kept, "
                 f"admission stays OPEN at epoch {self.admission_epoch}",
             )
-        self._warm_pages(self._tenant(placement_id))
         if stale:
             self._unload_when_settled(placement_id, executor, stale, served)
         self._reconcile_hosted(revision)
@@ -5496,7 +5494,6 @@ class Worker:
             return started, False
         owned.ready_bindings = set(wanted)
         self._load_weightless(tenant, owned)
-        self._warm_pages(tenant)
         wanted -= set(tenant.failed_bindings)
         return ("", False) if wanted else ("prepare refused: every binding", False)
 
@@ -5733,22 +5730,23 @@ class Worker:
         lane, slot = tenant.lane, tenant.slot
         placement_id = tenant.placement.placement_id
         first = group[0]
-        if any(model.prepared_adapters for model in first.model_bindings()):
-            from cozy_runtime.internal.lora_contract import CAPABILITY
-
-            if CAPABILITY not in executor.hello.get("model_adapters", ()):
-                raise AttemptRefusal(
-                    "adapter_composition_unsupported",
-                    "the package executor SDK cannot execute prepared LoRA graphs; "
-                    "update its Runtime dependency",
-                    cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
-                )
+        if any(
+            model.prepared_adapters for model in first.model_bindings()
+        ) and LORA_CAPABILITY not in executor.hello.get("model_adapters", ()):
+            raise AttemptRefusal(
+                "adapter_composition_unsupported",
+                "the package executor SDK cannot execute prepared LoRA graphs; "
+                "update its Runtime dependency",
+                cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+            )
         label = key.removeprefix("sha256:")[:12]
         if not first.weightless:
-            # Idle tenants of every device give room for the weights first. Bindings of one
-            # construction share its weights, so they are counted once.
-            declared = max(binding.logical_weight_bytes for binding in group)
             lane.touch(slot)
+        if not first.weightless and not plane_capable(executor):
+            # An executor before the plane fills its weights onto the device: idle tenants of
+            # every device give room first. Bindings of one construction share its weights,
+            # so they are counted once. A plane executor maps nothing until its turn.
+            declared = max(binding.logical_weight_bytes for binding in group)
             self.memory.make_room(
                 lane,
                 slot,
@@ -5774,17 +5772,14 @@ class Worker:
         began = time.perf_counter()
         self.monitor.start(subject, "load")
         try:
-            with self.memory.watch(lane, sample=False) as seen:
-                reply = executor.call(
-                    command,
-                    timeout=None,
-                    on_progress=lambda frame: self.monitor.advance(
-                        subject, int(frame.get("position", 0) or 0)
-                    ),
-                    on_request=self._room(lane, slot),
-                )
-            if reply.get("ok") and not first.weightless:
-                self.memory.moved(lane, slot, seen)
+            reply = executor.call(
+                command,
+                timeout=None,
+                on_progress=lambda frame: self.monitor.advance(
+                    subject, int(frame.get("position", 0) or 0)
+                ),
+                on_request=self._room(lane, slot),
+            )
         except ExecutorGone as exc:
             self.monitor.end(subject, "executor_gone")
             reply = {"ok": False, "code": "executor_gone_during_prepare", "detail": str(exc)}
@@ -5834,6 +5829,7 @@ class Worker:
             if row.ledger.executor_pid != executor.pid:
                 row.ledger.begin_generation(executor.pid)
             row.ledger.observe_construction(facts)
+            self.memory.observe(row, executor, reply)
         self.boot.step(
             "load",
             "reused" if reply.get("reused") else "filled",
@@ -5961,13 +5957,12 @@ class Worker:
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
             ) from exc
         try:
-            with executor.watched("activate"), self.memory.watch(tenant.lane, sample=False) as seen:
+            with executor.watched("activate"):
                 reply = executor.call(
                     Activate(construction=key, authorized_device_limit_bytes=authorized),
                     timeout=None,
                     on_request=self._room(tenant.lane, tenant.slot),
                 )
-            self.memory.moved(tenant.lane, tenant.slot, seen)
         except ExecutorGone as exc:
             raise AttemptRefusal(
                 "executor_absent",
@@ -5993,6 +5988,7 @@ class Worker:
                 {**reply, "restored": {"restored_bytes": reply.get("restored_bytes", 0)}},
                 f"activated {label}",
             )
+            self.memory.observe(row, executor, reply)
         parked = [str(name).removeprefix("sha256:")[:12] for name in reply.get("parked") or ()]
         self.note(
             "residency",
@@ -6099,56 +6095,6 @@ class Worker:
             f"fit: {(facts.get('fit') or {}).get('detail', 'unjudged')}",
         )
 
-    def _warm_pages(self, tenant: Tenant) -> None:
-        """Read every desired construction's stored bytes once, in the background (h3a-018).
-
-        A construction loads on its first attempt, from the store. Measured on an H100 pod,
-        that read runs at 23-33 GB/s when its pages are cached and at 0.73 GB/s when they
-        are not. The read here is the same store stream the fill performs, into host
-        buffers that are dropped, so the first load of each construction finds its pages
-        warm. It moves no device byte, holds no lane lock, and decides nothing; a component
-        already warmed by this worker is not read again.
-        """
-        placement_id = tenant.placement.placement_id
-        work = []
-        for binding in tenant.bindings.values():
-            for model in binding.model_bindings():
-                for name in model.components:
-                    item = (model.store, model.snapshot_for(name), name)
-                    if item not in self._pages_warmed:
-                        self._pages_warmed.add(item)
-                        work.append(item)
-        if not work:
-            return
-
-        def run() -> None:
-            for store, manifest, name in work:
-                try:
-                    report = page_warm.warm_component(store, manifest, name)
-                except Exception as exc:
-                    self._pages_warmed.discard((store, manifest, name))
-                    self.note(
-                        "residency",
-                        f"{placement_id!r} page warm of {name!r} failed: "
-                        f"{type(exc).__name__}: {exc}"[:256],
-                    )
-                    continue
-                if report.get("skipped"):
-                    self.note(
-                        "residency",
-                        f"{placement_id!r} page warm skipped {name!r}: {report['skipped']}"[:256],
-                    )
-                    continue
-                self.note("residency", f"{placement_id!r} {page_warm.describe(report)}"[:256])
-
-        # A LANE like every other worker thread (cr-061's fence): `run` reports every
-        # failure it can see; the wrap turns the one it cannot into WORKER_PHASE_FAILED.
-        threading.Thread(
-            target=self._lane(f"page-warm:{placement_id}", run, fatal=False),
-            name=f"page-warm:{placement_id}",
-            daemon=True,
-        ).start()
-
     def _finish_activation(self) -> None:
         """Publish the activation edge, or its typed failure when the executor was lost.
 
@@ -6195,9 +6141,10 @@ class Worker:
     # ------------------------------------------------------ residency arbitration
 
     def _arbitrate_residency(self, attempt: AttemptRecord, slot: AttemptSlot) -> None:
-        """Make room for THIS attempt on every device of its lane, then refill what an
-        eviction took from it (`memory.py`). The caller holds the lane's devices, so every
-        other tenant there is idle and none is mid-load."""
+        """Start THIS attempt's turn on every device of its lane (`memory.py`): idle tenants
+        give room, a plane executor gets its budget, an older one refills what an eviction
+        took. The caller holds the lane's devices, so every other tenant there is idle and
+        none is mid-load. Below the floor the attempt is refused with both numbers."""
         serving = attempt.spec.get("serving")
         if serving is None or self.accepted.mode != "serving":
             return
@@ -6208,15 +6155,27 @@ class Worker:
         tenant = attempt.placement_id
         why = f"attempt {attempt.request_id}#{attempt.attempt}"
         prepared = attempt.prepared
-        shape = (prepared.entrypoint, prepared.cell()) if prepared else (declared.entrypoint, "")
-        attempt.room = self.memory.admit(lane, tenant, shape, why)
+        stage = (
+            StageNeed(entrypoint=prepared.entrypoint, cell=prepared.cell())
+            if prepared
+            else StageNeed(entrypoint=declared.entrypoint)
+        )
+        granted = self.memory.start(tenant, stage, lane.ordinals, why)
+        if isinstance(granted, MemoryShortfall):
+            raise AttemptRefusal(
+                "device_shortfall", granted.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+            )
+        attempt.room, attempt.plane_budget_bytes = granted.whole, granted.plane_bytes
         row = lane.row(tenant)
-        self._restore_residency(lane, tenant, row, why)
-        row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
+        executor = row.executor()
+        if executor is not None and not plane_capable(executor):
+            self._restore_residency(lane, tenant, row, why)
+            row.ledger.observe_devices(lane.device_facts(lane.measure(accel.host_backend_family())))
 
     def _restore_residency(self, lane: DeviceLane, slot: str, row: LaneRow, why: str) -> None:
-        """Refill what an eviction took from `slot`, now that room was made for it. What
-        does not fit stays absent and the attempt stages it."""
+        """Refill what a vacate took from an executor before the plane, now that room was
+        made for it (a plane executor re-wants lazily). What does not fit stays absent and
+        the attempt stages it."""
         missing = row.ledger.missing_resident()
         executor = row.executor()
         if not (missing or row.emptied) or executor is None:
@@ -6224,9 +6183,8 @@ class Worker:
         kind = accel.host_backend_family()
         memory = lane.memory(kind)
         try:
-            with executor.watched("restore"), self.memory.watch(lane, sample=False) as seen:
+            with executor.watched("restore"):
                 reply = executor.call(Restore(names=tuple(sorted(missing))), timeout=None)
-            self.memory.moved(lane, slot, seen)
         except ExecutorGone as exc:
             row.ledger.device_unreadable(f"the executor died while restoring: {exc}")
             self.note("residency", f"{slot!r} died while restoring: {exc}"[:256])
@@ -6305,7 +6263,7 @@ class Worker:
             )
 
     def _room(self, lane: DeviceLane, slot: str) -> Handler:
-        """Answer an executor that asks for room mid-load or mid-call (released executors'
+        """Answer an executor before the plane that asks for room mid-load or mid-call (its
         rank 0 does): idle tenants of every device of its lane give theirs back."""
 
         def answer(request: Request) -> Answer:
@@ -6487,15 +6445,20 @@ class Worker:
             if staged and not self.stage(attempt):
                 return
             self.await_settled(attempt)
+            if staged:
+                self._prefill(attempt)
             with lane.device:
-                # A cancel or its deadline may have taken a staged attempt off the queue
-                # while it waited for the device: then its terminal is already sent.
-                if staged and not self.engine.claim_staged(attempt):
-                    return
-                if self.enter(attempt) if staged else self.admit(attempt):
-                    released = self.execute(attempt, lane)
-                # On REFUSALS too (#458): a poisoned generation refuses every attempt.
-                self._rebuild_lane(lane, attempt.placement_id)
+                try:
+                    # A cancel or its deadline may have taken a staged attempt off the queue
+                    # while it waited for the device: then its terminal is already sent.
+                    if staged and not self.engine.claim_staged(attempt):
+                        return
+                    if self.enter(attempt) if staged else self.admit(attempt):
+                        released = self.execute(attempt, lane)
+                    # On REFUSALS too (#458): a poisoned generation refuses every attempt.
+                    self._rebuild_lane(lane, attempt.placement_id)
+                finally:
+                    self.memory.end(attempt.placement_id)
         except Exception as exc:
             self._attempt_faulted(attempt, exc)
         finally:
@@ -6509,6 +6472,19 @@ class Worker:
         if released is not None:
             with lane.posting:
                 self.finish(released)
+
+    def _prefill(self, attempt: AttemptRecord) -> None:
+        """While a staged attempt waits for its devices, its plane executor fills the host
+        tier of its construction when that is already loaded (`memory.prefill`)."""
+        serving = attempt.spec.get("serving") or {}
+        with self.control_lock:
+            if self._placement_by_id(attempt.placement_id) is None:
+                return
+            declared = self._tenant(attempt.placement_id).bindings.get(
+                str(serving.get("entrypoint_binding_digest", ""))
+            )
+        if declared is not None and not declared.weightless:
+            self.memory.prefill(attempt.placement_id, (declared.construction_key(),))
 
     def _rebuild_lane(
         self,
@@ -6850,46 +6826,43 @@ class Worker:
 
     def execute(self, attempt: AttemptRecord, lane: DeviceLane) -> Released | None:
         """RUN -> RELEASE. The ledger closes at release, while the device is still held; the
-        caller runs the post phase after letting the device go. The driver is sampled while
-        the attempt runs: its peak is what this shape costs on each device (`memory.py`).
+        caller runs the post phase after letting the device go. The reply's activation growth
+        is what this shape costs on each device (`memory.py`).
 
         A terminal built here is one the device phase itself produced (cancelled before
         dispatch, the executor died, the worker faulted) and is sent at once."""
         self._record_executor(attempt)
-        with self.memory.watch(lane) as seen:
+        try:
+            if self.machine_calls is not None:
+                self.machine_calls.run_timing.begin(
+                    self.fence.record_owner_id, attempt.request_id, attempt.attempt
+                )
+                self.machine_calls.timing.phase(
+                    self.fence.record_owner_id, attempt.request_id, attempt.attempt, "running"
+                )
             try:
+                released = self.engine.execute(attempt)
+            finally:
                 if self.machine_calls is not None:
-                    self.machine_calls.run_timing.begin(
+                    self.machine_calls.run_timing.end(
                         self.fence.record_owner_id, attempt.request_id, attempt.attempt
                     )
                     self.machine_calls.timing.phase(
-                        self.fence.record_owner_id, attempt.request_id, attempt.attempt, "running"
+                        self.fence.record_owner_id,
+                        attempt.request_id,
+                        attempt.attempt,
+                        "finalizing",
                     )
-                try:
-                    released = self.engine.execute(attempt)
-                finally:
-                    if self.machine_calls is not None:
-                        self.machine_calls.run_timing.end(
-                            self.fence.record_owner_id, attempt.request_id, attempt.attempt
-                        )
-                        self.machine_calls.timing.phase(
-                            self.fence.record_owner_id,
-                            attempt.request_id,
-                            attempt.attempt,
-                            "finalizing",
-                        )
-            except Exception as exc:
-                self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
-                try:
-                    released = self.engine.abandon(
-                        attempt, f"the worker faulted while running this attempt: {exc}"
-                    )
-                except Exception as inner:
-                    self.note("attempt", f"even ABANDONED could not be built: {inner}")
-                    self.terminate(
-                        attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}"
-                    )
-                    return None
+        except Exception as exc:
+            self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
+            try:
+                released = self.engine.abandon(
+                    attempt, f"the worker faulted while running this attempt: {exc}"
+                )
+            except Exception as inner:
+                self.note("attempt", f"even ABANDONED could not be built: {inner}")
+                self.terminate(attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}")
+                return None
         if not isinstance(released, Released):
             self.settle(released)
             return None
@@ -6901,7 +6874,7 @@ class Worker:
                 lane,
                 attempt.placement_id,
                 (prepared.entrypoint, prepared.cell()),
-                seen,
+                released.reply,
                 ok=outcome is not None and outcome.terminal == "succeeded",
                 forget=code in DEVICE_SHORTFALL_CODES or code in GROUP_FAULT_CODES,
             )

@@ -22,7 +22,7 @@ device lanes 0..3 exist together, so a device holds any number of tenants (the o
 EXECUTION is exclusive per physical device (law 8): each device has one lock and a lane
 takes its devices' locks in ordinal order. RESIDENCY is shared and belongs to the machine's
 memory manager (`memory.py`): the device lock is the reservation, and idle tenants of a
-device are evicted for the one holding it.
+device give room to the one holding it.
 """
 
 from __future__ import annotations
@@ -86,16 +86,16 @@ class LaneRow:
     supervision: child.ExecutorSupervision | None = None
     #: the lane clock at this tenant's latest admission or load: LRU victim order
     last_used: int = 0
-    #: ordinal -> what this tenant holds there beyond its process's context, as the driver
-    #: measured its own loads, restores and calls (`memory.py`); cleared when it is evicted
-    held: dict[int, int] = field(default_factory=dict)
-    #: (entrypoint, shape cell) -> ordinal -> the most it held there during a successful call
-    peak: dict[tuple[str, str], dict[int, int]] = field(default_factory=dict)
-    #: ordinals an eviction emptied since the tenant last restored or ran: what it restores
+    #: (entrypoint, shape cell) -> the activation growth its successful calls reported
+    #: (`memory.py`): a property of the model and the shape, so it outlives the generation
+    activation: dict[tuple[str, str], int] = field(default_factory=dict)
+    #: ordinals an older executor's vacate emptied since it last restored or ran
     emptied: set[int] = field(default_factory=set)
 
     def resident_bytes(self) -> int:
-        return sum(self.ledger.resident.values())
+        """Device bytes its weights hold now: the plane's, else the older executor's."""
+        plane = self.ledger.plane
+        return sum((self.ledger.resident if plane is None else plane.resident).values())
 
     def executor(self) -> child.Executor | None:
         """The live, unpoisoned executor holding this row's bytes, or None."""
