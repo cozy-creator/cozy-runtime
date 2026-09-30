@@ -242,8 +242,9 @@ def test_prepare_reads_header_and_assets_without_a_closure_lease(tmp_path: Path)
         cold.assets()
 
 
+@pytest.mark.parametrize("adapter_header_fails", [False, True])
 def test_binding_reads_config_only_from_the_cozytensors_header(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, adapter_header_fails: bool
 ) -> None:
     store_root, manifest_id, manifest_length, store = _snapshot(tmp_path, include_asset=True)
     acquirer = _acquirer(tmp_path, store_root)
@@ -295,12 +296,36 @@ def test_binding_reads_config_only_from_the_cozytensors_header(
         installation_id="local-" + "33" * 16,
     )
 
-    from functools import partial
+    from collections.abc import Iterator
+    from contextlib import contextmanager
 
     from cozy_runtime.internal import memory
 
     machine = memory.Machine({}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30)
-    acquirer.store_read = partial(machine.store_demand, "acquire:metadata")
+    events: list[str] = []
+    header_reads = 0
+
+    @contextmanager
+    def reading() -> Iterator[None]:
+        with machine.store_demand("acquire:metadata"):
+            events.append("begin")
+            try:
+                yield
+            finally:
+                events.append("end")
+
+    class HeaderStore:
+        def manifest(self, snapshot: str) -> Any:
+            nonlocal header_reads
+            assert not machine.optional_store_wanted(), "native header escaped StoreRead authority"
+            header_reads += 1
+            events.append("header")
+            native = store.manifest(snapshot)
+            if header_reads == 2 and adapter_header_fails:
+                raise OSError("adapter header read failed")
+            return native
+
+    acquirer.store_read = reading
     logical_weight_bytes = fill.logical_weight_bytes
     observed: list[str] = []
 
@@ -311,11 +336,22 @@ def test_binding_reads_config_only_from_the_cozytensors_header(
 
     monkeypatch.setattr(fill, "logical_weight_bytes", logical)
     assert acquirer._models(placement) == 1
-    bindings, documents_count = acquirer._bindings(placement)
+    events.clear()
+    monkeypatch.setattr(fill, "store", lambda _: HeaderStore())
+    if adapter_header_fails:
+        with pytest.raises(OSError, match="adapter header read failed"):
+            acquirer._bindings(placement)
+    else:
+        bindings, documents_count = acquirer._bindings(placement)
     assert len(observed) == 1 and observed[0].startswith("acquire:metadata:")
+    assert header_reads == 2  # Logical geometry survey, then the prepared-adapter probe.
+    assert events == ["begin", "header", "end", "begin", "header", "end"]
     assert machine.optional_store_wanted()
+    if adapter_header_fails:
+        return
 
     (model,) = bindings[binding_digest].model_bindings()
+    assert not model.prepared_adapters
     assert tensorfs.parse_header(bytes(store.manifest(manifest_id)["header"]))["configs"] == {
         "unet": _CONFIG
     }

@@ -112,7 +112,8 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     package_interface: str = ""
     #: Speculative startup imports code without creating a device context or warming it.
     import_only: bool = False
-    #: Both peers affirm these semantics before any CUDA or package initialization.
+    #: Worker's supported optional memory operations, not requirements on the executor.
+    #: Each operation checks support; missing initialization coverage keeps broad guards.
     memory_capabilities: tuple[str, ...] = ()
     authorized_device_limit_bytes: int | UnsetType = UNSET
     memory_grants: tuple[int, ...] = ()

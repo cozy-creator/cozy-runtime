@@ -532,7 +532,9 @@ class Acquirer:
                         sequence_parallel_degrees=degrees,
                         prepared_adapters=any(
                             model_config.adapter_graph(
-                                fill.Checkpoint(self.tensorfs_root, snapshot).header.get("configs")
+                                fill.Checkpoint(
+                                    self.tensorfs_root, snapshot, store_read=self.store_read
+                                ).header.get("configs")
                             )
                             for snapshot in set(snapshots.values())
                         ),

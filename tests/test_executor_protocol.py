@@ -121,8 +121,9 @@ assert first != second == fresh and len(walks) == 1, (len(walks), second == fres
 
 
 @pytest.mark.parametrize("model_bearing", [False, True])
+@pytest.mark.parametrize("preparation_coverage", [False, True])
 def test_import_only_start_defers_warmup_and_device_initialization(
-    tmp_path: Path, model_bearing: bool
+    tmp_path: Path, model_bearing: bool, preparation_coverage: bool
 ) -> None:
     python = os.environ.get("COZY_CPU_TEST_PYTHON") if model_bearing else sys.executable
     if python is None:
@@ -143,11 +144,16 @@ import socket, sys
 from pathlib import Path
 import msgspec
 from cozy_runtime.internal import executor_commands, package_interface
+from cozy_runtime.internal import executor as runtime
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.executor_commands import Probe, Residency, Start, Vacate, Warm
 from cozy_runtime.internal.seam import Channel, EXECUTOR_MEMORY_CAPABILITIES
+from cozy_runtime.internal.worker.child import require_executor_protocol
 root, model_bearing = Path(sys.argv[1]), sys.argv[2] == 'True'
+preparation_coverage = sys.argv[3] == 'True'
+if not preparation_coverage:
+    runtime.EXECUTOR_MEMORY_CAPABILITIES = frozenset({'store_read_gate'})
 sys.path.insert(0, str(root))
 _capture_seal()
 body = package_interface.build(discover_installed('import_start_fixture:app'))
@@ -160,6 +166,11 @@ interface.write_bytes(package_interface.canonical_bytes(body))
 ours, theirs = socket.socketpair()
 executor = Executor(Channel(ours), root)
 try:
+    hello = executor.hello()
+    require_executor_protocol(hello)
+    assert ('store_read_prepare' in hello['memory']) == preparation_coverage
+    # The current Worker announces more operations than this older peer reports.
+    # Start still succeeds: announced support is not a mandatory peer bitset.
     command = Start(application='import_start_fixture:app', package_interface=str(interface),
                     import_only=True, memory_capabilities=tuple(EXECUTOR_MEMORY_CAPABILITIES))
     assert executor_commands.decode(executor_commands.encode(command)) == command
@@ -188,7 +199,7 @@ finally:
     theirs.close()
 """
     done = subprocess.run(
-        [python, "-c", program, str(tmp_path), str(model_bearing)],
+        [python, "-c", program, str(tmp_path), str(model_bearing), str(preparation_coverage)],
         env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "PYTHONDONTWRITEBYTECODE": "1"},
         capture_output=True,
         text=True,
