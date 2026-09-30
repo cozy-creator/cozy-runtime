@@ -154,6 +154,10 @@ class Held:
     scope_anchor: bool = False
     conversion_epoch: int = 0
     ops: dict[str, Callable[..., object]] = field(default_factory=dict)
+    overlap_key: OpKey | None = None
+    overlap_order: tuple[tiers.Unit, ...] = ()
+    overlap_epoch: int = 0
+    overlap_contract: tuple[object, ...] = ()
 
 
 @dataclass(eq=False)
@@ -162,6 +166,17 @@ class Frame:
     base: int
     working: int = 0
     loaded: int = 0
+    overlap_key: OpKey | None = None
+    overlap_expected: tuple[tiers.Unit, ...] = ()
+    overlap_visits: list[tiers.Unit] = field(default_factory=list)
+    overlap_enabled: bool = False
+    overlap_learnable: bool = False
+    overlap_contract: tuple[object, ...] = ()
+    overlap_obligation: int = 0
+    overlap_pending: tiers.HostTransfer | None = None
+    overlap_consumers: dict[tiers.Unit, tiers.HostTransfer] = field(default_factory=dict)
+    overlap_drain: set[tiers.Unit] = field(default_factory=set)
+    overlap_depth: dict[tiers.Unit, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -211,6 +226,12 @@ class Planner:
         self._last_host_credit = 0
         self.sharded = sharded
         self.grouped = grouped
+        # Executor-lifetime strong custody: poisoned transfers survive failed calls.
+        self._host_transfers: set[tiers.HostTransfer] = set()
+        self._overlap_stream: object | None = None
+        self._overlap_oom_room: int | None = None
+        self._overlap_oom_unknown = False
+        self.overlap: dict[str, int] = {}
         self.process_bytes = process_bytes
         self.driver_process_bytes = self.peak_driver_process_bytes = -1
         self.driver_observations = self.peak_driver_budget_excess_bytes = 0
@@ -365,7 +386,12 @@ class Planner:
         self.peak = max(self.peak, int(cuda.max_memory_reserved(self.device)))
         self.peak_allocated = max(self.peak_allocated, peak)
         for frame in self.stack:
-            frame.working = max(frame.working, peak - frame.base - frame.loaded)
+            pending = sum(
+                transfer.source_bytes
+                for transfer in self._host_transfers
+                if transfer.state == "prepared"
+            )
+            frame.working = max(frame.working, peak - frame.base - frame.loaded - pending)
         cuda.reset_peak_memory_stats(self.device)
 
     # ------------------------------------------------------------------ components
@@ -435,6 +461,7 @@ class Planner:
 
     def _converted(self, held: Held) -> None:
         """A real package dtype conversion invalidates old working-memory observations."""
+        self._overlap_retire(held=held, clear=True)
         self._validate_component(held)
         for unit in held.part.units:
             tiers.load_demand(self.torch, unit)
@@ -634,12 +661,14 @@ class Planner:
         raise refusal
 
     def forget(self, construction: str) -> None:
+        self._overlap_retire(clear=True)
         for key in [key for key, held in self.held.items() if held.construction == construction]:
             tiers.release(self.held.pop(key).part)
 
     def host(self, key: str) -> None:
         """Another GPU of the group keeps this component: it never occupies this one."""
         held = self.held[key]
+        self._overlap_retire(held=held, clear=True)
         if held.part.store is not None:
             tiers.to_disk(self.torch, held.part, None)
         held.hosted = True
@@ -651,6 +680,8 @@ class Planner:
             raise MemoryRefusal("device_fault", self.unusable, reusable=False)
         if grant is not None:
             self.grant = grant
+        self._overlap_retire(clear=True)
+        self.overlap = {}
         self.room_requests.clear()
         self.peak = self.peak_allocated = self.working = 0
         self.peak_driver_process_bytes = -1
@@ -723,6 +754,7 @@ class Planner:
             "log": list(self.log[-8:]),
             "plans": {op: list(seen) for op, seen in self.plans.items()},
             "operations": {op: dict(counts) for op, counts in self.operations.items()},
+            "host_overlap": dict(self.overlap),
             "anchor_validation": {
                 "calls": self.anchor_validation_calls,
                 "ns": self.anchor_validation_ns,
@@ -878,6 +910,9 @@ class Planner:
     def _enter_scope(self, construction: str, method: str, components: tuple[str, ...]) -> None:
         if not self.cuda:
             return
+        self._overlap_retire(pending_only=True)
+        for frame in self.stack:
+            frame.overlap_enabled = frame.overlap_learnable = False
         self._cap()
         scoped = [
             held
@@ -1030,6 +1065,7 @@ class Planner:
         self._cap()
 
     def _refill_whole(self, held: Held) -> None:
+        self._overlap_retire(pending_only=True)
         with self._moving():
             tiers.from_disk(self.torch, held.part, None)
         self.loads += 1
@@ -1047,6 +1083,7 @@ class Planner:
         raise self.refusal
 
     def exit(self) -> None:
+        self._overlap_retire(pending_only=True, clear=True)
         if self.scopes:
             self.scopes.pop()
 
@@ -1353,9 +1390,18 @@ class Planner:
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> object:
+        if any(frame.held is held for frame in self.stack):
+            self._overlap_retire(pending_only=True)
+            for parent in self.stack:
+                parent.overlap_enabled = parent.overlap_learnable = False
         if not self.cuda or held.hosted or any(frame.held is held for frame in self.stack):
             self._ready(held.key)
             return fn(*args, **kwargs)
+        # A nested callee may fill/reclaim. Retire only unbound hints here; a parent
+        # consumer retains its own custody until its posthook or failed-call cleanup.
+        self._overlap_retire(pending_only=True)
+        for parent in self.stack:
+            parent.overlap_enabled = parent.overlap_learnable = False
         self._validate_active(held)
         torch = self.torch
         leaves = list(_leaves((args, kwargs)))
@@ -1404,6 +1450,7 @@ class Planner:
         previous_room: int | None = None
         previous_shortfall = 0
         room_tried = False
+        replayed = False
         try:
             while True:
                 plan = self._plan(held, key, retryable, floor)
@@ -1441,6 +1488,7 @@ class Planner:
                         snapshot = self._arm(held, leaves)
                     self._sample()
                     frame = Frame(held, self._allocated())
+                    self._overlap_frame(frame, key, retryable and not replayed)
                     self.stack.append(frame)
                     self._ready(held.key)
                     entered = True
@@ -1448,6 +1496,8 @@ class Planner:
                         out = fn(*args, **kwargs)
                     self._validate_active(held)
                 except BaseException as exc:
+                    self._overlap_retire(held=held, clear=True)
+                    replayed = True
                     oom = is_oom(exc)
                     if oom:
                         self._sample()
@@ -1476,6 +1526,7 @@ class Planner:
                     self.working = max(self.working, frame.working)
                     record = self.records.setdefault(key, Record())
                     record.ok = max(record.ok, frame.working)
+                    self._overlap_learn(frame, key)
                     if record.fail and (
                         frame.working >= record.fail or plan.keep >= record.fail_keep
                     ):
@@ -1490,6 +1541,7 @@ class Planner:
                 finally:
                     self._sample()
                     if frame is not None:
+                        self._overlap_retire(held=held)
                         self.stack.remove(frame)
                     self.oom_asked = 0
                 floor, previous_room, asked_worker = self._recover(
@@ -1957,6 +2009,7 @@ class Planner:
             self.transition += self._allocated() - before
 
     def _load_common(self, held: Held) -> None:
+        self._overlap_retire(pending_only=True)
         part = held.part
         if all(unit.tier == DEVICE for unit in part.common_units):
             return
@@ -1971,6 +2024,7 @@ class Planner:
     def _load(self, part: tiers.Component, unit: tiers.Unit) -> None:
         if unit.tier == DEVICE:
             return
+        self._overlap_retire(pending_only=True)
         tiers.load_demand(self.torch, unit)  # Refuse unbounded pending transforms before a fill.
         with self._moving():
             if unit.tier == HOST:
@@ -2002,6 +2056,7 @@ class Planner:
 
     def _offload(self, held: Held, *, everything: bool = False, target: int | None = None) -> None:
         """Move a victim's unpinned device units off the device."""
+        self._overlap_retire(pending_only=True)
         self._refresh_constraints(held)
         part = held.part
         whole, common = self._pinned()
@@ -2078,6 +2133,7 @@ class Planner:
         if not nbytes:
             yield True
             return
+        self._overlap_retire(pending_only=True)
         if self.grouped or self.group_phase:
             credit = self._group_host_credit
             admitted = credit is not None and nbytes <= credit
@@ -2214,23 +2270,281 @@ class Planner:
         return released
 
     def _enter_unit(self, part: tiers.Component, unit: tiers.Unit) -> None:
-        """A block's forward is about to run: stream it in if the plan left it out."""
+        """At actual demand, publish a proven copy or use the ordinary load path."""
         self._sample()
-        if unit.tier == DEVICE:
-            return
-        self._load(part, unit)
-        unit.streamed = True
-        if self.stack:
-            self.stack[-1].loaded += unit.nbytes
+        frame = next((f for f in reversed(self.stack) if f.held.part is part), None)
+        if frame is not None:
+            depth = frame.overlap_depth.get(unit, 0)
+            frame.overlap_depth[unit] = depth + 1
+            if depth:
+                self._overlap_retire(pending_only=True)
+                frame.overlap_enabled = frame.overlap_learnable = False
+                return
+        pending = frame.overlap_pending if frame is not None else None
+        hit = False
+        if pending is not None:
+            assert frame is not None
+            if pending.unit is unit:
+                started = time.perf_counter_ns()
+                with self._moving():
+                    hit = pending.publish()
+                self._overlap_count("copy_wait_ns", time.perf_counter_ns() - started)
+                frame.overlap_pending = None
+                if hit:
+                    frame.overlap_consumers[unit] = pending
+                    self.loads += 1
+                    self.moved += pending.source_bytes
+                    self._overlap_count("hits")
+                else:
+                    self._overlap_count("wasted_bytes", pending.submitted_bytes)
+                    self.torch.cuda.reset_peak_memory_stats(self.device)
+            else:
+                self._overlap_retire(pending_only=True)
+        if hit or unit.tier != DEVICE:
+            if not hit:
+                self._load(part, unit)
+            unit.streamed = True
+            if frame is not None:
+                frame.loaded += unit.nbytes
+        if frame is not None:
+            frame.overlap_visits.append(unit)
+            self._overlap_prepare(frame, unit)
 
     def _leave_unit(self, part: tiers.Component, unit: tiers.Unit) -> None:
         self._sample()
+        frame = next((f for f in reversed(self.stack) if f.held.part is part), None)
+        if frame is not None:
+            depth = frame.overlap_depth.get(unit, 0)
+            if depth > 1:
+                frame.overlap_depth[unit] = depth - 1
+                return
+            frame.overlap_depth.pop(unit, None)
+            transfer = frame.overlap_consumers.pop(unit, None)
+            if transfer is not None:
+                with self._moving():
+                    transfer.finish()
+            elif unit in frame.overlap_drain:
+                # Authored purity does not promise exclusive use of the current stream.
+                try:
+                    self.torch.cuda.synchronize(self.device)
+                except BaseException as exc:
+                    self.unusable = f"HOST overlap consumer drain failed: {exc}"
+                    if frame.overlap_pending is not None:
+                        frame.overlap_pending._poison(exc, "consumer drain")
+                    raise MemoryRefusal("device_fault", self.unusable, reusable=False) from exc
+            frame.overlap_drain.discard(unit)
         if not unit.streamed:
             return
         unit.streamed = False
         self._home(part, unit)
-        if self.stack:
-            self.stack[-1].loaded -= unit.nbytes
+        if frame is not None:
+            frame.loaded -= unit.nbytes
+
+    def _overlap_count(self, name: str, amount: int = 1) -> None:
+        self.overlap[name] = self.overlap.get(name, 0) + amount
+
+    def _overlap_observed(self, transfer: tiers.HostTransfer) -> None:
+        self._overlap_count("cpu_staged_bytes", transfer.staged_bytes)
+        self._overlap_count("h2d_submitted_bytes", transfer.submitted_bytes)
+        if transfer.state != "prepared":
+            self._overlap_count("wasted_bytes", transfer.submitted_bytes)
+
+    @staticmethod
+    def _overlap_contract(held: Held) -> tuple[object, ...]:
+        # Once per operation boundary, never once per keep alternative/block. The
+        # positive pure/retry declaration supplies immutable custody inside the body;
+        # tensor version snapshots alone cannot detect inference/.data writers.
+        return tuple(
+            (
+                id(module),
+                id(
+                    getattr(
+                        tiers.original(getattr(module, "forward", None)),
+                        "__func__",
+                        tiers.original(getattr(module, "forward", None)),
+                    )
+                ),
+                tuple(id(fn) for fn in _hook_fns(module)),
+            )
+            for module in held.part.root.modules()
+        ) + (id(getattr(held.part.root, "_cozy_retry_state", None)),)
+
+    def _overlap_frame(self, frame: Frame, key: OpKey, retryable: bool) -> None:
+        held = frame.held
+        frame.overlap_key = key
+        eligible = (
+            self.cuda
+            and not self.stack
+            and not self.grouped
+            and not self.group_phase
+            and not self.spare
+            and retryable
+            and held.forward_only
+            and not held.whole
+            and not held.compiled
+            and not held.hosted
+            and not self.sharded(held.key)
+            and not self.torch.is_grad_enabled()
+            and all(u.readonly and not u.mutable and not u.pending for u in held.part.units)
+        )
+        if not eligible:
+            held.overlap_key, held.overlap_order = None, ()
+            return
+        frame.overlap_learnable = True
+        frame.overlap_contract = self._overlap_contract(held)
+        record = self.records.get(key)
+        if (
+            held.overlap_contract == frame.overlap_contract
+            and record is not None
+            and record.ok > 0
+            and held.overlap_key == key
+            and held.overlap_epoch == held.conversion_epoch
+        ):
+            frame.overlap_enabled = True
+            frame.overlap_expected = held.overlap_order
+            frame.overlap_obligation = max(record.ok, record.fail)
+
+    def _overlap_learn(self, frame: Frame, key: OpKey) -> None:
+        held, visits = frame.held, frame.overlap_visits
+        # A repeated/nested block has ambiguous consumer lifetime in this experiment.
+        if (
+            frame.overlap_learnable
+            and visits
+            and len(set(visits)) == len(visits)
+            and frame.overlap_contract == self._overlap_contract(held)
+        ) and all(u.readonly and not u.mutable and not u.pending for u in held.part.units):
+            held.overlap_key, held.overlap_order = key, tuple(visits)
+            held.overlap_epoch = held.conversion_epoch
+            held.overlap_contract = frame.overlap_contract
+        else:
+            held.overlap_key, held.overlap_order = None, ()
+
+    def _overlap_retire(
+        self, *, held: Held | None = None, pending_only: bool = False, clear: bool = False
+    ) -> None:
+        for frame in self.stack:
+            if held is not None and frame.held is not held:
+                continue
+            if clear:
+                frame.overlap_enabled = frame.overlap_learnable = False
+            transfer = frame.overlap_pending
+            if transfer is not None:
+                self._sample()
+                with self._moving():
+                    transfer.abort()
+                self._overlap_count("wasted_bytes", transfer.source_bytes)
+                frame.overlap_pending = None
+                self.torch.cuda.reset_peak_memory_stats(self.device)
+            if not pending_only:
+                for unit, transfer in tuple(frame.overlap_consumers.items()):
+                    with self._moving():
+                        transfer.finish()
+                    # Explicit conversion/unload can close custody inside a body.
+                    # Its eventual posthook still drains any later submissions.
+                    frame.overlap_drain.add(unit)
+                frame.overlap_consumers.clear()
+        if clear:
+            for each in self.held.values():
+                if held is None or each is held:
+                    each.overlap_key, each.overlap_order = None, ()
+
+    def _overlap_prepare(self, frame: Frame, current: tiers.Unit) -> None:
+        if not frame.overlap_enabled:
+            return
+        order, seen = frame.overlap_expected, frame.overlap_visits
+        if tuple(seen) != order[: len(seen)]:
+            frame.overlap_enabled = False
+            self._overlap_count("decline_order")
+            return
+        if len(seen) >= len(order):
+            return
+        unit = order[len(seen)]
+        if (
+            unit.tier != HOST
+            or unit.pending
+            or unit.mutable
+            or not unit.readonly
+            or frame.overlap_pending is not None
+            or self.unusable
+        ):
+            self._overlap_count("decline_source")
+            return
+        acquire = getattr(frame.held.part.store, "borrow_staging", None)
+        if acquire is None:
+            self._overlap_count("decline_staging")
+            return
+        self.observe_process()
+        self._cap()
+        room = self.allocatable()
+        # Keep the entire measured working obligation available. This conservative
+        # first experiment does not infer live activation reuse or evict a resident.
+        available = room - frame.overlap_obligation
+        if (
+            self._overlap_oom_unknown
+            or available < unit.nbytes
+            or (self._overlap_oom_room is not None and room < self._overlap_oom_room)
+        ):
+            self._overlap_count("decline_capacity")
+            return
+        epoch = frame.held.conversion_epoch
+
+        def valid() -> bool:
+            return (
+                not self.unusable
+                and frame in self.stack
+                and frame.overlap_enabled
+                and frame.held.conversion_epoch == epoch
+                and unit.readonly
+                and not unit.mutable
+                and not unit.pending
+                and not self.torch.is_grad_enabled()
+            )
+
+        self._sample()
+        started = time.perf_counter_ns()
+        old_asked = self.oom_asked
+        self.oom_asked = 0
+        try:
+            if self._overlap_stream is None:
+                self._overlap_stream = self.torch.cuda.Stream(device=self.device)
+            with self._moving():
+                transfer = tiers.HostTransfer.prepare(
+                    self.torch,
+                    unit,
+                    self.device,
+                    self._overlap_stream,
+                    acquire=acquire,
+                    device_capacity=available,
+                    valid=valid,
+                    owned=self._host_transfers,
+                    observed=self._overlap_observed,
+                )
+            if transfer is None:
+                self._overlap_count("decline_mechanism")
+                return
+            frame.overlap_pending = transfer
+            frame.overlap_drain.add(current)
+            self._overlap_count("prepared_bytes", transfer.source_bytes)
+        except BaseException as exc:
+            if not is_oom(exc) or self.unusable:
+                raise
+            asked = self.oom_asked or _asked(str(exc))
+            # Unknown allocation size supplies no reproducible gain proof.
+            if asked > 0:
+                self._overlap_oom_room = max(room, self.allocatable()) + asked
+            else:
+                self._overlap_oom_unknown = True
+            self._overlap_count("optional_oom")
+        finally:
+            self.oom_asked = old_asked
+            self._overlap_count("prepare_ns", time.perf_counter_ns() - started)
+            # No authored operation ran here. Transfer-only allocation peaks remain
+            # in global allocator evidence, but never become activation measurements.
+            self.peak_allocated = max(
+                self.peak_allocated, int(self.torch.cuda.max_memory_allocated(self.device))
+            )
+            self.peak = max(self.peak, int(self.torch.cuda.max_memory_reserved(self.device)))
+            self.torch.cuda.reset_peak_memory_stats(self.device)
 
     # ------------------------------------------------------------------ retry safety
 

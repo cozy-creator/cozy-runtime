@@ -1,0 +1,1 @@
+- Add an isolated automatic Planner experiment that borrows existing pinned capacity for one observed next HOST unit, with unchanged grants, conservative device completion and measured transfer diagnostics.

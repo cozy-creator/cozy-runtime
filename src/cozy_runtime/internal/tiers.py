@@ -582,13 +582,13 @@ def _transfer_snapshot(unit: Unit) -> tuple[object, ...]:
 
 
 class HostTransfer:
-    """Disabled experiment: one event-owned HOST copy, with no Planner/pool policy.
+    """One event-owned HOST copy; eligibility and pool policy belong to the Planner.
 
     The caller supplies an executor-lifetime custody set and an already-admitted
     exclusive pinned lease. Failed drain retains this object in that set. Publication
     joins the copy on CPU; final consumer retirement conservatively drains the device,
-    because purity does not imply exclusive current-stream use. No caller enables this
-    mechanism yet; ordinary to_device remains synchronous.
+    because purity does not imply exclusive current-stream use. Ordinary to_device
+    remains synchronous; the optional Planner experiment uses this separate custody.
     """
 
     def __init__(
@@ -614,6 +614,7 @@ class HostTransfer:
         self.copy_ready: Any = None
         self.consumer_done: Any = None
         self.started = False
+        self.staged_bytes = self.submitted_bytes = 0
         self.state = "new"
         self.poisoned = ""
 
@@ -629,6 +630,7 @@ class HostTransfer:
         device_capacity: int,
         valid: Callable[[], bool],
         owned: set[HostTransfer],
+        observed: Callable[[HostTransfer], None] | None = None,
     ) -> HostTransfer | None:
         """Prepare unbound destinations or decline; never execute authored Python.
 
@@ -673,6 +675,9 @@ class HostTransfer:
                 except BaseException as cleanup:
                     raise cleanup from exc
             raise
+        finally:
+            if observed is not None:
+                observed(result)
         return result
 
     def _current(self) -> bool:
@@ -729,6 +734,7 @@ class HostTransfer:
                     count = min(source.numel() - cursor, buffers[slot].numel() - offset)
                     target = buffers[slot].view(-1)[offset : offset + count]
                     target.copy_(source[cursor : cursor + count])
+                    self.staged_bytes += count
                     chunks.append((index, cursor, target))
                     cursor, offset = cursor + count, offset + count
         if not self._current():
@@ -747,6 +753,7 @@ class HostTransfer:
                 self.destinations[index][offset : offset + source.numel()].copy_(
                     source, non_blocking=True
                 )
+                self.submitted_bytes += source.numel()
             self.copy_ready = torch.cuda.Event()
             self.copy_ready.record(self.stream)
         self.state = "prepared"

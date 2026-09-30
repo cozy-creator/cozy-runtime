@@ -1,14 +1,15 @@
-# Disabled event-owned HOST transfer experiment
+# Event-owned HOST transfer experiment
 
-`tiers.HostTransfer` is a mechanism only. No Planner, fill path or executor calls it.
+`tiers.HostTransfer` is a mechanism only. The isolated Planner experiment described in
+[planner-host-overlap-experiment.md](planner-host-overlap-experiment.md) supplies its
+optional caller and admission policy. This is not a qualified release.
 Public memory work remains reserved for 0.18.91; immutable R17 .90dev is unchanged.
 
 A caller supplies a copy stream, explicit destination allowance, generation/eligibility
 validator, executor-lifetime custody set, and an exclusive already-admitted pinned buffer
 lease. The lease's full capacity must hold one whole unit up front; no buffer grows, no
-allocator cache is treated as a grant, and insufficient/unpinned capacity declines. A later
-provider may borrow the retained ring introduced separately by PR997, but no borrower or
-second pool is implemented here. Admission and numerical policy stay outside tiers.
+allocator cache is treated as a grant, and insufficient/unpinned capacity declines. The provider borrows the retained ring introduced separately by PR997; it creates no
+second pool. Admission and numerical policy stay outside tiers.
 
 Preparation holds original source references and snapshots, preserves one GPU allocation
 per original storage group, stages raw bytes across pinned slots and enqueues copies.
