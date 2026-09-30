@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 import zlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import torch
@@ -25,6 +25,7 @@ from transformers import (
 from transformers import initialization as transformer_init
 
 from cozy_runtime.author import Config, Loader, Model, uses_components
+from cozy_runtime.models._progress import PipelineProgress
 
 from .upstream.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
 from .upstream.pipeline_qwenimage21 import QwenImage21Pipeline, calculate_dimensions
@@ -100,6 +101,11 @@ class _StagedPipeline(QwenImage21Pipeline):
     reference_latents: torch.Tensor | None = None
     reference_pad_mask: torch.Tensor | None = None
 
+    def progress_bar[T](
+        self, iterable: Iterable[T] | None = None, total: int | None = None
+    ) -> PipelineProgress[T]:
+        return PipelineProgress(iterable, total)
+
     @property
     def _execution_device(self) -> torch.device:
         # Upstream chooses the first registered module (VAE), which can correctly
@@ -156,13 +162,11 @@ class QwenImage21Model(Model[QwenImage21Graph]):
     def _pipeline(self) -> _StagedPipeline:
         from diffusers import FlowMatchEulerDiscreteScheduler
 
-        pipeline = _StagedPipeline(
+        return _StagedPipeline(
             **self.graph.components,
             processor=self.processor,
             scheduler=FlowMatchEulerDiscreteScheduler.from_config(self.graph.scheduler_config),
         )
-        pipeline.set_progress_bar_config(disable=True)
-        return pipeline
 
     @uses_components("text_encoder")
     def encode(self, prompt: str) -> tuple[Any, Any]:
