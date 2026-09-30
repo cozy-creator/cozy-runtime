@@ -1,7 +1,8 @@
 """New GPU contexts use the real Worker's owned idle-memory admission.
 
-The Worker, tenant processes and Vacate exchange are real. NVML and the CUDA
-context allocation are hardware seams, so this CPU proof does not claim a GPU OOM.
+The Worker, tenant processes and their Budget/Vacate exchange are real. NVML (the idle
+tenant's device bytes, gone once it is cut) and the CUDA context allocation are hardware
+seams, so this CPU proof does not claim a GPU OOM.
 """
 
 from __future__ import annotations
@@ -14,7 +15,8 @@ import pytest
 
 from cozy_runtime.author._executor_requests import Handler
 from cozy_runtime.internal import accel
-from cozy_runtime.internal.executor_commands import Command, Start
+from cozy_runtime.internal.executor_commands import Budget, Command, Start, Vacate
+from cozy_runtime.internal.executor_replies import PlaneFacts
 from cozy_runtime.internal.worker import child, prespawn
 from cozy_runtime.internal.worker.session import HostedPlacement, Tenant
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -23,9 +25,21 @@ from test_memory_manager import TOTAL, GiB, needs_executor
 from test_memory_manager import machine as machine
 
 OOM = "GPU 1: cuDevicePrimaryCtxRetain failed: CUDA_ERROR_OUT_OF_MEMORY"
+HELD = {0: 20 * GiB, 1: TOTAL - (225 << 20)}
 
 
-def contexts(machine: Machine, monkeypatch: pytest.MonkeyPatch) -> tuple[Tenant, Tenant]:
+def cut(machine: Machine) -> bool:
+    return any(
+        ("vacated" in event.step or "cut to 0 B" in event.step) and "executor startup" in event.step
+        for event in machine.worker.activity
+    )
+
+
+def contexts(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Tenant, Tenant, dict[int, int]]:
+    """An idle tenant holding `HELD` on both GPUs, and a fresh one about to start there.
+    Returns them and the idle tenant's device bytes, emptied when the Worker cuts it."""
     machine.activate_warm(monkeypatch)
     machine.serving("A", "h3", gpus=2)
     machine.await_granted("A")
@@ -35,7 +49,14 @@ def contexts(machine: Machine, monkeypatch: pytest.MonkeyPatch) -> tuple[Tenant,
     machine.tick()
     worker = machine.worker
     previous = worker._tenant(idle.placement.placement_id)
-    previous.row().held = {0: 20 * GiB, 1: TOTAL - (225 << 20)}
+    occupied = dict(HELD)
+    monkeypatch.setattr(
+        accel,
+        "device_memory",
+        lambda entry, kind: accel.DeviceMemory(
+            "measured", TOTAL - occupied.get(int(entry), 0), TOTAL
+        ),
+    )
     document = pb.Placement()
     document.CopyFrom(idle.placement.document)
     document.placement_id = "fresh-context"
@@ -46,16 +67,19 @@ def contexts(machine: Machine, monkeypatch: pytest.MonkeyPatch) -> tuple[Tenant,
     assert worker._assign_lane(placement, fresh.bindings, supervision)
     current = worker._own_executor(worker._tenant(placement.placement_id))
     assert not isinstance(current, str)
-    return previous, worker._tenant(placement.placement_id)
+    return previous, worker._tenant(placement.placement_id), occupied
 
 
 def allocation(
     machine: Machine,
     tenant: Tenant,
     monkeypatch: pytest.MonkeyPatch,
+    idle: Tenant,
+    occupied: dict[int, int],
 ) -> tuple[list[Start], threading.Event]:
     executor = tenant.supervision.current
-    assert executor is not None
+    holder = idle.supervision.current
+    assert executor is not None and holder is not None
     original = child.Executor.call
     calls: list[Start] = []
     called = threading.Event()
@@ -76,7 +100,7 @@ def allocation(
             if any(m.state != "measured" or m.free_bytes < GiB for m in picture.values()):
                 return {"ok": False, "code": "group_unformed", "detail": OOM}
             return {"ok": True, "stages": [], "follower_pids": []}
-        return original(
+        reply = original(
             current,
             command,
             timeout=timeout,
@@ -84,6 +108,9 @@ def allocation(
             on_progress=on_progress,
             on_request=on_request,
         )
+        if current is holder and isinstance(command, Budget | Vacate) and reply.get("ok"):
+            occupied.clear()
+        return reply
 
     monkeypatch.setattr(child.Executor, "call", allocate)
     return calls, called
@@ -96,13 +123,13 @@ def test_start_admits_the_full_group_before_allocating_a_new_context(
     monkeypatch: pytest.MonkeyPatch,
     prespawned: bool,
 ) -> None:
-    idle, fresh = contexts(machine, monkeypatch)
+    idle, fresh, occupied = contexts(machine, monkeypatch)
     if prespawned:
         fresh = replace(fresh, lane=prespawn._lane(machine.worker, (0, 1)))
     old = idle.supervision.current
     executor = fresh.supervision.current
     assert old is not None and executor is not None
-    calls, _ = allocation(machine, fresh, monkeypatch)
+    calls, _ = allocation(machine, fresh, monkeypatch, idle, occupied)
     bindings = dict(fresh.bindings)
     assert fresh.lane.measure(machine.worker.memory.kind)[1].free_bytes == 225 << 20
     # An attempt can already hold the lane when its new context needs admission:
@@ -113,13 +140,9 @@ def test_start_admits_the_full_group_before_allocating_a_new_context(
     assert calls[0].devices == "0,1" and calls[0].sequence_parallel_degree == 2
     assert fresh.bindings == bindings and not fresh.failed_bindings
     assert executor.started and executor.alive() and old.alive()
-    assert idle.row().held == {} and idle.row().emptied == {0, 1}
+    assert not occupied and cut(machine)
     assert all(
         m.free_bytes == TOTAL for m in fresh.lane.measure(machine.worker.memory.kind).values()
-    )
-    assert any(
-        "vacated" in event.step and "executor startup" in event.step
-        for event in machine.worker.activity
     )
 
 
@@ -130,12 +153,12 @@ def test_start_waits_for_active_work_before_vacating_its_memory(
     monkeypatch: pytest.MonkeyPatch,
     prespawned: bool,
 ) -> None:
-    idle, fresh = contexts(machine, monkeypatch)
+    idle, fresh, occupied = contexts(machine, monkeypatch)
     if prespawned:
         fresh = replace(fresh, lane=prespawn._lane(machine.worker, (0, 1)))
     executor = fresh.supervision.current
     assert executor is not None
-    calls, called = allocation(machine, fresh, monkeypatch)
+    calls, called = allocation(machine, fresh, monkeypatch, idle, occupied)
     active, leave, waiting = threading.Event(), threading.Event(), threading.Event()
     lock = fresh.lane.device.locks[0]
 
@@ -166,14 +189,14 @@ def test_start_waits_for_active_work_before_vacating_its_memory(
         starter.start()
         assert waiting.wait(10), "startup never acquired the shared physical locks"
         assert not called.is_set() and not calls
-        assert idle.row().held[1] == TOTAL - (225 << 20)
+        assert occupied == HELD
     finally:
         leave.set()
         holder.join(10)
         starter.join(10)
     assert not holder.is_alive() and not starter.is_alive()
     assert result == [""] and len(calls) == 1
-    assert idle.row().held == {}
+    assert not occupied
 
 
 @needs_executor
@@ -183,11 +206,13 @@ def test_unmanaged_or_unreadable_startup_oom_refuses_once_with_its_original_reas
     monkeypatch: pytest.MonkeyPatch,
     readable: bool,
 ) -> None:
-    idle, fresh = contexts(machine, monkeypatch)
+    idle, fresh, occupied = contexts(machine, monkeypatch)
     executor = fresh.supervision.current
     assert executor is not None
     if readable:
-        idle.row().held.clear()
+        # The idle tenant's plane reports nothing mapped: the 225 MiB left is unmanaged.
+        idle.row().ledger.plane = PlaneFacts(committed_bytes=0)
+        idle.row().ledger.resident.clear()
     monkeypatch.setattr(
         accel,
         "device_memory",
@@ -197,12 +222,12 @@ def test_unmanaged_or_unreadable_startup_oom_refuses_once_with_its_original_reas
             else accel.DeviceMemory("unreadable")
         ),
     )
-    calls, _ = allocation(machine, fresh, monkeypatch)
+    calls, _ = allocation(machine, fresh, monkeypatch, idle, occupied)
     refusal = machine.worker._start_executor(fresh, executor)
     assert refusal == "group_unformed: " + OOM
     assert len(calls) == 1 and not executor.alive()
     assert all(value == "group_unformed: " + OOM for value in fresh.failed_bindings.values())
-    assert not any("vacated" in event.step for event in machine.worker.activity)
+    assert not cut(machine)
     assert idle.supervision.current is not None and idle.supervision.current.alive()
 
 
@@ -219,11 +244,11 @@ def test_a_started_executor_reuses_its_context_without_evicting_idle_neighbors(
     machine: Machine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    idle, fresh = contexts(machine, monkeypatch)
+    idle, fresh, occupied = contexts(machine, monkeypatch)
     executor = fresh.supervision.current
     assert executor is not None
-    calls, _ = allocation(machine, fresh, monkeypatch)
+    calls, _ = allocation(machine, fresh, monkeypatch, idle, occupied)
     executor.started = {"ok": True}
     assert machine.worker._prepare_generation(fresh) == ("", True)
     assert not calls and executor.alive()
-    assert idle.row().held == {0: 20 * GiB, 1: TOTAL - (225 << 20)}
+    assert occupied == HELD and not cut(machine)
