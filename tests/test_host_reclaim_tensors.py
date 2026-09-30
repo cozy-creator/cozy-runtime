@@ -1,6 +1,7 @@
 """Real CPU tensor storage and fill-plane eviction; no CUDA calls or process retirement."""
 
 from dataclasses import dataclass
+import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -19,6 +20,11 @@ def resident(name: str, elements: int = 32) -> tuple[memory.Planner, memory.Held
     backend.torch = torch
     backend._staging_ring = None
     backend._live_ring = None
+    backend._staging_lock = threading.Lock()
+    backend._staging_busy = False
+    backend._staging_borrow = None
+    backend._staging_poisoned = ""
+    backend.staging_started = backend.staging_drained = lambda: None
     backend.components = {name: root}
     backend.parked = {}
     backend.replaced = {}
