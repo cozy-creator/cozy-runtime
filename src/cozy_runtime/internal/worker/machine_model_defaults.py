@@ -71,6 +71,20 @@ class _Capture(msgspec.Struct, frozen=True):
 Sample = Callable[[int, int], None]
 
 
+class CheckpointSource(msgspec.Struct, frozen=True, kw_only=True):
+    model: str
+    manifest: str
+    manifest_length: int
+    release: str = ""
+    lane: str = ""
+
+
+class AdapterSource(CheckpointSource, frozen=True, kw_only=True):
+    component: str
+    source_component: str = "adapter"
+    scale: str = "1"
+
+
 class Selected(msgspec.Struct, frozen=True, kw_only=True):
     """One slot's exact checkpoint for this machine, as a preparation lands and binds it."""
 
@@ -79,6 +93,11 @@ class Selected(msgspec.Struct, frozen=True, kw_only=True):
     manifest: Manifest
     public_origin: str = ""
     gpus: int = 0
+    release: str = ""
+    lane: str = ""
+    native: bool = False
+    adapters: tuple[AdapterSource, ...] = ()
+    composed: CheckpointSource | None = None
 
 
 UNAVAILABLE = frozenset(
@@ -304,6 +323,30 @@ def decode(rows: Iterable[Mapping[str, object]]) -> list[Selected]:
         raise WorkspaceRefusal(f"selected Model row is malformed: {exc}") from exc
 
 
+def closure(rows: Iterable[Mapping[str, object]]) -> list[Selected]:
+    """Every catalog checkpoint the selected component graph owns, with unique input IDs."""
+    out: list[Selected] = []
+    for row in decode(rows):
+        if not row.native:
+            out.append(msgspec.structs.replace(row, adapters=(), composed=None))
+        sources: list[tuple[str, CheckpointSource]] = [
+            (f"{row.parameter}.adapter.{index}", source)
+            for index, source in enumerate(row.adapters)
+        ]
+        if row.composed is not None:
+            sources.append((row.parameter + ".composed", row.composed))
+        for parameter, source in sources:
+            out.append(
+                Selected(
+                    parameter=parameter,
+                    repository=source.model,
+                    manifest=Manifest(source.manifest, source.manifest_length),
+                    public_origin=row.public_origin,
+                )
+            )
+    return out
+
+
 def materialize(
     worker: Worker,
     rows: Iterable[Mapping[str, object]],
@@ -323,7 +366,7 @@ def materialize(
     H3's 1.6 GB turbo adapter after its 100 GB base, 46 s more before the first segment.
     `downloading` brackets one model's pull and may take its own byte samples.
     """
-    selected = decode(rows)
+    selected = closure(rows)
     if not selected:
         return
     assert worker.workspace is not None
@@ -413,7 +456,7 @@ def inputs(
     rows: Iterable[Mapping[str, object]],
 ) -> tuple[list[pb.InputBinding], list[pb.InputAccess]]:
     bindings, accesses = [], []
-    for row in decode(rows):
+    for row in closure(rows):
         input_id = grants.MODEL_PREFIX + row.parameter
         bindings.append(
             pb.InputBinding(

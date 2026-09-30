@@ -16,7 +16,7 @@ from tensorfs.derived import Config, Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import CapabilityError, ModelArtifact
 from cozy_runtime.internal.encoding import SPEC_PLAIN
-from cozy_runtime.internal.lora_composition import CONFIG, FORMAT, Graph, Selection, prepare
+from cozy_runtime.internal.lora_composition import GRAPH_CONFIG, FORMAT, Graph, Selection, prepare
 from native_weights import NativeExecution
 
 
@@ -128,7 +128,7 @@ def compose(
             ]
             prepared = prepare(source, selected)
             with execution.client.open_output("model", prepared.declaration) as writer:
-                writer.add_config(CONFIG, prepared.config)
+                writer.add_config(GRAPH_CONFIG, prepared.config)
                 result = execution.client.adopt_model(writer.commit())
             return result, prepared.graph
 
@@ -175,7 +175,7 @@ def test_ordered_stack_grafts_base_and_factor_parts_without_mutation(tmp_path: P
                 == source_header["components"]["adapter"][f"proj.lora_{role}.weight"]
             )
     assert prepared_header["configs"]["model"] == base_header["configs"]["model"]
-    assert msgspec.json.decode(prepared_header["configs"][CONFIG], type=Graph) == graph
+    assert msgspec.json.decode(prepared_header["configs"][GRAPH_CONFIG], type=Graph) == graph
     assert header(store, base) == original
     checkout = tmp_path / "checkout"
     store.checkout(result.manifest.digest, checkout, symlink=False)

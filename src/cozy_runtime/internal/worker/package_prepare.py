@@ -47,22 +47,37 @@ class PreparationRefusal(Exception):
         self.detail = detail
 
 
-class Selection(msgspec.Struct, frozen=True, kw_only=True):
-    """One model slot's exact checkpoint: its manifest digest is the identity, release and
-    lane are the labels it was chosen by."""
-
-    package: str = ""
-    slot: str = ""
+class CheckpointSelection(msgspec.Struct, frozen=True, kw_only=True):
     model: str = ""
     manifest: str = ""
     release: str = ""
     lane: str = ""
 
 
+class AdapterSelection(CheckpointSelection, frozen=True, kw_only=True):
+    component: str
+    source_component: str = "adapter"
+    scale: str = "1"
+
+
+class Selection(CheckpointSelection, frozen=True, kw_only=True):
+    """Original slot selection plus a prepared view and its ordered source custody."""
+
+    package: str = ""
+    slot: str = ""
+    adapters: tuple[AdapterSelection, ...] = ()
+    composed: CheckpointSelection | None = None
+
+
 def selections(rows: Iterable[Mapping[str, object] | pb.DownloadModelRef]) -> list[Selection]:
     """Selection rows a caller states as JSON or a download set signs, decoded once here."""
     try:
-        return [msgspec.convert(row, Selection, from_attributes=True) for row in rows]
+        return [
+            msgspec.convert(
+                documents.body(row) if isinstance(row, pb.DownloadModelRef) else row, Selection
+            )
+            for row in rows
+        ]
     except msgspec.ValidationError as exc:
         raise PreparationRefusal("package_prepare_model_selection_mismatch", str(exc)) from exc
 
@@ -87,6 +102,7 @@ class Construction:
     header: bytes
     assets: Callable[[], dict[str, bytes]]
     tensor_dtypes: dict[str, str]
+    adapters: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -97,6 +113,8 @@ class Selected:
     selection: Selection
     manifest_length: int
     construction: Construction | None = None
+    adapter_lengths: tuple[int, ...] = ()
+    composed_length: int = 0
 
 
 def _select_python(
@@ -994,6 +1012,7 @@ def _census(
                         header=construction.header,
                         encoded_leaves=slot.encoded_leaves == "accept",
                         assets=construction.assets,
+                        adapters=construction.adapters,
                     )
                     for path, (construction, slot) in sorted(built.items())
                 ],
@@ -1056,6 +1075,31 @@ def _entrypoints(
         )
         for slot, value in sorted(selected.items(), key=lambda item: model_ids[item[0]])
     ]
+    adapter_ids: dict[str, list[str]] = {}
+    composed_ids: dict[str, str] = {}
+    for path, value in sorted(selected.items()):
+        adapter_ids[path] = []
+        extra: list[tuple[str, CheckpointSelection, int]] = [
+            (model_id(f"{path}.adapter.{index}"), row, length)
+            for index, (row, length) in enumerate(
+                zip(value.selection.adapters, value.adapter_lengths, strict=True)
+            )
+        ]
+        adapter_ids[path] = [identifier for identifier, _, _ in extra]
+        if value.selection.composed is not None:
+            composed_ids[path] = model_id(path + ".composed")
+            extra.append((composed_ids[path], value.selection.composed, value.composed_length))
+        for identifier, source, length in extra:
+            models.append(
+                pb.Model(
+                    id=identifier,
+                    repo=source.model,
+                    version=source.release,
+                    lane=source.lane,
+                    manifest=pb.Ref(digest=documents.raw(source.manifest), length=length),
+                )
+            )
+    models.sort(key=lambda row: row.id)
     bound: list[package_interface.CallableDoc] = []
     for entry in interface.entrypoints:
         paths = {model.path for model in entry.models}
@@ -1099,8 +1143,21 @@ def _entrypoints(
                     # WHAT THE DERIVE CONSTRUCTED, in construction order (D9) — never the
                     # header's component set; the census's fit proved they agree.
                     components=[
-                        pb.Component(component=component, model_id=model_ids[path])
+                        pb.Component(
+                            component=component, model_id=composed_ids.get(path, model_ids[path])
+                        )
                         for component in found.components
+                    ],
+                    adapters=[
+                        pb.ModelAdapter(
+                            component=adapter.component,
+                            model_id=identifier,
+                            source_component=adapter.source_component,
+                            scale=adapter.scale,
+                        )
+                        for adapter, identifier in zip(
+                            chosen.adapters, adapter_ids[path], strict=True
+                        )
                     ],
                 )
             )
@@ -1217,7 +1274,16 @@ def _selected_models(
         facade = fill.tensorfs_module()
         store = fill.open_store(tensorfs_root)
         manifests: dict[str, tuple[int, bytes, bytes]] = {}
-        for selection in chosen.values():
+        closure = [
+            source
+            for selected in chosen.values()
+            for source in (
+                selected,
+                *selected.adapters,
+                *((selected.composed,) if selected.composed else ()),
+            )
+        ]
+        for selection in closure:
             # The selected manifest digest is the model's identity; release and lane are
             # labels. Where a mutable lane points now does not change what was selected.
             digest = selection.manifest
@@ -1253,7 +1319,7 @@ def _selected_models(
                     f"{digest}: expected tensor components",
                 )
             if not any(
-                slot in construction_slots and selection.manifest == digest
+                slot in construction_slots and (selection.composed or selection).manifest == digest
                 for slot, selection in chosen.items()
             ):
                 continue
@@ -1270,6 +1336,7 @@ def _selected_models(
                         msgspec.convert(header["assets"], dict[str, _Asset]),
                     ),
                     tensor_dtypes=model_config.tensor_dtypes(header),
+                    adapters=model_config.adapter_graph(header["configs"]),
                 )
             except model_config.ModelConfigRefusal as exc:
                 raise PreparationRefusal(
@@ -1289,7 +1356,11 @@ def _selected_models(
         slot: Selected(
             selection,
             manifests[selection.manifest][0],
-            constructions[selection.manifest] if slot in construction_slots else None,
+            constructions[(selection.composed or selection).manifest]
+            if slot in construction_slots
+            else None,
+            tuple(manifests[row.manifest][0] for row in selection.adapters),
+            manifests[selection.composed.manifest][0] if selection.composed else 0,
         )
         for slot, selection in chosen.items()
     }

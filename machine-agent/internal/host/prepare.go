@@ -164,8 +164,9 @@ func (m *Machine) preparePrivatePlacement(stream grpc.ServerStream) error {
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARING})
 		request := &pb.PreparePrivatePlacementRequest{OperationId: selected.OperationId, InstallationId: selected.InstallationId,
 			DownloadDelegation: selected.DownloadDelegation, DownloadDelegationSignature: selected.DownloadDelegationSignature,
-			NativeModels: selected.NativeModels}
-		if len(selected.NativeModels) > 0 {
+			NativeModels: selected.NativeModels, ModelChoices: selected.ModelChoices,
+			SourceCredentials: selected.SourceCredentials, Hub: selected.Hub, Owner: selected.Owner}
+		if len(selected.NativeModels) > 0 || len(selected.ModelChoices) > 0 {
 			request.Claim = m.claims.claim
 		}
 		var trailer metadata.MD

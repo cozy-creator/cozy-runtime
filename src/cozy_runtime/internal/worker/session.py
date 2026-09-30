@@ -5724,6 +5724,16 @@ class Worker:
         lane, slot = tenant.lane, tenant.slot
         placement_id = tenant.placement.placement_id
         first = group[0]
+        if any(model.prepared_adapters for model in first.model_bindings()):
+            from cozy_runtime.internal.lora_contract import CAPABILITY
+
+            if CAPABILITY not in executor.hello.get("model_adapters", ()):
+                raise AttemptRefusal(
+                    "adapter_composition_unsupported",
+                    "the package executor SDK cannot execute prepared LoRA graphs; "
+                    "update its Runtime dependency",
+                    cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+                )
         label = key.removeprefix("sha256:")[:12]
         if not first.weightless:
             # Idle tenants of every device give room for the weights first. Bindings of one

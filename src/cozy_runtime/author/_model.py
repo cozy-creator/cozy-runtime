@@ -541,6 +541,7 @@ class Model[PipelineT]:
     _cozy_identity: ConstructionIdentity | None = None
     _cozy_schedulers: Mapping[str, Scheduler] = {}
     _cozy_caches: tuple[DerivedCache, ...] = ()
+    _cozy_adapters: tuple[AdapterRef, ...] = ()
     _cozy_residency: Residency | None = None
     """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
@@ -667,7 +668,9 @@ class Model[PipelineT]:
                     fields=["sampler"],
                 )
         effective = derive_seed(ctx.request_id) if seed is None else seed
-        return RequestView._make(effective, ctx._adapters, self._cozy_schedulers, sampler)
+        return RequestView._make(
+            effective, self._cozy_adapters or ctx._adapters, self._cozy_schedulers, sampler
+        )
 
     # ----------------------------------------------------------------- testing
 
@@ -994,7 +997,7 @@ class ModelRegistry:
         adapters: Sequence[AdapterRef] = (),
     ) -> ModelT:
         """Bind one path. Equal identity -> the SAME generation, constructed once."""
-        adapter_rows = tuple(adapters)
+        adapter_rows = artifact._adapters or tuple(adapters)
         cls.validate_adapter_stack(adapter_rows)
         variant = artifact.variant
         if adapter_rows:
@@ -1096,8 +1099,9 @@ class ModelRegistry:
             record = records[0] if len(records) == 1 else _merge(records)
             _prove_components(cls, record)
             constructed = loader.constructed()
-            if adapters:
+            if adapters and artifact._prepare is None:
                 model.prepare_adapters(tuple(adapters))
+            object.__setattr__(model, "_cozy_adapters", tuple(adapters))
             # NOTHING IS WRAPPED HERE, AND THAT IS THE FIX (#573).
             #
             # A censused component used to be replaced by a proxy whose `__getattr__`

@@ -39,6 +39,7 @@ class SlotInput:
     header: bytes
     encoded_leaves: bool
     assets: Callable[[], Mapping[str, bytes]]
+    adapters: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +99,11 @@ def ensure(
             derive_child.DeriveRequest(
                 tuple(
                     derive_child.SlotRequest(
-                        row.slot, row.config, dict(row.assets()), dict(row.tensor_dtypes)
+                        row.slot,
+                        row.config,
+                        dict(row.assets()),
+                        dict(row.tensor_dtypes),
+                        row.adapters,
                     )
                     for _name, row in missing
                 ),

@@ -26,7 +26,8 @@ NORMALIZATION = "normalization"
 #: rather than deleted: folded into the constructor document its `weights` key reads as a
 #: source carrier and the §1.1 ban refuses the whole lane, which is exactly the 42-second
 #: prepare death cr-121 was opened for. Inert, not fatal.
-RESERVED = frozenset({"execution", NORMALIZATION})
+ADAPTERS = "model_adapters"
+RESERVED = frozenset({"execution", NORMALIZATION, ADAPTERS})
 
 
 def unnormalized(configs: object) -> str:
@@ -89,3 +90,13 @@ def construction_config(configs: object) -> bytes:
     if len(held) == 1:
         return held[0]
     return canonical.write(decoded)
+
+
+def adapter_graph(configs: object) -> bytes:
+    """The Runtime-owned prepared graph, kept outside the model factory's config."""
+    if not isinstance(configs, Mapping) or ADAPTERS not in configs:
+        return b""
+    raw = configs[ADAPTERS]
+    if not isinstance(raw, bytes):
+        raise ModelConfigRefusal("prepared model adapter graph must be inline JSON")
+    return raw

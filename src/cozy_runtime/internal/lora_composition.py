@@ -8,39 +8,37 @@ from __future__ import annotations
 
 import math
 import struct
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 import msgspec
 import numpy as np
-from tensorfs.derived import Config, Derivation, Part, PartSource, SourceCapability, Target, Tensor
+from tensorfs.derived import (
+    Config,
+    Derivation,
+    Part,
+    PartSource,
+    SourceCapability,
+    SourceInspection,
+    Target,
+    Tensor,
+)
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author import CapabilityError
+from cozy_runtime.author import AdapterRef, Artifact, CapabilityError, Config as ModelConfig, Model
 from cozy_runtime.internal.encoding import SPEC_PLAIN
+from cozy_runtime.internal.lora_contract import (
+    CAPABILITY as CAPABILITY,
+    FORMAT as FORMAT,
+    GRAPH_CONFIG as GRAPH_CONFIG,
+    Graph as Graph,
+    Linear,
+    read as read,
+)
 
-CONFIG = "model_adapters"
-FORMAT = "cozy.model.lora/1"
 _VALIDATION_BYTES = 1 << 20
 _DTYPES = {"f16": ("<f2", 2), "bf16": ("<u2", 2), "f32": ("<f4", 4)}
 _SUFFIXES = {".lora_A.weight": "a", ".lora_B.weight": "b", ".alpha": "alpha"}
-
-
-class Linear(msgspec.Struct, frozen=True):
-    """One ordinary PEFT layer's construction geometry and ordered scaling."""
-
-    component: str
-    target: str
-    adapter: str
-    rank: int
-    alpha: float
-    strength: float
-    dtype: str
-
-
-class Graph(msgspec.Struct, frozen=True):
-    format: str
-    layers: tuple[Linear, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +104,39 @@ def _validate(source: SourceCapability, component: str, key: str, tensor: Tensor
     return scalar
 
 
+def _component(base: SourceInspection, adapter: SourceInspection, selected: Selection) -> str:
+    if selected.component:
+        return selected.component
+    factors = adapter.components.get(selected.source_component, {})
+    pairs = {
+        key.removesuffix(".lora_A.weight"): tensor
+        for key, tensor in factors.items()
+        if key.endswith(".lora_A.weight")
+    }
+    matches: list[str] = []
+    for name, tensors in base.components.items():
+        if not pairs:
+            break
+        for path, a in pairs.items():
+            b, weight = factors.get(path + ".lora_B.weight"), tensors.get(path + ".weight")
+            if (
+                b is None
+                or weight is None
+                or len(a.shape) != 2
+                or len(b.shape) != 2
+                or (b.shape[0], a.shape[1]) != tuple(weight.shape)
+            ):
+                break
+        else:
+            matches.append(name)
+    if len(matches) != 1:
+        raise _refuse(
+            "component",
+            "select one adapter component; compatible choices: " + (", ".join(matches) or "none"),
+        )
+    return matches[0]
+
+
 def prepare(base: SourceCapability, selections: Sequence[Selection]) -> Prepared:
     """Produce a zero-copy native derivation, refusing unsupported keys before writing.
 
@@ -113,18 +144,20 @@ def prepare(base: SourceCapability, selections: Sequence[Selection]) -> Prepared
     alpha/rank and the caller's independent strength applied by PEFT exactly once.
     """
     structure = base.inspect()
-    if CONFIG in structure.configs:
+    if GRAPH_CONFIG in structure.configs:
         raise _refuse("nested", "select the original base and one complete ordered adapter stack")
     sources = {"base": structure.source}
     additions: dict[str, dict[str, Tensor]] = {name: {} for name in structure.components}
     drops: dict[str, set[str]] = {name: set() for name in structure.components}
     layers: list[Linear] = []
+    references: list[AdapterRef] = []
     for index, selection in enumerate(selections):
         if not math.isfinite(selection.strength):
             raise _refuse("scale", "adapter strength must be finite")
-        if selection.component not in structure.components:
-            raise _refuse("component", f"base has no component {selection.component!r}")
         inspection = selection.source.inspect()
+        component = _component(structure, inspection, selection)
+        if component not in structure.components:
+            raise _refuse("component", f"base has no component {component!r}")
         if set(inspection.components) != {selection.source_component}:
             raise _refuse(
                 "components", "an adapter must contain only its selected factor component"
@@ -149,8 +182,17 @@ def prepare(base: SourceCapability, selections: Sequence[Selection]) -> Prepared
                 if value is None:
                     raise _refuse("alpha", f"{path}: alpha must be a scalar")
                 scalars[path] = value
+        references.append(
+            AdapterRef(
+                selection.source.manifest,
+                selection.strength,
+                "lora",
+                component,
+                selection.source_component,
+                "",
+            )
+        )
         source_name = f"adapter_{index}"
-        component = selection.component
         base_tensors = structure.components[component]
         for path, pair in sorted(pairs.items()):
             if not {"a", "b"} <= pair.keys():
@@ -158,6 +200,11 @@ def prepare(base: SourceCapability, selections: Sequence[Selection]) -> Prepared
             a_key, a = pair["a"]
             b_key, b = pair["b"]
             weight = base_tensors.get(path + ".weight")
+            if weight is not None and len(weight.shape) != 2:
+                raise _refuse(
+                    "target_type",
+                    f"{component}.{path}: only ordinary linear LoRA targets are supported",
+                )
             if (
                 weight is None
                 or len(weight.shape) != 2
@@ -199,7 +246,7 @@ def prepare(base: SourceCapability, selections: Sequence[Selection]) -> Prepared
         for component in structure.components
     }
     configs = {name: Config("copy", "base", name) for name in structure.configs}
-    configs[CONFIG] = Config("add")
+    configs[GRAPH_CONFIG] = Config("add")
     order = [
         (component, key)
         for component, tensors in structure.components.items()
@@ -208,4 +255,104 @@ def prepare(base: SourceCapability, selections: Sequence[Selection]) -> Prepared
             *additions[component],
         )
     ]
-    return Prepared(Derivation(sources, targets, configs, order), Graph(FORMAT, tuple(layers)))
+    return Prepared(
+        Derivation(sources, targets, configs, order),
+        Graph(FORMAT, tuple(layers), tuple(references)),
+    )
+
+
+def composer(graph: Graph) -> Callable[[object], None]:
+    """Construct upstream PEFT layers before the ordinary census and fill.
+
+    Imports happen before the caller enters its weightless construction substrate.
+    PEFT owns the arithmetic, including its normal adapter dtype/rounding behavior.
+    No state is merged into the base, and this transform allocates no weight values.
+    """
+    if not graph.layers:
+        return lambda _obj: None
+    try:
+        import torch
+        from peft import LoraConfig
+        from peft.tuners.lora.layer import Linear as PeftLinear
+        from torch import nn
+    except ImportError as exc:
+        raise _refuse(
+            "backend_unavailable", "prepared LoRA graphs require Runtime's adapters extra"
+        ) from exc
+
+    # Private construction recipe only; rank and alpha are set independently for each term.
+    config = LoraConfig(init_lora_weights=False, inference_mode=True, lora_dropout=0.0)
+
+    def apply(obj: object) -> None:
+        members = getattr(obj, "components", None)
+        if not isinstance(members, Mapping):
+            raise _refuse("component", "model construction exposes no component mapping")
+        groups: dict[tuple[str, str], list[Linear]] = {}
+        for row in graph.layers:
+            groups.setdefault((row.component, row.target), []).append(row)
+        seen: set[int] = set()
+        for (component, path), rows in groups.items():
+            root = members.get(component)
+            if not isinstance(root, nn.Module):
+                raise _refuse("component", f"{component!r} is not a constructed module")
+            parent_path, _, name = path.rpartition(".")
+            try:
+                parent = root.get_submodule(parent_path)
+                base = parent.get_submodule(name)
+            except AttributeError as exc:
+                raise _refuse(
+                    "target", f"constructed model has no target {component}.{path}"
+                ) from exc
+            if not isinstance(base, nn.Linear):
+                raise _refuse("target_type", f"{component}.{path} is not an ordinary linear layer")
+            if id(base) in seen:
+                raise _refuse("alias", f"{component}.{path} aliases another adapted layer")
+            seen.add(id(base))
+            if len({row.adapter for row in rows}) != len(rows):
+                raise _refuse("graph", f"{component}.{path} repeats one adapter term")
+            first, *others = rows
+            layer = PeftLinear(
+                base, first.adapter, config=config, r=first.rank, lora_alpha=first.alpha
+            )
+            for row in others:
+                layer.update_layer(row.adapter, row.rank, lora_alpha=row.alpha, config=config)
+            for row in rows:
+                dtype = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}[
+                    row.dtype
+                ]
+                layer.lora_A[row.adapter].to(dtype=dtype)
+                layer.lora_B[row.adapter].to(dtype=dtype)
+                layer.set_scale(row.adapter, row.strength)
+            layer.set_adapter([row.adapter for row in rows], inference_mode=True)
+            layer.eval()
+            parent.set_submodule(name, layer)
+
+    return apply
+
+
+def bind(artifact: Artifact, model: type[Model[object]], data: bytes) -> Artifact:
+    """Bind one prepared view to a model's opt-in before weightless construction."""
+    if not data:
+        return artifact
+    graph = read(data)
+    model.validate_adapter_stack(graph.adapters)
+    given = artifact.config._tensor_dtypes
+    dtypes = (
+        dict(given)
+        if given is not None
+        else {key: spec.dtype for key, spec in artifact.tensor_schema.items()}
+    )
+    for row in graph.layers:
+        prefix = row.component + "." + row.target
+        for role in ("weight", "bias"):
+            key = prefix + ".base_layer." + role
+            if key in dtypes:
+                dtypes[prefix + "." + role] = dtypes.pop(key)
+        for role in ("A", "B"):
+            dtypes.pop(prefix + f".lora_{role}.{row.adapter}.weight", None)
+    return replace(
+        artifact,
+        config=ModelConfig(artifact.config.mapping(), tensor_dtypes=dtypes),
+        _prepare=composer(graph),
+        _adapters=graph.adapters,
+    )

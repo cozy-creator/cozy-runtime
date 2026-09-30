@@ -90,6 +90,8 @@ class _Default(msgspec.Struct, frozen=True):
     parameter: str
     repository: str
     manifest: ObjectRef
+    adapters: tuple[package_prepare.AdapterSelection, ...] = ()
+    composed: package_prepare.CheckpointSelection | None = None
 
 
 class _Cancellation(Protocol):
@@ -870,6 +872,8 @@ class Serving:
                                     "model": row.repository,
                                     "manifest": row.manifest.digest,
                                     "manifest_length": row.manifest.length,
+                                    "adapters": msgspec.to_builtins(row.adapters),
+                                    "composed": msgspec.to_builtins(row.composed),
                                 }
                                 for row in selected
                             ],

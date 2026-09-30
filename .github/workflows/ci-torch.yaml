@@ -28,7 +28,7 @@ jobs:
       - id: sync
         run: uv sync --locked
       - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.14.0" torchvision
-      - run: uv pip install --python .venv/bin/python "diffusers==0.40.0" "accelerate==1.14.0" "transformers==5.16.1"
+      - run: uv pip install --python .venv/bin/python "diffusers==0.40.0" "accelerate==1.14.0" "transformers==5.16.1" "peft==0.20.0"
       - run: .venv/bin/python -c "import torch; assert torch.version.cuda is None"
       - name: Torch-gated test files
         run: |

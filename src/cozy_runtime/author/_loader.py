@@ -32,7 +32,7 @@ from typing import Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_ch
 
 import msgspec
 
-from cozy_runtime.author._context import Device
+from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
 
 T = TypeVar("T")
@@ -339,6 +339,8 @@ class Artifact:
     unnormalized: str = ""
     """Set when the checkpoint was stored as-is from an unrecognized layout: why, and the
     fix. A construction that fails on it refuses `checkpoint_unnormalized` with this text."""
+    _prepare: Callable[[object], None] | None = field(default=None, repr=False, compare=False)
+    _adapters: tuple[AdapterRef, ...] = ()
 
 
 #: The `Fit` document `tensorfs.fit` returns, verbatim: `code` (one of the eight),
@@ -710,9 +712,9 @@ class Loader:
             config = Config(
                 config.mapping(),
                 config._where,
-                tensor_dtypes={
-                    key: spec.dtype for key, spec in self._artifact.tensor_schema.items()
-                },
+                tensor_dtypes=config._tensor_dtypes
+                if config._tensor_dtypes is not None
+                else {key: spec.dtype for key, spec in self._artifact.tensor_schema.items()},
             )
         try:
             obj = factory(config)
@@ -723,7 +725,6 @@ class Loader:
                 ) from exc
             raise
         _legs.append(("factory", round((time.perf_counter() - _t0) * 1000, 1)))
-        _weightless = _weightless_census(obj)
         _t0 = time.perf_counter()
         if not isinstance(obj, t):
             raise ConformanceError(
@@ -731,6 +732,9 @@ class Loader:
                 "a factory returns ONE whole object; no partial-binding tier exists (§1.1)",
                 code="factory_result",
             )
+        if self._artifact._prepare is not None:
+            self._artifact._prepare(obj)
+        _weightless = _weightless_census(obj)
         walked = census(obj)
         _legs.append(("census", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()

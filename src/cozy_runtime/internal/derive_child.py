@@ -50,6 +50,7 @@ class SlotRequest(msgspec.Struct, frozen=True):
     config: bytes
     assets: dict[_Name, bytes] = {}
     tensor_dtypes: dict[_Name, _Name] | None = None
+    adapters: bytes = b""
 
 
 class _Package(msgspec.Struct, frozen=True, omit_defaults=True):
@@ -96,6 +97,7 @@ class DeriveResponse(msgspec.Struct, frozen=True):
     requirements: tuple[_Answer, ...] = ()
     error: str | None = None
     detail: str | None = None
+    model_adapters: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +194,7 @@ def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements 
         )
     except ValueError as err:  # binascii.Error or msgspec.DecodeError
         raise DeriveRefusal("derive_child_invalid", str(err)) from err
+    _require_adapters(response, request)
     if response.error is not None:
         raise DeriveRefusal(response.error or "derive_child_failed", response.detail or "refused")
     if result.returncode != 0:
@@ -199,9 +202,20 @@ def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements 
     return read_response(response, request)
 
 
+def _require_adapters(response: DeriveResponse, request: DeriveRequest) -> None:
+    from cozy_runtime.internal.lora_contract import CAPABILITY
+
+    if any(row.adapters for row in request.slots) and CAPABILITY not in response.model_adapters:
+        raise DeriveRefusal(
+            "adapter_composition_unsupported",
+            "the package SDK cannot construct prepared LoRA graphs; update its Runtime dependency",
+        )
+
+
 def read_response(
     response: DeriveResponse, request: DeriveRequest
 ) -> tuple[TensorRequirements | SourceSlot, ...]:
+    _require_adapters(response, request)
     out: list[TensorRequirements | SourceSlot] = []
     for answer in response.requirements:
         if answer.source:
@@ -243,11 +257,14 @@ def _render(requirements: Sequence[TensorRequirements | SourceSlot]) -> dict[str
 
 
 def _emit(value: dict[str, object]) -> None:
+    from cozy_runtime.internal.lora_contract import CAPABILITY
+
+    value["model_adapters"] = [CAPABILITY]
     sys.stdout.buffer.write(RESULT_PREFIX + base64.b64encode(msgspec.msgpack.encode(value)) + b"\n")
 
 
 def _derive_slot(
-    binding: ModelBinding, config: Config, assets: Mapping[str, bytes]
+    binding: ModelBinding, config: Config, assets: Mapping[str, bytes], adapters: bytes = b""
 ) -> TensorRequirements:
     """Derive the ordered construction once; serving validates its actual destinations.
 
@@ -257,10 +274,15 @@ def _derive_slot(
 
     from cozy_runtime.author import Artifact
     from cozy_runtime.internal.derive import derive
+    from cozy_runtime.internal.lora_composition import bind
 
     result = derive(
         binding.model_class(),
-        Artifact("derive://request", {}, config, assets=assets, custody="canonical"),
+        bind(
+            Artifact("derive://request", {}, config, assets=assets, custody="canonical"),
+            binding.model_class,
+            adapters,
+        ),
         component_use=binding.components,
     )
     rows = tuple(
@@ -284,7 +306,7 @@ def _warm_torch() -> None:
 
 
 def main() -> int:
-    from cozy_runtime.author import Config, ConformanceError
+    from cozy_runtime.author import CapabilityError, Config, ConformanceError
     from cozy_runtime.internal.derive import DeriveError
     from cozy_runtime.internal.discovery import discover, discover_installed
 
@@ -334,12 +356,13 @@ def main() -> int:
                             tensor_dtypes=row.tensor_dtypes,
                         ),
                         row.assets,
+                        row.adapters,
                     )
                 )
     except DeriveRefusal as err:
         _emit({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
-    except ConformanceError as err:
+    except (ConformanceError, CapabilityError) as err:
         _emit({"error": err.code, "detail": str(err)})
         return int(Exit.structural)
     except (DeriveError, sandbox.FenceViolation) as err:

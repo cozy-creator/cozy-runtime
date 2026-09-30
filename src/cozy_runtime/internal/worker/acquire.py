@@ -22,6 +22,7 @@ from typing import Annotated, Literal
 
 import msgspec
 
+from cozy_runtime.internal import model_config
 from cozy_runtime.internal import (
     base_observation,
     fill,
@@ -526,6 +527,14 @@ class Acquirer:
                         snapshots=snapshots,
                         logical_weight_bytes=sum(logical.values()),
                         sequence_parallel_degrees=degrees,
+                        prepared_adapters=bool(
+                            model_config.adapter_graph(
+                                fill.Checkpoint(
+                                    self.tensorfs_root,
+                                    next(iter(snapshots.values()), reference_manifest),
+                                ).header.get("configs")
+                            )
+                        ),
                         # The manifest is identity; lane remains the human repo pointer the
                         # desired download set carried beside it.
                         model=reference.repo

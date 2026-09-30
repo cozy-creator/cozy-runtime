@@ -260,6 +260,23 @@ class Advanced(Answer, frozen=True, tag="advanced"):
     model: ObjectRef | None = None
 
 
+class AdapterViewInput(msgspec.Struct, frozen=True):
+    manifest: ObjectRef
+    component: str
+    source_component: str
+    scale: str
+
+
+class PrepareAdapterView(Step, frozen=True, tag="prepare_adapter_view"):
+    identity: str
+    base: ObjectRef
+    adapters: tuple[AdapterViewInput, ...]
+
+
+class AdapterViewReady(Answer, frozen=True, tag="adapter_view_ready"):
+    manifest: ObjectRef
+
+
 # ------------------------------------------------------------------ the child
 
 

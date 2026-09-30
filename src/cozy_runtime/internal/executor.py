@@ -720,6 +720,7 @@ class Executor:
             "tensorfs_version": _distribution_version("tensorfs"),
             "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
             "native_interfaces": native_interfaces.stated(),
+            "model_adapters": ["peft_graph/1"],
             #: what the worker's memory manager may ask beyond the floor's commands
             "memory": ["vacate_ranks"],
             "pgid": os.getpgrp(),
@@ -2416,6 +2417,11 @@ class Executor:
             # to canonical keeps the strict reading for any record that does not say.
             custody=binding.custody,
             unnormalized=model_config.unnormalized(config_checkpoint.header.get("configs")),
+        )
+        from cozy_runtime.internal.lora_composition import bind as bind_adapters
+
+        artifact = bind_adapters(
+            artifact, model_cls, model_config.adapter_graph(config_checkpoint.header.get("configs"))
         )
         seen = Observations()
         registry = ModelRegistry(
