@@ -209,6 +209,9 @@ class Planner:
         self.construction_staging_credit: int | None = None
         self._group_host_credit: int | None = None
         self._last_host_credit = 0
+        # Failed asynchronous drains retain their backings until this executor is reaped.
+        self._host_transfers: set[tiers.HostTransfer] = set()
+        self.demand_upload: dict[str, int] = {}
         self.sharded = sharded
         self.grouped = grouped
         self.process_bytes = process_bytes
@@ -663,6 +666,7 @@ class Planner:
         self.operations = {}
         self.anchor_validation_calls = self.anchor_validation_ns = 0
         self.refusal = None
+        self.demand_upload.clear()
         self.preparation_failure = ""
         if self.cuda:
             self.torch.cuda.reset_peak_memory_stats(self.device)
@@ -727,6 +731,7 @@ class Planner:
                 "calls": self.anchor_validation_calls,
                 "ns": self.anchor_validation_ns,
             },
+            "demand_upload": dict(self.demand_upload),
             "scope_backing": {
                 h.key: {
                     "metadata_anchor_bytes": (h.part.anchor or h.part.common).nbytes,
@@ -1974,12 +1979,83 @@ class Planner:
         tiers.load_demand(self.torch, unit)  # Refuse unbounded pending transforms before a fill.
         with self._moving():
             if unit.tier == HOST:
-                self.moved += tiers.to_device(self.torch, unit, self.device)
+                if not self._upload_host(part, unit):
+                    self._upload_count("fallback_bytes", unit.nbytes)
+                    self.moved += tiers.to_device(self.torch, unit, self.device)
             else:
                 tiers.from_disk(self.torch, part, unit)
                 self.moved += unit.nbytes
                 self.refilled += unit.nbytes
         self.loads += 1
+
+    def _upload_count(self, name: str, amount: int = 1) -> None:
+        self.demand_upload[name] = self.demand_upload.get(name, 0) + amount
+
+    def _upload_host(self, part: tiers.Component, unit: tiers.Unit) -> bool:
+        """Join one demanded upload using existing pinned capacity before authored code.
+
+        The ordinary plan already admits this unit. No future unit, new pinned pool,
+        grant request or optional OOM recovery is introduced by this transport choice.
+        """
+        held = next((h for h in self.held.values() if h.part is part), None)
+        acquire = getattr(part.store, "borrow_staging", None)
+        if (
+            not self.cuda
+            or self.grouped
+            or self.group_phase
+            or self.spare
+            or held is None
+            or held.compiled
+            or self.sharded(held.key)
+            or acquire is None
+            or self.torch.is_grad_enabled()
+            or unit.tier != HOST
+            or unit.nbytes == 0
+            or not unit.readonly
+            or unit.mutable
+            or unit.pending
+        ):
+            return False
+        self._upload_count("eligible_units")
+        self._upload_count("eligible_bytes", unit.nbytes)
+        transfer = None
+        started = time.perf_counter_ns()
+        try:
+            transfer = tiers.HostTransfer.prepare(
+                self.torch,
+                unit,
+                self.device,
+                self.torch.cuda.current_stream(self.device),
+                acquire=acquire,
+                device_capacity=unit.nbytes,
+                valid=lambda: not self.unusable and unit.tier == HOST,
+                owned=self._host_transfers,
+            )
+        finally:
+            self._upload_count("prepare_ns", time.perf_counter_ns() - started)
+        if transfer is None:
+            self._upload_count("declined_units")
+            return False
+        try:
+            self._upload_count("staged_bytes", transfer.source_bytes)
+            started = time.perf_counter_ns()
+            try:
+                published = transfer.publish()
+            finally:
+                self._upload_count("publish_ns", time.perf_counter_ns() - started)
+        finally:
+            # No authored consumer has run yet. A failure must keep both published
+            # bindings and poisoned transfer custody; _moving marks the Planner unusable.
+            started = time.perf_counter_ns()
+            try:
+                transfer.finish()
+            finally:
+                self._upload_count("finish_ns", time.perf_counter_ns() - started)
+        if published:
+            self.moved += transfer.source_bytes
+            self._upload_count("uploaded_units")
+            self._upload_count("uploaded_bytes", transfer.source_bytes)
+        return published
 
     def _home(self, part: tiers.Component, unit: tiers.Unit) -> None:
         """Send a device unit to host memory when the host has room, else to the store."""
