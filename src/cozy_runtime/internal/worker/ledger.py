@@ -187,6 +187,8 @@ class _Pinned(msgspec.Struct, frozen=True):
 class _Layout(msgspec.Struct, frozen=True):
     common: int = 0
     blocks: tuple[int, ...] = ()
+    #: (common, largest region) at the sub-block grain the executor refines to
+    fine: tuple[int, int] | None = None
 
 
 class ConstructionFacts(msgspec.Struct, frozen=True, kw_only=True):
@@ -442,7 +444,7 @@ class Ledger:
         self.declared_scopes = dict(read.declared_scopes)
         self.paging = {name: dict(layout) for name, layout in read.paging.items()}
         self.layouts = {
-            name: weight_policy.Layout(layout.common, layout.blocks)
+            name: weight_policy.Layout(layout.common, layout.blocks, layout.fine)
             for name, layout in read.layouts.items()
         }
         self.device_free = read.device_free_bytes

@@ -284,6 +284,10 @@ class Executor:
                     raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
                 return frame
 
+    def busy(self) -> bool:
+        """A call holds the seam now (an attempt, a load): a new one would wait for it."""
+        return self._calls.locked()
+
     @contextlib.contextmanager
     def watched(self, what: str) -> Iterator[None]:
         """Bound a seam call by this process's OWN work, not by a clock.

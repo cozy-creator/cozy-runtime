@@ -118,9 +118,9 @@ def test_the_refusal_floor_is_window_one_over_a_stage_or_its_largest_component()
     )
     assert weights(ledger) == 15 * GiB // 4 and weights(ledger, ("unet",)) == 5 * GiB // 4
     layouts = ledger.layouts
-    assert floor_bytes(layouts, ("unet",), GiB, 300 << 20) == 3 * GiB // 4 + GiB + (300 << 20)
-    assert floor_bytes(layouts, ("text_encoder", "unet"), 0, 0) == GiB
-    assert floor_bytes(layouts, (), 0, -1) == 3 * GiB // 4, "components in turn; context unread"
+    assert floor_bytes(layouts, ("unet",)) == 3 * GiB // 4
+    assert floor_bytes(layouts, ("text_encoder", "unet")) == GiB
+    assert floor_bytes(layouts, ()) == 3 * GiB // 4, "components in turn"
     ledger.begin_generation(2)
     ledger.observe_construction({"filled_bytes": 7 * GiB})
     assert weights(ledger) == 7 * GiB, "an older executor's filled bytes"

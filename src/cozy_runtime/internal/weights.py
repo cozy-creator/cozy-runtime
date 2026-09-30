@@ -213,11 +213,13 @@ class Weights:
     # -- budgets
 
     def set_budget(self, vram: int, pinned: int = -1) -> int:
-        """The Worker's budgets. Lowering unmaps at once; returns the device bytes freed."""
+        """The Worker's budgets. Lowering unmaps at once; returns the device bytes freed. A
+        negative `vram` is no grant: each stage derives its own from the driver."""
         if pinned >= 0:
             self.pinned = pinned
             self._pin(pinned)
-        if vram < 0:  # the VRAM budget stays as it is
+        if vram < 0:
+            self.budget = -1
             return 0
         self.budget = vram
         freed = self._apply(vram)
@@ -266,12 +268,15 @@ class Weights:
 
     def shrink(self, need: int, floor: int) -> int:
         """OOM at a block boundary: give torch `need` more bytes by unmapping plane bytes. The
-        cut is from what is mapped, which a budget larger than the model never reaches."""
+        cut is from what is mapped, which a budget larger than the model never reaches, and
+        it holds until the Worker's next grant."""
         mapped = max(plane.stats(self.plane).device(self.index).committed, 0)
         target = max(min(self.applied, mapped) - need - weight_policy.MARGIN, floor)
         if target >= self.applied:
             return 0
         self.oom_retries += 1
+        if self.budget >= 0:
+            self.budget = min(self.budget, target)
         return self._apply(target)
 
     def drain(self) -> None:

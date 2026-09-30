@@ -1946,6 +1946,9 @@ class Executor:
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
+        # A load plans in what the driver has: the Worker made room for it, and an earlier
+        # cut to 0 is no grant for this construction.
+        weights.set_budget(-1)
         backend = PlaneBackend(
             checkpoints,
             rows,
@@ -2229,7 +2232,11 @@ class Executor:
             "reserved_bytes": memory["reserved_bytes"],
             # THE WEIGHT SETS as the plane holds them: common and blocks per component.
             "layouts": {
-                name: {"common": c.layout.common, "blocks": list(c.layout.blocks)}
+                name: {
+                    "common": c.layout.common,
+                    "blocks": list(c.layout.blocks),
+                    "fine": list(c.layout.fine) if c.layout.fine else None,
+                }
                 for name, c in backend.components.items()
             },
             "plane": msgspec.to_builtins(weights.facts()),
@@ -2579,7 +2586,9 @@ class Executor:
         target = self._target(command, attempt=True)
         if isinstance(target, dict):
             return target
-        if command.plane_budget_bytes >= 0 and self.weights is not None:
+        # Every attempt carries its grant; none (-1: an older Worker, or no reading) derives
+        # from the driver, so a cut to 0 never outlives the attempt that follows it.
+        if self.weights is not None and command.plane_budget_bytes != self.weights.budget:
             granted = self.budget(Budget(vram_bytes=command.plane_budget_bytes))
             if not granted.get("ok"):
                 return granted

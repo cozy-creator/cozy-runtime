@@ -10,7 +10,9 @@ page cache and disk stay beneath it.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -38,18 +40,25 @@ class HostTiers:
         self.available = available
         self.held: dict[tuple[str, str], Held] = {}
         self.clock = 0
+        #: loads on separate lanes answer at once
+        self.lock = threading.Lock()
 
     def answer(self, request: HostTier) -> Reply:
         """An executor's `HostTier` exchange: keep an offered memfd, or hand one back."""
+        with self.lock:
+            return self._answer(request)
+
+    def _answer(self, request: HostTier) -> Reply:
         key = (request.name, request.layout)
         self.clock += 1
         if request.offer:
             if request.memfd < 0:
                 return refuse("host_tier_absent", "an offer arrived without its memfd")
+            kept = Held(request.memfd, _resident(request.memfd), self.clock)  # may raise: not kept
             prior = self.held.pop(key, None)
             if prior is not None:
                 os.close(prior.fd)
-            self.held[key] = Held(request.memfd, _resident(request.memfd), self.clock)
+            self.held[key] = kept
             self._trim()
             return Answer(ok=True)
         if request.memfd >= 0:  # an ask carries none; one that does is not kept
@@ -61,19 +70,25 @@ class HostTiers:
         return DescriptorReply(Tier(ok=True, held=True), os.dup(row.fd))
 
     def nbytes(self) -> int:
+        with self.lock:
+            return self._nbytes()
+
+    def _nbytes(self) -> int:
         return sum(row.nbytes for row in self.held.values())
 
     def _trim(self) -> None:
         for row in self.held.values():
-            row.nbytes = _resident(row.fd)
-        while self.held and self.nbytes() > (max(self.available(), 0) + self.nbytes()) // 2:
+            with contextlib.suppress(OSError):
+                row.nbytes = _resident(row.fd)
+        while self.held and self._nbytes() > (max(self.available(), 0) + self._nbytes()) // 2:
             key = min(self.held, key=lambda k: self.held[k].used)
             os.close(self.held.pop(key).fd)
 
     def close(self) -> None:
-        for row in self.held.values():
-            os.close(row.fd)
-        self.held.clear()
+        with self.lock:
+            for row in self.held.values():
+                os.close(row.fd)
+            self.held.clear()
 
 
 def _resident(fd: int) -> int:

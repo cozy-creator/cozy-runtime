@@ -5786,7 +5786,7 @@ class Worker:
                 on_progress=lambda frame: self.monitor.advance(
                     subject, int(frame.get("position", 0) or 0)
                 ),
-                on_request=self._room(lane, slot),
+                on_request=self._room(lane, slot, key),
             )
         except ExecutorGone as exc:
             self.monitor.end(subject, "executor_gone")
@@ -5836,7 +5836,9 @@ class Worker:
             row.model_bearing = row.model_bearing or not first.weightless
             if row.ledger.executor_pid != executor.pid:
                 row.ledger.begin_generation(executor.pid)
-            row.ledger.observe_construction(facts)
+            if not (first.weightless and row.model_bearing):
+                # A weightless load beside a model's construction says nothing of its weights.
+                row.ledger.observe_construction(facts)
             self.memory.observe(row, executor, reply)
         self.boot.step(
             "load",
@@ -6270,13 +6272,17 @@ class Worker:
                 + "; ".join(f"{name}: {reason}" for name, reason in sorted(held.items()))[:300],
             )
 
-    def _room(self, lane: DeviceLane, slot: str) -> Handler:
+    def _room(self, lane: DeviceLane, slot: str, construction: str = "") -> Handler:
         """Answer an executor's load or activation exchanges: a plane executor's pinned host
-        tiers (kept here across executors), and an older executor's room: idle tenants of
-        every device of its lane give theirs back."""
+        tiers of the `construction` it loads (kept here across executors), and an older
+        executor's room: idle tenants of every device of its lane give theirs back."""
 
         def answer(request: Request) -> Reply:
             if isinstance(request, HostTier):
+                if not construction or not request.name.startswith(f"{construction}#"):
+                    if request.memfd >= 0:
+                        os.close(request.memfd)
+                    return refuse("host_tier_foreign", "a tier of another construction")
                 return self.host_tiers.answer(request)
             if not isinstance(request, DeviceRoom):
                 return refuse("no_durable_exchange", "device_room or host_tier only")

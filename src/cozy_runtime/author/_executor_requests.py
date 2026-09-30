@@ -9,6 +9,7 @@ executor runs in its package's own environment, so either side may be the older 
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 from collections.abc import Callable, Mapping
@@ -337,14 +338,20 @@ def respond(
             request = decode(frame)
         except CapabilityError as exc:
             reply = refuse(exc.code, exc.message)
-    if received is not None:
-        if isinstance(request, HostTier):
-            request = msgspec.structs.replace(request, memfd=received)
-        else:
-            os.close(received)
-            request, reply = None, refuse("seam_descriptor", "unexpected memfd with a request")
+    if isinstance(request, HostTier):
+        # The descriptor is only ever the one that arrived: a number on the wire is not.
+        request = msgspec.structs.replace(request, memfd=-1 if received is None else received)
+    elif received is not None:
+        os.close(received)
+        request, reply = None, refuse("seam_descriptor", "unexpected memfd with a request")
     if request is not None and handler is not None:
-        reply = handler(request)
+        try:
+            reply = handler(request)
+        except Exception as exc:  # answered, so the executor's exchange stays in step
+            if isinstance(request, HostTier) and request.memfd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(request.memfd)
+            reply = refuse("request_failed", f"{type(exc).__name__}: {exc}"[:400])
     handoff = reply.descriptor if isinstance(reply, DescriptorReply) else None
     body = encode(reply.answer if isinstance(reply, DescriptorReply) else reply)
     if handoff is not None:

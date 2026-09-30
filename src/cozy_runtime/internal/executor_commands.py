@@ -70,6 +70,7 @@ class Restore(Command, frozen=True, kw_only=True, tag="restore"):
 class Budget(Command, frozen=True, kw_only=True, tag="budget"):
     """This executor's weight-plane budgets (`weight_plane/1`). Lowering unmaps at once."""
 
+    #: -1 is no grant: each stage derives its own from what the driver has free
     vram_bytes: int
     #: -1 leaves the pinned host tier's budget as it is
     pinned_bytes: int = -1

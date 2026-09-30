@@ -151,19 +151,13 @@ def weights(ledger: Ledger, components: Collection[str] = ()) -> int:
     return sum(built.get(name, 0) for name in components or built) or ledger.weights_bytes
 
 
-def floor_bytes(
-    layouts: Mapping[str, weight_policy.Layout],
-    components: Collection[str],
-    grow: int,
-    context: int,
-) -> int:
-    """The refusal floor: a stage's components' floors, its growth and the context.
-    Without components (one attempt, its components in turn) the largest single one's."""
+def floor_bytes(layouts: Mapping[str, weight_policy.Layout], components: Collection[str]) -> int:
+    """The weights' refusal floor: a stage's components' floors at their finest grain. Without
+    components (one attempt, its components in turn) the largest single one's."""
     per = {name: weight_policy.floor(layout) for name, layout in layouts.items()}
-    base = (
-        sum(per.get(name, 0) for name in components) if components else max(per.values(), default=0)
-    )
-    return base + grow + max(context, 0)
+    if components:
+        return sum(per.get(name, 0) for name in components)
+    return max(per.values(), default=0)
 
 
 def pinned_split(available: int, tenants: Sequence[tuple[str, int, int]]) -> dict[str, int]:
@@ -282,6 +276,8 @@ class MemoryManager:
         executor = row.executor() if row is not None else None
         if row is None or executor is None or not plane_capable(executor):
             return False
+        if executor.busy():
+            return False  # its previous attempt still runs, over a tier already filled
         keys = [key for key in contents if key in executor.loaded]
         if not keys:
             return False
@@ -290,13 +286,16 @@ class MemoryManager:
         try:
             with executor.watched("prefill"):
                 if pinned >= 0 and pinned != current:
-                    # vram -1 leaves the device budget: another tenant may hold the device now
+                    # no device grant: its attempt carries one when it holds the device
                     command = executor_commands.Budget(vram_bytes=-1, pinned_bytes=pinned)
                     self.observe(row, executor, executor.call(command, timeout=None))
                 for key in keys:
                     executor.call(executor_commands.Prefetch(construction=key), timeout=None)
         except ExecutorGone:
             return False  # device entry finds it dead and says so
+        except Exception as exc:  # a prefill is an overlap, never the attempt's failure
+            self.note("residency", f"{tenant!r}: prefill skipped: {exc}"[:400])
+            return False
         return True
 
     def prefetch(self, tenant: str, gpu: int, stage: StageNeed) -> bool:
@@ -382,7 +381,6 @@ class MemoryManager:
         ledger = row.ledger
         facts = ledger.plane or PlaneFacts()
         grow = banked or 0
-        context = facts.context_bytes if facts.context_bytes >= 0 else ledger.out_of_allocator
         size = weights(ledger, stage.components)
         want = size + grow + weight_policy.MARGIN if size else None
 
@@ -394,19 +392,21 @@ class MemoryManager:
             self.note("residency", f"{lane.lane_id}: unreadable; {tenant!r} derives its budget")
             return Budget(evicted=tuple(evicted))
         ledger.observe_devices(lane.device_facts(read))
-        floor = floor_bytes(ledger.layouts, stage.components, grow, context)
-        available = {o: usable(m) + max(context, 0) for o, m in read.items()}
-        if any(value < floor for value in available.values()):
+        # The grant must hold the weights' floor itself: that is the refusal line.
+        least = floor_bytes(ledger.layouts, stage.components)
+        budget = {o: weight_policy.plane_budget(usable(m), grow) for o, m in read.items()}
+        if any(value < least for value in budget.values()):
+            floor = least + grow + weight_policy.MARGIN
+            available = {o: usable(m) for o, m in read.items()}
             detail = (
-                f"{tenant!r} needs {floor} B per GPU for {why} (window-1 weights, {grow} B of "
-                f"activations, {max(context, 0)} B of context) with every idle tenant cut: "
+                f"{tenant!r} needs {floor} B per GPU for {why} ({least} B of weights at their "
+                f"finest grain, {grow} B of activations) with every idle tenant cut: "
                 + ", ".join(f"{self._gpu(lane, o)} has {v} B" for o, v in sorted(available.items()))
             )
             self.note("residency", f"{lane.lane_id}: refused {detail}"[:512])
             return Shortfall(
                 needed=dict.fromkeys(available, floor), available=available, detail=detail
             )
-        budget = {o: weight_policy.plane_budget(usable(m), grow) for o, m in read.items()}
         if evicted or banked is None:
             self.note(
                 "residency",
@@ -526,6 +526,8 @@ class MemoryManager:
             return
         if reply.plane is not None:
             row.ledger.plane = reply.plane
+        # Its cut released torch's cache too: no slack is left for its next grant to count.
+        row.ledger.device_reserved = row.ledger.device_allocated
         self.note(
             "residency",
             f"{lane.lane_id}: {other!r} (epoch {executor.epoch} pid {executor.pid}) cut to 0 B "
