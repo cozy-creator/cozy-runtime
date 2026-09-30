@@ -1067,8 +1067,13 @@ class ReadLeases:
     snapshot, not the model.
     """
 
-    def __init__(self, checkpoints: Mapping[str, Checkpoint]) -> None:
+    def __init__(
+        self,
+        checkpoints: Mapping[str, Checkpoint],
+        store_read: Callable[[], contextlib.AbstractContextManager[None]] = contextlib.nullcontext,
+    ) -> None:
         self.checkpoints = checkpoints
+        self.store_read = store_read
         self.held: dict[str, ReadLease] = {}
         #: How many times this generation went to the store. The EFFECT the keying has to
         #: show, reported rather than asserted about the code: one per distinct manifest.
@@ -1091,7 +1096,10 @@ class ReadLeases:
         manifest = checkpoint.manifest_id
         lease = self.held.get(manifest)
         if lease is None or not lease.live:
-            lease = self.held[manifest] = checkpoint.acquire()
+            # A new lease may verify payload before the stream begins. Cached leases
+            # need no extra round-trip, but acquisition shares the same demand gate.
+            with self.store_read():
+                lease = self.held[manifest] = checkpoint.acquire()
             self.acquisitions += 1
             self.peak = {
                 "objects": max(self.peak["objects"], self._objects()),
@@ -1170,6 +1178,7 @@ class StreamingFillBackend:
         qualified: tuple[Capabilities, QualificationResult] | None = None,
         forensics_dir: str = "",
         custody: str = "canonical",
+        store_read: Callable[[], contextlib.AbstractContextManager[None]] = contextlib.nullcontext,
     ) -> None:
         self.torch = torch_module()
         # ONE CHECKPOINT PER COMPONENT (cr-008b). A TensorFS read plan must name every
@@ -1192,6 +1201,7 @@ class StreamingFillBackend:
         #: a stored key the code does not consume, `local` lists and ignores it. The fit
         #: reads it; nothing else here does.
         self.custody = custody
+        self.store_read = store_read
         self.device = self.torch.device(device)
         self.device_str = str(self.torch.empty(0, device=self.device).device)
         #: The BACKEND this generation is filled on. Memory metering and reclaim go through
@@ -1215,7 +1225,7 @@ class StreamingFillBackend:
         #: position rather than a heartbeat — a stalled transfer stops moving it, while a
         #: slow one keeps moving it however slowly.
         self.on_position = on_position
-        self.leases = ReadLeases(self.checkpoints)
+        self.leases = ReadLeases(self.checkpoints, self.store_read)
         self.state: State = "open"
         self.enqueued: dict[str, Any] = {}
         self.expected: dict[str, frozenset[str]] = {}
@@ -1914,7 +1924,7 @@ class StreamingFillBackend:
         bytes to the device, and this is it.
         """
         started = time.perf_counter_ns()
-        with placing():
+        with self.store_read(), placing():
             ring = StagingRing(
                 self.torch,
                 self.device,

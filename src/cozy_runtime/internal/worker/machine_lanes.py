@@ -142,3 +142,32 @@ def placement_for(
         )
     offered.placement_id = replica.placement_id
     return dict(preparation, state=base64.b64encode(desired.SerializeToString()).decode())
+
+
+def page_targets(
+    preparation: Preparation,
+    offered: pb.AttemptOffer,
+    store_root: str,
+    template: tuple[str, str],
+) -> tuple[tuple[str, str, str], ...]:
+    """Exact selected native components, with no acquisition, imports or placement mutation."""
+    desired = preparation.desired()
+    if desired.WhichOneof("mode") != "placement_set":
+        return ()
+    placement = _selected(desired, offered.placement_id)
+    if (placement.installation_id, documents.spell(placement.bindings_digest)) != template:
+        return ()
+    spec = documents.parse(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
+    binding = documents.raw(spec.serving.entrypoint_binding_digest)
+    entry = next(e for e in placement.entrypoints if e.entrypoint_binding_digest == binding)
+    models = {model.id: model for model in placement.models}
+    targets = []
+    for slot in entry.slots:
+        references = [(part.model_id, part.component) for part in slot.components]
+        references.extend((part.model_id, part.source_component) for part in slot.adapters)
+        for model, component in references:
+            manifest = documents.spell(models[model].manifest.digest)
+            item = (store_root, manifest, component)
+            if component and item not in targets:
+                targets.append(item)
+    return tuple(targets)

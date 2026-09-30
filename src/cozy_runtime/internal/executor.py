@@ -52,6 +52,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -86,6 +87,7 @@ from cozy_runtime.author._executor_requests import (
     RankRoom,
     Request,
     Room,
+    StoreRead,
 )
 from cozy_runtime.author._executor_requests import encode as encode_request
 from cozy_runtime.author._invoke import (
@@ -639,6 +641,21 @@ class Executor:
             return None
         # NVML uses host PIDs. A namespace mismatch/absent row is not measured zero.
         return row.bytes if row.state == "present" else None
+
+    @contextlib.contextmanager
+    def _store_read(self) -> Iterator[None]:
+        """No follower IPC inside collectives; Worker holds their conservative phase gate."""
+        if self.world != 1 or "store_read_gate" not in self.host.worker_memory:
+            yield
+            return
+        token = "fill-" + uuid.uuid4().hex
+        answer = self._durable(StoreRead(reservation=token), Answer)
+        if not answer.ok:
+            raise RuntimeFailure(answer.detail or answer.code, code="store_read_refused")
+        try:
+            yield
+        finally:
+            self._durable(StoreRead(reservation=token, release=True), Answer)
 
     def _ask_host_room(self, token: str, nbytes: int, release: bool = False) -> bool:
         """A single-rank host copy reserves credit before allocation and releases it after."""
@@ -2375,6 +2392,7 @@ class Executor:
             qualified=qualified_pair,
             forensics_dir=self.fill_forensics_dir,
             custody=binding.custody,
+            store_read=self._store_read,
         )
         stage("backend_ctor")
         planner = self.host.planner

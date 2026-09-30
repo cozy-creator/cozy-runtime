@@ -63,6 +63,7 @@ from cozy_runtime.author._executor_requests import (
     ModelPrefetch,
     Request,
     Room,
+    StoreRead,
     refuse,
 )
 from cozy_runtime.internal import (
@@ -925,6 +926,13 @@ class Worker:
         self._page_warm_targets: dict[str, dict[tuple[str, str, str], tuple[str, ...]]] = {}
         self._memory_waiting: tuple[tuple[str, str], ...] = ()
         self._page_warm_frontier: tuple[policy.Demand, ...] = ()
+        #: Accepted queue keys, copied under the broker lock; read custody only off that lock.
+        self._first_use_waiting: tuple[tuple[str, tuple[str, str]], ...] = ()
+        self._memory_templates: frozenset[tuple[str, str]] = frozenset()
+        #: Coalesce first-use and activation reads for this live template cohort only.
+        self._first_pages_warmed: dict[tuple[str, str], set[tuple[str, str, str]]] = {}
+        self._first_pages_attempted: dict[tuple[str, str], set[tuple[str, str, str]]] = {}
+        self._page_warm_lock = threading.Lock()
         #: per placement: bindings digests of superseded documents -> {binding: construction}
         #: whose offers are still accepted when the binding and its construction are unchanged
         self._superseded: dict[str, dict[str, dict[str, str]]] = {}
@@ -973,6 +981,7 @@ class Worker:
         )
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         # Before any executor starts: an older executor reads the image kernel site once.
+        self.memory.optional_host_available = proctree.optional_host_bytes
         self.machine_kernels = machine_kernels.boot(
             config.kernel_cache, options.devices, dict(config.child_base_env)
         )
@@ -1610,6 +1619,7 @@ class Worker:
         new = (executor.pid, executor.epoch) if executor is not None else None
         if old is not None and old != new:
             self.memory.release_host_prefix(f"executor:{old[0]}:{old[1]}:")
+            self.memory.release_store_prefix(f"executor:{old[0]}:{old[1]}:")
         row.sync_memory_generation()
         row.ledger.begin_generation(executor.pid if executor else 0)
 
@@ -2534,6 +2544,14 @@ class Worker:
         ]
         queued.sort(key=lambda row: (roots[row[1].root], row[1].root))
         self._memory_waiting = tuple(want.template for _, want in queued if want.template[0])
+        self._first_use_waiting = tuple(
+            (key, want.template) for key, want in queued if want.template[0]
+        )
+        self._memory_templates = frozenset(
+            want.template
+            for want in self.gpu.wants.values()
+            if want.root in roots and want.template[0]
+        )
         self._refresh_memory_queue()
         if self.executions is None:
             return
@@ -2553,7 +2571,7 @@ class Worker:
     def _refresh_memory_queue(self) -> None:
         """Project known queued representations into memory hints, never GPU grants.
 
-        A template with no local placement remains with normal artifact preparation.
+        An accepted template without a replica can warm its selected immutable pages.
         Reading these immutable placement identities is a performance hint: a raced
         removal only loses a saving and is revalidated before a background read.
         """
@@ -2566,10 +2584,12 @@ class Worker:
             key: value for key, value in self._page_warm_targets.items() if key in live
         }
         demands: list[policy.Demand] = []
+        known = set()
         for placement in placements:
             if placement is None:
                 continue
             template = (placement.installation_id, documents.spell(placement.bindings_digest))
+            known.add(template)
             lane = self.lanes.lane_of(placement.placement_id)
             if template not in positions or lane is None:
                 continue
@@ -2584,6 +2604,13 @@ class Worker:
                     row.load_seconds if row is not None else None,
                 )
             )
+        for key, template in self._first_use_waiting:
+            if template not in known and template in positions:
+                demands.append(
+                    policy.Demand(
+                        "queued:" + key, template[1], template[0], (), positions[template]
+                    )
+                )
         self.memory.update_queue(demands)
         frontier = self.memory.prefetch_frontier()
         self._page_warm_frontier = frontier
@@ -2592,7 +2619,7 @@ class Worker:
         self._pages_warmed = {
             key: value for key, value in self._pages_warmed.items() if key[2] in live_items
         }
-        if frontier:
+        if frontier or self._first_pages_warmed or self._first_pages_attempted:
             self.supervisor.spawn("memory-prefetch", lambda _: self._prefetch_pages())
 
     def _prefetch_tier(
@@ -2624,9 +2651,26 @@ class Worker:
 
     def _prefetch_pages(self) -> None:
         """Bounded speculative store reads of the current queue frontier, with no GPU work."""
+        with self._page_warm_lock:
+            self._read_queued_pages()
+
+    def _read_queued_pages(self) -> None:
         frontier = self._page_warm_frontier
+        self._first_pages_warmed = {
+            template: items
+            for template, items in self._first_pages_warmed.items()
+            if template in self._memory_templates
+        }
+        self._first_pages_attempted = {
+            template: items
+            for template, items in self._first_pages_attempted.items()
+            if template in self._memory_templates
+        }
         warmed = self._pages_warmed
         for demand in frontier:
+            if demand.tenant.startswith("queued:"):
+                self._prefetch_first_use(demand)
+                continue
             for item in self._page_warm_targets.get(demand.tenant, ()):
                 key = (demand.artifact, demand.representation, item)
                 tier = self._prefetch_tier(demand, item)
@@ -2641,6 +2685,7 @@ class Worker:
                 ) -> bool:
                     return (
                         not self.stop.is_set()
+                        and self.memory.optional_store_wanted()
                         and any(
                             (d.tenant, d.artifact, d.representation)
                             == (demand.tenant, demand.artifact, demand.representation)
@@ -2658,9 +2703,11 @@ class Worker:
                 try:
                     report = page_warm.warm_component(
                         *item,
-                        reserve=partial(self.memory.reserve_host, token),
+                        reserve=partial(self.memory.reserve_host, token, optional=True),
                         release=partial(self.memory.release_host, token),
                         wanted=wanted,
+                        reading=self.memory.optional_store_read,
+                        allowance=self.memory.prefetch_allowance,
                     )
                 except Exception as exc:
                     self.note(
@@ -2674,6 +2721,84 @@ class Worker:
                     self.note(
                         "memory-prefetch", f"{demand.tenant!r} {page_warm.describe(report)}"[:256]
                     )
+
+    def _prefetch_first_use(self, demand: policy.Demand) -> None:
+        """An accepted first-use template has immutable refs but no executor tier yet."""
+        executions = self.executions
+        if executions is None or self.options.tensorfs_root is None:
+            return
+        owner, boot = self.fence.record_owner_id, self.fence.worker_boot_id
+        key = demand.tenant.removeprefix("queued:")
+        request, separator, ordinal = key.rpartition("#")
+        if not separator or not ordinal.isdecimal():
+            return
+        template = (demand.representation, demand.artifact)
+        try:
+            row = executions.row(owner, request)
+            if row is None or row.ordinal != int(ordinal):
+                return
+            preparation = executions.prepared(owner, request)
+            offered = row.attempt_offer()
+            items = machine_lanes.page_targets(
+                preparation, offered, str(self.options.tensorfs_root), template
+            )
+
+            def wanted() -> bool:
+                if (
+                    self.stop.is_set()
+                    or not self.memory.optional_store_wanted()
+                    or (owner, boot) != (self.fence.record_owner_id, self.fence.worker_boot_id)
+                    or (key, template) not in self._first_use_waiting
+                    or demand not in self._page_warm_frontier
+                    or any(
+                        attempt.state in {"preparing", "entering", "accepted"}
+                        for attempt in list(self.engine.live.values())
+                    )
+                ):
+                    return False
+                current = executions.row(owner, request)
+                return (
+                    current is not None
+                    and current == row
+                    and current.desired == "run"
+                    and not current.terminal
+                    and not current.dispatched
+                    and executions.assigned_here(owner, request, row.ordinal, boot)
+                    and executions.prepared(owner, request).state == preparation.state
+                )
+
+            remaining = self.memory.prefetch_allowance(fill.slot_bytes(fill.WINDOW_BYTES))
+            if remaining <= 0:
+                return
+            for item in items:
+                if not wanted():
+                    return
+                if item in self._first_pages_attempted.get(template, ()):
+                    continue
+                token = f"first-use:{key}"
+
+                def allowance(slots: int, budget: int = remaining) -> int:
+                    return min(budget, self.memory.prefetch_allowance(slots))
+
+                report = page_warm.warm_component(
+                    *item,
+                    reserve=partial(self.memory.reserve_host, token, optional=True),
+                    release=partial(self.memory.release_host, token),
+                    wanted=wanted,
+                    reading=self.memory.optional_store_read,
+                    allowance=allowance,
+                )
+                remaining = max(0, remaining - report.get("bytes", 0))
+                if report.get("bytes", 0) > 0:
+                    self._first_pages_attempted.setdefault(template, set()).add(item)
+                if report.get("skipped"):
+                    self.note("memory-prefetch", f"first use: {report['skipped']}"[:256])
+                elif report.get("complete") and wanted():
+                    self._first_pages_warmed.setdefault(template, set()).add(item)
+                    self.note("memory-prefetch", f"first use: {page_warm.describe(report)}"[:256])
+        except Exception as exc:
+            # Optional reads never change the accepted request or its ordinary preparation.
+            self.note("memory-prefetch", f"first use skipped: {type(exc).__name__}"[:256])
 
     def _record_executor(self, attempt: AttemptRecord) -> None:
         """The SDK the attempt's executor loaded, as it stated in its hello, on the execution's
@@ -2818,6 +2943,7 @@ class Worker:
             return False
         members = list(evidence.members) if evidence is not None else [dead.pid]
         self.memory.release_host_prefix(f"executor:{dead.pid}:{dead.epoch}:")
+        self.memory.release_store_prefix(f"executor:{dead.pid}:{dead.epoch}:")
         self.note(
             "recovery",
             f"{placement_id!r}: reclaimed executor epoch {dead.epoch} (pids {members}): "
@@ -5616,7 +5742,31 @@ class Worker:
             slot=placement_id,
         )
 
+    @contextlib.contextmanager
+    def _store_phase(
+        self, label: str, supervision: child.ExecutorSupervision | None
+    ) -> Iterator[None]:
+        """Unknown/group work owns the gate through failure until its generation is reaped."""
+        failed = False
+
+        def retain() -> str:
+            current = supervision.current if supervision is not None else None
+            if current is not None and (failed or current.poisoned or not current.alive()):
+                return f"executor:{current.pid}:{current.epoch}:phase:"
+            return ""
+
+        with self.memory.store_demand(label, retain=retain):
+            try:
+                yield
+            except BaseException:
+                failed = True
+                raise
+
     def _prepare_generation(self, tenant: Tenant) -> tuple[str, bool]:
+        with self._store_phase("prepare:" + tenant.placement.placement_id, tenant.supervision):
+            return self._prepare_generation_body(tenant)
+
+    def _prepare_generation_body(self, tenant: Tenant) -> tuple[str, bool]:
         """ONE placement's PROCESS: spawn or keep its executor and START it (proto-061 D2).
 
         Process identity is (environment, lane). Nothing here fills: `start` brings every
@@ -6481,13 +6631,30 @@ class Worker:
         self, placement_id: str, construction: str, items: tuple[tuple[str, str, str], ...]
     ) -> None:
         """One activation read per construction, before any executor tier report exists."""
+        with self._page_warm_lock:
+            self._read_construction_pages(placement_id, construction, items)
+
+    def _read_construction_pages(
+        self, placement_id: str, construction: str, items: tuple[tuple[str, str, str], ...]
+    ) -> None:
+        placement = self.hosted.get(placement_id)
+        selected = placement.placement if placement is not None else self.placement
+        template = (
+            (selected.installation_id, documents.spell(selected.bindings_digest))
+            if selected is not None
+            else ("", "")
+        )
         token = f"page-warm:{placement_id}:{construction}"
         for item in items:
+            if item in self._first_pages_warmed.get(template, ()):
+                continue
 
             def wanted(item: tuple[str, str, str] = item) -> bool:
                 keys = self._page_warm_targets.get(placement_id, {}).get(item, ())
-                return not self.stop.is_set() and any(
-                    key.startswith(construction + "#") for key in keys
+                return (
+                    not self.stop.is_set()
+                    and self.memory.optional_store_wanted()
+                    and any(key.startswith(construction + "#") for key in keys)
                 )
 
             if not wanted():
@@ -6495,9 +6662,11 @@ class Worker:
             try:
                 report = page_warm.warm_component(
                     *item,
-                    reserve=partial(self.memory.reserve_host, token),
+                    reserve=partial(self.memory.reserve_host, token, optional=True),
                     release=partial(self.memory.release_host, token),
                     wanted=wanted,
+                    reading=self.memory.optional_store_read,
+                    allowance=self.memory.prefetch_allowance,
                 )
                 detail = report.get("skipped") or page_warm.describe(report)
                 self.note("page-warm", f"{placement_id!r} {detail}"[:256])
@@ -6630,6 +6799,20 @@ class Worker:
         def answer(request: Request) -> Answer:
             if origin is None or lane.row(slot).executor() is not origin:
                 return refuse("executor_replaced", "memory request no longer owns this generation")
+            if isinstance(request, StoreRead):
+                if not request.reservation:
+                    return refuse("store_read_invalid", "store demand requires a token")
+                token = f"executor:{origin.pid}:{origin.epoch}:{slot}:{request.reservation}"
+                if request.release:
+                    self.memory.end_store_read(token)
+                    return Answer(ok=True)
+                # This seam runs outside scheduler/control locks. Publish demand, then wait
+                # until the native optional reader returned (and joined its workers).
+                if self.memory.begin_store_read(
+                    token, valid=lambda: lane.row(slot).executor() is origin
+                ):
+                    return Answer(ok=True)
+                return refuse("executor_replaced", "store demand generation was retired")
             if isinstance(request, HostRoom):
                 token = f"executor:{origin.pid}:{origin.epoch}:{slot}:{request.reservation}"
                 if not request.reservation or request.nbytes < 0:
@@ -7047,6 +7230,12 @@ class Worker:
         with self.control_lock:
             if self._entry_refused(attempt):
                 return False
+        with self._store_phase(
+            f"enter:{attempt.request_id}:{attempt.attempt}", self.engine.supervision_for(attempt)
+        ):
+            return self._enter_prepared(attempt)
+
+    def _enter_prepared(self, attempt: AttemptRecord) -> bool:
         try:
             self._ensure_construction(attempt)
             with self.control_lock:
@@ -7291,6 +7480,24 @@ class Worker:
         return False
 
     def execute(self, attempt: AttemptRecord, lane: DeviceLane) -> Released | None:
+        executor = attempt.executor
+        tracked = (
+            executor is not None
+            and len(lane.ordinals) == 1
+            and "store_read_gate" in executor.hello.get("memory", ())
+        )
+        guard = (
+            contextlib.nullcontext()
+            if tracked
+            else self._store_phase(
+                f"execute:{attempt.request_id}:{attempt.attempt}",
+                self.engine.supervision_for(attempt) if executor is not None else None,
+            )
+        )
+        with guard:
+            return self._execute(attempt, lane)
+
+    def _execute(self, attempt: AttemptRecord, lane: DeviceLane) -> Released | None:
         """RUN -> RELEASE. The ledger closes at release, while the device is still held; the
         caller runs the post phase after letting the device go. The driver is sampled while
         the attempt runs: its peak is what this shape costs on each device (`memory.py`).
@@ -7308,7 +7515,10 @@ class Worker:
             finally:
                 if self.machine_calls is not None:
                     self.machine_calls.timing.phase(
-                        self.fence.record_owner_id, attempt.request_id, attempt.attempt, "finalizing"
+                        self.fence.record_owner_id,
+                        attempt.request_id,
+                        attempt.attempt,
+                        "finalizing",
                     )
         except Exception as exc:
             self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")

@@ -105,6 +105,13 @@ def test_prefetch_cannot_clear_a_replacement_executors_memory_facts() -> None:
     row.memory_generation = cast(tuple[int, int], PreviousGeneration((executor.pid, 1)))
     item = ("store", "manifest", "model")
     worker = Worker.__new__(Worker)
+    worker._first_use_waiting = ()
+    worker._memory_templates = frozenset()
+    worker._first_pages_warmed = {}
+    worker._first_pages_attempted = {}
+    worker._page_warm_lock = threading.Lock()
+    worker.hosted = {}
+    worker.placement = None
     worker.lanes = lanes
     worker._page_warm_targets = {"tenant": {item: ("model",)}}
     demand = memory.Demand("tenant", "representation", "artifact", (0,), 0, None)
@@ -187,12 +194,20 @@ def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(
     )
     row.supervision = cast(ExecutorSupervision, SimpleNamespace(current=executor))
     worker = Worker.__new__(Worker)
+    worker._first_use_waiting = ()
+    worker._memory_templates = frozenset()
+    worker._first_pages_warmed = {}
+    worker._first_pages_attempted = {}
+    worker._page_warm_lock = threading.Lock()
+    worker.hosted = {}
+    worker.placement = None
     worker.lanes = lanes
     worker.stop = threading.Event()
     worker.engine = cast(AttemptEngine, SimpleNamespace(live={}))
     worker.memory = memory.Machine(
         {}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30
     )
+    worker.memory.optional_host_available = lambda: 1 << 30
     worker._page_warm_targets = {}
     worker._pages_warmed = {}
     worker._page_warm_frontier = ()
@@ -283,11 +298,19 @@ def test_activation_warms_native_store_once_before_any_load_report(
         components=("model",),
     )
     worker = Worker.__new__(Worker)
+    worker._first_use_waiting = ()
+    worker._memory_templates = frozenset()
+    worker._first_pages_warmed = {}
+    worker._first_pages_attempted = {}
+    worker._page_warm_lock = threading.Lock()
+    worker.hosted = {}
+    worker.placement = None
     worker.stop = threading.Event()
     worker.memory = memory.Machine(
         {}, lambda _: None, lambda _: None, host_available=lambda: 1 << 30
     )
     worker.lanes = cast(LaneSet, SimpleNamespace(lane_of=lambda _: None))
+    worker.memory.optional_host_available = lambda: 1 << 30
     worker._page_warm_targets = {}
     monkeypatch.setattr(worker, "_refresh_memory_queue", lambda: None)
     scheduled = []

@@ -1325,12 +1325,21 @@ def available_host_bytes() -> int:
     Unknown physical availability remains unreadable; cache credit is bounded by both
     observed usage and MemAvailable. Re-read at every grant, not just process startup.
     """
+    return _host_room(reclaimable=True)
+
+
+def optional_host_bytes() -> int:
+    """Physical MemFree and raw ancestor high/max room; unknown means optional reads skip."""
+    return _host_room(reclaimable=False)
+
+
+def _host_room(*, reclaimable: bool) -> int:
     _linux_only("available_host_bytes")
     try:
         physical = next(
             int(line.split()[1]) * 1024
             for line in Path("/proc/meminfo").read_text().splitlines()
-            if line.startswith("MemAvailable:")
+            if line.startswith("MemAvailable:" if reclaimable else "MemFree:")
         )
     except (OSError, StopIteration, IndexError, ValueError):
         return -1
@@ -1345,15 +1354,16 @@ def available_host_bytes() -> int:
         current = int((directory / current_name).read_text().strip())
         if limit < 0 or current < 0:
             raise ValueError("negative cgroup memory counter")
-        # Missing cache statistics must not invent reclaimable memory.
         inactive = 0
-        try:
-            stats = dict(
-                line.split() for line in (directory / "memory.stat").read_text().splitlines()
-            )
-            inactive = max(0, int(stats.get(cache_name, "0")))
-        except (OSError, ValueError):
-            pass
+        if reclaimable:
+            # Missing cache statistics must not invent reclaimable memory.
+            try:
+                stats = dict(
+                    line.split() for line in (directory / "memory.stat").read_text().splitlines()
+                )
+                inactive = max(0, int(stats.get(cache_name, "0")))
+            except (OSError, ValueError):
+                pass
         return max(0, limit - current + min(current, inactive))
 
     try:
@@ -1367,6 +1377,11 @@ def available_host_bytes() -> int:
             cgroup = mount / relative.lstrip("/")
             # A parent can constrain a child whose own memory.max is unlimited.
             while cgroup.is_relative_to(mount):
+                # The controller root has no memory limit files on ordinary v2 hosts.
+                if cgroup == mount and not (cgroup / "memory.max").is_file():
+                    break
+                if not reclaimable and not (cgroup / "memory.high").is_file():
+                    return -1
                 physical = min(
                     physical, credit(cgroup, "memory.max", "memory.current", "inactive_file")
                 )
@@ -1403,7 +1418,8 @@ def available_host_bytes() -> int:
                     break
                 cgroup = cgroup.parent
     except (ContainmentUnavailable, OSError, StopIteration, ValueError):
-        pass
+        if not reclaimable:
+            return -1
     return physical
 
 

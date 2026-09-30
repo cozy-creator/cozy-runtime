@@ -18,10 +18,11 @@ from __future__ import annotations
 import functools
 import math
 import re
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Condition, Lock
 from typing import TYPE_CHECKING, NoReturn, Protocol
 
 from cozy_runtime.author._errors import DEVICE_OOM, RuntimeFailure
@@ -2241,6 +2242,84 @@ class Machine:
         self.host_available = host_available
         self.host_pressure = host_pressure
         self.host_reserved: dict[str, int] = {}
+        self.optional_host_available: Callable[[], int] | None = None
+        self._store_condition = Condition()
+        self._store_demands: set[str] = set()
+        self._speculative_reader = False
+
+    def begin_store_read(self, token: str, valid: Callable[[], bool] = lambda: True) -> bool:
+        """Publish demand BEFORE waiting: its ACK follows native speculative reader drain."""
+        with self._store_condition:
+            if not valid():
+                return False
+            self._store_demands.add(token)
+            self._store_condition.notify_all()
+            while self._speculative_reader and token in self._store_demands:
+                self._store_condition.wait()
+            if not valid():
+                self._store_demands.discard(token)
+                self._store_condition.notify_all()
+                return False
+            return token in self._store_demands
+
+    def end_store_read(self, token: str) -> None:
+        with self._store_condition:
+            self._store_demands.discard(token)
+            self._store_condition.notify_all()
+
+    def release_store_prefix(self, prefix: str) -> None:
+        """Only confirmed executor retirement can abandon that generation's demand tokens."""
+        if not prefix:
+            raise ValueError("store read cleanup requires an explicit generation namespace")
+        with self._store_condition:
+            self._store_demands = {t for t in self._store_demands if not t.startswith(prefix)}
+            self._store_condition.notify_all()
+
+    @contextmanager
+    def store_demand(self, token: str, retain: Callable[[], str] = lambda: "") -> Iterator[None]:
+        token = token + ":" + uuid.uuid4().hex
+        if not self.begin_store_read(token):
+            raise RuntimeFailure("store demand generation was retired", code="executor_replaced")
+        try:
+            yield
+        finally:
+            with self._store_condition:
+                # A still-bound failed generation may own native readers. Rebind its
+                # phase protection atomically with the same lock as confirmed-reap cleanup.
+                owner = retain()
+                if owner:
+                    self._store_demands.add(owner + token)
+                self._store_demands.discard(token)
+                self._store_condition.notify_all()
+
+    @contextmanager
+    def optional_store_read(self) -> Iterator[bool]:
+        """One optional native reader, atomically excluded by waiting or active demand."""
+        with self._store_condition:
+            admitted = not self._store_demands and not self._speculative_reader
+            if admitted:
+                self._speculative_reader = True
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self._store_condition:
+                    self._speculative_reader = False
+                    self._store_condition.notify_all()
+
+    def optional_store_wanted(self) -> bool:
+        with self._store_condition:
+            return not self._store_demands
+
+    def prefetch_allowance(self, slots_bytes: int) -> int:
+        """Optional cache work spends only observed unreclaimed room, never demand credit."""
+        if self.optional_host_available is None:
+            return 0
+        room = self.optional_host_available()
+        if room < 0:
+            return 0
+        with self._host_lock:
+            return max(0, room - sum(self.host_reserved.values()) - slots_bytes)
 
     def update_queue(self, demands: Iterable[Demand]) -> None:
         """Replace the forecast atomically; stale hints cannot authorize any operation."""
@@ -2277,7 +2356,13 @@ class Machine:
         return tuple(frontier)
 
     def reserve_host(
-        self, owner: str, nbytes: int, *, requester: str = "", tenants: Sequence[HostTenant] = ()
+        self,
+        owner: str,
+        nbytes: int,
+        *,
+        requester: str = "",
+        tenants: Sequence[HostTenant] = (),
+        optional: bool = False,
     ) -> bool:
         """Reserve against fresh aggregate room, reclaiming safe idle cache if needed.
 
@@ -2295,6 +2380,10 @@ class Machine:
             assert self.host_available is not None
             with self._host_lock:
                 available = self.host_available()
+                if optional:
+                    if self.optional_host_available is None:
+                        return False
+                    available = min(available, self.optional_host_available())
                 reserved = sum(self.host_reserved.values())
                 if available < 0 or nbytes > available - reserved:
                     return False
@@ -2303,6 +2392,8 @@ class Machine:
 
         if reserve():
             return True
+        if optional:
+            return False  # Speculation never reclaims a tenant's useful backing.
         # Normal reservations may race with one another, but only one operation at a
         # time may ask an idle executor to release host backing.  The reclaim lock is
         # held across the RPC; the short reservation lock is not.

@@ -193,13 +193,15 @@ def test_worker_execution_boundary_excludes_preparation_and_postprocessing(
     worker = SimpleNamespace(
         machine_calls=SimpleNamespace(timing=timing),
         fence=SimpleNamespace(record_owner_id="owner"),
-        memory=SimpleNamespace(watch=lambda _: nullcontext()),
+        memory=SimpleNamespace(),
+        _store_phase=lambda *_: nullcontext(),
         _record_executor=lambda _: None,
         engine=SimpleNamespace(execute=execute, abandon=lambda *_: outcome),
         settle=settled.append,
         note=lambda *_: None,
     )
-    attempt = SimpleNamespace(request_id=call.child_request, attempt=1)
+    worker._execute = lambda attempt, lane: Worker._execute(cast(Any, worker), attempt, lane)
+    attempt = SimpleNamespace(request_id=call.child_request, attempt=1, executor=None)
     Worker.execute(cast(Any, worker), cast(Any, attempt), cast(Any, object()))
     assert settled == [outcome]
     clock[0] = 150
