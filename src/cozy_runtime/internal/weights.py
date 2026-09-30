@@ -916,8 +916,10 @@ class PlaneBackend:
                     os.close(held)  # the plane reopened its own description
             if ws is None:
                 held, ws = None, weights.plane.register(key, source, plan, ids)
-        if tiers is not None and held is None:
-            tiers.offer(key, digest, ws.host_fd)
+        if tiers is not None:
+            if held is None:
+                tiers.offer(key, digest, ws.host_fd)
+            tiers.share(key, digest, ws.host_fd)
         spans = msgspec.convert(ws.regions, list[_Span])
         placed = {row.what: row for row in msgspec.convert(ws.parts, list[_Placed])}
         sites = _sites(root, name)
@@ -978,11 +980,14 @@ class PlaneBackend:
 
 @dataclass(frozen=True, slots=True)
 class HostTiers:
-    """The worker's pinned host tiers, reached over the seam: `ask` returns the memfd it holds
-    for exactly (weight set, layout) or None; `offer` hands it a freshly filled one."""
+    """Where a weight set's pinned tier comes from and goes to: `ask` returns a memfd already
+    holding exactly (weight set, layout) or None (the worker's, or a group's rank 0's);
+    `offer` hands the worker one this process filled; `share` hands every registered one on
+    (rank 0 to its followers, so K ranks pin one copy)."""
 
     ask: Callable[[str, str], int | None]
     offer: Callable[[str, str, int], None]
+    share: Callable[[str, str, int], None] = lambda name, layout, memfd: None
 
 
 class _Span(msgspec.Struct, frozen=True):

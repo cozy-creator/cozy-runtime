@@ -1956,9 +1956,7 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            tiers=HostTiers(ask=host._ask_tier, offer=host._offer_tier)
-            if command.host_tier and self.rank == 0
-            else None,
+            tiers=self._tiers(command.host_tier),
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
@@ -3628,6 +3626,42 @@ class Executor:
     def _publish(self, request: Publish) -> Published:
         """One product onto the run's output log, durable before this returns."""
         return self._durable(request, Published)
+
+    def _tiers(self, worker: bool) -> HostTiers | None:
+        """Where this rank's pinned tiers come from: a follower adopts its leader's (one copy
+        for K ranks); rank 0 asks and offers the worker's when it keeps them, and shares every
+        tier with its followers."""
+        host = self.host
+        if self.rank > 0:
+            return HostTiers(ask=self._leader_tier, offer=lambda *_: None)
+        if not worker and self.group is None:
+            return None
+        return HostTiers(
+            ask=host._ask_tier if worker else lambda *_: None,
+            offer=host._offer_tier if worker else lambda *_: None,
+            share=self._share_tier,
+        )
+
+    def _share_tier(self, name: str, layout: str, memfd: int) -> None:
+        """Rank 0 hands one registered tier to every follower, in registration order."""
+        if self.group is None:
+            return
+        for follower in self.group.followers:
+            self.group.send_one(
+                follower.rank, {"event": "tier", "name": name, "layout": layout, "held": True}
+            )
+            self.group.memfd_to(follower.rank, memfd)
+
+    def _leader_tier(self, name: str, layout: str) -> int | None:
+        """A follower's tier: the one rank 0 registered for exactly this weight set."""
+        frame = self.channel.recv()
+        if (
+            frame is None
+            or frame.get("event") != "tier"
+            or (frame.get("name"), frame.get("layout")) != (name, layout)
+        ):
+            raise GroupRefusal(f"{_gpu(self.rank)} expected rank 0's tier for {name!r}")
+        return self.channel.recv_memfd() if frame.get("held") is True else None
 
     def _ask_tier(self, name: str, layout: str) -> int | None:
         """The pinned host tier the worker keeps for exactly this weight set's layout."""
