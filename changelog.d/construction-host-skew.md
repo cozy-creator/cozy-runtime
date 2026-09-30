@@ -1,0 +1,1 @@
+Grouped staging construction now preserves older Workers without host_room by using one leader-observed Planner capacity vector; capable Workers retain aggregate host reservations. Unsupported optional memory transport no longer refuses every construction.

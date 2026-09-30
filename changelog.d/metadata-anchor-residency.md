@@ -1,0 +1,1 @@
+- Separate real metadata-anchor backing from operation-common cache under existing forward-only and immutable backing contracts; keep metadata, whole-read, compiled and mutable pins intact.

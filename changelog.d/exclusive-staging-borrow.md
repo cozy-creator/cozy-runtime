@@ -1,0 +1,1 @@
+The fill backend can exclusively lend existing pinned staging buffers without allocation or new memory policy. Native fill/reclaim/close respect active borrows, and failed ownership/drain paths retain executor custody.

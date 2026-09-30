@@ -233,7 +233,9 @@ class Products:
         )
         return pb.NativeByteRetentionRequest(source=grant.source, retention_id=grant.retention_id)
 
-    def _journal(self, owner: str, request: str, product: pb.RunProduct) -> int:
+    def _journal(
+        self, owner: str, request: str, product: pb.RunProduct, *, collect: bool = True
+    ) -> int:
         fold = self.fold(owner, request)
         if product.op == SET:
             current = fold.single.get(product.output)
@@ -243,7 +245,8 @@ class Products:
             product.index = len(fold.lists.get(product.output, []))
         sequence = self.executions.notice(owner, request, "product", documents.document(product))
         fold.add(product)
-        self._collect(owner, request, fold)
+        if collect:
+            self._collect(owner, request, fold)
         return sequence
 
     def _collect(self, owner: str, request: str, fold: Fold) -> None:
@@ -269,45 +272,48 @@ class Products:
             return None
         slots = set(attempt.grant.outputs)
         with self.lock:
-            fold = self.fold(owner, attempt.request_id)
-            returned: dict[str, list[pb.OutputEntry]] = {}
-            fresh: list[tuple[pb.OutputEntry, int, int]] = []
-            for entry in entries:
-                slot = machine_byte_results.slot_of(entry.output_id, slots)
-                if slot is None or not entry.HasField("native_tree"):
-                    continue
-                if slot.endswith(machine_byte_results.LIST):
-                    returned.setdefault(slot.removesuffix(machine_byte_results.LIST), []).append(
-                        entry
+            try:
+                fold = self.fold(owner, attempt.request_id)
+                returned: dict[str, list[pb.OutputEntry]] = {}
+                fresh: list[tuple[pb.OutputEntry, int, int]] = []
+                for entry in entries:
+                    slot = machine_byte_results.slot_of(entry.output_id, slots)
+                    if slot is None or not entry.HasField("native_tree"):
+                        continue
+                    if slot.endswith(machine_byte_results.LIST):
+                        returned.setdefault(slot.removesuffix(machine_byte_results.LIST), []).append(
+                            entry
+                        )
+                        continue
+                    current = fold.single.get(entry.output_id)
+                    content = pb.Ref(digest=entry.digest, length=entry.length)
+                    if current is None or current.content != content:
+                        fresh.append((entry, SET, 0))
+                for output in set(fold.single) - {e.output_id for e in entries}:
+                    return f"output_changed: {output} was published and the result leaves it empty"
+                for output in set(fold.lists) | set(returned):
+                    items = sorted(
+                        returned.get(output, []), key=lambda e: int(e.output_id.rpartition(".")[2])
                     )
-                    continue
-                current = fold.single.get(entry.output_id)
-                content = pb.Ref(digest=entry.digest, length=entry.length)
-                if current is None or current.content != content:
-                    fresh.append((entry, SET, 0))
-            for output in set(fold.single) - {e.output_id for e in entries}:
-                return f"output_changed: {output} was published and the result leaves it empty"
-            for output in set(fold.lists) | set(returned):
-                items = sorted(
-                    returned.get(output, []), key=lambda e: int(e.output_id.rpartition(".")[2])
-                )
-                published = fold.lists.get(output, [])
-                if len(items) < len(published) or any(
-                    item.digest != shown.content.digest
-                    for item, shown in zip(items, published, strict=False)
-                ):
-                    return (
-                        f"output_changed: the returned {output} does not extend the "
-                        f"{len(published)} products already published"
+                    published = fold.lists.get(output, [])
+                    if len(items) < len(published) or any(
+                        item.digest != shown.content.digest
+                        for item, shown in zip(items, published, strict=False)
+                    ):
+                        return (
+                            f"output_changed: the returned {output} does not extend the "
+                            f"{len(published)} products already published"
+                        )
+                    for index in range(len(published), len(items)):
+                        fresh.append((items[index], APPEND, index))
+                for entry, op, index in fresh:
+                    # Publishing collects holds absent from the current fold. Acquire
+                    # each new hold only when its product is about to join that fold.
+                    self._journal(
+                        owner, attempt.request_id, self._returned(owner, attempt, entry, op, index)
                     )
-                for index in range(len(published), len(items)):
-                    fresh.append((items[index], APPEND, index))
-            for entry, op, index in fresh:
-                # Publishing collects holds absent from the current fold. Acquire
-                # each new hold only when its product is about to join that fold.
-                self._journal(
-                    owner, attempt.request_id, self._returned(owner, attempt, entry, op, index)
-                )
+            finally:
+                self._collect(owner, attempt.request_id, self.fold(owner, attempt.request_id))
         return None
 
     def _returned(

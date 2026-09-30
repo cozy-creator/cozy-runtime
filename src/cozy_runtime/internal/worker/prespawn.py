@@ -1,12 +1,8 @@
-"""Start a serving call's executor while its weights download (h3a-087, the startup warm).
+"""Import a serving executor while its weights download, without speculative GPU work.
 
-A download is network-bound; an executor's start is CPU-bound (torch, CUDA and the package:
-~14 s for H3) and so is proving its attention kernels. Neither needs a weight byte, so the
-preparation that begins a download also starts the placement's process on the GPUs its
-root would be granted — ones the root already holds, else free ones — at the lowest CPU
-priority, and proves its kernels while those cards are idle. The grant prefers those
-ordinals (`ordinals`), the replica adopts the started process (`claim`/`settle`) and its
-construction fill begins the moment the weights land.
+Python and Torch imports can overlap store preparation. CUDA contexts, communicators,
+kernel launches and model warmup wait for the adopted process's granted device phase.
+Older executors without import-only capability start through normal demand instead.
 
 Two preparations begin a download. A serving call's own (`request`) knows its root. The
 Host's, for a root it has not submitted yet (`request_landing`, h3a-089), knows none: its
@@ -36,12 +32,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import msgspec
-from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import accel, package_installation, package_interface
 from cozy_runtime.internal.canonical import Json
-from cozy_runtime.internal.execution_evidence import gpu_name, gpu_names
+from cozy_runtime.internal.execution_evidence import gpu_names
 from cozy_runtime.internal.executor_commands import Start, Warm
+from cozy_runtime.internal.seam import EXECUTOR_MEMORY_CAPABILITIES
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.gpu_scheduler import Ordinals, model_degrees, width_for
 from cozy_runtime.internal.worker.lanes import DeviceLane, lane_id_for
@@ -71,8 +67,6 @@ class Slot:
     claimed: threading.Event = field(default_factory=threading.Event)
     #: set when the warm thread has nothing more to send this process
     finished: threading.Event = field(default_factory=threading.Event)
-    #: set by every scheduling pass, claim and drop: the warm thread looks again
-    nudge: threading.Event = field(default_factory=threading.Event)
     executor: Executor | None = None
     #: the dead replica of these cards whose own slot this starts its successor in
     replica: str = ""
@@ -155,7 +149,6 @@ class Prespawns:
             worker.note("warm", f"{root!r} adopts the prespawn on {list(unrooted.ordinals)}")
             if emit is not None:
                 unrooted.attach(emit)
-            unrooted.nudge.set()
             return
         family = accel.host_backend_family()
         readable = [
@@ -230,6 +223,8 @@ class Prespawns:
             package_interface.publish(path, raw)
             slot.supervision.use_environment(str(installed.python), slot.installation)
             executor = slot.executor = slot.supervision.spawn(imposed=worker.imposed(lane))
+            if "import_only" not in executor.hello.get("memory", ()):
+                raise ExecutorGone("executor has no CPU-only import preparation capability")
             # The warm yields every CPU to the download and to running requests; a claim
             # restores the adopted process's priority.
             if not slot.claimed.is_set():
@@ -240,6 +235,8 @@ class Prespawns:
                     sequence_parallel_degree=len(slot.ordinals),
                     application=interface.application,
                     package_interface=str(path),
+                    import_only=True,
+                    memory_capabilities=tuple(sorted(EXECUTOR_MEMORY_CAPABILITIES)),
                 ),
                 timeout=None,
             )
@@ -257,33 +254,13 @@ class Prespawns:
             self._drop(slot)
             return
         worker.note("warm", f"prespawned {slot.installation} on {gpu_names(lane.entries)}: {legs}")
-        # Launch checks wait for idle cards; the compiles they start run beside the download.
-        while self._busy(slot.ordinals):
-            slot.nudge.wait()
-            slot.nudge.clear()
-            if slot.claimed.is_set() or not self._held(slot):
-                return
-        if slot.claimed.is_set() or not self._held(slot):
-            return
-        started, began = time.time(), time.perf_counter()
+        # Architecture-only compilation overlaps download; no context or launch is
+        # speculative. Native recipes that need a device explicitly report deferred.
         try:
-            reply = executor.call(Warm(), timeout=None)
-            ranks = reply.get("ranks") or []
-            detail = "; ".join(
-                f"{gpu_name(lane.entries, int(row.get('rank', -1)))}: "
-                + ", ".join(
-                    f"{k['kernel']} {k.get('line') or k['status']}" for k in row.get("kernels", ())
-                )
-                for row in ranks
-            ) or str(reply.get("skipped") or reply.get("detail") or "")
-            ok = bool(reply.get("ok"))
-            detail = "; ".join(
-                part for part in (_before_boot_compile(executor) + detail, _machine(worker)) if part
-            )
+            reply = executor.call(Warm(compile_only=True), timeout=None)
+            worker.note("warm", f"offline kernel preparation: {reply.get('ranks', [])}")
         except ExecutorGone as exc:
-            detail, ok = f"executor gone: {exc}"[:300], False
-        self._phase("Starting kernel compiles", started, began, ok, slot, detail)
-        worker.note("warm", f"prespawned {slot.installation} kernels: {detail}"[:256])
+            worker.note("warm", f"offline kernel preparation stopped: {exc}"[:300])
 
     def _phase(
         self, name: str, started: float, began: float, ok: bool, slot: Slot, detail: str
@@ -305,14 +282,6 @@ class Prespawns:
             }
         )
 
-    def _held(self, slot: Slot) -> bool:
-        with self.lock:
-            return self.slots.get((slot.installation, slot.ordinals)) is slot
-
-    def _busy(self, ordinals: Ordinals) -> bool:
-        grants = msgspec.convert(self.worker.gpu.view(), _Cards, strict=True).grants
-        return any(set(held) & set(ordinals) for _root, held in grants.values())
-
     def ordinals(self, installation: str) -> Ordinals:
         """Where a started process of this installation waits, so its grant goes there."""
         with self.lock:
@@ -333,7 +302,6 @@ class Prespawns:
             if sink is not None:
                 slot.attach(sink)
             slot.claimed.set()
-            slot.nudge.set()
             if slot.executor is not None:
                 _nice(slot.executor, _WORKER)
         return slot
@@ -396,8 +364,6 @@ class Prespawns:
                 if (slot.root and slot.root not in roots)
                 or any(taken.get(o, set()) - {slot.root} for o in slot.ordinals)
             ]
-            for slot in self.slots.values():
-                slot.nudge.set()
         for slot in leaving:
             self.worker.note("warm", f"prespawn on {list(slot.ordinals)} yields its cards")
             self._drop(slot)
@@ -407,7 +373,6 @@ class Prespawns:
         with self.lock:
             if self.slots.get((slot.installation, slot.ordinals)) is slot:
                 del self.slots[(slot.installation, slot.ordinals)]
-        slot.nudge.set()
         threading.Thread(target=self._retire, args=(slot,), daemon=True).start()
 
     def _retire(self, slot: Slot) -> None:
@@ -435,7 +400,6 @@ class Prespawns:
         with self.lock:
             slots, self.slots = list(self.slots.values()), {}
         for slot in slots:
-            slot.nudge.set()
             self._retire(slot)
 
 
@@ -453,31 +417,6 @@ def _lane(worker: Worker, ordinals: Ordinals) -> DeviceLane:
 
 #: The priority an adopted process returns to: the worker's own.
 _WORKER = os.getpriority(os.PRIO_PROCESS, 0)
-
-
-#: The first Runtime whose executor compiles its kernels on the machine (e345e63c).
-BOOT_COMPILE = Version("0.18.70")
-
-
-def _before_boot_compile(executor: Executor) -> str:
-    """An older executor compiles nothing and reads only the image kernel site: its rows
-    say absent until the machine's build of a kernel lands there, and it takes one at its
-    next construction. The package's lock picks it."""
-    found = str(executor.hello.get("runtime_version", ""))
-    try:
-        if Version(found) >= BOOT_COMPILE:
-            return ""
-    except InvalidVersion:
-        return ""
-    return (
-        f"executor cozy-runtime {found} (before {BOOT_COMPILE}) takes each machine kernel "
-        "from the image kernel site at its next construction after it is ready; "
-    )
-
-
-def _machine(worker: Worker) -> str:
-    machine = worker.machine_kernels
-    return machine.line() if machine is not None else ""
 
 
 def _nice(executor: Executor, value: int) -> None:

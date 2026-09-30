@@ -29,6 +29,7 @@ from cozy_runtime.internal import accel, child_env, executor_commands, package_i
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.executor_commands import Start
+from cozy_runtime.internal.seam import EXECUTOR_MEMORY_CAPABILITIES
 from cozy_runtime.internal.worker import lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -100,6 +101,7 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
                     application=str(body["application"]),
                     package_interface=str(interface),
                     devices=worker.lanes.lanes[0].devices,
+                    memory_capabilities=tuple(sorted(EXECUTOR_MEMORY_CAPABILITIES)),
                 ),
                 timeout=60.0,
             )
@@ -147,18 +149,22 @@ def test_ceilings_are_measured_and_never_double_booked() -> None:
     assert low - (1 << 20) < free_mib * (1 << 20) < high + (1 << 20), (real, after, projected)
     assert real.total_bytes == total_mib * (1 << 20), (real, projected)
 
-    # THE CEILING IS THE DEVICE: the lock is the reservation and idle co-tenants are
-    # evicted for the tenant holding it, so nothing is partitioned in advance.
-    with _workspace() as root:
-        worker = Worker(
-            *claimable(_config(root / "home"), WorkerOptions(root=root / "worker", devices="0")),
-            InMemoryControlHost(),
-        )
-        try:
-            lane = worker.lanes.lanes[0]
-            assert worker._ceiling(lane, "a") == real.total_bytes
-        finally:
-            worker.supervision.close()
+    # THE GRANT IS THE DEVICE LESS OTHER PROGRAMS, or the configured budget: idle co-tenants
+    # are evicted for the tenant that needs room, so nothing is partitioned in advance.
+    for budget in ((), ((0, 1 << 30),)):
+        with _workspace() as root:
+            options = WorkerOptions(root=root / "worker", devices="0", gpu_budget=budget)
+            worker = Worker(*claimable(_config(root / "home"), options), InMemoryControlHost())
+            try:
+                lane = worker.lanes.lanes[0]
+                free_before = accel.device_memory("0", kind).free_bytes
+                granted = worker._grant(lane, "a")
+                free_after = accel.device_memory("0", kind).free_bytes
+                ceiling = dict(budget).get(0, real.total_bytes)
+                low, high = sorted((free_before, free_after))
+                assert min(low, ceiling) <= granted <= min(high, ceiling)
+            finally:
+                worker.supervision.close()
 
 
 def test_a_load_without_an_assigned_ceiling_is_a_worker_defect() -> None:

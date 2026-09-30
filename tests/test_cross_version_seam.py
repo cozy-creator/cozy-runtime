@@ -1,19 +1,4 @@
-"""The worker at HEAD serves the executors of older Runtimes, and a package locked to an older
-Runtime runs the machine's own.
-
-An installed package's executor runs in the package's own environment and speaks the seam to
-whatever worker the pod runs. Its lock freezes its dependencies, not its Runtime: a package
-that declares a lower bound gets the machine's Runtime, and one that pins a Runtime exactly
-(like every environment installed before this rule) keeps that executor. Runtime 0.18.69 broke
-SDXL and Anima conversions because its worker refused a record an older peer wrote. Here the
-worker is this checkout and every executor is a real PyPI release.
-
-Each Runtime is locked the way a package locked it on release day (`--exclude-newer` at its
-upload) and installed by the product installer into `CACHE`, with its lock and the package
-wheel, so a rerun installs nothing and needs no network; delete that directory to rebuild.
-PyPI unreachable on a cold cache is a skip. Each worker session gets its own install root with
-the cached installation linked in, and prepares it through its ordinary reuse path.
-"""
+"""Actual published peers exercise additive Worker/executor memory compatibility."""
 
 from __future__ import annotations
 
@@ -40,11 +25,12 @@ import pytest
 from packaging.version import Version
 
 import signed_claims
+from conftest import image_python
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import child_env, derive_child, package_installation
 from cozy_runtime.internal.config import Credentials, RuntimeConfig, package_install_environment
-from cozy_runtime.internal.worker import activity, prespawn
-from cozy_runtime.internal.worker.control import GrpcControlHost
+from cozy_runtime.internal.worker import activity
+from cozy_runtime.internal.worker.control import GrpcControlHost, InMemoryControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
@@ -53,13 +39,11 @@ from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from local_owner import LocalRecordOwner, LocalRequest
 from test_end_to_end import NO_EXECUTOR, _development, _wheel_rows
 
-#: The executor floor (`child.require_executor_protocol`), the Runtime SDXL 2.3.23 pins, and the
-#: Runtime the owner's H3/Qwen environments pin.
-VERSIONS = ("0.18.51", "0.18.67", "0.18.69")
+#: Real retired releases exercise refusal at the capability boundary, not version gating.
+VERSIONS = ("0.18.51",)
 
-#: (the Runtime a lock holds, the package's own requirement on it). An exact pin keeps that
-#: executor; the owner's H3/Qwen packages declare `>=0.18.67` and so run the machine's own.
-CASES = (*((version, f"=={version}") for version in VERSIONS), ("0.18.67", ">=0.18.67"))
+#: An old dependency lock with a supported lower bound adopts the current machine SDK.
+CASES = (("0.18.67", ">=0.18.67"), ("0.18.86", "==0.18.86"), ("0.18.87", "==0.18.87"))
 
 CACHE = (
     Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
@@ -264,7 +248,8 @@ def _installation(version: str, requirement: str) -> tuple[str, Path, bytes, str
     """The cached package environment locked to cozy-runtime `version`, its wheel and lock,
     and the Runtime the installer chose for it."""
     lock, wheel = _lock(version), _wheel(requirement)
-    identity = b"\0".join((lock, wheel.read_bytes(), str(PYTHON).encode()))
+    runtime = next(image_python().parent.parent.parent.glob("wheels/cozy_runtime-*.whl"))
+    identity = b"\0".join((lock, wheel.read_bytes(), runtime.read_bytes(), str(PYTHON).encode()))
     installation = f"seam-{version}-{hashlib.sha256(identity).hexdigest()[:16]}"
     installed = package_installation.install(
         CACHE / "installs",
@@ -273,7 +258,7 @@ def _installation(version: str, requirement: str) -> tuple[str, Path, bytes, str
         python=PYTHON,
         installation_id=installation,
         requirements=lock,
-        wheels=(wheel,),
+        wheels=(wheel, runtime),
     )
     record = json.loads((installed.generation.parent / "installation.json").read_text())
     return installation, wheel, lock, record["sdk"]["cozy-runtime"]
@@ -577,19 +562,40 @@ def test_an_exact_pin_keeps_its_runtime_and_a_bound_runs_the_machines(harness: H
     assert Version(harness.version) > Version("0.18.67")
 
 
-def test_the_warm_says_an_older_executor_reads_the_image_kernel_site(harness: Harness) -> None:
-    """Every pinned Runtime here predates boot compile: it serves a compiled kernel only from
-    the image kernel site the machine fills (run 1525: H3 on 0.18.67 served SDPA on an image
-    with none). The kernel-compile phase says so from the executor's own hello."""
-    if Version(harness.version) >= Version("0.18.70"):
-        pytest.skip("this executor compiles its kernels at boot")
-    harness.serve("warm-note", "double", {"n": 1})
-    [executor] = [
-        hosted.supervision.current
-        for hosted in harness.worker.hosted.values()
-        if hosted.supervision.current is not None
-    ]
-    assert executor.hello["runtime_version"] == harness.version
-    note = prespawn._before_boot_compile(executor)
-    assert f"executor cozy-runtime {harness.version} (before 0.18.70)" in note, note
-    assert "from the image kernel site at its next construction" in note, note
+@pytest.mark.parametrize("version", VERSIONS)
+def test_old_published_executor_without_memory_fields_remains_compatible(
+    version: str, tmp_path: Path
+) -> None:
+    """An older hello may omit additive memory fields while keeping the command seam valid."""
+    from test_device_lanes import _config
+
+    environment = CACHE / "unsupported-peers" / version
+    python = environment / "bin/python"
+    if not python.exists():
+        environment.parent.mkdir(parents=True, exist_ok=True)
+        _uv("venv", "--python", str(PYTHON), str(environment), cwd=environment.parent)
+        requirements = environment / "requirements.txt"
+        requirements.write_bytes(_lock(version))
+        _uv(
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--require-hashes",
+            "--requirements",
+            str(requirements),
+            cwd=environment,
+        )
+    worker = Worker(
+        _config(tmp_path / "home"),
+        WorkerOptions(
+            root=tmp_path / "worker", devices="", accelerator_backend="none", python=str(python)
+        ),
+        InMemoryControlHost(),
+    )
+    try:
+        executor = worker.supervision.spawn(imposed=worker.imposed(worker.lanes.envelope))
+        assert executor.hello["executor_protocol_revision"] == 1
+        assert "memory" not in executor.hello
+    finally:
+        worker.supervision.close()

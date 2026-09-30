@@ -279,7 +279,23 @@ def _worker_options(
         # attached, nothing in flight, and nothing moving is idle.
         activity_path=layout.worker_activity,
         activity_owner=identity.host_owner,
+        gpu_budget=_budget_by_ordinal(config.gpu_budget, gpus),
     )
+
+
+def _budget_by_ordinal(
+    budget: tuple[tuple[int, int], ...], gpus: list[readiness.RuntimeGPU]
+) -> tuple[tuple[int, int], ...]:
+    """`gpu.budget` keyed by the worker's device ordinals rather than GPU numbers."""
+    by_gpu = dict(budget)
+    rows: list[tuple[int, int]] = []
+    for ordinal, row in enumerate(gpus):
+        size = by_gpu.get(int(row["device_index"]), by_gpu.get(-1))
+        if size is not None:
+            rows.append((ordinal, size))
+    if rows:
+        print(f"[worker] gpu budget by device ordinal: {dict(rows)}", file=sys.stderr, flush=True)
+    return tuple(rows)
 
 
 def _arm_supervisor_lifetime() -> None:
