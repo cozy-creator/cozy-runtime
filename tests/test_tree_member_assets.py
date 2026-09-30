@@ -72,6 +72,7 @@ def prepared(tmp_path: Path, *, root_input: bool = False) -> tuple[Any, ...]:
                 {
                     "kind": "tree",
                     "digest": digest,
+                    "length": native.manifest.length,
                     "local": str(local),
                     "media_type": byte_inputs.TREE_MIME,
                     "content_bytes": native.content_bytes,

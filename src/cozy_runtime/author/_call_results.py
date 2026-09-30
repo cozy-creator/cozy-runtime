@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,6 @@ from cozy_runtime.author._assets import (
     file_state,
 )
 from cozy_runtime.author._capture import ExecutionObservation
-from cozy_runtime.author._executor_requests import ByteGrant
 from cozy_runtime.author._media import admits, normalize
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -34,7 +33,28 @@ class ByteResult(msgspec.Struct, frozen=True):
     kind: str
     digest: str
     size_bytes: int
-    media_type: str = ""
+
+
+class FileResult(ByteResult, frozen=True):
+    media_type: str
+
+
+class _Grant(msgspec.Struct, frozen=True):
+    """Fields consumed when reading a grant from another Runtime's worker."""
+
+    output_id: str
+    kind: str
+    digest: str
+    local: str
+
+
+class _FileGrant(_Grant, frozen=True):
+    length: int
+    media_type: str
+
+
+class _TreeGrant(_Grant, frozen=True):
+    content_bytes: int
 
 
 def result_at(value: object, path: str) -> object:
@@ -49,9 +69,9 @@ def result_at(value: object, path: str) -> object:
 
 
 def decode(
-    value: Any,
+    value: object,
     result_type: object,
-    grants: list[ByteGrant],
+    grants: Sequence[Mapping[str, object]],
     *,
     request_id: str,
     guard: Callable[[], None],
@@ -63,51 +83,49 @@ def decode(
     if len(grants) > 32:
         raise ValueError("native result grant inventory exceeds its bound")
     handles: dict[str, Asset | Tree] = {}
-    for grant in grants:
-        output_id = grant.get("output_id")
-        if not isinstance(output_id, str) or output_id in handles:
+    for raw_grant in grants:
+        grant = msgspec.convert(raw_grant, _Grant, strict=True)
+        output_id = grant.output_id
+        if output_id in handles:
             raise ValueError("native result grant has a repeated or missing output ID")
         capture = output_id == "runtime.capture"
         node = result_at(value, output_id) if not capture else None
         if capture:
             if observation is None or observation.capture is None:
                 raise ValueError("capture grant has no matching execution observation")
-            kind, size, media_type = "tree", grant["content_bytes"], ""
-            digest = grant["digest"]
+            expected_size = msgspec.convert(raw_grant, _TreeGrant, strict=True).content_bytes
+            kind, size, media_type = "tree", expected_size, ""
+            digest = grant.digest
         else:
             if not isinstance(node, dict):
                 raise ValueError("native result field is not an asset record")
             declared = msgspec.convert(node, ByteResult, strict=True)
             kind = declared.kind
-            required = {"asset_ref", "kind", "digest", "size_bytes"}
-            if kind in _ASSETS:
-                required.add("media_type")
-            if not required <= set(node) or (kind not in _ASSETS and kind != "tree"):
+            if kind not in _ASSETS and kind != "tree":
                 raise ValueError("native result field has an invalid asset shape")
             digest, size = declared.digest, declared.size_bytes
-            media_type = declared.media_type
+            if kind == "tree":
+                expected_size = msgspec.convert(raw_grant, _TreeGrant, strict=True).content_bytes
+                media_type = ""
+            else:
+                file_grant = msgspec.convert(raw_grant, _FileGrant, strict=True)
+                expected_size = file_grant.length
+                media_type = msgspec.convert(node, FileResult, strict=True).media_type
+                if media_type != file_grant.media_type or not admits(kind, normalize(media_type)):
+                    raise ValueError("native result differs from its verified host grant")
             if declared.asset_ref != digest:
                 raise ValueError("native result reference differs from its byte identity")
         if (
-            kind != grant.get("kind")
-            or not isinstance(digest, str)
+            kind != grant.kind
             or _DIGEST.fullmatch(digest) is None
-            or digest != grant.get("digest")
-            or type(size) is not int
+            or digest != grant.digest
             or size < 0
-            or size != grant.get("content_bytes" if kind == "tree" else "length")
-            or (
-                kind in _ASSETS
-                and (
-                    media_type != grant.get("media_type") or not admits(kind, normalize(media_type))
-                )
-            )
-            or not isinstance(grant.get("local"), str)
-            or not Path(grant["local"]).is_absolute()
+            or size != expected_size
+            or not Path(grant.local).is_absolute()
         ):
             raise ValueError("native result differs from its verified host grant")
         if kind == "tree":
-            tree = Tree(digest, digest=digest, root=Path(grant["local"]), attempt=request_id)
+            tree = Tree(digest, digest=digest, root=Path(grant.local), attempt=request_id)
             tree.size_bytes = size
             tree._read_guard = guard
             tree._member_token = grant_token
@@ -118,7 +136,7 @@ def decode(
                 digest=digest,
                 media_type=media_type,
                 size_bytes=size,
-                local=Path(grant["local"]),
+                local=Path(grant.local),
                 attempt=request_id,
             )
             asset._read_guard = guard
@@ -138,7 +156,7 @@ def decode(
     ):
         raise ValueError("capture observation has no verified native result grant")
 
-    def replace(node: Any, path: str) -> Any:
+    def replace(node: object, path: str) -> object:
         if path in handles:
             return handles[path]
         if isinstance(node, dict):
@@ -152,7 +170,7 @@ def decode(
             ]
         return node
 
-    def granted(target: type, item: Any) -> Any:
+    def granted(target: type[object], item: object) -> Asset | Tree:
         if (
             isinstance(target, type)
             and issubclass(target, (Asset, Tree))

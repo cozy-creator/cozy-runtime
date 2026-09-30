@@ -8,7 +8,7 @@ from pathlib import Path
 import msgspec
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author._call_results import ByteResult, result_at
+from cozy_runtime.author._call_results import ByteResult, FileResult, result_at
 from cozy_runtime.author._executor_requests import ByteGrant
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, admits, normalize, reconcile, sniff
 from cozy_runtime.internal.worker import byte_inputs
@@ -64,13 +64,7 @@ def materialize(
                 raise WorkspaceRefusal("native child result changed its byte identity") from exc
             kind = declared.kind
             digest, length = declared.digest, declared.size_bytes
-            if (
-                type(length) is not int
-                or length < 0
-                or not isinstance(digest, str)
-                or declared.asset_ref != digest
-                or length != grant.source.content_bytes
-            ):
+            if length < 0 or declared.asset_ref != digest or length != grant.source.content_bytes:
                 raise WorkspaceRefusal("native child result changed its byte identity")
             if kind == "tree":
                 if digest != documents.spell(grant.source.manifest.digest):
@@ -78,7 +72,10 @@ def materialize(
                 length = grant.source.manifest.length
                 media_type = byte_inputs.TREE_MIME
             else:
-                media_type = declared.media_type
+                try:
+                    media_type = msgspec.convert(node, FileResult, strict=True).media_type
+                except msgspec.ValidationError as exc:
+                    raise WorkspaceRefusal("native child file omitted its media type") from exc
                 if not admits(kind, normalize(media_type)):
                     raise WorkspaceRefusal("native child file omitted its media type")
         destination = spool / "child-results" / str(result.call_index) / str(index)
