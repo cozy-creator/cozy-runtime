@@ -62,23 +62,26 @@ def test_later_invalid_adapter_cannot_publish_or_fall_back_to_the_base(tmp_path:
         )
         for name, artifact in (("style", first), ("invalid", invalid))
     ]
-    before = store.repo_get("local", "base")
-    with pytest.raises(WorkspaceRefusal, match="adapter_shape"):
-        machine_adapter_views.compose(worker, selected, stack, check=lambda: None)
-    assert store.repo_get("local", "base") == before
-    assert header(store, base) == original
-    assert worker.gpu.view() == {"leases": {}, "grants": {}, "waiting": {}}
-    assert not worker.engine.live
-    assert worker.supervision.current is None
-    # Repeating the same invalid selection still refuses; no partly applied cached view
-    # becomes a successful answer. Selecting only the valid adapter subsequently succeeds.
-    with pytest.raises(WorkspaceRefusal, match="adapter_shape"):
-        machine_adapter_views.compose(worker, selected, stack, check=lambda: None)
-    result = machine_adapter_views.compose(worker, selected, stack[:1], check=lambda: None)
-    assert result["manifest"] == selected["manifest"]
-    composed = result["composed"]
-    assert isinstance(composed, dict)
-    assert composed["manifest"] != base.manifest.digest
-    assert len(result["adapters"]) == 1
-    assert store.repo_get("local", "base") == before
-    assert header(store, base) == original
+    try:
+        before = store.repo_get("local", "base")
+        with pytest.raises(WorkspaceRefusal, match="adapter_shape"):
+            machine_adapter_views.compose(worker, selected, stack, check=lambda: None)
+        assert store.repo_get("local", "base") == before
+        assert header(store, base) == original
+        assert worker.gpu.view() == {"leases": {}, "grants": {}, "waiting": {}}
+        assert not worker.engine.live
+        assert worker.supervision.current is None
+        # Repeating the same invalid selection still refuses; no partly applied cached view
+        # becomes a successful answer. Selecting only the valid adapter subsequently succeeds.
+        with pytest.raises(WorkspaceRefusal, match="adapter_shape"):
+            machine_adapter_views.compose(worker, selected, stack, check=lambda: None)
+        result = machine_adapter_views.compose(worker, selected, stack[:1], check=lambda: None)
+        assert result["manifest"] == selected["manifest"]
+        composed = result["composed"]
+        assert isinstance(composed, dict)
+        assert composed["manifest"] != base.manifest.digest
+        assert len(result["adapters"]) == 1
+        assert store.repo_get("local", "base") == before
+        assert header(store, base) == original
+    finally:
+        worker.shutdown()
