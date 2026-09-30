@@ -17,7 +17,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.author._executor_requests import respond  # noqa: E402
+from cozy_runtime.author._executor_requests import (  # noqa: E402
+    Handler,
+    HostTier,
+    Reply,
+    Request,
+    respond,
+)
 from cozy_runtime.internal import plane  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.seam import Channel, SeamError  # noqa: E402
@@ -29,6 +35,14 @@ from test_weight_plane import assert_pinned, load, write_checkpoint  # noqa: E40
 pytestmark = pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
 
 
+def answer_tier(tiers: HostTiers) -> Handler:
+    def answer(request: Request) -> Reply:
+        assert isinstance(request, HostTier)
+        return tiers.answer(request)
+
+    return answer
+
+
 def serve(channel: Channel, tiers: HostTiers, stop: threading.Event) -> None:
     """The Worker's half of `child.Executor.call`'s request branch."""
     while not stop.is_set():
@@ -36,7 +50,7 @@ def serve(channel: Channel, tiers: HostTiers, stop: threading.Event) -> None:
         if frame is None:
             return
         received = channel.recv_memfd() if frame.get("descriptor") is True else None
-        answer, handoff = respond(frame, tiers.answer, received)
+        answer, handoff = respond(frame, answer_tier(tiers), received)
         channel.send(answer)
         if isinstance(handoff, int):
             channel.send_memfd(handoff)

@@ -97,8 +97,8 @@ def partition(root: Any, limit: int | None = None) -> BlockLayout | None:
             sizes[unit] += int(tensor.numel() * tensor.element_size())
             if local not in module._non_persistent_buffers_set:
                 keys[unit].append(f"{path}.{local}" if path else local)
-    declared = {key for group in keys.values() for key in group}
-    if declared != set(root.state_dict()):
+    mapped = {key for group in keys.values() for key in group}
+    if mapped != set(root.state_dict()):
         raise ValueError("custom state-dict keys do not map to registered paging destinations")
     units = {
         path: PageUnit(path, tuple(owners[path]), sizes[path], tuple(keys[path])) for path in owners

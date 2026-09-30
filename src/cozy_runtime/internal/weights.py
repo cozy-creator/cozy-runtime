@@ -751,7 +751,7 @@ class PlaneBackend:
                 f"{key!r} is not a destination this checkpoint supplies",
                 [key],
             )
-        shape = tuple(destination.shape)  # type: ignore[attr-defined]
+        shape = tuple(destination.shape)
         if shape != tuple(row.shape) or (spec.nbytes and spec.nbytes != row.nbytes):
             raise _refuse(
                 "length_mismatch",
@@ -759,11 +759,11 @@ class PlaneBackend:
                 f"({row.nbytes} B)",
                 [key],
             )
-        if dtype_name(destination.dtype) != dtype_name(row.dtype):  # type: ignore[attr-defined]
+        if dtype_name(destination.dtype) != dtype_name(row.dtype):
             raise _refuse(
                 "dtype_mismatch",
                 f"{key}: the checkpoint's logical dtype is {row.dtype} and the destination is "
-                f"{dtype_name(destination.dtype)}",  # type: ignore[attr-defined]
+                f"{dtype_name(destination.dtype)}",
                 [key],
             )
         self.enqueued[key] = destination

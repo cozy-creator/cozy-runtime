@@ -24,7 +24,7 @@ from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
 from cozy_runtime.author._loader import census  # noqa: E402
-from cozy_runtime.internal import plane  # noqa: E402
+from cozy_runtime.internal import plane, weight_policy  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.weights import (  # noqa: E402
@@ -153,7 +153,7 @@ def same(a: list[Any], b: list[Any]) -> bool:
 
 def tight(model: Any) -> int:
     """The floor at a window of two, plus one resident block: the rest must stream."""
-    layout = model.residency.components["stack"].layout
+    layout: weight_policy.Layout = model.residency.components["stack"].layout
     return layout.common + 3 * layout.largest
 
 

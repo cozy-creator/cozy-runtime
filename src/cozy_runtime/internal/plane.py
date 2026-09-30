@@ -7,13 +7,15 @@ never reorders a schedule. It maps, copies, streams and counts; `weights.py` and
 
 from __future__ import annotations
 
+from types import ModuleType
 from typing import Any
 
 import msgspec
 
+_plane: ModuleType | None
 try:
     from tensorfs import plane as _plane
-except ImportError:  # an older TensorFS: the executor serves without `weight_plane/1`
+except ImportError:  # an older TensorFS: the executor offers no `weight_plane/1`
     _plane = None
 
 #: The executor capability a Worker negotiates on (`hello.memory`).
