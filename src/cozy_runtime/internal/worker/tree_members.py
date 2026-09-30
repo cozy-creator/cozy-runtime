@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from cozy_runtime import canonical_json
 from cozy_runtime.author._assets import file_state
 from cozy_runtime.author._errors import RuntimeFailure
-from cozy_runtime.author._executor_requests import Answer, Member, TreeMember, refuse
+from cozy_runtime.author._executor_requests import Answer, ByteMetadata, Member, TreeMember, refuse
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, admits, sniff
 from cozy_runtime.internal.worker import byte_inputs, machine_models, workspace_byte_outputs
 from cozy_runtime.internal.worker.calls import Calls, _Received
@@ -155,7 +155,7 @@ def project(calls: Calls, attempt: AttemptRecord, request: TreeMember) -> Answer
                     retained = machine_models.retain_bytes(
                         workspace, calls.owner(), attempt.request_id, slot, native
                     )
-                    metadata = {
+                    metadata: ByteMetadata = {
                         "kind": kind,
                         "digest": "sha256:" + blob.sha256,
                         "length": blob.length,

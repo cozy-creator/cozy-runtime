@@ -38,7 +38,7 @@ import traceback
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NotRequired, TypedDict, Unpack
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author._executor_requests import Handler
@@ -396,6 +396,22 @@ class OwnerRecord:
     """Frozen pre-kill census, durable so reclaim proof survives worker death."""
 
 
+class _LaunchRequest(TypedDict):
+    """Arguments crossing onto the long-lived executor launch thread."""
+
+    python: str
+    module_argv: list[str]
+    base_env: tuple[tuple[str, str], ...]
+    imposed: Mapping[str, str]
+    cwd: str
+    scope: proctree.ExecutorScope
+    uid: NotRequired[int]
+    gid: NotRequired[int]
+
+
+type _LaunchResult = spawn.Spawned | BaseException
+
+
 #: The control document an executor derives into its handoff: one installed package's
 #: PackageInterface, written by `describe_installed` and unlinked by the reader at once.
 INTERFACE_DOCUMENT = "package-interface.json"
@@ -497,7 +513,9 @@ class ExecutorSupervision:
         session can invalidate only that epoch and serialize any rebuild with device
         work; a stale watcher has no authority over a successor.
         """
-        self._launches: queue.Queue[tuple[dict[str, Any], queue.Queue[Any]] | None] = queue.Queue()
+        self._launches: queue.Queue[tuple[_LaunchRequest, queue.Queue[_LaunchResult]] | None] = (
+            queue.Queue()
+        )
         self._launcher: threading.Thread | None = None
         self._launcher_lock = threading.Lock()
 
@@ -777,7 +795,7 @@ class ExecutorSupervision:
 
     # ------------------------------------------------------------------ spawn
 
-    def _launch(self, **request: Any) -> spawn.Spawned:
+    def _launch(self, **request: Unpack[_LaunchRequest]) -> spawn.Spawned:
         """`posix_spawn` from ONE thread that outlives every control stream.
 
         THE TRAMPOLINE'S CONTAINMENT SEAL IS THREAD-SCOPED. Linux delivers
@@ -801,9 +819,9 @@ class ExecutorSupervision:
                                 return
                             call, answer = request
                             try:
-                                answer.put(("ok", spawn.spawn_executor(**call)))
+                                answer.put(spawn.spawn_executor(**call))
                             except BaseException as exc:  # returned to the asking thread
-                                answer.put(("raise", exc))
+                                answer.put(exc)
                     except BaseException as exc:
                         self._lane_died("executor-launcher", exc)
 
@@ -811,12 +829,12 @@ class ExecutorSupervision:
                     target=serve_launches, daemon=True, name="executor-launcher"
                 )
                 self._launcher.start()
-        answer: queue.Queue[Any] = queue.Queue()
+        answer: queue.Queue[_LaunchResult] = queue.Queue()
         self._launches.put((request, answer))
-        kind, value = answer.get()
-        if kind == "raise":
+        value = answer.get()
+        if isinstance(value, BaseException):
             raise value
-        return value  # type: ignore[no-any-return]
+        return value
 
     def spawn(self, *, imposed: dict[str, str]) -> Executor:
         """EXEC-FIRST spawn of a fresh epoch. Bumps BOTH ordinals: a fresh executor

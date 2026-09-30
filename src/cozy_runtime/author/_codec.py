@@ -39,6 +39,7 @@ from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -1052,9 +1053,8 @@ class FragmentedJoin:
     muxer that is then closed, which flushes it, and its `moof`/`mdat` boxes are restamped onto
     the one timeline (`_restamp`). The AAC encoder persists across appends, so init plus the
     parts decode to exactly the frames and samples the one-muxer join writes, after every append.
-    Closing the join replaces its final revision with a packet-copy, indexed MP4. Previously
-    published parts remain immutable and playable; completed downloads have a full duration
-    and keyframe index instead of the live stream's empty movie header.
+    Fragments are the internal accumulator. Every exposed revision is a packet-copy,
+    indexed MP4, so ordinary players can read its duration and seek while the join grows.
     """
 
     def __init__(
@@ -1068,6 +1068,7 @@ class FragmentedJoin:
         self.audio_channels, self.audio_sample_rate = audio_channels, audio_sample_rate
         #: (file, media microseconds) per part, init first.
         self.parts: list[tuple[Path, int]] = []
+        self._revision: tuple[int, Path] | None = None
         self.frames = 0
         self.samples = 0
         self.flushed = False
@@ -1129,17 +1130,32 @@ class FragmentedJoin:
             )
         return self._complete()
 
-    def _complete(self) -> list[Path]:
+    def indexed_revision(self) -> Path:
+        """An immutable, seekable snapshot without closing the soundtrack encoder."""
+        if not self.parts:
+            raise OutputError("a joined video needs at least one video", code="media_header")
+        if self._finalized:
+            return self.parts[0][0]
+        if self._revision is None or self._revision[0] != len(self.parts):
+            path = self.directory / f"join-revision-{len(self.parts):04d}.mp4"
+            self._write_indexed(path)
+            self._revision = len(self.parts), path
+        return self._revision[1]
+
+    def _write_indexed(self, destination: Path) -> None:
         source = self.directory / ".join-complete.mp4"
-        final = self.directory / "join-final.mp4"
         try:
             with source.open("xb") as writer:
                 for part, _ in self.parts:
                     with part.open("rb") as reader:
                         shutil.copyfileobj(reader, writer, 1 << 20)
-            finalize_mp4(source, final, max_bytes=self.max_bytes)
+            finalize_mp4(source, destination, max_bytes=self.max_bytes)
         finally:
             source.unlink(missing_ok=True)
+
+    def _complete(self) -> list[Path]:
+        final = self.directory / "join-final.mp4"
+        self._write_indexed(final)
         duration = sum(micros for _, micros in self.parts)
         self.parts = [(final, duration)]
         self._bytes = final.stat().st_size
@@ -1279,7 +1295,7 @@ def probe_mp4(path: Path) -> EncodedVideoFacts:
                 start = int(packet.pts)
                 audio_ticks += max(0, start + int(packet.duration or 0)) - max(0, start)
         times.sort()
-        steps = {later - earlier for earlier, later in zip(times, times[1:], strict=False)}
+        steps = {later - earlier for earlier, later in pairwise(times)}
         if len(steps) > 1 or min(steps, default=1) <= 0:
             raise OutputError(
                 f"encoded video frame clock is discontinuous: steps={sorted(steps)[:4]}",

@@ -17,6 +17,8 @@ from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_BYTES
 from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.author._executor_requests import (
     Answer,
+    ByteGrant,
+    ByteMetadata,
     CallProgress,
     CallRequest,
     CallState,
@@ -61,7 +63,7 @@ class CapabilityUnavailable(ValueError):
 class _Pending:
     request: pb.ChildCallRequest
     result: pb.ChildCallResult
-    byte_grants: list[dict[str, Any]] | None = None
+    byte_grants: list[ByteGrant] | None = None
     spool: Path | None = None
     progress_label: str = ""
 
@@ -79,7 +81,7 @@ def _framed(answer: CallState) -> int:
 
 @dataclass(frozen=True, slots=True)
 class _Received:
-    metadata: dict[str, Any]
+    metadata: ByteMetadata
     source: pb.NativeByteRetentionRequest
 
 
@@ -346,7 +348,7 @@ class Calls:
         request.intent_digest = hashlib.sha256(canonical_intent(request)).digest()
         return request
 
-    def _materialize(self, attempt: AttemptRecord, pending: _Pending) -> list[dict[str, Any]]:
+    def _materialize(self, attempt: AttemptRecord, pending: _Pending) -> list[ByteGrant]:
         result = pending.result
         if not result.byte_result_grants:
             return []
@@ -373,7 +375,7 @@ class Calls:
                 received.setdefault(
                     identity,
                     _Received(
-                        dict(metadata),
+                        metadata.copy(),
                         pb.NativeByteRetentionRequest(
                             source=grant.source, retention_id=grant.retention_id
                         ),
@@ -403,12 +405,12 @@ class Calls:
 
     def received_inputs(
         self, attempt: AttemptRecord
-    ) -> list[tuple[dict[str, Any], pb.NativeByteRetentionRequest]]:
+    ) -> list[tuple[ByteMetadata, pb.NativeByteRetentionRequest]]:
         """Snapshot only native byte capabilities actually delivered to this attempt."""
         with self.lock:
             return [
                 (
-                    dict(value.metadata),
+                    value.metadata.copy(),
                     pb.NativeByteRetentionRequest.FromString(
                         value.source.SerializeToString(deterministic=True)
                     ),

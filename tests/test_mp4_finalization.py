@@ -1,14 +1,18 @@
-"""Completed downloads expose duration and seek to real reference frames."""
+"""Every published revision exposes duration and seeks to real reference frames."""
 
 from __future__ import annotations
 
+import re
+import shutil
+import struct
+import subprocess
 from collections.abc import Iterator
 from fractions import Fraction
 from functools import partial
 from pathlib import Path
 
-import pytest
 import numpy as np
+import pytest
 
 from cozy_runtime.author import DecodedAudioChunk, OutputError, VideoAsset, _codec, fakes
 from cozy_runtime.author._decode import DecodedMediaEvent
@@ -42,18 +46,52 @@ def _seek_frames(path: Path) -> None:
 
 
 def _indexed(path: Path, frames: int) -> None:
-    kinds = [kind for kind, *_ in _codec._boxes(path.read_bytes())]
+    data = path.read_bytes()
+    kinds = [kind for kind, *_ in _codec._boxes(data)]
     assert "moov" in kinds and "moof" not in kinds
     with av.open(str(path)) as container:
         video = container.streams.video[0]
         assert video.frames == frames
         assert video.duration * video.time_base == Fraction(frames, 24)
     _seek_frames(path)
+    if tool := shutil.which("gst-discoverer-1.0"):
+        probe = subprocess.run([tool, str(path)], text=True, capture_output=True, check=True)
+        duration = re.search(r"Duration: (\d+):(\d+):(\d+)\.(\d+)", probe.stdout)
+        assert duration is not None, probe.stdout
+        hours, minutes, seconds, nanos = duration.groups()
+        measured = int(hours) * 3600 + int(minutes) * 60 + int(seconds) + Fraction("0." + nanos)
+        _, start, head, size = next(box for box in _codec._boxes(data) if box[0] == "moov")
+        _, at, header, _ = next(
+            box for box in _codec._boxes(data, start + head, start + size) if box[0] == "mvhd"
+        )
+        offset = at + header
+        timescale = struct.unpack_from(">I", data, offset + (20 if data[offset] else 12))[0]
+        assert abs(measured - Fraction(frames, 24)) <= Fraction(1, timescale)
+
+
+def _timeline(path: Path) -> list[tuple[str, bytes, Fraction, Fraction]]:
+    with av.open(str(path)) as container:
+        return sorted(
+            [
+                (p.stream.type, bytes(p), p.pts * p.time_base, p.dts * p.time_base)
+                for p in container.demux()
+                if p.size
+            ],
+            key=lambda row: (row[0], row[3]),
+        )
+
+
+def _audio(path: Path) -> list[tuple[int, Fraction, int, bytes]]:
+    with av.open(str(path)) as container:
+        return [
+            (f.pts, f.time_base, f.samples, f.to_ndarray().tobytes())
+            for f in container.decode(audio=0)
+        ]
 
 
 @pytest.mark.parametrize("last", [False, True])
 @pytest.mark.parametrize("with_audio", [False, True])
-def test_progressive_join_finishes_indexed_without_changing_live_parts(
+def test_every_join_revision_is_indexed_without_changing_packets_or_previous_revisions(
     tmp_path: Path, last: bool, with_audio: bool
 ) -> None:
     sources = [_segment(tmp_path, name, 48) for name in ("a", "bb", "ccc")]
@@ -88,12 +126,20 @@ def test_progressive_join_finishes_indexed_without_changing_live_parts(
         )
         revision = join.append(video, partial(soundtrack, video), last=last and i == 2)
         parts = [parent.spool / part.local for part in parent.parts[revision.ref]]
-        if i < 2:
-            revisions.extend((path, path.read_bytes()) for path in parts)
-            preview = tmp_path / f"preview-{i}.mp4"
-            preview.write_bytes(b"".join(path.read_bytes() for path in parts))
-            with av.open(str(preview)) as container:
-                assert len(list(container.decode(video=0))) == (i + 1) * 48
+        assert len(parts) == 1
+        preview = parts[0]
+        _indexed(preview, (i + 1) * 48)
+        revisions.append((preview, preview.read_bytes()))
+        internal = tmp_path / f"internal-{i}.mp4"
+        internal.write_bytes(b"".join(path.read_bytes() for path, _ in join._join.parts))
+        assert _timeline(preview) == _timeline(internal)
+        if with_audio:
+            decoded = _audio(preview)
+            assert decoded == _audio(internal)  # AAC priming and sample clocks stay intact.
+            assert decoded[0][0] == 0
+            count = sum(samples for _, _, samples, _ in decoded)
+            if not (last and i == 2):
+                assert count <= written  # The unfinished AAC encoder retains its tail.
     saved = join.finish()
     final = saved.video._local
     assert final is not None
@@ -108,6 +154,19 @@ def test_progressive_join_finishes_indexed_without_changing_live_parts(
         assert b"".join(path.read_bytes() for path in parts) == final.read_bytes()
     if with_audio:
         assert saved.audio is not None and saved.audio.decoded_samples == written
+        # Raw AAC decoders may expose a padded final frame. The MP4 duration and
+        # the SDK's media reader must trim that padding to the authored samples.
+        extra = sum(samples for _, _, samples, _ in _audio(final)) - written
+        assert 0 <= extra < saved.audio.codec_frame_samples
+        hydrated = fakes.fake_input(
+            saved.video, attempt="parent", input_id="finished", max_decoded_bytes=8 << 20
+        )
+        with decoder.stream_audio(hydrated) as stream:
+            actual_samples = sum(e.sample_count for e in stream if isinstance(e, DecodedAudioChunk))
+            assert actual_samples == written
+    again = join.finish()
+    assert again.video._local is not None and again.video._local.read_bytes() == final.read_bytes()
+    assert again.submitted_audio_samples == saved.submitted_audio_samples
     assert not list((parent.spool / parts[0].parent.name).glob(".join-*"))
 
 

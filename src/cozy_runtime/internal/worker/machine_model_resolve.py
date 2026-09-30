@@ -13,9 +13,10 @@ import ssl
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypedDict
 from urllib.parse import quote, urlencode, urlsplit
 
+import msgspec
 from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.author import ConformanceError
@@ -34,12 +35,109 @@ if TYPE_CHECKING:
 MAX_METADATA = 1 << 20
 _REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
-type Fits = Callable[[Mapping[str, Any]], bool]
+type Fits = Callable[[Mapping[str, object]], bool]
 type Note = Callable[[str, int, int], None]
 #: A repository named without a lane serves full precision first when the slot ranks none.
 _FULL_PRECISION = ("bf16", "fp16", "fp32")
-#: One catalog answer as read: a binding row, or a lane's checkpoint.
-type Row = dict[str, Any]
+
+
+class Manifest(TypedDict):
+    digest: str
+    length: int
+
+
+class Checkpoint(TypedDict):
+    repository: str
+    manifest: Manifest
+    release: str
+    lane: str
+
+
+class Selection(Checkpoint):
+    parameter: str
+    public_origin: str
+    gpu: str
+    gpus: int
+
+
+class _Binding(msgspec.Struct, frozen=True):
+    slot: str
+    model: str = ""
+    release: str = ""
+    ladder: tuple[object, ...] | None = None
+
+
+class _Bindings(msgspec.Struct, frozen=True):
+    bindings: tuple[object, ...] = ()
+
+
+class _Rung(msgspec.Struct, frozen=True):
+    lane: str
+    gpu: str | msgspec.UnsetType = msgspec.UNSET
+    gpus: int = 0
+
+
+class _Lane(msgspec.Struct, frozen=True):
+    lane: str = ""
+    bytes: object = 0  # relevant only when no ranked or full-precision lane exists
+
+    def size(self) -> int:
+        value = self.bytes or 0
+        if isinstance(value, (int, float, str)):
+            try:
+                return int(value)
+            except (ValueError, OverflowError):
+                pass
+        raise WorkspaceRefusal("model catalog answered invalid lane size")
+
+
+class _Release(msgspec.Struct, frozen=True):
+    release: str = ""
+    yanked: object = False
+    lanes: object = None  # parsed only for the selected release
+
+
+class _Model(msgspec.Struct, frozen=True):
+    releases: tuple[object, ...] = ()
+
+
+class _Resolved(msgspec.Struct, frozen=True):
+    model: str = ""
+    manifest_id: str = ""
+    # Older catalogs omit the length; any unusable value triggers digest-verified measurement.
+    manifest_length: object = None
+    release: str | None = None
+    lane: str | None = None
+
+
+class _Parallel(msgspec.Struct, frozen=True):
+    degrees: tuple[int, ...] = ()
+
+
+class _Declaration(msgspec.Struct, frozen=True):
+    path: str
+    default_ladder: object = None
+    sequence_parallel: _Parallel = _Parallel()
+
+
+class _Pin(msgspec.Struct, frozen=True):
+    digest: str = ""
+    length: int = 0
+
+
+class _Choice(msgspec.Struct, frozen=True):
+    repository: str = ""
+    release: str = ""
+    lane: str = ""
+    manifest: _Pin | None = None
+
+
+def _read[T](value: object, into: type[T], what: str) -> T:
+    """Read only consumed fields; newer catalog members remain advisory."""
+    try:
+        return msgspec.convert(value, into)
+    except (msgspec.ValidationError, TypeError) as exc:
+        raise WorkspaceRefusal(f"model catalog answered invalid {what}") from exc
 
 
 @dataclass
@@ -47,8 +145,8 @@ class Resolved:
     """What one package's slots read at the Hub: the owner's bindings, and each lane's or
     digest's checkpoint. Every release and installation of the package shares it."""
 
-    bindings: dict[str, Row] = field(default_factory=dict)
-    checkpoints: dict[tuple[str, str, str], Row] = field(default_factory=dict)
+    bindings: dict[str, dict[str, object]] = field(default_factory=dict)
+    checkpoints: dict[tuple[str, str, str], Checkpoint] = field(default_factory=dict)
 
 
 class Resolutions:
@@ -106,7 +204,7 @@ class Catalog:
             raise WorkspaceRefusal(f"catalog answered {status} {_code(raw)} for {path[:200]}")
         return raw
 
-    def get(self, path: str, limit: int = MAX_METADATA) -> Any:
+    def get(self, path: str, limit: int = MAX_METADATA) -> object:
         raw = self.text(path, limit)
         if raw is None:
             return None
@@ -115,36 +213,48 @@ class Catalog:
         except ValueError as exc:
             raise WorkspaceRefusal("catalog answered invalid JSON") from exc
 
-    def binding(self, package: str, slot: str) -> dict[str, Any] | None:
+    def binding(self, package: str, slot: str) -> _Binding | None:
         """The owner's current binding of one slot, or None."""
         if package not in self.bindings:
             org, _, name = package.partition("/")
             value = self.get(f"/v1/packages/{quote(org)}/{quote(name)}/bindings") or {}
-            rows = value.get("bindings", []) if isinstance(value, dict) else None
-            if not isinstance(rows, list):
-                raise WorkspaceRefusal("model catalog answered invalid bindings")
-            self.bindings[package] = {
-                row["slot"]: row for row in rows if isinstance(row, dict) and "slot" in row
-            }
-        return self.bindings[package].get(slot)
+            rows = _read(value, _Bindings, "bindings").bindings
+            bindings: dict[str, object] = {}
+            for row in rows:
+                if isinstance(row, dict):
+                    slot_name: object = row.get("slot")
+                    if isinstance(slot_name, str):
+                        bindings[slot_name] = row
+            self.bindings[package] = bindings
+        selected = self.bindings[package].get(slot)
+        if selected is None or isinstance(selected, _Binding):
+            return selected
+        binding = _read(selected, _Binding, "binding")
+        self.bindings[package][slot] = binding
+        return binding
 
-    def lanes(self, model: str, release: str) -> tuple[str, dict[str, Row]]:
+    def lanes(self, model: str, release: str) -> tuple[str, dict[str, _Lane]]:
         """A release's lanes by name: the named release, else the newest one not yanked."""
         org, _, name = model.partition("/")
         card = self.get(f"/v1/models/{quote(org)}/{quote(name)}") or {}
-        rows = [row for row in card.get("releases", []) if isinstance(row, dict)]
+        rows = [
+            _read(row, _Release, "release")
+            for row in _read(card, _Model, "model").releases
+            if isinstance(row, dict)
+        ]
         if release:
-            rows = [row for row in rows if str(row.get("release", "")).lower() == release.lower()]
+            rows = [row for row in rows if row.release.lower() == release.lower()]
         else:
-            rows = sorted(
-                (row for row in rows if not row.get("yanked")), key=_version, reverse=True
-            )
+            rows = sorted((row for row in rows if not row.yanked), key=_version, reverse=True)
         if not rows:
             raise WorkspaceRefusal(f"model catalog has no release {release or '(any)'} of {model}")
-        lanes = {str(row["lane"]): row for row in rows[0].get("lanes") or [] if row.get("lane")}
-        return str(rows[0].get("release", release)), lanes
+        lane_rows = rows[0].lanes or ()
+        if not isinstance(lane_rows, (list, tuple)):
+            raise WorkspaceRefusal("model catalog answered invalid lanes")
+        lanes = [_read(row, _Lane, "lane") for row in lane_rows]
+        return rows[0].release or release, {row.lane: row for row in lanes if row.lane}
 
-    def resolve(self, model: str, release: str, lane: str) -> dict[str, Any]:
+    def resolve(self, model: str, release: str, lane: str) -> Checkpoint:
         """One lane's exact checkpoint: its manifest digest and length."""
         held = self.resolved.checkpoints.get((model, release, lane))
         if held is None:
@@ -153,26 +263,29 @@ class Catalog:
             )
         return held
 
-    def _resolve(self, model: str, release: str, lane: str) -> Row:
+    def _resolve(self, model: str, release: str, lane: str) -> Checkpoint:
         spec = model + ("@" + release if release else "")
         query = {"ref": spec, **({"lane": lane} if lane else {})}
-        value = self.get("/v1/models/resolve?" + urlencode(query))
-        # Names are case-insensitive: "Fidika/Anima" is the Hub's "fidika/anima".
-        named = str(value.get("model", "")) if isinstance(value, dict) else ""
-        if not isinstance(value, dict) or named.casefold() != model.casefold():
+        raw = self.get("/v1/models/resolve?" + urlencode(query))
+        if not isinstance(raw, dict):
             raise WorkspaceRefusal(f"model catalog cannot resolve {spec}/{lane}")
-        digest, length = value.get("manifest_id"), value.get("manifest_length")
+        value = _read(raw, _Resolved, "resolution")
+        # Names are case-insensitive: "Fidika/Anima" is the Hub's "fidika/anima".
+        named = value.model
+        if named.casefold() != model.casefold():
+            raise WorkspaceRefusal(f"model catalog cannot resolve {spec}/{lane}")
+        digest, length = value.manifest_id, value.manifest_length
         try:
-            documents.raw(str(digest))
+            documents.raw(digest)
         except documents.DocumentError as exc:
             raise WorkspaceRefusal(f"model catalog returned no manifest for {spec}/{lane}") from exc
         if type(length) is not int or length <= 0:
-            length = self.measure(named, str(digest))
+            length = self.measure(named, digest)
         return {
             "repository": named,
             "manifest": {"digest": digest, "length": length},
-            "release": str(value.get("release") or release),
-            "lane": str(value.get("lane") or lane),
+            "release": value.release or release,
+            "lane": value.lane or lane,
         }
 
     def measure(self, model: str, digest: str) -> int:
@@ -274,11 +387,11 @@ def own(worker: Worker, package: str = "", hub: str = "") -> Catalog:
     )
 
 
-def _version(row: Mapping[str, Any]) -> tuple[int, Version | str]:
+def _version(row: _Release) -> tuple[int, Version | str]:
     try:
-        return 1, Version(str(row.get("release", "")))
+        return 1, Version(row.release)
     except InvalidVersion:
-        return 0, str(row.get("release", ""))
+        return 0, row.release
 
 
 def _code(raw: bytes) -> str:
@@ -293,99 +406,97 @@ def _code(raw: bytes) -> str:
 def _ladder(
     catalog: Catalog,
     package: str,
-    declaration: Mapping[str, Any],
+    declaration: _Declaration,
     bound: bool = True,
     owner: str = "",
-) -> tuple[str, str, list[dict[str, Any]]] | None:
+) -> tuple[str, str, list[_Rung]] | None:
     """The owner's binding, else the authored default: (model, release, rungs). An org-relative
     default names the package's org, or for unpublished code (local/) its owner's."""
     if bound and package and not package.startswith("local/"):
-        row = catalog.binding(package, str(declaration["path"]))
+        row = catalog.binding(package, declaration.path)
         if row is not None:
-            rungs = row.get("ladder")
-            if not isinstance(rungs, list) or not rungs:
-                raise WorkspaceRefusal(f"the owner's binding of {declaration['path']} has no lanes")
-            return str(row.get("model", "")), str(row.get("release", "")), rungs
-    authored = declaration.get("default_ladder")
-    if not authored:
+            if not row.ladder:
+                raise WorkspaceRefusal(f"the owner's binding of {declaration.path} has no lanes")
+            rungs = []
+            for raw in row.ladder:
+                try:
+                    rungs.append(msgspec.convert(raw, _Rung))
+                except msgspec.ValidationError:
+                    continue  # an unreadable rung is not selectable on this machine
+            return row.model, row.release, rungs
+    if not declaration.default_ladder:
         return None
     try:
-        rows = default_ladder(authored)
+        rows = default_ladder(declaration.default_ladder)
         model, release, _ = reference(rows[0][2])
     except ConformanceError as exc:
-        raise WorkspaceRefusal(f"{declaration['path']} has an invalid authored default") from exc
+        raise WorkspaceRefusal(f"{declaration.path} has an invalid authored default") from exc
     if "/" not in model:
         org = package.partition("/")[0]
         org = owner if org == "local" else org
         if not org:
-            raise WorkspaceRefusal(f"{declaration['path']} names its owner's model with no owner")
+            raise WorkspaceRefusal(f"{declaration.path} names its owner's model with no owner")
         model = org + "/" + model
-    return (
-        model,
-        release,
-        [{"gpu": gpu, "gpus": gpus, "lane": reference(lane)[2]} for gpu, gpus, lane in rows],
-    )
+    return model, release, [_Rung(reference(lane)[2], gpu, gpus) for gpu, gpus, lane in rows]
 
 
 def slot(
     catalog: Catalog,
     package: str,
-    declaration: Mapping[str, Any],
+    declaration: Mapping[str, object],
     parameter: str,
-    choice: Mapping[str, Any] | None,
+    choice: Mapping[str, object] | None,
     fits: Fits,
     owner: str = "",
     note: Note | None = None,
-) -> dict[str, Any]:
+) -> Selection:
     """One slot's exact checkpoint for this machine, in the captured default row shape."""
-    base = {"parameter": parameter, "public_origin": catalog.origin}
-    choice = choice or {}
-    manifest = choice.get("manifest") or {}
-    if manifest.get("digest"):
-        digest, repository = str(manifest["digest"]), str(choice.get("repository", ""))
+    selected = _read(choice or {}, _Choice, "model choice")
+    manifest = selected.manifest
+    if manifest is not None and manifest.digest:
+        digest, repository = manifest.digest, selected.repository
         documents.raw(digest)
-        pinned: dict[str, Any] = {"digest": digest, "length": int(manifest.get("length", 0))}
+        pinned: Manifest = {"digest": digest, "length": manifest.length}
         if pinned["length"] <= 0:
             pinned = catalog.resolve(repository, digest, "")["manifest"]
         return {
-            **base,
+            "parameter": parameter,
+            "public_origin": catalog.origin,
             "gpu": "*",
             "gpus": 0,
             "repository": repository,
             "manifest": pinned,
-            "release": choice.get("release", ""),
-            "lane": choice.get("lane", ""),
+            "release": selected.release,
+            "lane": selected.lane,
         }
-    degrees = set(declaration.get("sequence_parallel", {}).get("degrees", []))
+    declared = _read(declaration, _Declaration, "slot declaration")
+    degrees = set(declared.sequence_parallel.degrees)
 
-    def usable(rung: object) -> bool:
-        return (
-            isinstance(rung, dict)
-            and int(rung.get("gpus", 0) or 0) in {0, 1, *degrees}
-            and fits(rung)
-        )
+    def usable(rung: _Rung) -> bool:
+        selector: dict[str, object] = {"gpus": rung.gpus, "lane": rung.lane}
+        if rung.gpu is not msgspec.UNSET:
+            selector["gpu"] = rung.gpu
+        return rung.gpus in {0, 1, *degrees} and fits(selector)
 
     # An explicit repository is the caller's choice: the owner's binding is not read for it.
-    ladder = _ladder(catalog, package, declaration, not choice.get("repository"), owner)
-    have: dict[str, Row] = {}
-    if choice.get("repository"):
-        model, release = str(choice["repository"]), str(choice.get("release", ""))
-        if choice.get("lane"):
-            rungs = [{"gpu": "*", "gpus": 0, "lane": choice["lane"]}]
+    ladder = _ladder(catalog, package, declared, not selected.repository, owner)
+    have: dict[str, _Lane] = {}
+    if selected.repository:
+        model, release = selected.repository, selected.release
+        if selected.lane:
+            rungs = [_Rung(selected.lane, "*")]
         else:
             # No lane named: the repository's own, as the slot's ladder ranks them here, else
             # full precision, else the smallest.
             release, have = catalog.lanes(model, release)
             if not have:
                 raise WorkspaceRefusal(f"{model}@{release} has no lane to serve {parameter}")
-            rungs = [
-                r for r in (ladder[2] if ladder else []) if usable(r) and r.get("lane") in have
-            ]
+            rungs = [r for r in (ladder[2] if ladder else []) if usable(r) and r.lane in have]
             if not rungs:
                 lane = next((name for name in _FULL_PRECISION if name in have), None) or min(
-                    have, key=lambda name: (int(have[name].get("bytes") or 0), name)
+                    have, key=lambda name: (have[name].size(), name)
                 )
-                rungs = [{"gpu": "*", "gpus": 0, "lane": lane}]
+                rungs = [_Rung(lane, "*")]
         ladder = model, release, rungs
     if ladder is None:
         raise WorkspaceRefusal(f"{parameter} has no owner binding or authored default")
@@ -396,16 +507,14 @@ def slot(
     if not fitting:
         raise WorkspaceRefusal(f"{parameter} has no rung for this accelerator")
     # The widest rung this machine holds: the width itself is the declared degree.
-    rung = max(fitting, key=lambda candidate: int(candidate.get("gpus", 0) or 0))
+    rung = max(fitting, key=lambda candidate: candidate.gpus)
     if have and note is not None:
-        note(
-            f"{parameter}: {model}@{release} lane {rung['lane']} of {', '.join(sorted(have))}", 0, 0
-        )
-    resolved = catalog.resolve(model, release, str(rung["lane"]))
+        note(f"{parameter}: {model}@{release} lane {rung.lane} of {', '.join(sorted(have))}", 0, 0)
+    resolved = catalog.resolve(model, release, rung.lane)
     return {
-        **base,
-        "gpu": str(rung.get("gpu", "*")),
-        "gpus": int(rung.get("gpus", 0) or 0),
-        "repository": model,
+        "parameter": parameter,
+        "public_origin": catalog.origin,
+        "gpu": "*" if rung.gpu is msgspec.UNSET else rung.gpu,
+        "gpus": rung.gpus,
         **resolved,
     }

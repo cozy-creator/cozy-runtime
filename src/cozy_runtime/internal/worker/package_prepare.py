@@ -812,7 +812,11 @@ def prepare_package(
     if materialized is not None:
         materialized(installed)
     distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
-    interface_raw = describe(installed, distribution)
+    interface_raw = (
+        _installed_interface(installed, distribution, artifact_cache, describe)
+        if installed.incarnation is not None
+        else describe(installed, distribution)
+    )
     interface_body = package_interface.parse(interface_raw, "installed package interface")
     interface_path = install_root / "installations" / installation_id / "package-interface.json"
     package_interface.publish(interface_path, interface_raw)
