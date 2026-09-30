@@ -2024,6 +2024,26 @@ class Executor:
         backend.poison(())
         self.poisoned = poison
 
+    def _prepare_memory_evidence(self) -> dict[str, object]:
+        planner = self.host.planner
+
+        def allocation() -> dict[str, int]:
+            if (
+                self.device_kind != "cuda"
+                or not self._device_ready
+                or self.torch is None
+                or not accel.initialized(self.torch, self.device_kind)
+            ):
+                return {}
+            return accel.allocation(
+                self.torch, self.device_kind, planner.device if planner is not None else None
+            )
+
+        return prepare_diagnostics.failure_memory(
+            allocation,
+            lambda: planner.document(self.construction) if planner is not None else {},
+        )
+
     def _prepare_first(
         self, command: Load, *, optional_attention_scope: bool = False
     ) -> dict[str, Any]:
@@ -2703,10 +2723,7 @@ class Executor:
                 # faults instead of serving a generation whose warm did not complete. The
                 # device running short is a capacity fact and is typed as one, so the
                 # refusal stays this attempt's and is never held against the binding.
-                evidence = prepare_diagnostics.failure_memory(
-                    lambda: accel.allocation(torch, self.device_kind),
-                    lambda: planner.document(self.construction) if planner is not None else {},
-                )
+                evidence = self._prepare_memory_evidence()
                 backend.poison(())
                 self.poisoned = f"warm failed: {exc}"[:200]
                 cause = exc.__cause__

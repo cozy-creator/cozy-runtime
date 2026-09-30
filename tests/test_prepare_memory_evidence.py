@@ -35,7 +35,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author import Context, Model
 from cozy_runtime.author._context import Device
 from cozy_runtime.internal import memory, tiers, prepare_diagnostics
-from cozy_runtime.internal.executor import _send_reply
+from cozy_runtime.internal.executor import Executor, _send_reply
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.warm import WarmFailed, warm_generation
 from cozy_runtime.internal.worker.attempts import AttemptRefusal
@@ -58,9 +58,12 @@ try:
     warm_generation(FailingWarm(), device=Device("cpu"), cancel=lambda: False)
 except WarmFailed as exc:
     assert isinstance(exc.__cause__, memory.MemoryRefusal)
-    evidence = prepare_diagnostics.failure_memory(
-        lambda: {"allocated_bytes": 0}, lambda: planner.document("generation")
-    )
+    observer = SimpleNamespace(device_kind="cpu", _device_ready=True, torch=torch,
+        host=SimpleNamespace(planner=planner), construction="generation")
+    evidence = Executor._prepare_memory_evidence(observer)
+    assert evidence["allocation"] == {}  # a CPU failure cannot initialize CUDA to measure it
+    observer.device_kind, observer._device_ready = "cuda", False
+    assert Executor._prepare_memory_evidence(observer)["allocation"] == {}
     reply = {"reply": "load", "ok": False, "code": exc.__cause__.code,
              "detail": str(exc), "preparation_memory": evidence}
 else:
@@ -106,7 +109,32 @@ print(json.dumps({"code": refused.code, "phase": phase}))
     )
     evidence = json.loads(result.stdout)
     assert evidence["code"] == "device_out_of_memory"
-    assert evidence["phase"]["preparation_memory"]["allocation"]["allocated_bytes"] == 0
+    assert evidence["phase"]["preparation_memory"]["allocation"] == {}
+
+
+def test_allocator_snapshot_uses_planner_device() -> None:
+    script = r"""
+from types import SimpleNamespace
+from cozy_runtime.internal.executor import Executor
+selected = object()
+seen = []
+def record(device):
+    assert device is selected
+    seen.append(device)
+    return 0
+cuda = SimpleNamespace(is_initialized=lambda: True,
+    mem_get_info=lambda device: (record(device), 100),
+    memory_allocated=record, memory_reserved=record)
+planner = SimpleNamespace(device=selected, document=lambda key: {"grant_bytes": 100})
+owner = SimpleNamespace(device_kind="cuda", _device_ready=True,
+    torch=SimpleNamespace(cuda=cuda), host=SimpleNamespace(planner=planner),
+    construction="generation")
+evidence = Executor._prepare_memory_evidence(owner)
+assert evidence["allocation"] == {"allocated_bytes": 0, "reserved_bytes": 0,
+    "driver_free_bytes": 0, "driver_total_bytes": 100}
+assert len(seen) == 3
+"""
+    subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
 
 
 def test_oversize_optional_evidence_keeps_original_refusal() -> None:
