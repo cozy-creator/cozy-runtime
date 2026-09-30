@@ -110,6 +110,8 @@ def test_prefetch_cannot_clear_a_replacement_executors_memory_facts() -> None:
     worker._first_pages_warmed = {}
     worker._first_pages_attempted = {}
     worker._page_warm_lock = threading.Lock()
+    worker._memory_prefetch_deferred = False
+    worker._prefetch_reasons = {}
     worker.hosted = {}
     worker.placement = None
     worker.lanes = lanes
@@ -199,6 +201,8 @@ def test_worker_prefetch_uses_live_disk_facts_and_keeps_warmth_on_reordering(
     worker._first_pages_warmed = {}
     worker._first_pages_attempted = {}
     worker._page_warm_lock = threading.Lock()
+    worker._memory_prefetch_deferred = False
+    worker._prefetch_reasons = {}
     worker.hosted = {}
     worker.placement = None
     worker.lanes = lanes
@@ -303,6 +307,8 @@ def test_activation_warms_native_store_once_before_any_load_report(
     worker._first_pages_warmed = {}
     worker._first_pages_attempted = {}
     worker._page_warm_lock = threading.Lock()
+    worker._memory_prefetch_deferred = False
+    worker._prefetch_reasons = {}
     worker.hosted = {}
     worker.placement = None
     worker.stop = threading.Event()
@@ -331,4 +337,6 @@ def test_activation_warms_native_store_once_before_any_load_report(
     # Retiring the construction cancels a queued read before it opens the store.
     worker._page_warm_targets.clear()
     scheduled[0][1](None)
-    assert len(notes) == 1
+    assert len(notes) == 2 and "activation interest changed" in notes[-1][1]
+    scheduled[0][1](None)
+    assert len(notes) == 2  # unchanged reasons do not spam or repeat the native read

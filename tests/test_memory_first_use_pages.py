@@ -95,6 +95,8 @@ def queued(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Worker, Acc
     worker._first_pages_warmed = {}
     worker._first_pages_attempted = {}
     worker._page_warm_lock = threading.Lock()
+    worker._memory_prefetch_deferred = False
+    worker._prefetch_reasons = {}
     template = ("installation", documents.spell(b"r" * 32))
     worker._memory_waiting = (template,)
     worker._first_use_waiting = (("next#1", template),)

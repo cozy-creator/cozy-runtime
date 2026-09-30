@@ -933,6 +933,8 @@ class Worker:
         self._first_pages_warmed: dict[tuple[str, str], set[tuple[str, str, str]]] = {}
         self._first_pages_attempted: dict[tuple[str, str], set[tuple[str, str, str]]] = {}
         self._page_warm_lock = threading.Lock()
+        self._memory_prefetch_deferred = False
+        self._prefetch_reasons: dict[str, str] = {}
         #: per placement: bindings digests of superseded documents -> {binding: construction}
         #: whose offers are still accepted when the binding and its construction are unchanged
         self._superseded: dict[str, dict[str, dict[str, str]]] = {}
@@ -978,6 +980,7 @@ class Worker:
             lambda text: self.note("residency", text),
             host_available=proctree.available_host_bytes,
             host_pressure=proctree.host_pressure,
+            store_ready=self._wake_memory_prefetch,
         )
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         # Before any executor starts: an older executor reads the image kernel site once.
@@ -1165,6 +1168,7 @@ class Worker:
             instance_id=options.instance_id,
             progress=self.emit_progress,
             dispatched=self._dispatched,
+            running=self._wake_memory_prefetch,
             bundles=self.bundles,
             monitor=self.monitor,
             posture=self.applied_posture,
@@ -2614,6 +2618,14 @@ class Worker:
         self.memory.update_queue(demands)
         frontier = self.memory.prefetch_frontier()
         self._page_warm_frontier = frontier
+        live_reasons = {demand.tenant for demand in frontier} | {
+            "activation:" + key for key in live
+        }
+        self._prefetch_reasons = {
+            key: value for key, value in list(self._prefetch_reasons.items()) if key in live_reasons
+        }
+        if not frontier:
+            self._memory_prefetch_deferred = False
         # Queue positions and measured load costs do not change the stored bytes.
         live_items = {item for targets in self._page_warm_targets.values() for item in targets}
         self._pages_warmed = {
@@ -2649,6 +2661,46 @@ class Worker:
             tuple((key, row.disk_revision.get(key, 0)) for key in keys),
         )
 
+    def _prefetch_blocked(self) -> str:
+        if self.stop.is_set():
+            return "worker stopping"
+        if not self.memory.optional_store_wanted():
+            return "foreground store demand"
+        if any(
+            attempt.state in {"preparing", "entering", "accepted"}
+            for attempt in list(self.engine.live.values())
+        ):
+            return "foreground preparation"
+        return ""
+
+    def _prefetch_note(self, key: str, reason: str) -> None:
+        if self._prefetch_reasons.get(key) != reason:
+            self._prefetch_reasons[key] = reason
+            self.note("memory-prefetch", f"{key!r}: {reason}"[:256])
+
+    def _wake_memory_prefetch(self) -> None:
+        """An eligibility edge pokes the existing coalesced unit, never a timer or RPC."""
+        try:
+            if (
+                self._memory_prefetch_deferred
+                and self._page_warm_frontier
+                and not self._prefetch_blocked()
+            ):
+                self.supervisor.spawn("memory-prefetch", lambda _: self._prefetch_pages())
+        except Exception:
+            # Optional startup/shutdown/resource failure cannot fail foreground work.
+            pass
+
+    def _defer_memory_prefetch(self, reason: str) -> None:
+        if not reason:
+            return
+        self._memory_prefetch_deferred = reason != "worker stopping"
+        for demand in self._page_warm_frontier:
+            self._prefetch_note(demand.tenant, reason)
+        # Release/running may have raced the decision to arm deferred interest.
+        # A fresh check either sees the block or preserves a poke for this unit's return.
+        self._wake_memory_prefetch()
+
     def _prefetch_pages(self) -> None:
         """Bounded speculative store reads of the current queue frontier, with no GPU work."""
         with self._page_warm_lock:
@@ -2666,39 +2718,45 @@ class Worker:
             for template, items in self._first_pages_attempted.items()
             if template in self._memory_templates
         }
+        self._memory_prefetch_deferred = False
+        if frontier and (reason := self._prefetch_blocked()):
+            self._defer_memory_prefetch(reason)
+            return
         warmed = self._pages_warmed
         for demand in frontier:
             if demand.tenant.startswith("queued:"):
                 self._prefetch_first_use(demand)
                 continue
-            for item in self._page_warm_targets.get(demand.tenant, ()):
+            targets = self._page_warm_targets.get(demand.tenant, ())
+            if not targets:
+                self._prefetch_note(demand.tenant, "no known immutable page targets")
+            for item in targets:
                 key = (demand.artifact, demand.representation, item)
                 tier = self._prefetch_tier(demand, item)
                 if tier is None or warmed.get(key) == tier:
                     continue
                 token = f"prefetch:{demand.tenant}:{item!r}"
+                blocked = ""
 
                 def wanted(
                     demand: policy.Demand = demand,
                     item: tuple[str, str, str] = item,
                     tier: tuple[object, ...] | None = tier,
                 ) -> bool:
+                    nonlocal blocked
+                    blocked = self._prefetch_blocked()
                     return (
-                        not self.stop.is_set()
-                        and self.memory.optional_store_wanted()
+                        not blocked
                         and any(
                             (d.tenant, d.artifact, d.representation)
                             == (demand.tenant, demand.artifact, demand.representation)
                             for d in self._page_warm_frontier
                         )
                         and self._prefetch_tier(demand, item) == tier
-                        and not any(
-                            attempt.state in {"preparing", "entering", "accepted"}
-                            for attempt in list(self.engine.live.values())
-                        )
                     )
 
                 if not wanted():
+                    self._defer_memory_prefetch(blocked)
                     return
                 try:
                     report = page_warm.warm_component(
@@ -2719,11 +2777,13 @@ class Worker:
                 self.note(
                     "memory-prefetch", f"{demand.tenant!r} {page_warm.describe(report)}"[:256]
                 )
+                self._defer_memory_prefetch(blocked)
 
     def _prefetch_first_use(self, demand: policy.Demand) -> None:
         """An accepted first-use template has immutable refs but no executor tier yet."""
         executions = self.executions
         if executions is None or self.options.tensorfs_root is None:
+            self._prefetch_note(demand.tenant, "immutable preparation unavailable")
             return
         owner, boot = self.fence.record_owner_id, self.fence.worker_boot_id
         key = demand.tenant.removeprefix("queued:")
@@ -2734,6 +2794,7 @@ class Worker:
         try:
             row = executions.row(owner, request)
             if row is None or row.ordinal != int(ordinal):
+                self._prefetch_note(demand.tenant, "accepted owner or attempt changed")
                 return
             preparation = executions.prepared(owner, request)
             offered = row.attempt_offer()
@@ -2741,17 +2802,16 @@ class Worker:
                 preparation, offered, str(self.options.tensorfs_root), template
             )
 
+            blocked = ""
+
             def wanted() -> bool:
+                nonlocal blocked
+                blocked = self._prefetch_blocked()
                 if (
-                    self.stop.is_set()
-                    or not self.memory.optional_store_wanted()
+                    blocked
                     or (owner, boot) != (self.fence.record_owner_id, self.fence.worker_boot_id)
                     or (key, template) not in self._first_use_waiting
                     or demand not in self._page_warm_frontier
-                    or any(
-                        attempt.state in {"preparing", "entering", "accepted"}
-                        for attempt in list(self.engine.live.values())
-                    )
                 ):
                     return False
                 current = executions.row(owner, request)
@@ -2765,11 +2825,18 @@ class Worker:
                     and executions.prepared(owner, request).state == preparation.state
                 )
 
+            if not items:
+                self._prefetch_note(demand.tenant, "no selected immutable component refs")
+                return
             remaining = self.memory.prefetch_allowance(fill.slot_bytes(fill.WINDOW_BYTES))
             if remaining <= 0:
+                self._prefetch_note(demand.tenant, "no optional unreclaimed host headroom")
                 return
             for item in items:
                 if not wanted():
+                    self._defer_memory_prefetch(blocked)
+                    if not blocked:
+                        self._prefetch_note(demand.tenant, "accepted queue interest changed")
                     return
                 if item in self._first_pages_attempted.get(template, ()):
                     continue
@@ -2792,6 +2859,7 @@ class Worker:
                 if not report.get("skipped") and report.get("complete") and wanted():
                     self._first_pages_warmed.setdefault(template, set()).add(item)
                 self.note("memory-prefetch", f"first use: {page_warm.describe(report)}"[:256])
+                self._defer_memory_prefetch(blocked)
         except Exception as exc:
             # Optional reads never change the accepted request or its ordinary preparation.
             self.note("memory-prefetch", f"first use skipped: {type(exc).__name__}"[:256])
@@ -6664,6 +6732,12 @@ class Worker:
                 )
 
             if not wanted():
+                reason = "activation interest changed"
+                if self.stop.is_set():
+                    reason = "worker stopping"
+                elif not self.memory.optional_store_wanted():
+                    reason = "foreground store demand"
+                self._prefetch_note("activation:" + placement_id, reason)
                 return
             try:
                 report = page_warm.warm_component(
