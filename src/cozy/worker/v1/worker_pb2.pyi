@@ -543,18 +543,20 @@ class KeepRentalAliveResult(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., acknowledged_at_unix_ms: _Optional[int] = ..., idle_deadline_unix_ms: _Optional[int] = ...) -> None: ...
 
 class MachineExecutionCapture(_message.Message):
-    __slots__ = ("bindings", "model_defaults", "root_installation_id", "installed_packages", "deferred_installations")
+    __slots__ = ("bindings", "model_defaults", "root_installation_id", "installed_packages", "deferred_installations", "model_choices")
     BINDINGS_FIELD_NUMBER: _ClassVar[int]
     MODEL_DEFAULTS_FIELD_NUMBER: _ClassVar[int]
     ROOT_INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     INSTALLED_PACKAGES_FIELD_NUMBER: _ClassVar[int]
     DEFERRED_INSTALLATIONS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_CHOICES_FIELD_NUMBER: _ClassVar[int]
     bindings: _containers.RepeatedCompositeFieldContainer[MachineCallableBinding]
     model_defaults: _containers.RepeatedCompositeFieldContainer[MachineModelDefault]
     root_installation_id: str
     installed_packages: _containers.RepeatedCompositeFieldContainer[InstalledPackage]
     deferred_installations: _containers.RepeatedCompositeFieldContainer[DeferredInstallation]
-    def __init__(self, bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ..., model_defaults: _Optional[_Iterable[_Union[MachineModelDefault, _Mapping]]] = ..., root_installation_id: _Optional[str] = ..., installed_packages: _Optional[_Iterable[_Union[InstalledPackage, _Mapping]]] = ..., deferred_installations: _Optional[_Iterable[_Union[DeferredInstallation, _Mapping]]] = ...) -> None: ...
+    model_choices: _containers.RepeatedCompositeFieldContainer[ModelChoice]
+    def __init__(self, bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ..., model_defaults: _Optional[_Iterable[_Union[MachineModelDefault, _Mapping]]] = ..., root_installation_id: _Optional[str] = ..., installed_packages: _Optional[_Iterable[_Union[InstalledPackage, _Mapping]]] = ..., deferred_installations: _Optional[_Iterable[_Union[DeferredInstallation, _Mapping]]] = ..., model_choices: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ...) -> None: ...
 
 class DeferredInstallation(_message.Message):
     __slots__ = ("key", "package", "release", "preparation")
@@ -637,7 +639,7 @@ class MachineExecutionWorkspaceQuery(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., describe: _Optional[_Union[PackageSelection, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionWorkspace(_message.Message):
-    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "described_release", "run_output_log", "release_root_owner", "submission_close")
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id", "devices", "accelerator_backend", "executor_uid_isolation", "described_release", "run_output_log", "release_root_owner", "submission_close", "model_overrides")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -648,6 +650,7 @@ class MachineExecutionWorkspace(_message.Message):
     RUN_OUTPUT_LOG_FIELD_NUMBER: _ClassVar[int]
     RELEASE_ROOT_OWNER_FIELD_NUMBER: _ClassVar[int]
     SUBMISSION_CLOSE_FIELD_NUMBER: _ClassVar[int]
+    MODEL_OVERRIDES_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
@@ -658,7 +661,8 @@ class MachineExecutionWorkspace(_message.Message):
     run_output_log: bool
     release_root_owner: bool
     submission_close: bool
-    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., described_release: _Optional[_Union[DescribedRelease, _Mapping]] = ..., run_output_log: bool = ..., release_root_owner: bool = ..., submission_close: bool = ...) -> None: ...
+    model_overrides: bool
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., devices: _Optional[_Iterable[_Union[MachineDevice, _Mapping]]] = ..., accelerator_backend: _Optional[str] = ..., executor_uid_isolation: bool = ..., described_release: _Optional[_Union[DescribedRelease, _Mapping]] = ..., run_output_log: bool = ..., release_root_owner: bool = ..., submission_close: bool = ..., model_overrides: bool = ...) -> None: ...
 
 class DescribedRelease(_message.Message):
     __slots__ = ("package", "release", "package_interface")
@@ -777,7 +781,7 @@ class ReleaseRoot(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., entrypoint: _Optional[str] = ..., models: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., input_access: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., attention_kernel: _Optional[str] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., job: bool = ..., weights_destination: _Optional[str] = ..., publication_grant: _Optional[str] = ..., installation_id: _Optional[str] = ..., owner: _Optional[str] = ..., hub: _Optional[str] = ...) -> None: ...
 
 class ModelChoice(_message.Message):
-    __slots__ = ("parameter", "repository", "release", "lane", "manifest", "source", "profiles")
+    __slots__ = ("parameter", "repository", "release", "lane", "manifest", "source", "profiles", "adapters")
     PARAMETER_FIELD_NUMBER: _ClassVar[int]
     REPOSITORY_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
@@ -785,6 +789,7 @@ class ModelChoice(_message.Message):
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
     SOURCE_FIELD_NUMBER: _ClassVar[int]
     PROFILES_FIELD_NUMBER: _ClassVar[int]
+    ADAPTERS_FIELD_NUMBER: _ClassVar[int]
     parameter: str
     repository: str
     release: str
@@ -792,7 +797,8 @@ class ModelChoice(_message.Message):
     manifest: Ref
     source: str
     profiles: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, parameter: _Optional[str] = ..., repository: _Optional[str] = ..., release: _Optional[str] = ..., lane: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., source: _Optional[str] = ..., profiles: _Optional[_Iterable[str]] = ...) -> None: ...
+    adapters: _containers.RepeatedCompositeFieldContainer[DownloadAdapterRef]
+    def __init__(self, parameter: _Optional[str] = ..., repository: _Optional[str] = ..., release: _Optional[str] = ..., lane: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., source: _Optional[str] = ..., profiles: _Optional[_Iterable[str]] = ..., adapters: _Optional[_Iterable[_Union[DownloadAdapterRef, _Mapping]]] = ...) -> None: ...
 
 class SourceCredential(_message.Message):
     __slots__ = ("provider", "credential")
@@ -1705,20 +1711,28 @@ class LocalPackageFile(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ..., path: _Optional[str] = ...) -> None: ...
 
 class PreparePrivatePlacementRequest(_message.Message):
-    __slots__ = ("operation_id", "download_delegation", "download_delegation_signature", "native_models", "claim", "installation_id")
+    __slots__ = ("operation_id", "download_delegation", "download_delegation_signature", "native_models", "claim", "installation_id", "model_choices", "source_credentials", "hub", "owner")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     NATIVE_MODELS_FIELD_NUMBER: _ClassVar[int]
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
+    MODEL_CHOICES_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
+    HUB_FIELD_NUMBER: _ClassVar[int]
+    OWNER_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     download_delegation: bytes
     download_delegation_signature: bytes
     native_models: _containers.RepeatedCompositeFieldContainer[NativeModelBinding]
     claim: Claim
     installation_id: str
-    def __init__(self, operation_id: _Optional[str] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ..., claim: _Optional[_Union[Claim, _Mapping]] = ..., installation_id: _Optional[str] = ...) -> None: ...
+    model_choices: _containers.RepeatedCompositeFieldContainer[ModelChoice]
+    source_credentials: _containers.RepeatedCompositeFieldContainer[SourceCredential]
+    hub: str
+    owner: str
+    def __init__(self, operation_id: _Optional[str] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ..., claim: _Optional[_Union[Claim, _Mapping]] = ..., installation_id: _Optional[str] = ..., model_choices: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., hub: _Optional[str] = ..., owner: _Optional[str] = ...) -> None: ...
 
 class LocalModelSourceFile(_message.Message):
     __slots__ = ("member", "object_id", "length", "path", "header_path", "verified")
@@ -2343,18 +2357,26 @@ class DesiredLocalPackageSet(_message.Message):
     def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ..., dependency_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., source_archive: _Optional[str] = ...) -> None: ...
 
 class DesiredPrivatePlacementSet(_message.Message):
-    __slots__ = ("operation_id", "download_delegation", "download_delegation_signature", "native_models", "installation_id")
+    __slots__ = ("operation_id", "download_delegation", "download_delegation_signature", "native_models", "installation_id", "model_choices", "source_credentials", "hub", "owner")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     NATIVE_MODELS_FIELD_NUMBER: _ClassVar[int]
     INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
+    MODEL_CHOICES_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
+    HUB_FIELD_NUMBER: _ClassVar[int]
+    OWNER_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     download_delegation: bytes
     download_delegation_signature: bytes
     native_models: _containers.RepeatedCompositeFieldContainer[NativeModelBinding]
     installation_id: str
-    def __init__(self, operation_id: _Optional[str] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ..., installation_id: _Optional[str] = ...) -> None: ...
+    model_choices: _containers.RepeatedCompositeFieldContainer[ModelChoice]
+    source_credentials: _containers.RepeatedCompositeFieldContainer[SourceCredential]
+    hub: str
+    owner: str
+    def __init__(self, operation_id: _Optional[str] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ..., installation_id: _Optional[str] = ..., model_choices: _Optional[_Iterable[_Union[ModelChoice, _Mapping]]] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., hub: _Optional[str] = ..., owner: _Optional[str] = ...) -> None: ...
 
 class NativeModelBinding(_message.Message):
     __slots__ = ("slot", "model", "manifest", "retention", "adapters")
@@ -2445,7 +2467,7 @@ class DownloadModelRef(_message.Message):
     def __init__(self, manifest: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., package: _Optional[str] = ..., slot: _Optional[str] = ..., lane: _Optional[str] = ..., adapters: _Optional[_Iterable[_Union[DownloadAdapterRef, _Mapping]]] = ...) -> None: ...
 
 class DownloadAdapterRef(_message.Message):
-    __slots__ = ("component", "model", "release", "lane", "manifest", "source_component", "scale")
+    __slots__ = ("component", "model", "release", "lane", "manifest", "source_component", "scale", "source", "profiles")
     COMPONENT_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
@@ -2453,6 +2475,8 @@ class DownloadAdapterRef(_message.Message):
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
     SOURCE_COMPONENT_FIELD_NUMBER: _ClassVar[int]
     SCALE_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    PROFILES_FIELD_NUMBER: _ClassVar[int]
     component: str
     model: str
     release: str
@@ -2460,7 +2484,9 @@ class DownloadAdapterRef(_message.Message):
     manifest: str
     source_component: str
     scale: str
-    def __init__(self, component: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., lane: _Optional[str] = ..., manifest: _Optional[str] = ..., source_component: _Optional[str] = ..., scale: _Optional[str] = ...) -> None: ...
+    source: str
+    profiles: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, component: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., lane: _Optional[str] = ..., manifest: _Optional[str] = ..., source_component: _Optional[str] = ..., scale: _Optional[str] = ..., source: _Optional[str] = ..., profiles: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class DownloadPackageRef(_message.Message):
     __slots__ = ("package", "release")
