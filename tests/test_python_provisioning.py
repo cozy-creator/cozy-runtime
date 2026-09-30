@@ -554,6 +554,7 @@ def test_cli_and_local_worker_share_one_managed_interpreter_root(
             install_root=str(install_root),
             artifact_cache=str(tmp_path / "artifacts"),
             environment_python=None,
+            publication_authority=None,
             python=sys.executable,
         ),
         stop=threading.Event(),

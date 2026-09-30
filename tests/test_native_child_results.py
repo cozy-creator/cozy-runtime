@@ -531,9 +531,14 @@ def png_result(tmp_path: Path) -> tuple[Workspace, pb.ChildCallResult, bytes]:
     return workspace, reply, data
 
 
-def test_encoded_png_result_hydrates_as_existing_image_asset(tmp_path: Path) -> None:
+@pytest.mark.parametrize("declared", ["image/png", "image/jpeg"])
+def test_encoded_png_result_hydrates_with_sniffed_image_type(tmp_path: Path, declared: str) -> None:
     workspace, reply, data = png_result(tmp_path)
+    value = canonical_json.decode(reply.result_canonical_bytes)
+    value["image"]["media_type"] = declared
+    reply.result_canonical_bytes = canonical_json.encode(value)
     rows = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+    assert rows[0]["media_type"] == "image/png"
     result, _ = decode(
         canonical_json.decode(reply.result_canonical_bytes),
         ImageResult,
@@ -547,9 +552,7 @@ def test_encoded_png_result_hydrates_as_existing_image_asset(tmp_path: Path) -> 
     assert result.image.read_bytes() == data
 
 
-@pytest.mark.parametrize(
-    "kind,mime", [("audio", "audio/wav"), ("image", "image/jpeg"), ("video", "image/png")]
-)
+@pytest.mark.parametrize("kind,mime", [("audio", "audio/wav"), ("video", "image/png")])
 def test_encoded_png_refuses_a_wrong_kind_or_mime(tmp_path: Path, kind: str, mime: str) -> None:
     workspace, reply, _ = png_result(tmp_path)
     value = canonical_json.decode(reply.result_canonical_bytes)

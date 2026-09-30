@@ -131,13 +131,19 @@ def test_defaults_must_name_actual_injected_models(
         static_interface.build(root)
 
 
-def test_artifact_reader_uses_the_same_ladder_refusals(tmp_path: Path) -> None:
+def test_artifact_reader_refuses_invalid_ladders(tmp_path: Path) -> None:
     body = static_interface.build(project(tmp_path, invocable=True))
+    assert package_interface.read_bytes(package_interface.canonical_bytes(body)) == body
     for vector in VECTORS["invalid"]:
         invalid = deepcopy(body)
         invalid["entrypoints"][0]["models"][0]["default_ladder"] = vector["ladder"]
-        with pytest.raises(ConformanceError, match="model_defaults"):
+        with pytest.raises(ConformanceError) as refused:
             package_interface.read_bytes(package_interface.canonical_bytes(invalid))
+        # Structural mistakes can be refused by the typed interface reader before
+        # the shared ladder validator checks the model-default semantics.
+        assert refused.value.code in ("model_defaults", "malformed_package_interface"), vector
+        if refused.value.code == "malformed_package_interface":
+            assert "default_ladder" in refused.value.message
 
 
 def test_defaults_do_not_open_other_fixed_point_locations(tmp_path: Path) -> None:
