@@ -114,7 +114,7 @@ def test_pending_cast_dispatch_keeps_uncached_victim_checks(
     unit.tier = tiers.DISK
     unit.pending = [tiers.DTypeConvert(lambda tensor: tensor.to(dtype=torch.float64))]
 
-    class ChangeDuringMetaProbe(TorchDispatchMode):
+    class ChangeDuringMetaProbe(TorchDispatchMode):  # type: ignore[misc]
         def __init__(self) -> None:
             super().__init__()
             self.probes = 0
