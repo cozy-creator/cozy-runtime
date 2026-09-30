@@ -1,0 +1,1 @@
+Preserve available allocator and planner observations from a failed model warmup in its existing preparation phase record before retiring the executor. Diagnostic failure or oversized evidence cannot replace the original refusal.

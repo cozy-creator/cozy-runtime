@@ -236,11 +236,16 @@ _SERVE = """
                dtype=torch.bfloat16) for _ in range(3))
     rows = []
     with attention_sol.observing(kernels=rows):
-        while (loaded := attention_sol._ready(4097, q.device, 5)) is None:
-            job = attention_sol._job_for(4097, torch.cuda.get_device_capability())
+        job = attention_sol._job_for(4097, torch.cuda.get_device_capability())
+        if store.entry(job.key) is None:
+            attention_sol.specialize(4097, q.device, -1)
             while kernel_compile.status(store, job).state in ("compiling", "pending"):
                 time.sleep(0.2)
-        out = attention_sol._native(q, k, v, None, 0, loaded)
+        # A later logical request can adopt the published object.
+        with attention_sol.selected(attention_sol.capture(q.device)):
+            loaded = attention_sol._ready(4097, q.device, 5)
+            assert loaded is not None
+            out = attention_sol._native(q, k, v, None, 0, loaded)
     torch.save(out.cpu(), sys.argv[1])
     print(json.dumps({"compiles": len(compiles), "sources": [r["source"] for r in rows]}))
 """
@@ -248,8 +253,8 @@ _SERVE = """
 
 def test_a_second_process_loads_the_sol_object_the_first_compiled(tmp_path: Path) -> None:
     """Process A's first sparse step finds no object, submits its compile and runs dense; the
-    builder publishes; A then loads it. Process B loads it without compiling, and both produce
-    bitwise-identical attention."""
+    builder publishes; A's next request then loads it. Process B loads it without compiling,
+    and both produce bitwise-identical attention."""
     _site()
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -259,7 +264,7 @@ def test_a_second_process_loads_the_sol_object_the_first_compiled(tmp_path: Path
     own = str(tmp_path / "u1")
     first = json.loads(_run(_SERVE, str(tmp_path / "out0.pt"), own).stdout.splitlines()[-1])
     second = json.loads(_run(_SERVE, str(tmp_path / "out1.pt"), own).stdout.splitlines()[-1])
-    assert first["sources"][0] == "cold_compile" and first["sources"][-1] == "store"
+    assert first["sources"][0] == "compiling" and first["sources"][-1] == "store"
     assert first["compiles"] == 0  # the builder process compiled, never this one
     assert second == {"compiles": 0, "sources": ["store"]}
     assert torch.equal(torch.load(tmp_path / "out0.pt"), torch.load(tmp_path / "out1.pt"))

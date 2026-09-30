@@ -162,7 +162,11 @@ def test_native_sol_preserves_protected_queries_and_input_bytes() -> None:
     original = [t.clone() for t in (q, k, v)]
     token = attention_sol._SITE.set(attention_sol.Site("dit", "blocks.2.attn"))
     try:
-        with attention_sol.observing() as counts, attention_scope(AttentionLayout(501, 33, 10)):
+        with (
+            attention_sol.selected(attention_sol.capture(q.device)),
+            attention_sol.observing() as counts,
+            attention_scope(AttentionLayout(501, 33, 10)),
+        ):
             output = attention_sol.sol_attention(q, k, v)
     finally:
         attention_sol._SITE.reset(token)

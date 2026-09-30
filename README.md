@@ -221,15 +221,27 @@ never for less than a floor derived from the sampling cadence. No number of seco
 anything on its own. The `timing-decides-nothing` fence proves observation cannot reach
 residency or placement.
 
-**Component residency is the runtime's, and the package has no vocabulary for it.** An
-package declares the possible heavyweight set of each public model operation with
-`@uses_components` and nothing else. Entering that scope ADMITS and MATERIALIZES the set
-before the body runs — freeing non-declared components, LRU over refcount-0 leases whose
-CUDA events have fired, until the plan's activation envelope fits ALLOCATABLE capacity —
-and leaving it records the fence and makes the bytes evictable. Eviction FREES; there is no
-host residence tier, and a re-stage is an ordinary cr-005 fill from the page-cached CAS
-mapping. The `package-owns-no-residency` fence proves the vocabulary is unreachable from
-package code rather than merely unused.
+**Runtime owns component residency.** A package declares the components its operation
+uses; the executor Planner chooses resident and streamed units across device, host and
+store tiers. The Worker Machine accounts for all executors and queued demand, reclaims
+idle cache before refusing work, and grants device and host room. Transfers preserve
+the previous placement until they complete. Managed weight identities remain immutable
+after construction; packages cannot retain untracked views across paging boundaries.
+
+Retry requires an explicit numerical-state contract: `author.pure` asserts that an
+operation has no persistent mutation, while `retry_state` supplies snapshot/restore
+callbacks for stateful models and hooks. Runtime preserves Torch CPU RNG, the assigned
+CUDA device's RNG and explicit Torch generators. Authors must include other RNGs and
+external state in their contract. Recovery retries the operation only after demonstrated
+additional room or a smaller feasible placement; it does not restart the run. SDXL's
+automatic decode selection happens before generation and remains fixed during retries.
+
+`gpu.budget` in the machine's `etc/cozy/runtime.yaml` is a process-footprint target.
+The allocator cap subtracts measured non-allocator overhead; cached allocator bytes
+are distinguished from immediately allocatable room. CUDA libraries can allocate outside
+that cap between measurements, so a configured budget alone does not prove a strict
+total-process maximum. Triage records measured driver peaks and budget excess, and
+keeps unavailable measurements unknown.
 
 **Anima's CUDA optimization is an exact post-fill plan.** Runtime recognizes only
 `anima:AnimaModel` with Diffusers `0.40.0` and the exact Anima Base 1.0 Cosmos config. After

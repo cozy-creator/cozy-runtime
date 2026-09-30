@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import cozy_runtime
+from cozy_runtime.internal.seam import EXECUTOR_PROTOCOL_REVISION
 from cozy_runtime.internal.worker import lanes
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -50,7 +51,7 @@ def test_executor_handshake_accepts_compatible_protocol_with_other_package_metad
             worker.supervision.python = str(_shadowing_python(root))
             compatible = worker.supervision.spawn(imposed=worker.imposed(lane))
             assert compatible.hello["runtime_version"] == "0.0.1"
-            assert compatible.hello["executor_protocol_revision"] == 1
+            assert compatible.hello["executor_protocol_revision"] == EXECUTOR_PROTOCOL_REVISION
             worker.supervision.retire_current(compatible, "compatible protocol proof")
         finally:
             worker.supervision.close()
