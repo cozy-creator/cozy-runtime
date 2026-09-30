@@ -186,7 +186,18 @@ class CallProgress(msgspec.Struct, frozen=True, kw_only=True):
     payload: dict[str, object]
 
 
-class ByteGrant(TypedDict):
+class ByteMetadata(TypedDict):
+    """Verified native byte metadata retained for forwarding and tree members."""
+
+    kind: str
+    digest: str
+    length: int
+    content_bytes: int
+    media_type: str
+    local: str
+
+
+class ByteGrant(ByteMetadata):
     """A native result projected into this executor's spool by its worker.
 
     The wire keys stay the same across SDK versions. The consumer validates the
@@ -194,12 +205,6 @@ class ByteGrant(TypedDict):
     """
 
     output_id: str
-    kind: str
-    digest: str
-    length: int
-    content_bytes: int
-    media_type: str
-    local: str
 
 
 class CallState(Answer, frozen=True, kw_only=True):
@@ -209,7 +214,9 @@ class CallState(Answer, frozen=True, kw_only=True):
     child_request_id: str = ""
     #: The child's canonical result document, once `state` is "succeeded".
     result: str = ""
-    byte_grants: tuple[ByteGrant, ...] = ()
+    # A peer may omit fields unused by its asset kind. Hydration reads the
+    # consumed fields into a typed record before constructing any handle.
+    byte_grants: tuple[Mapping[str, object], ...] = ()
     progress: CallProgress | None = None
     #: The child's execution observation document.
     observation: object = None

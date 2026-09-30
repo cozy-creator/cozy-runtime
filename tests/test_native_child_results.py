@@ -548,6 +548,64 @@ def test_encoded_png_result_hydrates_as_existing_image_asset(tmp_path: Path) -> 
     assert result.image.read_bytes() == data
 
 
+def test_native_grants_and_result_leaves_tolerate_producer_additions(tmp_path: Path) -> None:
+    workspace, reply, data = png_result(tmp_path)
+    value = canonical_json.decode(reply.result_canonical_bytes)
+    value["image"]["future"] = {"label": "newer producer"}
+    reply.result_canonical_bytes = canonical_json.encode(value)
+    grants = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+    answer = msgspec.to_builtins(CallState(ok=True, state="succeeded", byte_grants=tuple(grants)))
+    answer["byte_grants"][0]["future"] = ["newer worker"]
+    received = msgspec.convert(answer, CallState, strict=True)
+    assert received.byte_grants == ({**grants[0], "future": ["newer worker"]},)
+    result, _ = decode(
+        value,
+        ImageResult,
+        received.byte_grants,
+        request_id="parent",
+        guard=lambda: None,
+        observation=None,
+    )
+    assert result.image.read_bytes() == data
+
+
+@pytest.mark.parametrize(("index", "field"), [(0, "length"), (1, "content_bytes")])
+def test_native_grant_reader_rejects_boolean_byte_counts(
+    tmp_path: Path, index: int, field: str
+) -> None:
+    workspace, reply, _ = retained(tmp_path)
+    grants = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+    answer = msgspec.to_builtins(CallState(ok=True, state="succeeded", byte_grants=tuple(grants)))
+    answer["byte_grants"][index][field] = True
+    received = msgspec.convert(answer, CallState, strict=True)
+    with pytest.raises(msgspec.ValidationError, match="got `bool`"):
+        decode(
+            canonical_json.decode(reply.result_canonical_bytes),
+            Result,
+            received.byte_grants,
+            request_id="parent",
+            guard=lambda: None,
+            observation=None,
+        )
+
+
+def test_file_grant_without_tree_byte_count_still_hydrates(tmp_path: Path) -> None:
+    workspace, reply, data = png_result(tmp_path)
+    grants = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+    answer = msgspec.to_builtins(CallState(ok=True, state="succeeded", byte_grants=tuple(grants)))
+    del answer["byte_grants"][0]["content_bytes"]
+    received = msgspec.convert(answer, CallState, strict=True)
+    result, _ = decode(
+        canonical_json.decode(reply.result_canonical_bytes),
+        ImageResult,
+        received.byte_grants,
+        request_id="parent",
+        guard=lambda: None,
+        observation=None,
+    )
+    assert result.image.read_bytes() == data
+
+
 def test_encoded_png_mislabeled_as_jpeg_refuses_at_result_decode(tmp_path: Path) -> None:
     workspace, reply, data = png_result(tmp_path)
     value = canonical_json.decode(reply.result_canonical_bytes)
@@ -560,6 +618,27 @@ def test_encoded_png_mislabeled_as_jpeg_refuses_at_result_decode(tmp_path: Path)
     assert Path(rows[0]["local"]).read_bytes() == data
     with pytest.raises(ValueError, match="differs from its verified host grant"):
         decode(value, ImageResult, rows, request_id="parent", guard=lambda: None, observation=None)
+
+
+def test_native_grant_reader_ignores_fields_unused_by_its_kind(tmp_path: Path) -> None:
+    workspace, reply, data = retained(tmp_path)
+    grants = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+    answer = msgspec.to_builtins(CallState(ok=True, state="succeeded", byte_grants=tuple(grants)))
+    answer["byte_grants"][0]["content_bytes"] = {"newer": "unused on file"}
+    answer["byte_grants"][1]["media_type"] = ["unused on tree"]
+    answer["byte_grants"][1]["length"] = {"newer": "unused on tree"}
+    value = canonical_json.decode(reply.result_canonical_bytes)
+    value["bundle"]["media_type"] = {"newer": "unused on tree result"}
+    received = msgspec.convert(answer, CallState, strict=True)
+    result, _ = decode(
+        value,
+        Result,
+        received.byte_grants,
+        request_id="parent",
+        guard=lambda: None,
+        observation=None,
+    )
+    assert result.report.read_bytes() == (result.bundle.path / "payload").read_bytes() == data
 
 
 @pytest.mark.parametrize("kind,mime", [("audio", "audio/wav"), ("video", "image/png")])

@@ -18,6 +18,7 @@ from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.author._executor_requests import (
     Answer,
     ByteGrant,
+    ByteMetadata,
     CallProgress,
     CallRequest,
     CallState,
@@ -80,7 +81,7 @@ def _framed(answer: CallState) -> int:
 
 @dataclass(frozen=True, slots=True)
 class _Received:
-    metadata: ByteGrant
+    metadata: ByteMetadata
     source: pb.NativeByteRetentionRequest
 
 
@@ -404,7 +405,7 @@ class Calls:
 
     def received_inputs(
         self, attempt: AttemptRecord
-    ) -> list[tuple[ByteGrant, pb.NativeByteRetentionRequest]]:
+    ) -> list[tuple[ByteMetadata, pb.NativeByteRetentionRequest]]:
         """Snapshot only native byte capabilities actually delivered to this attempt."""
         with self.lock:
             return [
