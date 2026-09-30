@@ -108,15 +108,16 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	if err != nil {
 		return err
 	}
+	restartPath := filepath.Join(layout.State, "runtime-restarts.json")
+	restartState, err := openRestarts(restartPath)
+	if err != nil {
+		// Unreadable bookkeeping blocks launches, never the authenticated repair API.
+		restartState = &restarts{path: restartPath, blocked: true, safeCode: "runtime_restart_state_unavailable", detail: err.Error()}
+	}
 	m := &Machine{lease: lease, grant: g, layout: layout, id: id, claims: c, receipt: rec, hub: newHubClient(g), idle: state,
-		restarts: &restarts{}, log: log, started: now,
+		restarts: restartState, log: log, started: now,
 		inUpdate: true, // listener liveness is available while startup admission remains held
 		owned:    g.Lifetime == "persistent", ready: make(chan struct{}), wake: make(chan struct{}, 1), initialized: make(chan struct{})}
-	if rec.retained == nil {
-		if err := m.restarts.clear(); err != nil {
-			return err
-		}
-	}
 	state.persistent = m.owned
 	if m.owned && (g.bootstrap == nil || !g.bootstrap.Resume) {
 		if err := state.reset(now); err != nil {
@@ -190,6 +191,8 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 		}
 	} else if startupErr != nil {
 		m.restarts.fail(&launchRefusal{"runtime_update_recovery_required", startupErr.Error()})
+	} else if m.restarts.gone() && !m.startupPending() {
+		fmt.Fprintln(m.log, "cozy machine: persisted Runtime failure requires repair:", m.restarts.reason())
 	} else if err := m.tfs.initStore(ctx); err != nil {
 		if m.startupPending() {
 			if err := m.rollbackStartup(ctx, err); err != nil {
@@ -413,13 +416,17 @@ func (m *Machine) claimRuntime(p *runtimeProcess) {
 		case <-tick.C:
 		}
 	}
-	ready := func(ack *pb.ClaimAck) {
+	ready := func(ack *pb.ClaimAck) error {
 		m.mu.Lock()
+		defer m.mu.Unlock()
 		if m.proc == p {
+			if err := m.restarts.clear(); err != nil {
+				return err
+			}
 			m.runtimeAck = ack
 			close(m.ready)
 		}
-		m.mu.Unlock()
+		return nil
 	}
 	for {
 		ack, err := m.controlClaim(ctx)
@@ -431,7 +438,11 @@ func (m *Machine) claimRuntime(p *runtimeProcess) {
 					return
 				}
 			}
-			ready(ack)
+			if err := ready(ack); err != nil {
+				m.restarts.fail(&launchRefusal{"runtime_restart_state_unavailable", err.Error()})
+				p.stop()
+				return
+			}
 			return
 		}
 		if err == nil && ack.Rejection != pb.ClaimRejection_CLAIM_REJECTION_UNDURABLE {
@@ -578,17 +589,8 @@ func (m *Machine) supervise(ctx context.Context) error {
 			default: // keep observing rental idleness while an in-flight commit settles
 			}
 		}
-		busy, err := false, error(errors.New("Runtime activity is unavailable"))
-		if m.phase() == "ready" {
-			busy, err = work.observe(now)
-		}
-
-		// Software maintenance is not accepted workload and cannot establish or
-		// renew a rental work obligation. Its own progress guard owns recovery.
-		if m.preparations() {
-			busy, err = true, nil
-		}
-		deadline, observeErr := m.idle.observe(now, busy, err == nil)
+		busy, known := m.observeActivity(work, now)
+		deadline, observeErr := m.idle.observe(now, busy, known)
 		if observeErr != nil && !errors.Is(observeErr, errReleased) {
 			return observeErr
 		}
@@ -628,6 +630,22 @@ func (m *Machine) supervise(ctx context.Context) error {
 	}
 }
 
+// A live process protects unknown activity. Maintenance without a Runtime is not
+// accepted work and cannot renew a rental's idle deadline.
+func (m *Machine) observeActivity(work *activity, now time.Time) (busy, known bool) {
+	if !m.running() {
+		return false, true
+	}
+	if m.preparations() {
+		return true, true
+	}
+	if m.phase() != "ready" {
+		return false, false
+	}
+	busy, err := work.observe(now)
+	return busy, err == nil
+}
+
 func (m *Machine) running() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -640,13 +658,14 @@ func (m *Machine) relaunchAfter(p *runtimeProcess) error {
 		m.mu.Unlock()
 		return nil
 	}
+	wasReady := m.runtimeAck != nil
 	m.proc = nil
 	updating := m.inUpdate
 	m.mu.Unlock()
 	if p.stopped.Load() || updating { // the update relaunches it itself
 		return nil
 	}
-	if !m.restarts.exited(p.err) {
+	if !m.restarts.exited(p.err, wasReady) {
 		fmt.Fprintln(m.log, "cozy machine: the Runtime failed structurally; repair or update it before retrying:", exitText(p.err))
 		return nil
 	}

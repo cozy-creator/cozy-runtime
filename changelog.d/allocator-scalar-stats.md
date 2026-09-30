@@ -1,0 +1,1 @@
+- Read scalar allocator facts directly from fresh nested statistics, avoiding full dictionary flattening while preserving sampling cadence, driver-race checks and memory admission.

@@ -1,0 +1,1 @@
+Managed fills now admit exact staging host bytes before allocation, reuse a bounded ring, and retain buffer/credit ownership through failed drains. Group construction and operation paths use existing aggregate host authority; one-slot synchronous staging supports smaller available host budgets.
