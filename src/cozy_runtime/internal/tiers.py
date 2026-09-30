@@ -52,6 +52,115 @@ class Store(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class DTypeConvert:
+    """A canonical Torch dtype conversion, after Runtime removes device-move intent."""
+
+    apply: Convert
+
+    def __call__(self, tensor: Tensor) -> Tensor:
+        return self.apply(tensor)
+
+
+@dataclass(frozen=True)
+class LoadDemand:
+    resident: int
+    peak: int
+
+
+def _canonical_dtype(torch: Torch, fn: Convert) -> bool:
+    code = getattr(fn, "__code__", None)
+    if code is None:
+        return False
+    methods = ("to", "half", "float", "double", "bfloat16", "type", "cpu", "cuda")
+    known = any(
+        code is constant
+        for name in methods
+        for constant in getattr(
+            getattr(getattr(torch.nn.Module, name), "__code__", None), "co_consts", ()
+        )
+    )
+    # Memory-format transforms have shape/stride allocation semantics beyond dtype.
+    closure = dict(
+        zip(getattr(code, "co_freevars", ()), getattr(fn, "__closure__", ()) or (), strict=True)
+    )
+    layout = closure.get("convert_to_format")
+    return known and (layout is None or layout.cell_contents is None)
+
+
+def load_demand(torch: Torch, unit: Unit) -> LoadDemand:
+    """Current fill backing, settled dtype bytes and conservative conversion overlap.
+
+    Only the installed Torch's canonical dtype closures establish this bound. Calling
+    an arbitrary transform on a scalar does not prove its real allocation demand.
+    """
+    if unit.tier != DISK or not unit.pending:
+        return LoadDemand(unit.nbytes, unit.nbytes)
+    if not all(isinstance(convert, DTypeConvert) for convert in unit.pending):
+        raise RuntimeFailure("unbounded stored conversion", code="memory_capability")
+    slots = list(unit.slots())
+    if any(type(module)._apply is not torch.nn.Module._apply for _, module in unit.owners()):
+        raise RuntimeFailure(
+            "custom owner conversion has no allocation bound", code="memory_capability"
+        )
+    if any(
+        type(tensor) not in (torch.Tensor, torch.nn.Parameter)
+        or tensor.layout != torch.strided
+        or tensor.grad is not None
+        for *_, tensor in slots
+    ):
+        raise RuntimeFailure(
+            "stored conversion requires plain gradient-free tensors", code="memory_capability"
+        )
+    dtypes = [tensor.dtype for *_, tensor in slots]
+    sizes = [tensor.numel() * tensor.element_size() for *_, tensor in slots]
+    peak = max(unit.nbytes, sum(sizes))
+    converted = False
+    for convert in unit.pending:
+        changed = [convert(torch.empty(0, dtype=dtype, device="meta")).dtype for dtype in dtypes]
+        next_sizes = [
+            tensor.numel() * torch.empty(0, dtype=dtype, device="meta").element_size()
+            for (*_, tensor), dtype in zip(slots, changed, strict=True)
+        ]
+        if changed != dtypes:
+            converted = True
+            seen: set[int] = set()
+            for *_, tensor in slots:
+                storage = tensor.untyped_storage()
+                identity = int(storage._cdata)
+                if identity in seen or storage.nbytes() != tensor.numel() * tensor.element_size():
+                    raise RuntimeFailure(
+                        "stored conversion cannot split aliased backing", code="memory_capability"
+                    )
+                seen.add(identity)
+        allocated = sum(
+            size
+            for size, before, after in zip(next_sizes, dtypes, changed, strict=True)
+            if before != after
+        )
+        peak = max(peak, sum(sizes) + allocated)
+        sizes, dtypes = next_sizes, changed
+    return LoadDemand(sum(sizes), peak) if converted else LoadDemand(unit.nbytes, peak)
+
+
+def load_sequence(torch: Torch, units: tuple[Unit, ...], *, whole: bool = False) -> LoadDemand:
+    """New capacity for sequential unit loads, or one whole fill before replaying casts."""
+    missing = [unit for unit in units if unit.tier != DEVICE]
+    demands = [load_demand(torch, unit) for unit in missing]
+    if whole:
+        current = sum(unit.nbytes for unit in missing)
+        peak = current
+        for unit, demand in zip(missing, demands, strict=True):
+            peak = max(peak, current - unit.nbytes + demand.peak)
+            current += demand.resident - unit.nbytes
+        return LoadDemand(current, peak)
+    current = peak = 0
+    for demand in demands:
+        peak = max(peak, current + demand.peak)
+        current += demand.resident
+    return LoadDemand(current, peak)
+
+
 @dataclass(eq=False)
 class Unit:
     path: str
@@ -582,6 +691,9 @@ def intercept_apply(
     def _apply(fn: Convert, recurse: bool = True) -> Module:
         if component.moving or not recurse:
             return type(root)._apply(root, fn, recurse)
+        canonical = _canonical_dtype(torch, fn)
+        if not canonical and any(unit.tier == DISK for unit in component.units):
+            raise RuntimeFailure("unbounded transform on stored weights", code="memory_capability")
         # A real meta tensor cannot execute .to(cpu/cuda). FakeTensor traces device
         # intent without allocating or initializing that device, including .cuda().
         from torch._subclasses.fake_tensor import FakeTensorMode
@@ -601,6 +713,16 @@ def intercept_apply(
                     raise TypeError("unsupported device conversion on a managed component")
                 return root
             fn = functools.partial(_cast, probes[0].dtype)
+        if canonical:
+            fn = DTypeConvert(fn)
+        # Prove every parked replay before mutating any resident owner or queue.
+        for unit in component.units:
+            if unit.tier == DISK:
+                unit.pending.append(fn)
+                try:
+                    load_demand(torch, unit)
+                finally:
+                    unit.pending.pop()
         if any(
             getattr(module, "_compiled_call_impl", None) is not None for module in root.modules()
         ):
@@ -621,6 +743,9 @@ def intercept_apply(
                         fake = mode.from_tensor(tensor)
                         if fn(fake) is not fake:
                             raise RuntimeError("a managed conversion cannot split aliased storage")
+        # Invalidate before the first mutation too: an exception can leave a partially
+        # converted resident module, which must not reuse old resource observations.
+        applied()
         for unit in component.units:
             if unit.tier == DISK:
                 unit.pending.append(fn)
