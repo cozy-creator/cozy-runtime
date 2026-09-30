@@ -277,7 +277,9 @@ def composer(graph: Graph) -> Callable[[object], None]:
         from torch import nn
     except ImportError as exc:
         raise _refuse(
-            "backend_unavailable", "prepared LoRA graphs require Runtime's adapters extra"
+            "backend_unavailable",
+            "prepared LoRA graphs require cozy-runtime[adapters] in the package dependencies; "
+            "add the extra and relock the package",
         ) from exc
 
     # Private construction recipe only; rank and alpha are set independently for each term.

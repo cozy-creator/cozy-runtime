@@ -5,6 +5,8 @@ function retains its usual Model parameter; it needs no LoRA argument. A model
 library opts into the components it can adapt through `__adapter_compatibility__`.
 The shared Runtime composer supports ordinary linear A/B factors and refuses
 unsupported keys, shapes, target types or model components with an adapter error.
+Generic model packages declare `cozy-runtime[adapters]` to install the PEFT backend.
+The existing `minimax-h3` extra includes it; `model-execution` remains TensorFS-only.
 
 Model choices travel with a release root, a captured execution, or an authenticated
 private placement. A bare parameter selects the root's own model. A qualified
