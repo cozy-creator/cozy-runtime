@@ -1,7 +1,8 @@
-"""Runtime-owned paging units from a model's existing no-split forward boundaries.
+"""A component's weight-plane regions, from the model's own no-split forward boundaries.
 
-The layout carries module references and shape facts, never tensor payloads or a CPU
-state dict. Physical placement and completion fences remain in fill/residency.
+The layout carries module references and shape facts, never tensor payloads. `common` holds
+every weight outside a block; each innermost declared block is one region the plane moves
+as a unit and the executor hooks once per call (`weights.py`).
 """
 
 from __future__ import annotations
@@ -16,18 +17,6 @@ class PageUnit:
     owners: tuple[tuple[str, Any], ...]
     nbytes: int
     keys: tuple[str, ...]
-
-    def live(self, component: str) -> dict[str, Any]:
-        """The current registered destinations, including after a to_empty replacement."""
-        result: dict[str, Any] = {}
-        for path, module in self.owners:
-            prefix = f"{component}.{path}." if path else f"{component}."
-            for name, tensor in module.named_parameters(recurse=False, remove_duplicate=False):
-                result[prefix + name] = tensor.detach()
-            for name, tensor in module.named_buffers(recurse=False, remove_duplicate=False):
-                if name not in module._non_persistent_buffers_set:
-                    result[prefix + name] = tensor.detach()
-        return result
 
 
 @dataclass(frozen=True)
@@ -67,11 +56,13 @@ def partition(root: Any) -> BlockLayout | None:
     ):
         raise ValueError("no-split module declarations must contain class names")
     modules = list(root.named_modules(remove_duplicate=False))
-    blocks = [path for path, module in modules if path and type(module).__name__ in classes]
+    declared = [path for path, module in modules if path and type(module).__name__ in classes]
+    # The innermost declared instances are the blocks: an outer declared container (SDXL's
+    # CrossAttnUpBlock2D around its resnets and transformer blocks) keeps only its own
+    # weights, which fall to `common`.
+    blocks = [a for a in declared if not any(b.startswith(a + ".") for b in declared)]
     if not blocks:
         return None
-    if any(a != b and b.startswith(a + ".") for a in blocks for b in blocks):
-        raise ValueError("declared paging blocks overlap")
     owners: dict[str, list[tuple[str, Any]]] = {"": [], **{path: [] for path in blocks}}
     sizes = dict.fromkeys(owners, 0)
     keys: dict[str, list[str]] = {path: [] for path in owners}

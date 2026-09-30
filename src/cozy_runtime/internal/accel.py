@@ -377,6 +377,14 @@ def synchronize(torch: Any, kind: str) -> None:
         torch.cuda.synchronize()
 
 
+def drain(torch: Any, kind: str) -> None:
+    """Wait for the CURRENT stream only: the caller's own queued work, not other streams'."""
+    if kind == "mps":
+        raise AcceleratorUnsupported("mps", "drain")
+    if kind == "cuda":
+        torch.cuda.current_stream().synchronize()
+
+
 def initialize(torch: Any, kind: str) -> None:
     """Bring the accelerator context up EAGERLY, so its cost is a measured prepare step
     rather than a surprise inside the first kernel."""

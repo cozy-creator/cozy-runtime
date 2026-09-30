@@ -320,7 +320,7 @@ class _RecordingBackend:
         self.events.append(FillEvent(key, spec.nbytes, self.route))
 
     def commit(self) -> None:
-        """No device copies to fence — the freeze point is cr-005's `StreamingFillBackend`."""
+        """No device copies to fence — the weight plane (`internal/weights.py`) owns device bytes."""
         return None
 
     def poison(self, keys: Sequence[str]) -> None:
