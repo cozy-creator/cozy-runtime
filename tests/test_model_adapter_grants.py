@@ -42,15 +42,15 @@ def test_generated_adapter_sources_bind_and_retain_without_parameter_collisions(
 ) -> None:
     store, base, adapter, _ = fixture(tmp_path)
     composed, _ = compose(store, tmp_path, "composed", base, [(adapter, 0.8)])
-    for name, source in (("base", base), ("style", adapter), ("composed", composed)):
+    for name, artifact in (("base", base), ("style", adapter), ("composed", composed)):
         store.replace_local(
             None,
             name,
-            source.tensorfs_receipt_digest,
-            source.manifest.digest,
-            source.manifest.length,
+            artifact.tensorfs_receipt_digest,
+            artifact.manifest.digest,
+            artifact.manifest.length,
         )
-    source = {
+    source: dict[str, object] = {
         "parameter": parameter,
         "repository": "local/base",
         "manifest": {"digest": base.manifest.digest, "length": base.manifest.length},
