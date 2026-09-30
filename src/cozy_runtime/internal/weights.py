@@ -1,13 +1,13 @@
 """Executor weights on the TensorFS weight plane (weight-plane.md §3-4).
 
 Construction runs on meta and torch never allocates a weight. The plane holds every weight
-byte, one weight set per component, in regions: `common` and each no-split block
+byte, one weight set per component, in regions: `common` and each innermost no-split block
 (`paging.partition`). A scope is a stage: at `admit` the policy (`weight_policy.stage`) picks
-each component's resident prefix and window inside the plane budget, the plane is asked for
-the prefix (`want`) and streams the tail through a slot ring (`stream`). Each block runs
-inside exactly one acquire/release, which rebinds cached typed views only when the region's
-address changed. A torch OOM at a block boundary lowers the budget (unmap only) and runs the
-block again; capacity never poisons the executor.
+each component's resident prefix and window inside the plane budget; the prefix is wanted and
+a cursor streams the rest through a slot ring in the blocks' execution order. Each block runs
+inside exactly one acquire/release; a resident region binds once at its stable address, a
+streamed one per slot, from cached views. A torch OOM at a block boundary lowers the budget
+(unmap only) and runs the block again; capacity never poisons the executor.
 """
 
 from __future__ import annotations
@@ -19,9 +19,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+import msgspec
 import tensorfs
 
-from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
+from cozy_runtime.author._errors import RuntimeFailure
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.internal import accel, canonical, plane, weight_policy
 from cozy_runtime.internal.derive import placing
@@ -34,6 +35,8 @@ from cozy_runtime.internal.encoding import (
     device_line,
     implementation_digest,
     launch_providers,
+    measure_device,
+    measure_runtime,
 )
 from cozy_runtime.internal.executor_replies import PlaneFacts, Streamed
 from cozy_runtime.internal.fill import (
@@ -47,11 +50,16 @@ from cozy_runtime.internal.fill import (
     tensorfs_requirement_dtype,
 )
 from cozy_runtime.internal.paging import partition
-from cozy_runtime.internal.probe import QualificationResult, observed_capability_records
-from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
+from cozy_runtime.internal.planfacts import PlanFacts
+from cozy_runtime.internal.probe import QualificationResult, observed_capability_records, qualify
+from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
 
 _REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB)")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+#: The TensorFS planning window a weight set's read plan is cut into.
+READ_WINDOW = 4 << 20
+#: Passes a cursor is opened for before it is reopened: comfortably more than one stage's.
+PASSES = 64
 
 
 class ResidencyRefusal(RuntimeFailure):
@@ -69,12 +77,12 @@ class ResidencyRefusal(RuntimeFailure):
 
 @dataclass(slots=True)
 class Weight:
-    """One checkpoint tensor: its stored parts in the region and where it binds."""
+    """One checkpoint tensor: its stored parts in its region and where it binds."""
 
     row: PlanRow
     route: str
     provider: Any
-    #: role -> (offset in the region, torch dtype name, shape)
+    #: role -> (byte offset from the region's first byte, TensorFS dtype, shape)
     parts: dict[str, tuple[int, str, tuple[int, ...]]]
     #: (tensor table, name, parameter?) for every module attribute that names this tensor
     sites: list[tuple[dict[str, Any], str, bool]] = field(default_factory=list)
@@ -85,18 +93,33 @@ class Weight:
     derived_roles: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class Views:
+    """A region's typed views at one address: the writes that bind them, and each weight's
+    stored parts by role (what decode and derived leaf roles read)."""
+
+    writes: list[tuple[dict[str, Any], str, Any]]
+    parts: list[dict[str, Any]]
+
+
+#: Where a region is bound: its stable address in the weight set's VA, or a cursor slot.
+RESIDENT = -1
+
+
 @dataclass(slots=True)
 class Region:
     index: int
     path: str
     module: Any
     weights: list[Weight]
-    nbytes: int
-    #: address -> this region's typed views there
+    #: byte offset of the region in the weight set's layout, and its 2 MiB-aligned span
+    offset: int = 0
+    span: int = 0
+    #: RESIDENT or a slot of the current cursor -> this region's typed views there
     views: dict[int, Views] = field(default_factory=dict)
     #: meta placeholders: the writes that unbind it
     unbound: list[tuple[dict[str, Any], str, Any]] = field(default_factory=list)
-    bound: int = 0
+    bound: int | None = None
     #: decoded tensors and derived leaf roles kept alive while bound
     derived: list[Any] = field(default_factory=list)
 
@@ -110,22 +133,27 @@ class Component:
     """One weight set: a constructed component's regions in the plane."""
 
     name: str
+    #: the weight set's name in the plane, unique in this process
+    key: str
     root: Any
-    handle: int
+    ws: Any
+    device: int
     regions: list[Region]
     layout: weight_policy.Layout
-    #: block region indexes in observed execution order (address order until observed)
+    #: torch views over the weight set's VA and the current cursor's slots
+    va: Any = None
+    slots: dict[int, Any] = field(default_factory=dict)
+    #: block region indexes in execution order, once a pass has been observed
     order: list[int] = field(default_factory=list)
     observed: bool = False
     seen: list[int] = field(default_factory=list)
-    #: forward passes of the blocks in the last stage: >1 is a cyclic (denoise) stage
+    #: block passes in the running stage, and in its last one: >1 is a cyclic (denoise) stage
     passes: int = 0
     last_passes: int = 0
     residence: weight_policy.Residence | None = None
     cursor: Any = None
     common: Any = None
-    streamed: frozenset[int] = frozenset()
-    resident: frozenset[int] = frozenset()
+    resident: tuple[int, ...] = ()
 
 
 # ------------------------------------------------------------------------ the process
@@ -134,9 +162,9 @@ class Component:
 class Weights:
     """This executor process's plane, budgets and every registered weight set (one per rank).
 
-    Every component of every construction shares one plane: least recently used across
-    them is the plane's priority order, so a construction switch moves nothing until a
-    stage wants the room.
+    Every component of every construction shares one plane. Least recently used across them
+    is the plane's priority order, so a construction switch moves nothing until a stage wants
+    the room, and an evicted component's bytes stay in the pinned tier.
     """
 
     def __init__(self, torch: Any, device: Any, kind: str) -> None:
@@ -145,15 +173,16 @@ class Weights:
         self.kind = kind
         self.index = int(device.index or 0)
         self.plane = plane.open_plane(self.index)
-        #: -1: no Worker budget; each stage derives one from what the driver has free
+        #: the Worker's budgets; -1: none given, each stage derives one from the driver
         self.budget = -1
-        self.pinned_budget = -1
-        self.applied = -1
+        self.pinned = -1
+        #: what the plane holds now (budgets start at 0 in the plane)
+        self.applied = 0
+        self.pinned_applied = 0
         self.clock = 0
-        self.components: dict[tuple[str, str], Component] = {}
+        self.components: dict[str, Component] = {}
         self.activation: dict[str, int] = {}
         self.oom_retries = 0
-        self.context_bytes = -1
         self.modes: dict[str, str] = {}
 
     def tick(self) -> int:
@@ -166,41 +195,44 @@ class Weights:
     # -- budgets
 
     def set_budget(self, vram: int, pinned: int = -1) -> int:
-        """The Worker's budgets. Lowering unmaps at once; returns the bytes released."""
-        freed = 0
-        if pinned >= 0 and pinned != self.pinned_budget:
-            self.plane.set_pinned_budget(pinned)
-            self.pinned_budget = pinned
+        """The Worker's budgets. Lowering unmaps at once; returns the device bytes freed."""
+        if pinned >= 0:
+            self.pinned = pinned
+            self._pin(pinned)
         self.budget = vram
-        if vram >= 0:
-            freed = self._apply(vram)
+        freed = self._apply(vram) if vram >= 0 else 0
         if vram == 0:
             accel.release_cached(self.torch, self.kind)
         return freed
 
     def _apply(self, nbytes: int) -> int:
+        nbytes = max(nbytes, 0)
         if nbytes == self.applied:
             return 0
-        before = plane.stats(self.plane).committed
-        self.plane.set_vram_budget(self.index, max(nbytes, 0))
+        trim = self.plane.set_vram_budget(self.index, nbytes)
         self.applied = nbytes
-        self.unbind_evicted()
-        return max(before - plane.stats(self.plane).committed, 0)
+        self._evicted(trim.get("evicted", ()))
+        return int(trim.get("freed", 0))
+
+    def _pin(self, nbytes: int) -> None:
+        if nbytes != self.pinned_applied:
+            self.plane.set_pinned_budget(nbytes)
+            self.pinned_applied = nbytes
 
     def vacate(self) -> int:
         """Unmap every unleased weight (an older Worker's `Vacate`) without fixing a budget:
-        the next stage derives its own and wants its weights back from the host tier."""
+        the next stage derives its own and wants its weights back from the pinned tier."""
         freed = self._apply(0)
-        self.applied = -1
+        accel.release_cached(self.torch, self.kind)
         return freed
 
     def stage_budget(self, method: str) -> int:
-        """The Worker's budget, else what the driver has free beside this process's weights,
-        less the activations this method measured (activations first)."""
+        """The Worker's budget, else what the driver has free beside this process's weights
+        less the activation growth this method measured (activations first)."""
         if self.budget >= 0:
             return self.budget
         memory = accel.allocation(self.torch, self.kind)
-        committed = max(plane.stats(self.plane).committed, 0)
+        committed = max(plane.stats(self.plane).device(self.index).committed, 0)
         # torch reuses its own cached segments first; only growth beyond them needs the driver
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
         growth = max(self.activation.get(method, 0) - slack, 0)
@@ -208,127 +240,175 @@ class Weights:
 
     def shrink(self, need: int, floor: int) -> int:
         """OOM at a block boundary: give torch `need` more bytes by unmapping plane bytes."""
-        current = self.applied if self.applied >= 0 else max(plane.stats(self.plane).committed, 0)
-        target = max(current - need - weight_policy.MARGIN, floor)
-        if target >= current:
+        target = max(self.applied - need - weight_policy.MARGIN, floor)
+        if target >= self.applied:
             return 0
         self.oom_retries += 1
         return self._apply(target)
 
-    def unbind_evicted(self) -> None:
-        """Point every bound region the plane no longer holds at meta, before any kernel
-        could read it. The plane evicts only inside calls this process makes."""
-        for component in self.components.values():
-            resident = self.plane.resident(component.handle, self.index)
-            for region in component.regions:
-                if (
-                    region.bound
-                    and region.index not in resident
-                    and region.index not in (component.streamed)
-                ):
+    def drain(self) -> None:
+        """Read the plane's events: an evicted region's destinations go back to meta before
+        any kernel could read unmapped pages."""
+        self._evicted(
+            (event.ws, event.region)
+            for event in plane.events(self.plane)
+            if event.kind == "evicted"
+        )
+
+    def _evicted(self, pairs: Any) -> None:
+        for name, index in pairs:
+            component = self.components.get(str(name))
+            if component is not None and 0 <= int(index) < len(component.regions):
+                region = component.regions[int(index)]
+                if region.bound == RESIDENT:
                     unbind(region)
+
+    def resident_bytes(self, component: Component) -> int:
+        return plane.stats(self.plane).ready(component.key, self.index)
+
+    # -- the pinned tier
+
+    def register(self, component: Component) -> None:
+        """Track a new weight set and start filling the pinned tier with it. Without a Worker
+        budget the tier holds what this process registered, up to half the host's available
+        memory; it is optional and shrinkable (page cache and disk remain beneath it)."""
+        self.components[component.key] = component
+        if self.pinned < 0:
+            total = sum(c.ws.nbytes for c in self.components.values())
+            self._pin(min(total, max(_host_available(), 0) // 2))
+        if self.pinned_applied > 0:
+            self.plane.want(component.ws, plane.PINNED, None, priority=self.tick())
+
+    def prefetch(self, construction: str) -> int:
+        """Fill the pinned tier with every region of `construction`, now; returns the bytes."""
+        total = 0
+        for component in self.components.values():
+            if component.key.startswith(construction + "/"):
+                self.plane.want(component.ws, plane.PINNED, None, priority=self.tick())
+                total += component.ws.nbytes
+        return total
+
+    def forget(self, construction: str) -> None:
+        for key in [key for key in self.components if key.startswith(construction + "/")]:
+            component = self.components.pop(key)
+            close_cursor(component)
+            if component.common is not None:
+                component.common.release()
+                component.common = None
+            for region in component.regions:
+                unbind(region)
+                region.views.clear()
+            component.va = None
+            component.ws.close()
 
     # -- facts
 
-    def resident_bytes(self, component: Component) -> int:
-        return plane.stats(self.plane).resident.get(str(component.handle), 0)
-
     def facts(self) -> PlaneFacts:
         held = plane.stats(self.plane)
+        device = held.device(self.index)
         resident: dict[str, int] = {}
-        for (_, name), component in self.components.items():
-            resident[name] = resident.get(name, 0) + held.resident.get(str(component.handle), 0)
+        for component in self.components.values():
+            resident[component.name] = resident.get(component.name, 0) + held.ready(
+                component.key, self.index
+            )
+        stages = [row for row in held.stages if row.device == self.index]
+        copied = device.host_copy_bytes + device.disk_copy_bytes
+        copy_ns = device.host_copy_ns + device.disk_copy_ns
         return PlaneFacts(
-            budget_bytes=held.budget,
-            committed_bytes=held.committed,
-            leased_bytes=held.leased,
-            pinned_budget_bytes=held.pinned_budget,
-            pinned_bytes=held.pinned,
-            context_bytes=self.context_bytes,
+            budget_bytes=device.budget,
+            committed_bytes=device.committed,
+            leased_bytes=device.leased_bytes + device.held_bytes,
+            pinned_budget_bytes=held.host.budget,
+            pinned_bytes=held.host.used,
             resident=resident,
             streamed={
-                key[1]: Streamed(
+                component.name: Streamed(
                     blocks=len(component.layout.blocks),
                     resident_blocks=len(component.residence.resident),
                     window=component.residence.window,
                 )
-                for key, component in self.components.items()
+                for component in self.components.values()
                 if component.residence is not None
             },
-            h2d_bytes=held.h2d_bytes,
-            h2d_gbps=held.h2d_gbps,
-            late=held.late,
-            stall_ns=held.stall_ns,
-            misses=held.misses,
-            evictions=held.evictions,
+            h2d_bytes=copied,
+            h2d_gbps=round(copied / copy_ns, 3) if copy_ns else 0.0,
+            late=sum(row.late for row in stages),
+            stall_ns=sum(row.stall_ns for row in stages),
+            misses=device.misses,
+            evictions=device.evictions,
             oom_retries=self.oom_retries,
             modes=dict(self.modes),
         )
 
-    # -- construction lifecycle
 
-    def prefetch(self, construction: str) -> int:
-        """Fill the host tier with every region of `construction`, now; returns the bytes."""
-        total = 0
-        for (key, _), component in self.components.items():
-            if key == construction:
-                regions = [region.index for region in component.regions]
-                self.plane.want(
-                    component.handle, plane.pinned(), regions, (plane.IDLE, self.tick())
-                )
-                total += component.layout.total
-        return total
-
-    def forget(self, construction: str) -> None:
-        for key in [key for key in self.components if key[0] == construction]:
-            component = self.components.pop(key)
-            for region in component.regions:
-                unbind(region)
-            self.plane.unregister(component.handle)
+def _host_available() -> int:
+    """`MemAvailable`, or -1 where the kernel does not say."""
+    try:
+        with open("/proc/meminfo", "rb") as rows:
+            for row in rows:
+                if row.startswith(b"MemAvailable:"):
+                    return int(row.split()[1]) << 10
+    except (OSError, ValueError, IndexError):
+        return -1
+    return -1
 
 
 # ---------------------------------------------------------------------------- binding
 
 
-@dataclass(frozen=True, slots=True)
-class Views:
-    """A region's typed views at one address: the writes that bind them, and each weight's
-    stored parts by role (what decode and derived leaf roles read)."""
-
-    writes: list[tuple[dict[str, Any], str, Any]]
-    parts: list[dict[str, Any]]
-
-
-def bind(torch: Any, region: Region, lease: Any, *, fresh: bool) -> None:
-    """Point the region's destinations at the lease. Views are cached per address; decoded
-    tensors and derived leaf roles are recomputed when the address or the content moved
-    (`fresh`: a slot the ring just refilled)."""
-    address = int(lease.address)
-    views = region.views.get(address)
+def bind(torch: Any, component: Component, region: Region, slot: int | None) -> None:
+    """Point the region's destinations at its bytes: its stable address when resident
+    (`slot` None), else the cursor slot the plane filled. Decoded tensors and derived leaf
+    roles are recomputed when the bytes moved."""
+    where = RESIDENT if slot is None else int(slot)
+    views = region.views.get(where)
     if views is None:
-        views = region.views[address] = _views(torch, region, torch.from_dlpack(lease.view()))
-    moved = region.bound != address
+        if where == RESIDENT:
+            if component.va is None:
+                component.va = torch.from_dlpack(component.ws.view(component.device))
+            base = component.va[region.offset : region.offset + region.span]
+        else:
+            base = component.slots.get(where)
+            if base is None:
+                base = component.slots[where] = torch.from_dlpack(component.cursor.slot_view(where))
+        views = region.views[where] = _views(torch, region, base)
+    moved = region.bound != where
     if moved:
         for table, name, tensor in views.writes:
             table[name] = tensor
-    if region.transforms and (moved or fresh):
+    if region.transforms and (moved or where != RESIDENT):
         region.derived = _transform(torch, region, views.parts)
-    region.bound = address
+    region.bound = where
 
 
 def unbind(region: Region) -> None:
     for table, name, tensor in region.unbound:
         table[name] = tensor
     region.derived = []
-    region.bound = 0
+    region.bound = None
 
 
-def _views(torch: Any, region: Region, raw: Any) -> Views:
+def close_cursor(component: Component) -> None:
+    """Close the stage's cursor after dropping every view of its slots (views keep a cursor
+    open)."""
+    if component.cursor is None:
+        return
+    for region in component.regions:
+        if region.bound not in (None, RESIDENT):
+            unbind(region)
+        for where in [where for where in region.views if where != RESIDENT]:
+            del region.views[where]
+    component.slots.clear()
+    component.cursor.close()
+    component.cursor = None
+
+
+def _views(torch: Any, region: Region, base: Any) -> Views:
     writes: list[tuple[dict[str, Any], str, Any]] = []
     parts: list[dict[str, Any]] = []
     for weight in region.weights:
         typed = {
-            role: raw[offset : offset + _nbytes(shape, dtype)]
+            role: base[offset : offset + _nbytes(shape, dtype)]
             .view(getattr(torch, TORCH_DTYPES[dtype]))
             .view(shape)
             for role, (offset, dtype, shape) in weight.parts.items()
@@ -440,6 +520,56 @@ class PlaneBackend:
             key: self._select(key, row) for key, row in self.plan.items()
         }
         self.encoded_leaves = "refuse"
+
+    @classmethod
+    def for_script(
+        cls,
+        checkpoints: Mapping[str, Checkpoint],
+        rows: Sequence[PlanRow],
+        *,
+        weights: Weights,
+        construction: str,
+        release: str,
+        objective: str = "latency",
+        encoded_leaves: str = "accept",
+    ) -> PlaneBackend:
+        """A backend for a driver script with no model class: measure, qualify, resolve a
+        `script_plan` over these rows, then construct, through the executor's own authority."""
+        torch = weights.torch
+        facts = measure_device(torch, weights.index)
+        providers = launch_providers()
+        qualified = qualify(
+            torch,
+            providers,
+            facts,
+            sorted({dtype_name(row.dtype) for row in rows}),
+            release=release,
+        )
+        plan = script_plan(
+            rows=rows,
+            components=sorted({row.component for row in rows}),
+            release=release,
+            store="script",
+            snapshot=next(iter(checkpoints.values())).manifest_id,
+            snapshots={name: book.manifest_id for name, book in checkpoints.items()},
+            providers=providers,
+            capabilities=qualified[0],
+            device=facts,
+            runtime=measure_runtime(torch, release),
+            facts=PlanFacts(),
+            objective=objective,
+            encoded_leaves=encoded_leaves,
+            dtype_name=dtype_name,
+        )
+        return cls(
+            checkpoints,
+            rows,
+            plan=plan,
+            weights=weights,
+            construction=construction,
+            qualified=qualified,
+            device_facts=facts,
+        )
 
     def _select(self, key: str, row: PlanRow) -> Selection:
         """The plan's provider for one destination, matched by digest against this build and
@@ -639,7 +769,7 @@ class PlaneBackend:
             if keys:
                 component = self._register(name, root, keys, leaves)
                 self.components[name] = component
-                self.weights.components[(self.construction, name)] = component
+                self.weights.register(component)
         self.stats["register_ms"] = round((time.perf_counter() - started) * 1000, 2)
         self.state = "ready"
 
@@ -715,31 +845,46 @@ class PlaneBackend:
         keys: list[str],
         leaves: Mapping[str, tuple[Any, Any, tuple[str, ...]]],
     ) -> Component:
-        """Partition the component into regions, lay out their stored parts, find every
-        binding site, and register the weight set."""
+        """Partition the component into regions (common, then each block), register them as
+        one weight set, and bind every stored part to the destinations that name it."""
         try:
             layout = partition(root)
         except ValueError:
-            layout = None  # shared storage across blocks: one region, not streamable
+            layout = None  # storage shared across blocks: one region, not streamable
         blocks = [unit.path for unit in layout.blocks] if layout is not None else []
         members: list[list[str]] = [[] for _ in range(len(blocks) + 1)]
         for key in keys:
             path = key[len(name) + 1 :].rpartition(".")[0]
             members[_unit_of(path, blocks)].append(key)
+        if not members[0]:  # every weight in a block: one region
+            members, blocks = [keys], []
+        kept = [(index, group) for index, group in enumerate(members) if group]
+        checkpoint = self.checkpoints[name]
+        plan = checkpoint.read_plan(
+            [(name, self.plan[key].name) for key in keys], READ_WINDOW, (name,)
+        )
+        weights = self.weights
+        with store_refusals(f"registering {name}"):
+            ws = weights.plane.register(
+                f"{self.construction}/{name}",
+                checkpoint.store,
+                self.leases.take(name),
+                plan,
+                [[f"{name}/{self.plan[key].name}" for key in group] for _, group in kept],
+            )
+        spans = msgspec.convert(ws.regions, list[_Span])
+        placed = {row.what: row for row in msgspec.convert(ws.parts, list[_Placed])}
         sites = _sites(root, name)
         regions: list[Region] = []
-        specs: list[plane.Region] = []
-        for index, group in enumerate(members):
-            placed, nbytes = plane.layout(
-                [
-                    (self.plan[key].role_what(part.role), part.nbytes)
-                    for key in group
-                    for part in self.plan[key].encoded.parts
-                ]
+        for (index, group), span in zip(kept, spans, strict=True):
+            region = Region(
+                index=len(regions),
+                path=blocks[index - 1] if index else "",
+                module=root.get_submodule(blocks[index - 1]) if index else root,
+                weights=[],
+                offset=span.offset,
+                span=span.span,
             )
-            offsets = iter(placed)
-            region_weights: list[Weight] = []
-            unbound: list[tuple[dict[str, Any], str, Any]] = []
             for key in group:
                 row = self.plan[key]
                 weight = Weight(
@@ -747,48 +892,49 @@ class PlaneBackend:
                     route=self._route(key),
                     provider=self.selected[key].provider,
                     parts={
-                        part.role: (next(offsets).offset, part.dtype, tuple(part.shape))
+                        part.role: (
+                            placed[row.role_what(part.role)].offset - span.offset,
+                            part.dtype,
+                            tuple(part.shape),
+                        )
                         for part in row.encoded.parts
                     },
                     sites=sites.get(key, []),
                 )
                 if key in leaves:
                     weight.leaf, weight.replaced, weight.derived_roles = leaves[key]
-                    unbound.extend(
-                        (weight.leaf._buffers, role, t) for role, t in weight.leaf.roles().items()
+                    region.unbound.extend(
+                        (weight.leaf._buffers, role, tensor)
+                        for role, tensor in weight.leaf.roles().items()
                     )
-                unbound.extend((table, attr, table[attr]) for table, attr, _ in weight.sites)
-                region_weights.append(weight)
-            module = root.get_submodule(blocks[index - 1]) if index else root
-            regions.append(
-                Region(
-                    index,
-                    blocks[index - 1] if index else "",
-                    module,
-                    region_weights,
-                    nbytes,
-                    unbound=unbound,
-                )
-            )
-            specs.append(plane.Region(index, placed, nbytes))
-        checkpoint = self.checkpoints[name]
-        handle = self.weights.plane.register(
-            (checkpoint.manifest_id, name, self.execution.digest()),
-            specs,
-            source=self.leases.acquire(name),
-            header=checkpoint.header_bytes,
-        )
-        sizes = weight_policy.Layout(
-            common=regions[0].nbytes, blocks=tuple(region.nbytes for region in regions[1:])
-        )
+                region.unbound.extend((table, attr, table[attr]) for table, attr, _ in weight.sites)
+                region.weights.append(weight)
+            regions.append(region)
         return Component(
             name=name,
+            key=f"{self.construction}/{name}",
             root=root,
-            handle=handle,
+            ws=ws,
+            device=weights.index,
             regions=regions,
-            layout=sizes,
-            order=list(range(1, len(regions))),
+            layout=weight_policy.Layout(
+                common=regions[0].span, blocks=tuple(region.span for region in regions[1:])
+            ),
         )
+
+
+class _Span(msgspec.Struct, frozen=True):
+    index: int
+    offset: int
+    nbytes: int
+    span: int
+
+
+class _Placed(msgspec.Struct, frozen=True):
+    what: str
+    region: int
+    offset: int
+    nbytes: int
 
 
 def _unit_of(path: str, blocks: Sequence[str]) -> int:
@@ -852,20 +998,22 @@ class WeightResidency:
         self.components = dict(components)
         #: method -> the components it declares (`component_use`)
         self.scopes = dict(scopes or {})
-        #: method -> activation bytes per batch item, measured; and the batch it last ran at
-        self.per_item: dict[str, int] = {}
-        self.batch: dict[str, int] = {}
         self.hosted: frozenset[str] = frozenset()
         self.active: tuple[str, tuple[str, ...]] | None = None
         self.spare = False
         self.poisoned = ""
         self.last_shortfall: dict[str, Any] | None = None
         self.refusals: list[str] = []
+        #: this attempt's activation peak per method, and per batch item with the batch it ran
         self.peaks: dict[str, int] = {}
+        self.per_item: dict[str, int] = {}
+        self.batch: dict[str, int] = {}
         self.baseline = -1
         #: The scheduler's turn (W4, `stage/1`): called before a stage plans, returns the
         #: plane budget the Worker granted for it, or None to keep the current one.
         self.turn: Callable[[str, tuple[str, ...]], int | None] | None = None
+        self._mismatch = plane.error("ScheduleMismatch") if plane.available() else Exception
+        self._shortfall_error = plane.error("Shortfall") if plane.available() else Exception
         for component in self.components.values():
             for region in component.regions[1:]:
                 module = region.module
@@ -885,7 +1033,7 @@ class WeightResidency:
         self._require_clean(method)
         if self.active is not None:
             self.refusals.append(f"fault scope_overlap: {method} entered inside {self.active[0]}")
-            self.active = None
+            self.release(*self.active)
         local = tuple(
             name for name in components if name in self.components and name not in self.hosted
         )
@@ -894,45 +1042,39 @@ class WeightResidency:
             granted = self.turn(method, components)
             if granted is not None:
                 weights.set_budget(granted)
+        self.active = (method, local)
         try:
-            self._plan(local, weights.stage_budget(method), method)
-        except weight_policy.BelowFloor as exc:
-            raise self._shortfall(method, exc.needed, exc.available, str(exc)) from None
+            self._plan(method, local, weights.stage_budget(method))
+        except BaseException:
+            self.active = None
+            raise
         stream = weights.stream()
         for name in local:
             component = self.components[name]
             component.passes = 0
-            component.common = weights.plane.acquire(component.handle, weights.index, 0, stream)
-            bind(weights.torch, component.regions[0], component.common, fresh=False)
+            component.common = weights.plane.acquire(component.ws, weights.index, 0, stream)
+            bind(weights.torch, component, component.regions[0], component.common.slot)
         self.baseline = accel.allocated(weights.torch, weights.kind)
         accel.reset_peak(weights.torch, weights.kind)
-        self.active = (method, local)
 
     def release(self, method: str, components: tuple[str, ...]) -> None:
         if self.active is None:
             self.refusals.append(f"fault scope_over_release: {method}")
             return
         weights = self.weights
-        stream = weights.stream()
-        order = weights.tick()
-        for name in self.active[1]:
+        method, local = self.active
+        idle = weights.tick()
+        for name in local:
             component = self.components[name]
+            close_cursor(component)
             if component.common is not None:
-                component.common.release(stream)
+                component.common.release()
                 component.common = None
-            if component.cursor is not None:
-                component.cursor.close()
-                component.cursor = None
-            component.streamed = frozenset()
             component.last_passes = component.passes
             # Released weights stay mapped and bound, at idle priority: least recently used
             # first when another stage wants the room.
-            weights.plane.want(
-                component.handle,
-                plane.vram(weights.index),
-                sorted(component.resident),
-                (plane.IDLE, order),
-            )
+            weights.plane.want(component.ws, weights.index, list(component.resident), priority=idle)
+        weights.drain()
         if self.baseline >= 0:
             peak = max(accel.peak_allocated(weights.torch, weights.kind) - self.baseline, 0)
             self.peaks[method] = max(self.peaks.get(method, 0), peak)
@@ -942,7 +1084,7 @@ class WeightResidency:
         self.baseline = -1
         self.active = None
 
-    # -- the executor's calls
+    # -- the executor's and the package's calls
 
     def host(self, name: str) -> None:
         """`name` lives on another GPU of the group: never held here."""
@@ -969,11 +1111,11 @@ class WeightResidency:
         self._drop([c for name, c in self.components.items() if name not in held])
 
     def vacate(self) -> dict[str, Any]:
-        """Unmap this construction's weights (an older Worker's `Vacate`). The bytes stay
-        in the host tier; the next stage wants them back at link speed."""
-        before = plane.stats(self.weights.plane).committed
-        self._drop([c for c in self.components.values() if c.common is None])
-        freed = max(before - plane.stats(self.weights.plane).committed, 0)
+        """Unmap this construction's idle weights. They stay in the pinned tier; the next
+        stage wants them back at link speed."""
+        idle = [c for c in self.components.values() if c.common is None]
+        freed = sum(self.weights.resident_bytes(c) for c in idle)
+        self._drop(idle)
         return {"freed": {}, "held": {}, "freed_bytes": freed}
 
     def batch_fits(self, method: str, batch: int) -> bool:
@@ -997,13 +1139,14 @@ class WeightResidency:
         free = memory["driver_free_bytes"] + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )
-        held = plane.stats(weights.plane)
+        device = plane.stats(weights.plane).device(weights.index)
         floor = sum(
             weight_policy.floor(self.components[name].layout, 1)
             for name in components
             if name in self.components
         )
-        return free, max(held.committed - held.leased - floor, 0)
+        movable = device.committed - device.leased_bytes - device.held_bytes - floor
+        return free, max(movable, 0)
 
     def document(self) -> dict[str, Any]:
         weights = self.weights
@@ -1025,42 +1168,59 @@ class WeightResidency:
             "refusals": self.refusals[-8:],
         }
 
-    # -- internals
+    # -- the stage
 
-    def _plan(self, local: tuple[str, ...], budget: int, method: str) -> None:
-        """Place the stage's components inside `budget`: prefix wanted, tail streamed."""
+    def _plan(
+        self, method: str, local: tuple[str, ...], budget: int, resume: Mapping[str, int] = {}
+    ) -> None:
+        """Place the stage's components inside `budget`: each prefix wanted, the rest
+        streamed by a cursor in the blocks' execution order (from `resume[name]` when a block
+        boundary re-plans mid-pass). Before a component's order is observed its blocks are
+        acquired on demand."""
         weights = self.weights
         components = {name: self.components[name] for name in local}
-        placed = weight_policy.stage(
-            {name: c.layout for name, c in components.items()},
-            budget,
-            orders={name: [index - 1 for index in c.order] for name, c in components.items()},
-            cyclic={name for name, c in components.items() if c.last_passes != 1},
-        )
-        if self.spare:
-            need = sum(r.vram_bytes(components[n].layout) for n, r in placed.items())
-            if need > budget:
-                raise ResidencyRefusal("device_spared", f"{method}() declined: needs {need} B")
+        try:
+            placed = weight_policy.stage(
+                {name: c.layout for name, c in components.items()},
+                budget,
+                orders={
+                    name: [index - 1 for index in c.order]
+                    for name, c in components.items()
+                    if c.observed
+                },
+                cyclic={name for name, c in components.items() if c.last_passes != 1},
+            )
+        except weight_policy.BelowFloor as exc:
+            raise self._shortfall(method, exc.needed, exc.available, str(exc)) from None
+        need = sum(r.vram_bytes(components[n].layout) for n, r in placed.items())
+        if self.spare and need > budget:
+            raise ResidencyRefusal("device_spared", f"{method}() declined: needs {need} B")
         weights._apply(budget)
-        order = weights.tick()
+        priority = plane.ACTIVE + weights.tick()
         for name, residence in placed.items():
             component = components[name]
-            if component.cursor is not None:
-                component.cursor.close()
-            resident = [0, *(index + 1 for index in residence.resident)]
-            streamed = [index + 1 for index in residence.streamed]
-            weights.plane.want(
-                component.handle, plane.vram(weights.index), resident, (plane.ACTIVE, order)
-            )
-            component.cursor = (
-                weights.plane.stream(component.handle, weights.index, streamed, residence.window, 0)
-                if streamed
-                else None
-            )
-            component.resident = frozenset(resident)
-            component.streamed = frozenset(streamed)
+            close_cursor(component)
             component.residence = residence
-        weights.unbind_evicted()
+            component.resident = (0, *(index + 1 for index in residence.resident))
+            try:
+                weights.plane.want(
+                    component.ws, weights.index, list(component.resident), priority=priority
+                )
+            except self._shortfall_error as exc:
+                raise self._shortfall(method, need, budget, str(exc)) from None
+            if residence.streamed and component.observed:
+                order = component.order
+                start = order.index(resume[name]) if name in resume else 0
+                component.cursor = weights.plane.stream(
+                    component.ws,
+                    weights.index,
+                    order[start:] + order[:start],
+                    residence.window,
+                    repeat=max(2 * component.last_passes, PASSES),
+                    priority=priority,
+                    tag=method,
+                )
+        weights.drain()
 
     def _block(
         self, component: Component, region: Region, forward: Callable[..., Any]
@@ -1072,35 +1232,22 @@ class WeightResidency:
         oom = accel.oom_error(torch, weights.kind)
 
         def run(*args: Any, **kwargs: Any) -> Any:
-            if component.common is None:
-                raise CapabilityError(
-                    f"{component.name}.{region.path} ran outside a component-use scope: its "
-                    "weights are bound only while a declared method holds them (§1.1)",
-                    code="no_active_scope",
-                )
             self._observe(component, region.index)
             versions = _versions(args, kwargs)
             while True:
                 stream = weights.stream()
-                streamed = region.index in component.streamed
-                lease = (
-                    component.cursor.acquire(region.index, stream)
-                    if streamed
-                    else weights.plane.acquire(
-                        component.handle, weights.index, region.index, stream
-                    )
-                )
+                lease = self._acquire(component, region.index, stream)
                 need = 0
                 try:
-                    bind(torch, region, lease, fresh=streamed)
+                    bind(torch, component, region, lease.slot)
                     try:
                         return forward(*args, **kwargs)
                     except oom as exc:
-                        need = _requested(exc) or region.nbytes
+                        need = _requested(exc) or region.span
                 finally:
-                    if streamed:
+                    if lease.slot is not None:
                         unbind(region)
-                    lease.release(stream)
+                    lease.release()
                 if _versions(args, kwargs) != versions:
                     raise self._shortfall(
                         self.active[0] if self.active else "",
@@ -1109,9 +1256,57 @@ class WeightResidency:
                         f"{component.name}.{region.path} ran out of memory after changing its "
                         "inputs in place, so it cannot run again",
                     )
-                self._make_room(need)
+                self._make_room(need, component, region.index)
 
         return run
+
+    def _acquire(self, component: Component, index: int, stream: int) -> Any:
+        """The block's lease: from the stage's cursor, else resident access (a demand fill
+        counted as a miss when the region is not on the device)."""
+        weights = self.weights
+        if component.cursor is not None:
+            try:
+                return component.cursor.acquire(index, stream)
+            except self._mismatch:
+                # The forward took another path than the last pass: serve the rest of this
+                # stage on demand and learn the order again from the next stage's first block.
+                close_cursor(component)
+                component.observed = False
+                component.seen = []
+        return weights.plane.acquire(component.ws, weights.index, index, stream)
+
+    def _make_room(self, need: int, component: Component, index: int) -> None:
+        """Activations first: unmap `need` bytes of weights, then re-place the stage with the
+        OOMing component's cursor resuming at the block that runs again."""
+        weights = self.weights
+        if self.active is None:
+            if not weights.shrink(need, 0):
+                raise self._shortfall("", need, 0, "no weight bytes are left to unmap")
+            return
+        method, local = self.active
+        for name in local:
+            close_cursor(self.components[name])
+        floor = sum(weight_policy.floor(self.components[name].layout, 1) for name in local)
+        if not weights.shrink(need, floor):
+            raise self._shortfall(method, need, 0, "no weight bytes are left to unmap")
+        self._plan(method, local, weights.applied, resume={component.name: index})
+
+    def _observe(self, component: Component, index: int) -> None:
+        """Count passes and learn the blocks' execution order from a stage's first pass."""
+        if component.observed:
+            if index == component.order[0]:
+                component.passes += 1
+            return
+        if not component.seen:
+            component.passes += 1
+        elif index == component.seen[0]:
+            component.passes += 1
+            unseen = [i for i in range(1, len(component.regions)) if i not in component.seen]
+            component.order = [*component.seen, *unseen]
+            component.observed = True
+            return
+        if index not in component.seen:
+            component.seen.append(index)
 
     def _decode(self, component: Component, decode: Callable[..., Any]) -> Callable[..., Any]:
         """An image VAE's decode mode, decided before the call from what is free plus what the
@@ -1159,35 +1354,11 @@ class WeightResidency:
 
         return run
 
-    def _make_room(self, need: int) -> None:
-        """Activations first: unmap `need` bytes of weights, then re-place the stage."""
-        assert self.active is not None
-        method, local = self.active
-        weights = self.weights
-        floor = sum(weight_policy.floor(self.components[name].layout, 1) for name in local)
-        if not weights.shrink(need, floor):
-            raise self._shortfall(method, need, 0, "no weight bytes are left to unmap")
-        self._plan(local, weights.applied, method)
-
-    def _observe(self, component: Component, index: int) -> None:
-        """Count passes and learn the blocks' execution order from the first pass."""
-        entry = component.order[0] if component.observed else (component.seen or [index])[0]
-        if index == entry:
-            component.passes += 1
-        if component.observed:
-            return
-        if index in component.seen:
-            unseen = [i for i in range(1, len(component.regions)) if i not in component.seen]
-            component.order = [*component.seen, *unseen]
-            component.observed = True
-        else:
-            component.seen.append(index)
-
     def _drop(self, components: Sequence[Component]) -> None:
         weights = self.weights
         for component in components:
-            everything = [region.index for region in component.regions]
-            weights.plane.drop(component.handle, plane.vram(weights.index), everything)
+            close_cursor(component)
+            weights.plane.drop(component.ws, weights.index, None)
             for region in component.regions:
                 unbind(region)
 

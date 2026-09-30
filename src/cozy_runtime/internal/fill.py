@@ -663,6 +663,13 @@ class ReadLeases:
             }
         return lease
 
+    def take(self, component: str) -> ReadLease:
+        """The lease for this component's manifest, handed over: a plane weight set consumes
+        its lease, so the next component of the same manifest takes a fresh one."""
+        lease = self.acquire(component)
+        del self.held[self.checkpoints[component].manifest_id]
+        return lease
+
     def _objects(self) -> int:
         return sum(len(one.objects) for one in self.held.values())
 

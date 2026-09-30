@@ -1,16 +1,13 @@
-"""The weight plane's one door into cozy-runtime (`tensorfs-plane`, weight-plane.md §3).
+"""The weight plane's one door into cozy-runtime (`tensorfs.plane`, weight-plane.md §3).
 
-Everything the runtime asks of the plane goes through this file, so the plane's Python API
-can move without touching the executor. The plane is mechanism: it never measures free
-memory, never picks a victim among equals and never reorders a schedule. It maps, copies,
-streams and counts; `weights.py` and `weight_policy.py` decide.
+The plane is mechanism: it never measures free memory, never picks a victim among equals and
+never reorders a schedule. It maps, copies, streams and counts; `weights.py` and
+`weight_policy.py` decide. Everything the runtime reads back from it is typed here.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 import msgspec
 
@@ -21,139 +18,116 @@ except ImportError:  # an older TensorFS: the executor serves without `weight_pl
 
 #: The executor capability a Worker negotiates on (`hello.memory`).
 CAPABILITY = "weight_plane/1"
-#: Byte alignment of every stored part inside a region (R3): GEMM operands want 16 B, the
-#: plane's DMA wants 256 B.
-ALIGN = 256
-#: Priority classes. The plane evicts only unleased regions of strictly lower priority; within
-#: a class the LRU clock orders them.
-IDLE, ACTIVE = 1, 2
+PINNED = "pinned"
+#: Priorities are plain integers; the plane evicts ascending. Idle regions carry the LRU
+#: clock of their last stage, so the least recently used goes first; a running stage's wants
+#: sit above every idle one.
+ACTIVE = 1 << 40
 
 
 class Unavailable(Exception):
     """This environment has no weight plane."""
 
 
-class Lease(Protocol):
-    """One region held for one consumer stream until `release`."""
-
-    @property
-    def address(self) -> int: ...
-
-    @property
-    def nbytes(self) -> int: ...
-
-    def view(self) -> Any: ...
-
-    def release(self, stream: int) -> None: ...
+class HostStats(msgspec.Struct, frozen=True, kw_only=True):
+    budget: int = -1
+    used: int = -1
+    ready_bytes: int = 0
+    registered_bytes: int = 0
+    fill_bytes: int = 0
+    fill_ns: int = 0
+    evictions: int = 0
 
 
-class Cursor(Protocol):
-    def acquire(self, region: int, stream: int) -> Lease: ...
-
-    def close(self) -> None: ...
-
-
-class Plane(Protocol):
-    """The mechanism surface the runtime drives (§5.1 of the substrate study)."""
-
-    def register(
-        self,
-        content: tuple[str, str, str],
-        regions: Sequence[Region],
-        *,
-        source: Any,
-        header: bytes,
-    ) -> int: ...
-
-    def unregister(self, weights: int) -> None: ...
-
-    def set_vram_budget(self, device: int, nbytes: int) -> Any: ...
-
-    def set_pinned_budget(self, nbytes: int) -> Any: ...
-
-    def want(
-        self, weights: int, tier: Any, regions: Sequence[int], priority: tuple[int, int]
-    ) -> Any: ...
-
-    def drop(self, weights: int, tier: Any, regions: Sequence[int]) -> int: ...
-
-    def stream(
-        self, weights: int, device: int, order: Sequence[int], window: int, repeat: int
-    ) -> Cursor: ...
-
-    def acquire(self, weights: int, device: int, region: int, stream: int) -> Lease: ...
-
-    def resident(self, weights: int, device: int) -> frozenset[int]: ...
-
-    def stats(self) -> Mapping[str, Any]: ...
+class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):
+    ordinal: int
+    budget: int = -1
+    committed: int = -1
+    leased_bytes: int = 0
+    held_bytes: int = 0
+    host_copy_bytes: int = 0
+    host_copy_ns: int = 0
+    disk_copy_bytes: int = 0
+    disk_copy_ns: int = 0
+    misses: int = 0
+    evictions: int = 0
+    evicted_bytes: int = 0
 
 
-@dataclass(frozen=True, slots=True)
-class Part:
-    """One stored role of one checkpoint tensor inside a region."""
-
-    what: str
-    """TensorFS's `<component>/<name>#<role>`: the plane plans the read over exactly these."""
-    offset: int
-    nbytes: int
+class SetDevice(msgspec.Struct, frozen=True, kw_only=True):
+    ordinal: int
+    ready_bytes: int = 0
+    poisoned: bool = False
 
 
-@dataclass(frozen=True, slots=True)
-class Region:
-    index: int
-    parts: tuple[Part, ...]
-    nbytes: int
+class SetStats(msgspec.Struct, frozen=True, kw_only=True):
+    name: str
+    nbytes: int = 0
+    host_ready_bytes: int = 0
+    devices: tuple[SetDevice, ...] = ()
+
+
+class StageStats(msgspec.Struct, frozen=True, kw_only=True):
+    ws: str | int = ""
+    device: int = -1
+    tag: str = ""
+    acquires: int = 0
+    misses: int = 0
+    late: int = 0
+    late_bytes: int = 0
+    stall_ns: int = 0
+    streamed_bytes: int = 0
 
 
 class Stats(msgspec.Struct, frozen=True, kw_only=True):
-    """The counters the runtime reads from `Plane.stats()` (R7). Unknown keys are ignored."""
+    """`Plane.stats()` as the runtime reads it. Unknown keys are ignored."""
 
-    budget: int = -1
-    committed: int = -1
-    leased: int = -1
-    pinned_budget: int = -1
-    pinned: int = -1
-    resident: dict[str, int] = {}
-    h2d_bytes: int = 0
-    h2d_gbps: float = 0.0
-    late: int = 0
-    stall_ns: int = 0
-    misses: int = 0
-    evictions: int = 0
+    host: HostStats = HostStats()
+    devices: tuple[DeviceStats, ...] = ()
+    sets: tuple[SetStats, ...] = ()
+    stages: tuple[StageStats, ...] = ()
+
+    def device(self, ordinal: int) -> DeviceStats:
+        return next((d for d in self.devices if d.ordinal == ordinal), DeviceStats(ordinal=ordinal))
+
+    def ready(self, name: str, ordinal: int) -> int:
+        for row in self.sets:
+            if row.name == name:
+                return sum(d.ready_bytes for d in row.devices if d.ordinal == ordinal)
+        return 0
+
+
+class Event(msgspec.Struct, frozen=True, kw_only=True):
+    kind: str
+    ws: str | int = ""
+    region: int = -1
+    device: int = -1
+    bytes: int = 0
+    ns: int = 0
+    detail: str = ""
 
 
 def available() -> bool:
     return _plane is not None
 
 
-def layout(parts: Sequence[tuple[str, int]]) -> tuple[tuple[Part, ...], int]:
-    """Lay stored parts out contiguously in the given order, each aligned (R3)."""
-    placed: list[Part] = []
-    offset = 0
-    for what, nbytes in parts:
-        offset = -(-offset // ALIGN) * ALIGN
-        placed.append(Part(what, offset, nbytes))
-        offset += nbytes
-    return tuple(placed), offset
-
-
-def open_plane(device: int, *, host_tier: Any = None) -> Plane:
+def open_plane(device: int) -> Any:
     """One plane per executor process (phase 1), over this rank's device."""
     if _plane is None:
         raise Unavailable("this TensorFS build carries no weight plane")
-    opened: Plane = _plane.Plane.open(devices=[device], host_tier=host_tier)
-    return opened
+    return _plane.Plane(devices=[device])
 
 
-def vram(device: int) -> Any:
+def stats(plane: Any) -> Stats:
+    return msgspec.convert(plane.stats(), Stats)
+
+
+def events(plane: Any) -> list[Event]:
+    return msgspec.convert(plane.events(), list[Event])
+
+
+def error(name: str) -> type[BaseException]:
+    """The plane's typed error class `name` (`Shortfall`, `ScheduleMismatch`, ...)."""
     assert _plane is not None
-    return _plane.Vram(device)
-
-
-def pinned() -> Any:
-    assert _plane is not None
-    return _plane.Pinned
-
-
-def stats(plane: Plane) -> Stats:
-    return msgspec.convert(dict(plane.stats()), Stats)
+    found: type[BaseException] = getattr(_plane, name)
+    return found
