@@ -159,8 +159,8 @@ def test_independent_slots_of_the_same_checkpoint_still_sum(tmp_path: Path) -> N
 def test_missing_component_still_refuses_native_model_fit(tmp_path: Path) -> None:
     selected = binding(tmp_path, scope="missing_component")
     assert selected.logical_weight_bytes > 0
-    # The same native fit used by StreamingFillBackend before it reserves any
-    # destinations still judges the deliberately incomplete construction.
+    # The same native fit `PlaneBackend.fit` asks before construction registers anything
+    # still judges the deliberately incomplete construction.
     verdict = tensorfs.fit(
         [tensorfs.TensorRequirement("absent", "weight", [1], "f32")],
         (FIXTURE / "header.cbor").read_bytes(),

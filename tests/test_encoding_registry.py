@@ -16,8 +16,10 @@ from cozy_runtime.internal.encoding import (
     SPEC_SCALED_SCALAR,
     SPEC_SCALED_SCALAR_WEIGHT_ONLY,
     SPEC_VECTORS,
+    RolePart,
     launch_providers,
 )
+from cozy_runtime.internal.encoding.leaves import MicroScaledNativeLeaf
 
 VECTORS = Path(__file__).resolve().parents[1] / "src/cozy_runtime/internal/encoding/vectors"
 RETIRED = {
@@ -75,3 +77,15 @@ def test_reviewed_roles_and_vector_bytes_did_not_move() -> None:
     for _digest, (filename, expected) in SPEC_VECTORS.items():
         measured = "sha256:" + hashlib.sha256((VECTORS / filename).read_bytes()).hexdigest()
         assert measured == expected
+
+
+def test_mxfp8_padded_scale_storage_has_one_provider_price() -> None:
+    provider = MicroScaledNativeLeaf(SPEC_MXFP8)
+    parts = {
+        "data": RolePart("data", "f8_e4m3fn", (2, 1056), 2112),
+        "scale": RolePart("scale", "u8", (2, 33), 66),
+    }
+    # cuBLAS scales occupy complete 128x4 tiles: 2x33 becomes 128x36.
+    assert provider.resident_bytes(parts) == 2112 + 128 * 36
+    assert provider.fill_scratch_bytes(parts) == 3 * 128 * 36
+    assert provider.resident_bits_per_element(parts, 2112) == 8 * (2112 + 128 * 36) / 2112

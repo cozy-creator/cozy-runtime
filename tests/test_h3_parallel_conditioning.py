@@ -1,5 +1,5 @@
 """H3 across a group: text and reference conditioning at once, reference latents memoized,
-and the rank that hosts the text encoder decoding clips only beside everything it holds.
+and clips decoding on every rank, the one hosting the text encoder included.
 
 Real follower processes over gloo run the runtime's own H3Model, conditioner, VAEs and
 blocks at a few million parameters (`testdata/h3_conditioning.py`). Every result is compared
@@ -15,7 +15,6 @@ import sys
 import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,17 +28,9 @@ from cozy_runtime.author.fakes import fake_telemetry  # noqa: E402
 from cozy_runtime.internal import spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
-from cozy_runtime.internal.residency import ResidencyRefusal  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.models.minimax_h3.model import condition_references  # noqa: E402
 from cozy_runtime.models.minimax_h3.official import NumericalChecks  # noqa: E402
-from test_staged_demand_pull import (  # noqa: E402
-    CAPACITY,
-    ENVELOPE,
-    SCOPES,
-    TURBO,
-    Device,
-)
 from testdata import h3_conditioning as h3  # noqa: E402
 
 FIXTURE = Path(__file__).parent / "testdata" / "h3_conditioning.py"
@@ -153,11 +144,11 @@ def test_calls_that_hold_nothing_elsewhere_run_in_order_here() -> None:
 class Group:
     """Rank 0 in this process over real followers running `testdata/h3_conditioning.py`."""
 
-    def __init__(self, tmp_path: Path, degree: int, *follower_args: str) -> None:
+    def __init__(self, tmp_path: Path, degree: int) -> None:
         def launch(module_argv: list[str], fd: int) -> spawn.Child:
             return spawn.spawn_follower(
                 python=sys.executable,
-                module_argv=[str(FIXTURE), *module_argv[2:], *follower_args],
+                module_argv=[str(FIXTURE), *module_argv[2:]],
                 inherit_fd=fd,
                 env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
             )
@@ -169,9 +160,7 @@ class Group:
         leader.device_kind = "cpu"
         leader.group = self.group
         leader._group_model_key = "fixture"
-        leader.backend = SimpleNamespace(
-            components=h3.roots(self.model), parked={}, component_bytes=h3.SIZES
-        )
+        leader.backend = h3.backend(self.model)
         self.leader = leader
         self.tmp_path = tmp_path
 
@@ -259,94 +248,17 @@ def _latents(model: Any) -> Any:
     return torch.randn(1, channels, 33, 2, 3, generator=torch.Generator().manual_seed(5))
 
 
-@pytest.fixture
-def card(monkeypatch: pytest.MonkeyPatch) -> Device:
-    """Rank 0's simulated H100 in this process (run 1268's capacity, the turbo overlay held)."""
-    simulated = Device(CAPACITY, TURBO)
-    h3.simulate(simulated, monkeypatch.setattr)
-    return simulated
-
-
-def _staged(card: Device, measured: tuple[str, ...]) -> Any:
-    """Rank 0's own plane over the simulated card, open on run 1268's measured scopes."""
-    plane = h3.simulated(card, ("ref2va_dit", "video_vae", "audio_vae"))
-    plane.open_attempt("component_staged", ENVELOPE, dict(SCOPES), measured)
-    return plane
-
-
-@pytest.mark.parametrize(
-    ("degree", "home_capacity", "measured", "home_decodes"),
-    [
-        (2, 0, (), True),  # no device plane to spare: the CPU rank takes clips
-        (4, CAPACITY, tuple(SCOPES), False),  # an H100: the conditioner leaves no room
-        (4, 96_000_000_000, tuple(SCOPES), True),  # a 96 GB card has room beside it
-        (4, 96_000_000_000, (), False),  # room, but the decode's peak is not measured
-    ],
-)
-def test_the_home_rank_decodes_clips_only_beside_what_it_holds(
-    tmp_path: Path,
-    card: Device,
-    degree: int,
-    home_capacity: int,
-    measured: tuple[str, ...],
-    home_decodes: bool,
-) -> None:
-    """Rank 1 is offered clips like every rank. With its hosted conditioner and DiT shard
-    resident it takes one only on measured room for the VAE and the attempt's largest
-    scratch; otherwise it declines, the clip runs elsewhere, and the frames are the same."""
+def test_the_home_rank_decodes_clips_like_every_rank(tmp_path: Path) -> None:
+    """Rank 1 hosts the conditioner and is offered clips like every rank; the frames are
+    the one-process frames."""
     expected = _decode(h3.model(), _latents(h3.model()))
-    args = ("--home-capacity", str(home_capacity)) if home_capacity else ()
-    with Group(tmp_path, degree, *args) as ranks:
-        model = ranks.model
-        if home_capacity:
-            object.__setattr__(model, "_cozy_residency", _staged(card, measured))
-        actual = _decode(model, _latents(model))
+    with Group(tmp_path, 2) as ranks:
+        actual = _decode(ranks.model, _latents(ranks.model))
         assert torch.equal(actual, expected)
         log = ranks.group.spread_log["video_vae._decode_clip"]
-        assert log["spare"] is False
-        assert sum(log["calls"].values()) == 7
-        assert ("1" in log["calls"]) is home_decodes
-        assert ("1" in log["declined"]) is not home_decodes
-        if not home_decodes:
-            assert "declined" in log["declined"]["1"]
-            assert set(log["calls"]) == {"0", "2", "3"}
+        assert log["spare"] is False and "1" not in log["declined"]
+        assert sum(log["calls"].values()) == 7 and "1" in log["calls"]
     assert not torch.distributed.is_initialized()
-
-
-def test_an_h100_home_rank_spares_its_conditioner_and_a_roomier_one_keeps_the_vae(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Run 1268's numbers. Rank 1 holds the 51.5 GB conditioner and its 21.1 GB DiT shard.
-    On an H100 a decode clip would need the 5.6 GB VAE and 5.8 GB of scratch beside them:
-    declined, nothing evicted. On a 96 GB card it fits, and the VAE it stages survives the
-    next request's conditioner and denoise scopes."""
-    for capacity, fits in ((CAPACITY, False), (96_000_000_000, True)):
-        card = Device(capacity, TURBO)
-        h3.simulate(card, monkeypatch.setattr)
-        plane = h3.simulated(card, ("text_encoder", "ref2va_dit"))
-        plane.open_attempt("component_staged", ENVELOPE, dict(SCOPES), tuple(SCOPES))
-        held = sorted(plane.backend.components)
-        with plane.sparing():
-            if not fits:
-                with pytest.raises(ResidencyRefusal) as refused:
-                    plane.admit("decode_video", ("video_vae",))
-                assert refused.value.code == "device_spared"
-                assert sorted(plane.backend.components) == held
-                assert plane.attempt_evictions == 0
-                continue
-            plane.admit("decode_video", ("video_vae",))
-        plane.release("decode_video", ("video_vae",))
-        for _ in range(2):
-            plane.open_attempt("component_staged", ENVELOPE, dict(SCOPES), tuple(SCOPES))
-            for method, components in (
-                ("condition_text", ("text_encoder",)),
-                ("sample_ref2va_turbo", ("ref2va_dit",)),
-            ):
-                plane.admit(method, components)
-                plane.release(method, components)
-            assert plane.attempt_evictions == 0
-        assert sorted(plane.backend.components) == ["ref2va_dit", "text_encoder", "video_vae"]
-        assert card.allocated <= capacity
 
 
 @pytest.fixture(autouse=True)

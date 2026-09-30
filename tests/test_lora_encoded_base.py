@@ -1,6 +1,6 @@
 """Native multipart custody, meta census and actual CPU encoded-GEMM adapter arithmetic.
 
-This does not exercise StreamingFillBackend's accelerator staging or device admission.
+This does not exercise the weight plane's device binding.
 """
 
 from pathlib import Path
