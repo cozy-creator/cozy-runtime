@@ -332,7 +332,13 @@ def composer(graph: Graph) -> Callable[[object], None]:
     return apply
 
 
-def bind(artifact: Artifact, model: type[Model[object]], data: bytes) -> Artifact:
+def bind(
+    artifact: Artifact,
+    model: type[Model[object]],
+    data: bytes,
+    *,
+    prepared_snapshot: str = "",
+) -> Artifact:
     """Bind one prepared view to a model's opt-in before weightless construction."""
     if not data:
         return artifact
@@ -354,6 +360,9 @@ def bind(artifact: Artifact, model: type[Model[object]], data: bytes) -> Artifac
             dtypes.pop(prefix + f".lora_{role}.{row.adapter}.weight", None)
     return replace(
         artifact,
+        snapshot=prepared_snapshot or artifact.snapshot,
+        variant=prepared_snapshot or artifact.variant,
+        _selection_snapshot=artifact._selection_snapshot or artifact.snapshot,
         config=ModelConfig(artifact.config.mapping(), tensor_dtypes=dtypes),
         _prepare=composer(graph),
         _adapters=graph.adapters,

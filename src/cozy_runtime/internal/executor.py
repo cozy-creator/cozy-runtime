@@ -2435,7 +2435,7 @@ class Executor:
                     "one model slot selects different prepared adapter graphs",
                     code="adapter_graph_conflict",
                 )
-            artifact = bind_adapters(replace(artifact, variant=manifest), model_cls, data)
+            artifact = bind_adapters(artifact, model_cls, data, prepared_snapshot=manifest)
         seen = Observations()
         registry = ModelRegistry(
             release=binding.release,

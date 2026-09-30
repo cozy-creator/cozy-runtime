@@ -868,7 +868,11 @@ def _inject(
             artifact = getattr(overlay.payload, param.name, None) if surface.invocable else None
             if artifact is not None and (
                 not isinstance(artifact, ModelArtifact)
-                or getattr(model, "checkpoint_ref", "") != artifact.manifest.digest
+                or (
+                    getattr(model, "_cozy_selection_ref", "")
+                    or getattr(model, "checkpoint_ref", "")
+                )
+                != artifact.manifest.digest
             ):
                 raise InvalidRequest(
                     "bound model differs from the exact call artifact",

@@ -341,6 +341,8 @@ class Artifact:
     fix. A construction that fails on it refuses `checkpoint_unnormalized` with this text."""
     _prepare: Callable[[object], None] | None = field(default=None, repr=False, compare=False)
     _adapters: tuple[AdapterRef, ...] = ()
+    _selection_snapshot: str = ""
+    """The originally admitted base when a prepared view becomes the serving snapshot."""
 
 
 #: The `Fit` document `tensorfs.fit` returns, verbatim: `code` (one of the eight),

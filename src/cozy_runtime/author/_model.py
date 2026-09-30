@@ -530,6 +530,7 @@ class Model[PipelineT]:
     """Closed generic adapter declarations; empty means overlays are refused."""
 
     checkpoint_ref: str = ""
+    _cozy_selection_ref: str = ""
     """The pinned-ref REPRODUCTION FACT for result structs — an observation, never catalog
     authority. Model-scoped because it is construction identity."""
 
@@ -1123,6 +1124,9 @@ class ModelRegistry:
             object.__setattr__(model, "_cozy_schedulers", _schedulers(constructed, {}))
             object.__setattr__(model, "_cozy_caches", loader.caches())
             object.__setattr__(model, "checkpoint_ref", artifact.snapshot)
+            object.__setattr__(
+                model, "_cozy_selection_ref", artifact._selection_snapshot or artifact.snapshot
+            )
             object.__setattr__(model, "_cozy_record", record)
             object.__setattr__(model, "_cozy_identity", identity)
             object.__setattr__(model, "_cozy_ready", True)
