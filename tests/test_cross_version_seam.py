@@ -20,7 +20,6 @@ from __future__ import annotations
 import base64
 import datetime
 import hashlib
-import importlib.metadata
 import json
 import os
 import shutil
@@ -180,10 +179,6 @@ class _File(msgspec.Struct):
 
 class _Release(msgspec.Struct):
     urls: list[_File]
-
-
-class _Index(msgspec.Struct):
-    releases: dict[str, object]
 
 
 def _uv(*argv: str, cwd: Path) -> None:
@@ -547,15 +542,15 @@ def test_job_derives_adopts_and_reads_weights(harness: Harness) -> None:
 
 
 def test_an_exact_pin_keeps_its_runtime_and_a_bound_runs_the_machines(harness: Harness) -> None:
-    """The lock names 0.18.67 either way. A bound the machine's Runtime satisfies installs it
-    (the newest published one, while this checkout's version is unreleased)."""
+    """Execute the SDK selected when this environment was materialized. A later PyPI
+    publication cannot change that captured choice or an already running executor."""
+    assert harness.run("selected-sdk", "called", {"n": 2}) == {
+        "value": 6,
+        "runtime": harness.version,
+    }
     if harness.requirement.startswith("=="):
         assert harness.version == harness.requirement.removeprefix("==")
         return
-    mine = importlib.metadata.version("cozy-runtime")
-    with urllib.request.urlopen("https://pypi.org/pypi/cozy-runtime/json", timeout=30) as reply:
-        published = sorted(msgspec.json.decode(reply.read(), type=_Index).releases, key=Version)
-    assert harness.version == (mine if mine in published else published[-1])
     assert Version(harness.version) > Version("0.18.67")
 
 

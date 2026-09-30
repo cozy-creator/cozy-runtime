@@ -200,6 +200,10 @@ class Machine:
         ack = next(stream).claim_ack
         assert ack.accepted, (ack, self.output())
         stream.cancel()
+        # Observe RPC closure itself. EOF may win the race with local cancellation;
+        # the worker's corresponding log is asynchronous and may use either wording.
+        assert stream.code() in (grpc.StatusCode.OK, grpc.StatusCode.CANCELLED), self.output()
+        assert not stream.is_active()
         return claim, ack
 
     def output(self) -> str:
@@ -549,9 +553,9 @@ def test_restarted_worker_runs_its_owners_next_submission_without_another_claim(
             assert outcome.request_id == "after-restart"
             machine.log.flush()
             log = (root / "worker.log").read_text(errors="replace")
-            # The boot's own readiness proof, named, and the owner hanging up after its Claim.
+            # The boot's named negative readiness proof. _claim already observed its
+            # accepted RPC close before either submission or the restart.
             assert "REFUSED (CLAIM_REJECTION_UNAUTHENTICATED) for readiness-negative-arm" in log
-            assert "the control stream ended: RpcError: the peer closed the stream" in log
         finally:
             code = machine.close()
         assert code == 0, machine.output()
