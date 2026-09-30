@@ -105,6 +105,13 @@ warn_unreachable = true
 disallow_any_generics = true
 implicit_reexport = false
 
+# Excluding generated bindings from discovery does not exclude their imported .pyi.
+# Keep their types available without reporting protoc's diagnostics on a cold cache.
+[[tool.mypy.overrides]]
+module = ["cozy.worker.v1.worker_pb2"]
+follow_imports = "silent"
+follow_imports_for_stubs = true
+
 # torch is an OPTIONAL extra (§1.0: the base package is torch-free), so the checking venv
 # does not have it and mypy cannot see its types. The consequence is recorded rather than
 # papered over: the two modules that touch torch are checked without unused-ignore warnings
