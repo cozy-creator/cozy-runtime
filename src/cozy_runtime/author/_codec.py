@@ -31,6 +31,7 @@ import io
 import math
 import os
 import queue
+import shutil
 import struct
 import threading
 from array import array
@@ -505,6 +506,54 @@ class _BoundedWriter:
         return True
 
 
+def finalize_mp4(source: Path, destination: Path, *, max_bytes: int) -> None:
+    """Copy encoded packets into a completed MP4 with duration and sample indexes.
+
+    Progressive fragments are useful while a video grows, but their empty movie header
+    is not a completed download. Let libavformat write the track durations, edit lists,
+    keyframe table and sample offsets; neither pictures nor audio are re-encoded.
+    The destination is new and is removed on failure. The source stays untouched.
+    """
+    av = _av()
+    raw = destination.open("x+b")
+    try:
+        with raw:
+            with av.open(str(source), "r") as incoming:
+                # Edit-list gaps use the movie clock. Millisecond rounding can move
+                # reordered video by several track ticks, even during packet copy.
+                timescale = math.lcm(*(Fraction(s.time_base).denominator for s in incoming.streams))
+                outgoing = av.open(
+                    _BoundedWriter(raw, max_bytes),
+                    "w",
+                    format="mp4",
+                    options={
+                        "fflags": "+bitexact",
+                        "use_editlist": "1",
+                        "movie_timescale": str(min(timescale, (1 << 31) - 1)),
+                    },
+                )
+                try:
+                    tracks = {
+                        stream.index: outgoing.add_stream_from_template(stream)
+                        for stream in incoming.streams
+                    }
+                    for packet in incoming.demux():
+                        if packet.size:
+                            packet.stream = tracks[packet.stream.index]
+                            outgoing.mux(packet)
+                except BaseException:
+                    # Closing a failed AVIO can raise again; preserve the actual refusal.
+                    with suppress(BaseException):
+                        outgoing.close()
+                    raise
+                outgoing.close()
+            raw.flush()
+            os.fsync(raw.fileno())
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+
+
 @dataclass(frozen=True, slots=True)
 class VideoCopy:
     """H.264 tracks proved joinable by packet copy, read without decoding a picture."""
@@ -597,7 +646,7 @@ def plan_video_copy(paths: tuple[Path, ...]) -> VideoCopy:
 
 
 class StreamingMP4Encoder:
-    """The one bounded fragmented H.264/AAC writer used by the author stream sinks.
+    """The bounded H.264/AAC writer used by the author stream sinks.
 
     With `copy`, its video track is the planned tracks' packets, never re-encoded.
     Otherwise the caller converts each RGB frame (swscale on the x264 thread count, bitwise
@@ -689,7 +738,12 @@ class StreamingMP4Encoder:
                     "frag_duration": "1000000",
                     # Delay the initial metadata until timestamps are known so the
                     # edit list can discard AAC encoder priming without moving video.
-                    "movflags": "+empty_moov+default_base_moof+frag_keyframe+skip_sidx"
+                    # Keep recoverable fragments while encoding, then have libavformat
+                    # write a normal indexed MP4 at close. Empty movie headers alone
+                    # make desktop players misreport duration and seek into delta frames.
+                    "movflags": (
+                        "+hybrid_fragmented+empty_moov+default_base_moof+frag_keyframe+skip_sidx"
+                    )
                     + ("+delay_moov" if audio_channels else ""),
                     "use_editlist": "1" if audio_channels else "0",
                 },
@@ -998,6 +1052,9 @@ class FragmentedJoin:
     muxer that is then closed, which flushes it, and its `moof`/`mdat` boxes are restamped onto
     the one timeline (`_restamp`). The AAC encoder persists across appends, so init plus the
     parts decode to exactly the frames and samples the one-muxer join writes, after every append.
+    Closing the join replaces its final revision with a packet-copy, indexed MP4. Previously
+    published parts remain immutable and playable; completed downloads have a full duration
+    and keyframe index instead of the live stream's empty movie header.
     """
 
     def __init__(
@@ -1014,6 +1071,7 @@ class FragmentedJoin:
         self.frames = 0
         self.samples = 0
         self.flushed = False
+        self._finalized = False
         self._sequence = 0
         #: How far the first video's decode clock and the soundtrack start before zero (frame
         #: reordering; AAC priming): the joined media timeline begins there.
@@ -1053,23 +1111,40 @@ class FragmentedJoin:
             packets += self._flush()
         added = self._mux(video, packets, Fraction(frames) / facts[3])
         self.frames += frames
-        return added
+        return self._complete() if last else added
 
     def finish(self) -> list[Path]:
-        """Close the soundtrack: its last frames as one audio part, unless an append was last."""
-        if self.flushed or self._first is None:
+        """Close the soundtrack and finalize the download, once per join."""
+        if self._first is None:
             self.flushed = True
             return []
-        packets = self._flush()
-        return (
+        if self._finalized:
+            return []
+        packets = [] if self.flushed else self._flush()
+        if packets:
             self._mux(
                 None,
                 packets,
                 Fraction(sum(p.duration or 0 for p in packets), self.audio_sample_rate or 1),
             )
-            if packets
-            else []
-        )
+        return self._complete()
+
+    def _complete(self) -> list[Path]:
+        source = self.directory / ".join-complete.mp4"
+        final = self.directory / "join-final.mp4"
+        try:
+            with source.open("xb") as writer:
+                for part, _ in self.parts:
+                    with part.open("rb") as reader:
+                        shutil.copyfileobj(reader, writer, 1 << 20)
+            finalize_mp4(source, final, max_bytes=self.max_bytes)
+        finally:
+            source.unlink(missing_ok=True)
+        duration = sum(micros for _, micros in self.parts)
+        self.parts = [(final, duration)]
+        self._bytes = final.stat().st_size
+        self._finalized = True
+        return [final]
 
     def _encode(self, planar: Planar) -> list[Any]:
         if self._aac is None or planar.shape[0] != self.audio_channels:
@@ -1099,8 +1174,8 @@ class FragmentedJoin:
             "fflags": "+bitexact",
             "frag_duration": "1000000",
             "movflags": "+empty_moov+default_base_moof+frag_keyframe+skip_sidx+skip_trailer"
-            + ("+delay_moov" if first and self._aac is not None else ""),
-            "use_editlist": "1" if first and self._aac is not None else "0",
+            + ("+delay_moov" if first else ""),
+            "use_editlist": "1" if first else "0",
         }
         container = self._av.open(str(temporary), "w", format="mp4", options=options)
         try:

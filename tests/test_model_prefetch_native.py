@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import threading
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import msgspec
+import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
@@ -31,8 +33,10 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
 
+@pytest.mark.parametrize("preempt", [False, True])
 def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
     tmp_path: Path,
+    preempt: bool,
 ) -> None:
     source_root = tmp_path / "origin"
     source_root.mkdir()
@@ -83,13 +87,21 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             fetched.append(self.path)
             started.set()
             assert release.wait(5)
-            self.answer(bodies[self.path.removeprefix("/")])
+            # A paused native pull closes the old request before its replacement.
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                self.answer(bodies[self.path.removeprefix("/")])
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     store_root = tmp_path / "destination"
     store = tensorfs.Store.init(str(store_root))
+    if preempt:
+        # Already landed immutable bytes must survive pause/restart. The missing
+        # asset still uses a real, blocked HTTP transfer and PullCancellation.
+        header = tmp_path / "landed-header"
+        header.write_bytes(_HEADER)
+        store.put_file(str(header), "sha256:" + hashlib.sha256(_HEADER).hexdigest(), len(_HEADER))
     checkpoint = {"digest": manifest, "length": length}
     placement = {
         "installation_id": "installed-model",
@@ -158,6 +170,21 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
     try:
         first = serving._shared("owner", call, target, request, {}, speculative=True)
         assert started.wait(5)
+        if preempt:
+            other = Call("other-parent", 0, 1, 1, b"", b"", "other-child", b"", False, b"", "", "")
+            with serving.demand(other):
+                # Let the current HTTP read yield so the native pull observes its
+                # cancellation. This fixture does not assume it aborts response headers.
+                release.set()
+                # Wait for native cancellation, not for an arbitrary amount of runtime.
+                deadline = time.monotonic() + 5
+                while serving.preparations.started():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.001)
+                assert first is not None and not first.done()
+                assert store.contains(hashlib.sha256(_HEADER).hexdigest())
+            # This succeeds only if the resumed load got a NEW PullCancellation.
+            assert first.result(5).placement == placement
         # A's image becomes available later. It must not change the preparation key.
         _, models = arguments(
             target, canonical_json.encode({"image": "now-available", "model": None})
@@ -168,7 +195,10 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         prepared = joined.result(5)
         assert prepared.placement == placement
         store.verify_checkpoint_source("proof/model", manifest, length)
-        assert sorted(fetched) == sorted("/" + digest for digest in bodies)
+        if preempt:
+            assert "/" + hashlib.sha256(_HEADER).hexdigest() not in fetched
+        else:
+            assert sorted(fetched) == sorted("/" + digest for digest in bodies)
         assert not any(row.get("kind") == "progress" for row in progress)
         observations = [row.get("fields", {}) for row in progress]
         assert any(
@@ -181,20 +211,27 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             row.get("unit") == "bytes" for row in observations if row.get("position") is not None
         )
         fetch = [row["fields"] for row in progress if row.get("name") == "model fetch"]
-        assert [row["event"] for row in fetch] == ["start", "end"]
-        start, end = fetch
+        assert [row["event"] for row in fetch] == ["start", "end"] * (2 if preempt else 1)
+        if preempt:
+            assert fetch[1]["completed"] is False
+        start, end = fetch[-2:]
         assert start["model"] == end["model"] == "proof/model" and start["manifest"] == manifest
         assert (
             start["prefetch"] is True and start["step"] == "" and start["entrypoint"] == "generate"
         )
         assert end["completed"] is True and end["bytes"] == end["total_bytes"] > 0
-        assert end["moved_bytes"] == end["bytes"] and end["elapsed_ms"] > 0
+        if preempt:
+            assert end["moved_bytes"] <= end["bytes"]
+        else:
+            assert end["moved_bytes"] == end["bytes"]
+        assert end["elapsed_ms"] > 0
         assert end["rate_bytes_per_second"] > 0
         # The exact finished selection serves every demand; nothing is prepared again.
+        completed_fetches = len(fetched)
         again = serving._shared("owner", call, target, request, {}, speculative=False)
         assert again is not None and again is first
         assert again.result(5).placement == placement
-        assert len(fetched) == len(bodies)
+        assert len(fetched) == completed_fetches
         # No persistent read lease prevents legitimate cache eviction. Demanding the
         # completed metadata after a collection must refill bytes, not fail admission.
         store_gc.collect(store_root, keep_manifests=[])
@@ -202,7 +239,7 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         assert refilled is not first
         assert refilled is not None and refilled.result(5).placement == placement
         store.verify_checkpoint_source("proof/model", manifest, length)
-        assert len(fetched) > len(bodies)
+        assert len(fetched) > completed_fetches
         # No lanes, engine, GPU admission, or executor exists in this host harness.
         # The real byte preparation completed using only the CPU/store interfaces.
     finally:

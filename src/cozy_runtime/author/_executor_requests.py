@@ -61,6 +61,13 @@ class HostRoom(_Request, frozen=True, kw_only=True, tag="host_room"):
     release: bool = False
 
 
+class StoreRead(_Request, frozen=True, kw_only=True, tag="store_read"):
+    """Managed checkpoint demand waits for optional native reads to drain before ACK."""
+
+    reservation: str
+    release: bool = False
+
+
 class ChildEvents(_Request, frozen=True, kw_only=True, tag="child_events"):
     """The socket the worker nudges when one of this attempt's calls moves."""
 
@@ -160,6 +167,7 @@ class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
 type _Tagged = (
     DeviceRoom
     | HostRoom
+    | StoreRead
     | ChildEvents
     | Checkpoint
     | ChildCall

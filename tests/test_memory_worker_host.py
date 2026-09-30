@@ -4,9 +4,13 @@ import os
 import socket
 import subprocess
 import sys
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
-from cozy_runtime.author._executor_requests import Answer, HostRoom
+import pytest
+
+from cozy_runtime.author._executor_requests import Answer, HostRoom, StoreRead
 from cozy_runtime.internal import proctree
 from cozy_runtime.internal.memory import Machine
 from cozy_runtime.internal.seam import Channel
@@ -16,7 +20,10 @@ from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from test_device_lanes import _config
 
 
-def test_generation_change_releases_pending_and_rejects_old_handler(tmp_path: Path) -> None:
+def test_generation_change_releases_pending_and_rejects_old_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     worker = Worker(
         _config(tmp_path / "home"), WorkerOptions(root=tmp_path / "worker"), InMemoryControlHost()
     )
@@ -46,7 +53,7 @@ def test_generation_change_releases_pending_and_rejects_old_handler(tmp_path: Pa
         worker.executor_changed(executor)
         handler = worker._room(worker._primary_lane(), worker._primary_slot())
 
-        def answer(request: HostRoom) -> Answer:
+        def answer(request: HostRoom | StoreRead) -> Answer:
             reply = handler(request)
             assert isinstance(reply, Answer)
             return reply
@@ -56,11 +63,37 @@ def test_generation_change_releases_pending_and_rejects_old_handler(tmp_path: Pa
         assert answer(HostRoom(reservation="copy", release=True)).ok
         assert not worker.memory.host_reserved
         assert answer(HostRoom(reservation="interrupted", nbytes=70)).ok
+        assert answer(StoreRead(reservation="reading")).ok
+        assert not worker.memory.optional_store_wanted()
+        assert answer(StoreRead(reservation="reading", release=True)).ok
+        assert worker.memory.optional_store_wanted()
+        assert answer(StoreRead(reservation="interrupted")).ok
+        begin = worker.memory.begin_store_read
+        checked, resume = threading.Event(), threading.Event()
+        replies = []
+
+        def paused(token: str, valid: Callable[[], bool] = lambda: True) -> bool:
+            checked.set()  # handler already checked this origin before entering Machine
+            assert resume.wait(5)
+            return begin(token, valid)
+
+        monkeypatch.setattr(worker.memory, "begin_store_read", paused)
+        waiting = threading.Thread(
+            target=lambda: replies.append(answer(StoreRead(reservation="racing")))
+        )
+        waiting.start()
+        assert checked.wait(5)
         executor.channel.close()
+        assert not worker.memory.optional_store_wanted()  # EOF is not proof of native reader reap.
         peer.wait(timeout=5)
         worker.supervision.current = None
         worker.executor_changed(None)  # supervision publishes this only after confirmed reap
+        resume.set()
+        waiting.join(5)
+        assert not waiting.is_alive() and len(replies) == 1 and not replies[0].ok
         assert not worker.memory.host_reserved
+        assert worker.memory.optional_store_wanted()
+        assert not answer(StoreRead(reservation="stale")).ok
         assert not answer(HostRoom(reservation="stale", nbytes=1)).ok
         assert not worker.memory.host_reserved
     finally:

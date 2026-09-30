@@ -125,7 +125,14 @@ def test_child_progress_poll_reuses_journal_and_fences_owner_parent_and_attempt(
         lambda *_: pb.ChildCallResult(), workspace=Workspace(root), owner=lambda: "owner"
     )
     observed = transport._progress(pending)
-    assert observed is not None and observed.payload == document["payload"]
+    assert observed is not None
+    assert observed.payload["call_request"] == child.child_request
+    assert observed.payload["call_attempt"] == 1
+    assert {
+        key: value
+        for key, value in observed.payload.items()
+        if key not in {"call_request", "call_attempt"}
+    } == document["payload"]
     assert transport._progress(pending) == observed  # polling never adds journal rows
     incoming.parent_attempt_ordinal = 2
     assert transport._progress(pending) is None

@@ -86,6 +86,8 @@ class ProgressFrame:
     total: int | None = None
     overall_fraction: float | None = None
     step_ms: float = 0.0
+    call_request: str | None = None
+    call_attempt: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,9 +600,9 @@ class Outputs(_Bound):
 
         Each `append` copies one more H.264 video's packets (no picture is decoded or encoded)
         with its stretch of `audio`, the one soundtrack encoded across the join, and returns
-        the video joined so far: init plus one part per append, publishable with
-        `publish`. `finish` returns the joined video, which is the last of them byte for byte
-        when the last append said `last=True`.
+        the video joined so far, publishable with `publish`. Live revisions share immutable
+        fragments. `last=True` or `finish` finalizes a normal indexed MP4 by packet copy;
+        `finish` returns the last revision byte for byte when the last append said `last=True`.
         """
         self._attempt.check_open("Outputs.join_video")
         _codec.require_encoder()
@@ -1012,7 +1014,8 @@ class VideoJoin:
     ) -> VideoAsset:
         """Join `video` after the others with its stretch of the soundtrack: the audio chunks
         `soundtrack` returns given the video's frame count, continuing the joined sample
-        clock. The video joined so far comes back. `last` closes the soundtrack."""
+        clock. The video joined so far comes back. `last` closes the soundtrack and writes
+        the completed video's duration and seek index without re-encoding its media."""
         self._attempt.check_open("VideoJoin.append")
         if (
             not isinstance(video, VideoAsset)
@@ -1298,6 +1301,11 @@ class Telemetry(_Bound):
             valid_timing = False
         if not valid_timing:
             step_ms = 0.0
+        call_request, call_attempt = payload.get("call_request"), payload.get("call_attempt")
+        if not isinstance(call_request, str) or not 0 < len(call_request) <= 255:
+            call_request = None
+        if type(call_attempt) is not int or call_attempt <= 0:
+            call_attempt = None
         self._progress_frame(
             f"{scope.name} / {stage}"[:120],
             stage_fraction=fraction,
@@ -1305,6 +1313,8 @@ class Telemetry(_Bound):
             total=total,
             overall_fraction=overall,
             step_ms=step_ms,
+            call_request=call_request,
+            call_attempt=call_attempt,
             scoped=False,
         )
 
@@ -1369,6 +1379,8 @@ class Telemetry(_Bound):
         total: int | None = None,
         overall_fraction: float | None = None,
         step_ms: float = 0.0,
+        call_request: str | None = None,
+        call_attempt: int | None = None,
         scoped: bool = True,
     ) -> None:
         name = self._stage_name(stage)
@@ -1392,6 +1404,8 @@ class Telemetry(_Bound):
                 total=total,
                 overall_fraction=overall_fraction,
                 step_ms=step_ms,
+                call_request=call_request,
+                call_attempt=call_attempt,
             )
         )
 

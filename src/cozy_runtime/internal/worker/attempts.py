@@ -59,6 +59,7 @@ from cozy_runtime.author._executor_requests import (
     Published,
     Reply,
     Request,
+    StoreRead,
     TreeMember,
     WriterAdopt,
     WriterOutput,
@@ -1666,6 +1667,12 @@ class AttemptEngine:
                     self.room(attempt)(request)
                     if self.room is not None
                     else refuse("host_shortfall", "this job has no host reservation broker")
+                )
+            case StoreRead():
+                return (
+                    self.room(attempt)(request)
+                    if self.room is not None
+                    else refuse("no_durable_exchange", "this job has no store read broker")
                 )
             case DeviceRoom():
                 return refuse("no_durable_exchange", "a job's executor is granted no device room")

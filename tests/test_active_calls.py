@@ -100,6 +100,8 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
                     "position": 3,
                     "total": 8,
                     "step_ms": 100,
+                    "call_request": "child-1",
+                    "call_attempt": 2,
                 },
             ),
         )
@@ -112,6 +114,7 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
             3,
             8,
         )
+        assert (measured.call_request, measured.call_attempt) == ("child-1", 2)
         count = len(frames)
         broker._observe(first, update)
         assert len(frames) == count

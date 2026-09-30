@@ -124,6 +124,7 @@ class Execution:
         return True
 
     def _queued(self, unit: Unit, row: ExecutionRow) -> None:
+        self.calls.timing.phase(self.owner, self.request, row.ordinal, "queued")
         offered = row.attempt_offer()
         deadline = documents.parse(
             offered.invocation_spec_canonical_bytes, pb.InvocationSpec
@@ -154,6 +155,7 @@ class Execution:
                 if granted is None:
                     return  # moved or past its deadline: the next pass decides
                 ordinals = granted
+            self.calls.timing.phase(self.owner, self.request, row.ordinal, "preparing")
             attempt = self.worker.dispatch_machine(
                 unit, offered, ordinals, lambda: self._moved(row)
             )
