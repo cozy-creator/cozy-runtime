@@ -4,9 +4,46 @@ from __future__ import annotations
 
 import atexit
 import functools
+import os
 import shutil
 import tempfile
 from pathlib import Path
+
+import pytest
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--real-gpu",
+        action="store_true",
+        help="also run tests marked real_gpu, which allocate on this machine's GPU",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "real_gpu: allocates on this machine's GPU; runs only with --real-gpu"
+    )
+
+
+def gpu_hidden() -> bool:
+    """The run allows no CUDA device: `CUDA_VISIBLE_DEVICES` set empty, or to `-1`."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    return visible is not None and visible.split(",")[0].strip() in ("", "-1")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """A test that allocates on a real card runs only when the run says so and its devices
+    are visible: an environment that merely has a readable GPU (every shared box) is not
+    consent to use it. Skipped here, before any fixture reaches a driver."""
+    if config.getoption("--real-gpu") and not gpu_hidden():
+        return
+    skip = pytest.mark.skip(
+        reason="allocates on this machine's GPU: run with --real-gpu and a visible device"
+    )
+    for item in items:
+        if "real_gpu" in item.keywords:
+            item.add_marker(skip)
 
 
 @functools.cache

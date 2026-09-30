@@ -31,6 +31,7 @@ from typing import Any, Literal
 import pytest
 
 import signed_claims
+from conftest import gpu_hidden
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import accel, child_env, package_interface, proctree
@@ -326,6 +327,7 @@ class Machine:
                 devices=devices,
                 gpus=gpus,
                 worker_boot_id=boot,
+                accelerator_backend="none",
             ),
             InMemoryControlHost(),
         )
@@ -634,8 +636,28 @@ class Machine:
         return rows
 
 
+def driverless(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This process asks no GPU driver, and opens no NVIDIA device node: NVML is absent and
+    the driver's process tables list none of these executors, which never touch a device."""
+    monkeypatch.setattr(accel, "_nvml_library", lambda: None)
+    monkeypatch.setattr(
+        accel,
+        "process_memories",
+        lambda pids, kind: {pid: accel.ProcessMemory("absent") for pid in pids},
+    )
+    monkeypatch.setattr(
+        accel,
+        "process_memories_by_device",
+        lambda pids, kind, devices: {
+            device: {pid: accel.ProcessMemory("absent") for pid in pids} for device in devices
+        },
+    )
+
+
 @pytest.fixture
-def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
+def machine(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Iterator[Machine]:
+    if "real_gpu" not in request.node.keywords:
+        driverless(monkeypatch)
     unreadable: set[str] = set()
     free: dict[str, int] = {}
 
@@ -662,6 +684,7 @@ def test_grants_name_each_gpu_as_nvidia_smi_does(monkeypatch: pytest.MonkeyPatch
     `ordinals` older readers still take."""
     measured = accel.DeviceMemory("measured", 80 * GiB, 80 * GiB)
     monkeypatch.setattr(accel, "device_memory", lambda entry, kind: measured)
+    driverless(monkeypatch)
     inventory = tuple(
         RuntimeGPU(
             device_index=index,
@@ -1225,7 +1248,7 @@ def _rank(executor: Any) -> subprocess.Popen[str]:
     rode out SIGTERM for 15 s)."""
     scope = executor.scope
     cgroup = isinstance(scope, proctree.CgroupScope)
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
+    env = dict(os.environ)  # the run's own device visibility, never widened here
     if not cgroup:
         env[child_env.EXECUTOR_SCOPE_ENV] = scope.token
     rank = subprocess.Popen(
@@ -1249,11 +1272,7 @@ def _card_rows(*pids: int) -> dict[int, str]:
 
 
 @needs_executor
-@pytest.mark.skipif(
-    importlib.util.find_spec("torch") is None
-    or _card_rows(os.getpid())[os.getpid()] == "unreadable",
-    reason="a rank holding card 0 needs torch and a driver-readable card",
-)
+@pytest.mark.real_gpu
 def test_a_broken_group_is_reaped_before_its_cards_are_granted_again(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1263,6 +1282,14 @@ def test_a_broken_group_is_reaped_before_its_cards_are_granted_again(
     failed attempt ran on, now kills the whole generation (SIGKILL: it ignores SIGTERM),
     reaps every process and has the driver agree before the cards go back; only the
     successor waits for the next grant."""
+    # Asked only when the run opted in (`--real-gpu`), never at import: importing this module
+    # reaches no driver. A run that hides its GPUs forbids the card even when opted in.
+    if (
+        gpu_hidden()
+        or importlib.util.find_spec("torch") is None
+        or _card_rows(os.getpid())[os.getpid()] == "unreadable"
+    ):
+        pytest.skip("a rank holding card 0 needs torch and a visible, driver-readable card")
     shot, by_lane = _warm_shot(machine, monkeypatch)
     worker = machine.worker
     h3 = by_lane["lane-0+1+2+3"]
