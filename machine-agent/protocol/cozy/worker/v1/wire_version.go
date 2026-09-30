@@ -1,7 +1,7 @@
 package workerprotov1
 
 // WireMinor is the current release of cozy.worker.v1.
-const WireMinor uint32 = 69
+const WireMinor uint32 = 70
 
 // MinCompatibleWireMinor is the oldest peer minor whose preparation and execution this binding
 // speaks. It gates those operations only; it never refuses a connection or Claim.
