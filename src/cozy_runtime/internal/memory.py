@@ -149,6 +149,7 @@ class Held:
     whole: bool = False
     last_used: int = 0
     readonly_lost_reason: str = ""
+    conversion_epoch: int = 0
     ops: dict[str, Callable[..., object]] = field(default_factory=dict)
 
 
@@ -401,11 +402,20 @@ class Planner:
             tiers.intercept_apply(
                 self.torch,
                 part,
-                lambda: None,
+                lambda: self._converted(held),
                 host_copy=lambda size: self._host_copy(size, protected=part.units),
             )
             root.__dict__["_cozy_op"] = functools.partial(self.op, held)
         return held
+
+    def _converted(self, held: Held) -> None:
+        """A real package dtype conversion invalidates old working-memory observations."""
+        for unit in held.part.units:
+            tiers.load_demand(self.torch, unit)
+        self.records = {
+            key: value for key, value in self.records.items() if key.component != held.kind
+        }
+        held.conversion_epoch += 1
 
     def op(self, held: Held, method: str) -> Callable[..., object]:
         """A method the package spreads, run in its unchanged authored numerical mode."""
@@ -772,11 +782,11 @@ class Planner:
             tiers.wrap(held.part.root, functools.partial(self.run, held))
             held.compiled = _compiled(held.part.root)
             part = held.part
-            whole = part.nbytes - part.on(DEVICE)
+            whole = tiers.load_sequence(self.torch, part.units, whole=not part.unit_loads).peak
             if part.on(DISK) and part.store is not None:
                 whole += part.store.transient(part.name)
             whole_only = held.whole or (bool(part.on(DISK)) and not part.unit_loads)
-            common = part.common.nbytes if part.common.tier != DEVICE else 0
+            common = tiers.load_sequence(self.torch, (part.common,)).peak
             required = whole if whole_only else common
             if required > self.allocatable() and self._reserved() > self._allocated():
                 # Cached segments can put signed reserve room below zero even when
@@ -812,14 +822,14 @@ class Planner:
                 or (names and part.name not in names)
             ):
                 continue
-            missing = part.nbytes - part.on(DEVICE)
-            if missing <= 0:
+            demand = tiers.load_sequence(self.torch, part.units, whole=not part.unit_loads)
+            if demand.resident <= 0:
                 continue
-            if missing > self.allocatable():
+            if demand.peak > self.allocatable():
                 held_back[part.name] = "insufficient device room"
                 continue
             self._stage_whole(held, [])
-            restored[part.name] = missing
+            restored[part.name] = demand.resident
         return {"restored": restored, "held": held_back, "restored_bytes": sum(restored.values())}
 
     def _stage_whole(self, held: Held, victims: list[Held]) -> None:
@@ -1129,7 +1139,12 @@ class Planner:
             method,
             tuple((tuple(x.shape), str(x.dtype)) for x in leaves if isinstance(x, torch.Tensor)),
             tuple(x for x in leaves if isinstance(x, _SCALAR)),
-            _mode(held.part.root),
+            _mode(held.part.root)
+            + (
+                (("weight_conversion", f"{held.key}:{held.conversion_epoch}"),)
+                if held.conversion_epoch
+                else ()
+            ),
         )
         held.compiled = _compiled(held.part.root)
         # A prepared group transaction executes once after commit even if a future
@@ -1442,7 +1457,10 @@ class Planner:
         before, self.deep = self.deep, True
         try:
             part = held.part
-            stream = max((unit.nbytes for unit in part.blocks[plan.keep :]), default=0)
+            stream = max(
+                (tiers.load_demand(self.torch, unit).peak for unit in part.blocks[plan.keep :]),
+                default=0,
+            )
             placement = self._need(part, plan.keep) - stream
             needed = max(plan.needed or 0, target + placement)
             victims = [] if self.spare else self._victims(held)
@@ -1533,14 +1551,17 @@ class Planner:
         return list(range(blocks, self._minimum_keep(held) - 1, -1))
 
     def _need(self, part: tiers.Component, keep: int) -> int:
-        """Net bytes the device must still find for `part` with `keep` blocks resident."""
-        common = part.common.nbytes if part.common.tier != DEVICE else 0
+        """Net settled placement plus its largest real load/conversion overlap."""
         if part.on(DISK) and not part.unit_loads and part.store is not None:
-            common += part.store.transient(part.name)
-        load = sum(u.nbytes for u in part.blocks[:keep] if u.tier != DEVICE)
-        drop = sum(u.nbytes for u in part.blocks[keep:] if u.tier == DEVICE)
-        stream = max((u.nbytes for u in part.blocks[keep:]), default=0)
-        return common + load - drop + stream
+            return tiers.load_sequence(
+                self.torch, part.units, whole=True
+            ).peak + part.store.transient(part.name)
+        placement = tiers.load_sequence(self.torch, (part.common, *part.blocks[:keep]))
+        drop = sum(unit.nbytes for unit in part.blocks[keep:] if unit.tier == DEVICE)
+        stream = max(
+            (tiers.load_demand(self.torch, unit).peak for unit in part.blocks[keep:]), default=0
+        )
+        return max(placement.peak, placement.resident + stream) - drop
 
     def _room_from(self, victims: list[Held], need: int) -> list[Held] | None:
         """The fewest victims, in order, whose bytes make `need` allocatable; None if all can't."""
@@ -1719,6 +1740,7 @@ class Planner:
     def _load(self, part: tiers.Component, unit: tiers.Unit) -> None:
         if unit.tier == DEVICE:
             return
+        tiers.load_demand(self.torch, unit)  # Refuse unbounded pending transforms before a fill.
         with self._moving():
             if unit.tier == HOST:
                 self.moved += tiers.to_device(self.torch, unit, self.device)
@@ -1782,7 +1804,9 @@ class Planner:
         adoption. Existing host backings cost nothing, and ranks own separate address spaces.
         """
         return sum(
-            unit.nbytes if unit.tier == DISK else tiers.host_copy_bytes(unit)
+            tiers.load_demand(self.torch, unit).resident
+            if unit.tier == DISK
+            else tiers.host_copy_bytes(unit)
             for held in self.held.values()
             for unit in held.part.units
             if unit.tier != HOST and not unit.mutable
