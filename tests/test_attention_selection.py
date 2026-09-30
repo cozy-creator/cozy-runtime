@@ -651,32 +651,6 @@ def _cuda_proof_skip() -> str:
     return ""
 
 
-def test_the_warm_starts_every_chain_kernel_and_selection_reads_what_is_ready() -> None:
-    """The warm returns at once with a row per kernel of the chain and the ranked table: ready,
-    compiling, absent here, or unsupported on this card, each with why. A construction then
-    selects the first ready one."""
-    why = _cuda_proof_skip()
-    if why:
-        pytest.skip(why)
-    import torch
-    from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
-
-    from cozy_runtime.internal import attention
-    from cozy_runtime.internal.encoding import measure_device
-
-    device = measure_device(torch, 0)
-    preferred = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
-    rows = {row["kernel"]: row for row in attention.expect(device, preferred)}
-    assert set(rows) >= set(preferred)
-    assert rows["sdpa"]["status"] == "ready"
-    assert all(row["status"] == "ready" or row.get("detail") for row in rows.values()), rows
-    site = WanAttention(dim=1024, heads=8, dim_head=128, processor=WanAttnProcessor())
-    roots = {"dit": site.to("cuda", torch.bfloat16)}
-    applied = attention.select(device, roots, choose=lambda context: preferred)
-    [served] = applied.totals()
-    assert rows[served]["status"] == "ready"
-
-
 def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None:
     why = _cuda_proof_skip()
     if why:

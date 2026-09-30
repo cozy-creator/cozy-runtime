@@ -62,7 +62,6 @@ from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author._assets import GrantedInput
-from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._errors import (
@@ -1395,6 +1394,9 @@ class Executor:
             if self.discovered is None:
                 self._discover_provisioned(command.release())
                 stage("package_import")
+            compiles = (
+                self._expect_fusion() if model_bearing and self.rank == 0 and not imported else ""
+            )
             if command.import_only:
                 if model_bearing and accel.initialized(torch, self.device_kind):
                     self.poisoned = "the package import initialized a device before its grant"
@@ -1433,10 +1435,15 @@ class Executor:
             "ms": round(took_ms, 1),
             "legs_ms": {**self.boot.get("legs_ms", {}), **dict(stages)},
         }
-        return self._start_reply(stages, warmup_error=warmup_error)
+        return self._start_reply(stages, warmup_error=warmup_error, compiles=compiles)
 
     def _start_reply(
-        self, stages: list[tuple[str, float]], *, reused: bool = False, warmup_error: str = ""
+        self,
+        stages: list[tuple[str, float]],
+        *,
+        reused: bool = False,
+        warmup_error: str = "",
+        compiles: str = "",
     ) -> dict[str, Any]:
         total = free = -1
         if self.torch is not None and accel.present(self.torch, self.device_kind):
@@ -1454,96 +1461,34 @@ class Executor:
             "warmed": not warmup_error,
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
+            **({"compiles": compiles} if compiles else {}),
         }
 
     def warm(self, command: Warm) -> dict[str, Any]:
-        """The startup warm (h3a-087): a started process with nothing constructed starts, on
-        every rank's own card, the compiles its first construction will want (the fused glue
-        and every kernel of the model's preferred chain and the ranked table), so they run
-        beside the weights' download. It returns at once: nothing here waits on a compile.
-
-        An optimization and never a verdict: the construction selects again for real."""
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if not self.started or self.torch is None or self.device_kind != "cuda":
-            return {"ok": True, "ranks": [], "skipped": "no started device process"}
-        started = time.perf_counter()
-        try:
-            if self.group is not None and self.rank == 0:
-                self.group.broadcast(executor_commands.encode(command))
-            rows = [self._warm_rank()]
-            if self.group is not None and self.rank == 0:
-                rows += [reply.get("rank_warm") or {} for reply in self.group.collect("warm")]
-        except GroupRefusal as exc:
-            return self._group_refusal(exc)
-        if self.rank > 0:
-            return {"ok": True, "rank_warm": rows[0]}
-        took = (time.perf_counter() - started) * 1000
-        if "started_unix_ms" in self.boot:
-            # The boot record spans the warm too: `cozy run show` reads one executor boot.
-            for name in ("fusion_compile", "attention_compile"):
-                self.boot["legs_ms"][name] = max(r.get("legs_ms", {}).get(name, 0.0) for r in rows)
-            self.boot["ms"] = round(time.time() * 1000 - self.boot["started_unix_ms"], 1)
-        return {"ok": True, "ranks": rows, "ms": round(took, 1)}
-
-    def _warm_rank(self) -> dict[str, Any]:
-        from cozy_runtime.internal import fusion
-        from cozy_runtime.internal.encoding import measure_device
-
-        legs: dict[str, float] = {}
-        mark = time.perf_counter()
-        device = measure_device(self.torch, self.rank if self.world > 1 else 0)
-        fused = ""
-        classes = self._model_classes()
-        if any(getattr(cls, "__fusion__", "refuse") in ("accept", "require") for cls in classes):
-            fused = fusion.expect(self._rank_device(self.torch))[:200]
-            legs["fusion_compile"] = round((time.perf_counter() - mark) * 1000, 1)
-        mark = time.perf_counter()
-        kernels = attention.expect(device, self._preferred_attention(classes, device))
-        # Launch checks' scratch goes back to the driver: the card may be another call's.
-        accel.release_cached(self.torch, self.device_kind)
-        legs["attention_compile"] = round((time.perf_counter() - mark) * 1000, 1)
-        return {
-            "rank": self.rank,
-            "legs_ms": legs,
-            "kernels": kernels,
-            **({"fusion": fused} if fused else {}),
-        }
+        """An older worker's startup warm: its compiles start with the process now
+        (`_expect_fusion`) and launch checks run at construction."""
+        return {"ok": True, "ranks": [], "skipped": "compiles start with the process"}
 
     def _model_classes(self) -> list[type[Model[Any]]]:
         module = getattr(self.discovered, "module", None)
         values = vars(module).values() if module is not None else ()
         return [v for v in values if isinstance(v, type) and issubclass(v, Model) and v != Model]
 
-    def _preferred_attention(self, classes: list[type[Model[Any]]], device: Any) -> list[str]:
-        """Each model class's stated preference, asked per declared component with the facts
-        a site would carry. A class whose choice needs its constructed state says nothing."""
-        order: list[str] = []
-        for cls in classes:
-            if cls.choose_attention is Model.choose_attention:
-                continue
-            components = {c for used in component_use(cls).values() for c in used}
-            for component in sorted(components):
-                context = AttentionContext(
-                    component,
-                    "",
-                    device.kind,
-                    device.name,
-                    device.sm,
-                    "bfloat16",
-                    128,
-                    self.world,
-                    (),
-                    "",
-                    "",
-                )
-                try:
-                    chosen = cls.choose_attention(object.__new__(cls), context)
-                except Exception:
-                    continue
-                names = [chosen] if isinstance(chosen, str) else list(chosen or ())
-                order += [name for name in names if isinstance(name, str) and name not in order]
-        return order
+    def _expect_fusion(self) -> str:
+        """Start the fused glue's compile for each sealed card's architecture, read from the
+        driver's management library: no device context, so it runs beside the wait for the
+        grant and the weights (h3a-087). Construction takes the build once it is ready."""
+        if not any(
+            getattr(cls, "__fusion__", "refuse") in ("accept", "require")
+            for cls in self._model_classes()
+        ):
+            return ""
+        try:
+            fusion = importlib.import_module("cozy_runtime.internal.fusion")
+            archs = sorted({accel.device_capability(entry) for entry in _sealed_entries()} - {0})
+            return "; ".join(f"fusion sm{arch} {fusion.expect(arch)}" for arch in archs)
+        except Exception as exc:  # an optimization, never the start's verdict
+            return f"fusion compile not started: {type(exc).__name__}: {exc}"[:300]
 
     def _close_after(self, reply: dict[str, Any]) -> dict[str, Any]:
         """A refusal after followers were commanded leaves them mid-protocol: the process
@@ -4726,7 +4671,6 @@ _FOLLOWER_COMMANDS = frozenset(
     {
         "hello",
         "start",
-        "warm",
         "join",
         "load",
         "activate",

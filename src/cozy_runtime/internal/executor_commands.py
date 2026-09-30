@@ -44,7 +44,7 @@ class Residency(Command, frozen=True, kw_only=True, tag="residency"):
 
 
 class Warm(Command, frozen=True, kw_only=True, tag="warm"):
-    pass
+    """An older worker's startup warm. Never sent now; answered so that worker still runs."""
 
 
 class Join(Command, frozen=True, kw_only=True, tag="join"):

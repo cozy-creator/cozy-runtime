@@ -3,12 +3,14 @@ its package before its GPU grant, whoever holds the card meanwhile, and the gran
 process and only initializes its device.
 
 Real Worker, real durable journal, a real package environment the worker opens like any
-installed one, and real executor processes, on no GPU: the envelope's cards are GPU UUIDs no
-driver knows, so every executor is sealed to no visible device, and the device start that a
-card would initialize refuses `accelerator_unavailable` here. The one fake is
-`accel.device_memory`, the hardware memory seam, which reads those cards as measured. A
-download still in flight is a real TensorFS pull from an in-process origin whose object GETs
-are held open.
+installed one, and real executor processes, touching no GPU. The envelope's cards are GPU
+UUIDs no driver knows, the worker asks no driver (`accelerator_backend="none"`), and the
+package environment records and refuses every attempt to reach the CUDA driver (`GUARD`):
+torch's lazy CUDA init and its device count. So the device start that a card would
+initialize refuses `accelerator_unavailable` here, and the log says exactly when a process
+tried. The one fake is the hardware seam, `accel`'s driver reads, which see those cards as
+measured and holding no process. A download still in flight is a real TensorFS pull from an
+in-process origin whose object GETs are held open.
 """
 
 from __future__ import annotations
@@ -36,7 +38,8 @@ import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import accel, package_interface
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.executor_commands import Probe
+from cozy_runtime.internal.executor_commands import Hello, Probe, Residency, Start
+from cozy_runtime.internal.executor_commands import Warm as WarmCommand
 from cozy_runtime.internal.worker import prespawn
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.child import Executor
@@ -73,18 +76,70 @@ def _interface(degrees: tuple[int, ...] = ()) -> bytes:
     return package_interface.canonical_bytes(body)
 
 
-def _install(root: Path) -> None:
+#: Every process of the package environment loads this first: each call that would reach the
+#: CUDA driver is appended to `LOG` with its pid; the lazy init is refused, the count is zero.
+GUARD = """import importlib.abc, os, sys
+
+LOG = {log!r}
+
+
+def _attempt(name, answer):
+    def attempt(*args, **kwargs):
+        with open(LOG, "a") as log:
+            log.write(f"{{os.getpid()}} {{name}}\\n")
+        if answer is None:
+            raise RuntimeError(f"{{name}}: this test environment reaches no CUDA driver")
+        return answer
+    return attempt
+
+
+class _Guard(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name != "torch._C":
+            return None
+        spec = next(
+            (s for f in sys.meta_path if f is not self and hasattr(f, "find_spec")
+             for s in [f.find_spec(name, path, target)] if s is not None),
+            None,
+        )
+        if spec is None:
+            return None
+        real = spec.loader
+
+        class Loader(importlib.abc.Loader):
+            def create_module(self, spec):
+                return real.create_module(spec)
+
+            def exec_module(self, module):
+                real.exec_module(module)
+                module._cuda_init = _attempt("_cuda_init", None)
+                module._cuda_getDeviceCount = _attempt("_cuda_getDeviceCount", 0)
+
+        spec.loader = Loader()
+        return spec
+
+
+sys.meta_path.insert(0, _Guard())
+"""
+
+
+def _install(root: Path, installation: str = INSTALLATION) -> None:
     """A package environment as the worker records one: its own venv, whose path reaches this
-    interpreter's packages (torch, the runtime) and the marco-polo package it serves."""
-    home = root / "installations" / INSTALLATION
+    interpreter's packages (torch, the runtime) and the marco-polo package it serves, and whose
+    every process records its CUDA driver attempts (`GUARD`) in `cuda-attempts.log`."""
+    home = root / "installations" / installation
     venv = home / "venv"
     subprocess.run(
         [sys._base_executable, "-m", "venv", "--without-pip", str(venv)],  # type: ignore[attr-defined]
         check=True,
     )
     (site,) = (venv / "lib").glob("python*/site-packages")
+    (site / "startup_warm_cuda_guard.py").write_text(
+        GUARD.format(log=str(home / "cuda-attempts.log"))
+    )
     (site / "startup_warm_fixture.pth").write_text(
         f"import site; site.addsitedir({sysconfig.get_paths()['purelib']!r})\n{MARCO}\n"
+        "import startup_warm_cuda_guard\n"
     )
     (home / "installation.json").write_text(
         json.dumps({"python": str(venv / "bin" / "python"), "package": "t/m", "release": "1"})
@@ -177,6 +232,7 @@ class Warm(Machine):
                 artifact_cache=root / "artifacts",
                 devices=devices,
                 threads=1,
+                accelerator_backend="none",
             ),
             InMemoryControlHost(),
         )
@@ -245,11 +301,16 @@ class Warm(Machine):
         self.worker.engine.live[name] = attempt
         self.worker.execution(OWNER, name)
 
-    def target(self, checkpoint: dict[str, Any], degrees: tuple[int, ...] = ()) -> Target:
+    def target(
+        self,
+        checkpoint: dict[str, Any],
+        degrees: tuple[int, ...] = (),
+        installation: str = INSTALLATION,
+    ) -> Target:
         digest = "sha256:" + hashlib.sha256(b"warm-binding").hexdigest()
         placement = {
-            "placement_id": "tmpl-warm",
-            "installation_id": INSTALLATION,
+            "placement_id": "tmpl-" + installation,
+            "installation_id": installation,
             "package_interface": base64.b64encode(_interface(degrees)).decode(),
             "bindings_digest": digest,
             "models": [{"id": "model", "manifest": checkpoint}],
@@ -274,15 +335,20 @@ class Warm(Machine):
         models = [{"path": "marco.models.model"}]
         if degrees:
             models[0]["sequence_parallel"] = {"degrees": list(degrees)}  # type: ignore[assignment]
-        return Target(INSTALLATION, "marco", {"models": models}, {"placement": placement}, None, "")
+        return Target(installation, "marco", {"models": models}, {"placement": placement}, None, "")
 
-    def direct_root(self, name: str, checkpoint: dict[str, Any] | None = None) -> None:
+    def direct_root(
+        self,
+        name: str,
+        checkpoint: dict[str, Any] | None = None,
+        installation: str = INSTALLATION,
+    ) -> None:
         """A serving root as Creator submits a rented direct root once the Host's preparation
         answers: its template names the installed fixture, and no call asked for it before.
         `checkpoint` is its model's landed manifest; none names weights never landed."""
         checkpoint = checkpoint or {"digest": "sha256:" + "0" * 64, "length": 1}
         placement = {
-            **self.target(checkpoint).prepared_installation["placement"],
+            **self.target(checkpoint, installation=installation).prepared_installation["placement"],
             "package": {"package": "t/m", "release": "1"},
             "models": [{"id": "model", "repo": "proof/model", "manifest": checkpoint}],
         }
@@ -301,7 +367,7 @@ class Warm(Machine):
         self.submit(
             name,
             pb.InvocationSpec(
-                installation_id=INSTALLATION,
+                installation_id=installation,
                 serving=pb.ServingInvocationSpec(
                     entrypoint_binding_digest=digest,
                     attempt_binding_id=digest,
@@ -327,6 +393,21 @@ class Warm(Machine):
 def warm(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., Warm]]:
     measured = accel.DeviceMemory("measured", 80 * GiB, 80 * GiB)
     monkeypatch.setattr(accel, "device_memory", lambda entry, kind: measured)
+    # These cards are in no driver's table, and the test process asks no driver: it opens
+    # no NVIDIA device node (no NVML, no nvidia-smi).
+    monkeypatch.setattr(accel, "_nvml_library", lambda: None)
+    monkeypatch.setattr(
+        accel,
+        "process_memories",
+        lambda pids, kind: {pid: accel.ProcessMemory("absent") for pid in pids},
+    )
+    monkeypatch.setattr(
+        accel,
+        "process_memories_by_device",
+        lambda pids, kind, devices: {
+            device: {pid: accel.ProcessMemory("absent") for pid in pids} for device in devices
+        },
+    )
     made: list[Warm] = []
     # Short: an executor's control socket lives under it and `sun_path` holds 108 bytes.
     with tempfile.TemporaryDirectory(prefix="cz-warm.", dir="/tmp") as raw:
@@ -356,6 +437,14 @@ def _wait(condition: Callable[[], Any], what: str) -> Any:
 def _call(parent: str) -> tuple[Call, pb.ChildCallRequest]:
     call = Call(parent, 0, 1, 1, b"", b"", "child-warm", b"", False, b"", "", "")
     return call, pb.ChildCallRequest(parent_attempt_ordinal=1)
+
+
+def _attempts(machine: Warm, installation: str = INSTALLATION) -> list[tuple[int, str]]:
+    """Every call a process of the installation made toward the CUDA driver, in order."""
+    root = machine.worker.options.install_root or Path()
+    log = root / "installations" / installation / "cuda-attempts.log"
+    rows = log.read_text().split("\n") if log.exists() else []
+    return [(int(pid), name) for pid, name in (row.split() for row in rows if row)]
 
 
 def _imported(executor: Executor) -> bool:
@@ -445,6 +534,10 @@ def test_a_slow_download_overlaps_the_executor_imports(warm: Callable[..., Warm]
         assert executor is not None and executor.alive() and not executor.started
         assert executor.sealed_devices == CARDS[0] and _imported(executor)
         assert machine.worker._warm((INSTALLATION, "any")) == (0,)
+        # Version skew: an older worker still sends its warm; the process answers and stays.
+        reply = executor.call(WarmCommand())
+        assert reply["ok"] and reply["skipped"] and executor.alive(), reply
+        assert _attempts(machine) == []
         if prespawn._RESTORABLE:
             assert os.getpriority(os.PRIO_PROCESS, executor.pid) == 19
     finally:
@@ -488,6 +581,23 @@ def test_a_waiting_root_imports_while_another_root_holds_its_card_and_its_grant_
             lambda: machine.phases("D").get("Preparing model executor"), "D's prespawn phase"
         )
         assert prepared["completed"] and "package_import" in prepared["detail"], prepared
+        # Everything a worker of any version sends an unclaimed prespawn before its grant (its
+        # hello at spawn, the import-only start again, probes, residency, an older worker's
+        # warm) reaches no CUDA driver.
+        again = Start(
+            devices=executor.sealed_devices,
+            application=package_interface.parse(_interface(), "fixture").application,
+            package_interface=str(
+                Path(machine.worker.options.artifact_cache or "")
+                / "selections"
+                / INSTALLATION
+                / "package-interface.json"
+            ),
+            import_only=True,
+        )
+        for command in (again, Probe(), Residency(), WarmCommand(), Hello()):
+            assert executor.call(command)["ok"], command
+        assert _attempts(machine) == []
 
         notes = len(machine.worker.activity)
         machine.finish(a1)
@@ -502,10 +612,79 @@ def test_a_waiting_root_imports_while_another_root_holds_its_card_and_its_grant_
         # was left to do.
         refused = [s for s in steps if "start REFUSED" in s]
         assert refused and "accelerator_unavailable" in refused[0], steps
+        # The first reach for the driver is the adopting device start's own init.
+        assert _attempts(machine) == [(executor.pid, "_cuda_init")]
         started = machine.phases("D")["Starting model executor"]
         assert started["started_unix_ms"] >= prepared["started_unix_ms"] + prepared["elapsed_ms"]
     finally:
         origin.close()
+
+
+def test_one_process_imports_ahead_per_card_for_the_root_served_first(
+    warm: Callable[..., Warm],
+) -> None:
+    """Three roots of three installations wait behind A for the only card. One process
+    imports ahead, for the root first in line, and a started import keeps its place; each
+    claim starts the next one's in the scheduler's order, and every root adopts its own
+    process in turn. Never two unclaimed imports at once."""
+    machine = warm()
+    prespawns = machine.worker.prespawns
+    names = [f"{INSTALLATION}-{n}" for n in (1, 2, 3)]
+    for name in names:
+        _install(machine.worker.options.install_root, name)  # type: ignore[arg-type]
+    machine.submit_root("A")
+    a1 = machine.child("A", "qwen")
+    machine.tick()
+    assert machine.granted(a1) == [0]
+
+    seen: list[prespawn.Slot] = []
+    peak = [0]
+    stop = threading.Event()
+
+    def watch() -> None:
+        while not stop.is_set():
+            with prespawns.lock:
+                current = [s for s in prespawns.slots.values() if s.installation in names]
+            peak[0] = max(peak[0], len(current))
+            seen.extend(s for s in current if all(s is not t for t in seen))
+            time.sleep(0.005)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        # D1 arrives first: its import starts, and the later roots queue behind it.
+        machine.direct_root("D1", installation=names[0])
+        _wait(lambda: seen, "D1's prespawn")
+        machine.direct_root("D2", installation=names[1])
+        machine.direct_root("D3", installation=names[2])
+        _wait(lambda: len(prespawns.asks) == 2, "D2 and D3 asking")
+        first = _wait(lambda: seen[0].started.is_set() and seen[0], "D1's import")
+        assert first.installation == names[0] and first.roots == {"D1"} and first.ready
+        assert list(prespawns.slots.values()) == [first]
+        assert sorted(prespawns.asks) == names[1:]
+
+        notes = len(machine.worker.activity)
+        machine.finish(a1)
+        machine.finish("A")
+        _wait(lambda: len(seen) == 3 and all(s.claimed.is_set() for s in seen), "every claim")
+        machine.tick()
+    finally:
+        stop.set()
+        watcher.join()
+    assert peak[0] == 1, f"{peak[0]} unclaimed imports at once"
+    assert [s.installation for s in seen] == names
+    assert [s.roots for s in seen] == [{"D1"}, {"D2"}, {"D3"}]
+    grants = [
+        [body["ordinals"] for _, kind, body in machine.journal(f"D{n}") if kind == "gpu.grant"]
+        for n in (1, 2, 3)
+    ]
+    assert grants == [[[0]], [[0]], [[0]]]
+    assert all(_attempts(machine, name) == [] for name in names)
+    assert all(s.ready and s.supervision.spawns == 1 for s in seen)
+    steps = [e.step for e in list(machine.worker.activity)[notes:]]
+    adopted = [s for s in steps if "adopts prespawned epoch 1" in s]
+    assert len(adopted) == 3 and not [s for s in steps if "spawning the device" in s], steps
+    assert prespawns.slots == {} and prespawns.asks == {}
 
 
 def test_the_adopting_start_is_the_device_start_alone(warm: Callable[..., Warm]) -> None:
@@ -524,6 +703,7 @@ def test_the_adopting_start_is_the_device_start_alone(warm: Callable[..., Warm])
     assert executor is not None and slot.ready and executor.alive() and not executor.started
     assert os.getpriority(os.PRIO_PROCESS, executor.pid) == os.getpriority(os.PRIO_PROCESS, 0)
     assert [frame["fields"]["phase"] for frame in emitted] == ["Preparing model executor"]
+    assert _attempts(machine) == []
 
     hosted = _replica(machine, slot, "machine-adopter")
     notes = len(machine.worker.activity)
@@ -534,6 +714,7 @@ def test_the_adopting_start_is_the_device_start_alone(warm: Callable[..., Warm])
     assert not [s for s in steps if "spawning the device executor" in s], steps
     # The device start is all that was sent; with no card visible it refuses there.
     assert latch and [s for s in steps if "accelerator_unavailable" in s], steps
+    assert _attempts(machine) == [(executor.pid, "_cuda_init")]
 
     fresh = _replica(machine, None, "machine-fresh")
     notes = len(machine.worker.activity)
