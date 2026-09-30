@@ -600,8 +600,9 @@ class Outputs(_Bound):
 
         Each `append` copies one more H.264 video's packets (no picture is decoded or encoded)
         with its stretch of `audio`, the one soundtrack encoded across the join, and returns
-        the video joined so far, publishable with `publish`. Live revisions share immutable
-        fragments. `last=True` or `finish` finalizes a normal indexed MP4 by packet copy;
+        the video joined so far, publishable with `publish` as a normal indexed MP4 snapshot.
+        Each revision copies encoded packets; internal fragments keep append work incremental.
+        `last=True` or `finish` also flushes the soundtrack;
         `finish` returns the last revision byte for byte when the last append said `last=True`.
         """
         self._attempt.check_open("Outputs.join_video")
@@ -989,7 +990,7 @@ class Outputs(_Bound):
 
 
 class VideoJoin:
-    """`Outputs.join_video`: a copy join published as it grows (CMAF parts)."""
+    """`Outputs.join_video`: an indexed copy join published as it grows."""
 
     def __init__(self, outputs: Outputs, audio: DecodedAudioFormat | None) -> None:
         self._outputs, self._attempt, self._audio = outputs, outputs._attempt, audio
@@ -1014,8 +1015,8 @@ class VideoJoin:
     ) -> VideoAsset:
         """Join `video` after the others with its stretch of the soundtrack: the audio chunks
         `soundtrack` returns given the video's frame count, continuing the joined sample
-        clock. The video joined so far comes back. `last` closes the soundtrack and writes
-        the completed video's duration and seek index without re-encoding its media."""
+        clock. Each returned revision has a duration and seek index. `last` also closes
+        the soundtrack; neither publishing nor closing re-encodes the joined media."""
         self._attempt.check_open("VideoJoin.append")
         if (
             not isinstance(video, VideoAsset)
@@ -1110,15 +1111,21 @@ class VideoJoin:
         )
 
     def _revision(self) -> VideoAsset:
-        """The video joined so far: a composite of the parts, published without a copy."""
+        """Publish one indexed byte identity for desktop and browser playback."""
+        path = self._join.indexed_revision()
         handle = self._attempt.next_handle("revision")
         revision = VideoAsset(
             handle,
             media_type="video/mp4",
-            size_bytes=sum(part.stat().st_size for part, _ in self._join.parts),
+            size_bytes=path.stat().st_size,
             attempt=self._attempt.request_id,
         )
-        self._attempt.parts[handle] = self._parts()
+        self._attempt.parts[handle] = (
+            PublishPart(
+                local=f"{path.parent.name}/{path.name}",
+                duration_us=sum(duration for _, duration in self._join.parts),
+            ),
+        )
         return revision
 
 
