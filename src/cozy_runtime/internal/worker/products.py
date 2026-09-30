@@ -271,7 +271,7 @@ class Products:
         with self.lock:
             fold = self.fold(owner, attempt.request_id)
             returned: dict[str, list[pb.OutputEntry]] = {}
-            fresh: list[pb.RunProduct] = []
+            fresh: list[tuple[pb.OutputEntry, int, int]] = []
             for entry in entries:
                 slot = machine_byte_results.slot_of(entry.output_id, slots)
                 if slot is None or not entry.HasField("native_tree"):
@@ -284,7 +284,7 @@ class Products:
                 current = fold.single.get(entry.output_id)
                 content = pb.Ref(digest=entry.digest, length=entry.length)
                 if current is None or current.content != content:
-                    fresh.append(self._returned(owner, attempt, entry, SET, 0))
+                    fresh.append((entry, SET, 0))
             for output in set(fold.single) - {e.output_id for e in entries}:
                 return f"output_changed: {output} was published and the result leaves it empty"
             for output in set(fold.lists) | set(returned):
@@ -301,9 +301,13 @@ class Products:
                         f"{len(published)} products already published"
                     )
                 for index in range(len(published), len(items)):
-                    fresh.append(self._returned(owner, attempt, items[index], APPEND, index))
-            for product in fresh:
-                self._journal(owner, attempt.request_id, product)
+                    fresh.append((items[index], APPEND, index))
+            for entry, op, index in fresh:
+                # Publishing collects holds absent from the current fold. Acquire
+                # each new hold only when its product is about to join that fold.
+                self._journal(
+                    owner, attempt.request_id, self._returned(owner, attempt, entry, op, index)
+                )
         return None
 
     def _returned(
