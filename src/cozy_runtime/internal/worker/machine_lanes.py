@@ -40,6 +40,7 @@ class Shape:
     template: tuple[str, str] = ("", "")
     refusal: str = ""
     gpus: int = 0  # the exact group width the owner submitted; 0 lets the scheduler choose
+    interface: bytes = b""  # the template's PackageInterface, for its executor's prespawn
 
 
 def shape(worker: Worker, owner: str, request: str) -> Shape:
@@ -70,7 +71,14 @@ def _shape(
             for m in models
         )
         gpus = desired.placement_set.execution_gpus
-        found = Shape(root, "serving" if models else "cpu", degrees, template, gpus=gpus)
+        found = Shape(
+            root,
+            "serving" if models else "cpu",
+            degrees,
+            template,
+            gpus=gpus,
+            interface=row.package_interface,
+        )
     else:
         return Shape(root, "cpu")  # an owner-placed serving root already has its lane
     held = worker.engine.live.get(parent) if parent else None

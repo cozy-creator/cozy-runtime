@@ -597,6 +597,8 @@ class Executor:
         self.arbiter = ConstructionArbiter()
         self.active = ""
         self.started = False
+        #: torch, the Runtime and the package are imported (`Start.import_only`); no device yet
+        self.imported = False
         self.package_warmed = False
         #: rank 0 only: each follower's own start ledger, in rank order
         self.follower_stages: list[list[Any]] = []
@@ -728,7 +730,7 @@ class Executor:
             "native_interfaces": native_interfaces.stated(),
             "model_adapters": ["peft_graph/1"],
             #: what the worker's memory manager may ask beyond the floor's commands
-            "memory": ["vacate_ranks"],
+            "memory": ["import_only", "vacate_ranks"],
             "pgid": os.getpgrp(),
             "no_new_privs": _proc_status("NoNewPrivs"),
             "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
@@ -1281,10 +1283,15 @@ class Executor:
         package whose interface binds no model on any entrypoint imports no Torch at all,
         which is what keeps a weightless package servable on a cardless runner (cl-013).
         Idempotent: a started process answers with what it started as.
+
+        `import_only` (a prespawn, before the GPU grant) stops after the imports: no device
+        is initialized and `self.torch` stays unset, so the process holds no device memory
+        and reads as unstarted. The ordinary start that follows only initializes devices,
+        warms the package and forms the group.
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if self.started:
+        if self.started or (command.import_only and self.imported):
             return self._start_reply([], reused=True)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
         if command.devices != sealed_devices:
@@ -1341,6 +1348,8 @@ class Executor:
             stages.append((name, round((now - _mark[0]) * 1000, 1)))
             _mark[0] = now
 
+        imported = self.imported
+        warmup_error = ""
         try:
             if degree > 1 and self.rank == 0:
                 self.world = degree
@@ -1361,29 +1370,40 @@ class Executor:
             if model_bearing:
                 import torch
 
-                self.torch = torch
-                stage("torch_import")
-                try:
-                    refused = self._initialize_device(torch)
-                except RuntimeError as exc:
-                    refused = {
-                        "ok": False,
-                        "code": "accelerator_unavailable",
-                        "detail": f"the sealed devices {_SEALED.get('CUDA_VISIBLE_DEVICES')!r} "
-                        f"could not be initialized: {exc}"[:900],
-                    }
-                if refused is not None:
-                    self.poisoned = f"start refused: {refused['code']}"
-                    return self._close_after(refused)
-                stage("cuda_init")
-                for name in _CONSTRUCTION_MODULES:
-                    importlib.import_module(name)
-                stage("runtime_imports")
+                if not imported:
+                    stage("torch_import")
+                if not command.import_only:
+                    self.torch = torch
+                    try:
+                        refused = self._initialize_device(torch)
+                    except RuntimeError as exc:
+                        refused = {
+                            "ok": False,
+                            "code": "accelerator_unavailable",
+                            "detail": "the sealed devices "
+                            f"{_SEALED.get('CUDA_VISIBLE_DEVICES')!r} "
+                            f"could not be initialized: {exc}"[:900],
+                        }
+                    if refused is not None:
+                        self.poisoned = f"start refused: {refused['code']}"
+                        return self._close_after(refused)
+                    stage("cuda_init")
+                if not imported:
+                    for name in _CONSTRUCTION_MODULES:
+                        importlib.import_module(name)
+                    stage("runtime_imports")
             if self.discovered is None:
                 self._discover_provisioned(command.release())
-            stage("package_import")
-            warmup_error = self._warm_package()
-            stage("package_warmup")
+                stage("package_import")
+            if command.import_only:
+                if model_bearing and accel.initialized(torch, self.device_kind):
+                    self.poisoned = "the package import initialized a device before its grant"
+                    return self._close_after(
+                        self._refusal("cuda_initialized_before_runtime", self.poisoned)
+                    )
+            else:
+                warmup_error = self._warm_package()
+                stage("package_warmup")
             if self.group is not None:
                 replies = self.group.collect("start")
                 self.follower_stages = [list(reply.get("stages") or []) for reply in replies]
@@ -1394,8 +1414,9 @@ class Executor:
                             f"{reply.get('detail', '')}"[:800],
                             code="group_unformed",
                         )
-                self.pg = self.group.form(self.torch, _SEALED)
-                stage("group_form")
+                if not command.import_only:
+                    self.pg = self.group.form(self.torch, _SEALED)
+                    stage("group_form")
         except GroupRefusal as exc:
             return self._group_refusal(exc)
         except Exception:
@@ -1403,12 +1424,14 @@ class Executor:
             if self.group is not None:
                 self.group.close()
             raise
-        self.started = True
+        self.imported = True
+        self.started = not command.import_only
         took_ms = (time.perf_counter() - started) * 1000
+        # A prespawned process's record keeps its import legs beside the device start's.
         self.boot = {
             "started_unix_ms": int(time.time() * 1000 - took_ms),
             "ms": round(took_ms, 1),
-            "legs_ms": dict(stages),
+            "legs_ms": {**self.boot.get("legs_ms", {}), **dict(stages)},
         }
         return self._start_reply(stages, warmup_error=warmup_error)
 

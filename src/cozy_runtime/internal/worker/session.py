@@ -1685,6 +1685,11 @@ class Worker:
 
             from . import machine_materialization
 
+            # Its executor imports while the models are ensured, as a published package's does.
+            interface = prepared.document.package_interface
+            self.prespawns.request_landing(
+                revision, interface, package_prepare.landing_models(request, interface)
+            )
             machine_materialization.ensure(
                 self, request.download_delegation, native=request.native_models
             )
@@ -2668,10 +2673,10 @@ class Worker:
         lane = self.lanes.lane_of(placement_id)
         placement = self._placement_by_id(placement_id)
         if executor is not None and lane is not None and placement is not None:
-            # Its successor may already be starting beside this root's downloads.
+            # Its successor may already be importing, started while this root waited.
             warm = self.prespawns.claim(placement.installation_id, placement.device_pin or ())
             if warm is not None:
-                warm.started.wait()
+                self.prespawns.settle(warm, placement_id)
             self._rebuild_lane(lane, placement_id, executor, granted=True)
 
     def _cpu_job(self, job: pb.JobDirective) -> bool:
@@ -2974,7 +2979,7 @@ class Worker:
             machine_capture.restore(self, preparation)
         placement = self._placement_from_entry(row, desired.placement_set.placement_set_digest)
         placement.device_pin = pin
-        # The process started beside this replica's download (h3a-087), when there is one.
+        # The process imported ahead of this grant (`prespawn`), when there is one.
         journal = functools.partial(self._journal_row, request_id, attempt)
         warm = self.prespawns.claim(placement.installation_id, pin or (), journal)
         supervision = (
@@ -2994,14 +2999,8 @@ class Worker:
                 self.lanes.envelope.forget("")
                 self.job_slots.pop("envelope", None)
             self.accepted.mode = "serving"
-        # A claimed prespawn journals its own start; only a start this call pays is named here.
-        starting = (
-            self._call_phase(request_id, attempt, "Starting model executor")
-            if warm is None
-            else contextlib.nullcontext()
-        )
         try:
-            with starting:
+            with self._call_phase(request_id, attempt, "Starting model executor"):
                 if warm is not None:
                     self.prespawns.settle(warm, placement.placement_id)
                 current = self.supervision.current
@@ -7039,7 +7038,9 @@ class Worker:
         with self.control_lock:
             hosted = self.hosted.get(placement_id)
             supervision = hosted.supervision if hosted is not None else self.supervision
-            reclaimed = granted and supervision.current is None
+            # On its grant, a successor imported ahead of it (`prespawn`) is started too.
+            current = supervision.current
+            reclaimed = granted and (current is None or not current.started)
             if not reclaimed and (
                 supervision.current is not executor or (executor.alive() and not executor.poisoned)
             ):
