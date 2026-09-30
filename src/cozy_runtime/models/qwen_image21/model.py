@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import base64
 import zlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 import torch
 from tokenizers import Tokenizer
 from transformers import (
-    AutoModelForImageTextToText,
     PreTrainedTokenizerFast,
     Qwen2VLImageProcessor,
     Qwen3VLConfig,
@@ -24,17 +24,48 @@ from transformers import (
 )
 from transformers import initialization as transformer_init
 
-from cozy_runtime.author import Config, Loader, Model, uses_components
+from cozy_runtime.author import CapabilityError, Config, Loader, Model, retry_state, uses_components
+from cozy_runtime.models.qwen3_vl import Qwen3VLHiddenStateModel
 
 from .upstream.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
 from .upstream.pipeline_qwenimage21 import QwenImage21Pipeline, calculate_dimensions
-from .upstream.transformer_qwenimage21 import QwenImage21Transformer2DModel
+from .upstream.transformer_qwenimage21 import QwenImage21KVCache, QwenImage21Transformer2DModel
 
 
 def _section(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"Qwen Image {name} configuration must be a mapping")
     return dict(value)
+
+
+def _declare_vae_retry_state(vae: AutoencoderKLQwenImage21) -> None:
+    """Own this VAE's causal cache bindings, including an interrupted first call.
+
+    Every whole encode/decode, including each tiled path, clears these caches before
+    reading them. Causal layers replace list entries with newly produced tensors and
+    only read previous tensors; they never mutate their bytes. Preserve old lists and
+    entries without cloning device tensors or retaining the failed call's new caches.
+    """
+    names = (
+        "_conv_num", "_conv_idx", "_feat_map", "_enc_conv_num", "_enc_conv_idx", "_enc_feat_map",
+    )
+
+    def save() -> dict[str, tuple[Any, list[Any] | None]]:
+        return {
+            name: (value, list(value) if isinstance(value, list) else None)
+            for name in names if name in vars(vae)
+            for value in (vars(vae)[name],)
+        }
+
+    def restore(state: dict[str, tuple[Any, list[Any] | None]]) -> None:
+        for name in names:
+            vars(vae).pop(name, None)
+        for name, (value, items) in state.items():
+            if items is not None:
+                value[:] = items
+            vars(vae)[name] = value
+
+    retry_state(vae, save, restore)
 
 
 class QwenImage21Graph:
@@ -49,7 +80,7 @@ class QwenImage21Graph:
                 ).to(dtype=torch.bfloat16),
                 # Construction dtype leaves derived RoPE buffers in upstream F32.
                 # Casting the completed module would round those frequencies to BF16.
-                "text_encoder": AutoModelForImageTextToText.from_config(
+                "text_encoder": Qwen3VLHiddenStateModel._from_config(
                     Qwen3VLConfig(**_section(mapping["text_encoder"], "text_encoder")),
                     dtype=torch.bfloat16,
                 ),
@@ -57,6 +88,7 @@ class QwenImage21Graph:
                     dtype=torch.float32
                 ),
             }
+        _declare_vae_retry_state(self.components["vae"])
         self.scheduler_config = _section(mapping["scheduler"], "scheduler")
         self.processor_config = _section(mapping.get("processor", {}), "processor")
 
@@ -99,6 +131,69 @@ def build_processor(config: Mapping[str, Any]) -> Any:
 class _StagedPipeline(QwenImage21Pipeline):
     reference_latents: torch.Tensor | None = None
     reference_pad_mask: torch.Tensor | None = None
+    _kv_caches: list[QwenImage21KVCache]
+
+    def _make_kv_cache(self, num_blocks: int) -> QwenImage21KVCache:
+        cache = super()._make_kv_cache(num_blocks)
+        self._kv_caches.append(cache)
+        return cache
+
+    @contextmanager
+    def transformer_retry_state(self) -> Iterator[None]:
+        """Own the request's conditional/unconditional cache containers and RoPE list.
+
+        KV extraction replaces k/v with fresh clones; cached attention only reads
+        them. RoPE likewise rebinds its frequency list after device transfer. Preserve
+        these references, without copying cache tensors or retaining failed outputs.
+        Diffusers' empty cache_context registry has no tensor or hook state to save.
+        """
+        root: Any = self.transformer
+        self._kv_caches = []
+        names = (
+            "_cozy_retry_state", "_cozy_retry_tensors", "_cozy_retry_generators",
+            "_cozy_retry_hooks", "_cozy_retry_forwards",
+        )
+        previous = {name: vars(root)[name] for name in names if name in vars(root)}
+
+        def save() -> tuple[Any, list[Any], list[tuple[Any, Any, Any]]]:
+            freqs = root.pos_embed.freqs
+            return freqs, list(freqs), [
+                (layer, layer.k, layer.v)
+                for cache in self._kv_caches for layer in cache.layer_caches
+            ]
+
+        def restore(state: tuple[Any, list[Any], list[tuple[Any, Any, Any]]]) -> None:
+            freqs, entries, layers = state
+            freqs[:] = entries
+            root.pos_embed.freqs = freqs
+            for layer, key, value in layers:
+                layer.k, layer.v = key, value
+
+        # Residual-cache hooks and PEFT adapters have their own mutable state. This
+        # package has neither: do not extend this contract to externally added ones.
+        known = not getattr(root, "peft_config", None) and all(
+            not getattr(getattr(module, "_diffusers_hook", None), "hooks", {})
+            for module in root.modules()
+        )
+        try:
+            if known:
+                retry_state(root, save, restore)
+            else:
+                # An unrelated contract cannot acquire ownership of this request's
+                # newly created KV containers by surviving into the pipeline call.
+                for name in names:
+                    vars(root).pop(name, None)
+            yield
+        finally:
+            for name in names:
+                vars(root).pop(name, None)
+            vars(root).update(previous)
+            self._kv_caches.clear()
+            # Upstream cache_context does not use finally around yield. Close a
+            # failed pipeline's context too; empty registries make this a no-op.
+            registry = getattr(root, "_diffusers_hook", None)
+            if registry is not None:
+                registry._set_context(None)
 
     @property
     def _execution_device(self) -> torch.device:
@@ -132,17 +227,6 @@ def prefix_cache_bytes(transformer: Any, prefix_tokens: int) -> int:
         2 * config.num_attention_heads * config.attention_head_dim * transformer.dtype.itemsize
     )
     return int(prefix_tokens) * int(config.num_layers) * per_token
-
-
-def _prefix_cache_fits(
-    transformer: Any, embeds: Any, reference_latents: Any, device: torch.device
-) -> bool:
-    if device.type != "cuda":
-        return True
-    prefix = embeds.shape[1] + (0 if reference_latents is None else reference_latents.shape[1])
-    free, _total = torch.cuda.mem_get_info(device)
-    unused = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
-    return bool(prefix_cache_bytes(transformer, prefix) < free + unused)
 
 
 class QwenImage21Model(Model[QwenImage21Graph]):
@@ -226,6 +310,8 @@ class QwenImage21Model(Model[QwenImage21Graph]):
         reference_images: list[Any] | None = None,
         reference_latents: torch.Tensor | None = None,
         image_pad_mask: torch.Tensor | None = None,
+        use_kv_cache: bool | None = None,
+        on_cache_mode: Callable[[bool], None] | None = None,
     ) -> Any:
         transformer = self.graph.components["transformer"]
         device = next(transformer.parameters()).device
@@ -246,7 +332,9 @@ class QwenImage21Model(Model[QwenImage21Graph]):
             return values
 
         def run(use_kv_cache: bool) -> Any:
-            with torch.inference_mode():
+            if on_cache_mode is not None:
+                on_cache_mode(use_kv_cache)
+            with pipeline.transformer_retry_state(), torch.inference_mode():
                 return pipeline(
                     image=reference_images,
                     prompt_embeds=embeds.to(device=device, dtype=transformer.dtype),
@@ -262,15 +350,23 @@ class QwenImage21Model(Model[QwenImage21Graph]):
 
         cancel()
         # The prefix KV cache (text, vision and reference tokens, every layer) grows by
-        # ~2 GiB per 1 MP reference. It is an exact speedup: when the card cannot hold it,
-        # recompute the prefix each step instead, slower but the same image.
-        if _prefix_cache_fits(transformer, embeds, reference_latents, device):
-            try:
-                return run(use_kv_cache=True)
-            except torch.OutOfMemoryError:
-                pass
-            torch.cuda.empty_cache()
-        return run(use_kv_cache=False)
+        # ~2 GiB per 1 MP reference. Cached and recomputed attention have different
+        # sequence layouts and can round differently. Select before sampling, report
+        # the choice, and preserve it through every step and transactional retry.
+        if not transformer.config.causal_condition:
+            if use_kv_cache is True:
+                raise ValueError("prefix KV caching requires a causal-condition model")
+            use_kv_cache = False
+        if device.type != "cuda":
+            return run(use_kv_cache=True if use_kv_cache is None else use_kv_cache)
+        choose = getattr(transformer, "_cozy_optional_cache", None)
+        if not callable(choose):
+            raise CapabilityError(
+                "Qwen cache admission requires the current Runtime memory planner",
+                code="memory_planner_unavailable",
+            )
+        prefix = embeds.shape[1] + (0 if reference_latents is None else reference_latents.shape[1])
+        return choose(prefix_cache_bytes(transformer, prefix), run, requested=use_kv_cache)
 
     @uses_components("vae")
     def decode(self, latents: Any, *, width: int, height: int) -> Any:
