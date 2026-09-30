@@ -15,7 +15,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 from cozy_runtime.author._errors import RuntimeFailure
 from cozy_runtime.author._retry import is_declared_pure, original_callable, runtime_owned
@@ -535,6 +535,336 @@ def _move(torch: Torch, unit: Unit, device: Device) -> int:
         unit.seen.clear()
     unit.tier = HOST if device.type == "cpu" else DEVICE
     return copied
+
+
+class HostStaging(Protocol):
+    """Exclusive, already-admitted pinned backing; release returns its borrow, not RSS."""
+
+    buffers: tuple[Tensor, ...]
+    capacity: int
+
+    def release(self) -> None: ...
+
+
+def _transfer_version(tensor: Tensor) -> int | None:
+    try:
+        return int(tensor._version)
+    except RuntimeError:  # Inference tensors intentionally have no version counter.
+        return None
+
+
+def _transfer_snapshot(unit: Unit) -> tuple[object, ...]:
+    return (
+        unit.tier,
+        unit.readonly,
+        unit.mutable,
+        tuple(map(id, unit.applied)),
+        tuple(map(id, unit.pending)),
+        tuple(
+            (
+                id(module),
+                name,
+                parameter,
+                id(tensor),
+                _backing(tensor),
+                int(tensor.untyped_storage().nbytes()),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.storage_offset(),
+                tensor.dtype,
+                tensor.device,
+                tensor.requires_grad,
+                _transfer_version(tensor),
+            )
+            for module, name, parameter, tensor in unit.slots()
+        ),
+    )
+
+
+class HostTransfer:
+    """One event-owned HOST copy; eligibility and pool policy belong to the Planner.
+
+    The caller supplies an executor-lifetime custody set and an already-admitted
+    exclusive pinned lease. Failed drain retains this object in that set. Publication
+    joins the copy on CPU; final consumer retirement conservatively drains the device,
+    because purity does not imply exclusive current-stream use. Ordinary to_device
+    remains synchronous; the optional Planner experiment uses this separate custody.
+    """
+
+    def __init__(
+        self,
+        torch: Torch,
+        unit: Unit,
+        device: Device,
+        stream: Any,
+        valid: Callable[[], bool],
+        owned: set[HostTransfer],
+    ) -> None:
+        self.torch, self.unit, self.device, self.stream = torch, unit, device, stream
+        self.valid, self.owned = valid, owned
+        self.snapshot = _transfer_snapshot(unit)
+        self.groups = _moves(unit, "cuda")
+        self.source_bytes = sum(
+            int(group[0][3].untyped_storage().nbytes()) for group in self.groups
+        )
+        self.originals = [(slot, slot[3].detach()) for group in self.groups for slot in group]
+        self.destinations: list[Tensor] = []
+        self.staging: HostStaging | None = None
+        self._buffers: tuple[Tensor, ...] = ()
+        self.copy_ready: Any = None
+        self.consumer_done: Any = None
+        self.started = False
+        self.staged_bytes = self.submitted_bytes = 0
+        self.state = "new"
+        self.poisoned = ""
+
+    @classmethod
+    def prepare(
+        cls,
+        torch: Torch,
+        unit: Unit,
+        device: Device,
+        stream: Any,
+        *,
+        acquire: Callable[[int], HostStaging | None],
+        device_capacity: int,
+        valid: Callable[[], bool],
+        owned: set[HostTransfer],
+        observed: Callable[[HostTransfer], None] | None = None,
+    ) -> HostTransfer | None:
+        """Prepare unbound destinations or decline; never execute authored Python.
+
+        Capacity is supplied by admission. Payload bytes are not a claim about allocator
+        rounding or reusable cache; the caller's allocator cap remains authoritative.
+        The caller must hold exclusive immutable source custody through publication and
+        revoke ``valid`` before any writer can intervene. Geometry/version checks detect
+        observable changes only: inference tensors lack versions and .data can bypass them.
+        """
+        if (
+            device.type != "cuda"
+            or device.index is None
+            or getattr(stream, "device", None) != device
+            or torch.is_grad_enabled()
+            or unit.tier != HOST
+            or not unit.readonly
+            or unit.mutable
+            or unit.pending
+            or not valid()
+            or any(
+                type(tensor) not in (torch.Tensor, torch.nn.Parameter)
+                or tensor.device.type != "cpu"
+                or tensor.layout != torch.strided
+                or tensor.is_quantized
+                or tensor.grad is not None
+                for *_, tensor in unit.slots()
+            )
+        ):
+            return None
+        result = cls(torch, unit, device, stream, valid, owned)
+        if result.source_bytes > device_capacity:
+            return None
+        owned.add(result)  # Custody exists before any asynchronous operation can fail.
+        try:
+            if not result._prepare(acquire):
+                result.abort()
+                return None
+        except BaseException as exc:
+            if result.state != "poisoned":
+                try:
+                    result.abort()
+                except BaseException as cleanup:
+                    raise cleanup from exc
+            raise
+        finally:
+            if observed is not None:
+                observed(result)
+        return result
+
+    def _current(self) -> bool:
+        return self.valid() and _transfer_snapshot(self.unit) == self.snapshot
+
+    def _prepare(self, acquire: Callable[[int], HostStaging | None]) -> bool:
+        torch = self.torch
+        chunks: list[tuple[int, int, Tensor]] = []
+        if self.source_bytes:
+            self.staging = acquire(self.source_bytes)
+            if self.staging is None:
+                return False
+            buffers = self._buffers = tuple(self.staging.buffers)
+            if (
+                self.staging.capacity != sum(int(b.untyped_storage().nbytes()) for b in buffers)
+                or self.staging.capacity < self.source_bytes
+                or any(
+                    b.device.type != "cpu"
+                    or b.dtype != torch.uint8
+                    or not b.is_pinned()
+                    or not b.is_contiguous()
+                    or b.storage_offset() != 0
+                    or b.numel() != b.untyped_storage().nbytes()
+                    for b in buffers
+                )
+            ):
+                return False
+            # No borrowed range can alias another slot or the immutable source it stages.
+            ranges = [
+                (int(b.data_ptr()), int(b.data_ptr()) + b.numel()) for b in buffers if b.numel()
+            ]
+            sources = [
+                (
+                    int(g[0][3].untyped_storage().data_ptr()),
+                    int(g[0][3].untyped_storage().data_ptr())
+                    + int(g[0][3].untyped_storage().nbytes()),
+                )
+                for g in self.groups
+                if g[0][3].untyped_storage().nbytes()
+            ]
+            all_ranges = sorted(ranges + sources)
+            if any(a[1] > b[0] for a, b in zip(all_ranges, all_ranges[1:], strict=False)):
+                return False
+            slot, offset = 0, 0
+            for index, group in enumerate(self.groups):
+                storage = group[0][3].untyped_storage()
+                source = torch.empty(0, dtype=torch.uint8, device="cpu").set_(
+                    storage, 0, (storage.nbytes(),), (1,)
+                )
+                cursor = 0
+                while cursor < source.numel():
+                    while offset == buffers[slot].numel():
+                        slot, offset = slot + 1, 0
+                    count = min(source.numel() - cursor, buffers[slot].numel() - offset)
+                    target = buffers[slot].view(-1)[offset : offset + count]
+                    target.copy_(source[cursor : cursor + count])
+                    self.staged_bytes += count
+                    chunks.append((index, cursor, target))
+                    cursor, offset = cursor + count, offset + count
+        if not self._current():
+            return False
+        with torch.inference_mode(False), torch.no_grad(), torch.cuda.stream(self.stream):
+            self.started = True
+            for group in self.groups:
+                self.destinations.append(
+                    torch.empty(
+                        group[0][3].untyped_storage().nbytes(),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                )
+            for index, offset, source in chunks:
+                self.destinations[index][offset : offset + source.numel()].copy_(
+                    source, non_blocking=True
+                )
+                self.submitted_bytes += source.numel()
+            self.copy_ready = torch.cuda.Event()
+            self.copy_ready.record(self.stream)
+        self.state = "prepared"
+        return True
+
+    def _poison(self, exc: BaseException, phase: str = "drain") -> NoReturn:
+        self.poisoned = f"HOST transfer {phase} failed: {type(exc).__name__}: {exc}"
+        self.state = "poisoned"
+        raise RuntimeFailure(self.poisoned, code="device_fault") from exc
+
+    def _release_staging(self) -> None:
+        if self.staging is not None:
+            try:
+                self.staging.release()
+            except BaseException as exc:
+                self._poison(exc, "staging release")
+            self.staging = None
+            self._buffers = ()
+
+    def publish(self) -> bool:
+        """At actual demand, join and revalidate before atomically publishing any views."""
+        if self.state != "prepared":
+            raise RuntimeError("only a prepared transfer can publish")
+        try:
+            self.copy_ready.synchronize()
+        except BaseException as exc:
+            self._poison(exc, "copy completion")
+        try:
+            if not self._current():
+                self.abort()
+                return False
+            torch = self.torch
+            replacements: list[tuple[tuple[Module, str, bool, Tensor], Tensor, Tensor]] = []
+            cursor = 0
+            with torch.inference_mode(False), torch.no_grad():
+                for group, backing in zip(self.groups, self.destinations, strict=True):
+                    for slot in group:
+                        tensor = slot[3]
+                        placed = torch.empty(0, dtype=tensor.dtype, device=self.device).set_(
+                            backing.untyped_storage(),
+                            tensor.storage_offset(),
+                            tensor.shape,
+                            tensor.stride(),
+                        )
+                        placed.requires_grad_(tensor.requires_grad)
+                        replacements.append((slot, self.originals[cursor][1], placed))
+                        cursor += 1
+        except BaseException as exc:
+            if self.state != "poisoned":
+                try:
+                    self.abort()
+                except BaseException as cleanup:
+                    raise cleanup from exc
+            raise
+        host, seen = dict(self.unit.host), dict(self.unit.seen)
+        attempted = []
+        try:
+            for slot, original, placed in replacements:
+                module, name, parameter, tensor = slot
+                attempted.append((slot, original))
+                _bind(module, name, parameter, placed)
+            for slot, original, placed in replacements:
+                module, name, parameter, tensor = slot
+                self.unit.host[(id(module), name)] = original if parameter else tensor
+                self.unit.seen[(id(module), name)] = placed.data_ptr()
+            self.unit.tier = DEVICE
+        except BaseException:
+            try:
+                for slot, original in reversed(attempted):
+                    module, name, parameter, tensor = slot
+                    _bind(module, name, parameter, original if parameter else tensor)
+                self.unit.host, self.unit.seen, self.unit.tier = host, seen, HOST
+            except BaseException as exc:
+                self._poison(exc, "binding rollback")
+            self.abort()
+            raise
+        self.state = "published"
+        self._release_staging()  # Copy was joined; buffers are no longer DMA-live.
+        return True
+
+    def finish(self) -> None:
+        """After final consumer submission, prove device completion before retiring custody.
+
+        A recorded current-stream event is evidence, not permission to assume there were
+        no other using streams. The conservative device-wide drain is intentional.
+        The caller may home the unit only after this method succeeds.
+        """
+        if self.state == "retired":
+            return
+        if self.state == "poisoned":
+            raise RuntimeFailure(self.poisoned, code="device_fault")
+        try:
+            if self.state == "published":
+                self.consumer_done = self.torch.cuda.Event()
+                self.consumer_done.record(self.torch.cuda.current_stream(self.device))
+                self.torch.cuda.synchronize(self.device)
+            elif self.started:
+                self.stream.synchronize()
+        except BaseException as exc:
+            self._poison(exc)
+        self._release_staging()
+        self.destinations.clear()
+        self.originals.clear()
+        self.groups.clear()
+        self.copy_ready = self.consumer_done = None
+        self.state = "retired"
+        self.owned.discard(self)
+
+    def abort(self) -> None:
+        """Cancel optional work; published bindings remain for the Planner to home safely."""
+        self.finish()
 
 
 def to_host(torch: Torch, unit: Unit) -> int:

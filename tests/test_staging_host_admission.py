@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 import json
 import os
 import subprocess
@@ -288,6 +289,10 @@ def test_real_fill_boundary_holds_credit_through_close(
     backend.forensics = None
     backend.store_read = contextlib.nullcontext
     backend._live_ring = None
+    backend._staging_lock = threading.Lock()
+    backend._staging_busy = False
+    backend._staging_borrow = None
+    backend._staging_poisoned = ""
     backend._staging_ring = None
     backend.staging_started = backend.staging_drained = lambda: None
     events = []
@@ -436,6 +441,10 @@ def test_idle_staging_release_reports_logical_bytes_without_physical_credit(
     owner, machine = policy(16)
     backend: Any = object.__new__(fill.StreamingFillBackend)
     backend._live_ring = None
+    backend._staging_lock = threading.Lock()
+    backend._staging_busy = False
+    backend._staging_borrow = None
+    backend._staging_poisoned = ""
     backend.staging_started = backend.staging_drained = lambda: None
     backend._staging_ring = fill.StagingRing(
         fake_torch(), "cpu", window_bytes=16, slots=1, inflight=0
@@ -591,6 +600,10 @@ def test_parked_group_scope_before_operation_reuses_prepaid_actual_ring(
     backend.inflight = 8
     backend.fence = True
     backend._staging_ring = backend._live_ring = None
+    backend._staging_lock = threading.Lock()
+    backend._staging_busy = False
+    backend._staging_borrow = None
+    backend._staging_poisoned = ""
     backend.staging_started = backend.staging_drained = lambda: None
     backend.staging_host = owner.staging_host
     backend.prepare_staging()
@@ -658,6 +671,10 @@ def test_successful_construction_later_failed_refill_survives_unload_and_gc(
     backend.forensics = None
     backend.store_read = contextlib.nullcontext
     backend._live_ring = backend._staging_ring = None
+    backend._staging_lock = threading.Lock()
+    backend._staging_busy = False
+    backend._staging_borrow = None
+    backend._staging_poisoned = ""
 
     class Lease:
         def release(self) -> None:

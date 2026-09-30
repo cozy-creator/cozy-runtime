@@ -1040,6 +1040,45 @@ class StagingRing:
         self.views.clear()
 
 
+class StagingBorrow:
+    """Exclusive existing backing; release is legal only after the borrower proves DMA done.
+
+    Returning a borrow is not RSS relief. Buffer references must not be used after release.
+    A failed drain must leave this lease unreleased in executor-lifetime custody.
+    """
+
+    def __init__(self, backend: StreamingFillBackend, buffers: tuple[Any, ...]) -> None:
+        self._backend: StreamingFillBackend | None = backend
+        self.buffers = buffers
+        self.capacity = sum(int(buffer.untyped_storage().nbytes()) for buffer in buffers)
+        self._released = False
+
+    def release(self) -> None:
+        backend = self._backend
+        if backend is None:
+            return
+        with backend._staging_lock:
+            if self._released:
+                return
+            if backend._staging_borrow is not self:
+                backend._staging_poisoned = "stale staging borrow ownership"
+                backend.state = "poisoned"
+                backend.staging_started()
+                raise RuntimeFailure(backend._staging_poisoned, code="device_fault")
+            if backend._staging_poisoned:
+                raise RuntimeFailure(backend._staging_poisoned, code="device_fault")
+            if backend._live_ring is not backend._staging_ring:
+                backend._staging_poisoned = "staging borrow lost its ring identity"
+                backend.state = "poisoned"
+                raise RuntimeFailure(backend._staging_poisoned, code="device_fault")
+            backend._staging_borrow = None
+            backend._live_ring = None
+            self._released = True
+            self._backend = None
+            self.buffers = ()
+            backend.staging_drained()
+
+
 # -------------------------------------------------------------------------- backend
 
 
@@ -1202,6 +1241,10 @@ class StreamingFillBackend:
         self.store_read = store_read
         self.staging_host = staging_host
         self._live_ring: StagingRing | None = None
+        self._staging_lock = threading.Lock()
+        self._staging_busy = False
+        self._staging_borrow: StagingBorrow | None = None
+        self._staging_poisoned = ""
         self._staging_ring: StagingRing | None = None
         self.staging_released: Callable[[], None] = lambda: None
         self.staging_started: Callable[[], None] = lambda: None
@@ -1920,7 +1963,89 @@ class StreamingFillBackend:
         self._commit_enqueued()
         self.state = "ready"
 
+    def borrow_staging(self, required_bytes: int) -> StagingBorrow | None:
+        """Borrow the whole existing pinned ring or decline; never allocate or seek room."""
+        if required_bytes <= 0:
+            return None
+        with self._staging_lock:
+            ring = self._staging_ring
+            if (
+                ring is None
+                or self._live_ring is not None
+                or self._staging_busy
+                or self._staging_borrow is not None
+                or self._staging_poisoned
+                or self.state == "poisoned"
+            ):
+                return None
+            buffers = tuple(ring.buffers)
+            if not buffers or any(
+                not buffer.is_pinned()
+                or buffer.device.type != "cpu"
+                or buffer.dtype != self.torch.uint8
+                or not buffer.is_contiguous()
+                or buffer.storage_offset() != 0
+                or buffer.numel() != buffer.untyped_storage().nbytes()
+                for buffer in buffers
+            ):
+                return None
+            ranges = sorted(
+                (int(buffer.data_ptr()), int(buffer.data_ptr()) + buffer.numel())
+                for buffer in buffers
+                if buffer.numel()
+            )
+            if any(a[1] > b[0] for a, b in zip(ranges, ranges[1:], strict=False)):
+                return None
+            capacity = sum(int(buffer.untyped_storage().nbytes()) for buffer in buffers)
+            if capacity < required_bytes:
+                return None
+            lease = StagingBorrow(self, buffers)
+            self._staging_borrow = lease
+            # Existing generation cleanup already treats this actual ring as unproved
+            # until its owner drains it; a borrow must participate in that same lifetime.
+            self._live_ring = ring
+            # This callback only records strong executor ownership; it does not do I/O.
+            self.staging_started()
+            return lease
+
+    @contextlib.contextmanager
+    def _staging_use(self, *, optional: bool = False) -> Iterator[bool]:
+        """Claim before any CUDA/native work; never hold this lock across that work."""
+        with self._staging_lock:
+            blocked = self._staging_busy or self._staging_borrow is not None
+            if optional and (blocked or self._live_ring is not None or self._staging_poisoned):
+                yield_allowed = False
+            else:
+                if blocked or self._staging_poisoned or self._live_ring is not None:
+                    self._staging_poisoned = self._staging_poisoned or (
+                        "staging drain is unproved"
+                        if self._live_ring is not None
+                        else "staging ownership violated before drain"
+                    )
+                    self.state = "poisoned"
+                    self.staging_started()
+                    raise RuntimeFailure(self._staging_poisoned, code="device_fault")
+                self._staging_busy = True
+                self.staging_started()
+                yield_allowed = True
+        if not yield_allowed:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with self._staging_lock:
+                self._staging_busy = False
+                if self._staging_poisoned:
+                    raise RuntimeFailure(self._staging_poisoned, code="device_fault")
+                if self._live_ring is None:
+                    self.staging_drained()
+
     def prepare_staging(self) -> None:
+        with self._staging_use():
+            self._prepare_staging()
+
+    def _prepare_staging(self) -> None:
         """Materialize prepaid group staging without reading weights or submitting copies."""
         if self._staging_ring is not None:
             return
@@ -1944,6 +2069,10 @@ class StreamingFillBackend:
             }
 
     def _commit_enqueued(self) -> None:
+        with self._staging_use():
+            self._commit_staging()
+
+    def _commit_staging(self) -> None:
         """Move whatever is enqueued right now, fence it, and clear the queue.
 
         Split out of `commit` so a component STAGE is the same transaction over a smaller
@@ -1955,7 +2084,6 @@ class StreamingFillBackend:
             return
         if self._live_ring is not None:
             raise RuntimeFailure("staging drain is unproved", code="device_fault")
-        self.staging_started()
         allowance = (
             self.staging_host(self.slot_bytes, self.slots)
             if self._staging_ring is None and self.staging_host is not None
@@ -2013,7 +2141,6 @@ class StreamingFillBackend:
                     # until generation retirement proves that no device can use them.
                     raise RuntimeFailure("staging drain failed", code="device_fault") from None
                 self._live_ring = None
-                self.staging_drained()
         self.stats["stream_ms"] = (time.perf_counter_ns() - started) // 1_000_000
         # The tfs-018-comparable leg: reserve device destinations, read, copy, fence. It
         # deliberately EXCLUDES the meta construction, which those arms have no analogue
@@ -2089,12 +2216,15 @@ class StreamingFillBackend:
         }
 
     def release_staging(self) -> int:
+        with self._staging_use(optional=True) as admitted:
+            return self._release_staging() if admitted else 0
+
+    def _release_staging(self) -> int:
         """Idle release of owned buffers, never a promise that the host allocator returned RSS."""
         if self._live_ring is not None or self._staging_ring is None:
             return 0
         ring = self._staging_ring
         size = ring.allocated_bytes
-        self.staging_started()
         try:
             ring.close()
         except BaseException:
@@ -2102,16 +2232,13 @@ class StreamingFillBackend:
             raise RuntimeFailure("staging drain failed", code="device_fault") from None
         self._staging_ring = None
         self.staging_released()
-        self.staging_drained()
         return size
 
     def close(self) -> None:
-        """End the generation's read leases after every fill/move has completed."""
-        if self._live_ring is not None:
-            raise RuntimeFailure("staging drain is unproved", code="device_fault")
-        self.release_staging()
-        self.leases.release()
-        self.staging_drained()
+        """End the generation only when every native/borrowed use has completed."""
+        with self._staging_use():
+            self._release_staging()
+            self.leases.release()
 
     # -- component staging (cr-008b) ---------------------------------------------
 
