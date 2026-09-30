@@ -179,7 +179,7 @@ def test_failed_completion_poison_retains_custody(policy: Any) -> None:
     assert frame.overlap_pending.state == "poisoned"
 
 
-def test_history_requires_success_and_exact_operation_and_clears_at_scope_exit(policy: Any) -> None:
+def test_history_requires_success_and_exact_operation_and_survives_scope_exit(policy: Any) -> None:
     owner, held, frame, key, _, _ = policy
     frame.overlap_visits = list(held.part.blocks)
     owner._overlap_learn(frame, key)
@@ -190,6 +190,8 @@ def test_history_requires_success_and_exact_operation_and_clears_at_scope_exit(p
         owner._overlap_frame(new, other, True)
     assert not new.overlap_enabled
     owner.exit()
+    assert held.overlap_key == key and held.overlap_order == held.part.blocks
+    owner._overlap_retire(clear=True)
     assert held.overlap_key is None and not held.overlap_order
 
 
@@ -445,13 +447,29 @@ def test_nested_whole_scope_retires_shared_backend_borrow_before_fill(
     assert not frame.overlap_enabled and not frame.overlap_learnable
 
 
-@pytest.mark.parametrize("route", ["call", "forward", "encode", "decode", "recursive", "exception"])
+@pytest.mark.parametrize(
+    "route",
+    [
+        "call",
+        "forward",
+        "encode",
+        "decode",
+        "recursive",
+        "exception",
+        "scope",
+        "scope_room",
+        "scope_key",
+        "scope_epoch",
+        "scope_contract",
+        "scope_provider",
+    ],
+)
 def test_production_root_call_wrapper_learns_then_overlaps(
     policy: Any, monkeypatch: pytest.MonkeyPatch, route: str
 ) -> None:
     import functools
 
-    owner, held, _, _, _, _ = policy
+    owner, held, _, _, admission, _ = policy
     owner.stack.clear()
     held.overlap_key, held.overlap_order = None, ()
 
@@ -488,12 +506,38 @@ def test_production_root_call_wrapper_learns_then_overlaps(
     monkeypatch.setattr(owner, "_arm", lambda *_: None)
     call = (
         held.part.root
-        if route in ("call", "recursive", "exception")
+        if route in ("call", "recursive", "exception") or route.startswith("scope")
         else getattr(held.part.root, route)
     )
     with torch.no_grad():
+        if route.startswith("scope"):
+            owner.enter("construction", "generate", ("model",))
         first = call()
-        if route in ("call", "forward", "exception"):
+        if route.startswith("scope"):
+            owner.exit()
+            assert not owner.stack and not owner._host_transfers and not owner.scopes
+            assert held.overlap_order == held.part.blocks
+            if route == "scope_room":
+                admission["room"] = 31
+            elif route == "scope_key":
+                held.part.root.use_slicing = True
+            elif route == "scope_epoch":
+                owner._converted(held)
+            elif route == "scope_contract":
+                held.part.root.register_forward_hook(lambda *_: None)
+            elif route == "scope_provider":
+                admission["deny"] = True
+            owner.enter("construction", "generate", ("model",))
+        if route in (
+            "call",
+            "forward",
+            "exception",
+            "scope",
+            "scope_room",
+            "scope_provider",
+            "scope_key",
+            "scope_contract",
+        ):
             assert held.overlap_order == held.part.blocks
         else:
             assert held.overlap_order == ()
@@ -507,8 +551,27 @@ def test_production_root_call_wrapper_learns_then_overlaps(
         else:
             second = call()
             assert torch.equal(first, second)
-        if route in ("call", "forward", "exception"):
+        if route.startswith("scope"):
+            owner.exit()
+            assert not owner.scopes
+        if route in ("call", "forward", "exception", "scope"):
             assert owner.overlap["hits"] == 2
         else:
             assert owner.overlap.get("hits", 0) == 0
     assert not owner.stack and not owner._host_transfers
+
+
+def test_scope_hints_do_not_cross_attempt_or_forget(policy: Any) -> None:
+    owner, held, frame, key, _, _ = policy
+    frame.overlap_visits = list(held.part.blocks)
+    owner._overlap_learn(frame, key)
+    owner.stack.clear()
+    owner.exit()
+    assert held.overlap_key == key
+    owner.cuda = False  # actual begin policy; no simulated CUDA counters needed
+    owner.begin(None)
+    assert held.overlap_key is None and not held.overlap_order
+    held.overlap_key, held.overlap_order = key, held.part.blocks
+    owner.forget(held.construction)
+    assert not owner.held and not owner._host_transfers
+    assert held.overlap_key is None and not held.overlap_order

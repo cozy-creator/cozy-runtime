@@ -1107,7 +1107,11 @@ class Planner:
         raise self.refusal
 
     def exit(self) -> None:
-        self._overlap_retire(pending_only=True, clear=True)
+        self._overlap_retire(pending_only=True)
+        # A completed order is only a hint, revalidated by the next operation.
+        # A nested scope still invalidates learning in its active outer callers.
+        for frame in self.stack:
+            frame.overlap_enabled = frame.overlap_learnable = False
         if self.scopes:
             self.scopes.pop()
 

@@ -10,7 +10,7 @@ matching operation with a positive measured working-memory bound can prepare one
 observed successor while the current block runs. Repeated blocks, unknown contracts,
 groups, compiled/whole components, gradient mode, mutable state, pending casts and
 non-HOST candidates decline. History is local to the held construction, checked
-against hook/forward identities, and cleared on scope close, conversion, and failure.
+against hook/forward identities, and cleared on conversion, failure, attempt reset and unload.
 A failed replay is not a new source of lookahead authority.
 
 Preparation borrows only the fill backend's already materialized, entirely pinned
@@ -51,10 +51,13 @@ actual Planner and installed unit hooks, under the device-open-denying launcher.
 It cannot establish CUDA allocator behavior, real overlap, image parity, throughput,
 or thermal comparability. Those require a separately recorded immutable GPU candidate.
 
-History deliberately does not cross Model scope closure. A public pipeline that opens
-a new scope around every denoise step may therefore remain cold; a broader scope with
-repeated matching component operations can learn and reuse order. Eligibility is
-structural, not model-specific, and the experiment promises no uniform pipeline gain.
+Completed successful order hints survive ordinary Model scope closure within the same
+attempt and held construction. Scope exit still drains unbound transfers and disables
+lookahead/learning in active outer Frames; no copy or grant lives in the retained hint.
+The next operation freshly checks its key, hook/forward contract, conversion epoch,
+source state, working-memory record and available capacity. This removes an eligibility
+barrier for per-step scopes, not the need for extra room or existing pinned capacity.
+The experiment promises no uniform pipeline gain.
 
 ## Production wrapper correction
 

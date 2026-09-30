@@ -1,0 +1,1 @@
+- Retain completed successful overlap-order hints across ordinary Model scopes, while draining pending work, disabling active outer frames, and rechecking all source/contract/capacity facts before reuse.
