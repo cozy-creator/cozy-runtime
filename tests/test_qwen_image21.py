@@ -1,6 +1,8 @@
 """Real tiny Qwen modules: staged execution agrees with the upstream pipeline."""
 
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -207,3 +209,51 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Pat
 
     assert {x.dtype for x in graph.components["vae"].parameters()} == {torch.float32}
     assert {x.dtype for x in graph.components["transformer"].parameters()} == {torch.bfloat16}
+
+
+def test_runtime_pipeline_progress_preserves_cooperative_timing() -> None:
+    # An executor owns a fresh Python process. Repeated invocations must remain
+    # known, without hiding real author threads that outlive synchronous work.
+    code = """
+import asyncio
+import threading
+from cozy_runtime.author._activity import event_loop, observing
+from cozy_runtime.models.qwen_image21.model import _StagedPipeline
+
+pipeline = object.__new__(_StagedPipeline)
+pipeline.set_progress_bar_config(disable=True)
+for _ in range(2):
+    frames = []
+    with observing(lambda *frame: frames.append(frame)) as activity:
+        with pipeline.progress_bar(total=2) as progress:
+            progress.update(2)
+    assert frames[-1][1:] == (False, True, True), (
+        frames, [(type(t).__module__, type(t).__qualname__) for t in activity.unowned]
+    )
+
+frames = []
+with observing(lambda *frame: frames.append(frame)):
+    assert list(pipeline.progress_bar(iterable=[1, 2])) == [1, 2]
+    loop = event_loop()
+    try:
+        loop.run_until_complete(asyncio.sleep(0.01))
+    finally:
+        loop.close()
+assert all(frame[2] for frame in frames)
+assert any(not frame[1] and not frame[3] for frame in frames)
+
+release = threading.Event()
+raw = threading.Thread(target=release.wait)
+try:
+    frames = []
+    with observing(lambda *frame: frames.append(frame)):
+        raw.start()
+        with pipeline.progress_bar(total=1) as progress:
+            progress.update()
+    assert frames[-1][2] is False
+finally:
+    release.set()
+    raw.join()
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
