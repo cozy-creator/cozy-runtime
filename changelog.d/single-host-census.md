@@ -1,0 +1,1 @@
+- Collect total, resident and cached host-storage facts in one fresh local census, preserving shared-storage deduplication without a persistent cache or admission change.

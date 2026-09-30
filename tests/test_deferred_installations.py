@@ -17,7 +17,12 @@ import pytest
 import signed_claims
 from conftest import image_python
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import child_env, package_interface, static_interface
+from cozy_runtime.internal import (
+    child_env,
+    package_installation,
+    package_interface,
+    static_interface,
+)
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.plan import JobBinding
@@ -41,7 +46,11 @@ app.job(triple)
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 @pytest.mark.parametrize("case", ["selected", "broken"])
-def test_deferred_callee_installs_on_first_selection(case: str) -> None:
+def test_deferred_callee_installs_on_first_selection(
+    case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sdk_wheels = image_python().parents[2] / "wheels"
+    monkeypatch.setattr(package_installation, "machine_wheels", lambda _: sdk_wheels)
     uv = shutil.which("uv")
     assert uv is not None
     with tempfile.TemporaryDirectory(prefix="cz-defer.") as raw:

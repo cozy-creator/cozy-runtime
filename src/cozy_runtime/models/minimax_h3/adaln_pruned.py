@@ -22,7 +22,7 @@ from diffusers import MiniMaxH3Transformer3DModel
 from torch import nn
 from torch.nn import functional as F
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author import ConformanceError, retry_state
 
 from .turbo import (
     ATTENTION_KWARG,
@@ -182,6 +182,13 @@ class AdaLNPrunedMiniMaxH3Transformer(MiniMaxH3Transformer3DModel):  # type: ign
         super().__init__(**config)
         self.time_proj = _AdaLNPrunedTimestepLookup(table_timesteps)
         self.time_embedder = _AdaLNPrunedTimestepRows()
+        # The root pre-hook runs before any transformer block is paged in. Coverage
+        # is tiny config-derived metadata, so keep it with the root's common state,
+        # independently of the per-block table indices used by the actual math.
+        coverage = torch.zeros((len(table_timesteps), 3), dtype=torch.bool)
+        for timestep_row, modality_tag in table_block_keys:
+            coverage[timestep_row, modality_tag] = True
+        self.register_buffer("table_coverage", coverage, persistent=False)
         for block in self.transformer_blocks:
             block.adaln_proj = _AdaLNPrunedBlockTable(
                 hidden_size=int(self.config.hidden_size),
@@ -199,19 +206,41 @@ class AdaLNPrunedMiniMaxH3Transformer(MiniMaxH3Transformer3DModel):  # type: ign
             setattr(self, name, _SelectableHead(head.in_features, head.out_features))
         self._arming: TurboArming | None = None
         self._lora_hooks_installed = False
-        self.register_forward_pre_hook(self._arm, with_kwargs=True)
-        self.register_forward_hook(self._disarm, always_call=True)
+        arm, disarm = self._arm, self._disarm
+        self.register_forward_pre_hook(arm, with_kwargs=True)
+        self.register_forward_hook(disarm, always_call=True)
+        retry_state(self, self._save_retry_state, self._restore_retry_state, hooks=(arm, disarm))
+
+    def _save_retry_state(self) -> tuple[Any, list[tuple[Any, Any]]]:
+        # Arming rebinds these objects; it never mutates an existing marker or its
+        # source tensors. Preserve references, including a partially armed baseline.
+        return self._arming, [
+            (module, module._armed) for module in self.modules() if hasattr(module, "_armed")
+        ]
+
+    def _restore_retry_state(self, state: tuple[Any, list[tuple[Any, Any]]]) -> None:
+        self._arming, armed = state
+        for module, value in armed:
+            module._armed = value
 
     def install_lora_consumers(self) -> None:
         """Install once during turbo-capable construction, before Runtime fill/fusion."""
         if self._lora_hooks_installed:
             return
+        hooks = []
         for path, site in self.named_modules():
             if path.startswith(
                 ("token_refiner.refiner_blocks.", "transformer_blocks.")
             ) and path.endswith(LORA_FAMILIES):
-                site.register_forward_hook(_LoRAHook(self, path))
+                hook = _LoRAHook(self, path)
+                site.register_forward_hook(hook)
+                hooks.append(hook)
         self._lora_hooks_installed = True
+        retry_state(
+            self, self._save_retry_state, self._restore_retry_state,
+            hooks=(*self._cozy_retry_hooks, *hooks),
+            forwards=self._cozy_retry_forwards,
+        )
 
     def _arm(
         self,
@@ -271,8 +300,7 @@ class AdaLNPrunedMiniMaxH3Transformer(MiniMaxH3Transformer3DModel):  # type: ign
                 tables = overlay
             global_rows = self.time_proj.rows(timestep)
             row_timesteps = global_rows.index_select(0, timestep_indices)
-            table_index = tables.transformer_blocks[0].adaln_proj.table_index
-            present = table_index[row_timesteps, token_tags] >= 0
+            present = tables.table_coverage[row_timesteps, token_tags]
             if not bool(torch.all(present)):
                 raise ConformanceError(
                     "model modulation tables do not cover a requested reference timestep/modality; "

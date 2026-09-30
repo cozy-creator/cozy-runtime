@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.18.96"
+version = "0.19.0"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
@@ -21,6 +21,7 @@ dependencies = [
     "packaging>=24",
     "pillow>=12",
     "protobuf>=6.31",
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -105,6 +106,13 @@ strict = true
 warn_unreachable = true
 disallow_any_generics = true
 implicit_reexport = false
+
+# Excluding generated bindings from discovery does not exclude their imported .pyi.
+# Keep their types available without reporting protoc's diagnostics on a cold cache.
+[[tool.mypy.overrides]]
+module = ["cozy.worker.v1.worker_pb2"]
+follow_imports = "silent"
+follow_imports_for_stubs = true
 
 # torch is an OPTIONAL extra (§1.0: the base package is torch-free), so the checking venv
 # does not have it and mypy cannot see its types. The consequence is recorded rather than
