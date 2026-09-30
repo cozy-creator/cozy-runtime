@@ -91,6 +91,9 @@ TREE_PREFIX = "tree:"
 MODEL_PREFIX = "model:"
 MODEL_MIME = "application/vnd.cozy.model-manifest"
 _MODEL_PARAM = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_MODEL_SOURCE_PARAM = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]{0,127}\.(?:adapter\.(?:0|[1-9][0-9]{0,18})|composed)$"
+)
 
 #: The one input_id that is not an asset: the request DOCUMENT itself rides the grant as an
 #: input, which is why the payload and the assets share one authorization table and reader.
@@ -427,8 +430,16 @@ def bind(
                     "grant_model_serving_refused",
                     f"serving InvocationSpec cannot carry job Model input {input_id!r}",
                 )
+            # Generated adapter/view capabilities are independent catalog roots, not
+            # authored Model parameters. Admit only their closed serving namespace.
+            auxiliary_source = (
+                declared.serving is not None
+                and declared.job is None
+                and bool(catalog_repository)
+                and _MODEL_SOURCE_PARAM.fullmatch(parameter) is not None
+            )
             if (
-                _MODEL_PARAM.fullmatch(parameter) is None
+                (_MODEL_PARAM.fullmatch(parameter) is None and not auxiliary_source)
                 or row.kind_mime != MODEL_MIME
                 or carried_order != 0
                 or carried_length <= 0

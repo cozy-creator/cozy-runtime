@@ -35,8 +35,10 @@ def offer(bindings: list[pb.InputBinding], accesses: list[pb.InputAccess]) -> pb
     )
 
 
+@pytest.mark.parametrize("parameter", ["model", "base_model"])
 def test_generated_adapter_sources_bind_and_retain_without_parameter_collisions(
     tmp_path: Path,
+    parameter: str,
 ) -> None:
     store, base, adapter, _ = fixture(tmp_path)
     composed, _ = compose(store, tmp_path, "composed", base, [(adapter, 0.8)])
@@ -49,7 +51,7 @@ def test_generated_adapter_sources_bind_and_retain_without_parameter_collisions(
             source.manifest.length,
         )
     source = {
-        "parameter": "model",
+        "parameter": parameter,
         "repository": "local/base",
         "manifest": {"digest": base.manifest.digest, "length": base.manifest.length},
         "adapters": [
@@ -69,7 +71,15 @@ def test_generated_adapter_sources_bind_and_retain_without_parameter_collisions(
         },
     }
     bindings, accesses = defaults.inputs(
-        [source, dict(source, parameter="model_adapter_0", adapters=[], composed=None)]
+        [
+            source,
+            dict(source, parameter=parameter + "_adapter_0", adapters=[], composed=None),
+            {
+                "parameter": "turbo_lora",
+                "repository": "local/style",
+                "manifest": {"digest": adapter.manifest.digest, "length": adapter.manifest.length},
+            },
+        ]
     )
     submitted = offer(bindings, accesses)
     selected = grants.model_inputs(
@@ -79,10 +89,17 @@ def test_generated_adapter_sources_bind_and_retain_without_parameter_collisions(
             submitted.invocation_spec_digest,
         )
     )
-    assert set(selected) == {"model", "model.adapter.0", "model.composed", "model_adapter_0"}
-    assert selected["model.adapter.0"].digest == documents.raw(adapter.manifest.digest)
-    assert selected["model.composed"].digest == documents.raw(composed.manifest.digest)
-    assert selected["model_adapter_0"].digest == documents.raw(base.manifest.digest)
+    assert set(selected) == {
+        parameter,
+        parameter + ".adapter.0",
+        parameter + ".composed",
+        parameter + "_adapter_0",
+        "turbo_lora",
+    }
+    assert selected[parameter + ".adapter.0"].digest == documents.raw(adapter.manifest.digest)
+    assert selected[parameter + ".composed"].digest == documents.raw(composed.manifest.digest)
+    assert selected[parameter + "_adapter_0"].digest == documents.raw(base.manifest.digest)
+    assert selected["turbo_lora"].digest == documents.raw(adapter.manifest.digest)
     workspace = Workspace(Path(store.root))
     with machine_checkpoint_inputs.admission(workspace, "owner", submitted.request_id):
         machine_checkpoint_inputs.preflight(workspace, "owner", submitted, selected)
@@ -101,11 +118,15 @@ def test_generated_adapter_sources_bind_and_retain_without_parameter_collisions(
             str(row["native_owner"])
             for row in db.execute("SELECT native_owner FROM execution_checkpoint_inputs")
         ]
-    assert len(roots) == 4
-    assert all(not store.checkpoint_root(root)["released"] for root in roots)
+    assert len(roots) == 5
+    for root in roots:
+        held = store.checkpoint_root(root)
+        assert held is not None and not held["released"]
     outcome = complete(executions, submitted.request_id, 14)
     executions.acknowledge_collection("owner", ack(outcome))
-    assert all(store.checkpoint_root(root)["released"] for root in roots)
+    for root in roots:
+        held = store.checkpoint_root(root)
+        assert held is not None and held["released"]
 
 
 @pytest.mark.parametrize(
@@ -120,13 +141,21 @@ def test_generated_adapter_sources_bind_and_retain_without_parameter_collisions(
         "model/../composed",
         "model.other",
         "model.adapter.0.composed",
+        "model.adapter.12345678901234567890",
     ],
 )
 def test_malformed_auxiliary_model_inputs_are_refused(parameter: str) -> None:
     bindings, accesses = defaults.inputs(
-        [{"parameter": parameter, "repository": "local/base", "manifest": {
-            "digest": "sha256:" + "11" * 32, "length": 100,
-        }}]
+        [
+            {
+                "parameter": parameter,
+                "repository": "local/base",
+                "manifest": {
+                    "digest": "sha256:" + "11" * 32,
+                    "length": 100,
+                },
+            }
+        ]
     )
     submitted = offer(bindings, accesses)
     with pytest.raises(grants.GrantRefusal, match="grant_model_identity"):
@@ -140,9 +169,16 @@ def test_malformed_auxiliary_model_inputs_are_refused(parameter: str) -> None:
 @pytest.mark.parametrize("catalog", [False, True])
 def test_auxiliary_sources_do_not_expand_authored_job_parameters(catalog: bool) -> None:
     bindings, accesses = defaults.inputs(
-        [{"parameter": "model.adapter.0", "repository": "local/base", "manifest": {
-            "digest": "sha256:" + "11" * 32, "length": 100,
-        }}]
+        [
+            {
+                "parameter": "model.adapter.0",
+                "repository": "local/base",
+                "manifest": {
+                    "digest": "sha256:" + "11" * 32,
+                    "length": 100,
+                },
+            }
+        ]
     )
     if not catalog:
         accesses[0].ClearField("catalog_model")
@@ -173,9 +209,16 @@ def test_auxiliary_sources_do_not_expand_authored_job_parameters(catalog: bool) 
 )
 def test_auxiliary_serving_sources_keep_exact_access_checks(mutation: str, code: str) -> None:
     bindings, accesses = defaults.inputs(
-        [{"parameter": "model.composed", "repository": "local/base", "manifest": {
-            "digest": "sha256:" + "11" * 32, "length": 100,
-        }}]
+        [
+            {
+                "parameter": "model.composed",
+                "repository": "local/base",
+                "manifest": {
+                    "digest": "sha256:" + "11" * 32,
+                    "length": 100,
+                },
+            }
+        ]
     )
     if mutation == "no_catalog":
         accesses[0].ClearField("catalog_model")
