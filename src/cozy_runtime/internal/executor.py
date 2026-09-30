@@ -65,7 +65,13 @@ from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
-from cozy_runtime.author._errors import CapabilityError, InvalidRequest, Outcome, classify
+from cozy_runtime.author._errors import (
+    CapabilityError,
+    InvalidRequest,
+    Outcome,
+    classify,
+    is_device_oom,
+)
 from cozy_runtime.author._executor_requests import (
     Answer,
     Checkpoint,
@@ -2557,7 +2563,7 @@ class Executor:
             # the backend's own OOM — which is asked of the accelerator boundary rather
             # than named here, so a second backend spells its allocator error once (#447).
             refusal = exc if isinstance(exc, FillRefusal) else None
-            if refusal is None and not accel.is_oom(torch, exc):
+            if refusal is None and not is_device_oom(exc):
                 raise
             # The generation is already rolled back, so the numbers that matter are the
             # HIGH-WATER marks beside the after state — "released 0 B" would be true and
@@ -2713,7 +2719,7 @@ class Executor:
                 self.poisoned = f"warm failed: {exc}"[:200]
                 cause = exc.__cause__
                 short = cause if isinstance(cause, ResidencyRefusal) else None
-                oom = cause is not None and accel.is_oom(torch, cause)
+                oom = cause is not None and is_device_oom(cause)
                 return {
                     "ok": False,
                     "code": short.code if short else "device_out_of_memory" if oom else exc.code,

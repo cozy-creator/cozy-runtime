@@ -41,7 +41,7 @@ from cozy_runtime.author._errors import (
     CapabilityError,
     ConformanceError,
     InvalidRequest,
-    _is_device_oom,
+    is_device_oom,
 )
 from cozy_runtime.author._loader import (
     Artifact,
@@ -396,7 +396,7 @@ def placeable(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
 # VAE's decode streams chunks to its caller, and a second run would deliver them twice.
 def _tiles_after_oom(model: Any, components: tuple[str, ...], exc: Exception) -> list[Any]:
     plane: Any = model._cozy_residency
-    held = plane.backend.components if plane is not None and _is_device_oom(exc) else {}
+    held = plane.backend.components if plane is not None and is_device_oom(exc) else {}
     modules = [held.get(name) for name in components]
     image_vaes = all(
         any(k.__name__ == "AutoencoderKL" and k.__module__.startswith("diffusers.") for k in

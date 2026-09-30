@@ -395,16 +395,9 @@ def initialized(torch: Any, kind: str) -> bool:
     return False
 
 
-def is_oom(torch: Any, exc: BaseException) -> bool:
-    """The OOM PRIMITIVE only — what the failure IS. What it MEANS (#418's
-    accepted_envelope_breach classification) stays with the attempt lifecycle."""
-    oom = getattr(torch.cuda, "OutOfMemoryError", ())
-    return isinstance(exc, oom)
-
-
 def oom_error(torch: Any, kind: str) -> type[BaseException]:
-    """The OOM exception CLASS, for the one shape `is_oom` cannot serve: an `except`
-    clause that must name the type before an instance exists."""
+    """The OOM exception CLASS, for an `except` clause that must name the type before an
+    instance exists. An instance is classified by `author._errors.is_device_oom`."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "oom_error")
     cls = getattr(torch.cuda, "OutOfMemoryError", None)

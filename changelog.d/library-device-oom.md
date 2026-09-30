@@ -1,0 +1,1 @@
+cuBLAS/cuDNN workspace allocation failures and asynchronous CUDA out-of-memory errors are device OOM. A warm that hits one no longer marks its binding unavailable for the life of the pod, and a run that hits one reports `device_out_of_memory` instead of an author exception.
