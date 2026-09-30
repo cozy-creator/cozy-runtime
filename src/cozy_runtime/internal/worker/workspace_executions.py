@@ -766,6 +766,21 @@ class Executions:
             ).fetchone()
         return cast(dict[str, Json], canonical_json.decode(row[0])) if row is not None else None
 
+    def last_grants(self, owner: str) -> list[tuple[str, tuple[int, ...]]]:
+        """Each GPU set's most recent grant, newest first: the granted execution and its set."""
+        with self.workspace.locked() as db:
+            rows = db.execute(
+                "SELECT json_extract(CAST(body AS TEXT),'$.key'), "
+                "json_extract(CAST(body AS TEXT),'$.ordinals') FROM execution_events "
+                "WHERE owner=? AND kind='gpu.grant' ORDER BY at_ms DESC, sequence DESC LIMIT ?",
+                (owner, MAX_PAGE),
+            ).fetchall()
+        latest: dict[tuple[int, ...], str] = {}
+        for key, ordinals in rows:
+            cards = msgspec.json.decode(ordinals, type=tuple[int, ...])
+            latest.setdefault(cards, str(key).rpartition("#")[0])
+        return [(request, cards) for cards, request in latest.items()]
+
     def active(self, owner: str) -> bool:
         with self.workspace.locked() as db:
             return (

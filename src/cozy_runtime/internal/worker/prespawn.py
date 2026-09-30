@@ -17,12 +17,16 @@ cards. Where the grant depends on who leaves first, nothing starts. At most one 
 process imports per card set, for the root the scheduler serves first there; the next one
 starts when it is claimed or leaves (`_admit`), and roots of one installation share it.
 
+A restarted, idle machine prewarms at boot (`prewarm`): the installation each GPU set last
+served, from its own journal, starts for no root on that set.
+
 Nothing here reserves a GPU or allocates device memory. A slot yields when every root waiting
 for it ends, when its installation's replica binds other cards or is collected, and, started
-for no root, when another installation is granted its cards. An executor that predates
-import-only starts (`import_only` absent from its hello) is only spawned: sent the start it
-does not know, it would initialize the device. A failure anywhere is a missed saving, never
-a verdict: the replica then starts its own process exactly as it did before this existed.
+for no root, when another installation is granted its cards or host memory stalls. An
+executor that predates import-only starts (`import_only` absent from its hello) is only
+spawned: sent the start it does not know, it would initialize the device. A failure anywhere
+is a missed saving, never a verdict: the replica then starts its own process exactly as it did
+before this existed.
 """
 
 from __future__ import annotations
@@ -49,9 +53,11 @@ from cozy_runtime.internal import package_installation, package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.execution_evidence import gpu_names
 from cozy_runtime.internal.executor_commands import Start
+from cozy_runtime.internal.worker import machine_lanes
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.gpu_scheduler import Ordinals, Want, model_degrees, width_for
 from cozy_runtime.internal.worker.lanes import DeviceLane, lane_id_for
+from cozy_runtime.internal.worker.machine_slots import memory_stalled
 from cozy_runtime.internal.worker.stage_progress import Emit
 
 if TYPE_CHECKING:
@@ -115,6 +121,8 @@ class Ask:
     roots: set[str]
     sink: Emit | None
     arrival: int
+    #: the card set a boot prewarm names (what it last served); empty: foreseen at admission
+    ordinals: Ordinals = ()
 
 
 class Prespawns:
@@ -164,8 +172,29 @@ class Prespawns:
         readable = self.worker.readable_gpus()
         return width_for(model_degrees(models), len(readable)) if models and readable else 0
 
+    def prewarm(self, owner: str) -> None:
+        """A restarted, idle machine's first grant pays no executor start either: the
+        installation each GPU set last served, read from this machine's own journal, starts
+        importing there for no root; the first root to ask for it, or be granted those cards
+        for it, adopts it."""
+        assert self.worker.executions is not None
+        for request, ordinals in self.worker.executions.last_grants(owner):
+            try:
+                shape = machine_lanes.recorded(self.worker, owner, request)
+                if shape.kind == "serving":
+                    installation, interface = shape.template[0], shape.interface
+                    self._request("", installation, interface, len(ordinals), None, ordinals)
+            except Exception as exc:  # a missed saving, never the boot's failure
+                self.worker.note("warm", f"no prewarm from {request}: {exc!r}"[:256])
+
     def _request(
-        self, root: str, installation: str, interface: bytes, width: int, emit: Emit | None
+        self,
+        root: str,
+        installation: str,
+        interface: bytes,
+        width: int,
+        emit: Emit | None,
+        ordinals: Ordinals = (),
     ) -> None:
         if not width or self.worker.options.install_root is None:
             return
@@ -180,7 +209,13 @@ class Prespawns:
                 ask.sink = ask.sink or emit
             else:
                 self.asks[installation] = Ask(
-                    installation, interface, width, {root} - {""}, emit, next(self.arrivals)
+                    installation,
+                    interface,
+                    width,
+                    {root} - {""},
+                    emit,
+                    next(self.arrivals),
+                    ordinals,
                 )
         if slot is None:
             self._admit()
@@ -209,7 +244,9 @@ class Prespawns:
                         self.asks.pop(ask.installation, None)
                         continue
                 root = min(ask.roots, key=lambda r: self.priorities.get(r, math.inf), default="")
-                ordinals = self._foreseen(root, ask.width)
+                ordinals = ask.ordinals or self._foreseen(root, ask.width)
+                if ask.ordinals and not set(ask.ordinals) <= set(self.worker.readable_gpus()):
+                    ordinals = None  # a card set this machine no longer reads
                 if ordinals is None or held & set(ordinals):
                     continue
                 held |= set(ordinals)
@@ -411,6 +448,8 @@ class Prespawns:
         installations = installations or {}
         self.priorities = dict(roots)
         cards = msgspec.convert(view, _Cards, strict=True)
+        # Host memory stalled: what no root waits for (a prewarm, a landing) goes first.
+        stalled = memory_stalled()
         taken: dict[int, set[str]] = {}
         granted: dict[int, set[tuple[str, str]]] = {}
         for root, held in cards.leases.items():
@@ -440,15 +479,19 @@ class Prespawns:
                 if (slot.roots and not slot.roots & roots.keys())
                 or (
                     not slot.roots
-                    and any(
-                        installation != slot.installation
-                        for o in slot.ordinals
-                        for _, installation in granted.get(o, ())
+                    and (
+                        stalled
+                        or any(
+                            installation != slot.installation
+                            for o in slot.ordinals
+                            for _, installation in granted.get(o, ())
+                        )
                     )
                 )
             ]
-            for ask in [a for a in self.asks.values() if a.roots and not a.roots & roots.keys()]:
-                del self.asks[ask.installation]
+            for ask in list(self.asks.values()):
+                if (ask.roots and not ask.roots & roots.keys()) or (stalled and not ask.roots):
+                    del self.asks[ask.installation]
         for slot in leaving:
             self.worker.note("warm", f"prespawn on {list(slot.ordinals)} yields")
             self._drop(slot)

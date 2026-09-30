@@ -69,7 +69,7 @@ def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: Jo
     if warm is not None and not (warm.binding == binding and warm.ready()):
         warm.supervision.close()
         warm = None
-    if warm is None and _memory_stalled():
+    if warm is None and memory_stalled():
         # A new process needs memory the idle ones are holding.
         for idle in list(worker.warm_cpu):
             worker.warm_cpu.pop(idle).supervision.close()
@@ -142,7 +142,7 @@ def release(worker: Worker, request: str, *, ordinal: int | None = None) -> None
         worker.lanes.by_id.pop(slot_key, None)
 
 
-def _memory_stalled() -> bool:
+def memory_stalled() -> bool:
     """Whether the kernel measured every runnable task stalled on memory in its last 10 s."""
     try:
         full = Path("/proc/pressure/memory").read_text().splitlines()[1].split()

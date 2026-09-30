@@ -2335,6 +2335,8 @@ class Worker:
             self.execution(owner, request)
         for request in self.machine_calls.journal.unsettled_effects(owner):
             self.execution(owner, request)
+        if not owed:
+            self.prespawns.prewarm(owner)
 
     def submit_execution(
         self,

@@ -1,0 +1,1 @@
+A restarted, idle machine prewarms at boot: the installation each GPU set last served, read from the machine's own execution journal, starts its import-only executor there for no root, so the first grant adopts it instead of paying the executor start. Host memory stall releases such unclaimed prewarms first.

@@ -49,6 +49,7 @@ from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
 from cozy_runtime.internal.worker.session import HostedPlacement, Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace_calls import Call
+from cozy_runtime.internal.worker.workspace_executions import TERMINAL
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_cross_version_seam import _installation
@@ -694,6 +695,59 @@ def test_one_process_imports_ahead_per_card_for_the_root_served_first(
     adopted = [s for s in steps if "adopts prespawned epoch 1" in s]
     assert len(adopted) == 3 and not [s for s in steps if "spawning the device" in s], steps
     assert prespawns.slots == {} and prespawns.asks == {}
+
+
+def test_a_restarted_machine_prewarms_what_its_card_last_served(
+    warm: Callable[..., Warm],
+) -> None:
+    """A machine served D1 on its card, then restarted idle. At boot, from its own journal, it
+    imports the installation that card last served, for no root; D2, the first root to ask for
+    it, is granted the card and adopts that very process: no spawn and no import at its grant,
+    and its first driver call is the device start's."""
+    del warm  # its driver fakes only: both boots share one machine root
+    with tempfile.TemporaryDirectory(prefix="cz-boot.", dir="/tmp") as raw:
+        first = Warm(Path(raw), CARDS[0])
+        origin = Origin(Path(tempfile.mkdtemp(prefix="cz-origin.", dir="/tmp")))
+        try:
+            first.captured_root("A", origin)
+            origin.release.set()
+            call, request = _call("A")
+            serving = first.worker.machine_calls.serving  # type: ignore[union-attr]
+            landing = serving._shared(
+                OWNER, call, first.target(origin.checkpoint), request, {}, speculative=False
+            )
+            assert landing is not None and landing.result(120)
+            first.finish("A")
+            first.direct_root("D1", origin.checkpoint)
+            _wait(lambda: first.executions.status(OWNER, "D1").state in TERMINAL, "D1 served")
+            assert first.executions.last_grants(OWNER) == [("D1", (0,))]
+            served = len(_attempts(first))  # D1's own device start, on the first boot
+        finally:
+            origin.close()
+            first.worker.shutdown()
+
+        # The worker process restarts within the machine's boot: same root, same journal.
+        second = Warm(Path(raw), CARDS[0])
+        try:
+            prespawns = second.worker.prespawns
+            slot = _wait(lambda: prespawns.slots.get((INSTALLATION, (0,))), "the boot's prewarm")
+            assert not slot.roots and slot.started.wait(300) and slot.ready
+            executor = slot.executor
+            assert executor is not None and executor.alive() and _imported(executor)
+            assert _attempts(second)[served:] == []
+
+            notes = len(second.worker.activity)
+            second.direct_root("D2", origin.checkpoint)
+            second.tick()
+            grants = [b["ordinals"] for _, k, b in second.journal("D2") if k == "gpu.grant"]
+            assert grants == [[0]] and slot.claimed.is_set() and slot.roots == {"D2"}
+            assert slot.supervision.spawns == 1 and executor.epoch == 1
+            steps = [e.step for e in list(second.worker.activity)[notes:]]
+            assert [s for s in steps if "adopts prespawned epoch 1" in s], steps
+            assert not [s for s in steps if "spawning the device executor" in s], steps
+            assert _attempts(second)[served:] == [(executor.pid, "_cuda_init")]
+        finally:
+            second.worker.shutdown()
 
 
 def test_the_adopting_start_is_the_device_start_alone(warm: Callable[..., Warm]) -> None:

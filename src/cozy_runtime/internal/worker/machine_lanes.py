@@ -51,6 +51,18 @@ def shape(worker: Worker, owner: str, request: str) -> Shape:
     return _shape(worker, root, parent, desired, executions.offer(owner, request))
 
 
+def recorded(worker: Worker, owner: str, request: str) -> Shape:
+    """What a journaled execution, finished or not, asked of the GPUs, from its own offer."""
+    executions = worker.executions
+    assert executions is not None
+    row = executions.row(owner, request)
+    if row is None:
+        return Shape(request, "cpu")
+    return _shape(
+        worker, "", "", executions.prepared(owner, request).desired(), row.attempt_offer()
+    )
+
+
 def _shape(
     worker: Worker, root: str, parent: str, desired: pb.DesiredWorkerState, offered: pb.AttemptOffer
 ) -> Shape:
