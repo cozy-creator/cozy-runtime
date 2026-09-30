@@ -160,6 +160,9 @@ func (m *Machine) preparePrivatePlacement(stream grpc.ServerStream) error {
 		if len(selected.NativeModels) > 0 && !m.supportsRuntime("runtime-model-preparation/1") {
 			return prepared{code: pb.CapabilityUnavailableCode, detail: "the installed Runtime does not support model preparation; update its Runtime wheel"}
 		}
+		if len(selected.ModelChoices) > 0 && !m.supportsRuntime("runtime-model-overrides/1") {
+			return prepared{code: pb.CapabilityUnavailableCode, detail: "the installed Runtime cannot prepare model overrides; update its Runtime wheel"}
+		}
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED})
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARING})
 		request := &pb.PreparePrivatePlacementRequest{OperationId: selected.OperationId, InstallationId: selected.InstallationId,

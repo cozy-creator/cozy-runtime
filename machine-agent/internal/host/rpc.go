@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/capability"
@@ -162,6 +163,11 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 	if err != nil {
 		return err
 	}
+	if submit, ok := first.(*pb.MachineExecutionSubmit); ok {
+		if err := m.requireModelOverrides(submit); err != nil {
+			return err
+		}
+	}
 	if submit, ok := first.(*pb.MachineExecutionSubmit); ok && submit.Hub != "" {
 		peer, err := pb.NewRuntimePreparationClient(conn).ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
 		if err != nil {
@@ -216,6 +222,26 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 		}
 	}
 	stream.SetTrailer(out.Trailer())
+	return nil
+}
+
+func (m *Machine) requireModelOverrides(request *pb.MachineExecutionSubmit) error {
+	requested := false
+	for _, choice := range request.GetReleaseRoot().GetModels() {
+		requested = requested || len(choice.Adapters) > 0 || strings.Contains(choice.Parameter, ".models.")
+	}
+	if len(request.CaptureCanonicalBytes) > 0 {
+		var capture struct {
+			ModelChoices []json.RawMessage `json:"model_choices"`
+		}
+		if err := json.Unmarshal(request.CaptureCanonicalBytes, &capture); err != nil {
+			return status.Error(codes.InvalidArgument, "invalid captured execution document")
+		}
+		requested = requested || len(capture.ModelChoices) > 0
+	}
+	if requested && !m.supportsRuntime("runtime-model-overrides/1") {
+		return status.Error(codes.FailedPrecondition, pb.CapabilityUnavailableCode+": this Runtime cannot preserve model overrides; update the Runtime")
+	}
 	return nil
 }
 

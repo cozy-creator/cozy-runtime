@@ -1694,7 +1694,7 @@ class Worker:
                 self.verified_artifacts.record(digest, length, path)
 
             with contextlib.ExitStack() as access:
-                if request.native_models:
+                if request.native_models or request.model_choices:
                     if self.workspace is None:
                         raise package_prepare.PreparationRefusal(
                             "private_workspace_absent",
@@ -1710,6 +1710,18 @@ class Worker:
                         access.enter_context(
                             self.workspace.held_model(owner, model.retention, model.manifest)
                         )
+                overrides = None
+                if request.model_choices:
+                    from . import machine_model_overrides
+
+                    def check_model_preparation() -> None:
+                        self.authorize_workspace(request.claim)
+                        if self.stop.is_set():
+                            raise WorkspaceRefusal("machine stopped during model preparation")
+
+                    overrides = machine_model_overrides.private(
+                        self, request, prepared.document, check=check_model_preparation
+                    )
                 result = package_prepare.prepare_unpublished_placement(
                     request,
                     prepared=prepared.document,
@@ -1721,8 +1733,9 @@ class Worker:
                         else None
                     ),
                     verified=mark_verified,
+                    model_overrides=overrides,
                 )
-                if request.native_models:
+                if request.native_models or request.model_choices:
                     self.authorize_workspace(request.claim)
             joined = read_placement_set(result.placement_set)
             if len(joined) != 1 or joined[0].installation_id != revision:

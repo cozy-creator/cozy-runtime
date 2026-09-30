@@ -41,7 +41,7 @@ from packaging.version import Version
 
 import signed_claims
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import child_env, package_installation
+from cozy_runtime.internal import child_env, derive_child, package_installation
 from cozy_runtime.internal.config import Credentials, RuntimeConfig, package_install_environment
 from cozy_runtime.internal.worker import activity, prespawn
 from cozy_runtime.internal.worker.control import GrpcControlHost
@@ -539,6 +539,29 @@ def test_job_polls_a_finished_job_child(harness: Harness) -> None:
 def test_job_derives_adopts_and_reads_weights(harness: Harness) -> None:
     """ExecutionStorage's `weights_writer`: output and adopt in one child, source in another."""
     assert harness.run("derived", "derived", {"n": 4}) == {"value": 1, "runtime": harness.version}
+
+
+def test_prepared_adapters_refuse_only_the_unsupported_installed_sdk(harness: Harness) -> None:
+    """The same real old SDK still answers base-only derivation; adapter work refuses alone."""
+    installation = package_installation.open_installation(
+        harness.root / "installs", harness.prepared.installed_package.installation_id
+    )
+    bare = derive_child.SlotRequest("inspect.models.model", b"{}")
+    request = derive_child.DeriveRequest((bare,), application=MODULE + ":app")
+    assert derive_child.derive_in(installation.python, request) == (
+        derive_child.SourceSlot(bare.slot),
+    )
+    if not harness.requirement.startswith("=="):
+        return
+    graph = canonical_json.encode({"format": "cozy.model.lora/1", "layers": [], "adapters": []})
+    adapted = derive_child.DeriveRequest(
+        (derive_child.SlotRequest(bare.slot, b"{}", adapters=graph),),
+        application=MODULE + ":app",
+    )
+    with pytest.raises(derive_child.DeriveRefusal) as refused:
+        derive_child.derive_in(installation.python, adapted)
+    assert refused.value.code == "adapter_composition_unsupported"
+    assert "update its Runtime dependency" in refused.value.detail
 
 
 def test_an_exact_pin_keeps_its_runtime_and_a_bound_runs_the_machines(harness: Harness) -> None:

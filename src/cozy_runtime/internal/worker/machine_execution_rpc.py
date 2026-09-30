@@ -131,6 +131,7 @@ class MachineExecutionRPC:
                 run_output_log=True,
                 release_root_owner=True,
                 submission_close=True,
+                model_overrides=True,
             )
 
         return self._call(request.claim, context, get)

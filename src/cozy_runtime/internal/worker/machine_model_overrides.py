@@ -96,6 +96,16 @@ def checkpoint(
     if choice.source:
         return machine_source_models.slot(worker, choice, credentials, note)
     pin = _pin(worker, choice)
+    if pin is not None and pin["length"]:
+        authority = machine_model_resolve.registration(worker, hub)
+        return {
+            "parameter": choice.parameter,
+            "repository": choice.repository,
+            "manifest": pin,
+            "release": choice.release,
+            "lane": choice.lane,
+            "public_origin": authority.origin if authority is not None else hub,
+        }
     catalog = machine_model_resolve.own(worker, package, hub)
     selected: dict[str, Json] = {
         "repository": choice.repository,
@@ -181,3 +191,111 @@ def context(worker: Worker, owner: str, call: Call) -> tuple[str, str, dict[str,
         held = worker.machine_sources.credentials.get((owner, root), {})
         credentials = {PROVIDERS[key]: value for key, value in held.items() if key in PROVIDERS}
     return prepared.hub, prepared.account, credentials
+
+
+def private(
+    worker: Worker,
+    request: pb.PreparePrivatePlacementRequest,
+    prepared: pb.Placement,
+    *,
+    check: Callable[[], None],
+) -> tuple[list[dict[str, Json]], list[pb.NativeModelBinding]]:
+    """Resolve exact slots before a private capture exists, under the caller's current claim."""
+    interface = package_interface.parse(prepared.package_interface, "private model overrides")
+    package = (
+        prepared.package.package if prepared.HasField("package") else prepared.development.package
+    )
+    allowed = {
+        slot.path: slot for entrypoint in interface.entrypoints for slot in entrypoint.models
+    }
+    catalog = (
+        documents.parse(request.download_delegation, pb.DownloadDelegation)
+        if request.download_delegation
+        else None
+    )
+    selections: dict[str, dict[str, Json]] = {
+        row.slot: documents.body(row) for row in (() if catalog is None else catalog.models)
+    }
+    native = {row.slot: row for row in request.native_models}
+    chosen: set[str] = set()
+    credentials = machine_source_models.credentials(request.source_credentials)
+    for original in request.model_choices:
+        path = original.parameter
+        if path not in allowed or path in chosen:
+            raise WorkspaceRefusal(
+                "model_override_invalid: private choices require one exact serving callable model slot"
+            )
+        chosen.add(path)
+        choice = machine_model_choices.normalized(original)
+        choice.parameter = allowed[path].parameter
+        original_native = native.get(path)
+        if has_base(choice):
+            if original_native is not None:
+                raise WorkspaceRefusal(
+                    "model_override_conflict: an owned ModelArtifact already selects this base"
+                )
+            base = checkpoint(
+                worker,
+                choice,
+                msgspec.to_builtins(allowed[path]),
+                package=package,
+                hub=request.hub,
+                owner=request.owner,
+                credentials=credentials,
+                note=lambda *_: None,
+            )
+        elif original_native is not None:
+            base = {
+                "parameter": choice.parameter,
+                "repository": original_native.model,
+                "manifest": documents.body(original_native.manifest),
+                "native": True,
+            }
+        elif path in selections:
+            selected = selections[path]
+            pin = pb.ModelChoice(
+                parameter=choice.parameter,
+                repository=str(selected["model"]),
+                release=str(selected.get("release", "")),
+                lane=str(selected.get("lane", "")),
+            )
+            pin.manifest.digest = documents.raw(str(selected["manifest"]))
+            base = checkpoint(
+                worker,
+                pin,
+                msgspec.to_builtins(allowed[path]),
+                package=package,
+                hub=request.hub,
+                owner=request.owner,
+                credentials=credentials,
+                note=lambda *_: None,
+            )
+        else:
+            raise WorkspaceRefusal(
+                "model_override_invalid: adapter-only private choice has no selected base"
+            )
+        result = apply(
+            worker,
+            base,
+            choice,
+            package=package,
+            hub=request.hub,
+            owner=request.owner,
+            credentials=credentials,
+            note=lambda *_: None,
+            check=check,
+            native_base=original_native is not None,
+        )
+        selected_row = machine_model_defaults.decode([result])[0]
+        selections[path] = {
+            "package": package,
+            "slot": path,
+            "model": selected_row.repository,
+            "manifest": selected_row.manifest.digest,
+            "release": selected_row.release,
+            "lane": selected_row.lane,
+            "adapters": msgspec.to_builtins(selected_row.adapters),
+            "composed": msgspec.to_builtins(selected_row.composed),
+        }
+        native.pop(path, None)
+    return list(selections.values()), list(native.values())

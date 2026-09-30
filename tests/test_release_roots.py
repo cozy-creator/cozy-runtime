@@ -787,6 +787,7 @@ def test_a_provider_source_choice_is_made_by_the_machine_once(
     )
     origin = HuggingFace(_repository(modular=False))
     source = "hf://example/diffusers@" + "c" * 40
+    secret = "hf_cozy_private_preparation_credential_must_stay_in_memory_292"
     calls = machine.worker.source_calls
     assert calls is not None
     supervisor = Supervisor(machine.store_root, 1 << 30, 0)
@@ -800,6 +801,9 @@ def test_a_provider_source_choice_is_made_by_the_machine_once(
         def sourced(request: str) -> pb.MachineExecutionSubmit:
             submitted = submission(machine, request)
             submitted.release_root.models.append(pb.ModelChoice(parameter="model", source=source))
+            submitted.source_credentials.add(
+                provider=pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE, credential="bearer " + secret
+            )
             return submitted
 
         receipt, _ = submit(machine, sourced("first"))
@@ -822,6 +826,9 @@ def test_a_provider_source_choice_is_made_by_the_machine_once(
         # assets. Nothing outside the pipeline was.
         repository = _repository(modular=False)
         assert origin.touched == set(repository) - {"README.md"}
+        assert any(secret in value for value in origin.authorization), (
+            "the real native source child did not present the transient provider credential"
+        )
         header = store.manifest(model["manifest"]["digest"])["header"]
         assert header is not None
         assert sorted(tensorfs.parse_header(header)["assets"]) == [
@@ -840,6 +847,15 @@ def test_a_provider_source_choice_is_made_by_the_machine_once(
         ]
         assert again == resolved
     catalog.close()
+    assert machine.worker.workspace is not None
+    # Include journal/WAL, source facts and plans, native logs and retained preparation.
+    roots = (machine.worker.workspace.directory, machine.worker.config.cozy_home)
+    for root in roots:
+        for path in root.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                assert secret.encode() not in path.read_bytes(), (
+                    f"provider credential persisted in {path.relative_to(root)}"
+                )
 
 
 def test_a_published_job_is_a_release_root_the_machine_mints(published: Machine) -> None:

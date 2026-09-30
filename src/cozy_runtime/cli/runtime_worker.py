@@ -91,6 +91,7 @@ def main(
                         "capabilities": [
                             "machine-supervisor/1",
                             "runtime-model-preparation/1",
+                            "runtime-model-overrides/1",
                             "machine-public-reads/1",
                         ]
                     }

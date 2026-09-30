@@ -52,6 +52,7 @@ class HuggingFace:
         self.served: Counter[str] = Counter()  # body bytes per carrier, header probes apart
         self.probed = 0
         self.requests = 0  # every request, listings included
+        self.authorization: list[str] = []  # transient fixture observation only
         self.touched: set[str] = set()  # members read at all, header or body
         self.lock = threading.Lock()
         self.watch: Callable[[int], None] = lambda _total: None
@@ -72,6 +73,7 @@ class HuggingFace:
             def do_GET(self) -> None:
                 with origin.lock:
                     origin.requests += 1
+                    origin.authorization.append(self.headers.get("Authorization", ""))
                 listing: object = None
                 if self.path.startswith("/api/models/"):
                     listing = [

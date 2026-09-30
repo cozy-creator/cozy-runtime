@@ -639,6 +639,8 @@ def prepare_unpublished_placement(
     artifact_cache: Path,
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
+    model_overrides: tuple[Sequence[Mapping[str, object]], Sequence[pb.NativeModelBinding]]
+    | None = None,
 ) -> pb.PreparePackageSetResult:
     """Bind retained models to an already-installed private package."""
 
@@ -673,8 +675,8 @@ def prepare_unpublished_placement(
     return prepare_model_placement(
         prepared=prepared,
         installed=installed,
-        models=models,
-        native_models=request.native_models,
+        models=models if model_overrides is None else model_overrides[0],
+        native_models=request.native_models if model_overrides is None else model_overrides[1],
         artifact_cache=artifact_cache,
         tensorfs_root=tensorfs_root,
         verified=verified,

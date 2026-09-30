@@ -20,7 +20,7 @@ def _refuse(detail: str) -> ExecutionWorkspaceRefusal:
     return ExecutionWorkspaceRefusal("model_override_invalid", detail)
 
 
-def _choice(choice: pb.ModelChoice) -> pb.ModelChoice:
+def normalized(choice: pb.ModelChoice) -> pb.ModelChoice:
     copied = pb.ModelChoice()
     copied.CopyFrom(choice)
     if copied.source:
@@ -120,7 +120,7 @@ def resolve(
         key = candidates[0]
         if key in result:
             raise _refuse(f"model target {selector!r} repeats an existing selection")
-        choice = _choice(original)
+        choice = normalized(original)
         choice.parameter = key[2]
         result[key] = choice
     return result
