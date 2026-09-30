@@ -505,6 +505,8 @@ def test_real_group_fill_drain_releases_construction_before_warm_host_round(
     owner, machine = policy(32, grouped=True)
     leader.planner = owner
     leader._construction_staging_tokens = []
+    leader._construction_staging_local = 0
+    leader.worker_memory = frozenset({"host_room"})
     leader._previous_construction_staging_credit = None
 
     def durable(request: Any, kind: Any) -> Answer:

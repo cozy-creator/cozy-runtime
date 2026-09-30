@@ -388,6 +388,8 @@ class Executor:
         #: HOST ONLY: every memory decision of this process (made at device init)
         self.planner: memory.Planner | None = None
         self._staging_quarantine: dict[int, Any] = {}
+        self._construction_staging_local: int = 0
+        self._previous_construction_staging_credit: int | None = None
         self.started = False
         self.imported = False
         self.package_warmed = False
@@ -2047,6 +2049,10 @@ class Executor:
         for token, size in self._construction_staging_tokens:
             self._durable(HostRoom(reservation=token, nbytes=size, release=True), Answer)
         self._construction_staging_tokens.clear()
+        if self._construction_staging_local:
+            assert self.host.planner is not None
+            self.host.planner.release_local_staging(self._construction_staging_local)
+            self._construction_staging_local = 0
         if self.host.planner is not None:
             self.host.planner.construction_staging_credit = (
                 self._previous_construction_staging_credit
@@ -2055,6 +2061,16 @@ class Executor:
     def _reserve_construction_staging(
         self, demands: tuple[tuple[int, int, int], ...]
     ) -> tuple[int, ...]:
+        if "host_room" not in self.host.worker_memory:
+            # Supported older Workers omit this additive capability. Preserve the
+            # existing observed-capacity fallback, coordinated once by the leader.
+            planner = self.host.planner
+            if planner is None or self.rank != 0:
+                return ()
+            if self._construction_staging_local:
+                raise RuntimeError("construction staging already reserved")
+            credits, self._construction_staging_local = planner.reserve_local_staging(demands)
+            return credits
         token = "construction-staging-" + uuid.uuid4().hex
 
         def reserve(nbytes: int) -> bool:
@@ -2090,6 +2106,7 @@ class Executor:
     ) -> dict[str, Any]:
         """Construction host credit outlives every rank's native reader and copy drain."""
         self._construction_staging_tokens: list[tuple[str, int]] = []
+        self._construction_staging_local = 0
         self._construction_staging_drained = False
         planner = self.host.planner
         previous = planner.construction_staging_credit if planner is not None else None
@@ -2104,7 +2121,7 @@ class Executor:
         finally:
             planner = self.host.planner
             backend = getattr(self, "backend", None)
-            if self._construction_staging_tokens:
+            if self._construction_staging_tokens or self._construction_staging_local:
                 if self.group is not None and (
                     not self._construction_staging_drained or self.group.broken
                 ):
@@ -2122,7 +2139,9 @@ class Executor:
                     if planner is not None and exc.code == "device_fault":
                         planner.unusable = str(exc)
                     raise
-            if self._construction_staging_tokens and (planner is None or not planner.unusable):
+            if (self._construction_staging_tokens or self._construction_staging_local) and (
+                planner is None or not planner.unusable
+            ):
                 self._release_construction_staging()
             if planner is not None:
                 planner.construction_staging_credit = previous

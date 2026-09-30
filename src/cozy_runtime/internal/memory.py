@@ -2130,6 +2130,26 @@ class Planner:
             previous = sizes
         return ()
 
+    def reserve_local_staging(
+        self, demands: tuple[tuple[int, int, int], ...]
+    ) -> tuple[tuple[int, ...], int]:
+        """Legacy Worker fallback: one leader-observed vector, not a global promise."""
+
+        def reserve(nbytes: int) -> bool:
+            if proctree.available_host_bytes() < nbytes + self._host_pending:
+                return False
+            self._host_pending += nbytes
+            return True
+
+        credits = self.staging_vector(demands, reserve)
+        return credits, sum(credits)
+
+    def release_local_staging(self, nbytes: int) -> None:
+        """The caller proves all rank fills drained/reaped before ending this promise."""
+        if nbytes < 0 or nbytes > self._host_pending:
+            raise ValueError("invalid local staging settlement")
+        self._host_pending -= nbytes
+
     @contextmanager
     def staging_host(self, quantum: int, slots: int, *, owner: str = "") -> Iterator[int]:
         """Fund one retained ring allocation; its backing is reused, never credit-refunded."""
