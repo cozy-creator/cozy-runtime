@@ -528,6 +528,9 @@ class ExecutorSupervision:
         pids = {process.pid for process in processes}
         if self._device_process is not None:
             return {pid: self._device_process(pid) for pid in pids}
+        if not self.devices:
+            # Sealed to no device: it cannot hold device memory, and no driver is asked.
+            return {pid: accel.ProcessMemory("absent", 0) for pid in pids}
         return accel.process_memories(pids, accel.host_backend_family())
 
     def _owner_payload(self, owner: OwnerRecord) -> str:

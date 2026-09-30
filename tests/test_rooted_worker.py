@@ -47,9 +47,10 @@ pytestmark = pytest.mark.skipif(
     bool(NO_EXECUTOR) or os.geteuid() == 0, reason=NO_EXECUTOR or "the proof is non-root"
 )
 
+#: Ordinals no card has: a virtual device can never resolve to a real one.
 VIRTUAL_GPUS = [
     {
-        "device_index": index,
+        "device_index": 64 + index,
         "device_name": "Virtual Accelerator",
         "device_uuid": f"GPU-virtual-{index}",
         "driver_version": "0.0",
@@ -59,9 +60,12 @@ VIRTUAL_GPUS = [
     for index in range(4)
 ]
 
+#: A virtual inventory asks no driver: NVML is absent and `nvidia-smi` is the root's refusal.
 LAUNCH_VIRTUAL = (
     "import json, sys\n"
     "from cozy_runtime.cli import runtime_worker\n"
+    "from cozy_runtime.internal import accel\n"
+    "accel._nvml_absent = True\n"
     "sys.exit(runtime_worker.main([], gpus=json.loads(sys.argv[1])))\n"
 )
 
@@ -72,7 +76,9 @@ BOOT_BOUND = 180
 class Machine:
     """One rooted machine: its bootstrap handoff, media stand-in and running worker."""
 
-    def __init__(self, root: Path, gpus: list[dict[str, Any]] | None) -> None:
+    def __init__(
+        self, root: Path, gpus: list[dict[str, Any]] | None, env: dict[str, str] | None = None
+    ) -> None:
         self.root = root
         self.worker_id = "rooted-worker"
         self.key = Ed25519PrivateKey.generate()
@@ -95,12 +101,16 @@ class Machine:
         ):
             (root / relative).parent.mkdir(parents=True, exist_ok=True)
             (root / relative).symlink_to(target)
+        if gpus is not None:
+            refusal = root / "usr/local/bin/nvidia-smi"
+            refusal.write_text("#!/bin/sh\nexit 9\n")
+            refusal.chmod(0o755)
         self.media, self.media_port = _media_stand_in(self.certificate_pem, key_pem)
         self.worker_port = _free_port()
         public = self.key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw
         )
-        env = {
+        launch = {
             "PATH": f"{root}/usr/local/bin:/usr/bin:/bin",
             "TMPDIR": str(root / "tmp"),
             "COZY_MACHINE_ROOT": str(root),
@@ -116,8 +126,8 @@ class Machine:
                 }
             ),
             "TENSORHUB_OBJECT_STORAGE_HOSTS": "",
-        }
-        self.env = env
+        } | (env or {})
+        self.env = launch
         self.image, self.gpus = image, gpus
         self.log = (root / "worker.log").open("ab")
         self._launch()
@@ -505,6 +515,8 @@ def test_user_worker_measures_this_machines_driver_inventory() -> None:
     with tempfile.TemporaryDirectory(prefix="cz-measured.") as raw:
         root = Path(raw) / "machine"
         root.mkdir()
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            pytest.skip("this process names its GPUs; test_visible_devices proves that inventory")
         machine = Machine(root, None)
         try:
             uuids: list[str] = []
@@ -525,6 +537,34 @@ def test_user_worker_measures_this_machines_driver_inventory() -> None:
         finally:
             code = machine.close()
         assert code == 0, machine.output()
+
+
+def test_user_worker_with_hidden_gpus_serves_cpu_and_asks_no_driver() -> None:
+    """An empty CUDA_VISIBLE_DEVICES is no GPU: the worker serves a CPU job, and no driver
+    query runs from boot through the executor's reclaim. NVML is a stand-in library, so any
+    query would reach the recording nvidia-smi instead of a card."""
+    with tempfile.TemporaryDirectory(prefix="cz-hidden.") as raw:
+        root = Path(raw) / "machine"
+        (root / "usr/local/bin").mkdir(parents=True)
+        asked = Path(raw) / "asked"
+        tool = root / "usr/local/bin/nvidia-smi"
+        tool.write_text(f'#!/bin/sh\necho "$@" >> {asked}\nexit 9\n')
+        tool.chmod(0o755)
+        library = Path(raw) / "lib"
+        library.mkdir()
+        shutil.copy(Path(grpc._cython.cygrpc.__file__), library / "libnvidia-ml.so.1")  # no NVML
+        machine = Machine(root, None, {"CUDA_VISIBLE_DEVICES": "", "LD_LIBRARY_PATH": str(library)})
+        try:
+            observed = machine.control.GetMachineExecutionWorkspace(
+                pb.MachineExecutionWorkspaceQuery(claim=machine.claim)
+            )
+            assert list(observed.devices) == [] and observed.accelerator_backend == "none"
+            _run_job(machine, Path(raw) / "scratch")
+            assert "libnvidia-ml" not in Path(f"/proc/{machine.process.pid}/maps").read_text()
+        finally:
+            code = machine.close()
+        assert code == 0, machine.output()
+        assert not asked.exists(), asked.read_text()
 
 
 def test_restarted_worker_runs_its_owners_next_submission_without_another_claim() -> None:

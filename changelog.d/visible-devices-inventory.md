@@ -1,0 +1,1 @@
+`CUDA_VISIBLE_DEVICES` is where a machine's GPUs are. The machine agent passes it to the Runtime. The Runtime's inventory keeps only the entries it names (by index or GPU UUID); empty means no GPU, served CPU only, and no driver is asked, even on a CUDA base. A worker without GPUs seals its one lane to no device instead of card 0, and reads no per-process GPU memory.
