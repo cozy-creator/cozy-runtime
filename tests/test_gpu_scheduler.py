@@ -755,8 +755,9 @@ def test_a_fifth_reference_waits_on_its_own_runs_calls_and_names_itself(
 ) -> None:
     downloaded = machine.hold_activations(monkeypatch)
     machine.root("C")
-    references = [machine.child("C", "qwen") for _ in range(5)]
-    machine.await_granted(*references[:4])
+    references = [machine.child("C", "qwen") for _ in range(4)]
+    machine.await_granted(*references)
+    references.append(machine.child("C", "qwen"))
     own = "Waiting for GPU (needs 1, 4 in use by this run's other calls)"
 
     def stages() -> list[str]:
