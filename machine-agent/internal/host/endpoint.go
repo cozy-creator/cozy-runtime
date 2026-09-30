@@ -153,7 +153,7 @@ func (w *authorityWriter) Flush() {
 
 func (m *Machine) serveAuthorizedHTTP(routes http.Handler, w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/v1/bootstrap/receipt" && r.URL.Path != "/v1/health" {
-		if _, err := m.claims.refreshAuthority(r.Context()); err != nil {
+		if err := m.claims.checkAuthority(); err != nil {
 			http.Error(w, "rental_authority_unavailable: current rental authority could not be verified", http.StatusServiceUnavailable)
 			return
 		}

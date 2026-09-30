@@ -91,6 +91,8 @@ class InstalledEnvironment:
     package: str
     release: str
     reused: bool = False
+    # Local record incarnation, not package content or a peer compatibility fence.
+    incarnation: tuple[int, int, int, int] | None = None
 
 
 def _directory(root: Path, installation_id: str) -> Path:
@@ -108,7 +110,9 @@ def _read_record(directory: Path) -> InstallationRecord:
 def open_installation(root: Path, installation_id: str) -> InstalledEnvironment:
     directory = _directory(root, installation_id)
     try:
-        record = _read_record(directory)
+        with (directory / "installation.json").open("rb") as stream:
+            record = msgspec.json.decode(stream.read(), type=InstallationRecord)
+            info = os.fstat(stream.fileno())
         python = Path(record.get("python", directory / "venv" / "bin" / "python"))
         generation = Path(record.get("generation", python.parent.parent))
         sites = (
@@ -126,6 +130,9 @@ def open_installation(root: Path, installation_id: str) -> InstalledEnvironment:
             record["package"],
             record["release"],
             True,
+            (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+            if generation.is_relative_to(directory) and _retained(directory)
+            else None,
         )
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise EnvironmentRefusal("package_installation_absent", installation_id) from exc
@@ -506,6 +513,7 @@ def _install(
         installed.python,
         installed.package,
         installed.release,
+        incarnation=installed.incarnation,
     )
 
 

@@ -35,13 +35,14 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime.author._executor_requests import Handler, respond
+from cozy_runtime.author._executor_requests import Handler
+from cozy_runtime.author._executor_requests import respond as answer_request
 from cozy_runtime.internal import accel, executor_commands, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import (
     ALLOWLIST,
@@ -49,15 +50,28 @@ from cozy_runtime.internal.child_env import (
     FLASH_ATTENTION_CACHE_ENABLED_ENV,
 )
 from cozy_runtime.internal.executor_commands import Command, Hello
+from cozy_runtime.internal.executor_replies import rank_memory_facts
 from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
     Channel,
     SeamError,
+    _scan,
     listener,
 )
 from cozy_runtime.internal.worker.plan import PreparedModel
 
 _LOG = logging.getLogger(__name__)
+
+
+def respond(
+    frame: Mapping[str, object], handler: Handler | None
+) -> tuple[dict[str, object], socket.socket | None]:
+    """Preserve the seam's credential check before interpreting optional byte counters."""
+    _scan(dict(frame))
+    if frame.get("kind") == "device_room" and "rank_memory" in frame:
+        frame = {**frame, "rank_memory": rank_memory_facts(frame["rank_memory"])}
+    return answer_request(frame, handler)
+
 
 #: How often the worker LOOKS while a spawned executor is dialling back. A sampling
 #: cadence, not a bound: `spawn` waits while the child is alive, and this only says how
@@ -127,14 +141,13 @@ def require_executor_protocol(hello: dict[str, Any]) -> None:
         and isinstance(hello.get("native_interfaces"), dict)
     ):
         return
-    # The executor states its revision and native interfaces in its hello (cozy-runtime
-    # 0.18.51 on). Say which side to update.
+    # Reject before device initialization. Package versions and build hashes do not gate it.
     executor = hello.get("runtime_version", "unknown")
     remedy = (
         "update the rental's Runtime: cozy rental update <rental>"
         if type(revision) is int and revision > EXECUTOR_PROTOCOL_REVISION
-        else "publish the package against cozy-runtime>=0.18.51 (its lock pins "
-        f"cozy-runtime {executor}), then run it again"
+        else "reinstall or republish the package with the current Runtime memory contract, "
+        "then run it again"
     )
     raise ExecutorProtocolMismatch(
         f"executor_protocol_incompatible: the package environment runs cozy-runtime "
@@ -235,44 +248,78 @@ class Executor:
         # originate on different worker lanes; serializing here prevents their frames and
         # replies from corrupting each other even if a caller violates the higher-level lane.
         with self._calls:
-            name = command.__struct_config__.tag
-            deadline = time.monotonic() + total_timeout if total_timeout is not None else None
-            self.channel.send(executor_commands.encode(command))
-            while True:
-                try:
-                    remaining = None if deadline is None else max(deadline - time.monotonic(), 0)
-                    frame = self.channel.recv(timeout, total_timeout=remaining)
-                except SeamError as exc:
-                    raise ExecutorGone(f"seam: {exc}") from exc
-                if frame is None:
-                    raise ExecutorGone(
-                        self.wedged
-                        or f"the executor died during {name!r} (exit status {self.exit_status})",
-                        self.exit_status,
-                    )
-                if frame.get("event") == "progress":
-                    if on_progress is not None:
-                        try:
-                            on_progress(frame)
-                        except Exception as exc:  # the lossy lane sheds; the call goes on
-                            _LOG.warning("dropped an executor progress frame: %r", exc)
-                    continue
-                if frame.get("event") == "request":
-                    answer, handoff = respond(frame, on_request)
+            return self._exchange(command, timeout, total_timeout, on_progress, on_request)
+
+    def call_if_idle(
+        self,
+        command: Command,
+        *,
+        eligible: Callable[[], bool],
+        on_reply: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Never wait behind another command or reclaim a replaced/active generation."""
+        if not self._calls.acquire(blocking=False):
+            return {"ok": False, "code": "executor_busy"}
+        try:
+            if not eligible():
+                return {"ok": False, "code": "executor_busy"}
+            # Start observation only after claiming an eligible idle stream. A
+            # contended call must never place a watcher over another attempt.
+            with self.watched(str(command.__struct_config__.tag)):
+                reply = self._exchange(command, None, None, None, None)
+                if on_reply is not None:
+                    on_reply(reply)
+                return reply
+        finally:
+            self._calls.release()
+
+    def _exchange(
+        self,
+        command: Command,
+        timeout: float | None,
+        total_timeout: float | None,
+        on_progress: Callable[[dict[str, Any]], None] | None,
+        on_request: Handler | None,
+    ) -> dict[str, Any]:
+        """One transaction while the caller owns _calls."""
+        name = command.__struct_config__.tag
+        deadline = time.monotonic() + total_timeout if total_timeout is not None else None
+        self.channel.send(executor_commands.encode(command))
+        while True:
+            try:
+                remaining = None if deadline is None else max(deadline - time.monotonic(), 0)
+                frame = self.channel.recv(timeout, total_timeout=remaining)
+            except SeamError as exc:
+                raise ExecutorGone(f"seam: {exc}") from exc
+            if frame is None:
+                raise ExecutorGone(
+                    self.wedged
+                    or f"the executor died during {name!r} (exit status {self.exit_status})",
+                    self.exit_status,
+                )
+            if frame.get("event") == "progress":
+                if on_progress is not None:
                     try:
-                        self.channel.send(answer)
-                        if handoff is not None:
-                            self.channel.send_descriptor(handoff)
-                    finally:
-                        if handoff is not None:
-                            handoff.close()
-                    continue
-                if "reply" not in frame and frame.get("event") is not None:
-                    # An event kind from a newer executor that this worker does not consume.
-                    continue
-                if frame.get("reply") != name:
-                    raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
-                return frame
+                        on_progress(frame)
+                    except Exception as exc:  # the lossy lane sheds; the call goes on
+                        _LOG.warning("dropped an executor progress frame: %r", exc)
+                continue
+            if frame.get("event") == "request":
+                answer, handoff = respond(frame, on_request)
+                try:
+                    self.channel.send(answer)
+                    if handoff is not None:
+                        self.channel.send_descriptor(handoff)
+                finally:
+                    if handoff is not None:
+                        handoff.close()
+                continue
+            if "reply" not in frame and frame.get("event") is not None:
+                # An event kind from a newer executor that this worker does not consume.
+                continue
+            if frame.get("reply") != name:
+                raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
+            return frame
 
     @contextlib.contextmanager
     def watched(self, what: str) -> Iterator[None]:
@@ -708,10 +755,25 @@ class ExecutorSupervision:
                 temporary.unlink(missing_ok=True)
 
     @contextlib.contextmanager
-    def hold(self, expected: Executor) -> Any:
+    def hold(self, expected: Executor) -> Iterator[bool]:
         """Keep one exact executor current across an acceptance commit."""
         with self._lifecycle:
             yield self.current is expected and expected.alive() and not self._closed
+
+    @contextlib.contextmanager
+    def try_hold(self, expected: Executor) -> Iterator[bool | None]:
+        """An ownership commit must not wait for lifecycle I/O while holding Worker control.
+
+        None means busy; False means acquired but the expected generation is no longer
+        owned. The caller may wait outside its other locks, then recheck every fence.
+        """
+        if not self._lifecycle.acquire(blocking=False):
+            yield None
+            return
+        try:
+            yield self.current is expected and expected.alive() and not self._closed
+        finally:
+            self._lifecycle.release()
 
     # ------------------------------------------------------------------ spawn
 

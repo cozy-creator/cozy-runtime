@@ -164,6 +164,7 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Pat
     model = QwenImage21Model.for_test(graph=graph, processor=processor)
     embeds, mask = model.encode("a person in a blue jacket")
     assert embeds.shape[-1] == 16
+    cache_modes: list[bool] = []
     latents = model.denoise(
         embeds,
         mask,
@@ -173,7 +174,9 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Pat
         seed=44,
         on_step=lambda i: None,
         cancel=lambda: None,
+        on_cache_mode=cache_modes.append,
     )
+    assert cache_modes == [True]
     actual = model.decode(latents, width=32, height=32)
     model.harness.assert_scopes("encode", "denoise", "decode")
     pipe = QwenImage21Pipeline(
@@ -189,7 +192,8 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Pat
         generator=torch.Generator().manual_seed(44),
         output_type="pt",
     ).images
-    # Without the prefix KV cache (a card too small to hold it) the image is the same.
+    # This tiny CPU control is exact. It does not establish reduced-precision GPU
+    # equality: cached and recomputed attention have different sequence layouts.
     uncached = pipe(
         prompt="a person in a blue jacket",
         width=32,
@@ -204,6 +208,23 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Pat
     assert actual.shape == (1, 4, 32, 32)
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    cache_modes.clear()
+    uncached_latents = model.denoise(
+        embeds,
+        mask,
+        width=32,
+        height=32,
+        steps=2,
+        seed=44,
+        on_step=lambda i: None,
+        cancel=lambda: None,
+        use_kv_cache=False,
+        on_cache_mode=cache_modes.append,
+    )
+    assert cache_modes == [False]
+    torch.testing.assert_close(uncached_latents, latents, rtol=0, atol=0)
+    model.harness.assert_scopes("encode", "denoise", "decode", "denoise")
 
     assert {x.dtype for x in graph.components["vae"].parameters()} == {torch.float32}
     assert {x.dtype for x in graph.components["transformer"].parameters()} == {torch.bfloat16}

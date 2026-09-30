@@ -46,12 +46,15 @@ func TestCapabilityProbeDoesNotLaunchUnsupportedRuntime(t *testing.T) {
 	}
 }
 
-func TestCrashesRemainFailuresAndRetryWithBackoff(t *testing.T) {
+func TestReadyCrashesRemainFailuresAndRetryWithBackoff(t *testing.T) {
 	r := &restarts{}
 	for i := 0; i < 4; i++ {
 		if !r.exited(runtimeExit{"exit status 1", 1}) || r.gone() || r.due(time.Now()) {
 			t.Fatal("transient exit became idle/blocked or skipped backoff")
 		}
+		if err := r.clear(); err != nil {
+			t.Fatal(err)
+		} // authenticated readiness between exits
 	}
 	if r.exited(runtimeExit{"exit status 6", 6}) || !r.gone() || r.code() != "runtime_launch_refused" {
 		t.Fatal("structural refusal was retried")
