@@ -3083,9 +3083,13 @@ class Worker:
             *journal, {"kind": "progress", "stage": f"{label} / {name}" if label else name}
         )
         started, began, completed = time.time(), time.perf_counter(), False
+        preparation_memory: dict[str, object] = {}
         try:
             yield
             completed = True
+        except AttemptRefusal as exc:
+            preparation_memory = exc.preparation_memory
+            raise
         finally:
             fields = {
                 "child_request": request,
@@ -3102,6 +3106,7 @@ class Worker:
                     "value": "info",
                     "at_unix_ms": int(time.time() * 1000),
                     "fields": fields,
+                    **({"preparation_memory": preparation_memory} if preparation_memory else {}),
                 },
             )
 
@@ -6364,6 +6369,9 @@ class Worker:
             raise AttemptRefusal(
                 code,
                 f"construction {label} could not be loaded: {str(reply.get('detail'))[:512]}",
+                preparation_memory=reply.get("preparation_memory")
+                if isinstance(reply.get("preparation_memory"), dict)
+                else None,
                 # A load refused before it touched the process is this request's constraint
                 # (a pin, a fit, the device's free bytes); a poisoned one is the executor's.
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT

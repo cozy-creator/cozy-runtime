@@ -2703,6 +2703,10 @@ class Executor:
                 # faults instead of serving a generation whose warm did not complete. The
                 # device running short is a capacity fact and is typed as one, so the
                 # refusal stays this attempt's and is never held against the binding.
+                evidence = prepare_diagnostics.failure_memory(
+                    lambda: accel.allocation(torch, self.device_kind),
+                    lambda: planner.document(self.construction) if planner is not None else {},
+                )
                 backend.poison(())
                 self.poisoned = f"warm failed: {exc}"[:200]
                 cause = exc.__cause__
@@ -2716,6 +2720,7 @@ class Executor:
                     "traceback": prepare_diagnostics.exception_trace(exc),
                     "state": backend.state,
                     "envelope": envelope,
+                    "preparation_memory": evidence,
                 }
         stage("warm")
         if "sol-attn" in applied.totals():
@@ -4571,7 +4576,7 @@ class Executor:
 
 
 #: Telemetry a reply can lose to fit one frame; the worker reads each as optional.
-_SHEDDABLE = ("execution", "attribution")
+_SHEDDABLE = ("execution", "attribution", "preparation_memory")
 
 #: The keys the minimal reply below actually carries. A reply whose own keys are a subset
 #: of these loses nothing by being reduced; anything else would be silently mutilated.

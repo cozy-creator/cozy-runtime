@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import sys
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import PurePath
 from typing import Any
 
@@ -83,6 +83,24 @@ def memory_summary(reply: Mapping[str, Any]) -> str:
         measured = f"{value} B" if type(value) is int and value >= 0 else "unknown"
         parts.append(f"{label}: {measured}")
     return "memory at failure: " + ", ".join(parts)
+
+
+def failure_memory(
+    allocation: Callable[[], Mapping[str, int]],
+    residency: Callable[[], Mapping[str, object]],
+) -> dict[str, object]:
+    """Post-rollback observations before retirement; never a new admission or recovery.
+
+    Collect each source independently: a faulty CUDA reader must not hide the planner's
+    retained decisions or replace the original refusal. Missing measurements stay absent.
+    """
+    evidence: dict[str, object] = {"sample": "after_failure_before_retirement"}
+    for name, read in (("allocation", allocation), ("residency", residency)):
+        try:
+            evidence[name] = dict(read())
+        except Exception as exc:
+            evidence[name + "_unavailable"] = type(exc).__name__
+    return evidence
 
 
 def startup_facts(*, rank: int, world: int, device_kind: str) -> dict[str, Any]:
