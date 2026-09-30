@@ -47,9 +47,9 @@ def traversable_fixture_root(tmp_path: Path, tmp_path_factory: pytest.TempPathFa
     """The real machine root is traversable; pytest's private parents default to 0700."""
     if os.geteuid() == 0:
         base = tmp_path_factory.getbasetemp()
-        paths = (tmp_path, base)
+        paths = [tmp_path, base]
         if base.name.startswith("pytest-") and base.parent.name.startswith("pytest-of-"):
-            paths += (base.parent,)
+            paths.append(base.parent)
         for path in paths:
             path.chmod(path.stat().st_mode | 0o111)
 
