@@ -1684,6 +1684,12 @@ class OfficialH3Pipeline:
         return facts
 
     def decode_audio(self, task: Task, state: Any) -> Any:
+        # A retained completed latent is hydrated on CPU; placement is known only once
+        # the caller has entered the audio VAE component scope.
+        components = _ScopedPipeline(
+            self._pipes[self._workflow(task, state)], self.components["audio_vae"]
+        )
+        state.set("audio_latents", state.audio_latents.to(components._execution_device))
         self._run(task, "decode.audio", state, component="audio_vae")
         delivery = state.get("continuation_delivery")
         if delivery is None:
@@ -1725,7 +1731,7 @@ class OfficialH3Pipeline:
         delivery = state.get("continuation_delivery")
         tail = CompletedTail(delivery) if delivery is not None else None
         with torch.no_grad():
-            chunks = vae.decode_chunks(state.latents * latents_std + latents_mean)
+            chunks = vae.decode_chunks(state.latents.to(device) * latents_std + latents_mean)
             while True:
                 with torch.autocast(
                     device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"
