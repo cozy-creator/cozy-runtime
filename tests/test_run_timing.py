@@ -609,13 +609,14 @@ def nested(ctx: Context, payload: Request) -> Result:
         )
         ticks: list[tuple[int, float]] = []
         cursor = 0
+        deadline = time.monotonic() + 12
         try:
-            while len(ticks) < 2:
+            while len(ticks) < 2 and time.monotonic() < deadline:
                 page = pod.client.ListMachineExecutionEvents(
                     pb.MachineExecutionEventsQuery(
                         execution=query, after=cursor, limit=128, wait=True
                     ),
-                    timeout=12,
+                    timeout=max(deadline - time.monotonic(), 0.01),
                 )
                 cursor = page.next_after
                 for event in page.events:
@@ -628,6 +629,7 @@ def nested(ctx: Context, payload: Request) -> Result:
                 assert pod.state("ticks") == "running"
         finally:
             gate.touch()
+        assert len(ticks) >= 2, ticks
         assert 1500 <= ticks[1][0] - ticks[0][0] < 4000, ticks
         assert 1500 <= ticks[1][1] - ticks[0][1] < 4000, ticks
         assert not pod.rows(
