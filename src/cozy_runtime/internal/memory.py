@@ -973,8 +973,9 @@ class Planner:
                 chosen = self._room_from(victims, required)
             if chosen is None:
                 self._refuse_scope(held, method, required, victims)
+            probe = self._target_reclaim_probe(required)
             for victim in chosen:
-                self._offload(victim, target=required)
+                self._offload(victim, target=required, probe=probe)
             units = part.units if whole_only else scope_units
             if whole_only and part.on(DISK) == part.nbytes and part.store is not None:
                 self._place_scope(held, method, functools.partial(self._refill_whole, held))
@@ -2042,10 +2043,11 @@ class Planner:
 
     def _apply(self, held: Held, plan: Plan) -> None:
         self._cap()
+        probe = self._target_reclaim_probe(plan.needed)
         for victim in plan.evict:
             if plan.needed is not None and self.allocatable() >= plan.needed:
                 break
-            self._offload(victim, target=plan.needed)
+            self._offload(victim, target=plan.needed, probe=probe)
         part = held.part
         for unit in part.blocks[plan.keep :]:
             if unit.tier == DEVICE:
@@ -2115,7 +2117,43 @@ class Planner:
             else:
                 raise self._host_refusal(needed)
 
-    def _offload(self, held: Held, *, everything: bool = False, target: int | None = None) -> None:
+    def _target_reclaim_probe(self, target: int | None) -> Callable[[], bool] | None:
+        """A pass-local release witness triggers trimming, never admission credit."""
+        if target is None or not self.cuda or self.grouped or self.group_phase:
+            return None
+        previous = self._allocated()
+        released = 0
+
+        def probe() -> bool:
+            nonlocal previous, released
+            current = self._allocated()
+            released = max(0, released + previous - current)
+            previous = current
+            gap = target - self.allocatable()
+            if gap <= 0:
+                return True
+            if released < gap:
+                return False
+            try:
+                tiers.trim(self.torch)
+            except BaseException as exc:
+                self.unusable = f"target reclaim cache drain failed: {exc}"
+                raise MemoryRefusal("device_fault", self.unusable, reusable=False) from exc
+            self.dropped = False
+            released = 0
+            previous = self._allocated()
+            return self.allocatable() >= target
+
+        return probe
+
+    def _offload(
+        self,
+        held: Held,
+        *,
+        everything: bool = False,
+        target: int | None = None,
+        probe: Callable[[], bool] | None = None,
+    ) -> None:
         """Move a victim's unpinned device units off the device."""
         self._overlap_retire(pending_only=True)
         self._refresh_constraints(held)
@@ -2128,6 +2166,7 @@ class Planner:
         )
         units = tuple(unit for unit in part.units if unit not in protected)
         moving = [unit for unit in units if unit.tier == DEVICE and not unit.mutable]
+        probe = probe or self._target_reclaim_probe(target)
         if units == part.units and self._whole_store(part):
             needed = sum(tiers.host_copy_bytes(unit) for unit in moving)
             with self._moving(), self._host_copy(needed, protected=tuple(moving)) as admitted:
@@ -2139,13 +2178,17 @@ class Planner:
                     self.stored += sum(unit.nbytes for unit in moving)
                     tiers.to_disk(self.torch, part, None)
             self.dropped |= bool(moving)
+            if probe is not None:
+                probe()
             return
         for unit in moving:
             if target is not None and self.allocatable() >= target:
                 break
             if self._movable(part, unit):
                 self._home(part, unit)
-        self.dropped |= any(unit.tier != DEVICE for unit in moving)
+                self.dropped |= unit.tier != DEVICE
+                if probe is not None and probe():
+                    break
 
     def host_needed(self) -> int:
         """Fresh backing for at most one copy of every movable unit in this operation.
