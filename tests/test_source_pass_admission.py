@@ -66,7 +66,7 @@ def test_source_pass_uses_native_bounds_instead_of_whole_carriers(
             "write_interval_bytes": preferred,
         }
 
-    def ensure(_: Path) -> SimpleNamespace:
+    def ensure(_: str | Path) -> SimpleNamespace:
         assert admitted, "Store creation started before metadata admission"
         return SimpleNamespace(prepare_model_source=advance)
 

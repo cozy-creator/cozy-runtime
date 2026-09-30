@@ -398,7 +398,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.18.96"
+version = "0.19.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -408,6 +408,7 @@ dependencies = [
     { name = "packaging" },
     { name = "pillow" },
     { name = "protobuf" },
+    { name = "pyyaml" },
     { name = "tensorfs" },
 ]
 
@@ -483,6 +484,7 @@ requires-dist = [
     { name = "peft", marker = "extra == 'minimax-h3'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
     { name = "protobuf", specifier = ">=6.31" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "safetensors", marker = "extra == 'minimax-h3'", specifier = ">=0.8.0" },
     { name = "safetensors", marker = "extra == 'qwen-image21'", specifier = ">=0.8" },
     { name = "tensorfs", specifier = ">=0.3.78" },

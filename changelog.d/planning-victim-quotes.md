@@ -1,0 +1,1 @@
+Reuse validated victim-byte quotes while enumerating residency alternatives within one planning decision. Recheck after resource callbacks and immediately before movement; live allocator readings and operation boundaries are never cached.

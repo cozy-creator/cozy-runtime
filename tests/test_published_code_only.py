@@ -131,13 +131,15 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
         index.close()
 
 
-def test_real_worker_retains_published_serving_only_child_without_loading_model() -> None:
+def test_real_worker_retains_published_serving_only_child_without_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import os
     import shutil
     import tempfile
 
     from conftest import image_python
-    from cozy_runtime.internal import child_env
+    from cozy_runtime.internal import child_env, package_installation
     from cozy_runtime.internal.config import Credentials, RuntimeConfig
     from cozy_runtime.internal.worker.acquire import Acquirer
     from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -150,6 +152,7 @@ def test_real_worker_retains_published_serving_only_child_without_loading_model(
 
     python = image_python()
     runtime = next(python.parent.parent.parent.glob("wheels/cozy_runtime-*.whl"))
+    monkeypatch.setattr(package_installation, "machine_wheels", lambda _: runtime.parent)
     uv = shutil.which("uv")
     assert uv is not None
     with tempfile.TemporaryDirectory(prefix="cozy-pubcode.") as raw:

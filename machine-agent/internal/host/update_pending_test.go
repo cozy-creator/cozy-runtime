@@ -315,7 +315,7 @@ func TestPendingCandidateSurvivesRequestPlaneRestart(t *testing.T) {
 	m.initialized = make(chan struct{})
 	m.openUpdates()
 	if m.updates.status.State != "waiting_activation" || m.updates.active != request.Operation {
-		t.Fatalf("lost prepared operation: %+v", m.updates)
+		t.Fatalf("lost prepared operation: status=%+v active=%q", m.updates.status, m.updates.active)
 	}
 	raw, err := os.ReadFile(m.updatePath())
 	if err != nil {

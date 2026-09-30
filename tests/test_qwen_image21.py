@@ -185,8 +185,10 @@ def _staged_qwen_proof(tmp_path: Path) -> None:
     def observed(sequence: int, active: bool, known: bool, finished: bool) -> None:
         frames.append((sequence, active, known, finished))
 
+    cache_modes: list[bool] = []
     for _ in range(2):
         frames.clear()
+        cache_modes.clear()
         with observing(observed):
             embeds, mask = model.encode("a person in a blue jacket")
             assert embeds.shape[-1] == 16
@@ -199,7 +201,9 @@ def _staged_qwen_proof(tmp_path: Path) -> None:
                 seed=44,
                 on_step=lambda i: None,
                 cancel=lambda: None,
+                on_cache_mode=cache_modes.append,
             )
+            assert cache_modes == [True]
             actual = model.decode(latents, width=32, height=32)
         assert frames[-1][1:] == (False, True, True), frames
     model.harness.assert_scopes("encode", "denoise", "decode", "encode", "denoise", "decode")
@@ -216,7 +220,8 @@ def _staged_qwen_proof(tmp_path: Path) -> None:
         generator=torch.Generator().manual_seed(44),
         output_type="pt",
     ).images
-    # Without the prefix KV cache (a card too small to hold it) the image is the same.
+    # This tiny CPU control is exact. It does not establish reduced-precision GPU
+    # equality: cached and recomputed attention have different sequence layouts.
     uncached = pipe(
         prompt="a person in a blue jacket",
         width=32,
@@ -231,6 +236,23 @@ def _staged_qwen_proof(tmp_path: Path) -> None:
     assert actual.shape == (1, 4, 32, 32)
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    cache_modes.clear()
+    uncached_latents = model.denoise(
+        embeds,
+        mask,
+        width=32,
+        height=32,
+        steps=2,
+        seed=44,
+        on_step=lambda i: None,
+        cancel=lambda: None,
+        use_kv_cache=False,
+        on_cache_mode=cache_modes.append,
+    )
+    assert cache_modes == [False]
+    torch.testing.assert_close(uncached_latents, latents, rtol=0, atol=0)
+    model.harness.assert_scopes("encode", "denoise", "decode", "encode", "denoise", "decode", "denoise")
 
     assert {x.dtype for x in graph.components["vae"].parameters()} == {torch.float32}
     assert {x.dtype for x in graph.components["transformer"].parameters()} == {torch.bfloat16}

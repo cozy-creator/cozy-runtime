@@ -132,11 +132,15 @@ def holding(worker: Worker) -> list[str]:
         held += [f"preparation:{key}" for key in calls.serving.preparations.started()]
     if worker.preparation_lock.locked():
         held.append("preparation_lock")
+    # A reclaimed machine replica retains ACTIVATING while waiting for its next grant.
+    # That state is demand eligibility, not running preparation. Its actual revival is
+    # covered by _activating and its supervised unit; retained models cannot block updates.
     placements = [worker.placement, *(h.placement for h in tuple(worker.hosted.values()))]
     held += [
         f"activating:{p.placement_id}"
         for p in placements
         if p and p.serving == pb.SERVING_STATE_ACTIVATING
+        and (p.placement_id not in worker._dead_replicas or p.placement_id in worker._activating)
     ]
     return held
 
