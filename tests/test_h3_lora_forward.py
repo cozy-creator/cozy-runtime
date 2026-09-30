@@ -104,6 +104,12 @@ def test_real_h3_forward_matches_ordered_reference_adapters(component: str, turb
         ),
     )
     composer(graph)(SimpleNamespace(components={component: actual}))
+    from cozy_runtime.internal import attention
+
+    for path in ("token_refiner.refiner_blocks.0.attn", "transformer_blocks.0.attn"):
+        assert attention._dtype(actual.get_submodule(path)) == attention._dtype(
+            original.get_submodule(path)
+        ) == "float32"
     untouched = {name: value.clone() for name, value in original.state_dict().items()}
 
     def reference_hook(
