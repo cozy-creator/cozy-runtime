@@ -64,15 +64,17 @@ The machine-agent workflow runs checks only. There is no separate agent release
 selection or publication path; images and clients obtain the executable from
 the Runtime wheel. Capabilities and worker-protocol ranges determine compatibility.
 
-Rental control authority is refreshed from the owning Hub before every new gRPC
-call, privileged HTTP request, and WebRTC handshake. The worker's latest-attempt
-credential reads `/v1/worker/rental/authorized-keys`; user login credentials never
-reach this endpoint. Existing client transports are revoked when their signer
-leaves the set or its server-declared lease expires. A failed authority read
-refuses new control and clears cached authority. This never cancels durable work
-or changes the agent's private Runtime-owner claim. Standalone machines retain
-locally owned keys. Deploy the Hub authority endpoint before rolling out agents
-that require it; older Hubs do not provide rental authorization fallback.
+Rental control authority is a Hub lease the agent refreshes in the background at
+half its server-declared length. New gRPC calls, privileged HTTP requests, and
+WebRTC handshakes check only that cached lease, so a warm run makes no Hub read.
+The worker's latest-attempt credential reads `/v1/worker/rental/authorized-keys`;
+user login credentials never reach this endpoint. Existing client transports are
+revoked when their signer leaves the set or the lease expires. A failed read
+neither revokes nor extends the current lease; an explicit Hub denial (401/403)
+revokes at once. This never cancels durable work or changes the agent's private
+Runtime-owner claim. Standalone machines retain locally owned keys. Deploy the
+Hub authority endpoint before rolling out agents that require it; older Hubs do
+not provide rental authorization fallback.
 
 At boot, automatic discovery (the default) makes one attempt to select a
 stable Runtime/TensorFS pair within their installed compatible lines (major.minor for 0.x). Selection

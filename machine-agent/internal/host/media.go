@@ -311,8 +311,7 @@ func (p *parts) Close() error {
 	return nil
 }
 
-// RefreshKeys proves current rental authority before a new media session.
-func (m *Machine) RefreshKeys(ctx context.Context) error {
-	_, err := m.claims.refreshAuthority(ctx)
-	return err
+// RefreshKeys checks the cached rental lease before a new media session.
+func (m *Machine) RefreshKeys(context.Context) error {
+	return m.claims.checkAuthority()
 }

@@ -59,13 +59,8 @@ func TestRentalAuthorityRevokesOnlyClientTransports(t *testing.T) {
 	if _, err := c.refreshAuthority(t.Context()); err == nil {
 		t.Fatal("offline control remained authorized")
 	}
-	select {
-	case <-kept.Done():
-	case <-time.After(time.Second):
-		t.Fatal("offline authority remained open")
-	}
-	if len(c.authorizedKeys()) != 0 {
-		t.Fatal("stale authority retained")
+	if kept.Err() != nil || len(c.authorizedKeys()) != 1 {
+		t.Fatal("transport failure revoked a still-valid lease")
 	}
 }
 
@@ -88,6 +83,9 @@ func TestRentalAuthorityLeaseEndsWithoutFurtherRequests(t *testing.T) {
 	if len(c.authorizedKeys()) != 0 {
 		t.Fatal("expired keys retained")
 	}
+	if status.Code(c.checkAuthority()) != codes.Unavailable {
+		t.Fatal("expired lease still admitted calls")
+	}
 }
 
 func TestRevocationClosesRealControlStreamAndRefusesNewRPC(t *testing.T) {
@@ -100,6 +98,9 @@ func TestRevocationClosesRealControlStreamAndRefusesNewRPC(t *testing.T) {
 		}
 		return []ed25519.PublicKey{key}, time.Hour, nil
 	}}
+	if _, err := c.refreshAuthority(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	m := &Machine{grant: &Grant{WorkerID: "worker", Lifetime: "rental"}, id: &Identity{BootID: "boot"}, claims: c, log: io.Discard}
 	listener := bufconn.Listen(1 << 20)
 	defer listener.Close()
@@ -167,15 +168,22 @@ func TestRentalMaintenanceHTTPChecksCurrentAuthority(t *testing.T) {
 		m.serveAuthorizedHTTP(handler, w, r)
 		return w.Code
 	}
+	if code := request(); code != http.StatusServiceUnavailable {
+		t.Fatal("bootstrap keys bypassed the Hub lease", code)
+	}
+	if _, err := c.refreshAuthority(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	if code := request(); code != http.StatusAccepted {
 		t.Fatal(code)
 	}
 	live = false
+	_, _ = c.refreshAuthority(t.Context())
 	if code := request(); code != http.StatusForbidden {
 		t.Fatal("revoked update accepted", code)
 	}
 	offline = true
-	if code := request(); code != http.StatusServiceUnavailable {
+	if code := request(); code != http.StatusForbidden {
 		t.Fatal("offline update accepted", code)
 	}
 	if writes != 1 {
@@ -213,4 +221,74 @@ func TestLeaseExpiryDoesNotWaitForStalledRefresh(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+func TestWarmAndCancelledCallsDoNotRefreshRentalAuthority(t *testing.T) {
+	public, private, _ := ed25519.GenerateKey(rand.Reader)
+	c, _ := newClaims("worker", "boot", make([]byte, 32), nil)
+	var calls atomic.Int32
+	c.authority = &rentalAuthority{fetch: func(context.Context) ([]ed25519.PublicKey, time.Duration, error) {
+		calls.Add(1)
+		return []ed25519.PublicKey{public}, time.Hour, nil
+	}}
+	if _, err := c.refreshAuthority(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	m := &Machine{grant: &Grant{WorkerID: "worker", Lifetime: "rental"}, claims: c}
+	token, _ := capability.Mint(private, capability.Grant{Machine: "worker", Action: capability.Maintenance, Expires: time.Now().Add(time.Hour).Unix()})
+	for n := 0; n < 4; n++ {
+		ctx, cancel := context.WithCancel(t.Context())
+		if n%2 == 1 {
+			cancel()
+		}
+		request := httptest.NewRequest("GET", "/v1/machine/runtime", nil).WithContext(ctx)
+		request.Header.Set("Authorization", "Cozy-Cap "+token)
+		m.serveAuthorizedHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), httptest.NewRecorder(), request)
+		cancel()
+		_ = m.RefreshKeys(ctx)
+	}
+	if calls.Load() != 1 || len(c.authorizedKeys()) != 1 {
+		t.Fatal("warm/canceled request refreshed or revoked", calls.Load())
+	}
+}
+
+func TestAuthorityTransportFailuresRetainLeaseButDeniedResponseRevokes(t *testing.T) {
+	public, _, _ := ed25519.GenerateKey(rand.Reader)
+	c, _ := newClaims("worker", "boot", make([]byte, 32), nil)
+	c.authority = &rentalAuthority{fetch: func(context.Context) ([]ed25519.PublicKey, time.Duration, error) {
+		return []ed25519.PublicKey{public}, time.Hour, nil
+	}}
+	_, _ = c.refreshAuthority(t.Context())
+	timer := c.authority.timer
+	for _, failure := range []error{context.Canceled, context.DeadlineExceeded, errors.New("HTTP500")} {
+		c.authority.fetch = func(context.Context) ([]ed25519.PublicKey, time.Duration, error) { return nil, 0, failure }
+		if _, err := c.refreshAuthority(t.Context()); err == nil {
+			t.Fatal("transport failure hidden")
+		}
+		if len(c.authorizedKeys()) != 1 || c.authority.timer != timer {
+			t.Fatal("transport changed keys or lease")
+		}
+	}
+	c.authority.fetch = func(context.Context) ([]ed25519.PublicKey, time.Duration, error) { return nil, 0, errAuthorityDenied }
+	if _, err := c.refreshAuthority(t.Context()); err == nil || len(c.authorizedKeys()) != 0 {
+		t.Fatal("authoritative denial retained keys", err)
+	}
+	if status.Code(c.checkAuthority()) != codes.Unavailable {
+		t.Fatal("denied authority still admitted calls")
+	}
+}
+
+func TestAuthorityHTTPOnlyDefinitiveDenialRevokes(t *testing.T) {
+	for _, code := range []int{http.StatusInternalServerError, http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(code) }))
+			defer server.Close()
+			h := &hubClient{origin: server.URL, http: server.Client(), workerID: "worker", token: "fixture"}
+			keys, _, err := h.authorizedKeys(t.Context())
+			denied := code == http.StatusUnauthorized || code == http.StatusForbidden
+			if errors.Is(err, errAuthorityDenied) != denied || keys != nil {
+				t.Fatal("authority classification", code, err)
+			}
+		})
+	}
 }

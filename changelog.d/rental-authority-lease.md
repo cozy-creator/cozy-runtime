@@ -1,0 +1,1 @@
+Rental machines check a background-refreshed Hub authority lease for each new call instead of reading the Hub per call. A Hub transport failure no longer revokes every key and drops attached clients; an explicit Hub denial still revokes at once.
