@@ -284,6 +284,7 @@ def test_run_timing_unions_nested_work_and_keeps_one_cumulative_snapshot(tmp_pat
     clock[0] = 2
     active("parent", 2, False)
     clock[0] = 102  # GPU queue while every executor is blocked
+    timing.sample()
     timing.begin("owner", child, 1)
     active(child, 1, True)
     clock[0] = 104
@@ -293,7 +294,7 @@ def test_run_timing_unions_nested_work_and_keeps_one_cumulative_snapshot(tmp_pat
     timing.end("owner", child, 1)
     clock[0] = 110
     for _ in range(300):
-        timing.snapshot("owner", "parent", 1)
+        timing.sample()
     active("parent", 4, False, finished=True)
     timing.end("owner", "parent", 1)
     with executions.workspace.locked() as db:
@@ -337,6 +338,7 @@ def test_incomplete_executor_observations_never_become_execution_time(
                 "finished": problem != "died_while_blocked",
             },
         )
+    timing.sample()
     timing.end("owner", "parent", 1)
     with executions.workspace.locked() as db:
         event = canonical_json.decode(
@@ -569,3 +571,76 @@ async def nested(ctx: Context, payload: Request) -> Result:
         # must exclude the real blocked interval while retaining its CPU work.
         assert terminal["execution_ms"] - measured["execution_ms"] >= 400, (terminal, measured)
         assert not pod.rows("SELECT body FROM execution_events WHERE kind='execution_activity'")
+
+
+def test_real_worker_reports_execution_between_model_progress_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_end_to_end import NO_EXECUTOR
+    from test_machine_partial_work import machine
+
+    if NO_EXECUTOR:
+        pytest.skip(NO_EXECUTOR)
+    entered, gate = tmp_path / "entered", tmp_path / "gate"
+    source = f"""import msgspec
+from pathlib import Path
+from cozy_runtime.author import App, Context
+app = App()
+class Request(msgspec.Struct):
+    pass
+class Result(msgspec.Struct):
+    value: int
+@app.job
+def nested(ctx: Context, payload: Request) -> Result:
+    Path({str(entered)!r}).touch()
+    value = 7
+    while not Path({str(gate)!r}).exists():
+        value = (value * 17 + 11) % 1000003
+    return Result(value)
+"""
+    with machine(monkeypatch, source) as pod:
+        pod.start(())
+        submission = pod.submit("ticks")
+        pod.wait("the smooth author work to start", entered.exists, 120)
+        query = pb.MachineExecutionQuery(
+            claim=pod.claim,
+            request_id="ticks",
+            expected_execution_workspace_id=submission.expected_execution_workspace_id,
+        )
+        ticks: list[tuple[int, float]] = []
+        cursor = 0
+        deadline = time.monotonic() + 12
+        try:
+            while len(ticks) < 2 and time.monotonic() < deadline:
+                page = pod.client.ListMachineExecutionEvents(
+                    pb.MachineExecutionEventsQuery(
+                        execution=query, after=cursor, limit=128, wait=True
+                    ),
+                    timeout=max(deadline - time.monotonic(), 0.01),
+                )
+                cursor = page.next_after
+                for event in page.events:
+                    if event.kind != "run.timing":
+                        continue
+                    body = canonical_json.decode(event.body_canonical_bytes)
+                    elapsed = body.get("execution_ms")
+                    if isinstance(elapsed, (int, float)) and elapsed >= 1000:
+                        ticks.append((event.at_ms, float(elapsed)))
+                assert pod.state("ticks") == "running"
+        finally:
+            gate.touch()
+        assert len(ticks) >= 2, ticks
+        assert 1500 <= ticks[1][0] - ticks[0][0] < 4000, ticks
+        assert 1500 <= ticks[1][1] - ticks[0][1] < 4000, ticks
+        assert not pod.rows(
+            "SELECT body FROM execution_events WHERE request='ticks' AND kind='progress'"
+        )
+        assert pod.outcome("ticks")["status"] == pb.OUTCOME_STATUS_SUCCEEDED
+        assert (
+            len(
+                pod.rows(
+                    "SELECT body FROM execution_events WHERE request='ticks' AND kind='run.timing'"
+                )
+            )
+            == 1
+        )
