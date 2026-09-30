@@ -17,6 +17,12 @@ revalidates source/generation, and atomically publishes views with original dtyp
 stride and offset. Failed publication restores attempted bindings. Mutable/changed sources,
 gradient operations, unsupported layouts and insufficient capacity do not acquire authority.
 
+The caller must positively own exclusive immutable source custody through publication;
+unknown or mutable ownership stays on the ordinary path. ``valid`` must be revoked before
+an external writer intervenes. Geometry and available version counters are sanity checks,
+not a content proof: inference tensors have no counter and Tensor.data writes can bypass
+ordinary counters. The mechanism does not claim to detect arbitrary contract-violating writes.
+
 Pinned borrows return only after copy completion. Published GPU backing remains owned
 until `finish`, called after the final consumer submission, records a consumer event and
 conservatively drains the device. A pure callable does not prove exclusive current-stream

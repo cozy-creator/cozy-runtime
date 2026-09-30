@@ -634,6 +634,9 @@ class HostTransfer:
 
         Capacity is supplied by admission. Payload bytes are not a claim about allocator
         rounding or reusable cache; the caller's allocator cap remains authoritative.
+        The caller must hold exclusive immutable source custody through publication and
+        revoke ``valid`` before any writer can intervene. Geometry/version checks detect
+        observable changes only: inference tensors lack versions and .data can bypass them.
         """
         if (
             device.type != "cuda"
