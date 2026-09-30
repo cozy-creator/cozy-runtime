@@ -317,10 +317,26 @@ class Planner:
         self.overhead += max(grown, 0)
 
     def _allocated(self) -> int:
-        return int(self.torch.cuda.memory_allocated(self.device)) if self.cuda else 0
+        return self._allocator_scalar("allocated_bytes", "current", "memory_allocated")
 
     def _reserved(self) -> int:
-        return int(self.torch.cuda.memory_reserved(self.device)) if self.cuda else 0
+        return self._allocator_scalar("reserved_bytes", "current", "memory_reserved")
+
+    def _allocator_scalar(self, metric: str, field: str, fallback: str) -> int:
+        """Read fresh native facts without flattening/sorting every allocator statistic.
+
+        No cache: in particular, observe_process still reads reserve independently
+        before and after the driver query. Older Torch uses its existing scalar API.
+        """
+        if not self.cuda:
+            return 0
+        cuda = self.torch.cuda
+        nested = getattr(cuda, "memory_stats_as_nested_dict", None)
+        if callable(nested):
+            row = nested(self.device).get(metric, {})
+            row = row.get("all", {}) if isinstance(row, Mapping) else {}
+            return int(row.get(field, 0)) if isinstance(row, Mapping) else 0
+        return int(getattr(cuda, fallback)(self.device))
 
     def _driver(self) -> tuple[int, int]:
         free, total = self.torch.cuda.mem_get_info(self.device)
@@ -361,8 +377,10 @@ class Planner:
         cuda = self.torch.cuda
         if self.observe_process():
             self._cap()
-        peak = int(cuda.max_memory_allocated(self.device))
-        self.peak = max(self.peak, int(cuda.max_memory_reserved(self.device)))
+        peak = self._allocator_scalar("allocated_bytes", "peak", "max_memory_allocated")
+        self.peak = max(
+            self.peak, self._allocator_scalar("reserved_bytes", "peak", "max_memory_reserved")
+        )
         self.peak_allocated = max(self.peak_allocated, peak)
         for frame in self.stack:
             frame.working = max(frame.working, peak - frame.base - frame.loaded)
