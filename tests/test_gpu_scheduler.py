@@ -700,6 +700,7 @@ def test_an_older_root_holds_all_four_gpus_through_its_gap_and_b_starts_after(
     machine.root("A")
     machine.root("B")
     a1 = machine.child("A", "h3")
+    machine.await_granted(a1)
     b1 = machine.child("B", "h3")
     view = machine.tick()
     assert machine.granted(a1) == [0, 1, 2, 3]
@@ -814,9 +815,11 @@ def test_cancel_while_waiting_takes_no_grant_and_the_next_root_starts(machine: M
     machine.root("B")
     machine.root("C")
     a1 = machine.child("A", "h3")
+    machine.await_granted(a1)
     b1 = machine.child("B", "h3")
     c1 = machine.child("C", "qwen")
     machine.tick()
+    assert b1 + "#1" in machine.worker.gpu.view()["waiting"]
     machine.control(b1, "cancel")
     machine.tick()
     assert b1 + "#1" not in machine.worker.gpu.view()["waiting"] and machine.granted(b1) == []
@@ -941,9 +944,10 @@ def test_machine_execution_state_reports_the_gpu_phase(
     machine.root("B")
     assert gpu("A").phase == "none"
     a1 = machine.child("A", "h3")
+    machine.await_granted(a1)
     b1 = machine.child("B", "h3")
     bound = time.monotonic() + 120
-    while gpu("A").phase != "granted":  # granted, its replica not yet on the device
+    while gpu("A").phase != "granted" or gpu("B").phase != "waiting":
         assert time.monotonic() < bound
         time.sleep(0.01)
     assert (gpu("A").phase, list(gpu("A").ordinals)) == ("granted", [0, 1, 2, 3])
