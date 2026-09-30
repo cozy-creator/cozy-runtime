@@ -1,0 +1,1 @@
+A described installed interface is kept beside its installation, keyed by record incarnation, environment generation, distribution and application. A restarted Runtime reads it instead of importing the package in a fresh executor: the first local-package preparation after a machine starts drops from ~0.8 s (trivial package) and ~6.6 s (SDXL import and discovery, CPU) to ~30 ms.
