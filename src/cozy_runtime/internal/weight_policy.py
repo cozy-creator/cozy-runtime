@@ -30,6 +30,8 @@ class Layout:
 
     common: int
     blocks: tuple[int, ...] = ()
+    #: (common, largest region) at the sub-block grain, when that is finer than `blocks`
+    fine: tuple[int, int] | None = None
 
     @property
     def total(self) -> int:
@@ -56,12 +58,14 @@ class Residence:
 
 
 class BelowFloor(Exception):
-    """The budget cannot hold even the non-streamable minimum. Carries both numbers."""
+    """The budget cannot hold even the non-streamable minimum. Carries both numbers, and the
+    component that did not fit at its current grain."""
 
-    def __init__(self, needed: int, available: int, detail: str) -> None:
+    def __init__(self, needed: int, available: int, detail: str, component: str = "") -> None:
         super().__init__(f"{detail}: needs {needed} B, {available} B available")
         self.needed = needed
         self.available = available
+        self.component = component
 
 
 def plane_budget(free: int, activation: int, context: int = 0, margin: int = MARGIN) -> int:
@@ -70,11 +74,14 @@ def plane_budget(free: int, activation: int, context: int = 0, margin: int = MAR
 
 
 def floor(layout: Layout, window: int, activation: int = 0) -> int:
-    """The least a stage can run in: common, W slots of the largest block, activations. A
-    component without blocks cannot stream, so all of it."""
-    if not layout.blocks:
-        return layout.total + activation
-    return layout.common + max(window, 1) * layout.largest + activation
+    """The least a stage can run in: common, W slots of the largest region, activations, at
+    the finest grain the component offers. A component without blocks cannot stream, so all
+    of it."""
+    width = max(window, 1)
+    coarse = layout.common + width * layout.largest if layout.blocks else layout.total
+    if layout.fine is not None:
+        coarse = min(coarse, layout.fine[0] + width * layout.fine[1])
+    return coarse + activation
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,9 +152,9 @@ def residence(
     walk = list(order) if sorted(order) == list(range(count)) else list(range(count))
     if layout.total <= budget:
         return Residence(resident=tuple(walk), streamed=(), window=0)
-    if not layout.blocks or floor(layout, 1) > budget:
-        need = floor(layout, 1)
-        raise BelowFloor(need, budget, "the stage's weights do not fit the plane budget")
+    need = layout.common + layout.largest if layout.blocks else layout.total
+    if need > budget:
+        raise BelowFloor(need, budget, "the component does not fit the plane budget at its grain")
     sizes = [layout.blocks[i] for i in walk]
     costs = costs or Costs()
     known = [costs.compute[i] for i in walk if i in costs.compute]
@@ -275,13 +282,18 @@ def stage(
     placed: dict[str, Residence] = {}
     for name in sorted(layouts, key=lambda n: (n not in cyclic, -layouts[n].total, n)):
         layout = layouts[name]
-        chosen = residence(
-            layout,
-            need[name] + spare,
-            order=orders.get(name, ()),
-            costs=costs.get(name),
-            cyclic=name in cyclic,
-        )
+        try:
+            chosen = residence(
+                layout,
+                need[name] + spare,
+                order=orders.get(name, ()),
+                costs=costs.get(name),
+                cyclic=name in cyclic,
+            )
+        except BelowFloor as exc:
+            raise BelowFloor(
+                exc.needed, exc.available, "a component does not fit at its grain", name
+            ) from None
         spare -= max(chosen.vram_bytes(layout) - need[name], 0)
         placed[name] = chosen
     return placed

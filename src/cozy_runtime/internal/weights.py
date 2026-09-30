@@ -54,6 +54,8 @@ from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult, observed_capability_records, qualify
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
 
+#: The largest region at the sub-block grain (proving-cpu.md C2: SDXL runs at 1 GiB).
+REGION_LIMIT = 16 << 20
 _REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB)")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
 #: The TensorFS planning window a weight set's read plan is cut into.
@@ -133,8 +135,14 @@ class Component:
     root: Any
     ws: Any
     device: int
+    #: every region, by plane index
     regions: list[Region]
+    #: the region outside every block, if any, and the blocks in address order
+    common: Region | None
+    blocks: list[Region]
     layout: weight_policy.Layout
+    #: regions of at most `REGION_LIMIT` bytes: the grain a budget below the block floor needs
+    fine: bool = False
     #: block region indexes in execution order, once a pass has been observed
     order: list[int] = field(default_factory=list)
     observed: bool = False
@@ -144,8 +152,15 @@ class Component:
     last_passes: int = 0
     residence: weight_policy.Residence | None = None
     cursor: Any = None
-    common: Any = None
+    #: the common region's lease for the running stage
+    lease: Any = None
+    #: region indexes wanted resident for the running stage
     resident: tuple[int, ...] = ()
+    #: block region index -> its position in `blocks` (the policy's block number)
+    numbers: dict[int, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.numbers = {region.index: i for i, region in enumerate(self.blocks)}
 
 
 # ------------------------------------------------------------------------ the process
@@ -284,15 +299,17 @@ class Weights:
 
     def forget(self, construction: str) -> None:
         for key in [key for key in self.components if key.startswith(construction + "/")]:
-            component = self.components.pop(key)
-            close_cursor(component)
-            if component.common is not None:
-                component.common.release()
-                component.common = None
-            for region in component.regions:
-                unbind(region)
-                region.views.clear()
-            component.ws.close()
+            self.close(self.components.pop(key))
+
+    def close(self, component: Component) -> None:
+        close_cursor(component)
+        if component.lease is not None:
+            component.lease.release()
+            component.lease = None
+        for region in component.regions:
+            unbind(region)
+            region.views.clear()
+        component.ws.close()
 
     # -- facts
 
@@ -508,6 +525,8 @@ class PlaneBackend:
             key: self._select(key, row) for key, row in self.plan.items()
         }
         self.encoded_leaves = "refuse"
+        #: contract key -> (installed leaf, replaced module, derived roles)
+        self.leaves: dict[str, tuple[Any, Any, tuple[str, ...]]] = {}
 
     @classmethod
     def for_script(
@@ -749,13 +768,13 @@ class PlaneBackend:
             )
         started = time.perf_counter()
         order = list(self.enqueued)
-        leaves = {
+        self.leaves = {
             key: self._install_leaf(key) for key in order if self._route(key) == "encoded_gemm"
         }
         for name, root in self.roots.items():
             keys = [key for key in order if self.plan[key].component == name]
             if keys:
-                component = self._register(name, root, keys, leaves)
+                component = self._register(name, root, keys)
                 self.components[name] = component
                 self.weights.register(component)
         self.stats["register_ms"] = round((time.perf_counter() - started) * 1000, 2)
@@ -827,26 +846,29 @@ class PlaneBackend:
         derived = tuple(sorted(role for role in parts if kept.get(role) is not parts[role]))
         return leaf, replaced, derived
 
-    def _register(
-        self,
-        name: str,
-        root: Any,
-        keys: list[str],
-        leaves: Mapping[str, tuple[Any, Any, tuple[str, ...]]],
-    ) -> Component:
-        """Partition the component into regions (common, then each block), register them as
-        one weight set, and bind every stored part to the destinations that name it."""
+    def refine(self, name: str) -> Component:
+        """Register `name` again at the sub-block grain (regions of at most `REGION_LIMIT`
+        bytes): the only way a budget below its block floor can run it."""
+        old = self.components[name]
+        self.weights.close(old)
+        keys = [key for key in self.enqueued if self.plan[key].component == name]
+        component = self._register(name, old.root, keys, fine=True)
+        self.components[name] = component
+        self.weights.register(component)
+        return component
+
+    def _register(self, name: str, root: Any, keys: list[str], *, fine: bool = False) -> Component:
+        """Partition the component into regions (common, then each block or sub-block unit),
+        register them as one weight set, and bind every stored part to its destinations."""
         try:
-            layout = partition(root)
+            layout = partition(root, REGION_LIMIT if fine else None)
         except ValueError:
-            layout = None  # storage shared across blocks: one region, not streamable
-        blocks = [unit.path for unit in layout.blocks] if layout is not None else []
-        members: list[list[str]] = [[] for _ in range(len(blocks) + 1)]
+            layout = None  # storage shared across units: one region, not streamable
+        units = [unit.path for unit in layout.blocks] if layout is not None else []
+        members: list[list[str]] = [[] for _ in range(len(units) + 1)]
         for key in keys:
             path = key[len(name) + 1 :].rpartition(".")[0]
-            members[_unit_of(path, blocks)].append(key)
-        if not members[0]:  # every weight in a block: one region
-            members, blocks = [keys], []
+            members[_unit_of(path, units)].append(key)
         kept = [(index, group) for index, group in enumerate(members) if group]
         checkpoint = self.checkpoints[name]
         plan = checkpoint.read_plan(
@@ -872,8 +894,8 @@ class PlaneBackend:
         for (index, group), span in zip(kept, spans, strict=True):
             region = Region(
                 index=len(regions),
-                path=blocks[index - 1] if index else "",
-                module=root.get_submodule(blocks[index - 1]) if index else root,
+                path=units[index - 1] if index else "",
+                module=root.get_submodule(units[index - 1]) if index else root,
                 weights=[],
                 offset=span.offset,
                 span=span.span,
@@ -894,8 +916,8 @@ class PlaneBackend:
                     },
                     sites=sites.get(key, []),
                 )
-                if key in leaves:
-                    weight.leaf, weight.replaced, weight.derived_roles = leaves[key]
+                if key in self.leaves:
+                    weight.leaf, weight.replaced, weight.derived_roles = self.leaves[key]
                     region.unbound.extend(
                         (weight.leaf._buffers, role, tensor)
                         for role, tensor in weight.leaf.roles().items()
@@ -903,6 +925,8 @@ class PlaneBackend:
                 region.unbound.extend((table, attr, table[attr]) for table, attr, _ in weight.sites)
                 region.weights.append(weight)
             regions.append(region)
+        common = regions[0] if kept[0][0] == 0 else None
+        blocks = [region for region in regions if region is not common]
         return Component(
             name=name,
             key=f"{self.construction}/{name}",
@@ -910,9 +934,14 @@ class PlaneBackend:
             ws=ws,
             device=weights.index,
             regions=regions,
+            common=common,
+            blocks=blocks,
             layout=weight_policy.Layout(
-                common=regions[0].span, blocks=tuple(region.span for region in regions[1:])
+                common=common.span if common else 0,
+                blocks=tuple(region.span for region in blocks),
+                fine=None if fine else _fine(root),
             ),
+            fine=fine,
         )
 
 
@@ -928,6 +957,22 @@ class _Placed(msgspec.Struct, frozen=True):
     region: int
     offset: int
     nbytes: int
+
+
+def _fine(root: Any) -> tuple[int, int] | None:
+    """(common, largest region) spans at the sub-block grain, for the refusal floor."""
+    try:
+        layout = partition(root, REGION_LIMIT)
+    except ValueError:
+        return None
+    if layout is None:
+        return None
+    return _span(layout.common.nbytes), _span(max(unit.nbytes for unit in layout.blocks))
+
+
+def _span(nbytes: int) -> int:
+    """A region's footprint in the plane: its bytes rounded up to 2 MiB."""
+    return -(-nbytes // (2 << 20)) * (2 << 20)
 
 
 def _unit_of(path: str, blocks: Sequence[str]) -> int:
@@ -1003,9 +1048,14 @@ class WeightResidency:
         weights: Weights,
         components: Mapping[str, Component],
         scopes: Mapping[str, tuple[str, ...]] | None = None,
+        refine: Callable[[str], Component] | None = None,
     ) -> None:
         self.weights = weights
         self.components = dict(components)
+        #: re-registers a component at the sub-block grain (the backend's `refine`)
+        self.refine = refine
+        #: component -> (module, had its own `forward`, that forward) per hooked region
+        self.hooks: dict[str, list[tuple[Any, bool, Any]]] = {}
         #: method -> the components it declares (`component_use`)
         self.scopes = dict(scopes or {})
         self.hosted: frozenset[str] = frozenset()
@@ -1029,11 +1079,24 @@ class WeightResidency:
         self._shortfall_error = plane.error("Shortfall") if plane.available() else Exception
         self._budget_error = plane.error("BudgetExceeded") if plane.available() else Exception
         for component in self.components.values():
-            for region in component.regions[1:]:
-                module = region.module
-                module.forward = self._block(component, region, module.forward)
+            self._hook(component)
             if _image_vae(component.root):
-                component.root.decode = self._decode(component, component.root.decode)
+                component.root.decode = self._decode(component.name, component.root.decode)
+
+    def _hook(self, component: Component) -> None:
+        """One wrapper per block region: its module's forward acquires and releases it."""
+        rows = self.hooks[component.name] = []
+        for region in component.blocks:
+            module = region.module
+            rows.append((module, "forward" in module.__dict__, module.forward))
+            module.forward = self._block(component, region, module.forward)
+
+    def _unhook(self, name: str) -> None:
+        for module, had, forward in self.hooks.pop(name, []):
+            if had:
+                module.forward = forward
+            else:
+                del module.forward
 
     # -- the Residency protocol
 
@@ -1071,8 +1134,11 @@ class WeightResidency:
         for name in local:
             component = self.components[name]
             component.passes = 0
-            component.common = weights.plane.acquire(component.ws, weights.index, 0, stream)
-            bind(weights.torch, component.regions[0], component.common)
+            if component.common is not None:
+                component.lease = weights.plane.acquire(
+                    component.ws, weights.index, component.common.index, stream
+                )
+                bind(weights.torch, component.common, component.lease)
         self.baseline = accel.allocated(weights.torch, weights.kind)
         accel.reset_peak(weights.torch, weights.kind)
         self.entered_ns = time.perf_counter_ns()
@@ -1089,9 +1155,9 @@ class WeightResidency:
         for name in local:
             component = self.components[name]
             close_cursor(component)
-            if component.common is not None:
-                component.common.release()
-                component.common = None
+            if component.lease is not None:
+                component.lease.release()
+                component.lease = None
             component.last_passes = component.passes
             # Released weights stay mapped and bound, at idle priority: least recently used
             # first when another stage wants the room.
@@ -1163,7 +1229,7 @@ class WeightResidency:
     def vacate(self) -> dict[str, Any]:
         """Unmap this construction's idle weights. They stay in the pinned tier; the next
         stage wants them back at link speed."""
-        idle = [c for c in self.components.values() if c.common is None]
+        idle = [c for c in self.components.values() if c.lease is None and c.cursor is None]
         freed = sum(self.weights.resident_bytes(c) for c in idle)
         self._drop(idle)
         return {"freed": {}, "held": {}, "freed_bytes": freed}
@@ -1223,10 +1289,11 @@ class WeightResidency:
     def _plan(
         self, method: str, local: tuple[str, ...], budget: int, resume: Mapping[str, int] = {}
     ) -> None:
-        """Place the stage's components inside `budget`: each prefix wanted, the rest
+        """Place the stage's components inside `budget`: each resident set wanted, the rest
         streamed by a cursor in the blocks' execution order (from `resume[name]` when a block
         boundary re-plans mid-pass). Before a component's order is observed its blocks are
-        acquired on demand."""
+        acquired on demand. A component whose block floor does not fit moves to the
+        sub-block grain first."""
         weights = self.weights
         components = {name: self.components[name] for name in local}
         try:
@@ -1234,7 +1301,7 @@ class WeightResidency:
                 {name: c.layout for name, c in components.items()},
                 budget,
                 orders={
-                    name: [index - 1 for index in c.order]
+                    name: [c.numbers[index] for index in c.order]
                     for name, c in components.items()
                     if c.observed
                 },
@@ -1242,6 +1309,9 @@ class WeightResidency:
                 cyclic={name for name, c in components.items() if c.last_passes != 1},
             )
         except weight_policy.BelowFloor as exc:
+            if name := self._refinable(exc.component, method):
+                self._refine(name)
+                return self._plan(method, local, budget, resume)
             raise self._shortfall(method, exc.needed, exc.available, str(exc)) from None
         need = sum(r.vram_bytes(components[n].layout) for n, r in placed.items())
         if self.spare and need > budget:
@@ -1253,7 +1323,10 @@ class WeightResidency:
             close_cursor(component)
             component.residence = residence
             before = set(component.resident)
-            component.resident = (0, *(index + 1 for index in residence.resident))
+            component.resident = (
+                *((component.common.index,) if component.common is not None else ()),
+                *(component.blocks[i].index for i in residence.resident),
+            )
             if name in resume and (stale := sorted(before - set(component.resident))):
                 # A re-plan inside the stage: what left the prefix leaves the device, so the
                 # cursor's slots have the room the lower budget promised them.
@@ -1290,6 +1363,26 @@ class WeightResidency:
                     tag=method,
                 )
         weights.drain()
+
+    def _refinable(self, name: str, method: str) -> str:
+        """`name`, when it can still move to the sub-block grain: at a stage's start, never
+        inside one (its leases pin the coarse regions)."""
+        component = self.components.get(name)
+        if (
+            component is None
+            or component.fine
+            or component.layout.fine is None
+            or self.refine is None
+            or any(c.lease is not None or c.cursor is not None for c in self.components.values())
+        ):
+            return ""
+        return name
+
+    def _refine(self, name: str) -> None:
+        assert self.refine is not None
+        self._unhook(name)
+        component = self.components[name] = self.refine(name)
+        self._hook(component)
 
     def _block(
         self, component: Component, region: Region, forward: Callable[..., Any]
@@ -1369,20 +1462,20 @@ class WeightResidency:
             component.passes += 1
         elif index == component.seen[0]:
             component.passes += 1
-            unseen = [i for i in range(1, len(component.regions)) if i not in component.seen]
+            unseen = [r.index for r in component.blocks if r.index not in component.seen]
             component.order = [*component.seen, *unseen]
             component.observed = True
             return
         if index not in component.seen:
             component.seen.append(index)
 
-    def _decode(self, component: Component, decode: Callable[..., Any]) -> Callable[..., Any]:
+    def _decode(self, name: str, decode: Callable[..., Any]) -> Callable[..., Any]:
         """An image VAE's decode mode, decided before the call from what is free plus what the
         plane may unmap: untiled when its measured activations fit, else tiled with the tile
         clamped to what is free. Unmeasured runs untiled (its blocks retry on OOM); only a
         decode that cannot run untiled even with every idle weight unmapped runs again tiled.
         The mode is recorded in the run's outputs."""
-        root = component.root
+        root = self.components[name].root
         weights = self.weights
         oom = accel.oom_error(weights.torch, weights.kind)
         per_pixel: list[int] = []
@@ -1390,7 +1483,7 @@ class WeightResidency:
 
         def run(z: Any, *args: Any, **kwargs: Any) -> Any:
             pixels = int(z.shape[0]) * int(z.shape[-2]) * int(z.shape[-1]) * scale * scale
-            free, evictable = self.room((component.name,))
+            free, evictable = self.room((name,))
             mode = (
                 weight_policy.decode_mode(free, evictable, per_pixel[0] * pixels)
                 if per_pixel
@@ -1411,13 +1504,13 @@ class WeightResidency:
                 failed = True
             if failed:  # outside `except`, so the failed call's frames are gone
                 mode = "tiled"
-                free, _ = self.room((component.name,))
+                free, _ = self.room((name,))
                 _tile(root, free // max(per_pixel[0] if per_pixel else 1, 1), scale)
                 out = decode(z, *args, **kwargs)
             elif mode == "untiled":
                 peak = accel.peak_allocated(weights.torch, weights.kind) - baseline
                 per_pixel[:] = [max(peak // max(pixels, 1), *per_pixel)]
-            weights.modes[f"{component.name}.decode"] = mode
+            weights.modes[f"{name}.decode"] = mode
             return out
 
         return run
@@ -1461,13 +1554,13 @@ def _costs(
     out: dict[str, weight_policy.Costs] = {}
     for name, component in components.items():
         compute = {
-            row.region - 1: row.compute_ns / row.uses / 1e9
+            component.numbers[row.region]: row.compute_ns / row.uses / 1e9
             for row in held.regions
             if row.ws == component.key
             and row.tag == tag
             and row.device == weights.index
             and row.uses
-            and row.region > 0
+            and row.region in component.numbers
         }
         out[name] = weight_policy.Costs(compute=compute, link_bps=link)
     return out

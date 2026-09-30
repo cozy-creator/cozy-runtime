@@ -42,14 +42,21 @@ class BlockLayout:
         }
 
 
-def partition(root: Any) -> BlockLayout | None:
+def partition(root: Any, limit: int | None = None) -> BlockLayout | None:
     """Use declared indivisible blocks; never guess an arbitrary ModuleList's semantics.
 
+    With `limit`, the units are instead the largest module subtrees of at most `limit` bytes
+    anywhere in the component (a single larger leaf stays whole), and only the weights of the
+    modules that had to be split stay in `common`. That is the sub-block grain a budget below
+    the block floor needs (proving-cpu.md C2: SDXL at 1 GiB); every unit's own forward is its
+    hook, so it holds only for components whose weights are read through module calls.
     Cross-unit module/tensor aliases and custom state-dict layouts cannot safely be
-    independently parked. Refuse before any device allocation rather than break ties.
+    independently placed; they refuse before any device allocation.
     """
     classes = getattr(root, "_no_split_modules", None)
-    if not classes:
+    if limit is not None:
+        classes = ()
+    elif not classes:
         return None
     if not isinstance(classes, (tuple, list, set, frozenset)) or any(
         not isinstance(name, str) for name in classes
@@ -61,6 +68,8 @@ def partition(root: Any) -> BlockLayout | None:
     # CrossAttnUpBlock2D around its resnets and transformer blocks) keeps only its own
     # weights, which fall to `common`.
     blocks = [a for a in declared if not any(b.startswith(a + ".") for b in declared)]
+    if limit is not None:
+        blocks = [unit for unit in _split(root, "", limit) if unit]
     if not blocks:
         return None
     owners: dict[str, list[tuple[str, Any]]] = {"": [], **{path: [] for path in blocks}}
@@ -95,3 +104,20 @@ def partition(root: Any) -> BlockLayout | None:
         path: PageUnit(path, tuple(owners[path]), sizes[path], tuple(keys[path])) for path in owners
     }
     return BlockLayout(units[""], tuple(units[path] for path in blocks))
+
+
+def _split(root: Any, path: str, limit: int) -> list[str]:
+    """`path`, or its children's units when its weights exceed `limit`."""
+    module = root.get_submodule(path) if path else root
+    children = [
+        f"{path}.{name}" if path else name
+        for name, child in module.named_children()
+        if next(child.parameters(), None) is not None
+    ]
+    if not children or (path and _bytes(module) <= limit):
+        return [path]
+    return [unit for child in children for unit in _split(root, child, limit)]
+
+
+def _bytes(module: Any) -> int:
+    return sum(int(t.numel() * t.element_size()) for t in module.parameters())

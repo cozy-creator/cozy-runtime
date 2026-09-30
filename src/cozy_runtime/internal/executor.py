@@ -2097,7 +2097,9 @@ class Executor:
         self.models = {name: model for name in binding.parameter_names()}
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY: from here on a declared scope is a
         # stage on the plane, and each block runs inside one acquire/release.
-        self.residency = WeightResidency(weights, backend.components, component_use(model_cls))
+        self.residency = WeightResidency(
+            weights, backend.components, component_use(model_cls), refine=backend.refine
+        )
         object.__setattr__(model, "_cozy_residency", self.residency)
         record = registry.generations()[0].record
         self.plan = plan

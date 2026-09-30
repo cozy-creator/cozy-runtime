@@ -38,13 +38,17 @@ BLOCKS = 8
 
 
 class Block(torch.nn.Module):  # type: ignore[misc,name-defined]
+    """16 MiB and a little: at the sub-block grain its two projections are separate regions
+    and its own `norm` joins `common`."""
+
     def __init__(self) -> None:
         super().__init__()
         self.proj = torch.nn.Linear(HIDDEN, HIDDEN, bias=False, dtype=torch.float16)
+        self.out = torch.nn.Linear(HIDDEN, HIDDEN, bias=False, dtype=torch.float16)
         self.norm = torch.nn.Parameter(torch.empty(HIDDEN, dtype=torch.float16))
 
     def forward(self, x: Any) -> Any:
-        return x + torch.tanh(self.proj(x * self.norm))
+        return x + torch.tanh(self.out(torch.tanh(self.proj(x * self.norm))))
 
 
 class Stack(torch.nn.Module):  # type: ignore[misc,name-defined]
@@ -68,9 +72,10 @@ def write_checkpoint(root: Path) -> tuple[Checkpoint, dict[str, Any]]:
     generator = torch.Generator().manual_seed(7)
     values: dict[str, Any] = {"embed": torch.rand(HIDDEN, generator=generator) + 0.5}
     for index in range(BLOCKS):
-        values[f"blocks.{index}.proj.weight"] = (
-            torch.randn(HIDDEN, HIDDEN, generator=generator) / HIDDEN**0.5
-        )
+        for name in ("proj", "out"):
+            values[f"blocks.{index}.{name}.weight"] = (
+                torch.randn(HIDDEN, HIDDEN, generator=generator) / HIDDEN**0.5
+            )
         values[f"blocks.{index}.norm"] = torch.rand(HIDDEN, generator=generator) + 0.5
     tensors = {
         key: Tensor("f16", tuple(value.shape), SPEC_PLAIN, {"value": Part("f16", value.shape)})
@@ -150,10 +155,23 @@ def test_the_pinned_tier_holds_every_part_where_the_layout_says(tmp_path: Path) 
     weights = Weights(torch, torch.device("cpu"), "cpu")
     weights.set_budget(-1, pinned=1 << 30)
     checkpoint, values = write_checkpoint(tmp_path)
-    component = load(weights, checkpoint, "host").backend.components["stack"]
+    model = load(weights, checkpoint, "host")
+    component = model.backend.components["stack"]
     assert [region.path for region in component.regions] == [""] + [
         f"blocks.{i}" for i in range(BLOCKS)
     ]
+    assert_pinned(weights, component, values)
+    # Below its block floor a component moves to the sub-block grain: each projection is
+    # a region, and the blocks' own `norm`s join `common`.
+    fine = model.backend.refine("stack")
+    assert [region.path for region in fine.blocks] == [
+        f"blocks.{i}.{name}" for i in range(BLOCKS) for name in ("proj", "out")
+    ]
+    assert fine.common is not None and len(fine.common.weights) == 1 + BLOCKS
+    assert_pinned(weights, fine, values)
+
+
+def assert_pinned(weights: Weights, component: Any, values: dict[str, Any]) -> None:
     weights.plane.want(component.ws, "pinned").wait()
     held = mmap.mmap(component.ws.host_fd, component.ws.nbytes, prot=mmap.PROT_READ)
     for region in component.regions:
@@ -178,6 +196,22 @@ def test_streamed_blocks_are_bit_identical_to_resident(card: Any) -> None:
     assert facts.streamed["stack"].window == 2
     assert facts.streamed["stack"].resident_blocks < BLOCKS
     assert facts.h2d_bytes > 0
+    assert same(resident, streamed)
+
+
+@on_card
+def test_a_budget_below_the_block_floor_runs_at_the_sub_block_grain(card: Any) -> None:
+    weights = card.weights
+    model = load(weights, card.checkpoint, "fine")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    resident = run(model, x)
+    layout = model.residency.components["stack"].layout
+    assert layout.fine is not None
+    weights.set_budget(layout.fine[0] + 2 * layout.fine[1])  # below common + one block
+    assert layout.common + layout.largest > weights.budget
+    streamed = run(model, x)
+    assert model.residency.components["stack"].fine
     assert same(resident, streamed)
 
 
