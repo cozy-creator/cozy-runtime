@@ -112,6 +112,7 @@ def test_encoded_refill_uses_peak_relative_to_settled_native_bytes() -> None:
         destinations=64, native_destinations=64, native=16, native_resident=16
     )
     backend.component_memory = {"model": cell}
+    backend.derived = {}  # This encoded-weight fixture has no derived buffers.
     backend.expected = {"model": frozenset({"model.weight"})}
     backend.resolved = {
         "model.weight": cast(TensorResolution, SimpleNamespace(route="encoded_gemm"))
