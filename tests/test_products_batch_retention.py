@@ -1,4 +1,4 @@
-"""Returned multi-file products keep native custody across batch journaling/failure."""
+"""Returned products retain only journaled native custody across publication failure."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 
 @pytest.mark.parametrize("fail_after", [None, 1, 2])
-def test_finish_keeps_all_journaled_native_files_and_releases_only_unjournaled(
+def test_finish_keeps_journaled_files_without_retaining_unjournaled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_after: int | None
 ) -> None:
     workspace = Workspace(tmp_path / "store")
@@ -103,5 +103,14 @@ def test_finish_keeps_all_journaled_native_files_and_releases_only_unjournaled(
             assert readback == payloads[name]
     with workspace.locked() as db:
         held = db.all(NativeHold, "SELECT * FROM holds WHERE owner=?", ("owner",))
-    assert sum(h.state == "held" for h in held) == (fail_after or 4)
-    assert sum(h.state == "released" for h in held) == (4 - fail_after if fail_after else 0)
+    # Master acquires each hold immediately before its journal entry. A lost reply
+    # must not cause either dangling future holds or tombstones for unacquired ones.
+    assert len(held) == (fail_after or 4)
+    assert all(h.state == "held" for h in held)
+    if fail_after is not None:
+        monkeypatch.setattr(executions, "notice", notice)
+        assert log.finish("owner", cast(AttemptRecord, attempt), entries) is None
+        assert len(log.fold("owner", "producer").single) == 4
+        with workspace.locked() as db:
+            resumed = db.all(NativeHold, "SELECT * FROM holds WHERE owner=?", ("owner",))
+        assert len(resumed) == 4 and all(h.state == "held" for h in resumed)

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -22,7 +23,7 @@ from cozy_runtime.author import (
     uses_components,
 )
 from cozy_runtime.author._loader import census
-from cozy_runtime.internal import lora_composition
+from cozy_runtime.internal import fill, lora_composition, tiers
 from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of
 from native_weights import NativeExecution
 from test_lora_composition import compose, fixture, header
@@ -133,6 +134,31 @@ def test_native_peft_graph_matches_reference_and_keeps_ordinary_destinations(
     assert torch.equal(component.proj.base_layer.weight, base_weight)
     assert torch.equal(component.proj.base_layer.bias, bias)
     assert torch.equal(actual, component.proj(x))
+
+    # The merged memory reader must quote/reconstruct the prepared graph's mixed
+    # canonical base/adapter dtypes, not the execution dtype left on parked metadata.
+    # This exercises the real RefillSchema reader without accelerator construction.
+    backend: Any = fill.StreamingFillBackend.__new__(fill.StreamingFillBackend)
+    backend.torch = torch
+    backend.specs = tensor_schema_of(rows)
+    backend.derived = {}
+    backend.resolved = {row.key: SimpleNamespace(route="verbatim") for row in rows}
+    canonical = {row.key: getattr(torch, fill.dtype_name(row.dtype)) for row in rows}
+    component.to_empty(device="meta")
+    component.bfloat16()
+    unit = tiers.Unit("", component, tier=tiers.DISK)
+    parked = list(component.parameters())
+    schema = backend.load_schema("transformer", unit)
+    assert isinstance(schema, tiers.RefillSchema) and schema.dtypes is not None
+    assert dict(zip(unit.live("transformer"), schema.dtypes, strict=True)) == canonical
+    assert set(schema.dtypes) == {torch.float16, torch.float32}
+    assert all(parameter.dtype == torch.bfloat16 for parameter in component.parameters())
+    assert [id(parameter) for parameter in component.parameters()] == [
+        id(parameter) for parameter in parked
+    ]
+    backend._canonicalize_refill("transformer", unit)
+    assert {key: value.dtype for key, value in unit.live("transformer").items()} == canonical
+    assert header(store, result) == checkpoint.header_bytes
     assert not torch.cuda.is_initialized()
     registry.unload_all()
 
