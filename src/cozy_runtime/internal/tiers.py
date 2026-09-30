@@ -746,29 +746,35 @@ def intercept_apply(
         # Invalidate before the first mutation too: an exception can leave a partially
         # converted resident module, which must not reuse old resource observations.
         applied()
-        for unit in component.units:
-            if unit.tier == DISK:
-                unit.pending.append(fn)
-                continue
-            needed = 0
-            with FakeTensorMode() as mode:
-                for *_, tensor in unit.slots():
-                    if tensor.device.type == "cpu":
-                        fake = mode.from_tensor(tensor)
-                        converted = fn(fake)
-                        if converted is not fake:
-                            needed += converted.untyped_storage().nbytes()
-            reservation = host_copy(needed) if host_copy is not None else nullcontext(True)
-            with reservation as admitted:
-                if not admitted:
-                    raise RuntimeFailure(
-                        f"dtype conversion needs {needed} B of host memory", code="host_shortfall"
-                    )
-                for _, module in unit.owners():
-                    type(module)._apply(module, fn, recurse=False)
-            unit.applied.append(fn)
-            unit.seen.clear()
-        measure(component)
+        try:
+            for unit in component.units:
+                if unit.tier == DISK:
+                    unit.pending.append(fn)
+                    continue
+                needed = 0
+                with FakeTensorMode() as mode:
+                    for *_, tensor in unit.slots():
+                        if tensor.device.type == "cpu":
+                            fake = mode.from_tensor(tensor)
+                            converted = fn(fake)
+                            if converted is not fake:
+                                needed += converted.untyped_storage().nbytes()
+                reservation = host_copy(needed) if host_copy is not None else nullcontext(True)
+                with reservation as admitted:
+                    if not admitted:
+                        raise RuntimeFailure(
+                            f"dtype conversion needs {needed} B of host memory",
+                            code="host_shortfall",
+                        )
+                    for _, module in unit.owners():
+                        type(module)._apply(module, fn, recurse=False)
+                unit.applied.append(fn)
+                unit.seen.clear()
+        finally:
+            # Earlier owners may already have converted when a later reservation or
+            # cast fails. Keep their real backing sizes, without claiming that the
+            # failed unit completed its replay or replacing the original exception.
+            measure(component)
         applied()
         return root
 

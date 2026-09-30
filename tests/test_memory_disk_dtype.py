@@ -223,3 +223,49 @@ def test_noop_cast_preserves_full_shared_meta_backing_quote() -> None:
     unit = tiers.Unit("", root, tier=tiers.DISK, nbytes=backing.untyped_storage().nbytes())
     unit.pending.append(conversion)
     assert tiers.load_demand(torch, unit) == tiers.LoadDemand(64, 64)
+
+
+def test_partial_host_conversion_reservation_failure_refreshes_actual_bytes() -> None:
+    root = Network()
+    owner = memory.Planner(torch, torch.device("cpu"), grouped=True)
+    owner.cuda = True  # production adapters, no CUDA operation
+    held = owner.adopt("c", "network", root, None, tiers.HOST)
+    key = memory.OpKey(held.kind, "forward", ())
+    owner.records[key] = memory.Record(ok=999)
+    # Common's floating weight needs32B; the next block's32B is not prepaid.
+    with owner.host_credit(32), pytest.raises(RuntimeFailure) as failure:
+        root.double()
+    assert failure.value.code == "host_shortfall"
+    assert root.marker.weight.dtype == torch.float64
+    assert root.blocks[0].weight.dtype == torch.float32
+    assert held.part.common.nbytes == 48  # actual32B weight +unchanged16B integer buffer
+    assert [unit.nbytes for unit in held.part.blocks] == [16, 16]
+    assert tiers.load_demand(torch, held.part.common) == tiers.LoadDemand(48, 48)
+    assert owner._need(held.part, 0) == 64
+    assert len(held.part.common.applied) == 1
+    assert not held.part.blocks[0].applied and not held.part.blocks[0].pending
+    assert key not in owner.records and not owner.unusable
+
+
+def test_partial_owner_cast_failure_preserves_exception_and_truthful_sizes() -> None:
+    failure = ValueError("owner cast failed after changing backing")
+
+    class FailingBlock(Block):
+        def _apply(self, fn: Any, recurse: bool = True) -> Any:
+            super()._apply(fn, recurse)
+            raise failure
+
+    root = Network()
+    root._no_split_modules = ["FailingBlock"]
+    root.blocks = torch.nn.ModuleList([FailingBlock(2, 2, bias=False) for _ in range(2)])
+    owner = memory.Planner(torch, torch.device("cpu"), grouped=True)
+    owner.cuda = True
+    held = owner.adopt("c", "network", root, None, tiers.HOST)
+    with owner.host_credit(128), pytest.raises(ValueError) as caught:
+        root.double()
+    assert caught.value is failure
+    assert held.part.common.nbytes == 48
+    assert [unit.nbytes for unit in held.part.blocks] == [32, 16]
+    assert tiers.load_demand(torch, held.part.blocks[0]) == tiers.LoadDemand(32, 32)
+    assert not held.part.blocks[0].applied  # partial owner work is not a completed replay
+    assert not held.part.blocks[0].pending
