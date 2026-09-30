@@ -18,6 +18,7 @@ from __future__ import annotations
 import functools
 import math
 import re
+import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -167,7 +168,6 @@ class Plan:
     keep: int
     evict: list[Held]
     #: its victims include the scope's other components' common units
-    deep: bool = False
     #: concrete net room target; None means a measured recovery needs every movable byte
     needed: int | None = None
 
@@ -222,7 +222,6 @@ class Planner:
         self.last_seq: dict[str, list[str]] = {}
         self.clock = 0
         self.spare = False
-        self.deep = False
         self.room_requests: set[tuple[int, int, bool, int | None]] = set()
         self.room_asks = 0
         self.peak = 0
@@ -240,6 +239,7 @@ class Planner:
         self.log: list[str] = []
         self.plans: dict[str, list[str]] = {}
         self.operations: dict[str, dict[str, int]] = {}
+        self.anchor_validation_calls = self.anchor_validation_ns = 0
         self.oom_asked = 0
         #: the typed refusal this attempt ended on, for the reply's shortfall numbers
         self.refusal: MemoryRefusal | None = None
@@ -409,7 +409,10 @@ class Planner:
             and not held.compiled
             and part.unit_loads
             and self._state_contract(held, [])
-            and all(unit.readonly and not unit.mutable for unit in part.units)
+            and all(
+                unit.readonly and not unit.mutable and (unit.tier != DISK or tiers.store_safe(unit))
+                for unit in part.units
+            )
         ):
             tiers.split_common(part)
             held.scope_anchor = part.anchor is not None
@@ -643,6 +646,7 @@ class Planner:
         self.log = []
         self.plans = {}
         self.operations = {}
+        self.anchor_validation_calls = self.anchor_validation_ns = 0
         self.refusal = None
         self.preparation_failure = ""
         if self.cuda:
@@ -704,6 +708,40 @@ class Planner:
             "log": list(self.log[-8:]),
             "plans": {op: list(seen) for op, seen in self.plans.items()},
             "operations": {op: dict(counts) for op, counts in self.operations.items()},
+            "anchor_validation": {
+                "calls": self.anchor_validation_calls,
+                "ns": self.anchor_validation_ns,
+            },
+            "scope_backing": {
+                h.key: {
+                    "metadata_anchor_bytes": (h.part.anchor or h.part.common).nbytes,
+                    "operation_common_bytes": (
+                        h.part.common.nbytes
+                        if h.part.anchor is not None and h.part.anchor is not h.part.common
+                        else 0
+                    ),
+                    "operation_common_device_bytes": (
+                        h.part.common.nbytes
+                        if h.part.anchor is not None
+                        and h.part.anchor is not h.part.common
+                        and h.part.common.tier == DEVICE
+                        else 0
+                    ),
+                    "anchor_only_scope": h.scope_anchor and not h.whole and not h.compiled,
+                    "scope_minimum_bytes": sum(
+                        unit.nbytes
+                        for unit in (
+                            h.part.units
+                            if h.whole or h.compiled
+                            else tuple(
+                                set(self._scope_common(h))
+                                | {unit for unit in h.part.units if unit.mutable}
+                            )
+                        )
+                    ),
+                }
+                for h in mine
+            },
             "poisoned": self.unusable,
         }
 
@@ -763,11 +801,39 @@ class Planner:
         }
 
     def _validate_component(self, held: Held) -> None:
+        if held.part.anchor is None:
+            return
+        began = time.perf_counter_ns()
         try:
             tiers.validate_anchor(held.part)
         except RuntimeFailure as exc:
             self.unusable = f"{held.key}: {exc}"
             raise MemoryRefusal(exc.code, self.unusable, reusable=False) from None
+        finally:
+            self.anchor_validation_calls += 1
+            self.anchor_validation_ns += time.perf_counter_ns() - began
+
+    def _validate_active(self, held: Held) -> None:
+        active = {held.key}
+        active.update(
+            f"{construction}/{name}" for construction, names in self.scopes for name in names
+        )
+        for key in active:
+            if (component := self.held.get(key)) is not None:
+                self._refresh_constraints(component)
+
+    def _refresh_constraints(self, held: Held) -> None:
+        """Refresh mutable/whole/compiled and alias facts at quote and movement boundaries."""
+        self._validate_component(held)
+        held.compiled = _compiled(held.part.root)
+        held.whole = held.whole or bool(getattr(held.part.root, "_cozy_read_whole", False))
+        self._pin_state(held)
+        held.scope_anchor = (
+            held.part.anchor is not None
+            and held.forward_only
+            and self._state_contract(held, [])
+            and all(unit.readonly and not unit.mutable for unit in held.part.common_units)
+        )
 
     def _scope_common(self, held: Held) -> tuple[tiers.Unit, ...]:
         """Scope metadata is real backing; unknown effects retain every common unit."""
@@ -805,16 +871,7 @@ class Planner:
         for held in scoped:
             # A package may have replaced a forward since (a cache hook): it is an op again.
             tiers.wrap(held.part.root, functools.partial(self.run, held))
-            held.compiled = _compiled(held.part.root)
-            held.whole = held.whole or bool(getattr(held.part.root, "_cozy_read_whole", False))
-            self._pin_state(held)
-            self._validate_component(held)
-            held.scope_anchor = (
-                held.part.anchor is not None
-                and held.forward_only
-                and self._state_contract(held, [])
-                and all(unit.readonly and not unit.mutable for unit in held.part.common_units)
-            )
+            self._refresh_constraints(held)
         for held in scoped:
             part = held.part
             whole = part.nbytes - part.on(DEVICE)
@@ -844,6 +901,8 @@ class Planner:
                 self._offload(victim, target=required)
             if whole_only:
                 self._stage_whole(held, [])
+            elif scope_units == part.common_units:
+                self._load_common(held)
             else:
                 for unit in scope_units:
                     self._load(part, unit)
@@ -1171,7 +1230,7 @@ class Planner:
         if not self.cuda or held.hosted or any(frame.held is held for frame in self.stack):
             self._ready(held.key)
             return fn(*args, **kwargs)
-        self._validate_component(held)
+        self._validate_active(held)
         torch = self.torch
         leaves = list(_leaves((args, kwargs)))
         key = OpKey(
@@ -1280,7 +1339,7 @@ class Planner:
                     if not oom:
                         raise
                 else:
-                    self._validate_component(held)
+                    self._validate_active(held)
                     self._sample()
                     assert frame is not None
                     self.working = max(self.working, frame.working)
@@ -1382,12 +1441,7 @@ class Planner:
             f"{plan.keep}/{len(held.part.blocks)} blocks resident"
         )
         self.log.append(numbers)
-        before = self.deep
-        self.deep = True
-        try:
-            reclaim = not self.spare and any(self._evictable(v) for v in self._victims(held))
-        finally:
-            self.deep = before
+        reclaim = not self.spare and any(self._evictable(v) for v in self._victims(held))
         smaller = (snapshot is not None or not entered) and (
             plan.keep > self._minimum_keep(held) or reclaim
         )
@@ -1455,59 +1509,40 @@ class Planner:
                 # The previous op's cache may be all that stands in the way: give it back so
                 # the plan reads what can really be reserved.
                 tiers.trim(self.torch)
-        for deep in (False, True):
-            # The second pass also takes the common units of the scope's other components:
-            # the last room there is, before a refusal.
-            self.deep = deep
-            victims = [] if self.spare else self._victims(held)
-            try:
-                if floor or (not retryable and not exact):
-                    plan = self._fit(held, working or 0, victims, floor=True, measured=measured)
-                elif retryable and working is None:
-                    plan = self._max_room(held, victims)
-                else:
-                    plan = self._fit(
-                        held, working or 0, victims, floor=False, ceiling=ceiling, measured=measured
-                    )
-            except MemoryRefusal as exc:
-                if deep and not exact and not self.spare and exc.code == SHORTFALL:
-                    # A different input shape supplies a forecast, not a refusal proof.
-                    # Try the legal floor once under the same cap; an OOM for this exact
-                    # key still supplies a hard lower bound and normal replay gain gates.
-                    record = self.records.get(key)
-                    failure_floor = record.fail if record is not None else 0
-                    plan = self._fit(held, failure_floor, victims, floor=True)
-                    self.log.append(
-                        f"{held.key}.{key.method}: forecast exceeded room; attempting floor"
-                    )
-                elif deep or self.spare:
-                    raise
-                else:
-                    continue
-            finally:
-                self.deep = False
-            plan.deep = deep
+        victims = [] if self.spare else self._victims(held)
+        try:
+            if floor or (not retryable and not exact):
+                return self._fit(held, working or 0, victims, floor=True, measured=measured)
+            if retryable and working is None:
+                return self._max_room(held, victims)
+            return self._fit(
+                held, working or 0, victims, floor=False, ceiling=ceiling, measured=measured
+            )
+        except MemoryRefusal as exc:
+            if exact or self.spare or exc.code != SHORTFALL:
+                raise
+            # An inexact shape forecast is not a refusal proof. Metadata pins stay
+            # intact while the legal floor gets the same ordinary admission/retry path.
+            record = self.records.get(key)
+            failure_floor = record.fail if record is not None else 0
+            plan = self._fit(held, failure_floor, victims, floor=True)
+            self.log.append(f"{held.key}.{key.method}: forecast exceeded room; attempting floor")
             return plan
-        raise AssertionError("unreachable")
 
     def _replay_room(self, held: Held, plan: Plan, target: int) -> None:
-        """Price the failed allocation's full gain, including reclaimable sibling common units.
+        """Price the failed allocation's full gain against legally reclaimable sibling cache.
 
         Working-memory samples are lower bounds. Even when that bound fits the same
         placement, an actual replay must make the additional room the failure requested.
         """
-        before, self.deep = self.deep, True
-        try:
-            part = held.part
-            stream = max((unit.nbytes for unit in part.blocks[plan.keep :]), default=0)
-            placement = self._need(part, plan.keep) - stream
-            needed = max(plan.needed or 0, target + placement)
-            victims = [] if self.spare else self._victims(held)
-            chosen = self._room_from(victims, needed)
-            plan.evict = victims if chosen is None else chosen
-            plan.needed, plan.deep = needed, True
-        finally:
-            self.deep = before
+        part = held.part
+        stream = max((unit.nbytes for unit in part.blocks[plan.keep :]), default=0)
+        placement = self._need(part, plan.keep) - stream
+        needed = max(plan.needed or 0, target + placement)
+        victims = [] if self.spare else self._victims(held)
+        chosen = self._room_from(victims, needed)
+        plan.evict = victims if chosen is None else chosen
+        plan.needed = needed
 
     def _fit(
         self,
@@ -1656,6 +1691,7 @@ class Planner:
         return whole, common
 
     def _evictable(self, victim: Held) -> int:
+        self._refresh_constraints(victim)
         whole, common = self._pinned()
         if victim.key in whole or victim.compiled:
             return 0
@@ -1730,14 +1766,10 @@ class Planner:
 
     def _apply(self, held: Held, plan: Plan) -> None:
         self._cap()
-        self.deep = plan.deep
-        try:
-            for victim in plan.evict:
-                if plan.needed is not None and self.allocatable() >= plan.needed:
-                    break
-                self._offload(victim, target=plan.needed)
-        finally:
-            self.deep = False
+        for victim in plan.evict:
+            if plan.needed is not None and self.allocatable() >= plan.needed:
+                break
+            self._offload(victim, target=plan.needed)
         part = held.part
         for unit in part.blocks[plan.keep :]:
             if unit.tier == DEVICE:
@@ -1806,9 +1838,9 @@ class Planner:
 
     def _offload(self, held: Held, *, everything: bool = False, target: int | None = None) -> None:
         """Move a victim's unpinned device units off the device."""
+        self._refresh_constraints(held)
         part = held.part
         whole, common = self._pinned()
-        held.compiled = _compiled(held.part.root)
         if held.compiled or (held.key in whole and not everything):
             return
         protected = (
@@ -1983,6 +2015,8 @@ class Planner:
         if provider is None:
             return
         state = tuple(provider())
+        if not state:
+            return
         identities = {id(tensor) for tensor in state}
         storages = {
             tensor.untyped_storage().data_ptr()

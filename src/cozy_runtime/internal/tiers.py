@@ -152,18 +152,14 @@ class Component:
 
 def _backing(tensor: Tensor) -> tuple[str, int]:
     storage = tensor.untyped_storage()
-    return str(storage.device), storage.data_ptr() if storage.nbytes() else id(tensor)
+    identity = int(storage._cdata) if tensor.is_meta else storage.data_ptr()
+    return str(storage.device), identity if storage.nbytes() else id(tensor)
 
 
 def _bytes(tensors: Iterator[Tensor]) -> int:
-    sizes: dict[object, int] = {}
-    for tensor in tensors:
-        key = id(tensor) if tensor.is_meta else _backing(tensor)
-        sizes[key] = (
-            tensor.numel() * tensor.element_size()
-            if tensor.is_meta
-            else tensor.untyped_storage().nbytes()
-        )
+    sizes: dict[tuple[str, int], int] = {
+        _backing(tensor): int(tensor.untyped_storage().nbytes()) for tensor in tensors
+    }
     return sum(sizes.values())
 
 
@@ -173,9 +169,8 @@ def _tokens(module: Module) -> Iterator[tuple[str, int]]:
         if tensor is not None:
             yield "tensor", id(tensor)
             if tensor.numel():
-                storage = tensor.untyped_storage()
-                identity = int(storage._cdata) if tensor.is_meta else storage.data_ptr()
-                yield f"storage:{tensor.device}", identity
+                device, identity = _backing(tensor)
+                yield f"storage:{device}", identity
 
 
 def partition(name: str, root: Module, tier: str, store: Store | None = None) -> Component:
@@ -442,11 +437,11 @@ def store_safe(unit: Unit) -> bool:
     """The fill plane reconstructs slots, not alias/view storage geometry."""
     seen: set[tuple[str, int]] = set()
     for *_, tensor in unit.slots():
-        if tensor.is_meta:
-            continue
         key = _backing(tensor)
         if (
             key in seen
+            or tensor.storage_offset() != 0
+            or not tensor.is_contiguous()
             or tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size()
         ):
             return False
@@ -506,6 +501,8 @@ def from_disk(torch: Torch, component: Component, unit: Unit | None) -> None:
     loading = [
         (each, list(each.pending), list(each.applied)) for each in units if each.tier == DISK
     ]
+    if any(not store_safe(each) for each, _, _ in loading):
+        raise RuntimeFailure("store cannot reconstruct aliased backing", code="memory_capability")
     original = [slot for each, _, _ in loading for slot in each.slots()]
     component.moving = True
     try:

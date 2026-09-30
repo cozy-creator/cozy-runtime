@@ -19,8 +19,25 @@ slot geometry or cross-unit aliases before further movement and after its operat
 ordinary Python retry caches are not tensor topology. Unknown contracts never get split.
 
 The former deep fallback could evict the real metadata common and return to authored code
-without restoring it. The metadata pin now survives both planning passes. Only legal
-remainder/block cache may be reclaimed; cost-ranking alternatives remains separate work.
+without restoring it. The metadata pin is now unconditional. The redundant shallow/deep pass is removed;
+richest-to-smallest placement and inexact-forecast floor fallback remain. Only legal
+remainder/block cache may be reclaimed; cost-ranking alternatives remain separate work.
 
-CPU/meta tests and static component-size evidence are being added. No GPU qualification or
-performance gain is claimed by this draft.
+CPU/meta tests cover owner/census identity, alias closures, mutation between quote and
+move, retry-cache versus tensor-graph changes, metadata-preserving replay and unsupported
+initial alias refills. Meta sizes use full unique backing; detection never claims the store
+can reconstruct alias/view geometry.
+
+`scope_backing` telemetry separates metadata anchor, operation-common remainder, current
+remainder device bytes and scope minima. `anchor_validation` reports owner/alias validation
+calls and CPU nanoseconds so its overhead is visible. No plan-cost changes are included.
+
+Static safetensors/source inspection suggests Anima transformer siblings retain at least
+376978816B in real first owners out of632851750B common: at most255872934B (~244MiB)
+remains before additional aliases/buffers. This is a lower-bound owner census, not an
+instantiated partition or measured speedup. The large text embeddings cannot be replaced
+with small metadata stand-ins.
+
+Pending-DISK dtype conversion accounting is a separate prerequisite under review. This
+branch stays out of inference candidates until its real production callback/load path is
+integrated and tested. No GPU qualification or performance gain is claimed.

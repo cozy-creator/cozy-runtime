@@ -69,7 +69,7 @@ def test_scaled_hint_selects_floor_then_runs_body_once(monkeypatch: pytest.Monke
     assert owner.grant == 2463891456 and memory._mode(held.part.root) == mode
     assert owner._estimate(key) == (0, True)  # replaces the forecast with this call's observation
     assert len(owner.log) == 1 and "forecast exceeded room" in owner.log[0]
-    assert owner.deep is False and not owner.unusable
+    assert not owner.unusable
 
 
 @pytest.mark.parametrize("kind", ["exact", "failed", "spread"])
@@ -91,7 +91,7 @@ def test_measured_bounds_and_missing_retry_contract_still_refuse(
     else:
         assert caught.value.needed == 2523073536
         assert caught.value.available == 2025488704
-    assert not owner.log and owner.deep is False
+    assert not owner.log
 
 
 def test_failed_exact_key_floor_survives_larger_forecast(
@@ -100,7 +100,7 @@ def test_failed_exact_key_floor_survives_larger_forecast(
     owner, held, key = forecast(monkeypatch)
     owner.records[key] = memory.Record(fail=2000000000)
     plan = owner._plan(held, key, True, True)
-    assert plan.keep == 0 and plan.deep
+    assert plan.keep == 0
     assert owner.records[key].fail == 2000000000
     monkeypatch.setattr(owner, "allocatable", lambda: 1999999999)
     with pytest.raises(memory.MemoryRefusal) as caught:
