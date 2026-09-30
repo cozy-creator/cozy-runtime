@@ -205,6 +205,8 @@ class Planner:
         self.host_room = host_room
         self._host_sequence = 0
         self._host_pending = 0
+        self.staging_unbacked: dict[str, int] = {}
+        self.construction_staging_credit: int | None = None
         self._group_host_credit: int | None = None
         self._last_host_credit = 0
         self.sharded = sharded
@@ -1094,6 +1096,19 @@ class Planner:
         """
         if nbytes <= 0 or self.stack or self.scopes or self.group_phase:
             return 0
+        staging_released = 0
+        for store in self._staging_stores():
+            release = getattr(store, "release_staging", None)
+            if release is not None:
+                try:
+                    staging_released += int(release())
+                except RuntimeFailure as exc:
+                    if exc.code == "device_fault":
+                        self.unusable = str(exc)
+                    raise
+                if staging_released >= nbytes:
+                    return staging_released
+        nbytes -= staging_released
         before = self._host_backings()
         for held in sorted(self.held.values(), key=lambda held: held.last_used):
             self._pin_state(held)
@@ -1131,7 +1146,26 @@ class Planner:
                 tiers.to_disk(self.torch, part, None)
             if self._released_host_bytes(before) >= nbytes:
                 break
-        return self._released_host_bytes(before)
+        return staging_released + self._released_host_bytes(before)
+
+    def _staging_stores(self) -> tuple[object, ...]:
+        return tuple(
+            {
+                id(h.part.store): h.part.store
+                for h in self.held.values()
+                if h.part.store is not None
+            }.values()
+        )
+
+    def _staging_memory(self) -> tuple[int, int]:
+        allocated = pinned = 0
+        for store in self._staging_stores():
+            observe = getattr(store, "staging_memory", None)
+            if observe is not None:
+                facts = observe()
+                allocated += int(facts["allocated_bytes"])
+                pinned += int(facts["pinned_bytes"])
+        return allocated, pinned
 
     @staticmethod
     def _unit_host_backings(
@@ -1225,8 +1259,12 @@ class Planner:
 
     def host_memory(self) -> dict[str, int]:
         """Deduplicated managed CPU storage, separate from the process's total RSS."""
+        staging, pinned = self._staging_memory()
         return {
-            "managed_host_bytes": sum(self._host_backings().values()),
+            "managed_host_bytes": sum(self._host_backings().values()) + staging,
+            "staging_host_bytes": staging,
+            "staging_pinned_bytes": pinned,
+            "staging_pageable_bytes": staging - pinned,
             "resident_host_bytes": sum(self._host_backings(cached=False).values()),
             "cached_host_bytes": sum(self._host_backings(resident=False).values()),
         }
@@ -1974,7 +2012,7 @@ class Planner:
         Partitioned units own disjoint storage; cross-component aliases are rejected at
         adoption. Existing host backings cost nothing, and ranks own separate address spaces.
         """
-        return sum(
+        return sum(self.staging_unbacked.values()) + sum(
             tiers.load_demand(self.torch, unit).resident
             if unit.tier == DISK
             else tiers.host_copy_bytes(unit)
@@ -2003,7 +2041,9 @@ class Planner:
         )
 
     @contextmanager
-    def _host_copy(self, nbytes: int, *, protected: tuple[tiers.Unit, ...] = ()) -> Iterator[bool]:
+    def _host_copy(
+        self, nbytes: int, *, protected: tuple[tiers.Unit, ...] = (), retain_on_fault: bool = False
+    ) -> Iterator[bool]:
         """Reserve before allocating and release the pending promise on every exit.
 
         Standalone planners use local observed capacity only. Managed executors supply
@@ -2045,9 +2085,66 @@ class Planner:
         try:
             yield True
         finally:
-            self._host_pending -= nbytes
-            if self.host_room is not None:
-                self.host_room(token, nbytes, True)
+            if not (retain_on_fault and self.unusable):
+                self._host_pending -= nbytes
+                if self.host_room is not None:
+                    self.host_room(token, nbytes, True)
+
+    @staticmethod
+    def staging_vector(
+        demands: tuple[tuple[int, int, int], ...], reserve: Callable[[int], bool]
+    ) -> tuple[int, ...]:
+        """Lower slot count, never slot quantum; old readers require their full geometry."""
+        if not demands or any(q <= 0 or low <= 0 or high < low for q, high, low in demands):
+            raise ValueError("invalid staging demand vector")
+        previous: tuple[int, ...] = ()
+        for cap in range(max(high for _, high, _ in demands), 0, -1):
+            sizes = tuple(q * max(low, min(cap, high)) for q, high, low in demands)
+            if sizes != previous and reserve(sum(sizes)):
+                return sizes
+            previous = sizes
+        return ()
+
+    @contextmanager
+    def staging_host(self, quantum: int, slots: int, *, owner: str = "") -> Iterator[int]:
+        """Fund one retained ring allocation; its backing is reused, never credit-refunded."""
+        if quantum <= 0 or slots <= 0:
+            raise ValueError("staging geometry must be positive")
+        if self.unusable:
+            raise MemoryRefusal("device_fault", self.unusable, reusable=False)
+        self.staging_unbacked[owner] = quantum
+        construction = self.construction_staging_credit
+        if self.grouped and construction is not None:
+            admitted = min(slots, construction // quantum)
+            if not admitted:
+                raise self._host_refusal(quantum)
+            self.construction_staging_credit = construction - admitted * quantum
+            try:
+                yield admitted
+            except RuntimeFailure as exc:
+                if exc.code == "device_fault":
+                    self.unusable = str(exc)
+                raise
+            else:
+                self.staging_unbacked.pop(owner, None)
+            return
+        # An operation's group vector carries the minimum ring plus independent backing
+        # copies. Use only that minimum; never consume their promised bytes opportunistically.
+        counts = (1,) if self.grouped or self.group_phase else range(slots, 0, -1)
+        for admitted in counts:
+            with self._host_copy(quantum * admitted, retain_on_fault=True) as ok:
+                if not ok:
+                    continue
+                try:
+                    yield admitted
+                except RuntimeFailure as exc:
+                    if exc.code == "device_fault":
+                        self.unusable = str(exc)
+                    raise
+                else:
+                    self.staging_unbacked.pop(owner, None)
+                return
+        raise self._host_refusal(quantum)
 
     def _host_refusal(self, nbytes: int) -> MemoryRefusal:
         refusal = MemoryRefusal(

@@ -67,6 +67,7 @@ from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, Unpack, 
 
 import tensorfs
 
+from cozy_runtime.author._errors import RuntimeFailure
 from cozy_runtime.author._loader import (
     Census,
     TensorLike,
@@ -957,9 +958,10 @@ class StagingRing:
         inflight: int,
         fence: bool = True,
     ) -> None:
-        # Double buffering needs two slots and one free slot beyond the copies in flight;
-        # a smaller request is raised to that minimum rather than refused.
-        slots = max(int(slots), 2)
+        if window_bytes <= 0 or slots <= 0 or inflight < 0:
+            raise ValueError("invalid staging geometry")
+        # One admitted slot is legal: keep=0 drains each batch synchronously.
+        slots = int(slots)
         self.torch = torch
         self.device = device
         self.window_bytes = int(window_bytes)
@@ -971,32 +973,27 @@ class StagingRing:
         self.stream.wait_stream(torch.cuda.current_stream(device))
         self.buffers: list[Any] = []
         self.views: list[memoryview] = []
-        pinned, locked = True, 0
-        while len(self.buffers) < slots:
-            # device="cpu" is NOT redundant: construction runs under an ambient meta
-            # device, and a meta staging buffer has data_ptr() == 0 — the ring would read
-            # into address zero. Every allocation this plane makes names its device.
-            try:
+        locked = 0
+        try:
+            for _ in range(slots):
+                # Explicit CPU: model construction can have an ambient meta device.
+                # Do not misclassify an arbitrary CUDA RuntimeError as host pressure.
                 buffer = torch.empty(
-                    self.window_bytes, dtype=torch.uint8, pin_memory=pinned, device="cpu"
+                    self.window_bytes, dtype=torch.uint8, pin_memory=True, device="cpu"
                 )
-            except RuntimeError:
-                # A host that cannot page-lock more gets a smaller ring, and one that
-                # cannot page-lock two slots stages through pageable memory: slower, never
-                # a refusal (host RAM is whatever the machine has).
-                if len(self.buffers) >= 2:
-                    break
-                if not pinned:
-                    raise
-                pinned = False
-                continue
-            locked += pinned
-            block = (ctypes.c_ubyte * buffer.numel()).from_address(buffer.data_ptr())
-            self.buffers.append(buffer)
-            self.views.append(memoryview(block).cast("B"))
+                locked += int(buffer.is_pinned())
+                block = (ctypes.c_ubyte * buffer.numel()).from_address(buffer.data_ptr())
+                self.buffers.append(buffer)
+                self.views.append(memoryview(block).cast("B"))
+        except BaseException:
+            # No native read or DMA has been submitted during construction.
+            self.views.clear()
+            self.buffers.clear()
+            raise
         self.keep = min(int(inflight), len(self.buffers) - 1)
         #: The page-locked bytes this ring REGISTERED with the driver, and the high-water
         #: of slots DMA-live at once. Facts for the worker's ledger, never a budget.
+        self.allocated_bytes = self.window_bytes * len(self.buffers)
         self.registered_bytes = self.window_bytes * locked
         self.inflight: collections.deque[tuple[Any, Any]] = collections.deque()
         self.waits = 0
@@ -1179,6 +1176,7 @@ class StreamingFillBackend:
         forensics_dir: str = "",
         custody: str = "canonical",
         store_read: Callable[[], contextlib.AbstractContextManager[None]] = contextlib.nullcontext,
+        staging_host: Callable[[int, int], contextlib.AbstractContextManager[int]] | None = None,
     ) -> None:
         self.torch = torch_module()
         # ONE CHECKPOINT PER COMPONENT (cr-008b). A TensorFS read plan must name every
@@ -1202,6 +1200,12 @@ class StreamingFillBackend:
         #: reads it; nothing else here does.
         self.custody = custody
         self.store_read = store_read
+        self.staging_host = staging_host
+        self._live_ring: StagingRing | None = None
+        self._staging_ring: StagingRing | None = None
+        self.staging_released: Callable[[], None] = lambda: None
+        self.staging_started: Callable[[], None] = lambda: None
+        self.staging_drained: Callable[[], None] = lambda: None
         self.device = self.torch.device(device)
         self.device_str = str(self.torch.empty(0, device=self.device).device)
         #: The BACKEND this generation is filled on. Memory metering and reclaim go through
@@ -1916,6 +1920,29 @@ class StreamingFillBackend:
         self._commit_enqueued()
         self.state = "ready"
 
+    def prepare_staging(self) -> None:
+        """Materialize prepaid group staging without reading weights or submitting copies."""
+        if self._staging_ring is not None:
+            return
+        if self.staging_host is None:
+            raise RuntimeFailure("group staging requires host admission", code="host_shortfall")
+        with self.staging_host(self.slot_bytes, self.slots) as slots:
+            ring = StagingRing(
+                self.torch,
+                self.device,
+                window_bytes=self.slot_bytes,
+                slots=slots,
+                inflight=self.inflight,
+                fence=self.fence,
+            )
+            self._staging_ring = ring
+            self.pinned = {
+                "allocated_bytes": ring.allocated_bytes,
+                "pageable_bytes": ring.allocated_bytes - ring.registered_bytes,
+                "registered_bytes": ring.registered_bytes,
+                "in_flight_peak_bytes": 0,
+            }
+
     def _commit_enqueued(self) -> None:
         """Move whatever is enqueued right now, fence it, and clear the queue.
 
@@ -1924,15 +1951,34 @@ class StreamingFillBackend:
         bytes to the device, and this is it.
         """
         started = time.perf_counter_ns()
-        with self.store_read(), placing():
-            ring = StagingRing(
-                self.torch,
-                self.device,
-                window_bytes=self.slot_bytes,
-                slots=self.slots,
-                inflight=self.inflight,
-                fence=self.fence,
-            )
+        if not self.enqueued:
+            return
+        if self._live_ring is not None:
+            raise RuntimeFailure("staging drain is unproved", code="device_fault")
+        self.staging_started()
+        allowance = (
+            self.staging_host(self.slot_bytes, self.slots)
+            if self._staging_ring is None and self.staging_host is not None
+            else contextlib.nullcontext(self.slots)
+        )
+        with allowance as slots, self.store_read(), placing():
+            ring = self._staging_ring
+            if ring is None:
+                ring = StagingRing(
+                    self.torch,
+                    self.device,
+                    window_bytes=self.slot_bytes,
+                    slots=slots,
+                    inflight=self.inflight,
+                    fence=self.fence,
+                )
+                self._staging_ring = ring
+            else:
+                # A new destination may reuse memory freed by intervening compute.
+                ring.stream.wait_stream(self.torch.cuda.current_stream(self.device))
+            ring.waits = 0
+            ring.in_flight_peak = 0
+            self._live_ring = ring
             try:
                 for tensor in self.enqueued.values():
                     ring.track(tensor)
@@ -1954,11 +2000,20 @@ class StreamingFillBackend:
                 self.stats["windows"] = windows
                 self.stats["waits"] = ring.waits
                 self.pinned = {
+                    "allocated_bytes": ring.allocated_bytes,
+                    "pageable_bytes": ring.allocated_bytes - ring.registered_bytes,
                     "registered_bytes": ring.registered_bytes,
                     "in_flight_peak_bytes": ring.in_flight_peak * ring.window_bytes,
                 }
             finally:
-                ring.close()
+                try:
+                    ring.finish()
+                except BaseException:
+                    # Keep buffers/native batches alive, along with their host promise,
+                    # until generation retirement proves that no device can use them.
+                    raise RuntimeFailure("staging drain failed", code="device_fault") from None
+                self._live_ring = None
+                self.staging_drained()
         self.stats["stream_ms"] = (time.perf_counter_ns() - started) // 1_000_000
         # The tfs-018-comparable leg: reserve device destinations, read, copy, fence. It
         # deliberately EXCLUDES the meta construction, which those arms have no analogue
@@ -2026,9 +2081,37 @@ class StreamingFillBackend:
             )
             del self.stage_log[:-64]
 
+    def staging_memory(self) -> dict[str, int]:
+        ring = self._staging_ring
+        return {
+            "allocated_bytes": ring.allocated_bytes if ring is not None else 0,
+            "pinned_bytes": ring.registered_bytes if ring is not None else 0,
+        }
+
+    def release_staging(self) -> int:
+        """Idle release of owned buffers, never a promise that the host allocator returned RSS."""
+        if self._live_ring is not None or self._staging_ring is None:
+            return 0
+        ring = self._staging_ring
+        size = ring.allocated_bytes
+        self.staging_started()
+        try:
+            ring.close()
+        except BaseException:
+            self._live_ring = ring
+            raise RuntimeFailure("staging drain failed", code="device_fault") from None
+        self._staging_ring = None
+        self.staging_released()
+        self.staging_drained()
+        return size
+
     def close(self) -> None:
         """End the generation's read leases after every fill/move has completed."""
+        if self._live_ring is not None:
+            raise RuntimeFailure("staging drain is unproved", code="device_fault")
+        self.release_staging()
         self.leases.release()
+        self.staging_drained()
 
     # -- component staging (cr-008b) ---------------------------------------------
 
@@ -2247,7 +2330,8 @@ class StreamingFillBackend:
         how many destinations were in flight, and the read lease's end — a hold kept for a
         generation that no longer exists would be the store's reaper's problem.
         """
-        self.leases.release()
+        if self._live_ring is None:
+            self.leases.release()
         self.poison_report = {
             "keys_in_flight": len(keys),
             "enqueued": len(self.enqueued),

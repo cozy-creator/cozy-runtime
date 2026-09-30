@@ -131,6 +131,28 @@ def test_defaults_must_name_actual_injected_models(
         static_interface.build(root)
 
 
+def test_artifact_reader_checks_ladders_and_preserves_additive_fields(tmp_path: Path) -> None:
+    body = static_interface.build(project(tmp_path, invocable=True))
+    assert package_interface.read_bytes(package_interface.canonical_bytes(body)) == body
+    for vector in VECTORS["invalid"]:
+        invalid = deepcopy(body)
+        invalid["entrypoints"][0]["models"][0]["default_ladder"] = vector["ladder"]
+        if vector["name"] == "unknown_field":
+            # Author declarations reject unknown fields; a published interface
+            # preserves additions from newer producers without changing the ladder.
+            assert (
+                package_interface.read_bytes(package_interface.canonical_bytes(invalid)) == invalid
+            )
+            continue
+        with pytest.raises(ConformanceError) as refused:
+            package_interface.read_bytes(package_interface.canonical_bytes(invalid))
+        # Structural mistakes can be refused by the typed interface reader before
+        # the shared ladder validator checks the model-default semantics.
+        assert refused.value.code in ("model_defaults", "malformed_package_interface"), vector
+        if refused.value.code == "malformed_package_interface":
+            assert "default_ladder" in refused.value.message
+
+
 @pytest.mark.parametrize("vector", VECTORS["invalid"], ids=lambda row: row["name"])
 def test_artifact_reader_validates_known_ladder_fields(
     tmp_path: Path, vector: dict[str, Any]

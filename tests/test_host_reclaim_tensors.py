@@ -17,6 +17,8 @@ def resident(name: str, elements: int = 32) -> tuple[memory.Planner, memory.Held
     root.weight = torch.nn.Parameter(torch.ones(elements))
     backend = fill.StreamingFillBackend.__new__(fill.StreamingFillBackend)
     backend.torch = torch
+    backend._staging_ring = None
+    backend._live_ring = None
     backend.components = {name: root}
     backend.parked = {}
     backend.replaced = {}
@@ -101,6 +103,9 @@ def test_unique_host_accounting_and_clean_device_cache_release_preserve_device_w
         "managed_host_bytes": 256,
         "resident_host_bytes": 0,
         "cached_host_bytes": 256,
+        "staging_host_bytes": 0,
+        "staging_pinned_bytes": 0,
+        "staging_pageable_bytes": 0,
     }
     assert owner.reclaim_host(256) == 256
     assert held.part.root.weight is original and not original.is_meta

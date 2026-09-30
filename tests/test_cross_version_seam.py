@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import datetime
 import hashlib
-import importlib.metadata
 import json
 import os
 import shutil
@@ -164,10 +163,6 @@ class _File(msgspec.Struct):
 
 class _Release(msgspec.Struct):
     urls: list[_File]
-
-
-class _Index(msgspec.Struct):
-    releases: dict[str, object]
 
 
 def _uv(*argv: str, cwd: Path) -> None:
@@ -531,12 +526,17 @@ def test_job_derives_adopts_and_reads_weights(harness: Harness) -> None:
     assert harness.run("derived", "derived", {"n": 4}) == {"value": 1, "runtime": harness.version}
 
 
-def test_an_old_lower_bound_lock_runs_the_current_machine_runtime(harness: Harness) -> None:
+def test_an_exact_pin_keeps_its_runtime_and_a_bound_runs_the_machines(harness: Harness) -> None:
+    """Execute the SDK selected when this environment was materialized. A later PyPI
+    publication cannot change that captured choice or an already running executor."""
+    assert harness.run("selected-sdk", "called", {"n": 2}) == {
+        "value": 6,
+        "runtime": harness.version,
+    }
     if harness.requirement.startswith("=="):
         assert harness.version == harness.requirement.removeprefix("==")
-    else:
-        assert harness.version == importlib.metadata.version("cozy-runtime")
-        assert Version(harness.version) > Version("0.18.67")
+        return
+    assert Version(harness.version) > Version("0.18.67")
 
 
 @pytest.mark.parametrize("version", VERSIONS)

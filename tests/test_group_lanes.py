@@ -532,13 +532,35 @@ def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group(
 
 
 @needs_executor
-def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
+@pytest.mark.parametrize("readable", [True, False], ids=["one-readable-device", "cpu-only"])
+def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both(
+    monkeypatch: pytest.MonkeyPatch, readable: bool
+) -> None:
     """THE K-DEVICE SEAL, read from the child's own `/proc` environment: a group lane's
     executor carries `CUDA_VISIBLE_DEVICES=0,1` and `NCCL_NVLS_ENABLE=0`; a device lane's
     carries no NVLS row. The degree is checked against the seal before any weight moves;
-    a weightless package refuses to shard; degree 1 is a plain start. Retirement
-    proves absence for EVERY device of the lane: two rows, one per entry, beside the merged
-    proof — and the card that does not exist is UNREADABLE, never absent by omission."""
+    a weightless package refuses to shard. Retirement proves the actual process is gone
+    and retains a driver observation for each sealed device. Explicit driver fixtures
+    cover a readable device and a CPU-only host without probing physical GPUs."""
+    expected = {
+        "0": accel.ProcessMemory("absent", 0) if readable else accel.ProcessMemory("unreadable"),
+        "1": accel.ProcessMemory("unreadable"),
+    }
+    device_reads: list[tuple[set[int], tuple[str, ...]]] = []
+
+    def process_rows(pids: set[int], kind: str) -> dict[int, accel.ProcessMemory]:
+        # The real reclaim path must still establish OS exit; a failed driver
+        # read cannot claim a live process's device allocations were released.
+        return {pid: accel.ProcessMemory("unreadable") for pid in pids}
+
+    def device_rows(
+        pids: set[int], kind: str, devices: tuple[str, ...]
+    ) -> dict[str, dict[int, accel.ProcessMemory]]:
+        device_reads.append((set(pids), devices))
+        return {device: {pid: expected[device] for pid in pids} for device in devices}
+
+    monkeypatch.setattr(accel, "process_memories", process_rows)
+    monkeypatch.setattr(accel, "process_memories_by_device", device_rows)
     with _workspace() as root:
         config = _config(root / "home")
         worker = Worker(
@@ -576,15 +598,11 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
         finally:
             evidence = worker.supervision.retire_current(executor, "seal arm done")
         assert evidence is not None
+        assert not executor.alive()
         assert evidence.members == (executor.pid,)
-        assert sorted(evidence.devices) == ["0", "1"], evidence
-        for ordinal in ("0", "1"):
-            measured = accel.device_memory(ordinal, "cuda").state == "measured"
-            assert evidence.devices[ordinal].state == ("absent" if measured else "unreadable"), (
-                "a readable device proves the retired PID absent; an unavailable device "
-                "must remain unreadable",
-                evidence,
-            )
+        assert evidence.device == accel.ProcessMemory("absent", 0), evidence
+        assert evidence.devices == expected, evidence
+        assert device_reads == [({executor.pid}, ("0", "1"))]
         # degree checks, each on a fresh executor (a refused start poisons its epoch)
         for extra, code in (
             ({"sequence_parallel_degree": 3}, "sequence_parallel_degree_mismatch"),
@@ -600,6 +618,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
                     assert "sealed to 2 device(s) ('0,1')" in reply["detail"], reply
             finally:
                 worker.supervision.retire_current(executor, "degree arm done")
+            assert not executor.alive()
         worker.supervision.close()
 
 

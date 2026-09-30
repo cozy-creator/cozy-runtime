@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import importlib.metadata
 import itertools
 import json
+import subprocess
+import sys
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -25,7 +29,38 @@ from test_machine_calls import request, running
 from test_machine_execution import complete, offer
 
 
+def _executor_process[**P](case: Callable[P, None]) -> Callable[P, None]:
+    """Give process-lifetime thread observations the same isolation as an executor.
+
+    Other tests run Worker servers and author calls in pytest's process. A server
+    started after an earlier author call correctly makes that shared clock unknown.
+    Each scenario gets a fresh process; its invocations still share real observer state.
+    """
+
+    @functools.wraps(case)
+    def run(*args: P.args, **kwargs: P.kwargs) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json, pathlib, runpy, sys; "
+                "sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent)); "
+                "case = runpy.run_path(sys.argv[1])[sys.argv[2]].__wrapped__; "
+                "args, kwargs = json.loads(sys.argv[3]); case(*args, **kwargs)",
+                str(Path(__file__).resolve()),
+                case.__name__,
+                json.dumps((args, kwargs)),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    return run
+
+
 @pytest.mark.parametrize("threaded", [False, True])
+@_executor_process
 def test_private_loop_excludes_waits_but_preserves_parallel_author_work(threaded: bool) -> None:
     observed: list[tuple[float, bool, bool]] = []
     activity = Activity(
@@ -60,6 +95,7 @@ def test_private_loop_excludes_waits_but_preserves_parallel_author_work(threaded
     assert observed[-1][0] - observed[0][0] >= 0.4
 
 
+@_executor_process
 def test_untracked_thread_makes_cooperative_measurement_unknown() -> None:
     observed: list[bool] = []
     activity = Activity(lambda _seq, _active, known, _finished: observed.append(known))
@@ -78,6 +114,7 @@ def test_untracked_thread_makes_cooperative_measurement_unknown() -> None:
     assert observed[-1] is False
 
 
+@_executor_process
 def test_canceled_pool_submission_cannot_hide_an_untracked_thread() -> None:
     activity = Activity(None)
     loop = EventLoop(activity)
@@ -109,6 +146,7 @@ def test_canceled_pool_submission_cannot_hide_an_untracked_thread() -> None:
         activity.change(-1)
 
 
+@_executor_process
 def test_sdk_pool_preserves_initializer_cancellation_and_reuse_without_idle_execution() -> None:
     local = threading.local()
     initialized: list[int] = []
@@ -164,6 +202,7 @@ def test_sdk_pool_preserves_initializer_cancellation_and_reuse_without_idle_exec
 
 
 @pytest.mark.parametrize("escaped", [False, True])
+@_executor_process
 def test_joined_helpers_are_covered_by_their_owned_callback_but_escaped_work_is_unknown(
     escaped: bool,
 ) -> None:
@@ -194,6 +233,22 @@ def test_joined_helpers_are_covered_by_their_owned_callback_but_escaped_work_is_
                     raw.join()
                 loop.close()
         assert activity.known is (not escaped)
+
+
+@_executor_process
+def test_an_escaped_thread_keeps_the_next_invocation_unknown() -> None:
+    release = threading.Event()
+    raw = threading.Thread(target=release.wait)
+    try:
+        with observing(None) as first:
+            raw.start()
+        assert not first.known
+        with observing(None) as following:
+            pass
+        assert not following.known
+    finally:
+        release.set()
+        raw.join()
 
 
 def test_run_timing_unions_nested_work_and_keeps_one_cumulative_snapshot(tmp_path: Path) -> None:
@@ -425,7 +480,7 @@ def test_real_worker_nested_child_wait_is_not_run_execution(
             "pool = ThreadPoolExecutor(max_workers=1)"
         )
     )
-    source = f"""import asyncio, time, msgspec, importlib.metadata, json
+    source = f"""import asyncio, time, msgspec, importlib.metadata, json, sys
 from pathlib import Path
 from cozy_runtime.author import App, Context, Telemetry, invocable
 from cozy_runtime.author._invoke import Invocation
@@ -447,6 +502,9 @@ async def leaf(ctx: Context, tel: Telemetry, *, n: int) -> Result:
     metadata.write_text(json.dumps({{
         "runtime": importlib.metadata.version("cozy-runtime"),
         "activity": "activity" in Invocation.__dataclass_fields__,
+        "loaded": sys.modules[Invocation.__module__].__file__,
+        "installed": str(importlib.metadata.distribution("cozy-runtime").locate_file(
+            "cozy_runtime/author/_invoke.py")),
     }}))
     metadata.replace({str(entered)!r})
     tel.progress(0.25, stage="Ready")
@@ -472,7 +530,7 @@ async def nested(ctx: Context, payload: Request) -> Result:
             "        return (await leaf(n=3)).value\n    return asyncio.run(nested())\n"
         )
         source += (
-            '\nfrom cozy_runtime.author import script_app\n'
+            "\nfrom cozy_runtime.author import script_app\n"
             'app = script_app("prepare_nested")\napp.job(leaf)\n'
         )
     with machine(monkeypatch, source) as pod:
@@ -480,6 +538,8 @@ async def nested(ctx: Context, payload: Request) -> Result:
         pod.submit("timed")
         pod.wait("the nested child to await its gate", entered.exists, 120)
         sdk = json.loads(entered.read_text())
+        assert sdk["runtime"] == (runtime or importlib.metadata.version("cozy-runtime")), sdk
+        assert Path(sdk["loaded"]).resolve() == Path(sdk["installed"]).resolve(), sdk
         assert sdk["activity"] is (not runtime), sdk
         time.sleep(0.6)  # controlled observation interval, not a production timeout
         gate.touch()

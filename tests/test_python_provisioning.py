@@ -554,16 +554,17 @@ def test_cli_and_local_worker_share_one_managed_interpreter_root(
             install_root=str(install_root),
             artifact_cache=str(tmp_path / "artifacts"),
             environment_python=None,
-            python=sys.executable,
             publication_authority=None,
+            python=sys.executable,
         ),
         stop=threading.Event(),
         note=lambda *a: None,
-        _describe_installed=lambda *a, **k: b"",
+        _describe_published=lambda *a, **k: b"",
     )
     with pytest.raises(package_prepare.PreparationRefusal, match="selected"):
         Worker._prepare_published(
-            cast(Worker, worker), pb.PreparePackageSetRequest(locked_requirements=b"fixture==1\n")
+            cast(Worker, worker),
+            pb.PreparePackageSetRequest(locked_requirements=b"cozy-runtime==0.18.89\n"),
         )
     assert calls == [config.managed_python_root / "managed"]
     assert not (install_root / "python").exists()
