@@ -141,7 +141,9 @@ class PressureCache:
     def reclaim_generation(self) -> int | None:
         return self.generation
 
-    def reclaim_host(self, nbytes: int) -> tuple[int, int]:
+    def reclaim_host(
+        self, nbytes: int, *, expected_generation: object | None = None
+    ) -> tuple[int, int]:
         self.calls.append(nbytes)
         released = min(10, self.held)
         self.held -= released
@@ -202,7 +204,7 @@ def test_pressure_relief_requires_idle_generation_and_monotone_progress(
     if change == "no_generation":
         cache.generation = None
 
-    def reclaim(nbytes: int) -> tuple[int, int]:
+    def reclaim(nbytes: int, *, expected_generation: object | None = None) -> tuple[int, int]:
         if change == "no_progress":
             cache.calls.append(nbytes)
             return 1, cache.held  # A claimed release cannot sustain an endless loop.
@@ -230,7 +232,9 @@ def test_pressure_relief_remeasures_physical_relief_without_logical_release() ->
     pressure = [proctree.HostPressure("/worker", 120, 100, 20)]
 
     class PhysicalOnly(PressureCache):
-        def reclaim_host(self, nbytes: int) -> tuple[int, int]:
+        def reclaim_host(
+            self, nbytes: int, *, expected_generation: object | None = None
+        ) -> tuple[int, int]:
             self.calls.append(nbytes)
             fact = self.pressure[0]
             self.pressure[0] = proctree.HostPressure(fact.scope, 100, 100, 0)
@@ -359,7 +363,9 @@ class Cache:
     def state(self) -> str:
         return self.status
 
-    def reclaim_host(self, nbytes: int) -> tuple[int, int]:
+    def reclaim_host(
+        self, nbytes: int, *, expected_generation: object | None = None
+    ) -> tuple[int, int]:
         self.asked.append(nbytes)
         self.current[0] -= self.relief
         return self.relief, max(0, self.current[0])

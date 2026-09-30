@@ -6233,9 +6233,16 @@ class Worker:
                     row.overhead[ordinal] = overhead
             row.held[ordinal] = row.overhead.get(ordinal, 0) + reserved
 
-    def _reclaim_host(self, tenant: _Tenant, nbytes: int) -> tuple[int, int] | None:
+    def _reclaim_host(
+        self, tenant: _Tenant, nbytes: int, *, expected_generation: object | None = None
+    ) -> tuple[int, int] | None:
         executor = tenant.row.executor()
         if executor is None or "reclaim_host" not in executor.hello.get("memory", ()):
+            return None
+        if expected_generation is not None and expected_generation != (
+            executor.pid,
+            executor.epoch,
+        ):
             return None
 
         def eligible() -> bool:
@@ -8341,8 +8348,10 @@ class _Tenant:
             return "active"
         return "idle"
 
-    def reclaim_host(self, nbytes: int) -> tuple[int, int] | None:
-        return self.worker._reclaim_host(self, nbytes)
+    def reclaim_host(
+        self, nbytes: int, *, expected_generation: object | None = None
+    ) -> tuple[int, int] | None:
+        return self.worker._reclaim_host(self, nbytes, expected_generation=expected_generation)
 
     def vacate(self, ordinals: tuple[int, ...]) -> bool:
         return self.worker._vacate(self, ordinals)
