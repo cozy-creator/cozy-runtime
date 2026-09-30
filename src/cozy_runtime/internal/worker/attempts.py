@@ -553,6 +553,7 @@ class AttemptEngine:
         instance_id: str,
         progress: Callable[[str, int, dict[str, Any]], None],
         dispatched: Callable[[AttemptRecord], None] = lambda attempt: None,
+        running: Callable[[], None] = lambda: None,
         bundles: triage.BundleStore,
         monitor: observe.SilenceMonitor,
         posture: Callable[[], dict[str, Any]],
@@ -575,6 +576,7 @@ class AttemptEngine:
         #: journals that execution STARTED, immediately before the executor is handed the
         #: command: the one boundary between work the machine never got and work it ran
         self.dispatched = dispatched
+        self.running = running
         self.live: dict[str, AttemptRecord] = {}  # request_id -> the attempt held right now
         self.history: dict[tuple[str, int], AttemptRecord] = {}
         self.boot_id = ""
@@ -1783,6 +1785,12 @@ class AttemptEngine:
                 attempt.executions += 1
         if attempt.state != "running":
             return self.finish_cancel(attempt, attempt.canceling)
+        # State is published and the attempt lock is released before optional work wakes.
+        # An optional callback failure must not change this successfully admitted call.
+        try:
+            self.running()
+        except Exception:
+            pass
         self.executed += 1
         attempt.poke()
         attempt.dispatched_at = time.perf_counter()
