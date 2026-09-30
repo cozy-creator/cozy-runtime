@@ -9,7 +9,7 @@ import socket
 import struct
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import torch
 from tensorfs.derived import Config as NativeConfig
@@ -195,7 +195,102 @@ class H3Calls(Model[object]):
         return result
 
 
-def h3_model() -> H3Calls:
+class H3LoRACalls(H3Calls):
+    turbo_overlay: torch.nn.Module
+
+    @uses_components("dit", "turbo_overlay")
+    def warm_dit(self) -> None:
+        with torch.no_grad():
+            self.dit(**h3_turbo_inputs(h3_batch(), self.turbo_overlay))
+
+    @uses_components("dit", "turbo_overlay")
+    def compute(
+        self, batch: dict[str, object], expected: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            result = self.dit(**h3_turbo_inputs(batch, self.turbo_overlay))
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
+        assert self.dit._arming is None
+        assert self.dit.proj_out.base_layer._armed is None
+        assert self.dit.audio_proj_out.base_layer._armed is None
+        return cast("tuple[torch.Tensor, torch.Tensor]", result)
+
+
+def h3_turbo_inputs(batch: dict[str, object], overlay: torch.nn.Module) -> dict[str, object]:
+    from cozy_runtime.models.minimax_h3.turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
+
+    tags = cast("torch.Tensor", batch["token_tags"])
+    # Text/video share the video sigma; audio uses its paired sigma. No terminal
+    # origin is evaluated here, matching the ordinary H3 Turbo forward contract.
+    return {
+        **batch,
+        "timestep": torch.tensor([0.75, 0.25]),
+        "timestep_indices": torch.where(tags == 2, 1, 0),
+        "attention_kwargs": {ATTENTION_KWARG: TURBO_BANK, OVERLAY_KWARG: overlay},
+    }
+
+
+def h3_lora_model(dit: torch.nn.Module) -> H3LoRACalls:
+    from cozy_runtime.author import AdapterRef
+    from cozy_runtime.internal import lora_composition, lora_contract
+    from cozy_runtime.models.minimax_h3.turbo import TurboOverlay, TurboSchedule
+
+    dit.install_lora_consumers()
+    overlay = TurboOverlay(
+        hidden_size=16,
+        inner_dim=56 * 16,
+        ffn_dim=32,
+        num_layers=2,
+        num_refiner_layers=1,
+        video_out=2,
+        audio_out=2,
+        rank=1,
+        alpha=1,
+        schedule=TurboSchedule((0.75, 0.0), (0.25, 0.0)),
+        table_timesteps=(0.0, 0.25, 0.75),
+        table_block_keys=[(row, tag) for row in range(3) for tag in range(3)],
+        block_table_dtype=torch.float32,
+        final_table_dtype=torch.float32,
+    ).eval()
+    with torch.no_grad():
+        for parameter in overlay.parameters():
+            parameter.normal_(0, 0.1)
+    paths = (
+        "proj_in",
+        "audio_proj_in",
+        "context_embedder",
+        "token_refiner.refiner_blocks.0.attn.to_q",
+        "transformer_blocks.0.attn.to_q",
+        "transformer_blocks.1.attn.to_q",
+        "transformer_blocks.0.ff.net.2",
+        "proj_out",
+        "audio_proj_out",
+    )
+    rows = tuple(
+        lora_contract.Linear("dit", path, f"adapter_{index}", rank, alpha, strength, dtype)
+        for path in paths
+        for index, (rank, alpha, strength, dtype) in enumerate(
+            ((1, 2.0, 0.5, "f32"), (2, 1.0, -0.25, "f16"))
+        )
+    )
+    graph = lora_contract.Graph(
+        lora_contract.FORMAT,
+        rows,
+        tuple(
+            AdapterRef("sha256:" + digest * 32, strength, "lora", "dit", "adapter")
+            for digest, strength in (("12", 0.5), ("34", -0.25))
+        ),
+    )
+    lora_composition.composer(graph)(SimpleNamespace(components={"dit": dit}))
+    with torch.no_grad():
+        for row in rows:
+            layer = dit.get_submodule(row.target)
+            layer.lora_A[row.adapter].weight.normal_(0, 0.1)
+            layer.lora_B[row.adapter].weight.normal_(0, 0.1)
+    return H3LoRACalls.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4), turbo_overlay=overlay)
+
+
+def h3_model(*, adapters: bool = False) -> H3Calls:
     from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
 
     torch.manual_seed(231)
@@ -228,6 +323,8 @@ def h3_model() -> H3Calls:
         assert not torch.is_grad_enabled()
 
     dit.register_forward_pre_hook(no_grad)
+    if adapters:
+        return h3_lora_model(dit)
     return H3Calls.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4))
 
 
@@ -348,11 +445,12 @@ def main() -> None:
     parser.add_argument("--rank-fd", type=int)
     parser.add_argument("--leader")
     parser.add_argument("--h3", action="store_true")
+    parser.add_argument("--h3-lora", action="store_true")
     parser.add_argument("--staged", action="store_true")
     parser.add_argument("--hosted", action="store_true")
     parser.add_argument("--spread", action="store_true")
     args = parser.parse_args()
-    args.h3 = args.h3 or args.hosted or args.spread
+    args.h3 = args.h3 or args.h3_lora or args.hosted or args.spread
     torch.set_num_threads(1)
     _capture_seal()
     channel = Channel(socket.socket(fileno=args.rank_fd))
@@ -363,7 +461,7 @@ def main() -> None:
         if args.hosted
         else spread_model()
         if args.spread
-        else h3_model()
+        else h3_model(adapters=args.h3_lora)
         if args.h3
         else collective_model(args.root / f"rank-{args.rank}" if args.staged else None)
     )
@@ -376,6 +474,8 @@ def main() -> None:
         if args.h3
         else {"block": model.block, "overlay": model.overlay, "spare": model.spare}
     )
+    if args.h3_lora:
+        roots["turbo_overlay"] = model.turbo_overlay
     executor.backend = SimpleNamespace(
         components=roots, parked={}, component_bytes=HOSTED_SIZES if args.hosted else {}
     )

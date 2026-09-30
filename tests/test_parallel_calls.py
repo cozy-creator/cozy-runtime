@@ -47,6 +47,7 @@ from testdata.parallel_calls import (  # noqa: E402
     collective_model,
     h3_batch,
     h3_model,
+    h3_turbo_inputs,
     hosted_model,
     spread_model,
 )
@@ -91,11 +92,16 @@ def test_truncated_tensor_refuses_instead_of_returning_uninitialized_memory(tmp_
         ("h3", 4),
         ("h3", 7),
         ("h3", 8),
+        ("h3-lora", 2),
+        ("h3-lora", 4),
     ],
 )
 def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int, kind: str) -> None:
-    if kind == "h3":
+    is_h3 = kind in ("h3", "h3-lora")
+    if is_h3:
         pytest.importorskip("diffusers")
+    if kind == "h3-lora":
+        pytest.importorskip("peft")
     if kind == "staged" and not torch.cuda.is_available():
         pytest.skip("native component residency requires CUDA; both replicas use one physical GPU")
     fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
@@ -106,7 +112,7 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
             module_argv=[
                 str(fixture),
                 *module_argv[2:],
-                *(["--" + kind] if kind in ("h3", "staged") else []),
+                *(["--" + kind] if is_h3 or kind == "staged" else []),
             ],
             inherit_fd=fd,
             env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
@@ -114,14 +120,26 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
 
     group = RankGroup(degree=degree, backend="cpu:gloo", root=str(tmp_path), launch=launch)
     model: Any = (
-        h3_model()
-        if kind == "h3"
+        h3_model(adapters=kind == "h3-lora")
+        if is_h3
         else collective_model(tmp_path / "rank-0" if kind == "staged" else None)
     )
-    if kind == "h3":
+    if is_h3:
         with torch.no_grad():
             batches = [h3_batch(), h3_batch(mixed_lengths=True)]
-            expected = [(batch, model.dit(**batch)) for batch in batches]
+            expected = [
+                (
+                    batch,
+                    model.dit(
+                        **(
+                            h3_turbo_inputs(batch, model.turbo_overlay)
+                            if kind == "h3-lora"
+                            else batch
+                        )
+                    ),
+                )
+                for batch in batches
+            ]
     spool = tmp_path / "attempt-a"
     ours, theirs = socket.socketpair()
     leader: Any = Executor(Channel(ours), tmp_path, world=degree)
@@ -130,15 +148,17 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
     leader._group_model_key = "fixture"
     roots = (
         {"dit": model.dit, "text_encoder": model.text_encoder}
-        if kind == "h3"
+        if is_h3
         else {"block": model.block, "overlay": model.overlay, "spare": model.spare}
     )
+    if kind == "h3-lora":
+        roots["turbo_overlay"] = model.turbo_overlay
     leader.backend = SimpleNamespace(components=roots, parked={})
     try:
         group.spawn()
         group.form(torch, {})
         leader.pg = group.pg
-        if kind == "h3":
+        if is_h3:
             # The first processor is valid; an incompatible later site must still refuse.
             rejected = h3_model()
             rejected.dit.transformer_blocks[
@@ -215,7 +235,7 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                     plan.placement, plan.headroom_bytes, dict(plan.scope_headroom_bytes)
                 )
             served: dict[str, set[str]] = {}
-            if kind == "h3":
+            if is_h3:
                 for batch, full_output in expected:
                     # Observe the inputs of real SDPA calls, not just approximately equal
                     # model outputs: replicated text must not become a degree-times-long
@@ -279,8 +299,8 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
             # What served on each follower is recorded, as the leader observed its own: the
             # SDPA backend torch dispatched inside the Ulysses wrapper (none without attention).
             impls = {row["attention"]["impl"] for row in records.values()}
-            assert impls == ({attention.implementations(served)} if kind == "h3" else {""})
-            assert kind != "h3" or impls <= {"flash", "efficient", "math"}
+            assert impls == ({attention.implementations(served)} if is_h3 else {""})
+            assert not is_h3 or impls <= {"flash", "efficient", "math"}
             execution = leader._execution("ref2va_dit=sdpa", None, 1, 2)
             assert execution["degree"] == degree
             assert [row["rank"] for row in execution["ranks"]] == list(range(degree))
@@ -307,6 +327,8 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         ours.close()
         theirs.close()
     assert not torch.distributed.is_initialized()
+    if kind == "h3-lora":
+        assert not torch.cuda.is_initialized()
 
 
 @pytest.mark.parametrize("degree", [2, 4])
