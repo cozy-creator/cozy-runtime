@@ -532,7 +532,7 @@ class ReleaseRoots:
                 for model, parameter in zip(slots, parameters, strict=True)
                 if parameter not in sourced
             }
-            resolved = {parameter: row.result() for parameter, row in resolving.items()}
+            resolved = {parameter: dict(row.result()) for parameter, row in resolving.items()}
         # A provider source is made here, in order: headers first, only its profile's members.
         return [
             machine_source_models.slot(self.worker, given[parameter], credentials, note)

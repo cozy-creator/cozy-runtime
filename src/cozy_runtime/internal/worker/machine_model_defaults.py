@@ -270,14 +270,16 @@ def select(
         if default is None:
             assert catalog is not None and prepared is not None
             selected.append(
-                machine_model_resolve.slot(
-                    catalog,
-                    package,
-                    declared[parameter],
-                    parameter,
-                    None,
-                    catalog_fits(fits),
-                    prepared.account,
+                dict(
+                    machine_model_resolve.slot(
+                        catalog,
+                        package,
+                        declared[parameter],
+                        parameter,
+                        None,
+                        catalog_fits(fits),
+                        prepared.account,
+                    )
                 )
             )
             continue
