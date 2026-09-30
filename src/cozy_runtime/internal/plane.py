@@ -19,10 +19,12 @@ except ImportError:  # an older TensorFS: the executor serves without `weight_pl
 #: The executor capability a Worker negotiates on (`hello.memory`).
 CAPABILITY = "weight_plane/1"
 PINNED = "pinned"
-#: Priorities are plain integers; the plane evicts ascending. Idle regions carry the LRU
-#: clock of their last stage, so the least recently used goes first; a running stage's wants
-#: sit above every idle one.
-ACTIVE = 1 << 40
+#: Priorities are plain integers; the plane evicts ascending and never picks among equals, so
+#: every band carries the LRU clock. Idle regions (a finished stage's) sit lowest; a running
+#: stage's streamed and demand-filled blocks above them, each newer one above the older; its
+#: resident prefix above everything, so nothing in the stage evicts it.
+STREAMED = 1 << 40
+PREFIX = 2 << 40
 
 
 class Unavailable(Exception):
@@ -57,7 +59,6 @@ class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):
 class SetDevice(msgspec.Struct, frozen=True, kw_only=True):
     ordinal: int
     ready_bytes: int = 0
-    poisoned: bool = False
 
 
 class SetStats(msgspec.Struct, frozen=True, kw_only=True):
@@ -68,15 +69,27 @@ class SetStats(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class StageStats(msgspec.Struct, frozen=True, kw_only=True):
-    ws: str | int = ""
+    ws: str = ""
     device: int = -1
     tag: str = ""
     acquires: int = 0
+    skipped: int = 0
     misses: int = 0
     late: int = 0
     late_bytes: int = 0
     stall_ns: int = 0
     streamed_bytes: int = 0
+
+
+class RegionStats(msgspec.Struct, frozen=True, kw_only=True):
+    ws: str = ""
+    device: int = -1
+    tag: str = ""
+    region: int = -1
+    uses: int = 0
+    compute_ns: int = 0
+    stall_ns: int = 0
+    late: int = 0
 
 
 class Stats(msgspec.Struct, frozen=True, kw_only=True):
@@ -86,6 +99,8 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
     devices: tuple[DeviceStats, ...] = ()
     sets: tuple[SetStats, ...] = ()
     stages: tuple[StageStats, ...] = ()
+    regions: tuple[RegionStats, ...] = ()
+    poisoned: str | None = None
 
     def device(self, ordinal: int) -> DeviceStats:
         return next((d for d in self.devices if d.ordinal == ordinal), DeviceStats(ordinal=ordinal))
@@ -121,6 +136,11 @@ def open_plane(device: int) -> Any:
         raise Unavailable(f"the weight plane cannot open device {device}: {exc}") from exc
 
 
+def source(plane: Any, store: Any, lease: Any) -> Any:
+    """One manifest's read source, shared by its components' weight sets; consumes `lease`."""
+    return plane.source(store, lease)
+
+
 def stats(plane: Any) -> Stats:
     return msgspec.convert(plane.stats(), Stats)
 
@@ -130,7 +150,7 @@ def events(plane: Any) -> list[Event]:
 
 
 def error(name: str) -> type[BaseException]:
-    """The plane's typed error class `name` (`Shortfall`, `ScheduleMismatch`, ...)."""
+    """The plane's typed error class `name` (`Shortfall`, `BudgetExceeded`, ...)."""
     assert _plane is not None
     found: type[BaseException] = getattr(_plane, name)
     return found
