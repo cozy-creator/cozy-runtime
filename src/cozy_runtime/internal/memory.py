@@ -794,7 +794,7 @@ class Planner:
         if self.observe_process():
             self._cap()
         reserved, allocated = self._reserved(), self._allocated()
-        return {
+        facts = {
             "overhead_bytes": self.overhead,
             "reserved_bytes": reserved,
             "allocated_bytes": allocated,
@@ -809,11 +809,15 @@ class Planner:
             "driver_observations": self.driver_observations,
             "peak_allocated_bytes": self.peak_allocated,
             "working_bytes": self.working,
-            "host_bytes": sum(self._host_backings().values()),
-            "host_resident_bytes": sum(self._host_backings(cached=False).values()),
-            "host_cached_bytes": sum(self._host_backings(resident=False).values()),
-            "disk_weight_bytes": sum(h.part.on(DISK) for h in self.held.values() if not h.hosted),
         }
+        host, resident, cached = self._host_totals()
+        facts.update(
+            host_bytes=host,
+            host_resident_bytes=resident,
+            host_cached_bytes=cached,
+            disk_weight_bytes=sum(h.part.on(DISK) for h in self.held.values() if not h.hosted),
+        )
+        return facts
 
     def _validate_component(self, held: Held) -> None:
         if held.part.anchor is None:
@@ -1187,6 +1191,24 @@ class Planner:
             for unit in held.part.units:
                 found.update(self._unit_host_backings(unit, cached=cached, resident=resident))
         return found
+
+    def _host_totals(self) -> tuple[int, int, int]:
+        """One fresh census; shared backing may belong to both resident and cache."""
+        combined: dict[int, int] = {}
+        resident: dict[int, int] = {}
+        cached: dict[int, int] = {}
+        for held in self.held.values():
+            for unit in held.part.units:
+                host = list(unit.host.values())
+                live = [tensor for *_, tensor in unit.slots()] if unit.tier == HOST else []
+                for tensors, category in ((host, cached), (live, resident)):
+                    for tensor in tensors:
+                        if tensor.device.type == "cpu":
+                            storage = tensor.untyped_storage()
+                            pointer, nbytes = storage.data_ptr(), storage.nbytes()
+                            category[pointer] = nbytes
+                            combined[pointer] = nbytes
+        return sum(combined.values()), sum(resident.values()), sum(cached.values())
 
     def host_reclaim_status(self) -> dict[str, object]:
         """Explain current gates without changing backing or claiming RSS ownership.
