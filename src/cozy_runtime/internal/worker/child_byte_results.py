@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
+
+import msgspec
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author._call_results import result_at
+from cozy_runtime.author._call_results import ByteResult, result_at
+from cozy_runtime.author._executor_requests import ByteGrant
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, admits, normalize, reconcile, sniff
 from cozy_runtime.internal.worker import byte_inputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
@@ -38,15 +40,12 @@ def materialize(
     spool: Path,
     *,
     max_bytes: int = byte_inputs.MAX_BYTES,
-) -> list[dict[str, Any]]:
+) -> list[ByteGrant]:
     validate(result)
     if sum(grant.source.content_bytes for grant in result.byte_result_grants) > max_bytes:
         raise WorkspaceRefusal("native child results exceed the parent's byte bound")
     value = canonical_json.decode(result.result_canonical_bytes)
-    digest: Any
-    length: Any
-    media_type: Any
-    rows: list[dict[str, Any]] = []
+    rows: list[ByteGrant] = []
     for index, grant in enumerate(result.byte_result_grants):
         capture = grant.output_id == "runtime.capture"
         node = None if capture else result_at(value, grant.output_id)
@@ -59,13 +58,17 @@ def materialize(
         else:
             if not isinstance(node, dict) or node.get("kind") not in (*KIND_MEDIA, "tree"):
                 raise WorkspaceRefusal("native grant no longer names a typed byte result")
-            kind = node["kind"]
-            digest, length = node.get("digest"), node.get("size_bytes")
+            try:
+                declared = msgspec.convert(node, ByteResult, strict=True)
+            except msgspec.ValidationError as exc:
+                raise WorkspaceRefusal("native child result changed its byte identity") from exc
+            kind = declared.kind
+            digest, length = declared.digest, declared.size_bytes
             if (
                 type(length) is not int
                 or length < 0
                 or not isinstance(digest, str)
-                or node.get("asset_ref") != digest
+                or declared.asset_ref != digest
                 or length != grant.source.content_bytes
             ):
                 raise WorkspaceRefusal("native child result changed its byte identity")
@@ -75,8 +78,8 @@ def materialize(
                 length = grant.source.manifest.length
                 media_type = byte_inputs.TREE_MIME
             else:
-                media_type = node.get("media_type")
-                if not isinstance(media_type, str) or not admits(kind, normalize(media_type)):
+                media_type = declared.media_type
+                if not admits(kind, normalize(media_type)):
                     raise WorkspaceRefusal("native child file omitted its media type")
         destination = spool / "child-results" / str(result.call_index) / str(index)
         held = pb.NativeByteRetentionRequest(source=grant.source, retention_id=grant.retention_id)
