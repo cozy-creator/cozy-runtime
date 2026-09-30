@@ -43,3 +43,21 @@ The feature is isolated above baseline80c39efc. Only its focused commit should b
 to the reviewed c17 integration/candidate; the separate fresh-master merge is not an
 isolated GPU-performance change. No public release or active environment installation
 is part of this CPU qualification.
+
+## Reproduced local GPU case
+
+The isolated R20+reserve+refill wheel completed ordinary full SDXL1005 → Anima1006 →
+SDXL1007 inference at uncapped 8 GB. All three targeted outputs and the two separate
+environment-preparation outputs matched the corresponding qualified decoded RGB exactly;
+ledgers closed and targeted allocator OOM/retry counts remained zero.
+
+Returning SDXL reused the same executor PID/start generation. The VAE disk epoch advanced
+from 0 to 26, and the return reported 6,937,676,966 logical refill bytes while retaining
+whole-frame decode and its execution-conversion mode. This qualifies the reproduced
+returning-model DISK path; per-tensor GPU dtype replay was not separately instrumented.
+Logical refill counts are not physical disk I/O measurements.
+
+The targeted total is unscored. An external CLI update preceded the test and is recorded
+separately, so it is not an isolated throughput comparison with earlier cohorts. Six-job
+grouped/alternating comparisons, remaining constrained-VRAM and multi-GPU cases remain
+separate gates. No production rollout is established by this local result.
