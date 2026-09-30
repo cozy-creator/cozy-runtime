@@ -861,6 +861,8 @@ class Planner:
         Common units keep `.device` valid; blocks arrive with managed operations. Components
         explicitly read outside operations (`read_whole`) must fit whole.
         """
+        if self.unusable:
+            raise MemoryRefusal("device_fault", self.unusable, reusable=False)
         before = len(self.scopes)
         self.scopes.append((construction, frozenset(components)))
         try:
@@ -912,14 +914,84 @@ class Planner:
                 self._refuse_scope(held, method, required, victims)
             for victim in chosen:
                 self._offload(victim, target=required)
-            if whole_only:
-                self._stage_whole(held, [])
-            elif scope_units == part.common_units:
-                self._load_common(held)
+            units = part.units if whole_only else scope_units
+            if whole_only and part.on(DISK) == part.nbytes and part.store is not None:
+                self._place_scope(held, method, functools.partial(self._refill_whole, held))
             else:
-                for unit in scope_units:
-                    self._load(part, unit)
+                for unit in units:
+                    if unit.tier != DEVICE:
+                        self._place_scope(held, method, functools.partial(self._load, part, unit))
             self._cap()
+
+    def _place_scope(
+        self,
+        held: Held,
+        method: str,
+        place: Callable[[], None],
+    ) -> None:
+        """Recover an atomic transfer before the authored scope body starts.
+
+        A group keeps its existing all-rank preparation/recovery authority. A spare
+        operation never acquires another tenant's room. Neither replays its placement here.
+        """
+        if self.grouped or self.spare:
+            place()
+            return
+
+        counts = self.operations.setdefault(f"{held.key}.scope:{method}", {"calls": 0})
+        counts["calls"] += 1
+        before = self.allocatable()
+        while True:
+            self.oom_asked = 0
+            try:
+                with self._traffic(counts, "placement"):
+                    place()
+            except BaseException as exc:
+                if not is_oom(exc):
+                    raise
+                asked = max(self.oom_asked, _asked(str(exc)), 1)
+                self.oom_asked = 0
+                text = (str(exc).splitlines() or [type(exc).__name__])[0][:300]
+                exc.__traceback__ = None
+                counts["placement_ooms"] = counts.get("placement_ooms", 0) + 1
+            else:
+                return
+
+            # Compare one atomic transfer with itself, not an entire partially staged
+            # component. A previous successful unit may have reused reserved cache pages.
+            # Also do not credit a failed allocation growing R, then trim undoing that
+            # same growth: the recovery must improve on the pre-attempt high-water room.
+            before = max(before, self.allocatable())
+            # Tier moves either committed or restored their original bindings. No
+            # application body or RNG draw is replayed; release unused allocator pages
+            # and ask the existing Machine policy for a measured extra allocation.
+            try:
+                tiers.trim(self.torch)
+                self._cap()
+            except Exception as exc:
+                self.unusable = f"{held.key}: scope placement recovery failed: {type(exc).__name__}"
+                self.refusal = MemoryRefusal("device_fault", self.unusable, reusable=False)
+                raise self.refusal from None
+            target = max(before, 0) + asked
+            if self.allocatable() < target:
+                self._ask_room(target, [], measured=True)
+            after = self.allocatable()
+            if after < target:
+                self.refusal = MemoryRefusal(
+                    DEVICE_OOM,
+                    f"{held.key} scope {method}: no placement retry: {text}; "
+                    f"needed {target - before} B of extra room, gained {after - before} B",
+                    target - before,
+                    max(after - before, 0),
+                )
+                raise self.refusal from None
+            self._refresh_constraints(held)
+            counts["placement_retries"] = counts.get("placement_retries", 0) + 1
+            counts["placement_gain_bytes"] = counts.get("placement_gain_bytes", 0) + after - before
+            self.log.append(
+                f"{held.key} scope {method}: retrying placement after gaining {after - before} B"
+            )
+            before = after
 
     def restore_resident(self, construction: str, names: tuple[str, ...]) -> dict[str, object]:
         """A revision-1 Worker's explicit restore, without evicting another component."""
@@ -948,15 +1020,18 @@ class Planner:
             self._offload(victim)
         part = held.part
         if part.on(DISK) == part.nbytes and part.store is not None:
-            with self._moving():
-                tiers.from_disk(self.torch, part, None)
-            self.loads += 1
-            self.refilled += part.nbytes
+            self._refill_whole(held)
         else:
             self._load_common(held)
             for unit in part.blocks:
                 self._load(part, unit)
         self._cap()
+
+    def _refill_whole(self, held: Held) -> None:
+        with self._moving():
+            tiers.from_disk(self.torch, held.part, None)
+        self.loads += 1
+        self.refilled += held.part.nbytes
 
     def _refuse_scope(self, held: Held, method: str, need: int, victims: list[Held]) -> NoReturn:
         available = self.allocatable() + sum(self._evictable(v) for v in victims)

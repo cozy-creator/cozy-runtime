@@ -282,9 +282,7 @@ def test_scope_minimum_reclaims_sibling_blocks_without_evicting_common(
     monkeypatch.setattr(owner, "allocatable", lambda: 24 - allocated())
     monkeypatch.setattr(owner, "_cap", lambda: None)
     monkeypatch.setattr(owner, "_home", lambda part, unit: setattr(unit, "tier", tiers.HOST))
-    monkeypatch.setattr(
-        owner, "_load_common", lambda held: setattr(held.part.common, "tier", tiers.DEVICE)
-    )
+    monkeypatch.setattr(owner, "_load", lambda part, unit: setattr(unit, "tier", tiers.DEVICE))
     owner.enter("c", "render", ("first", "last"))
     assert first.part.common.tier == second.part.common.tier == tiers.DEVICE
     assert [unit.tier for unit in first.part.blocks] == [tiers.HOST, tiers.DEVICE]
