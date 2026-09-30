@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import importlib.metadata
 import itertools
 import json
 import threading
@@ -425,7 +426,7 @@ def test_real_worker_nested_child_wait_is_not_run_execution(
             "pool = ThreadPoolExecutor(max_workers=1)"
         )
     )
-    source = f"""import asyncio, time, msgspec, importlib.metadata, json
+    source = f"""import asyncio, time, msgspec, importlib.metadata, json, sys
 from pathlib import Path
 from cozy_runtime.author import App, Context, Telemetry, invocable
 from cozy_runtime.author._invoke import Invocation
@@ -447,6 +448,9 @@ async def leaf(ctx: Context, tel: Telemetry, *, n: int) -> Result:
     metadata.write_text(json.dumps({{
         "runtime": importlib.metadata.version("cozy-runtime"),
         "activity": "activity" in Invocation.__dataclass_fields__,
+        "loaded": sys.modules[Invocation.__module__].__file__,
+        "installed": str(importlib.metadata.distribution("cozy-runtime").locate_file(
+            "cozy_runtime/author/_invoke.py")),
     }}))
     metadata.replace({str(entered)!r})
     tel.progress(0.25, stage="Ready")
@@ -480,6 +484,8 @@ async def nested(ctx: Context, payload: Request) -> Result:
         pod.submit("timed")
         pod.wait("the nested child to await its gate", entered.exists, 120)
         sdk = json.loads(entered.read_text())
+        assert sdk["runtime"] == (runtime or importlib.metadata.version("cozy-runtime")), sdk
+        assert Path(sdk["loaded"]).resolve() == Path(sdk["installed"]).resolve(), sdk
         assert sdk["activity"] is (not runtime), sdk
         time.sleep(0.6)  # controlled observation interval, not a production timeout
         gate.touch()

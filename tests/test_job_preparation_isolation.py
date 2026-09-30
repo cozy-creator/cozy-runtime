@@ -43,14 +43,15 @@ def JOB(ctx: Context, payload: Request) -> Result:
 def package(
     root: Path, label: str, *, runtime: str = ""
 ) -> tuple[Path, pb.PrepareLocalPackageRequest]:
-    """A local package locked to this checkout's Runtime, or to released `runtime` from PyPI."""
+    """A local package admitting the machine SDK, or requiring an explicit public Runtime."""
     project = root / ("project_" + label)
     project.mkdir()
     name, module = "prepare-" + label, "prepare_" + label
+    requirement = f"cozy-runtime=={runtime}" if runtime else "cozy-runtime>=0.16.8,<1"
     (project / (module + ".py")).write_text(SOURCE.replace("JOB", label))
     (project / "pyproject.toml").write_text(
         f'[project]\nname="{name}"\nversion="1.0.0"\n'
-        'requires-python=">=3.12,<3.13"\ndependencies=["cozy-runtime>=0.16.8,<1"]\n'
+        f'requires-python=">=3.12,<3.13"\ndependencies=["{requirement}"]\n'
         f'[project.entry-points."cozy.application"]\ndefault="{module}:app"\n'
         '[build-system]\nrequires=["hatchling"]\nbuild-backend="hatchling.build"\n'
         f'[tool.hatch.build.targets.wheel]\nonly-include=["{module}.py"]\n'
