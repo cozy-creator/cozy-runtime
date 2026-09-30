@@ -5748,10 +5748,13 @@ class Worker:
     ) -> Iterator[None]:
         """Unknown/group work owns the gate through failure until its generation is reaped."""
         failed = False
+        origin = supervision.current if supervision is not None else None
 
         def retain() -> str:
             current = supervision.current if supervision is not None else None
-            if current is not None and (failed or current.poisoned or not current.alive()):
+            if current is not None and (
+                current.poisoned or not current.alive() or (failed and current is origin)
+            ):
                 return f"executor:{current.pid}:{current.epoch}:phase:"
             return ""
 

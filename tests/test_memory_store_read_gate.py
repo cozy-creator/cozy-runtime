@@ -330,3 +330,34 @@ def test_job_store_read_uses_generation_room_broker_not_child_calls() -> None:
         engine, cast(Any, object()), StoreRead(reservation="read")
     )
     assert isinstance(refused, Answer) and not refused.ok
+
+
+@pytest.mark.parametrize("initial", ["old", "none-healthy", "none-poisoned"])
+def test_phase_exception_cannot_pin_a_healthy_successor(initial: str) -> None:
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from cozy_runtime.internal.worker.session import Worker
+
+    machine = policy()
+    old = SimpleNamespace(pid=123, epoch=4, poisoned="", alive=lambda: True)
+    new = SimpleNamespace(pid=456, epoch=5, poisoned="", alive=lambda: True)
+    supervision = SimpleNamespace(current=old if initial == "old" else None)
+    worker = cast(Any, SimpleNamespace(memory=machine))
+    with (
+        pytest.raises(ValueError, match="old phase failed"),
+        Worker._store_phase(worker, "prepare", cast(Any, supervision)),
+    ):
+        # Confirmed old-generation retirement and replacement happen before the old
+        # phase unwinds. Its exception is not evidence against the healthy successor.
+        supervision.current = None
+        machine.release_store_prefix("executor:123:4:")
+        supervision.current = new
+        if initial == "none-poisoned":
+            new.poisoned = "new generation still has readers"
+        raise ValueError("old phase failed")
+    with machine.optional_store_read() as admitted:
+        assert admitted == (initial != "none-poisoned")
+    if initial == "none-poisoned":
+        machine.release_store_prefix("executor:456:5:")
+    assert not machine._store_demands
