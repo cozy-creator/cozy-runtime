@@ -2599,9 +2599,23 @@ class Executor:
         self.memory_key = self._group_model_key
         if planner is not None:
             for name, root in backend.components.items():
-                planner.adopt(self.memory_key, name, root, backend, tiers.DEVICE)
+                planner.adopt(
+                    self.memory_key,
+                    name,
+                    root,
+                    backend,
+                    tiers.DEVICE,
+                    forward_only=getattr(type(model), "__encoded_leaves__", "refuse") == "accept",
+                )
             for name, root in backend.parked.items():
-                planner.adopt(self.memory_key, name, root, backend, tiers.DISK)
+                planner.adopt(
+                    self.memory_key,
+                    name,
+                    root,
+                    backend,
+                    tiers.DISK,
+                    forward_only=getattr(type(model), "__encoded_leaves__", "refuse") == "accept",
+                )
             object.__setattr__(model, "_cozy_residency", _Scopes(planner, self.memory_key))
         record = registry.generations()[0].record
         # THE CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is

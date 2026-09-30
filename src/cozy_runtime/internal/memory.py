@@ -149,6 +149,8 @@ class Held:
     whole: bool = False
     last_used: int = 0
     readonly_lost_reason: str = ""
+    forward_only: bool = False
+    scope_anchor: bool = False
     ops: dict[str, Callable[..., object]] = field(default_factory=dict)
 
 
@@ -364,7 +366,14 @@ class Planner:
     # ------------------------------------------------------------------ components
 
     def adopt(
-        self, construction: str, name: str, root: Module, store: tiers.Store | None, tier: str
+        self,
+        construction: str,
+        name: str,
+        root: Module,
+        store: tiers.Store | None,
+        tier: str,
+        *,
+        forward_only: bool = False,
     ) -> Held:
         """Take a constructed component under management: units, hooks, op wrappers."""
         key = f"{construction}/{name}"
@@ -388,11 +397,22 @@ class Planner:
             kind=f"{type(root).__module__}.{type(root).__qualname__}:{name}:{part.nbytes}",
             compiled=_compiled(root),
             whole=bool(getattr(root, "_cozy_read_whole", False)),
+            forward_only=forward_only,
         )
         self.held[key] = held
         root.__dict__["_cozy_select_decode_mode"] = functools.partial(self.select_decode_mode, held)
         root.__dict__["_cozy_optional_cache"] = functools.partial(self.optional_cache, held)
         self._pin_state(held)
+        if (
+            held.forward_only
+            and not held.whole
+            and not held.compiled
+            and part.unit_loads
+            and self._state_contract(held, [])
+            and all(unit.readonly and not unit.mutable for unit in part.units)
+        ):
+            tiers.split_common(part)
+            held.scope_anchor = part.anchor is not None
         if self.cuda:
             tiers.install(part, self._enter_unit, self._leave_unit)
             tiers.wrap(root, functools.partial(self.run, held))
@@ -742,6 +762,20 @@ class Planner:
             "disk_weight_bytes": sum(h.part.on(DISK) for h in self.held.values() if not h.hosted),
         }
 
+    def _validate_component(self, held: Held) -> None:
+        try:
+            tiers.validate_anchor(held.part)
+        except RuntimeFailure as exc:
+            self.unusable = f"{held.key}: {exc}"
+            raise MemoryRefusal(exc.code, self.unusable, reusable=False) from None
+
+    def _scope_common(self, held: Held) -> tuple[tiers.Unit, ...]:
+        """Scope metadata is real backing; unknown effects retain every common unit."""
+        part = held.part
+        if held.scope_anchor and part.anchor is not None:
+            return (part.anchor,)
+        return part.common_units
+
     def enter(self, construction: str, method: str, components: tuple[str, ...]) -> None:
         """Pin every declared component's minimum before any optional operation residency.
 
@@ -762,19 +796,35 @@ class Planner:
         if not self.cuda:
             return
         self._cap()
-        for name in components:
-            held = self.held.get(f"{construction}/{name}")
-            if held is None or held.hosted:
-                continue
+        scoped = [
+            held
+            for name in components
+            if (held := self.held.get(f"{construction}/{name}")) is not None and not held.hosted
+        ]
+        # Refresh every sibling before any transfer can quote it as an optional victim.
+        for held in scoped:
             # A package may have replaced a forward since (a cache hook): it is an op again.
             tiers.wrap(held.part.root, functools.partial(self.run, held))
             held.compiled = _compiled(held.part.root)
+            held.whole = held.whole or bool(getattr(held.part.root, "_cozy_read_whole", False))
+            self._pin_state(held)
+            self._validate_component(held)
+            held.scope_anchor = (
+                held.part.anchor is not None
+                and held.forward_only
+                and self._state_contract(held, [])
+                and all(unit.readonly and not unit.mutable for unit in held.part.common_units)
+            )
+        for held in scoped:
             part = held.part
             whole = part.nbytes - part.on(DEVICE)
             if part.on(DISK) and part.store is not None:
                 whole += part.store.transient(part.name)
-            whole_only = held.whole or (bool(part.on(DISK)) and not part.unit_loads)
-            common = part.common.nbytes if part.common.tier != DEVICE else 0
+            whole_only = (
+                held.whole or held.compiled or (bool(part.on(DISK)) and not part.unit_loads)
+            )
+            scope_units = self._scope_common(held)
+            common = sum(unit.nbytes for unit in scope_units if unit.tier != DEVICE)
             required = whole if whole_only else common
             if required > self.allocatable() and self._reserved() > self._allocated():
                 # Cached segments can put signed reserve room below zero even when
@@ -795,7 +845,8 @@ class Planner:
             if whole_only:
                 self._stage_whole(held, [])
             else:
-                self._load_common(held)
+                for unit in scope_units:
+                    self._load(part, unit)
             self._cap()
 
     def restore_resident(self, construction: str, names: tuple[str, ...]) -> dict[str, object]:
@@ -1120,6 +1171,7 @@ class Planner:
         if not self.cuda or held.hosted or any(frame.held is held for frame in self.stack):
             self._ready(held.key)
             return fn(*args, **kwargs)
+        self._validate_component(held)
         torch = self.torch
         leaves = list(_leaves((args, kwargs)))
         key = OpKey(
@@ -1148,6 +1200,12 @@ class Planner:
                 # later declaration cannot validate an old host/checkpoint copy.
                 unit.host.clear()
                 unit.seen.clear()
+        held.scope_anchor = (
+            held.part.anchor is not None
+            and held.forward_only
+            and readonly
+            and all(unit.readonly and not unit.mutable for unit in held.part.common_units)
+        )
         counts = self.operations.setdefault(f"{held.key}.{method}", {"calls": 0})
         counts["calls"] += 1
         counts["total_blocks"] = len(held.part.blocks)
@@ -1222,6 +1280,7 @@ class Planner:
                     if not oom:
                         raise
                 else:
+                    self._validate_component(held)
                     self._sample()
                     assert frame is not None
                     self.working = max(self.working, frame.working)
@@ -1532,7 +1591,7 @@ class Planner:
 
     def _need(self, part: tiers.Component, keep: int) -> int:
         """Net bytes the device must still find for `part` with `keep` blocks resident."""
-        common = part.common.nbytes if part.common.tier != DEVICE else 0
+        common = sum(unit.nbytes for unit in part.common_units if unit.tier != DEVICE)
         if part.on(DISK) and not part.unit_loads and part.store is not None:
             common += part.store.transient(part.name)
         load = sum(u.nbytes for u in part.blocks[:keep] if u.tier != DEVICE)
@@ -1590,8 +1649,7 @@ class Planner:
         for construction, names in self.scopes:
             for name in names:
                 key = f"{construction}/{name}"
-                if not self.deep:
-                    common.add(key)
+                common.add(key)
                 held = self.held.get(key)
                 if held is not None and held.whole:
                     whole.add(key)
@@ -1601,7 +1659,8 @@ class Planner:
         whole, common = self._pinned()
         if victim.key in whole or victim.compiled:
             return 0
-        units = victim.part.blocks if victim.key in common else victim.part.units
+        protected = set(self._scope_common(victim)) if victim.key in common else set()
+        units = tuple(unit for unit in victim.part.units if unit not in protected)
         whole_store = units == victim.part.units and self._whole_store(victim.part)
         return sum(
             unit.nbytes
@@ -1704,14 +1763,15 @@ class Planner:
 
     def _load_common(self, held: Held) -> None:
         part = held.part
-        if part.common.tier == DEVICE:
+        if all(unit.tier == DEVICE for unit in part.common_units):
             return
-        if part.common.tier == DISK and not part.unit_loads:
+        if any(unit.tier == DISK for unit in part.common_units) and not part.unit_loads:
             self.refilled += part.on(DISK)
             with self._moving():
                 tiers.from_disk(self.torch, part, None)
             return
-        self._load(part, part.common)
+        for unit in part.common_units:
+            self._load(part, unit)
 
     def _load(self, part: tiers.Component, unit: tiers.Unit) -> None:
         if unit.tier == DEVICE:
@@ -1751,7 +1811,10 @@ class Planner:
         held.compiled = _compiled(held.part.root)
         if held.compiled or (held.key in whole and not everything):
             return
-        units = part.blocks if held.key in common and not everything else part.units
+        protected = (
+            set(self._scope_common(held)) if held.key in common and not everything else set()
+        )
+        units = tuple(unit for unit in part.units if unit not in protected)
         moving = [unit for unit in units if unit.tier == DEVICE and not unit.mutable]
         if units == part.units and self._whole_store(part):
             needed = sum(tiers.host_copy_bytes(unit) for unit in moving)

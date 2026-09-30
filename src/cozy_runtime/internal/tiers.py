@@ -73,9 +73,13 @@ class Unit:
     #: package conversions applied since the unit's last fill, and those waiting for its next
     applied: list[Convert] = field(default_factory=list)
     pending: list[Convert] = field(default_factory=list)
+    #: Exact whole owners for a nonstreamed common partition; never individual slots.
+    members: tuple[tuple[str, Module], ...] | None = None
 
     def owners(self) -> list[tuple[str, Module]]:
         """Every (path, module) whose own tensors belong to this unit."""
+        if self.members is not None:
+            return list(self.members)
         skip = {id(module) for module in self.skip}
         found: list[tuple[str, Module]] = []
         stack = [(self.path, self.module)]
@@ -124,10 +128,19 @@ class Component:
     hooks: list[Handle] = field(default_factory=list)
     #: a move of ours is converting tensors: a package conversion is not intercepted
     moving: bool = False
+    #: Real first-parameter owner plus alias closure; None keeps legacy common pins.
+    anchor: Unit | None = None
+    anchor_structure: tuple[object, ...] = ()
+
+    @property
+    def common_units(self) -> tuple[Unit, ...]:
+        if self.anchor is None or self.anchor is self.common:
+            return (self.common,)
+        return (self.anchor, self.common)
 
     @property
     def units(self) -> tuple[Unit, ...]:
-        return (self.common, *self.blocks)
+        return (*self.common_units, *self.blocks)
 
     @property
     def nbytes(self) -> int:
@@ -159,8 +172,10 @@ def _tokens(module: Module) -> Iterator[tuple[str, int]]:
     for tensor in (*module._parameters.values(), *module._buffers.values()):
         if tensor is not None:
             yield "tensor", id(tensor)
-            if not tensor.is_meta and tensor.numel():
-                yield f"storage:{tensor.device}", tensor.untyped_storage().data_ptr()
+            if tensor.numel():
+                storage = tensor.untyped_storage()
+                identity = int(storage._cdata) if tensor.is_meta else storage.data_ptr()
+                yield f"storage:{tensor.device}", identity
 
 
 def partition(name: str, root: Module, tier: str, store: Store | None = None) -> Component:
@@ -213,6 +228,102 @@ def partition(name: str, root: Module, tier: str, store: Store | None = None) ->
     keys = frozenset(key for unit in component.units for key in unit.live(name))
     component.unit_loads = store is not None and store.unit_loads(name, keys)
     return component
+
+
+def _structure(root: Module) -> tuple[object, ...]:
+    """Registered owner/slot geometry, independent of legal backing moves and casts."""
+    return tuple(
+        (
+            path,
+            id(module),
+            tuple((name, id(child)) for name, child in module._modules.items()),
+            tuple(
+                (
+                    parameter,
+                    name,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    name in module._non_persistent_buffers_set,
+                )
+                for parameter, slots in ((True, module._parameters), (False, module._buffers))
+                for name, tensor in slots.items()
+                if tensor is not None
+            ),
+        )
+        for path, module in Unit("", root).owners()
+    )
+
+
+def split_common(component: Component) -> None:
+    """Partition complete common owners; admission/eligibility belongs to Planner."""
+    common = component.common
+    owners = common.owners()
+    first = next(
+        (
+            module
+            for _, module in Unit("", component.root).owners()
+            if any(tensor is not None for tensor in module._parameters.values())
+        ),
+        None,
+    )
+    if first is None or not any(module is first for _, module in owners):
+        return
+    selected = {id(first)}
+    while True:
+        tokens = {
+            token for _, module in owners if id(module) in selected for token in _tokens(module)
+        }
+        expanded = selected | {
+            id(module) for _, module in owners if tokens.intersection(_tokens(module))
+        }
+        if expanded == selected:
+            break
+        selected = expanded
+    anchored = tuple((path, module) for path, module in owners if id(module) in selected)
+    remainder = tuple((path, module) for path, module in owners if id(module) not in selected)
+    if not remainder:
+        component.anchor = common
+    else:
+
+        def unit(members: tuple[tuple[str, Module], ...]) -> Unit:
+            identifiers = {id(module) for _, module in members}
+            return Unit(
+                "",
+                component.root,
+                tier=common.tier,
+                members=members,
+                host={key: value for key, value in common.host.items() if key[0] in identifiers},
+                seen={key: value for key, value in common.seen.items() if key[0] in identifiers},
+                mutable=common.mutable,
+                readonly=common.readonly,
+                applied=list(common.applied),
+                pending=list(common.pending),
+            )
+
+        component.anchor, component.common = unit(anchored), unit(remainder)
+    component.anchor_structure = _structure(component.root)
+    measure(component)
+    validate_anchor(component)
+
+
+def validate_anchor(component: Component) -> None:
+    """A split immutable construction cannot silently acquire unaccounted owners/aliases."""
+    if component.anchor is None:
+        return
+    if _structure(component.root) != component.anchor_structure:
+        raise RuntimeFailure(
+            "registered component owner/slot geometry changed after common partition",
+            code="component_structure_changed",
+        )
+    owners: dict[tuple[str, int], Unit] = {}
+    for unit in component.units:
+        for _, module in unit.owners():
+            for token in _tokens(module):
+                if owners.setdefault(token, unit) is not unit:
+                    raise RuntimeFailure(
+                        "registered component acquired an alias across residency units",
+                        code="component_structure_changed",
+                    )
 
 
 def measure(component: Component) -> None:
