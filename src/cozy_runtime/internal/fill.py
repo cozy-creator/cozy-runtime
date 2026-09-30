@@ -102,7 +102,7 @@ from cozy_runtime.internal.resolution import (
     TensorResolution,
     script_plan,
 )
-from cozy_runtime.internal.tiers import Unit
+from cozy_runtime.internal.tiers import RefillSchema, Unit
 
 # Every `Any` below is a torch module, tensor, event or device: torch is absent from the
 # check venv.
@@ -2269,6 +2269,106 @@ class StreamingFillBackend:
         )
         del self.stage_log[:-64]
 
+    def _canonical_slots(
+        self,
+        name: str,
+        unit: Unit,
+    ) -> list[tuple[Any, str, bool, Any, Any]]:
+        """Metadata only: the same persistent/derived schema a refill reconstructs."""
+        slots: list[tuple[Any, str, bool, Any, Any]] = []
+        for path, module in unit.owners():
+            prefix = f"{name}.{path}." if path else f"{name}."
+            for parameter, mapping in ((True, module._parameters), (False, module._buffers)):
+                for local, tensor in mapping.items():
+                    if tensor is None:
+                        continue
+                    if not parameter and local in module._non_persistent_buffers_set:
+                        source = self.derived.get(name, {}).get((module, local))
+                        if (
+                            source is None
+                            or source.layout != self.torch.strided
+                            or source.grad is not None
+                        ):
+                            raise RuntimeFailure(
+                                "derived refill metadata unavailable", code="memory_capability"
+                            )
+                        shape, dtype = tuple(source.shape), source.dtype
+                    else:
+                        key = prefix + local
+                        spec = self.specs.get(key)
+                        if spec is None:
+                            raise _refuse(
+                                "destination_absent", "canonical refill slot missing", [key]
+                            )
+                        shape = spec.shape
+                        dtype = getattr(self.torch, dtype_name(spec.dtype))
+                    if tuple(tensor.shape) != tuple(shape) or tensor.layout != self.torch.strided:
+                        raise _refuse(
+                            "length_mismatch",
+                            "canonical refill shape/layout changed",
+                            [prefix + local],
+                        )
+                    slots.append((module, local, parameter, tensor, dtype))
+        return slots
+
+    def load_schema(self, name: str, unit: Unit) -> RefillSchema:
+        """Canonical plain replay types; encoded reconstruction retains its own quote."""
+        if any(
+            key.startswith(name + ".") and route.route == "encoded_gemm"
+            for key, route in self.resolved.items()
+        ):
+            # Existing whole-fill quote is settled+provider transient. Only add
+            # derived restoration if its actual initial peak exceeds that envelope.
+            memory = self.component_memory[name]
+            derived = max(
+                (int(v.numel() * v.element_size()) for v in self.derived.get(name, {}).values()),
+                default=0,
+            )
+            extra = max(memory.destinations + derived - memory.peak, 0)
+            return RefillSchema(None, extra)
+        slots = self._canonical_slots(name, unit)
+        for key in unit.live(name):
+            resolved = self.resolved.get(key)
+            if resolved is None:
+                raise _refuse("destination_absent", "canonical refill route missing", [key])
+            if resolved.route not in ("verbatim", "decoded_float"):
+                raise RuntimeFailure(
+                    "stored conversion of encoded leaves is unsupported", code="memory_capability"
+                )
+        # _restore_derived holds the current placeholder while its copied value
+        # materializes. Copies replace one slot at a time, so only the largest
+        # single derived allocation overlaps the complete canonical placeholder tree.
+        extra = max(
+            (
+                tensor.numel() * self.torch.empty(0, dtype=dtype, device="meta").element_size()
+                for module, local, parameter, tensor, dtype in slots
+                if not parameter and local in module._non_persistent_buffers_set
+            ),
+            default=0,
+        )
+        return RefillSchema(tuple(dtype for _, _, _, _, dtype in slots), extra)
+
+    def _canonicalize_refill(self, name: str, unit: Unit) -> None:
+        # Do not change parked .dtype during drop or a quote. Only the transaction's
+        # imminent fill gets canonical destinations, before any device allocation.
+        slots = self._canonical_slots(name, unit)
+        for module, local, parameter, tensor, dtype in slots:
+            if tensor.dtype == dtype:
+                continue
+            if not tensor.is_meta:
+                raise RuntimeFailure(
+                    "canonical refill requires parked slots", code="memory_capability"
+                )
+            replacement = self.torch.empty_strided(
+                tuple(tensor.shape), tuple(tensor.stride()), dtype=dtype, device="meta"
+            )
+            if parameter:
+                module._parameters[local] = self.torch.nn.Parameter(
+                    replacement, requires_grad=tensor.requires_grad
+                )
+            else:
+                module._buffers[local] = replacement
+
     def load(self, name: str) -> StageRow:
         """Re-reserve and RE-FILL one component from the store. The same transaction, scoped.
 
@@ -2300,6 +2400,7 @@ class StreamingFillBackend:
         started = time.perf_counter_ns()
         memory = self.component_memory[name]
         with placing():
+            self._canonicalize_refill(name, Unit("", member))
             member.to_empty(device=self.device, recurse=True)
             _restore_derived(member, self.derived.get(name, {}))
             fresh = census(_Holder({name: member}))
@@ -2406,6 +2507,7 @@ class StreamingFillBackend:
 
     def _fill_unit(self, name: str, unit: Unit) -> None:
         with placing():
+            self._canonicalize_refill(name, unit)
             owners = unit.owners()
             for _, module in owners:
                 module.to_empty(device=self.device, recurse=False)

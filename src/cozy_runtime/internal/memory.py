@@ -490,7 +490,7 @@ class Planner:
         self._overlap_retire(held=held, clear=True)
         self._validate_component(held)
         for unit in held.part.units:
-            tiers.load_demand(self.torch, unit)
+            tiers.load_demand(self.torch, unit, component=held.part)
         self.records = {
             key: value for key, value in self.records.items() if key.component != held.kind
         }
@@ -957,14 +957,16 @@ class Planner:
             self._refresh_constraints(held)
         for held in scoped:
             part = held.part
-            whole = tiers.load_sequence(self.torch, part.units, whole=not part.unit_loads).peak
+            whole = tiers.load_sequence(
+                self.torch, part.units, whole=not part.unit_loads, component=part
+            ).peak
             if part.on(DISK) and part.store is not None:
                 whole += part.store.transient(part.name)
             whole_only = (
                 held.whole or held.compiled or (bool(part.on(DISK)) and not part.unit_loads)
             )
             scope_units = self._scope_common(held)
-            common = tiers.load_sequence(self.torch, scope_units).peak
+            common = tiers.load_sequence(self.torch, scope_units, component=part).peak
             required = whole if whole_only else common
             if required > self.allocatable() and self._reserved() > self._allocated():
                 # Cached segments can put signed reserve room below zero even when
@@ -1074,7 +1076,9 @@ class Planner:
                 or (names and part.name not in names)
             ):
                 continue
-            demand = tiers.load_sequence(self.torch, part.units, whole=not part.unit_loads)
+            demand = tiers.load_sequence(
+                self.torch, part.units, whole=not part.unit_loads, component=part
+            )
             if demand.resident <= 0:
                 continue
             if demand.peak > self.allocatable():
@@ -1837,7 +1841,10 @@ class Planner:
         """
         part = held.part
         stream = max(
-            (tiers.load_demand(self.torch, unit).peak for unit in part.blocks[plan.keep :]),
+            (
+                tiers.load_demand(self.torch, unit, component=part).peak
+                for unit in part.blocks[plan.keep :]
+            ),
             default=0,
         )
         placement = self._need(part, plan.keep) - stream
@@ -1955,12 +1962,18 @@ class Planner:
         """Net settled placement plus its largest real load/conversion overlap."""
         if part.on(DISK) and not part.unit_loads and part.store is not None:
             return tiers.load_sequence(
-                self.torch, part.units, whole=True
+                self.torch, part.units, whole=True, component=part
             ).peak + part.store.transient(part.name)
-        placement = tiers.load_sequence(self.torch, (*part.common_units, *part.blocks[:keep]))
+        placement = tiers.load_sequence(
+            self.torch, (*part.common_units, *part.blocks[:keep]), component=part
+        )
         drop = sum(unit.nbytes for unit in part.blocks[keep:] if unit.tier == DEVICE)
         stream = max(
-            (tiers.load_demand(self.torch, unit).peak for unit in part.blocks[keep:]), default=0
+            (
+                tiers.load_demand(self.torch, unit, component=part).peak
+                for unit in part.blocks[keep:]
+            ),
+            default=0,
         )
         return max(placement.peak, placement.resident + stream) - drop
 
@@ -2146,7 +2159,9 @@ class Planner:
         if unit.tier == DEVICE:
             return
         self._overlap_retire(pending_only=True)
-        tiers.load_demand(self.torch, unit)  # Refuse unbounded pending transforms before a fill.
+        tiers.load_demand(
+            self.torch, unit, component=part
+        )  # Refuse unbounded pending transforms before a fill.
         with self._moving():
             if unit.tier == HOST:
                 self.moved += tiers.to_device(self.torch, unit, self.device)
@@ -2255,7 +2270,7 @@ class Planner:
         adoption. Existing host backings cost nothing, and ranks own separate address spaces.
         """
         return sum(self.staging_unbacked.values()) + sum(
-            tiers.load_demand(self.torch, unit).resident
+            tiers.load_demand(self.torch, unit, component=held.part).resident
             if unit.tier == DISK
             else tiers.host_copy_bytes(unit)
             for held in self.held.values()

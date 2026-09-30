@@ -47,6 +47,10 @@ class Store(Protocol):
 
     def unit_loads(self, name: str, keys: frozenset[str]) -> bool: ...
 
+    def load_schema(self, name: str, unit: Unit) -> RefillSchema:
+        """Canonical slot dtypes and derived-buffer copy overlap, metadata only."""
+        ...
+
     def transient(self, name: str) -> int:
         """Bytes a whole fill of `name` holds beyond the component while it arrives."""
         ...
@@ -63,9 +67,21 @@ class DTypeConvert:
 
 
 @dataclass(frozen=True)
+class RefillSchema:
+    """No payloads: None dtypes marks opaque encoded topology, not missing metadata."""
+
+    dtypes: tuple[object, ...] | None
+    restoration_peak_extra: int = 0
+
+
+@dataclass(frozen=True)
 class LoadDemand:
     resident: int
     peak: int
+    #: Initial canonical fill allocation, before replay; parked metadata can be wider.
+    source: int | None = field(default=None, compare=False)
+    restoration_peak_extra: int = field(default=0, compare=False)
+    replay_peak: int | None = field(default=None, compare=False)
 
 
 def _canonical_dtype(torch: Torch, fn: Convert) -> bool:
@@ -88,22 +104,26 @@ def _canonical_dtype(torch: Torch, fn: Convert) -> bool:
     return known and (layout is None or layout.cell_contents is None)
 
 
-def load_demand(torch: Torch, unit: Unit) -> LoadDemand:
+def load_demand(torch: Torch, unit: Unit, *, component: Component | None = None) -> LoadDemand:
     """Current fill backing, settled dtype bytes and conservative conversion overlap.
 
     Only the installed Torch's canonical dtype closures establish this bound. Calling
     an arbitrary transform on a scalar does not prove its real allocation demand.
     """
-    if unit.tier != DISK or not unit.pending:
+    if unit.tier != DISK:
+        return LoadDemand(unit.nbytes, unit.nbytes)
+    if not unit.pending and (component is None or component.store is None):
         return LoadDemand(unit.nbytes, unit.nbytes)
     if not all(isinstance(convert, DTypeConvert) for convert in unit.pending):
         raise RuntimeFailure("unbounded stored conversion", code="memory_capability")
     slots = list(unit.slots())
-    if any(type(module)._apply is not torch.nn.Module._apply for _, module in unit.owners()):
+    if unit.pending and any(
+        type(module)._apply is not torch.nn.Module._apply for _, module in unit.owners()
+    ):
         raise RuntimeFailure(
             "custom owner conversion has no allocation bound", code="memory_capability"
         )
-    if any(
+    if unit.pending and any(
         type(tensor) not in (torch.Tensor, torch.nn.Parameter)
         or tensor.layout != torch.strided
         or tensor.grad is not None
@@ -112,9 +132,32 @@ def load_demand(torch: Torch, unit: Unit) -> LoadDemand:
         raise RuntimeFailure(
             "stored conversion requires plain gradient-free tensors", code="memory_capability"
         )
-    dtypes = [tensor.dtype for *_, tensor in slots]
-    sizes = [tensor.numel() * tensor.element_size() for *_, tensor in slots]
-    peak = max(unit.nbytes, sum(sizes))
+    schema = (
+        component.store.load_schema(component.name, unit)
+        if component is not None and component.store is not None
+        else RefillSchema(tuple(tensor.dtype for *_, tensor in slots))
+    )
+    if schema.dtypes is None:
+        if unit.pending:
+            raise RuntimeFailure(
+                "stored conversion of encoded leaves is unsupported", code="memory_capability"
+            )
+        return LoadDemand(
+            unit.nbytes,
+            unit.nbytes + schema.restoration_peak_extra,
+            unit.nbytes,
+            schema.restoration_peak_extra,
+            unit.nbytes,
+        )
+    dtypes = list(schema.dtypes)
+    if len(dtypes) != len(slots):
+        raise RuntimeFailure("canonical refill slot count changed", code="memory_capability")
+    sizes = [
+        tensor.numel() * torch.empty(0, dtype=dtype, device="meta").element_size()
+        for (*_, tensor), dtype in zip(slots, dtypes, strict=True)
+    ]
+    source = sum(sizes)
+    replay_peak = source
     converted = False
     for convert in unit.pending:
         changed = [convert(torch.empty(0, dtype=dtype, device="meta")).dtype for dtype in dtypes]
@@ -138,21 +181,40 @@ def load_demand(torch: Torch, unit: Unit) -> LoadDemand:
             for size, before, after in zip(next_sizes, dtypes, changed, strict=True)
             if before != after
         )
-        peak = max(peak, sum(sizes) + allocated)
+        replay_peak = max(replay_peak, sum(sizes) + allocated)
         sizes, dtypes = next_sizes, changed
-    return LoadDemand(sum(sizes), peak) if converted else LoadDemand(unit.nbytes, peak)
+    peak = max(source + schema.restoration_peak_extra, replay_peak)
+    if converted or (component is not None and component.store is not None):
+        return LoadDemand(sum(sizes), peak, source, schema.restoration_peak_extra, replay_peak)
+    # Standalone quotes without a store must retain full unique backing size.
+    return LoadDemand(unit.nbytes, max(peak, unit.nbytes), max(source, unit.nbytes))
 
 
-def load_sequence(torch: Torch, units: tuple[Unit, ...], *, whole: bool = False) -> LoadDemand:
+def load_sequence(
+    torch: Torch,
+    units: tuple[Unit, ...],
+    *,
+    whole: bool = False,
+    component: Component | None = None,
+) -> LoadDemand:
     """New capacity for sequential unit loads, or one whole fill before replaying casts."""
     missing = [unit for unit in units if unit.tier != DEVICE]
-    demands = [load_demand(torch, unit) for unit in missing]
+    demands = [load_demand(torch, unit, component=component) for unit in missing]
     if whole:
-        current = sum(unit.nbytes for unit in missing)
-        peak = current
-        for unit, demand in zip(missing, demands, strict=True):
-            peak = max(peak, current - unit.nbytes + demand.peak)
-            current += demand.resident - unit.nbytes
+        sources = [
+            unit.nbytes if demand.source is None else demand.source
+            for unit, demand in zip(missing, demands, strict=True)
+        ]
+        current = sum(sources)
+        peak = current + max((d.restoration_peak_extra for d in demands), default=0)
+        for source, demand in zip(sources, demands, strict=True):
+            peak = max(
+                peak,
+                current
+                - source
+                + (demand.peak if demand.replay_peak is None else demand.replay_peak),
+            )
+            current += demand.resident - source
         return LoadDemand(current, peak)
     current = peak = 0
     for demand in demands:
@@ -1050,7 +1112,7 @@ def intercept_apply(
             if unit.tier == DISK:
                 unit.pending.append(fn)
                 try:
-                    load_demand(torch, unit)
+                    load_demand(torch, unit, component=component)
                 finally:
                     unit.pending.pop()
         if any(
