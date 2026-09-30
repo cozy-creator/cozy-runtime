@@ -531,12 +531,8 @@ def png_result(tmp_path: Path) -> tuple[Workspace, pb.ChildCallResult, bytes]:
     return workspace, reply, data
 
 
-@pytest.mark.parametrize("declared", ["image/png", "image/jpeg"])
-def test_encoded_png_result_hydrates_with_sniffed_image_type(tmp_path: Path, declared: str) -> None:
+def test_encoded_png_result_hydrates_as_existing_image_asset(tmp_path: Path) -> None:
     workspace, reply, data = png_result(tmp_path)
-    value = canonical_json.decode(reply.result_canonical_bytes)
-    value["image"]["media_type"] = declared
-    reply.result_canonical_bytes = canonical_json.encode(value)
     rows = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
     assert rows[0]["media_type"] == "image/png"
     result, _ = decode(
@@ -552,8 +548,24 @@ def test_encoded_png_result_hydrates_with_sniffed_image_type(tmp_path: Path, dec
     assert result.image.read_bytes() == data
 
 
+def test_encoded_png_mislabeled_as_jpeg_refuses_at_result_decode(tmp_path: Path) -> None:
+    workspace, reply, data = png_result(tmp_path)
+    value = canonical_json.decode(reply.result_canonical_bytes)
+    value["image"]["media_type"] = "image/jpeg"
+    reply.result_canonical_bytes = canonical_json.encode(value)
+    rows = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+    # Materialization corrects same-family MIME claims from the bytes. A native
+    # result must still agree with its verified grant when the SDK hydrates it.
+    assert rows[0]["media_type"] == "image/png"
+    assert Path(rows[0]["local"]).read_bytes() == data
+    with pytest.raises(ValueError, match="differs from its verified host grant"):
+        decode(value, ImageResult, rows, request_id="parent", guard=lambda: None, observation=None)
+
+
 @pytest.mark.parametrize("kind,mime", [("audio", "audio/wav"), ("video", "image/png")])
-def test_encoded_png_refuses_a_wrong_kind_or_mime(tmp_path: Path, kind: str, mime: str) -> None:
+def test_encoded_png_refuses_a_wrong_kind_or_media_family(
+    tmp_path: Path, kind: str, mime: str
+) -> None:
     workspace, reply, _ = png_result(tmp_path)
     value = canonical_json.decode(reply.result_canonical_bytes)
     value["image"].update(kind=kind, media_type=mime)
