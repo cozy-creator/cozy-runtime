@@ -245,7 +245,7 @@ func TestGuardedUpdateWaitsForNormalLaunch(t *testing.T) {
 
 func TestBootCrashBackoffReturnsVisibleUnavailable(t *testing.T) {
 	m := &Machine{owned: true, idle: &idle{}, restarts: &restarts{}, wake: make(chan struct{}, 1)}
-	m.restarts.exited(runtimeExit{detail: "boot configuration failed", code: 1})
+	m.restarts.exited(runtimeExit{detail: "boot configuration failed", code: 1}, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan error, 1)

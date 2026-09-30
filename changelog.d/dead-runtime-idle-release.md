@@ -1,0 +1,1 @@
+A rental whose Runtime has exited is known idle, so a used rental with a dead or blocked Runtime releases on its idle clock instead of billing indefinitely. An exit after readiness relaunches; a second consecutive exit before readiness stays blocked until readiness or repair, and that count survives agent restarts.
