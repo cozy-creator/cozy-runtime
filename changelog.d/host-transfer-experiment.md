@@ -1,0 +1,1 @@
+Add a disabled, separately reviewed HOST transfer mechanism with admitted pinned-buffer leases, atomic view publication and event-owned drain/poison custody. No runtime path enables asynchronous transfer yet.
