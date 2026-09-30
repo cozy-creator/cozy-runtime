@@ -49,7 +49,14 @@ jobs:
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$b"
           cmp "$a"/*.whl "$b"/*.whl
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
-        run: uv run pytest
+        name: Tests with delegated executor containment
+        run: |
+          sudo systemd-run --wait --pipe --collect \
+            --unit="cozy-runtime-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            .venv/bin/python -m pytest
       # Older Runtimes' executors against this worker; their locked environments are cached.
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         uses: actions/cache@v4

@@ -7,8 +7,9 @@ model supplies its live layout, step policy and dense module paths explicitly.
 The kernel compiles once per object per machine, out of process (`kernel_compile`): one per
 card, and on SM90 one per 64-token block layout (`variant`), which only the request knows. So
 the first sight of a length (a model's intake statement, or the first dense step) submits its
-compile, and conditioning and the dense steps cover it. A sparse step whose object is not
-compiled yet runs the dense reference instead: nothing waits on a compile. Upstream's
+compile for a future request. Each request freezes already-published logical variants before
+authored execution; an unavailable variant stays dense for every step and retry. Nothing
+waits on a compile, and the next request can adopt newly published variants. Upstream's
 preprocess autotuning is pinned to one configuration, because its candidates differ bitwise
 and a timing race must not choose the output.
 """
@@ -26,7 +27,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from importlib import import_module
 from inspect import Parameter, Signature, signature
@@ -35,7 +36,9 @@ from types import MethodType
 from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
+from cozy_runtime.author._errors import UnsupportedInput
 from cozy_runtime.author._observations import Scalar
+from cozy_runtime.author._retry import plain_forward, pure
 from cozy_runtime.internal import config, kernel_cache, kernel_compile
 from cozy_runtime.internal.attention_ulysses import Local
 
@@ -58,6 +61,78 @@ _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
 _KERNEL_ROWS: ContextVar[list[dict[str, Scalar]] | None] = ContextVar(
     "cozy_sol_kernel_rows", default=None
 )
+
+# None denotes every logical block/full layout, not an unknown measurement. Generic
+# architectures compile one object; SM90 compiles a finite set of these logical layouts.
+type Variants = tuple[tuple[int, bool], ...] | None
+
+
+@dataclass(slots=True)
+class Selection:
+    store: kernel_cache.Store | None
+    capability: tuple[int, int] | None
+    jobs: dict[tuple[int, bool] | None, kernel_compile.Job]
+    variants: Variants
+    loaded: dict[str, Loaded] = field(default_factory=dict)
+
+
+_SELECTION: ContextVar[Selection | None] = ContextVar("cozy_sol_selection", default=None)
+
+
+def intersect(choices: list[Variants]) -> Variants:
+    """Agree semantic coverage, independent of architecture-specific object digests."""
+    finite = [set(choice) for choice in choices if choice is not None]
+    return tuple(sorted(set.intersection(*finite))) if finite else None
+
+
+def capture(device: Any) -> Selection:
+    """Snapshot published local variants once, without loading native code or compiling."""
+    capability, store = _capability(device), kernel_cache.configured()
+    jobs: dict[tuple[int, bool] | None, kernel_compile.Job] = {}
+    if capability is not None and store is not None:
+        candidates = (
+            kernel_compile.learned(store, _scope(capability))
+            if capability == (9, 0)
+            else [_job_for(1, capability)]
+        )
+        for found in candidates:
+            inputs = json.loads(found.key.inputs)
+            if not isinstance(inputs, dict):
+                continue
+            shape = inputs.get("variant", {})
+            if not isinstance(shape, dict):
+                continue
+            blocks, full = shape.get("blocks", 1), shape.get("full", False)
+            if type(blocks) is not int or blocks < 1 or type(full) is not bool:
+                continue
+            tokens = blocks * _BLOCK if full else blocks * _BLOCK - 1
+            # Ignore stale learned rows from another library/options/architecture.
+            if found.key != _job_for(tokens, capability).key or store.entry(found.key) is None:
+                continue
+            jobs[(blocks, full) if capability == (9, 0) else None] = found
+    variants: Variants = (
+        None if None in jobs else tuple(sorted(key for key in jobs if key is not None))
+    )
+    return Selection(store, capability, jobs, variants)
+
+
+@contextmanager
+def selected(selection: Selection) -> Iterator[Selection]:
+    """Hold one request's route choices independently of per-call observations."""
+    token = _SELECTION.set(selection)
+    try:
+        yield selection
+    finally:
+        _SELECTION.reset(token)
+
+
+def narrow(selection: Selection, variants: Variants) -> None:
+    """A follower may only take a subset of the availability it already acknowledged."""
+    if intersect([selection.variants, variants]) != variants:
+        raise UnsupportedInput(
+            "Sol rank selection exceeds captured variants", code="attention_gpu_divergence"
+        )
+    selection.variants = variants
 
 
 @contextmanager
@@ -178,7 +253,7 @@ def install_site(module: Any, component: str, path: str) -> None:
         [Parameter(self_name, Parameter.POSITIONAL_ONLY), *original_signature.parameters.values()],
         return_annotation=original_signature.return_annotation,
     )
-    wrapper = MethodType(scoped_forward, module)
+    wrapper = MethodType(pure(scoped_forward) if plain_forward(module) else scoped_forward, module)
     module.forward = wrapper
     try:
         module._cozy_sol_site = _InstalledSite(site, wrapper, call, bound, had_forward, prior)
@@ -485,25 +560,41 @@ def _row(
 
 
 def _ready(tokens: int, device: Any, step: int) -> Loaded | None:
-    """The object for this length when it is compiled, else None and its compile submitted:
-    the step then runs dense. Nothing here compiles or waits."""
-    capability = _capability(device)
-    store = kernel_cache.configured()
-    if capability is None or store is None:
+    """Use only this request's captured route; publication can benefit the next request."""
+    selection = _SELECTION.get()
+    if selection is None:
+        raise UnsupportedInput(
+            "Sparse Sol attention requires a request selection scope",
+            code="attention_selection_missing",
+        )
+    logical = (-(-tokens // _BLOCK), tokens % _BLOCK == 0)
+    if selection.variants is not None and logical not in selection.variants:
         return None
-    found = _job_for(tokens, capability)
-    loaded = _KERNELS.get(found.key.digest)
+    if selection.capability != _capability(device):
+        raise UnsupportedInput(
+            "Sol selection belongs to another architecture", code="attention_gpu_divergence"
+        )
+    found = selection.jobs.get(logical) or selection.jobs.get(None)
+    if found is None or selection.store is None:
+        raise UnsupportedInput("Selected Sol variant is absent", code="attention_kernel_absent")
+    loaded = selection.loaded.get(found.key.digest)
     if loaded is not None:
         return loaded
     started = time.perf_counter()
-    data = store.get(found.key)
+    data = selection.store.get(found.key)
     if data is None:
-        state = kernel_compile.submit(store, found)
-        _SUBMITTED.add(found.key.digest)
-        _kernel_row(_row(tokens, found, "cold_compile", started, step=step, state=state.line()))
-        return None
-    loaded = _KERNELS[found.key.digest] = load(data)
-    entry = kernel_compile.status(store, found)
+        raise UnsupportedInput(
+            "Selected Sol artifact is missing or corrupt", code="attention_kernel_absent"
+        )
+    try:
+        loaded = _KERNELS.get(found.key.digest) or load(data)
+    except Exception as exc:
+        raise UnsupportedInput(
+            f"Selected Sol artifact cannot load: {type(exc).__name__}: {exc}",
+            code="attention_kernel_load_failed",
+        ) from exc
+    selection.loaded[found.key.digest] = _KERNELS[found.key.digest] = loaded
+    entry = kernel_compile.status(selection.store, found)
     _kernel_row(_row(tokens, found, "store", started, step=step, compile_ms=entry.ms))
     return loaded
 
