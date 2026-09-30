@@ -212,7 +212,8 @@ class Planner:
         self.driver_process_bytes = self.peak_driver_process_bytes = -1
         self.driver_observations = self.peak_driver_budget_excess_bytes = 0
         self.grant: int | None = None
-        #: this process's non-allocator device bytes: context, modules, communicators
+        #: High-water consumed non-allocator bytes: context, modules, communicators.
+        #: This is not a separate reservation for unmeasured future growth.
         self.overhead = 0
         self.held: dict[str, Held] = {}
         self.records: dict[OpKey, Record] = {}
@@ -323,15 +324,16 @@ class Planner:
         return int(free), int(total)
 
     def allocatable(self) -> int:
-        """Bytes the allocator may still reserve: inside the grant, and never the driver's
-        headroom (one `overhead` kept free on the device). Its cache is no credit: holes
+        """Bytes the allocator may still reserve, inside both its grant and driver free.
+        Driver free already excludes consumed overhead; only the total grant charges it.
+        Its cache is no credit: holes
         between live blocks cannot be released, and the cap counts them. Negative when the
         process holds more than its grant, and the plan must give bytes back."""
         if not self.cuda:
             return 1 << 62
         free, total = self._driver()
         granted = (total if self.grant is None else self.grant) - self.overhead - self._reserved()
-        return min(granted, free - self.overhead)
+        return min(granted, free)
 
     def _cap(self) -> None:
         """Cap allocator reserve after sampled process overhead; external growth is observed."""
@@ -344,7 +346,7 @@ class Planner:
         free, total = self._driver()
         limit = min(
             (total if self.grant is None else self.grant) - self.overhead,
-            free + self._reserved() - self.overhead,
+            free + self._reserved(),
         )
         self.torch.cuda.set_per_process_memory_fraction(
             min(max(limit, 0) / total, 1.0), self.device
@@ -1196,7 +1198,7 @@ class Planner:
             "available": available,
             "free_bytes": free,
             "grant_bytes": grant,
-            "free_wanted": required + self.overhead if capacity else 0,
+            "free_wanted": required if capacity else 0,
             "grant_wanted": self._reserved() + self.overhead + required if capacity else 0,
         }
 
@@ -1658,11 +1660,12 @@ class Planner:
         if self.room is None or self.spare:
             return False
         own = sum(self._evictable(v) for v in victims)
-        slack = self._reserved() - self._allocated()
         before = self.grant
+        # Physical free excludes already-consumed context bytes. The total grant must
+        # still cover them and every reserved segment, including unreleasable cache holes.
         request = (
-            max(need - own - slack, 0) + self.overhead,
-            max(self._allocated() - own + need + self.overhead, 0),
+            max(need - own, 0),
+            max(self._reserved() - own + need + self.overhead, 0),
             measured,
             before,
         )

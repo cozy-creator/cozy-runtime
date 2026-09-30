@@ -1,0 +1,1 @@
+Count observed non-allocator usage once against the process grant, instead of subtracting it again from already-free driver bytes. Keep allocator reserve fully charged, and align physical-free versus total-grant room invoices. Scope, alias, numerical-mode and residency policy remain unchanged; sampled limits and OOM recovery still apply.
