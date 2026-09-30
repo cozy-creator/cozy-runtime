@@ -1198,6 +1198,8 @@ class OfficialH3Pipeline:
         steps: int,
         frames: int,
         reference_image_short_edges: Sequence[int],
+        height: int | None = None,
+        width: int | None = None,
         task: Task = "ref2va",
         context: AVContext | None = None,
         delivery: ContinuationPlan | None = None,
@@ -1227,6 +1229,8 @@ class OfficialH3Pipeline:
             frames=frames,
             references=list(references),
             image_short_edges=tuple(reference_image_short_edges),
+            height=height,
+            width=width,
         )
         if context is not None and (context.height, context.width) != (state.height, state.width):
             raise InvalidRequest(
