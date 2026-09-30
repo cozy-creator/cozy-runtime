@@ -36,6 +36,7 @@ from cozy_runtime.author import ModelArtifact
 from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.internal import effect_interfaces
 from cozy_runtime.internal.call_intent import canonical_intent
+from cozy_runtime.internal.worker import machine_publication
 from cozy_runtime.internal.worker.machine_effects import _STALLED_ATTEMPTS, Effects
 from cozy_runtime.internal.worker.machine_publication import (
     PublicationAuthority,
@@ -580,18 +581,59 @@ def test_pushes_in_flight_grow_while_they_land_faster(
         assert sum(hub.verify_batches) == 102 and hub.unverified_at_finalize == [0]
 
 
-def test_pushes_in_flight_settle_where_the_link_stops_landing_faster(
+def test_congested_upload_verifies_and_releases_custody_after_pushes_finish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Past the link's capacity, twice the pushes land slower: the best level holds."""
+    """Real HTTP pushes and TLS grants settle every object under server-side congestion."""
     with staging(tmp_path, monkeypatch.setenv, parts=200) as (staged, hub, effects):
         hub.bucket.seconds, hub.bucket.capacity = 0.5, 16
         call = settle(staged, effects)
         assert not call.safe_code and call.result
         assert len(hub.bucket.objects) == 202 and set(hub.bucket.puts.values()) == {1}
-        # Thirty-two were tried once, then the window returned to sixteen for good.
-        assert 16 < hub.bucket.peak <= 32
-        assert max(hub.bucket.starts[-64:]) <= 16
+        # The bucket counts only requests whose bodies arrived. Client measurements
+        # also include connection/setup, grant and scheduling delays: server capacity
+        # cannot prescribe one exact chosen client window on a loaded CI host.
+        assert hub.bucket.active == 0
+        assert sum(hub.verify_batches) == 202 and hub.unverified_at_finalize == [0]
+        drive(effects, lambda: staged.hold_states() == ["released"])
+        assert not staged.calls.has_unsettled_effects("owner", "parent")
+
+
+@pytest.mark.parametrize(
+    "seconds,levels",
+    [((1.0, 4.0, 0.25), (32, 16, 16)), ((1.0, 1.0, 1.0), (32, 64, 64))],
+)
+def test_push_window_follows_observed_throughput_and_keeps_the_best_level(
+    monkeypatch: pytest.MonkeyPatch,
+    seconds: tuple[float, ...],
+    levels: tuple[int, ...],
+) -> None:
+    """Exercise the real policy with known byte/rate observations, apart from TLS noise."""
+    now = 0.0
+
+    class Clock:
+        @staticmethod
+        def monotonic() -> float:
+            return now
+
+    # Control only this policy's clock; the integration above uses real transport
+    # and clocks. No production callback or replacement pacing policy is involved.
+    monkeypatch.setattr(machine_publication, "time", Clock)
+    pace = machine_publication._Pace(16, 64)
+    pace.started()
+    now += 0.25
+    pace.ended(16, None)
+    assert pace.level == 16 and pace.count == 0 and not pace.settled
+
+    for duration, expected in zip(seconds, levels, strict=True):
+        level = pace.level
+        for _ in range(level):
+            pace.started()
+        now += duration
+        for _ in range(level):
+            pace.ended(level, (1 << 20, duration))
+        assert pace.level == expected and pace.running == 0
+    assert pace.settled and pace.best[1] == levels[-1]
 
 
 def test_upload_reports_held_bytes_then_publication_with_stage_timings(
