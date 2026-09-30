@@ -75,6 +75,7 @@ from cozy_runtime.internal import (
     machine_kernels,
     package_environment,
     package_installation,
+    package_interface,
     prepare_diagnostics,
     proctree,
     readiness,
@@ -1827,8 +1828,6 @@ class Worker:
         root = self.executions.capture_root(owner, attempt.request_id)
         capture = self.executions.capture(owner, root)
         prepared = self.executions.preparation(owner, root)["installations"]
-        from cozy_runtime.internal import package_interface
-
         from . import machine_child_target, machine_deferred
 
         deferred = machine_deferred.rows(capture)
@@ -1930,8 +1929,6 @@ class Worker:
         have no incarnation and must be rediscovered. The record is replaced on every
         rebuild, including repairs and SDK rollbacks to a previously used venv path.
         """
-        from cozy_runtime.internal import package_interface
-
         kept = package_installation.described(
             Path(self.options.install_root or ""), installed, distribution, application
         )
