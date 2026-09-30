@@ -3,11 +3,12 @@
 Construction runs on meta and torch never allocates a weight. The plane holds every weight
 byte, one weight set per component, in regions: `common` and each innermost no-split block
 (`paging.partition`). A scope is a stage: at `admit` the policy (`weight_policy.stage`) picks
-each component's resident prefix and window inside the plane budget; the prefix is wanted and
-a cursor streams the rest through a slot ring in the blocks' execution order. Each block runs
-inside exactly one acquire/release; a resident region binds once at its stable address, a
-streamed one per slot, from cached views. A torch OOM at a block boundary lowers the budget
-(unmap only) and runs the block again; capacity never poisons the executor.
+each component's resident set, window and ring inside the plane budget; the resident set is
+wanted and a cursor streams the rest through its byte ring in the blocks' execution order.
+Each block runs inside exactly one acquire/release; a resident region binds at its stable
+address, a streamed one at its place in the ring, from cached views. A torch OOM at a block
+boundary lowers the budget (unmap only) and runs the block again; capacity never poisons the
+executor.
 """
 
 from __future__ import annotations
@@ -380,18 +381,21 @@ def _host_available() -> int:
 
 
 def bind(torch: Any, region: Region, lease: Any) -> None:
-    """Point the region's destinations at the lease's bytes: its home while resident, a slot
-    while streamed. Views are cached by address (addresses repeat); decoded tensors and
-    derived leaf roles are recomputed whenever the bytes moved or a slot was refilled."""
+    """Point the region's destinations at the lease's bytes: its home while resident, its place
+    in the stage's ring while streamed. Views are cached by address (ring placements repeat
+    with the window); decoded tensors and derived leaf roles are recomputed whenever the bytes
+    moved or were streamed in again."""
     address = int(lease.ptr)
     views = region.views.get(address)
     if views is None:
+        if len(region.views) > weight_policy.MAX_WINDOW:
+            del region.views[next(a for a in region.views if a != region.bound)]
         views = region.views[address] = _views(torch, region, torch.from_dlpack(lease.view()))
     moved = region.bound != address
     if moved:
         for table, name, tensor in views.writes:
             table[name] = tensor
-    if region.transforms and (moved or lease.slot is not None):
+    if region.transforms and (moved or lease.ring_offset is not None):
         region.derived = _transform(torch, region, views.parts)
     region.bound = address
 
@@ -404,16 +408,16 @@ def unbind(region: Region) -> None:
 
 
 def close_cursor(component: Component) -> None:
-    """Close the stage's cursor after dropping every view of its slots (a slot's view keeps
-    its cursor open)."""
+    """Close the stage's cursor after dropping every view into its ring (one keeps the cursor
+    open)."""
     cursor = component.cursor
     if cursor is None:
         return
-    slots = set(cursor.slot_ptrs)
+    ring = range(cursor.ring_ptr, cursor.ring_ptr + cursor.ring_nbytes)
     for region in component.regions:
-        if region.bound in slots:
+        if region.bound is not None and region.bound in ring:
             unbind(region)
-        for address in slots & region.views.keys():
+        for address in [a for a in region.views if a in ring]:
             del region.views[address]
     cursor.close()
     component.cursor = None
@@ -1122,8 +1126,8 @@ class WeightResidency:
         self.exit: Callable[[StageExit], None] | None = None
         self.entered_ns = 0
         self.stage_mark = (0, 0, 0)
-        self._shortfall_error = plane.error("Shortfall") if plane.available() else Exception
-        self._budget_error = plane.error("BudgetExceeded") if plane.available() else Exception
+        self._shortfall_error = (plane.error("Shortfall"), plane.error("BelowFloor"))
+        self._budget_error = plane.error("BudgetExceeded")
         for component in self.components.values():
             self._hook(component)
             if _image_vae(component.root):
@@ -1304,7 +1308,7 @@ class WeightResidency:
         )
         device = plane.stats(weights.plane).device(weights.index)
         floor = sum(
-            weight_policy.floor(self.components[name].layout, 1)
+            weight_policy.floor(self.components[name].layout)
             for name in components
             if name in self.components
         )
@@ -1378,8 +1382,8 @@ class WeightResidency:
                 *(component.blocks[i].index for i in residence.resident),
             )
             if name in resume and (stale := sorted(before - set(component.resident))):
-                # A re-plan inside the stage: what left the prefix leaves the device, so the
-                # cursor's slots have the room the lower budget promised them.
+                # A re-plan inside the stage: what left the resident set leaves the device,
+                # so the cursor's ring has the room the lower budget promised it.
                 weights.plane.drop(component.ws, weights.index, stale)
                 for index in stale:
                     unbind(component.regions[index])
@@ -1403,15 +1407,19 @@ class WeightResidency:
             if residence.streamed and component.observed:
                 order = component.order
                 start = order.index(resume[name]) if name in resume else 0
-                component.cursor = weights.plane.stream(
-                    component.ws,
-                    weights.index,
-                    order[start:] + order[:start],
-                    residence.window,
-                    repeat=0,
-                    priority=plane.STREAMED + clock,
-                    tag=method,
-                )
+                try:
+                    component.cursor = weights.plane.stream(
+                        component.ws,
+                        weights.index,
+                        order[start:] + order[:start],
+                        residence.window,
+                        repeat=0,
+                        priority=plane.STREAMED + clock,
+                        tag=method,
+                        ring_bytes=residence.ring,
+                    )
+                except self._shortfall_error as exc:
+                    raise self._shortfall(method, need, budget, str(exc)) from None
         weights.drain()
 
     def _derived(self) -> int:
@@ -1466,7 +1474,7 @@ class WeightResidency:
                             raise
                         need = _requested(exc) or region.span
                 finally:
-                    if lease.slot is not None:
+                    if lease.ring_offset is not None:
                         unbind(region)
                     lease.release()
                 if _versions(args, kwargs) != versions:
@@ -1506,7 +1514,7 @@ class WeightResidency:
         method, local = self.active
         for name in local:
             close_cursor(self.components[name])
-        floor = sum(weight_policy.floor(self.components[name].layout, 1) for name in local)
+        floor = sum(weight_policy.floor(self.components[name].layout) for name in local)
         if not weights.shrink(need, floor):
             raise self._shortfall(method, need, 0, "no weight bytes are left to unmap")
         self._plan(method, local, weights.applied, resume={component.name: index})

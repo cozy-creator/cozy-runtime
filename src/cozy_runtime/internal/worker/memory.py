@@ -157,9 +157,9 @@ def floor_bytes(
     grow: int,
     context: int,
 ) -> int:
-    """The refusal floor: a stage's components' window-1 floors, its growth and the context.
+    """The refusal floor: a stage's components' floors, its growth and the context.
     Without components (one attempt, its components in turn) the largest single one's."""
-    per = {name: weight_policy.floor(layout, 1) for name, layout in layouts.items()}
+    per = {name: weight_policy.floor(layout) for name, layout in layouts.items()}
     base = (
         sum(per.get(name, 0) for name in components) if components else max(per.values(), default=0)
     )

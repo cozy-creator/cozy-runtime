@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import Literal
 
-#: Slots when nothing is measured yet: the block computing and the next one arriving.
+#: Streamed positions in flight when nothing is measured yet: the block computing and the next
+#: one arriving.
 DEFAULT_WINDOW = 2
 MAX_WINDOW = 6
 #: Allocator fragmentation between the plane's budget and torch's activations. Small because a
@@ -44,17 +45,18 @@ class Layout:
 
 @dataclass(frozen=True, slots=True)
 class Residence:
-    """One component's placement for one stage: the blocks that stay resident, the ones
-    streamed through `window` slots (both address-order indexes into `Layout.blocks`)."""
+    """One component's placement for one stage: the blocks that stay resident and the ones
+    streamed `window` ahead through a `ring` of device bytes (both address-order indexes
+    into `Layout.blocks`)."""
 
     resident: tuple[int, ...]
     streamed: tuple[int, ...]
     window: int
+    ring: int = 0
 
     def vram_bytes(self, layout: Layout) -> int:
-        """What this placement holds on the device: common, the resident set and the slots."""
-        slots = self.window * max((layout.blocks[i] for i in self.streamed), default=0)
-        return layout.common + sum(layout.blocks[i] for i in self.resident) + slots
+        """What this placement holds on the device: common, the resident set and the ring."""
+        return layout.common + sum(layout.blocks[i] for i in self.resident) + self.ring
 
 
 class BelowFloor(Exception):
@@ -73,15 +75,32 @@ def plane_budget(free: int, activation: int, context: int = 0, margin: int = MAR
     return max(free - activation - context - margin, 0)
 
 
-def floor(layout: Layout, window: int, activation: int = 0) -> int:
-    """The least a stage can run in: common, W slots of the largest region, activations, at
+def floor(layout: Layout, activation: int = 0) -> int:
+    """The least a stage can run in: common, a ring of the largest region, activations, at
     the finest grain the component offers. A component without blocks cannot stream, so all
     of it."""
-    width = max(window, 1)
-    coarse = layout.common + width * layout.largest if layout.blocks else layout.total
+    coarse = layout.common + layout.largest if layout.blocks else layout.total
     if layout.fine is not None:
-        coarse = min(coarse, layout.fine[0] + width * layout.fine[1])
+        coarse = min(coarse, sum(layout.fine))
     return coarse + activation
+
+
+def ring_bytes(sizes: Sequence[int], window: int) -> int:
+    """The ring that streams `sizes` (execution order, cyclic) `window` ahead without waiting
+    on anything but the release `window` positions back: room for any `window` consecutive
+    regions plus one wrap's waste, and never more than the plane's `window` x largest. Sizes
+    are spans (2 MiB multiples), which hold the plane's 4 KiB-aligned ring placements."""
+    if not sizes:
+        return 0
+    largest = max(sizes)
+    if window <= 1:
+        return largest
+    cycle = [sizes[i % len(sizes)] for i in range(len(sizes) + window - 1)]
+    run = most = sum(cycle[:window])
+    for i in range(window, len(cycle)):
+        run += cycle[i] - cycle[i - window]
+        most = max(most, run)
+    return min(window * largest, most + largest)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,8 +123,9 @@ def simulate(
 ) -> float:
     """Seconds per steady pass of one stage over its blocks in execution order (C2's model).
 
-    One copy stream and `window` slots, issued in order: streamed use k starts copying at the
-    later of the previous copy's end and the release of the use `window` before it, and takes
+    One copy stream, `window` positions in flight, issued in order (a `ring_bytes` ring never
+    adds a wait): streamed use k starts copying at the later of the previous copy's end and
+    the release of the use `window` before it, and takes
     `COPY_OVERHEAD_S + bytes / link`. A block starts after the previous one and, when streamed,
     after its copy; it holds the GPU for its compute plus `HOOK_S`. Copies run ahead across pass
     boundaries. The mean of passes 2..`passes` (the only pass when `passes` is 1).
@@ -146,7 +166,8 @@ def residence(
     streamed first -- and C2's event model (`simulate`) picks the fastest. Spread wins wherever
     it matters: a streamed tail idles the copy stream during a resident prefix (SDXL, +17-37%).
     Unmeasured costs place a spread set at `DEFAULT_WINDOW`. A run-once stage is resident whole
-    when it fits and streamed whole otherwise. Raises `BelowFloor` below common + one slot.
+    when it fits and streamed whole otherwise. Raises `BelowFloor` below common + the largest
+    block.
     """
     count = len(layout.blocks)
     walk = list(order) if sorted(order) == list(range(count)) else list(range(count))
@@ -163,8 +184,8 @@ def residence(
     typical = sum(known) / len(known) if known else 1.0
     compute = [costs.compute.get(i, typical) for i in walk] if measured else [1.0] * count
     if not cyclic:
-        width = _widest(layout, budget, (DEFAULT_WINDOW, 1))
-        return Residence(resident=(), streamed=tuple(walk), window=width)
+        width = DEFAULT_WINDOW if layout.common + ring_bytes(sizes, DEFAULT_WINDOW) <= budget else 1
+        return Residence((), tuple(walk), width, ring_bytes(sizes, width))
     best: tuple[float, int, int, Residence] | None = None
     widths = range(1, MAX_WINDOW + 1) if measured else (DEFAULT_WINDOW, 1)
     picks = (_spread(compute), _tail(count), _dense(sizes, compute))
@@ -177,6 +198,7 @@ def residence(
                 resident=tuple(i for p, i in enumerate(walk) if p not in streamed),
                 streamed=tuple(i for p, i in enumerate(walk) if p in streamed),
                 window=width,
+                ring=ring_bytes([sizes[p] for p in sorted(streamed)], width),
             )
             flags = [p in streamed for p in range(count)]
             seconds = simulate(sizes, compute, flags, width, costs.link_bps) if measured else 0.0
@@ -196,14 +218,14 @@ def _fit(
     sizes: Sequence[int],
     pick: Callable[[int], list[int]],
 ) -> frozenset[int] | None:
-    """The fewest streamed positions `pick` chooses (bisected) so common, the rest and `width`
-    slots of the largest streamed block fit `budget`; None when none do."""
+    """The fewest streamed positions `pick` chooses (bisected) so common, the rest and the
+    ring streaming them `width` ahead fit `budget`; None when none do."""
     total = sum(sizes)
 
     def fits(count: int) -> frozenset[int] | None:
         chosen = pick(count)
-        slot = max(sizes[p] for p in chosen)
-        held = layout.common + total - sum(sizes[p] for p in chosen) + width * slot
+        ring = ring_bytes([sizes[p] for p in sorted(chosen)], width)
+        held = layout.common + total - sum(sizes[p] for p in chosen) + ring
         return frozenset(chosen) if held <= budget else None
 
     low, high = 1, len(sizes)
@@ -251,10 +273,6 @@ def _dense(sizes: Sequence[int], compute: Sequence[float]) -> Callable[[int], li
     return lambda count: ranked[:count]
 
 
-def _widest(layout: Layout, budget: int, widths: Sequence[int]) -> int:
-    return next(w for w in widths if floor(layout, w) <= budget)
-
-
 def stage(
     layouts: Mapping[str, Layout],
     budget: int,
@@ -265,18 +283,18 @@ def stage(
 ) -> dict[str, Residence]:
     """Every declared component's residence for one stage, inside one plane budget.
 
-    Each component first gets its window-1 floor; what is left goes to cyclic components first
+    Each component first gets its floor; what is left goes to cyclic components first
     (they repeat, so every resident byte saves a copy per pass), then to run-once ones, which
     are resident only when whole. Components outside the stage are not counted: they are
     evictable, lower priority, and the plane unmaps them as this stage's wants arrive.
     """
     orders, costs = orders or {}, costs or {}
-    need = {name: floor(layout, 1) for name, layout in layouts.items()}
+    need = {name: floor(layout) for name, layout in layouts.items()}
     if sum(need.values()) > budget:
         raise BelowFloor(
             sum(need.values()),
             budget,
-            "the stage's common weights and one streaming slot do not fit the plane budget",
+            "the stage's common weights and its largest regions do not fit the plane budget",
         )
     spare = budget - sum(need.values())
     placed: dict[str, Residence] = {}
