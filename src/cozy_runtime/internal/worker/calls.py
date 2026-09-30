@@ -115,7 +115,13 @@ class Calls:
             return ()
         result = [dict(row) for row in attempt.job.call_interfaces]
         if self.installed_bindings is not None:
-            result.extend(self.installed_bindings(attempt))
+            captured = self.installed_bindings(attempt)
+            selected = {(row["module"], row["export"]) for row in captured}
+            # Installed metadata inventories imports; captured bindings determine
+            # their execution role. A full implementation wheel also embeds its
+            # own exports, which must retain their captured self-call binding.
+            result = [row for row in result if (row["module"], row["export"]) not in selected]
+            result.extend(captured)
         executor = attempt.executor
         result.extend(native_interfaces.rows(executor.hello if executor is not None else {}))
         if builtin_operations.supports_environment(attempt.job.python):
