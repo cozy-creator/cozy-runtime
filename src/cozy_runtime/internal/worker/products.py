@@ -233,7 +233,9 @@ class Products:
         )
         return pb.NativeByteRetentionRequest(source=grant.source, retention_id=grant.retention_id)
 
-    def _journal(self, owner: str, request: str, product: pb.RunProduct) -> int:
+    def _journal(
+        self, owner: str, request: str, product: pb.RunProduct, *, collect: bool = True
+    ) -> int:
         fold = self.fold(owner, request)
         if product.op == SET:
             current = fold.single.get(product.output)
@@ -243,7 +245,8 @@ class Products:
             product.index = len(fold.lists.get(product.output, []))
         sequence = self.executions.notice(owner, request, "product", documents.document(product))
         fold.add(product)
-        self._collect(owner, request, fold)
+        if collect:
+            self._collect(owner, request, fold)
         return sequence
 
     def _collect(self, owner: str, request: str, fold: Fold) -> None:

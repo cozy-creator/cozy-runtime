@@ -84,7 +84,7 @@ var routes = func() map[string]*route {
 }()
 
 func (m *Machine) serveRPC(_ any, stream grpc.ServerStream) (err error) {
-	if _, err := m.claims.refreshAuthority(stream.Context()); err != nil {
+	if err := m.claims.checkAuthority(); err != nil {
 		return err
 	}
 	call, cancel := context.WithCancel(stream.Context())

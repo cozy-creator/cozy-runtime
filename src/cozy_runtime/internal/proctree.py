@@ -96,6 +96,33 @@ class ProcessTreeScope:
     uid: int
 
 
+@dataclass(frozen=True, slots=True)
+class HostReclaimSample:
+    """Cumulative kernel activity at one finite-limit cgroup incarnation."""
+
+    scope: str
+    device: int
+    inode: int
+    limit_bytes: int
+    high: int | None
+    refault_file: int
+    maximum: int | None = None
+    high_limit: int | None = None
+    max_limit: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HostPressure:
+    """Kernel-limit excess, with reclaimable file bytes reported separately."""
+
+    scope: str
+    current_bytes: int
+    limit_bytes: int
+    debt_bytes: int
+    reclaimable_file_bytes: int = 0
+    reclaim_samples: tuple[HostReclaimSample, ...] = ()
+
+
 ExecutorScope = CgroupScope | ProcessTreeScope
 
 _PROCESS_SCOPE_TOKEN_BYTES = 32
@@ -1277,6 +1304,23 @@ def descendants(pid: int) -> list[int]:
     return sorted(found)
 
 
+def trim_host_allocator() -> bool:
+    """Ask libc to return free heap pages; live allocations and aliases remain owned.
+
+    This is an optional pressure response, not a byte estimate. Callers must measure
+    RSS and aggregate host headroom afterward even when libc reports success.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        trim = ctypes.CDLL(None).malloc_trim
+    except (OSError, AttributeError):
+        return False
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    return bool(trim(0))
+
+
 def rss_bytes(pid: int) -> int:
     """Current resident bytes for one pid, read BY THE PARENT from the kernel — never the
     child's claim about itself. -1 when the process is gone (UNREADABLE)."""
@@ -1292,40 +1336,258 @@ def rss_bytes(pid: int) -> int:
 
 
 def available_host_bytes() -> int:
-    """The LIVE host budget, from the cgroup when there is one, else MemAvailable.
+    """Live physical and cgroup headroom, including reclaimable inactive file cache.
 
-    §3.2's host-RAM rule: re-read at every grant, because a budget fixed at boot describes
-    a machine nobody else is on. -1 means UNREADABLE, never 0.
+    Unknown physical availability remains unreadable; cache credit is bounded by both
+    observed usage and MemAvailable. Re-read at every grant, not just process startup.
     """
+    return _host_room(reclaimable=True)
+
+
+def optional_host_bytes() -> int:
+    """Physical MemFree and raw ancestor high/max room; unknown means optional reads skip."""
+    return _host_room(reclaimable=False)
+
+
+def _host_room(*, reclaimable: bool) -> int:
     _linux_only("available_host_bytes")
-    if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
-        try:
+    try:
+        physical = next(
+            int(line.split()[1]) * 1024
+            for line in Path("/proc/meminfo").read_text().splitlines()
+            if line.startswith("MemAvailable:" if reclaimable else "MemFree:")
+        )
+    except (OSError, StopIteration, IndexError, ValueError):
+        return -1
+    if physical < 0:
+        return -1
+
+    def credit(directory: Path, limit_name: str, current_name: str, cache_name: str) -> int:
+        limit_text = (directory / limit_name).read_text().strip()
+        if limit_text == "max":
+            return physical
+        limit = int(limit_text)
+        current = int((directory / current_name).read_text().strip())
+        if limit < 0 or current < 0:
+            raise ValueError("negative cgroup memory counter")
+        inactive = 0
+        if reclaimable:
+            # Missing cache statistics must not invent reclaimable memory.
+            try:
+                stats = dict(
+                    line.split() for line in (directory / "memory.stat").read_text().splitlines()
+                )
+                inactive = max(0, int(stats.get(cache_name, "0")))
+            except (OSError, ValueError):
+                pass
+        return max(0, limit - current + min(current, inactive))
+
+    try:
+        if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
             relative = next(
                 line.split("::", 1)[1]
                 for line in Path("/proc/self/cgroup").read_text().splitlines()
                 if line.startswith("0::")
             )
-            cgroup = Path("/sys/fs/cgroup") / relative.lstrip("/")
-            v2_limit = (cgroup / "memory.max").read_text().strip()
-            if v2_limit != "max":
-                current = int((cgroup / "memory.current").read_text().strip())
-                return max(int(v2_limit) - current, 0)
-        except (OSError, StopIteration, ValueError):
-            pass
-    else:
+            mount = Path("/sys/fs/cgroup")
+            cgroup = mount / relative.lstrip("/")
+            # A parent can constrain a child whose own memory.max is unlimited.
+            while cgroup.is_relative_to(mount):
+                # The controller root has no memory limit files on ordinary v2 hosts.
+                if cgroup == mount and not (cgroup / "memory.max").is_file():
+                    break
+                if not reclaimable and not (cgroup / "memory.high").is_file():
+                    return -1
+                physical = min(
+                    physical, credit(cgroup, "memory.max", "memory.current", "inactive_file")
+                )
+                # memory.high is the kernel's reclaim/throttle boundary, even when
+                # memory.max still has room. Do not promise storage past either.
+                if (cgroup / "memory.high").is_file():
+                    physical = min(
+                        physical, credit(cgroup, "memory.high", "memory.current", "inactive_file")
+                    )
+                if cgroup == mount:
+                    break
+                cgroup = cgroup.parent
+        else:
+            cgroup = _cgroup_v1_controller_path("memory")
+            mounts = tuple(
+                mount
+                for mount in _cgroup_v1_mounts()
+                if "memory" in mount.controllers and cgroup.is_relative_to(mount.target)
+            )
+            if len(mounts) != 1:
+                raise ContainmentUnavailable("memory cgroup path has no unique v1 mount")
+            v1_mount = mounts[0]
+            while cgroup.is_relative_to(v1_mount.target):
+                physical = min(
+                    physical,
+                    credit(
+                        cgroup,
+                        "memory.limit_in_bytes",
+                        "memory.usage_in_bytes",
+                        "total_inactive_file",
+                    ),
+                )
+                if cgroup == v1_mount.target:
+                    break
+                cgroup = cgroup.parent
+    except (ContainmentUnavailable, OSError, StopIteration, ValueError):
+        if not reclaimable:
+            return -1
+    return physical
+
+
+def host_pressure() -> HostPressure | None:
+    """Read actual cgroup-limit excess, independently of admission's cache credit.
+
+    The returned debt is the largest ``max(0, current - limit)``
+    across this process's cgroup ancestors.  ``limit`` is the minimum finite v2
+    ``memory.high``/``memory.max``; v1 uses ``memory.limit_in_bytes``.  Very large finite
+    limits naturally produce zero debt. An unreadable finite fact yields no observation.
+
+    The kernel charges file pages to memory.high too. Subtracting inactive_file here
+    can hide active reclaim/refault stalls while idle managed backing remains cached.
+    Those pages still supply admission credit through available_host_bytes(); this observation
+    lets Machine prefer releasing safe idle backing when the kernel limit is exceeded.
+    """
+    _linux_only("host_pressure")
+
+    def finite(text: str) -> int | None:
+        value = text.strip().lower()
+        if value == "max":
+            return None
+        limit = int(value)
+        if limit < 0:
+            raise ValueError("invalid cgroup memory limit")
+        return limit
+
+    facts: list[HostPressure] = []
+    samples: list[HostReclaimSample] = []
+
+    def read_v2(directory: Path) -> None:
         try:
-            memory = _cgroup_v1_controller_path("memory")
-            v1_limit = int((memory / "memory.limit_in_bytes").read_text().strip())
-            current = int((memory / "memory.usage_in_bytes").read_text().strip())
-            # cgroup v1 represents "unlimited" as a page-rounded value near LONG_MAX.
-            if 0 < v1_limit < (1 << 60):
-                return max(v1_limit - current, 0)
-        except (ContainmentUnavailable, OSError, ValueError):
+            identity = directory.stat()
+        except OSError:
+            identity = None
+        limits: list[int] = []
+        configured: dict[str, int | None] = {}
+        for name in ("memory.high", "memory.max"):
+            path = directory / name
+            if path.is_file():
+                limit = finite(path.read_text())
+                configured[name] = limit
+                if limit is not None:
+                    limits.append(limit)
+        if not limits:
+            return
+        limit = min(limits)
+        current = int((directory / "memory.current").read_text().strip())
+        if current < 0:
+            raise ValueError("invalid cgroup memory current")
+        stats = dict(line.split() for line in (directory / "memory.stat").read_text().splitlines())
+        inactive = max(0, min(current, int(stats.get("inactive_file", "0"))))
+        # Optional observations must not disable ordinary debt maintenance on older
+        # kernels. Never manufacture a zero counter for unavailable evidence.
+        try:
+            events = dict(
+                line.split() for line in (directory / "memory.events").read_text().splitlines()
+            )
+            high = int(events["high"]) if "high" in events else None
+            maximum = int(events["max"]) if "max" in events else None
+            refault = int(stats["workingset_refault_file"])
+            after_identity = directory.stat()
+            if (
+                identity is not None
+                and (identity.st_dev, identity.st_ino)
+                == (after_identity.st_dev, after_identity.st_ino)
+                and (high is not None or maximum is not None)
+                and all(value >= 0 for value in (high, maximum, refault) if value is not None)
+            ):
+                samples.append(
+                    HostReclaimSample(
+                        str(directory),
+                        identity.st_dev,
+                        identity.st_ino,
+                        limit,
+                        high,
+                        refault,
+                        maximum,
+                        configured.get("memory.high"),
+                        configured.get("memory.max"),
+                    )
+                )
+        except (OSError, KeyError, ValueError):
             pass
+        facts.append(
+            HostPressure(
+                str(directory),
+                current,
+                limit,
+                max(current - limit, 0),
+                inactive,
+            )
+        )
+
+    def read_v1(directory: Path) -> None:
+        limit = finite((directory / "memory.limit_in_bytes").read_text())
+        if limit is None:
+            return
+        current = int((directory / "memory.usage_in_bytes").read_text().strip())
+        if current < 0:
+            raise ValueError("invalid cgroup memory usage")
+        stats = dict(line.split() for line in (directory / "memory.stat").read_text().splitlines())
+        inactive = max(0, min(current, int(stats.get("total_inactive_file", "0"))))
+        facts.append(
+            HostPressure(
+                str(directory),
+                current,
+                limit,
+                max(current - limit, 0),
+                inactive,
+            )
+        )
+
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    except (OSError, IndexError, ValueError):
-        return -1
-    return -1
+        if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
+            relative = next(
+                line.split("::", 1)[1]
+                for line in Path("/proc/self/cgroup").read_text().splitlines()
+                if line.startswith("0::")
+            )
+            mount = Path("/sys/fs/cgroup")
+            cgroup = mount / relative.lstrip("/")
+            while cgroup.is_relative_to(mount):
+                read_v2(cgroup)
+                if cgroup == mount:
+                    break
+                cgroup = cgroup.parent
+        else:
+            cgroup = _cgroup_v1_controller_path("memory")
+            mounts = tuple(
+                mount
+                for mount in _cgroup_v1_mounts()
+                if "memory" in mount.controllers and cgroup.is_relative_to(mount.target)
+            )
+            if len(mounts) != 1:
+                raise ContainmentUnavailable("memory cgroup path has no unique v1 mount")
+            v1_mount = mounts[0]
+            while cgroup.is_relative_to(v1_mount.target):
+                read_v1(cgroup)
+                if cgroup == v1_mount.target:
+                    break
+                cgroup = cgroup.parent
+    except (ContainmentUnavailable, OSError, StopIteration, IndexError, ValueError):
+        return None
+    chosen = max(facts, key=lambda fact: fact.debt_bytes, default=None)
+    if chosen is None:
+        return None
+    return HostPressure(
+        chosen.scope,
+        chosen.current_bytes,
+        chosen.limit_bytes,
+        chosen.debt_bytes,
+        chosen.reclaimable_file_bytes,
+        tuple(samples),
+    )

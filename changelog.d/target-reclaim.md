@@ -1,0 +1,1 @@
+- For known-target reclamation, trim only after observed allocator release could cover the remaining gap, then stop only on fresh proven room; preserve unknown/group policies and poison failed drains.

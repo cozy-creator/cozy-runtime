@@ -75,7 +75,10 @@ func (i *idle) observe(now time.Time, busy, known bool) (time.Time, error) {
 	}
 	hadWork := i.s.WorkObserved || known && busy
 	unknown := !known && hadWork
-	if known && busy || unknown || i.s.Unknown {
+	// A live Runtime with unreadable activity holds the deadline. Once the
+	// Runtime is known dead, its prior unknown sample must not start a fresh
+	// idle window.
+	if known && busy || unknown {
 		i.renewed = max(i.renewed, now.Add(idleGrace).UnixMilli())
 	}
 	target := max(i.s.Deadline, i.renewed)
@@ -222,14 +225,56 @@ func (a *activity) say(now time.Time, line string) {
 }
 
 // restarts paces transient failures and exposes structural failures until repair/update.
-// It never persists a crash count as idleness or infers success from CPU activity.
+// Pre-readiness failures survive request-plane and machine restarts; only a proved
+// readiness or explicit repair clears them. They are not workload observations.
 type restarts struct {
+	path     string
 	mu       sync.Mutex
 	failures uint
 	retryAt  time.Time
 	blocked  bool
 	detail   string
 	safeCode string
+}
+
+type restartState struct {
+	Failures uint   `json:"pre_ready_failures"`
+	Blocked  bool   `json:"blocked"`
+	Detail   string `json:"detail,omitempty"`
+	Code     string `json:"code,omitempty"`
+}
+
+func openRestarts(path string) (*restarts, error) {
+	r := &restarts{path: path}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return r, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var s restartState
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, fmt.Errorf("Runtime restart state unreadable: %w", err)
+	}
+	r.failures, r.blocked, r.detail, r.safeCode = s.Failures, s.Blocked, s.Detail, s.Code
+	return r, nil
+}
+
+func (r *restarts) save() error {
+	if r.path == "" {
+		return nil
+	}
+	raw, _ := json.Marshal(restartState{r.failures, r.blocked, r.detail, r.safeCode})
+	return writeAtomic(r.path, raw, 0o600)
+}
+
+func (r *restarts) retain() {
+	if err := r.save(); err != nil {
+		r.blocked = true
+		r.safeCode = "runtime_restart_state_unavailable"
+		r.detail = fmt.Sprintf("cannot persist Runtime restart state: %v", err)
+	}
 }
 
 func (r *restarts) gone() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.blocked }
@@ -251,7 +296,7 @@ func (r *restarts) clear() error {
 	r.blocked = false
 	r.detail, r.safeCode = "", ""
 	r.retryAt = time.Time{}
-	return nil
+	return r.save()
 }
 func (r *restarts) fail(err error) {
 	var refusal *launchRefusal
@@ -266,8 +311,9 @@ func (r *restarts) fail(err error) {
 	if errors.As(err, &refusal) {
 		r.safeCode = refusal.code
 	}
+	r.retain()
 }
-func (r *restarts) exited(err error) bool {
+func (r *restarts) exited(err error, wasReady ...bool) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.detail = "Runtime exited: " + exitText(err)
@@ -275,10 +321,25 @@ func (r *restarts) exited(err error) bool {
 	if errors.As(err, &exited) && exited.ExitCode() == 6 {
 		r.safeCode = "runtime_launch_refused"
 		r.blocked = true
+		r.retain()
 		return false
 	}
-	r.failures++
-	delay := min(time.Second*time.Duration(uint64(1)<<min(r.failures-1, 5)), 30*time.Second)
+	if len(wasReady) > 0 && wasReady[0] {
+		r.failures = 0
+	} else {
+		r.failures++
+	}
+	if r.failures >= 2 {
+		r.blocked = true
+		r.safeCode = "runtime_readiness_failed"
+		r.retain()
+		return false
+	}
+	r.retain()
+	if r.blocked {
+		return false
+	}
+	delay := min(time.Second*time.Duration(uint64(1)<<min(max(r.failures, 1)-1, 5)), 30*time.Second)
 	r.retryAt = time.Now().Add(delay)
 	return true
 }

@@ -20,7 +20,7 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor, _send_reply
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
 from cozy_runtime.internal.executor_replies import AttemptReply
-from cozy_runtime.internal.seam import MAX_FRAME, Channel
+from cozy_runtime.internal.seam import EXECUTOR_MEMORY_CAPABILITIES, MAX_FRAME, Channel
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -86,7 +86,16 @@ def executor(tmp_path: Path) -> Iterator[Executor]:
     with left, right:
         host = Executor(Channel(left), tmp_path / "root")
         (tmp_path / "root").mkdir()
-        assert host.start(msgspec.convert({**binding, "devices": devices}, Start))["ok"]
+        assert host.start(
+            msgspec.convert(
+                {
+                    **binding,
+                    "devices": devices,
+                    "memory_capabilities": sorted(EXECUTOR_MEMORY_CAPABILITIES),
+                },
+                Start,
+            )
+        )["ok"]
         load = {"devices": devices, "binding": binding, "budgets": {}, "construction": "a"}
         assert host.load(msgspec.convert(load, Load))["ok"]
         assert host.activate(Activate(construction="a"))["ok"]
@@ -179,7 +188,14 @@ def test_telemetry_of_any_shape_reaches_the_worker_and_never_fails_the_attempt(
     (long,) = [row for name, row in rows.items() if str(name).startswith("mmm")]
     assert len(str(long["name"])) == 200 and "~" in str(long["name"])
     assert long["fields"] == {
-        "seed": str(2**60), "loss": "nan", "scale": 0.5, "k0": 0, "k1": 1, "k2": 2, "k3": 3, "k4": 4
+        "seed": str(2**60),
+        "loss": "nan",
+        "scale": 0.5,
+        "k0": 0,
+        "k1": 1,
+        "k2": 2,
+        "k3": 3,
+        "k4": 4,
     }
     assert rows["loss"]["value"] == "inf"
     assert "older" not in rows and attempt.caps["unreadable_rows"] == 1
