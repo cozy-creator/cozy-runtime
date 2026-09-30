@@ -7,9 +7,10 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import torch
-from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+from transformers import Qwen3VLConfig
 
 from cozy_runtime.author import ConformanceError
+from cozy_runtime.models.qwen3_vl import Qwen3VLHiddenStateModel
 
 _SOURCE_ARCHITECTURE = "Qwen3VLForConditionalGeneration"
 _SOURCE_LAYERS = 64
@@ -26,7 +27,12 @@ def release_position_cache(conditioner: Any) -> Any:
     scope, so it runs wherever the conditioner runs, including a group rank that hosts it,
     and on a failing forward too.
     """
-    return conditioner.model.register_forward_hook(_forget_rope_deltas, always_call=True)
+    handle = conditioner.model.register_forward_hook(_forget_rope_deltas, always_call=True)
+    if isinstance(conditioner, Qwen3VLHiddenStateModel):
+        # This adapter explicitly owns rope_deltas; do not extend another root's
+        # unrelated custom contract merely because it acquired this hook.
+        conditioner._cozy_retry_hooks = (*conditioner._cozy_retry_hooks, _forget_rope_deltas)
+    return handle
 
 
 def _forget_rope_deltas(module: Any, _args: Any, _output: Any) -> None:
@@ -61,7 +67,7 @@ class FinalHiddenState:
         return torch.device("cpu")
 
     def model(self, **kwargs: Any) -> Any:
-        outputs = self._conditioner.model(**{**kwargs, "output_hidden_states": False})
+        outputs = self._conditioner(**{**kwargs, "output_hidden_states": False})
         return SimpleNamespace(hidden_states={_RETAINED_LAYERS: outputs.last_hidden_state})
 
 
@@ -119,7 +125,7 @@ def build_text_conditioner(config: Mapping[str, object]) -> Any:
             fields=["text_encoder", "text_config", "num_hidden_layers"],
         )
 
-    model = Qwen3VLForConditionalGeneration(Qwen3VLConfig(**source))
+    model = Qwen3VLHiddenStateModel(Qwen3VLConfig(**source))
     language = cast(Any, model.model.language_model)
     if len(language.layers) != _SOURCE_LAYERS:
         raise ConformanceError(

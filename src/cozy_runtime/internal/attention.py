@@ -406,6 +406,42 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     return ready
 
 
+def prepare(arch: int, preferred: Sequence[str] = ()) -> list[dict[str, object]]:
+    """Prepare architecture-only artifacts with GPUs hidden; never import or launch a kernel."""
+    store = kernel_cache.configured()
+    rows: list[dict[str, object]] = []
+    if store is None:
+        return [{"status": "unavailable", "detail": "no machine kernel store"}]
+    seen: set[str] = set()
+    names = [*preferred, *(candidate.name for candidate in CANDIDATES)]
+    for name in dict.fromkeys(names):
+        candidate = BY_NAME.get(name)
+        if candidate is None:
+            continue
+        if not candidate.artifact or candidate.artifact in seen or _architecture_admits(
+            candidate, "cuda", arch
+        ):
+            continue
+        seen.add(candidate.artifact)
+        try:
+            job = kernel_sources.job(candidate.artifact, arch)
+            if job.kind != "python" and candidate.artifact != "sageattention":
+                rows.append({
+                    "kernel": candidate.name, "status": "deferred",
+                    "detail": "native recipe requires owned-device preparation",
+                })
+                continue
+            state = kernel_compile.submit(
+                store, replace(job, env={**job.env, "CUDA_VISIBLE_DEVICES": ""})
+            )
+            rows.append({"kernel": candidate.name, **state.document()})
+        except Exception as exc:
+            rows.append({
+                "kernel": candidate.name, "status": "unavailable", "detail": str(exc)[:300],
+            })
+    return rows
+
+
 def expect(device: DeviceFacts, preferred: Sequence[str] = ()) -> list[dict[str, Any]]:
     """Start compiling, before any construction exists, every kernel this device's first
     construction could select: the model's preference and the ranked table. Returns at once,
@@ -548,22 +584,26 @@ def _bind_sol_dense(dense: Ready) -> None:
 
 
 def _device_admits(candidate: Candidate, device: DeviceFacts) -> str:
-    """Empty when this DEVICE is inside the candidate's DECLARED range, else why it is not."""
-    if candidate.sms and device.sm not in candidate.sms:
-        return f"{candidate.name} serves SM {sorted(candidate.sms)}, not sm{device.sm}"
-    if candidate.min_sm and (device.kind != "cuda" or device.sm < candidate.min_sm):
+    return _architecture_admits(candidate, device.kind, device.sm)
+
+
+def _architecture_admits(candidate: Candidate, kind: str, sm: int) -> str:
+    """Static architecture eligibility; it says nothing about launch qualification."""
+    if candidate.sms and sm not in candidate.sms:
+        return f"{candidate.name} serves SM {sorted(candidate.sms)}, not sm{sm}"
+    if candidate.min_sm and (kind != "cuda" or sm < candidate.min_sm):
         return (
             f"{candidate.name} needs sm{candidate.min_sm} or better; this executor holds "
-            f"{device.kind} sm{device.sm}"
+            f"{kind} sm{sm}"
         )
-    if candidate.max_sm and device.kind == "cuda" and device.sm > candidate.max_sm:
+    if candidate.max_sm and kind == "cuda" and sm > candidate.max_sm:
         serves = (
             f"sm{candidate.max_sm} only"
             if candidate.min_sm == candidate.max_sm
             else f"sm{candidate.min_sm} through sm{candidate.max_sm}"
         )
         return (
-            f"{candidate.name} serves {serves}; this executor holds sm{device.sm}, and the "
+            f"{candidate.name} serves {serves}; this executor holds sm{sm}, and the "
             "binary behind it carries no device code for that architecture. Calling it anyway "
             "returns `cudaErrorNoKernelImageForDevice` or kills the process from C++ rather "
             "than raising something this runtime could recover from (h3a-022)"

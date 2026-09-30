@@ -161,7 +161,12 @@ def executor_serve(
     site_module = roots["ref2va_dit"]
     hidden = torch.randn(1, TOKENS, 1024, device=cuda, dtype=torch.bfloat16)
     layout = AttentionLayout(TOKENS, 0, step=5, dense_until_step=4)
-    with torch.no_grad(), attention_sol.observing() as counts, attention_scope(layout):
+    with (
+        torch.no_grad(),
+        attention_sol.selected(attention_sol.capture(cuda)),
+        attention_sol.observing() as counts,
+        attention_scope(layout),
+    ):
         sol = site_module(hidden)
     out["sol_counts"] = dict(counts)
     out["sol_site_finite"] = bool(torch.isfinite(sol).all())
@@ -195,7 +200,11 @@ def sol_numerics(cuda: Any, layout: AttentionLayout) -> dict[str, float]:
     value = torch.randn(1, TOKENS, heads, 128, generator=generator, device=cuda).bfloat16()
     token = attention_sol._SITE.set(attention_sol.Site("ref2va_dit", ""))
     try:
-        with torch.no_grad(), attention_scope(layout):
+        with (
+            torch.no_grad(),
+            attention_sol.selected(attention_sol.capture(cuda)),
+            attention_scope(layout),
+        ):
             sol = attention_sol.sol_attention(query, key, value)
     finally:
         attention_sol._SITE.reset(token)
