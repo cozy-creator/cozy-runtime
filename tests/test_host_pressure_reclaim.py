@@ -12,7 +12,7 @@ import pytest
 from cozy_runtime.internal import memory, proctree
 
 
-def test_host_pressure_excludes_bounded_inactive_file_cache(
+def test_host_pressure_counts_file_pages_charged_to_the_kernel_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     files = {
@@ -42,7 +42,34 @@ def test_host_pressure_excludes_bounded_inactive_file_cache(
     assert pressure.current_bytes == 1300
     assert pressure.limit_bytes == 1000
     assert pressure.reclaimable_file_bytes == 100
-    assert pressure.debt_bytes == 200
+    assert pressure.debt_bytes == 300
+
+
+@pytest.mark.parametrize(
+    ("current", "debt", "available"), [(900, 0, 300), (1000, 0, 200), (1100, 100, 100)]
+)
+def test_cache_remains_admission_credit_without_hiding_kernel_pressure(
+    current: int, debt: int, available: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    files = {
+        "/proc/meminfo": "MemAvailable: 1000 kB\nMemFree: 1000 kB\n",
+        "/proc/self/cgroup": "0::/worker\n",
+        "/sys/fs/cgroup/worker/memory.current": str(current),
+        "/sys/fs/cgroup/worker/memory.high": "1000",
+        "/sys/fs/cgroup/worker/memory.max": "2000",
+        "/sys/fs/cgroup/worker/memory.stat": "inactive_file 200\n",
+    }
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda path: str(path) == "/sys/fs/cgroup/cgroup.controllers" or str(path) in files,
+    )
+    monkeypatch.setattr(Path, "read_text", lambda path: files[str(path)])
+    pressure = proctree.host_pressure()
+    assert pressure is not None and pressure.debt_bytes == debt
+    assert pressure.reclaimable_file_bytes == 200
+    assert proctree.available_host_bytes() == available
+    assert proctree.optional_host_bytes() == max(1000 - current, 0)
 
 
 def test_host_pressure_v1_large_limit_leaves_parent_debt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -70,7 +97,7 @@ def test_host_pressure_v1_large_limit_leaves_parent_debt(monkeypatch: pytest.Mon
     pressure = proctree.host_pressure()
     assert pressure is not None
     assert pressure.scope.endswith("/parent")
-    assert pressure.debt_bytes == 200
+    assert pressure.debt_bytes == 300
 
 
 def test_unlimited_ancestor_without_counters_does_not_hide_child_debt(
@@ -121,7 +148,7 @@ class PressureCache:
         fact = self.pressure[0]
         self.pressure[0] = proctree.HostPressure(
             fact.scope,
-            fact.current_bytes,
+            fact.current_bytes - released,
             fact.limit_bytes,
             max(fact.debt_bytes - released, 0),
             fact.reclaimable_file_bytes,
@@ -191,8 +218,8 @@ def test_pressure_relief_requires_idle_generation_and_monotone_progress(
     assert len(cache.calls) == expected_calls
 
 
-def test_pressure_relief_does_not_touch_cache_when_debt_is_covered() -> None:
-    pressure = [proctree.HostPressure("/worker", 120, 100, 0, 20)]
+def test_pressure_relief_keeps_cache_when_usage_is_at_the_limit() -> None:
+    pressure = [proctree.HostPressure("/worker", 100, 100, 0, 20)]
     policy = memory.Machine({}, lambda _: None, lambda _: None, host_pressure=lambda: pressure[0])
     cache = PressureCache("idle", 40, pressure)
     assert policy.relieve_host_pressure([cache]) is None
@@ -211,7 +238,8 @@ def test_pressure_relief_remeasures_physical_relief_without_logical_release() ->
 
     policy = memory.Machine({}, lambda _: None, lambda _: None, host_pressure=lambda: pressure[0])
     cache = PhysicalOnly("idle", 40, pressure)
-    assert policy.relieve_host_pressure([cache]) == {
+    later = PressureCache("later", 40, pressure, last_used=1)
+    assert policy.relieve_host_pressure([cache, later]) == {
         "initial_debt_bytes": 20,
         "reclaimed_managed_bytes": 0,
         "attempts": 1,
@@ -221,6 +249,7 @@ def test_pressure_relief_remeasures_physical_relief_without_logical_release() ->
         "generation": "",
     }
     assert cache.calls == [20]
+    assert not later.calls
 
 
 def test_pressure_schedule_does_not_block_caller_or_duplicate_work() -> None:
