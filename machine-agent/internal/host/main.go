@@ -53,7 +53,7 @@ func inherited(environ []string) []string {
 	var out []string
 	for _, entry := range environ {
 		switch name, _, _ := cut(entry); name {
-		case "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR":
+		case "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR", "CUDA_VISIBLE_DEVICES":
 			out = append(out, entry)
 		}
 	}

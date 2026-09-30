@@ -148,8 +148,8 @@ class DeviceLane:
 
     @property
     def entries(self) -> tuple[str, ...]:
-        """The seal's entries, one per ordinal, in ordinal order."""
-        return split_envelope(self.devices)
+        """The seal's entries, one per ordinal, in ordinal order; "" on a lane of no device."""
+        return split_envelope(self.devices) or ("",) * len(self.ordinals)
 
     @property
     def group(self) -> bool:
@@ -265,7 +265,8 @@ class LaneSet:
 
     @classmethod
     def from_envelope(cls, devices: str, *, worker_pid: int) -> LaneSet:
-        entries = split_envelope(devices) or ("0",)
+        # No GPU is one lane sealed to no device, never to a card the inventory lacks.
+        entries = split_envelope(devices) or ("",)
         lanes = tuple(
             DeviceLane(lane_id_for((ordinal,)), (ordinal,), entry, worker_pid=worker_pid)
             for ordinal, entry in enumerate(entries)

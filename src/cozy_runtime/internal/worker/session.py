@@ -3448,7 +3448,7 @@ class Worker:
         The ledger's legacy scalar cannot express absence separately. Lifecycle reclaim uses
         AcceleratorOps' tri-state observation directly, where that distinction is authoritative.
         """
-        if pid <= 0:
+        if pid <= 0 or not self.options.gpus:  # no GPU to hold memory on, no driver to ask
             return -1
         observed = accel.process_memory(pid, accel.host_backend_family())
         return observed.bytes if observed.state == "present" else -1
