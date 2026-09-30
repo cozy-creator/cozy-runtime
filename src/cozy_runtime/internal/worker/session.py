@@ -2714,13 +2714,11 @@ class Worker:
                         "memory-prefetch", f"{demand.tenant!r}: {type(exc).__name__}: {exc}"[:256]
                     )
                     continue
-                if report.get("skipped"):
-                    self.note("memory-prefetch", f"{demand.tenant!r}: {report['skipped']}"[:256])
-                elif wanted():
+                if not report.get("skipped") and wanted():
                     self._pages_warmed[key] = tier
-                    self.note(
-                        "memory-prefetch", f"{demand.tenant!r} {page_warm.describe(report)}"[:256]
-                    )
+                self.note(
+                    "memory-prefetch", f"{demand.tenant!r} {page_warm.describe(report)}"[:256]
+                )
 
     def _prefetch_first_use(self, demand: policy.Demand) -> None:
         """An accepted first-use template has immutable refs but no executor tier yet."""
@@ -2791,11 +2789,9 @@ class Worker:
                 remaining = max(0, remaining - report.get("bytes", 0))
                 if report.get("bytes", 0) > 0:
                     self._first_pages_attempted.setdefault(template, set()).add(item)
-                if report.get("skipped"):
-                    self.note("memory-prefetch", f"first use: {report['skipped']}"[:256])
-                elif report.get("complete") and wanted():
+                if not report.get("skipped") and report.get("complete") and wanted():
                     self._first_pages_warmed.setdefault(template, set()).add(item)
-                    self.note("memory-prefetch", f"first use: {page_warm.describe(report)}"[:256])
+                self.note("memory-prefetch", f"first use: {page_warm.describe(report)}"[:256])
         except Exception as exc:
             # Optional reads never change the accepted request or its ordinary preparation.
             self.note("memory-prefetch", f"first use skipped: {type(exc).__name__}"[:256])
@@ -6671,8 +6667,7 @@ class Worker:
                     reading=self.memory.optional_store_read,
                     allowance=self.memory.prefetch_allowance,
                 )
-                detail = report.get("skipped") or page_warm.describe(report)
-                self.note("page-warm", f"{placement_id!r} {detail}"[:256])
+                self.note("page-warm", f"{placement_id!r} {page_warm.describe(report)}"[:256])
             except Exception as exc:
                 self.note("page-warm", f"{placement_id!r}: {type(exc).__name__}: {exc}"[:256])
 

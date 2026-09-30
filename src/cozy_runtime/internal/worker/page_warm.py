@@ -127,12 +127,23 @@ def warm_component(
 
 
 def describe(report: WarmReport) -> str:
-    """One line for the worker's residency notes, in the words the restore path uses."""
+    """Keep measured work even when a read stopped; a denied read invents no measurements."""
+    if "bytes" not in report:
+        return report.get("skipped", "no page read measured")
     moved, took, read = report["bytes"], report["ms"], report["read_bytes"]
-    rate = f"{moved / took / 1e6:.1f} GB/s" if took > 0 else "instant"
+    rate = f"{moved / took / 1e6:.1f} GB/s" if took > 0 else "rate unavailable"
     if read < 0:
         served = "block-device reads unreadable"
     else:
         cache = "cold" if read > moved // 2 else "warm page cache"
         served = f"{read} B read from the block layer ({cache})"
-    return f"page-warmed {report['component']!r}: {moved} B in {took:.0f} ms ({rate}), {served}"
+    measured = f"{moved} B in {took:.1f} ms ({rate}), {served}"
+    if "batches" in report:
+        measured += f", {report['batches']} batches"
+    if report.get("complete") is True:
+        return f"page-warmed {report['component']!r}: {measured}"
+    state = "partial page-warm" if report.get("complete") is False else "page read"
+    if reason := report.get("skipped"):
+        measured += f"; stopped: {reason}"
+    # Worker notes are bounded: keep work and its stop reason ahead of a long component name.
+    return f"{state}: {measured}; component={report['component']!r}"
