@@ -623,7 +623,7 @@ def test_push_window_follows_observed_throughput_and_keeps_the_best_level(
     pace.started()
     now += 0.25
     pace.ended(16, None)
-    assert pace.level == 16 and pace.count == 0 and not pace.settled
+    assert (pace.level, pace.count, pace.settled) == (16, 0, False)
 
     for duration, expected in zip(seconds, levels, strict=True):
         level = pace.level
