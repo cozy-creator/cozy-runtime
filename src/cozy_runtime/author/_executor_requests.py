@@ -9,6 +9,7 @@ executor runs in its package's own environment, so either side may be the older 
 
 from __future__ import annotations
 
+import os
 import socket
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -130,8 +131,21 @@ class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
     length: int
 
 
+class HostTier(_Request, frozen=True, kw_only=True, tag="host_tier"):
+    """One weight set's pinned host tier (`tensorfs.plane`), which the worker keeps across
+    executors: `offer` sends it (its memfd follows this request), else asks for the one the
+    worker holds for exactly this layout (`Tier` answers; its memfd follows when held)."""
+
+    name: str
+    layout: str
+    offer: bool = False
+    #: the memfd the worker received with an offer; never on the wire
+    memfd: int = -1
+
+
 type _Tagged = (
     DeviceRoom
+    | HostTier
     | ChildEvents
     | Checkpoint
     | ChildCall
@@ -169,6 +183,13 @@ def refuse(code: str, detail: str) -> Answer:
 class Handoff(Answer, frozen=True, kw_only=True):
     """An answer the worker follows with one connected socket, whose received fd this is."""
 
+    descriptor: int = -1
+
+
+class Tier(Answer, frozen=True, kw_only=True):
+    """The worker's answer to a `HostTier` ask; one memfd follows when `held`."""
+
+    held: bool = False
     descriptor: int = -1
 
 
@@ -262,10 +283,11 @@ class Exchange(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class DescriptorReply:
-    """A trusted handler's answer and its one connected capability; never a JSON fd number."""
+    """A trusted handler's answer and its one capability, a connected socket or a memfd the
+    sender closes after sending; never a JSON fd number."""
 
     answer: Answer
-    descriptor: socket.socket
+    descriptor: socket.socket | int
 
 
 type Reply = Answer | DescriptorReply
@@ -301,10 +323,13 @@ def decode(frame: Mapping[str, object]) -> Request:
 
 
 def respond(
-    frame: Mapping[str, object], handler: Handler | None
-) -> tuple[dict[str, object], socket.socket | None]:
-    """The answer frame to one request frame, and the socket that follows it."""
+    frame: Mapping[str, object], handler: Handler | None, received: int | None = None
+) -> tuple[dict[str, object], socket.socket | int | None]:
+    """The answer frame to one request frame, and the capability that follows it. `received`
+    is the memfd that came with the request (a `HostTier` offer); it goes to the handler or
+    is closed."""
     reply: Reply
+    request: Request | None = None
     if handler is None:
         reply = refuse("no_durable_exchange", f"no handler for {frame.get('kind')!r}")
     else:
@@ -312,8 +337,14 @@ def respond(
             request = decode(frame)
         except CapabilityError as exc:
             reply = refuse(exc.code, exc.message)
+    if received is not None:
+        if isinstance(request, HostTier):
+            request = msgspec.structs.replace(request, memfd=received)
         else:
-            reply = handler(request)
+            os.close(received)
+            request, reply = None, refuse("seam_descriptor", "unexpected memfd with a request")
+    if request is not None and handler is not None:
+        reply = handler(request)
     handoff = reply.descriptor if isinstance(reply, DescriptorReply) else None
     body = encode(reply.answer if isinstance(reply, DescriptorReply) else reply)
     if handoff is not None:

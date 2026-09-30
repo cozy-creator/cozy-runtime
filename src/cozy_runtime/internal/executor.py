@@ -78,9 +78,11 @@ from cozy_runtime.author._executor_requests import (
     CheckpointReceipt,
     ChildEvents,
     Handoff,
+    HostTier,
     Publish,
     Published,
     Request,
+    Tier,
 )
 from cozy_runtime.author._executor_requests import encode as encode_request
 from cozy_runtime.author._invoke import (
@@ -165,7 +167,13 @@ from cozy_runtime.internal.seam import (
     SeamError,
     connect,
 )
-from cozy_runtime.internal.weights import PlaneBackend, ResidencyRefusal, WeightResidency, Weights
+from cozy_runtime.internal.weights import (
+    HostTiers,
+    PlaneBackend,
+    ResidencyRefusal,
+    WeightResidency,
+    Weights,
+)
 from cozy_runtime.internal.worker.plan import shape_cell
 
 #: The inline-result door (worker-protocol/01 `ResultEnvelope`): a small typed result rides
@@ -1948,6 +1956,9 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
+            tiers=HostTiers(ask=host._ask_tier, offer=host._offer_tier)
+            if command.host_tier and self.rank == 0
+            else None,
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
@@ -2312,6 +2323,7 @@ class Executor:
                     if self.world > 1
                     else UNSET,
                     sequence_parallel_degree=max(self.world, 1),
+                    host_tier=command.host_tier,
                 ),
                 optional_attention_scope=True,
             )
@@ -3617,6 +3629,15 @@ class Executor:
         """One product onto the run's output log, durable before this returns."""
         return self._durable(request, Published)
 
+    def _ask_tier(self, name: str, layout: str) -> int | None:
+        """The pinned host tier the worker keeps for exactly this weight set's layout."""
+        answer = self._durable(HostTier(name=name, layout=layout), Tier)
+        return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
+
+    def _offer_tier(self, name: str, layout: str, memfd: int) -> None:
+        """Hand the worker a tier this process filled, so its bytes outlive the process."""
+        self._durable(HostTier(name=name, layout=layout, offer=True, memfd=memfd), Answer)
+
     def _child_events(self) -> int | None:
         """The worker's nudge socket for this attempt's calls; None from an older worker."""
         answer = self._durable(ChildEvents(), Handoff)
@@ -3630,10 +3651,16 @@ class Executor:
         the lossy lane's whole contract is that it may shed.
         """
         body = encode_request(request)
+        sending = request.memfd if isinstance(request, HostTier) and request.offer else -1
+        body.pop("memfd", None)
         with self._durable_lock:
             self._exchange += 1
             exchange = f"{body['kind']}#{self._exchange}"
+            if sending >= 0:
+                body["descriptor"] = True
             self.channel.send({"event": "request", "seq": self._exchange, **body})
+            if sending >= 0:
+                self.channel.send_memfd(sending)
             frame = self.channel.recv()
             if frame is None:
                 raise SeamError("seam_closed", f"the worker closed during {exchange}")
@@ -3644,10 +3671,13 @@ class Executor:
                 )
             handoff = issubclass(into, Handoff)
             if frame.get("descriptor") is True:
-                if not handoff:
+                if issubclass(into, Tier):
+                    frame["descriptor"] = self.channel.recv_memfd()
+                elif not handoff:
                     self.channel.close()
                     raise SeamError("seam_descriptor", "unexpected capability in control reply")
-                frame["descriptor"] = self.channel.recv_descriptor()
+                else:
+                    frame["descriptor"] = self.channel.recv_descriptor()
             elif handoff and frame.get("ok") is True:
                 raise SeamError("seam_descriptor", "successful reply omitted its capability")
         try:

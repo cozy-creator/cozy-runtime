@@ -30,6 +30,7 @@ import contextlib
 import json
 import os
 import socket
+import stat
 import struct
 import threading
 import time
@@ -138,6 +139,50 @@ class Channel:
 
     def recv_descriptor(self) -> int:
         """Receive exactly one connected socket with close-on-exec descriptor custody."""
+        # Reject a regular file, listener, TCP socket or datagram before a storage handle
+        # sees it. No address is opened or connected here.
+        received = self._recv_fd()
+        try:
+            descriptor = socket.socket(fileno=received)
+        except OSError as exc:
+            os.close(received)
+            self._raise(exc)
+        try:
+            if descriptor.family != socket.AF_UNIX or descriptor.type != socket.SOCK_STREAM:
+                raise SeamError("seam_descriptor", "capability must be a local stream")
+            descriptor.getpeername()
+            descriptor.set_inheritable(False)
+            return descriptor.detach()
+        except OSError as exc:
+            self._raise(exc)
+        finally:
+            descriptor.close()
+
+    def send_memfd(self, fd: int) -> None:
+        """Transfer one weight set's pinned host tier (`tensorfs.plane` memfd)."""
+        _require_memfd(fd)
+        try:
+            sent = self.sock.sendmsg(
+                [b"\0"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))]
+            )
+        except OSError as exc:
+            self._raise(exc)
+        if sent != 1:
+            raise SeamError("seam_descriptor", "memfd handoff was truncated")
+        self.sent_bytes += 1
+
+    def recv_memfd(self) -> int:
+        """Receive exactly one memfd; anything else is closed and refused."""
+        received = self._recv_fd()
+        try:
+            _require_memfd(received)
+        except SeamError:
+            os.close(received)
+            raise
+        return received
+
+    def _recv_fd(self) -> int:
+        """One descriptor after a one-byte marker, close-on-exec, and nothing else."""
         received: list[int] = []
         width = array.array("i").itemsize
         try:
@@ -155,19 +200,8 @@ class Channel:
                 valid = valid and len(data) % width == 0
             if not valid or len(received) != 1:
                 raise SeamError("seam_descriptor", "expected exactly one scoped capability")
-            # Reject a regular file, listener, TCP socket or datagram before a
-            # storage handle sees it. No address is opened or connected here.
-            descriptor = socket.socket(fileno=received[0])
-            received.clear()  # The socket now owns the received descriptor.
-            try:
-                if descriptor.family != socket.AF_UNIX or descriptor.type != socket.SOCK_STREAM:
-                    raise SeamError("seam_descriptor", "capability must be a local stream")
-                descriptor.getpeername()
-                descriptor.set_inheritable(False)
-                self.recv_bytes += 1
-                return descriptor.detach()
-            finally:
-                descriptor.close()
+            self.recv_bytes += 1
+            return received.pop()
         except OSError as exc:
             self._raise(exc)
         finally:
@@ -288,3 +322,14 @@ def connect(path: str) -> Channel:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(path)
     return Channel(sock)
+
+
+def _require_memfd(fd: int) -> None:
+    """A regular file the kernel names `/memfd:…`: an anonymous in-memory tier, never a path."""
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        named = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"memfd unreadable: {exc}") from exc
+    if not regular or not named.startswith("/memfd:"):
+        raise SeamError("seam_descriptor", "capability must be a memfd")

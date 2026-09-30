@@ -58,7 +58,9 @@ from cozy_runtime.author._executor_requests import (
     Answer,
     DeviceRoom,
     Handler,
+    HostTier,
     ModelPrefetch,
+    Reply,
     Request,
     Room,
     refuse,
@@ -147,13 +149,14 @@ from cozy_runtime.internal.worker.control import (
     WatchFanout,
 )
 from cozy_runtime.internal.worker.gpu_scheduler import GpuBroker, width_for
+from cozy_runtime.internal.worker.host_tier import HostTiers
 from cozy_runtime.internal.worker.lanes import (
     DeviceLane,
     LaneRefusal,
     LaneRow,
     LaneSet,
 )
-from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
+from cozy_runtime.internal.worker.ledger import Ledger, read_host_available, read_vmrss
 from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority, origin_key
 from cozy_runtime.internal.worker.memory import MemoryManager, StageNeed, plane_capable
@@ -953,6 +956,8 @@ class Worker:
         self.lanes = LaneSet.from_envelope(options.devices, worker_pid=os.getpid())
         #: every device byte of this machine, across every executor, package and rank
         self.memory = MemoryManager(self.lanes, self.note, self._end_tenant)
+        #: every weight set's pinned host tier, kept across executors (`host_tier.py`)
+        self.host_tiers = HostTiers(read_host_available)
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         # Before any executor starts: an older executor reads the image kernel site once.
         self.machine_kernels = machine_kernels.boot(
@@ -5768,6 +5773,8 @@ class Worker:
             parameter_names=_parameter_names_by_model(group),
             attention_pin=attention_pin,
         )
+        if plane_capable(executor):
+            command = msgspec.structs.replace(command, host_tier=True)
         subject = f"load:{label}"
         began = time.perf_counter()
         self.monitor.start(subject, "load")
@@ -6263,12 +6270,15 @@ class Worker:
             )
 
     def _room(self, lane: DeviceLane, slot: str) -> Handler:
-        """Answer an executor before the plane that asks for room mid-load or mid-call (its
-        rank 0 does): idle tenants of every device of its lane give theirs back."""
+        """Answer an executor's load or activation exchanges: a plane executor's pinned host
+        tiers (kept here across executors), and an older executor's room: idle tenants of
+        every device of its lane give theirs back."""
 
-        def answer(request: Request) -> Answer:
+        def answer(request: Request) -> Reply:
+            if isinstance(request, HostTier):
+                return self.host_tiers.answer(request)
             if not isinstance(request, DeviceRoom):
-                return refuse("no_durable_exchange", "device_room only")
+                return refuse("no_durable_exchange", "device_room or host_tier only")
             need = request.free_bytes
             why = f"its executor needs {need} B free"
             self.memory.make_room(lane, slot, {ordinal: need for ordinal in lane.ordinals}, why)

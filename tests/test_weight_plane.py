@@ -27,7 +27,12 @@ from cozy_runtime.author._loader import census  # noqa: E402
 from cozy_runtime.internal import plane  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
-from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights  # noqa: E402
+from cozy_runtime.internal.weights import (  # noqa: E402
+    HostTiers,
+    PlaneBackend,
+    WeightResidency,
+    Weights,
+)
 from cozy_runtime.internal.weights_sink import weights_transaction_id  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
@@ -101,7 +106,14 @@ def write_checkpoint(root: Path) -> tuple[Checkpoint, dict[str, Any]]:
     return Checkpoint(root / "store", manifest), {k: v.half() for k, v in values.items()}
 
 
-def load(weights: Weights, checkpoint: Checkpoint, key: str, *, reverse: bool = False) -> Any:
+def load(
+    weights: Weights,
+    checkpoint: Checkpoint,
+    key: str,
+    *,
+    reverse: bool = False,
+    tiers: HostTiers | None = None,
+) -> Any:
     """Construct on meta and register with the plane, as the executor's prepare does."""
     backend = PlaneBackend.for_script(
         {"stack": checkpoint},
@@ -109,6 +121,7 @@ def load(weights: Weights, checkpoint: Checkpoint, key: str, *, reverse: bool = 
         weights=weights,
         construction=key,
         release="plane-test/1",
+        tiers=tiers,
     )
     with torch.device("meta"):
         stack = Stack(reverse=reverse)

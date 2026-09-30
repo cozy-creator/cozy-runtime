@@ -202,6 +202,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: A follower's half: rank 0's hardware plan and, in a many-model load, which model.
     group: GroupHardware | UnsetType = UNSET
     model_key: str | UnsetType = UNSET
+    #: The worker keeps pinned host tiers (`HostTier` exchanges); older workers do not.
+    host_tier: bool = False
 
     def single(self) -> ModelLoad:
         return ModelLoad(

@@ -498,8 +498,12 @@ class PlaneBackend:
         qualified: tuple[Capabilities, QualificationResult],
         device_facts: DeviceFacts,
         custody: str = "canonical",
+        tiers: HostTiers | None = None,
     ) -> None:
         self.weights = weights
+        #: the worker's pinned host tiers, kept across executors: adopted when it holds one
+        #: for exactly this layout, offered when this process filled a new one
+        self.tiers = tiers
         self.torch = weights.torch
         self.construction = construction
         self.checkpoints = dict(checkpoints)
@@ -552,6 +556,7 @@ class PlaneBackend:
         release: str,
         objective: str = "latency",
         encoded_leaves: str = "accept",
+        tiers: HostTiers | None = None,
     ) -> PlaneBackend:
         """A backend for a driver script with no model class: measure, qualify, resolve a
         `script_plan` over these rows, then construct, through the executor's own authority."""
@@ -589,6 +594,7 @@ class PlaneBackend:
             construction=construction,
             qualified=qualified,
             device_facts=facts,
+            tiers=tiers,
         )
 
     def _select(self, key: str, row: PlanRow) -> Selection:
@@ -888,18 +894,30 @@ class PlaneBackend:
             [(name, self.plan[key].name) for key in keys], READ_WINDOW, (name,)
         )
         weights = self.weights
+        key = f"{self.construction}/{name}"
+        ids = [[f"{name}/{self.plan[k].name}" for k in group] for _, group in kept]
+        digest = canonical.digest({"manifest": checkpoint.manifest_id, "regions": ids})
+        tiers = None if fine else self.tiers
+        held = tiers.ask(key, digest) if tiers is not None else None
         with store_refusals(f"registering {name}"):
             source = self.sources.get(checkpoint.manifest_id)
             if source is None:
                 source = self.sources[checkpoint.manifest_id] = plane.source(
                     weights.plane, checkpoint.store, self.leases.take(name)
                 )
-            ws = weights.plane.register(
-                f"{self.construction}/{name}",
-                source,
-                plan,
-                [[f"{name}/{self.plan[key].name}" for key in group] for _, group in kept],
-            )
+            try:
+                ws = weights.plane.register(key, source, plan, ids, host_fd=held)
+            except plane.error("Invalid"):
+                if held is None:
+                    raise
+                ws = None  # the held tier is not this layout after all
+            finally:
+                if held is not None:
+                    os.close(held)  # the plane reopened its own description
+            if ws is None:
+                held, ws = None, weights.plane.register(key, source, plan, ids)
+        if tiers is not None and held is None:
+            tiers.offer(key, digest, ws.host_fd)
         spans = msgspec.convert(ws.regions, list[_Span])
         placed = {row.what: row for row in msgspec.convert(ws.parts, list[_Placed])}
         sites = _sites(root, name)
@@ -956,6 +974,15 @@ class PlaneBackend:
             ),
             fine=fine,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class HostTiers:
+    """The worker's pinned host tiers, reached over the seam: `ask` returns the memfd it holds
+    for exactly (weight set, layout) or None; `offer` hands it a freshly filled one."""
+
+    ask: Callable[[str, str], int | None]
+    offer: Callable[[str, str, int], None]
 
 
 class _Span(msgspec.Struct, frozen=True):
