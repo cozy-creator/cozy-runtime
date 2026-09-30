@@ -160,12 +160,13 @@ def test_real_private_prepares_reuse_and_rebuild_interface(metadata: bool, memoi
             assert incarnations[0] != incarnations[1]
             assert imports() == 4 * described + 1
             # Adopted environments are mutable, so each description imports.
-            adopted = package_installation.open_existing_environment(
-                refreshed.python, "mutable", package=installed.package, release=installed.release
+            adopted = package_installation.retain_environment(
+                install_root, refreshed.python, package=installed.package, release=installed.release
             )
             assert adopted.incarnation is None
+            request.package.installation_id = adopted.installation_id
             for _ in range(2):
-                actual = worker._describe_installed(adopted, "cache-probe")
+                actual = prepare()
                 assert package_interface.parse(actual).application == "cache_probe:app"
             assert imports() == 4 * described + 3
         finally:
