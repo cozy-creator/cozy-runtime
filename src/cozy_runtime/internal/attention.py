@@ -14,6 +14,7 @@ activation precision; quantizing those activations requires an explicit backend 
 from __future__ import annotations
 
 import site
+import sys
 import time
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
@@ -785,13 +786,11 @@ def _projection_dtype(projection: Any) -> str:
     """Encoded output contract, or an ordinary floating Linear's result dtype."""
     import torch
 
-    if type(projection).__module__ == "peft.tuners.lora.layer":
-        from peft.tuners.lora.layer import Linear as PeftLinear
-
-        if type(projection) is PeftLinear:
-            # PEFT returns the base result's dtype, even with differently typed factors.
-            # Inspect the current base: encoded fill can replace it after construction.
-            projection = projection.get_base_layer()
+    peft_linear = getattr(sys.modules.get("peft.tuners.lora.layer"), "Linear", None)
+    if peft_linear is not None and type(projection) is peft_linear:
+        # PEFT returns the base result's dtype, even with differently typed factors.
+        # Inspect the current base: encoded fill can replace it after construction.
+        projection = projection.get_base_layer()
     declared = getattr(projection, "out_dtype", None)
     if declared is None and type(projection) is torch.nn.Linear:
         declared = projection.weight.dtype

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -58,9 +59,10 @@ def test_peft_attention_contract_tracks_actual_encoded_replacement(factor_dtype:
     assert not torch.cuda.is_initialized()
 
 
-def test_custom_wrapper_cannot_claim_peft_output_contract() -> None:
+def test_custom_wrapper_cannot_claim_peft_output_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     torch = pytest.importorskip("torch")
-    pytest.importorskip("peft")
     from cozy_runtime.internal import attention
 
     class Custom:
@@ -71,3 +73,8 @@ def test_custom_wrapper_cannot_claim_peft_output_contract() -> None:
             return torch.nn.Linear(4, 4, dtype=torch.bfloat16)
 
     assert attention._projection_dtype(Custom()) == ""
+    # Unavailable optional exports must not break an unadapted author's projection.
+    monkeypatch.setitem(sys.modules, "peft.tuners.lora.layer", ModuleType("unavailable_peft"))
+    assert attention._projection_dtype(Custom()) == ""
+    sdpa = next(candidate for candidate in attention.CANDIDATES if candidate.name == "sdpa")
+    assert attention._admits(sdpa, attention._projection_dtype(Custom()), 128)
