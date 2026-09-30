@@ -348,7 +348,7 @@ class MemoryManager:
         self, lane: DeviceLane, slot: str, need: dict[int, int] | None, why: str
     ) -> dict[int, DeviceMemory]:
         """Cut idle tenants of `lane`'s devices until `need` is free on each (None: the whole
-        device), for an executor before the plane that loads or asks for room."""
+        device), for a load or an older executor that asks for room."""
 
         def short(o: int, memory: DeviceMemory) -> bool:
             return need is None or memory.free_bytes < need[o]

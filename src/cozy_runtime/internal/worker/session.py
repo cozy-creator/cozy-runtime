@@ -5747,10 +5747,11 @@ class Worker:
         label = key.removeprefix("sha256:")[:12]
         if not first.weightless:
             lane.touch(slot)
-        if not first.weightless and not plane_capable(executor):
-            # An executor before the plane fills its weights onto the device: idle tenants of
-            # every device give room first. Bindings of one construction share its weights,
-            # so they are counted once. A plane executor maps nothing until its turn.
+        if not first.weightless:
+            # Idle tenants of every device give room for the weights first: an executor before
+            # the plane fills them onto the device, and a plane executor's `Model.warm` stages
+            # them. A plane tenant gives room by a budget cut, so its bytes stay pinned.
+            # Bindings of one construction share its weights, so they are counted once.
             declared = max(binding.logical_weight_bytes for binding in group)
             self.memory.make_room(
                 lane,
