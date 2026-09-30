@@ -451,7 +451,10 @@ def _lane(worker: Worker, ordinals: Ordinals) -> DeviceLane:
     """The seal of the lane a replica on these cards binds, without binding one."""
     devices = ",".join(worker.lanes.by_id[lane_id_for((o,))].devices for o in ordinals)
     return DeviceLane(
-        lane_id_for(ordinals), ordinals, devices, worker_pid=os.getpid(),
+        lane_id_for(ordinals),
+        ordinals,
+        devices,
+        worker_pid=os.getpid(),
         locks=tuple(worker.lanes.by_id[lane_id_for((o,))].locks[0] for o in ordinals),
     )
 
