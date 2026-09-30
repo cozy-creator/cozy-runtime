@@ -5585,8 +5585,11 @@ class Worker:
         return executor
 
     def _start_executor(self, tenant: Tenant, executor: child.Executor) -> str:
-        """`start` the process OFF the device lock: every rank spawned, joined, imported and
-        warmed. Returns a latch, or "" once the process is started."""
+        """Start every rank, admitting new model-bearing contexts through MemoryManager.
+
+        Weightless starts keep their CPU overlap. Returns the actual startup
+        refusal, or "" once the process is started.
+        """
         lane = tenant.lane
         placement_id = tenant.placement.placement_id
         first = next(iter(tenant.bindings.values()), None)
@@ -5601,7 +5604,13 @@ class Worker:
         began = time.perf_counter()
         self.monitor.start(f"start:{placement_id}", "load")
         try:
-            reply = executor.call(command, timeout=None)
+            admission = (
+                self.memory.starting(lane, tenant.slot)
+                if any(not binding.weightless for binding in tenant.bindings.values())
+                else contextlib.nullcontext()
+            )
+            with admission:
+                reply = executor.call(command, timeout=None)
         except ExecutorGone as exc:
             self.monitor.end(f"start:{placement_id}", "executor_gone")
             reply = {"ok": False, "code": "executor_gone_during_start", "detail": str(exc)}
@@ -5630,7 +5639,7 @@ class Worker:
                 tenant.supervision.retire_current(executor, f"start refused: {reply.get('code')}")
             except ExecutorGone as exc:
                 self.note("recovery", f"start refusal reclaim failed: {exc}")
-            return "prepare refused: every binding"
+            return f"{reply.get('code') or 'executor_start_refused'}: {detail}"
         self.monitor.end(f"start:{placement_id}", "started")
         executor.started = dict(reply)
         stages = reply.get("stages") or ()

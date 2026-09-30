@@ -115,6 +115,19 @@ class MemoryManager:
 
     # ------------------------------------------------------------------ admission
 
+    @contextmanager
+    def starting(self, lane: DeviceLane, slot: str) -> Iterator[None]:
+        """Admit a new device context under the same physical locks as a call.
+
+        Startup has no measured bound yet. Use the existing unknown-need policy:
+        every idle managed tenant on these devices vacates before CUDA or the
+        rank group initializes. Active work keeps its lock; external allocations
+        remain external, and a genuine startup refusal is never retried here.
+        """
+        with lane.device:
+            self.make_room(lane, slot, None, "executor startup")
+            yield
+
     def need(self, lane: DeviceLane, slot: str, shape: Shape) -> Need:
         """What one call of `shape` needs free on each device, beyond what `slot` holds."""
         row = lane.row(slot)

@@ -234,15 +234,17 @@ class Prespawns:
             # restores the adopted process's priority.
             if not slot.claimed.is_set():
                 _nice(executor, 19)
-            reply = executor.call(
-                Start(
-                    devices=lane.devices,
-                    sequence_parallel_degree=len(slot.ordinals),
-                    application=interface.application,
-                    package_interface=str(path),
-                ),
-                timeout=None,
-            )
+            startup = "warm-" + _digest([slot.installation, list(slot.ordinals)])
+            with worker.memory.starting(lane, startup):
+                reply = executor.call(
+                    Start(
+                        devices=lane.devices,
+                        sequence_parallel_degree=len(slot.ordinals),
+                        application=interface.application,
+                        package_interface=str(path),
+                    ),
+                    timeout=None,
+                )
             if not reply.get("ok"):
                 raise ExecutorGone(f"start refused: {reply.get('code')}: {reply.get('detail')}")
             executor.started = dict(reply)
@@ -448,7 +450,10 @@ def uid_key(installation: str, ordinals: Ordinals) -> str:
 def _lane(worker: Worker, ordinals: Ordinals) -> DeviceLane:
     """The seal of the lane a replica on these cards binds, without binding one."""
     devices = ",".join(worker.lanes.by_id[lane_id_for((o,))].devices for o in ordinals)
-    return DeviceLane(lane_id_for(ordinals), ordinals, devices, worker_pid=os.getpid())
+    return DeviceLane(
+        lane_id_for(ordinals), ordinals, devices, worker_pid=os.getpid(),
+        locks=tuple(worker.lanes.by_id[lane_id_for((o,))].locks[0] for o in ordinals),
+    )
 
 
 #: The priority an adopted process returns to: the worker's own.
