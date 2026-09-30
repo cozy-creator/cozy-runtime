@@ -220,12 +220,15 @@ class _Offer(msgspec.Struct, frozen=True, tag_field="reply", tag="plan_offer"):
     rank: int
     model: str
     plan: GroupPlan
+    staging_quantum: int = 0
+    staging_slots: int = 0
 
 
 class _Agreed(msgspec.Struct, frozen=True, tag_field="cmd", tag="plan_agreed"):
     """Rank 0's verdict: every rank resolved the same plan, so every rank may fill."""
 
     model: str
+    staging_credits: tuple[int, ...] = ()
 
 
 class SpreadLog(TypedDict):
@@ -314,15 +317,30 @@ def _decode[T](
         raise GpuDivergence(gpu, field_name, f"{what}: {exc}") from exc
 
 
-def offer_plan(channel: Channel, *, rank: int, model: str, plan: Mapping[str, object]) -> None:
+def offer_plan(
+    channel: Channel,
+    *,
+    rank: int,
+    model: str,
+    plan: Mapping[str, object],
+    staging: tuple[int, int] = (0, 0),
+) -> int:
     """A follower's half of `RankGroup.agree_plan`: offer this rank's plan and fill only
     once rank 0 found every plan equal to its own."""
-    offer = _Offer(rank, model, GroupPlan.read(plan))
+    offer = _Offer(rank, model, GroupPlan.read(plan), *staging)
     gpu = execution_evidence.gpu_name(offer.plan.devices, rank)
     channel.send(msgspec.to_builtins(offer))
     agreed = _decode(channel.recv(timeout=None), _Agreed, gpu, "plan", "invalid plan agreement")
     if agreed.model != model:
         raise GpuDivergence(gpu, "plan", f"invalid plan agreement for {agreed.model!r}")
+    if staging[0]:
+        credits = agreed.staging_credits
+        if len(credits) != offer.plan.degree or any(value < 0 for value in credits):
+            raise GroupRefusal("construction staging credit missing or invalid")
+        if credits[rank] < staging[0] or credits[rank] % staging[0]:
+            raise GroupRefusal("construction staging credit cannot fund one complete slot")
+        return credits[rank]
+    return 0
 
 
 class RankGroup:
@@ -623,16 +641,40 @@ class RankGroup:
                 raise GroupRefusal(self.broken, code="group_broken")
             return body
 
-    def agree_plan(self, *, model: str, plan: Mapping[str, object]) -> None:
-        """Every rank resolved on its own card; a plan that differs is divergence, refused
-        before a destination exists. Where each rank's weights live is its own."""
+    def agree_plan(
+        self,
+        *,
+        model: str,
+        plan: Mapping[str, object],
+        staging: tuple[int, int] = (0, 0),
+        reserve_staging: Callable[[tuple[tuple[int, int, int], ...]], tuple[int, ...]]
+        | None = None,
+    ) -> int:
+        """Agree invariant plans, then admit rank-local staging before any fill starts."""
         mine = GroupPlan.read(plan)
+        demands = [(staging[0], staging[1], 1)]
         for follower, reply in zip(self.followers, self.collect("plan_offer"), strict=True):
             offer = _decode(reply, _Offer, follower.gpu, "plan", "invalid GPU offer")
             if (offer.rank, offer.model) != (follower.rank, model):
                 raise GpuDivergence(follower.gpu, "plan", "invalid GPU offer")
             offer.plan.assert_agrees(mine, rank=follower.rank)
-        self.broadcast(msgspec.to_builtins(_Agreed(model)))
+            if offer.staging_quantum < 0 or offer.staging_slots < 0:
+                raise GroupRefusal("negative construction staging geometry")
+            if offer.staging_quantum and offer.staging_slots:
+                demands.append((offer.staging_quantum, offer.staging_slots, 1))
+            else:
+                # An older peer uses the common Load binding's full ring geometry.
+                # It cannot consume a reduced allowance that it does not understand.
+                demands.append((staging[0], staging[1], staging[1]))
+        credits: tuple[int, ...] = ()
+        if staging[0]:
+            if reserve_staging is None:
+                raise GroupRefusal("construction staging admission unavailable")
+            credits = reserve_staging(tuple(demands))
+            if len(credits) != self.degree:
+                raise GroupRefusal("construction staging admission refused")
+        self.broadcast(msgspec.to_builtins(_Agreed(model, credits)))
+        return credits[0] if credits else 0
 
     def call(self, command: Mapping[str, object]) -> list[dict[str, Any]]:
         self.broadcast(command)

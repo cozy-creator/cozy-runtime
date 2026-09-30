@@ -387,6 +387,7 @@ class Executor:
         self.active = ""
         #: HOST ONLY: every memory decision of this process (made at device init)
         self.planner: memory.Planner | None = None
+        self._staging_quarantine: dict[int, Any] = {}
         self.started = False
         self.imported = False
         self.package_warmed = False
@@ -652,10 +653,17 @@ class Executor:
         answer = self._durable(StoreRead(reservation=token), Answer)
         if not answer.ok:
             raise RuntimeFailure(answer.detail or answer.code, code="store_read_refused")
+        drained = True
         try:
             yield
+        except RuntimeFailure as exc:
+            if exc.code == "device_fault":
+                drained = False
+                self.host.poisoned = str(exc)
+            raise
         finally:
-            self._durable(StoreRead(reservation=token, release=True), Answer)
+            if drained:
+                self._durable(StoreRead(reservation=token, release=True), Answer)
 
     def _ask_host_room(self, token: str, nbytes: int, release: bool = False) -> bool:
         """A single-rank host copy reserves credit before allocation and releases it after."""
@@ -1949,6 +1957,8 @@ class Executor:
                     self.planner.forget(member.memory_key)
                 if member.backend is not None:
                     member.backend.close()
+                if self.planner is not None:
+                    self.planner.staging_unbacked.pop(member.memory_key, None)
             prefix = key + "#"
             for name in [name for name in self.group_components if name[0].startswith(prefix)]:
                 del self.group_components[name]
@@ -2024,7 +2034,60 @@ class Executor:
         backend.poison(())
         self.poisoned = poison
 
+    def _own_fill_backend(self, backend: Any) -> None:
+        self.backend = backend
+        self.host._staging_quarantine[id(backend)] = backend
+
+    def _reserve_construction_staging(
+        self, demands: tuple[tuple[int, int, int], ...]
+    ) -> tuple[int, ...]:
+        token = "construction-staging-" + uuid.uuid4().hex
+
+        def reserve(nbytes: int) -> bool:
+            answer = self._durable(HostRoom(reservation=token, nbytes=nbytes), Answer)
+            if answer.ok:
+                self._construction_staging_tokens.append((token, nbytes))
+            return bool(answer.ok)
+
+        return memory.Planner.staging_vector(demands, reserve)
+
     def _prepare_first(
+        self, command: Load, *, optional_attention_scope: bool = False
+    ) -> dict[str, Any]:
+        """Construction host credit outlives every rank's native reader and copy drain."""
+        self._construction_staging_tokens: list[tuple[str, int]] = []
+        self._construction_staging_drained = False
+        planner = self.host.planner
+        previous = planner.construction_staging_credit if planner is not None else None
+        try:
+            return self._prepare_first_body(
+                command, optional_attention_scope=optional_attention_scope
+            )
+        finally:
+            planner = self.host.planner
+            if self._construction_staging_tokens:
+                if self.group is not None and (
+                    not self._construction_staging_drained or self.group.broken
+                ):
+                    # Reuse the existing group reclamation barrier on asymmetric failure.
+                    # If it raises, retain the Worker promise until verified generation reap.
+                    self.group.close()
+                    if any(follower.exit_status() is None for follower in self.group.followers):
+                        self.poisoned = "construction staging followers not reaped"
+                        if planner is not None:
+                            planner.unusable = self.poisoned
+                if planner is None or not planner.unusable:
+                    for token, size in self._construction_staging_tokens:
+                        self._durable(
+                            HostRoom(reservation=token, nbytes=size, release=True), Answer
+                        )
+            if planner is not None:
+                planner.construction_staging_credit = previous
+            backend = getattr(self, "backend", None)
+            if backend is not None and backend._live_ring is None:
+                self.host._staging_quarantine.pop(id(backend), None)
+
+    def _prepare_first_body(
         self, command: Load, *, optional_attention_scope: bool = False
     ) -> dict[str, Any]:
         """Construct and fill one construction (or one model of a many-model one)."""
@@ -2394,8 +2457,18 @@ class Executor:
             custody=binding.custody,
             store_read=self._store_read,
         )
+        # The executor owns buffers and read leases before the first native fill, even
+        # if construction raises and the local registry/traceback is later discarded.
+        self._own_fill_backend(backend)
         stage("backend_ctor")
         planner = self.host.planner
+        if planner is not None:
+            staging_key = self._group_model_key
+            planner.staging_unbacked[staging_key] = backend.slot_bytes
+            backend.staging_host = functools.partial(planner.staging_host, owner=staging_key)
+            backend.staging_released = lambda: planner.staging_unbacked.__setitem__(
+                staging_key, backend.slot_bytes
+            )
         if planner is not None:
             # Residency follows use: every component stays on the store until an op of it
             # runs, so one no call reaches never occupies the device.
@@ -2404,11 +2477,24 @@ class Executor:
         try:
             if self.world > 1 and self.rank == 0:
                 assert self.group is not None
-                self.group.agree_plan(model=self._group_model_key, plan=mine.document())
-            elif self.world > 1:
-                offer_plan(
-                    self.channel, rank=self.rank, model=self._group_model_key, plan=mine.document()
+                credit = self.group.agree_plan(
+                    model=self._group_model_key,
+                    plan=mine.document(),
+                    staging=(backend.slot_bytes, backend.slots),
+                    reserve_staging=self._reserve_construction_staging,
                 )
+                assert planner is not None
+                planner.construction_staging_credit = credit
+            elif self.world > 1:
+                credit = offer_plan(
+                    self.channel,
+                    rank=self.rank,
+                    model=self._group_model_key,
+                    plan=mine.document(),
+                    staging=(backend.slot_bytes, backend.slots),
+                )
+                assert planner is not None
+                planner.construction_staging_credit = credit
         except (GroupRefusal, SeamError) as exc:
             return self._group_refusal(
                 exc if isinstance(exc, GroupRefusal) else GroupRefusal(str(exc))
@@ -2646,6 +2732,7 @@ class Executor:
             # is held to rank 0's own construction identities.
             try:
                 replies = self.group.collect("load")
+                self._construction_staging_drained = all(reply.get("ok") for reply in replies)
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
             for follower, reply in zip(self.group.followers, replies, strict=True):
