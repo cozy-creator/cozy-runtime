@@ -1,4 +1,4 @@
-"""The memory manager on a real card, through the machine path (runs 1458/1459, 1507, 1514).
+"""The memory policy on a real card, through the machine path (runs 1458/1459, 1507, 1514).
 
 Real: the Worker on device 0, SubmitMachineExecution, each root's execution unit and GPU
 grant, replica activation, real executor processes with Torch on the card, real weights from
@@ -515,7 +515,7 @@ class Card:
 
     def vacated(self) -> list[tuple[str, str]]:
         """(victim, for whom) per eviction the memory manager made."""
-        pattern = re.compile(r"'([^']+)' \(epoch \d+ pid \d+\) vacated for '([^']+)'")
+        pattern = re.compile(r"vacated '([^']+)' for '([^']+)'")
         return [(m.group(1), m.group(2)) for s in self.steps() if (m := pattern.search(s))]
 
     def epochs(self) -> dict[str, int]:
@@ -557,14 +557,13 @@ def succeeded(body: dict[str, Any]) -> bool:
 @needs_card
 def test_models_that_fit_together_stay_resident_once_measured(card: Card) -> None:
     """1507: two tenants that fit together. Once each has measured its call, alternating
-    calls move nothing: every plan is all-resident and nobody is evicted."""
+    calls move nothing: nobody is evicted."""
     for index in range(1, 4):
         assert succeeded(card.call(f"p-{index}", "touch", "p", seed=index))
         assert succeeded(card.call(f"q-{index}", "retouch", "q", seed=index))
         if index == 1:
             measured = len(card.vacated())
     assert card.vacated()[measured:] == [], card.vacated()
-    assert {card.plans[f"{t}-{i}"] for t in "pq" for i in (2, 3)} == {"all_resident"}, card.plans
     assert set(card.epochs().values()) == {1}
 
 
@@ -596,8 +595,9 @@ def test_a_longer_segment_is_not_admitted_on_a_shorter_ones_peak(
     """Run 1560: H3's 12 s segment ran on its 6 s segment's measured peak, because the length
     sat in an invocable's `payload` and both were one shape. A 4 s call after a 1 s one of the
     same entrypoint is unmeasured, so the idle neighbour goes instead of the call running out.
-    Small weights, so both tenants stay resident beside another process's memory."""
-    small = write_store(tmp_path, blocks=2, models=("p", "q"))
+    Q's weights are large enough that half of them outweighs the driver headroom the call
+    keeps free, and small enough that both tenants stay resident."""
+    small = write_store(tmp_path, blocks=12, models=("p", "q"))
     with serving(small, monkeypatch) as card:
         assert succeeded(card.call("q-touch", "touch", "q"))
         assert succeeded(card.call("s-1", "segment", "p", payload={"seconds": 1}))

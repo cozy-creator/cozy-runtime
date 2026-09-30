@@ -26,7 +26,8 @@ def spread(
     runner = getattr(component, "_cozy_spread", None)
     calls = iter(arguments)
     if runner is None:
-        local = getattr(component, method)
+        op = getattr(component, "_cozy_op", None)
+        local = op(method) if op is not None else getattr(component, method)
         return (local(*args) for args in calls)
     result: Iterator[Any] = runner(method, calls, spare)
     return result

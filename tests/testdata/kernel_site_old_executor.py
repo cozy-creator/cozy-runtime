@@ -10,13 +10,44 @@ from __future__ import annotations
 import json
 import sys
 import time
+from collections.abc import Iterable, Sequence
+from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
+from typing import Protocol, cast
 
 import torch
 
-from cozy_runtime.internal import attention, kernel_site
 from cozy_runtime.internal.encoding.selection import measure_device
+
+
+class _OldPlacement(Protocol):
+    def document(self) -> dict[str, object]: ...
+
+
+class _OldKernelSite(Protocol):
+    def activate(self) -> _OldPlacement: ...
+
+
+class _OldProbe(Protocol):
+    kernel: str
+    status: str
+    rel_l2_by_rows: object
+
+
+class _OldEvidence(Protocol):
+    probes: Sequence[_OldProbe]
+
+
+class _OldAttention(Protocol):
+    def warm(self, device: object, preferred: Sequence[str]) -> object: ...
+    def evidence(self, served: Iterable[str]) -> _OldEvidence: ...
+
+
+# This subprocess deliberately imports the published old SDK, not the source
+# tree mypy checks. These protocols describe that fixture's historical API only.
+kernel_site = cast(_OldKernelSite, import_module("cozy_runtime.internal.kernel_site"))
+attention = cast(_OldAttention, import_module("cozy_runtime.internal.attention"))
 
 #: `cozy_runtime.models.minimax_h3.model.DIT_ATTENTION` in these releases
 H3 = ("sol-attn", "sageattention", "flash-attn3", "sdpa")

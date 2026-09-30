@@ -15,6 +15,7 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
+from cozy_runtime.internal.seam import EXECUTOR_PROTOCOL_REVISION
 from cozy_runtime.internal.worker.child import ExecutorProtocolMismatch, require_executor_protocol
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.ledger import Ledger
@@ -96,12 +97,22 @@ def test_ledger_releasing_more_than_it_took_moves_the_baseline_not_a_leak() -> N
 @pytest.mark.parametrize(
     ("hello", "remedy"),
     [
-        ({"runtime_version": "0.18.33"}, "publish the package against cozy-runtime>=0.18.51"),
+        (
+            {"runtime_version": "0.18.33"},
+            "reinstall or republish the package with the current Runtime memory contract",
+        ),
         (
             {"runtime_version": "0.18.49", "executor_protocol_revision": 1},
-            "publish the package against cozy-runtime>=0.18.51",
+            "reinstall or republish the package with the current Runtime memory contract",
         ),
-        ({"executor_protocol_revision": 2}, "cozy rental update <rental>"),
+        (
+            {"executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION},
+            "current Runtime memory contract",
+        ),
+        (
+            {"executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION + 1},
+            "cozy rental update <rental>",
+        ),
     ],
 )
 def test_executor_protocol_refusal_names_the_side_to_update(

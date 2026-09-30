@@ -1,0 +1,1 @@
+Rearm deferred optional queue reads when foreground Store demand ends or execution starts, using existing supervised event coalescing; report bounded skip reasons and actual native-reader drain waits without affecting foreground success.
