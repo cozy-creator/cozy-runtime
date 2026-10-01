@@ -279,6 +279,7 @@ def _worker_options(
         # attached, nothing in flight, and nothing moving is idle.
         activity_path=layout.worker_activity,
         activity_owner=identity.host_owner,
+        memo=config.memo,
     )
 
 

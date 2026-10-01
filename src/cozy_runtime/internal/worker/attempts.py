@@ -58,6 +58,8 @@ from cozy_runtime.author._executor_requests import (
     Published,
     Reply,
     Request,
+    StageMemoLookup,
+    StageMemoStore,
     TreeMember,
     WriterAdopt,
     WriterOutput,
@@ -113,6 +115,7 @@ from cozy_runtime.internal.worker.plan import (
 )
 from cozy_runtime.internal.worker.products import Products
 from cozy_runtime.internal.worker.records import WorkerRecords
+from cozy_runtime.internal.worker.stage_memo import MachineMemo
 from cozy_runtime.internal.worker.tree_members import project as project_tree_member
 from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.internal.worker.workspace import Workspace
@@ -596,6 +599,8 @@ class AttemptEngine:
         self.inventory = tuple(inventory)
         #: the run output log: `Outputs.publish` mid-run and the returned result at post
         self.products: Products | None = None
+        #: the machine tier of memoized Model methods, when this Worker keeps one
+        self.stage_memo: MachineMemo | None = None
         #: the demand falsifier. It ships first, it counts, and it decides nothing — the
         #: `timing-decides-nothing` fence proves the module it lives in cannot reach the
         #: planner, the ledger or the fill plane.
@@ -1613,6 +1618,8 @@ class AttemptEngine:
                 if self.calls is None:
                     return refuse("child_broker_absent", "no RecordOwner call lane")
                 return project_tree_member(self.calls, attempt, request)
+            case StageMemoLookup() | StageMemoStore():
+                return self.memo_exchange(attempt, request)
             case WriterSource() | WriterOutput() | WriterAdopt():
                 return self._writer(attempt, request)
             case _:
@@ -1634,11 +1641,24 @@ class AttemptEngine:
             attempt.moved()
             if isinstance(request, Publish):
                 return self.publish(attempt, request)
+            if isinstance(request, (StageMemoLookup, StageMemoStore)):
+                return self.memo_exchange(attempt, request)
             if room is None:
                 return refuse("no_durable_exchange", "a serving attempt asks only for room")
             return room(request)
 
         return answer
+
+    def memo_exchange(
+        self, attempt: AttemptRecord, request: StageMemoLookup | StageMemoStore
+    ) -> Reply:
+        """A memoized method's lookup or outcome, against the machine tier."""
+        if self.stage_memo is None or attempt.spool is None:
+            return refuse("stage_memo_unavailable", "this worker keeps no machine memo tier")
+        owner = f"{attempt.request_id}#{attempt.attempt}"
+        if isinstance(request, StageMemoLookup):
+            return self.stage_memo.lookup(owner, attempt.spool, request)
+        return self.stage_memo.store(owner, attempt.spool, request)
 
     def _writer(self, attempt: AttemptRecord, request: WriterRequest) -> Reply:
         if self.weights is None or attempt.spool is None:
@@ -1797,6 +1817,8 @@ class AttemptEngine:
             executor.worst_pause = max(executor.worst_pause, attempt.pace.worst_pause)
             if self.weights is not None:
                 self.weights.writer_broker.close_attempt(attempt)
+            if self.stage_memo is not None:
+                self.stage_memo.release(f"{attempt.request_id}#{attempt.attempt}")
         return self.release(attempt, reply, spool, key)
 
     @staticmethod
