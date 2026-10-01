@@ -1,0 +1,1 @@
+Every preparation stage line now reaches the run record (quick successive lines, such as each adapter's, were coalesced away); a replica never adopts a dead replica's prespawned executor slot; and after a Runtime update a prespawn rebuilds the installation's SDK generation first, while a process of a replaced generation yields at the claim instead of serving the next run.

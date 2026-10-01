@@ -2680,7 +2680,9 @@ class Worker:
         placement = self._placement_by_id(placement_id)
         if executor is not None and lane is not None and placement is not None:
             # Its successor may already be importing, started while this root waited.
-            warm = self.prespawns.claim(placement.installation_id, placement.device_pin or ())
+            warm = self.prespawns.claim(
+                placement.installation_id, placement.device_pin or (), placement=placement_id
+            )
             if warm is not None:
                 self.prespawns.settle(warm, placement_id)
             self._rebuild_lane(lane, placement_id, executor, granted=True)
@@ -2987,7 +2989,9 @@ class Worker:
         placement.device_pin = pin
         # The process imported ahead of this grant (`prespawn`), when there is one.
         journal = functools.partial(self._journal_row, request_id, attempt)
-        warm = self.prespawns.claim(placement.installation_id, pin or (), journal)
+        warm = self.prespawns.claim(
+            placement.installation_id, pin or (), journal, placement.placement_id
+        )
         supervision = (
             warm.supervision
             if warm is not None

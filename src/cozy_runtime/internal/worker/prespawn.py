@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
-from cozy_runtime.internal import package_installation, package_interface
+from cozy_runtime.internal import package_environment, package_installation, package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.execution_evidence import gpu_names
 from cozy_runtime.internal.executor_commands import Start
@@ -85,6 +85,8 @@ class Slot:
     executor: Executor | None = None
     #: the dead replica of these cards whose own slot this starts its successor in
     replica: str = ""
+    #: the installation generation's interpreter the process was started from
+    python: str = ""
     #: where phase rows go; rows wait here until a root's journal takes them
     sink: Emit | None = None
     frames: list[dict[str, Json]] = field(default_factory=list)
@@ -312,9 +314,14 @@ class Prespawns:
         started, began = time.time(), time.perf_counter()
         lane = _lane(worker, slot.ordinals)
         try:
-            installed = package_installation.open_installation(
-                Path(worker.options.install_root or ""), slot.installation
+            # A Runtime update leaves the installation's SDK generation behind: rebuild it
+            # first, so no executor starts from the old one (run 2495).
+            installed = package_installation.refresh(
+                Path(worker.options.install_root or ""),
+                slot.installation,
+                cache=worker.config.dependency_cache,
             )
+            slot.python = str(installed.python)
             interface = package_interface.parse(raw, "prespawned installation")
             path = (
                 Path(worker.options.artifact_cache or "")
@@ -396,14 +403,23 @@ class Prespawns:
                 sorted({o for key in self.slots if key[0] == installation for o in key[1]})
             )
 
-    def claim(self, installation: str, ordinals: Ordinals, sink: Emit | None = None) -> Slot | None:
+    def claim(
+        self, installation: str, ordinals: Ordinals, sink: Emit | None = None, placement: str = ""
+    ) -> Slot | None:
         """The replica about to bind these cards takes the slot started for them; every other
         slot of its installation is now useless and yields. A slot started for no root sends
-        its phase rows to `sink`, the claiming execution's journal."""
+        its phase rows to `sink`, the claiming execution's journal. A slot started in another
+        (dead) replica's own executor slot is that replica's: another `placement` sharing it
+        would share one executor between two rows, so it yields instead (run 2493)."""
         with self.lock:
             slot = self.slots.pop((installation, ordinals), None)
             stale = [s for key, s in self.slots.items() if key[0] == installation]
             self.asks.pop(installation, None)
+        if slot is not None and (
+            (slot.replica and placement and slot.replica != placement) or not self._current(slot)
+        ):
+            stale.append(slot)
+            slot = None
         for other in stale:
             self._drop(other)
         self._readmit()
@@ -414,6 +430,19 @@ class Prespawns:
             if slot.executor is not None:
                 _nice(slot.executor, _WORKER)
         return slot
+
+    def _current(self, slot: Slot) -> bool:
+        """Whether the slot's process runs its installation's current generation: one a
+        refresh has since replaced yields, and the replica starts from the new one."""
+        if not slot.python:
+            return True
+        try:
+            installed = package_installation.open_installation(
+                Path(self.worker.options.install_root or ""), slot.installation
+            )
+        except (package_environment.EnvironmentRefusal, OSError):
+            return False
+        return str(installed.python) == slot.python
 
     def settle(self, slot: Slot, placement_id: str) -> None:
         """Wait out the claimed slot's imports (the replica would pay them anyway), then hand

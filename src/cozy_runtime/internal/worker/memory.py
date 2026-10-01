@@ -203,8 +203,14 @@ class MemoryManager:
                     for o in short
                 )
             )
+            mine = lane.rows.get(slot)
             victim = self._victim(
-                slot, short, tried, ended if reachable else None, again=need is not None
+                slot,
+                short,
+                tried,
+                ended if reachable else None,
+                again=need is not None,
+                own=mine.supervision if mine is not None else None,
             )
             if victim is None:
                 if need is not None:
@@ -236,17 +242,25 @@ class MemoryManager:
             self._evict(other, other_lane, row, executor, slot, why, measured, short)
 
     def _victim(
-        self, slot: str, short: set[int], tried: set[str], ended: set[str] | None, *, again: bool
+        self,
+        slot: str,
+        short: set[int],
+        tried: set[str],
+        ended: set[str] | None,
+        *,
+        again: bool,
+        own: child.ExecutorSupervision | None,
     ) -> tuple[str, DeviceLane, LaneRow, child.Executor] | None:
         """The next tenant to give room on `short`: a dead one, else the least recently used
         idle one holding bytes there, else (`ended` given) the least recently used idle
-        process holding none, `again` including one this call vacated. Never `slot`."""
+        process holding none, `again` including one this call vacated. Never `slot`, nor any
+        row reaching the requester's own executor slot (`own`)."""
         dead = []
         idle = []
         bare = []
         for other, lane, row in self.tenants(short):
             executor = row.supervision.current if row.supervision is not None else None
-            if other == slot or executor is None:
+            if other == slot or executor is None or (own is not None and row.supervision is own):
                 continue
             dying = executor.poisoned or not executor.alive()
             if other not in tried and dying:

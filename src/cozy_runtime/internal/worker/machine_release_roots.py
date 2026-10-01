@@ -13,6 +13,7 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -114,6 +115,8 @@ class _Job:
     moved: int = 0
     total: int = 0
     noted: float = 0.0  # when a byte count last woke the waiting submitter
+    #: stages the submitter has not been answered yet, oldest first: none is coalesced away
+    stages: deque[str] = field(default_factory=lambda: deque(maxlen=64))
     done: bool = False
     result: _Prepared | None = None
     error: BaseException | None = None
@@ -176,6 +179,10 @@ class ReleaseRoots:
                     daemon=True,
                 ).start()
             self._wait(job, context)
+            if job.stages:
+                stage = job.stages.popleft()
+                latest = stage == job.progress and not job.stages
+                raise Preparing(stage, *((job.moved, job.total) if latest else (0, 0)))
             if not job.done:
                 raise Preparing(job.progress, job.moved, job.total)
             del self.jobs[identity]
@@ -196,7 +203,7 @@ class ReleaseRoots:
         if not context.add_callback(leave):
             leave()  # the RPC already ended: its callback will never run
         seen = job.version
-        while not job.done and job.version == seen and not gone.is_set():
+        while not job.done and not job.stages and job.version == seen and not gone.is_set():
             self.changed.wait()
 
     def _note(self, job: _Job, progress: str, moved: int = 0, total: int = 0) -> None:
@@ -207,6 +214,8 @@ class ReleaseRoots:
                 (moved, total) == (job.moved, job.total) or now - job.noted < 1
             ):
                 return
+            if progress != job.progress:
+                job.stages.append(progress)
             job.progress, job.moved, job.total, job.noted = progress, moved, total, now
             job.version += 1
             self.changed.notify_all()

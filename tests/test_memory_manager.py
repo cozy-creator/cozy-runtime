@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ import pytest
 from cozy_runtime.internal import accel, proctree
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
 from cozy_runtime.internal.worker.memory import Watch
+from cozy_runtime.internal.worker.session import HostedPlacement
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
 from test_gpu_scheduler import VIRTUAL, Machine, driverless
@@ -219,6 +221,38 @@ def test_idle_processes_end_lru_when_their_contexts_leave_a_device_short(
     assert ended() == [qwen[2], qwen[0], qwen[1], qwen[3]]
     assert set(machine.executors()) == {h3} and worker.hosted[h3].supervision.current is survivor
     assert all(accel.device_memory(o, "cuda").free_bytes >= 55 * GiB for o in VIRTUAL.split(","))
+
+
+@needs_executor
+def test_a_dead_replicas_row_never_ends_the_executor_its_successor_entered_with(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 2493: idle constructions left processes without weights; a dead replica's row on
+    the same cards still named the executor slot its prespawned successor now ran in. The
+    successor's unmeasured admission ended that "idle" executor, its own, and device entry
+    refused `executor_replaced_before_entry`. The stale processes end; the requester's
+    executor is still the one it commits entry with."""
+    h3, qwen = long_form(machine, monkeypatch)
+    worker = machine.worker
+    for placement in qwen:
+        worker._lane_of(placement).row(placement).held = {}
+        worker._lane_of(placement).row(placement).ledger.resident.clear()
+    hosted = worker.hosted[h3]
+    document = pb.Placement()
+    document.CopyFrom(hosted.placement.document)
+    document.placement_id = "machine-dead"
+    worker.hosted["machine-dead"] = HostedPlacement(
+        replace(hosted.placement, document=document), hosted.supervision
+    )
+    group = worker._lane_of(h3)
+    ghost = group.row("machine-dead")
+    ghost.model_bearing, ghost.supervision = True, hosted.supervision
+    executor = hosted.supervision.current
+    assert executor is not None
+    assert worker.memory.admit(group, h3, ("segment", "frames=500"), "unmeasured")
+    assert set(machine.executors()) == {h3, "machine-dead"}, "every stale process ended"
+    with hosted.supervision.hold(executor) as owned:
+        assert owned, "the executor entry commits with was replaced"
 
 
 @needs_executor

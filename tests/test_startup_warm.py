@@ -21,6 +21,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -951,7 +952,86 @@ def test_a_dead_replica_starts_its_successor_while_its_root_waits(
     assert executor is not None and executor.alive() and not executor.started
     failed = [e.step for e in list(machine.worker.activity)[notes:] if "no prespawn" in e.step]
     assert failed == [], failed
-    assert machine.worker.prespawns.claim(INSTALLATION, (0,)) is slot
+    assert machine.worker.prespawns.claim(INSTALLATION, (0,), placement="machine-dead") is slot
+
+
+def test_another_replica_never_adopts_a_dead_replicas_successor(
+    warm: Callable[..., Warm],
+) -> None:
+    """Run 2493: a new construction of the same installation and cards adopted the process
+    started in a dead replica's own executor slot, so two rows named one executor and the
+    dead one's eviction ended it. Another placement's claim lets that slot yield instead."""
+    machine = warm()
+    machine.submit_root("A")
+    target = machine.target({"digest": "sha256:" + "0" * 64, "length": 1})
+    placement = machine.worker._placement_from_entry(
+        documents.from_body(
+            {**target.prepared_installation["placement"], "placement_id": "machine-dead"},
+            pb.Placement,
+        ),
+        b"",
+    )
+    placement.device_pin = (0,)
+    supervision = machine.worker._new_placement_supervision("machine-dead")
+    machine.worker.hosted[placement.placement_id] = HostedPlacement(placement, supervision)
+    machine.worker.prespawns.request(OWNER, "A", target, lambda frame: None)
+    (slot,) = machine.worker.prespawns.slots.values()
+    assert slot.replica == "machine-dead" and slot.started.wait(300) and slot.ready
+    executor = slot.executor
+    assert executor is not None and executor.alive()
+    assert machine.worker.prespawns.claim(INSTALLATION, (0,), placement="machine-new") is None
+    _wait(lambda: not executor.alive() and supervision.current is None, "the successor yields")
+    assert not machine.worker.prespawns.slots
+
+
+def _generation(home: Path, name: str, version: str) -> Path:
+    """What `package_installation.refresh` leaves after a Runtime update: a new generation
+    beside the old one, whose SDK says `version`, recorded as the installation's python."""
+    venv = home / name
+    subprocess.run(
+        [sys._base_executable, "-m", "venv", "--without-pip", str(venv)],  # type: ignore[attr-defined]
+        check=True,
+    )
+    (site,) = (venv / "lib").glob("python*/site-packages")
+    for path in (home / "venv" / "lib").glob("python*/site-packages/startup_warm_*"):
+        shutil.copy(path, site / path.name)
+    dist = site / f"cozy_runtime-{version}.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: cozy-runtime\nVersion: {version}\n"
+    )
+    record = json.loads((home / "installation.json").read_text())
+    record["python"] = str(venv / "bin" / "python")
+    (home / "installation.json").write_text(json.dumps(record))
+    return venv
+
+
+def test_a_new_sdk_generation_retires_the_old_generations_prespawn(
+    warm: Callable[..., Warm],
+) -> None:
+    """Run 2495: after a Runtime update, a process prewarmed from the installation's previous
+    SDK generation served the next run. A process whose generation the installation has moved
+    past yields at the claim, and the next one starts from the new generation and reports its
+    Runtime. Nothing refuses: an older executor is never a verdict."""
+    machine = warm()
+    machine.submit_root("A")
+    target = machine.target({"digest": "sha256:" + "0" * 64, "length": 1})
+    prespawns = machine.worker.prespawns
+    prespawns.request(OWNER, "A", target, lambda frame: None)
+    (old,) = prespawns.slots.values()
+    assert old.started.wait(300) and old.ready and old.executor is not None
+    executor = old.executor
+    home = Path(machine.worker.options.install_root or "") / "installations" / INSTALLATION
+    assert executor.hello["python_executable"] == str(home / "venv" / "bin" / "python")
+    venv = _generation(home, "venv-next", "0.18.100+next")
+    assert prespawns.claim(INSTALLATION, (0,), placement="machine-next") is None
+    _wait(lambda: not executor.alive(), "the old generation's process yields")
+    prespawns.request(OWNER, "A", target, lambda frame: None)
+    new = _wait(lambda: prespawns.slots.get((INSTALLATION, (0,))), "the next prespawn")
+    assert new.started.wait(300) and new.ready and new.executor is not None
+    assert new.executor.hello["python_executable"] == str(venv / "bin" / "python")
+    assert new.executor.hello["runtime_version"] == "0.18.100+next"
+    assert prespawns.claim(INSTALLATION, (0,), placement="machine-next") is new
 
 
 def test_an_executor_before_import_only_starts_is_only_spawned(
