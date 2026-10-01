@@ -82,6 +82,11 @@ def write_checkpoint(root: Path) -> tuple[Checkpoint, dict[str, Any]]:
                 torch.randn(HIDDEN, HIDDEN, generator=generator) / HIDDEN**0.5
             )
         values[f"blocks.{index}.norm"] = torch.rand(HIDDEN, generator=generator) + 0.5
+    return store_component(root, "stack", values), {k: v.half() for k, v in values.items()}
+
+
+def store_component(root: Path, name: str, values: dict[str, Any]) -> Checkpoint:
+    """`values` as one component's fp16 tensors in a real TensorFS store."""
     tensors = {
         key: Tensor("f16", tuple(value.shape), SPEC_PLAIN, {"value": Part("f16", value.shape)})
         for key, value in values.items()
@@ -92,18 +97,17 @@ def write_checkpoint(root: Path) -> tuple[Checkpoint, dict[str, Any]]:
         1,
         *Derivation(
             sources={},
-            targets={"stack": Target(add=tensors)},
-            configs={"stack": NativeConfig("add")},
-            order=tuple(("stack", key) for key in values),
+            targets={name: Target(add=tensors)},
+            configs={name: NativeConfig("add")},
+            order=tuple((name, key) for key in values),
         ).native_arguments(1 << 30),
         work_fingerprint="sha256:" + "2" * 64,
     )
     for key, value in values.items():
-        writer.add_part("stack", key, "value", io.BytesIO(value.half().numpy().tobytes()))
-    writer.add_config("stack", io.BytesIO(b"{}"))
+        writer.add_part(name, key, "value", io.BytesIO(value.half().numpy().tobytes()))
+    writer.add_config(name, io.BytesIO(b"{}"))
     receipt = writer.commit()
-    manifest = "sha256:" + receipt["manifest"]["sha256"]
-    return Checkpoint(root / "store", manifest), {k: v.half() for k, v in values.items()}
+    return Checkpoint(root / "store", "sha256:" + receipt["manifest"]["sha256"])
 
 
 def load(
@@ -113,29 +117,31 @@ def load(
     *,
     reverse: bool = False,
     tiers: HostTiers | None = None,
+    name: str = "stack",
+    factory: Any = None,
 ) -> Any:
     """Construct on meta and register with the plane, as the executor's prepare does."""
     backend = PlaneBackend.for_script(
-        {"stack": checkpoint},
-        checkpoint.rows("stack"),
+        {name: checkpoint},
+        checkpoint.rows(name),
         weights=weights,
         construction=key,
         release="plane-test/1",
         tiers=tiers,
     )
     with torch.device("meta"):
-        stack = Stack(reverse=reverse)
-    holder = SimpleNamespace(components={"stack": stack})
+        module = factory() if factory is not None else Stack(reverse=reverse)
+    holder = SimpleNamespace(components={name: module})
     walked = census(holder)
-    backend.expect({"stack": [d.key for d in walked.destinations]})
+    backend.expect({name: [d.key for d in walked.destinations]})
     live = backend.materialize(holder, walked)
     for destination in walked.destinations:
         backend.fill(destination.key, destination.spec, live[destination.key])
     backend.commit()
     residency = WeightResidency(
-        weights, backend.components, {"run": ("stack",)}, refine=backend.refine
+        weights, backend.components, {"run": (name,)}, refine=backend.refine
     )
-    return SimpleNamespace(stack=stack, residency=residency, backend=backend)
+    return SimpleNamespace(stack=module, residency=residency, backend=backend)
 
 
 def run(model: Any, x: Any, passes: int = 3) -> list[Any]:
@@ -280,6 +286,69 @@ def test_a_component_converted_with_to_streams_in_that_dtype(card: Any) -> None:
     streamed = run(model, x)
     assert weights.facts().streamed["stack"].resident_blocks < BLOCKS
     assert all(s.dtype == torch.float32 for s in streamed)
+    assert all(torch.equal(a, b) for a, b in zip(resident, streamed, strict=True))
+
+
+def sdxl_unet() -> Any:
+    """SDXL's UNet architecture (convolutions, group norms, cross-attention transformer
+    blocks, text-time embeddings), small: what streams in SDXL, in fp16."""
+    diffusers = pytest.importorskip("diffusers")
+    return diffusers.UNet2DConditionModel(
+        sample_size=32,
+        down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
+        up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
+        block_out_channels=(64, 128),
+        transformer_layers_per_block=(1, 2),
+        attention_head_dim=(2, 4),
+        cross_attention_dim=64,
+        use_linear_projection=True,
+        addition_embed_type="text_time",
+        addition_time_embed_dim=8,
+        projection_class_embeddings_input_dim=8 * 6 + 64,
+    ).to(torch.float16)
+
+
+@on_card
+def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path) -> None:
+    """The same process, the same free memory: SDXL's UNet resident, then streamed through
+    a tight budget, computes the same bits (the image-level difference under physical
+    ballast is then the kernels' choice under memory pressure, not the plane)."""
+    torch.manual_seed(11)
+    values = {k: v.float() * 0.05 for k, v in sdxl_unet().state_dict().items()}
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    model = load(
+        weights, store_component(tmp_path, "unet", values), "unet", name="unet", factory=sdxl_unet
+    )
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    args = (
+        torch.randn(2, 4, 32, 32, device="cuda", dtype=torch.float16, generator=generator),
+        torch.tensor([500.0], device="cuda"),
+        torch.randn(2, 16, 64, device="cuda", dtype=torch.float16, generator=generator),
+    )
+    added = {
+        "text_embeds": torch.randn(2, 64, device="cuda", dtype=torch.float16, generator=generator),
+        "time_ids": torch.tensor([[256, 256, 0, 0, 256, 256]] * 2, device="cuda").half(),
+    }
+
+    def steps() -> list[Any]:
+        out = []
+        for _ in range(3):
+            model.residency.admit("run", ("unet",))
+            try:
+                with torch.inference_mode():
+                    out.append(model.stack(*args, added_cond_kwargs=added).sample)
+            finally:
+                model.residency.release("run", ("unet",))
+        return out
+
+    weights.set_budget(1 << 30)
+    resident = steps()
+    layout: weight_policy.Layout = model.residency.components["unet"].layout
+    weights.set_budget(layout.common + 3 * layout.largest)
+    streamed = steps()
+    model.residency.unpark()
+    assert weights.facts().streamed["unet"].resident_blocks < len(layout.blocks)
     assert all(torch.equal(a, b) for a, b in zip(resident, streamed, strict=True))
 
 
