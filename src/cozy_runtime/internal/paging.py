@@ -116,9 +116,15 @@ def _split(root: Any, path: str, limit: int) -> list[str]:
         for name, child in module.named_children()
         if next(_tensors(child), None) is not None
     ]
-    if not children or (path and _bytes(module) <= limit):
+    if not children or (path and _bytes(module) <= limit and not _container(module)):
         return [path]
     return [unit for child in children for unit in _split(root, child, limit)]
+
+
+def _container(module: Any) -> bool:
+    """A ModuleList or ModuleDict: never called itself (its owner calls its members), so it
+    can never be a unit, whose module call is what binds it."""
+    return getattr(type(module).forward, "__name__", "") == "_forward_unimplemented"
 
 
 def _tensors(module: Any) -> Iterator[Any]:

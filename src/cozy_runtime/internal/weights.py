@@ -1639,9 +1639,15 @@ class WeightResidency:
                 self._refine(name)
                 return self._plan(method, local, budget, resume)
             raise self._shortfall(method, exc.needed, exc.available, str(exc)) from None
-        # One block at a time streams with no overlap: regions of at most 16 MiB let the
-        # same budget hold a window of several.
-        crawl = [n for n, r in placed.items() if r.streamed and r.window == 1]
+        # A budget that only fits one block at a time streams with no overlap: regions of at
+        # most 16 MiB let it hold a window of several. (Window 1 chosen when two fit stays.)
+        crawl = [
+            n
+            for n, r in placed.items()
+            if r.streamed
+            and r.window == 1
+            and components[n].layout.common + 2 * components[n].layout.largest > budget
+        ]
         if name := next((n for n in crawl if self._refinable(n, method)), ""):
             self._refine(name)
             return self._plan(method, local, budget, resume)
@@ -1909,6 +1915,10 @@ class WeightResidency:
                 peak = accel.peak_allocated(weights.torch, weights.kind) - baseline
                 peaks[pixels] = max(peaks.get(pixels, 0), peak)
             weights.modes[f"{name}.decode"] = mode
+            # The decode's transient activations go back to the driver: kept in torch's
+            # cache they shrink the next grant, and the weights the decode unmapped come
+            # back into exactly that room.
+            accel.release_cached(weights.torch, weights.kind)
             return out
 
         return run
