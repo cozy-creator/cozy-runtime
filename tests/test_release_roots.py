@@ -1419,6 +1419,7 @@ def test_the_compatibility_check_overlaps_the_weight_download(
         cancellation: Any = None,
         progress: Any = None,
         downloading: Any = None,
+        waiting: Any = None,
     ) -> None:
         began = time.monotonic()
         for step in range(15):  # 1.5 s of weights, reported as they land
