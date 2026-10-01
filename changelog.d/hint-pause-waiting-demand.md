@@ -1,0 +1,1 @@
+A running model prefetch hint pauses only when a demanded preparation is waiting for a worker. Any demand used to pause it, even one preparing on the other worker, and it stayed paused until no demand remained: run 2322's ~100 GB H3 hint sat 20 minutes behind a reference download's tail. Hints no longer wait while a called package installs.
