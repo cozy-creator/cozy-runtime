@@ -152,14 +152,7 @@ def test_loader_consumes_verified_header_assets(tmp_path: Path) -> None:
     assets = fill.Checkpoint(store_root, manifest_id).model_assets()
     assert assets == {"tokenizer/vocab.txt": _ASSET}
 
-    class Owner:
-        def _cozy_require_scope(self, what: str) -> None:
-            raise AssertionError(what)
-
-    loader = Loader(
-        Artifact("checkpoint", {}, Config({}), assets=assets),
-        owner=Owner(),
-    )
+    loader = Loader(Artifact("checkpoint", {}, Config({}), assets=assets), owner=object())
     capability = loader.assets
     writes: list[str] = []
 

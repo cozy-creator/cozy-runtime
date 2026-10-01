@@ -48,7 +48,6 @@ from cozy_runtime.author._loader import (
     Backend,
     Config,
     ConstructionRecord,
-    DerivedCache,
     Loader,
     Mode,
     Scheduler,
@@ -555,7 +554,6 @@ class Model[PipelineT]:
     _cozy_record: ConstructionRecord | None = None
     _cozy_identity: ConstructionIdentity | None = None
     _cozy_schedulers: Mapping[str, Scheduler] = {}
-    _cozy_caches: tuple[DerivedCache, ...] = ()
     _cozy_adapters: tuple[AdapterRef, ...] = ()
     _cozy_residency: Residency | None = None
     """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
@@ -740,16 +738,6 @@ class Model[PipelineT]:
     def _cozy_scope(self, method: str, components: tuple[str, ...]) -> _Scope:
         return _ComponentScope(self, method, components)
 
-    def _cozy_require_scope(self, what: str) -> None:
-        """A derived-cache entry is legal only inside an active component-use scope."""
-        self._cozy_require_ready(what)
-        if self._cozy_active is None and remote_scope(self) is None:
-            raise CapabilityError(
-                f"{what} outside an active component-use scope: the runtime joins the entry's "
-                "lease to the scope, and there is nowhere for it to live otherwise (§1.3)",
-                code="no_active_scope",
-            )
-
     def _cozy_require_ready(self, what: str) -> None:
         if not self._cozy_ready:
             raise CapabilityError(
@@ -772,8 +760,8 @@ class Model[PipelineT]:
                 )
             raise CapabilityError(
                 f"{type(self).__name__}.{name} = …: the model generation is immutable after "
-                "construction — a model instance never hides unaccounted state; declare a "
-                "loader.cache(...) handle for reusable derived entries (§1.3)",
+                "construction — a model instance never hides unaccounted state; a reusable "
+                "derived result is a memoized method, @uses_components(..., memoize=True)",
                 code="persistent_allocation",
                 fields=[name],
             )
@@ -1076,8 +1064,6 @@ class ModelRegistry:
                 finally:
                     object.__setattr__(model, "_cozy_ready", False)
                     object.__setattr__(model, "_cozy_loading", False)
-                for cache in model._cozy_caches:
-                    cache.drop()
             self._generations.clear()
             self._by_path.clear()
 
@@ -1138,7 +1124,6 @@ class ModelRegistry:
             # that — the offender is reached through `__getattr__`, so it is by definition
             # not in the message — while costing a broken `isinstance` on every component.
             object.__setattr__(model, "_cozy_schedulers", _schedulers(constructed, {}))
-            object.__setattr__(model, "_cozy_caches", loader.caches())
             object.__setattr__(model, "checkpoint_ref", artifact.snapshot)
             object.__setattr__(
                 model, "_cozy_selection_ref", artifact._selection_snapshot or artifact.snapshot
@@ -1147,10 +1132,8 @@ class ModelRegistry:
             object.__setattr__(model, "_cozy_identity", identity)
             object.__setattr__(model, "_cozy_ready", True)
         except Exception:
-            # Transactional: a failure rolls fills, caches and registrations back together
-            # and no generation is ever observable half-built (§1.1).
-            for cache in loader.caches():
-                cache.drop()
+            # Transactional: a failure rolls fills and registrations back together and no
+            # generation is ever observable half-built (§1.1).
             object.__setattr__(model, "_cozy_ready", False)
             raise
         finally:

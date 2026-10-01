@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import io
 import time
-from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -493,107 +492,6 @@ class _NullBackend:
         return None
 
 
-# --------------------------------------------------------------------------- cache
-
-
-@final
-class DerivedCache:
-    """A model-generation-scoped handle for immutable, digest-keyed derived entries.
-
-    MEMORY-ONLY and declared-bounded: entries die with the generation, `get` is legal only
-    inside an active component-use scope, and there is no persistence surface to declare
-    (durable derived tables live in pruned-DiT artifacts produced by jobs, §1.3). At its
-    bound the least recently used entries leave to admit a new one; an entry larger than
-    the whole bound refuses. cr-008b owns the ledger accounting and lease mechanics.
-    """
-
-    __slots__ = ("_bytes", "_entries", "_owner", "max_bytes", "max_entries", "name")
-
-    def __init__(self, name: str, *, max_entries: int, max_bytes: int, owner: _ScopeHost) -> None:
-        self.name = name
-        self.max_entries = max_entries
-        self.max_bytes = max_bytes
-        self._entries: OrderedDict[object, tuple[object, int]] = OrderedDict()
-        self._bytes = 0
-        self._owner = owner
-
-    def __repr__(self) -> str:
-        return (
-            f"DerivedCache({self.name!r}, entries={len(self._entries)}/{self.max_entries}, "
-            f"bytes={self._bytes}/{self.max_bytes})"
-        )
-
-    def __contains__(self, key: object) -> bool:
-        return key in self._entries
-
-    @property
-    def entries(self) -> int:
-        return len(self._entries)
-
-    def get(self, key: object, *, build: Callable[[], V]) -> V:
-        """Return the cached entry, or build it single-flight under the ACTIVE scope."""
-        self._owner._cozy_require_scope(f"{self.name}.get")
-        try:
-            hash(key)
-        except TypeError:
-            raise ConformanceError(
-                f"cache {self.name!r}: key {type(key).__name__} is mutable — entries are "
-                "keyed by immutable digests, never by a live object",
-                code="cache_key",
-            ) from None
-        if key in self._entries:
-            self._entries.move_to_end(key)
-            return cast(V, self._entries[key][0])
-        value = build()
-        _require_immutable(self.name, value)
-        size = _entry_bytes(value)
-        if size > self.max_bytes or self.max_entries < 1:
-            raise CapabilityError(
-                f"cache {self.name!r}: one {size} B entry exceeds its declared bound "
-                f"({self.max_entries} entries, {self.max_bytes} bytes)",
-                code="cache_bound",
-            )
-        while len(self._entries) >= self.max_entries or self._bytes + size > self.max_bytes:
-            _, (_, dropped) = self._entries.popitem(last=False)
-            self._bytes -= dropped
-        self._entries[key] = (value, size)
-        self._bytes += size
-        return value
-
-    def drop(self) -> None:
-        self._entries.clear()
-        self._bytes = 0
-
-
-def _require_immutable(name: str, value: object) -> None:
-    if isinstance(value, (list, dict, set, bytearray)):
-        raise ConformanceError(
-            f"cache {name!r}: {type(value).__name__} entries are mutable — the cache accepts "
-            "only immutable derived entries (§1.3)",
-            code="cache_mutable",
-        )
-    if isinstance(value, tuple):
-        for item in value:
-            _require_immutable(name, item)
-
-
-def _entry_bytes(value: object) -> int:
-    nbytes = getattr(value, "nbytes", None)
-    if isinstance(nbytes, int):
-        return nbytes
-    if isinstance(value, tuple):
-        return sum(_entry_bytes(v) for v in value)
-    if isinstance(value, (bytes, bytearray, str)):
-        return len(value)
-    return 8
-
-
-class _ScopeHost(Protocol):
-    """What a cache needs from the model generation that declared it."""
-
-    def _cozy_require_scope(self, what: str) -> None: ...
-
-
 # --------------------------------------------------------------------------- adapters
 
 _ADAPTERS: dict[type, Callable[[Config], object]] = {}
@@ -654,14 +552,13 @@ class ConstructionRecord:
 
 @final
 class Loader:
-    """The load/unload-ONLY capability. Its whole surface is `construct`, `load`, `cache`
+    """The load/unload-ONLY capability. Its whole surface is `construct`, `load`, `assets`
     and `device` — there is no path, dtype, placement, offload, compile or catalog door."""
 
     __slots__ = (
         "_artifact",
         "_assets",
         "_backend",
-        "_caches",
         "_device",
         "_mode",
         "_objects",
@@ -674,7 +571,7 @@ class Loader:
         self,
         artifact: Artifact,
         *,
-        owner: _ScopeHost,
+        owner: object,
         backend: Backend | None = None,
         mode: Mode = "serve",
         device: Device | None = None,
@@ -688,7 +585,6 @@ class Loader:
         self._open = True
         self._records: list[ConstructionRecord] = []
         self._objects: list[object] = []
-        self._caches: list[DerivedCache] = []
 
     @property
     def device(self) -> Device:
@@ -784,27 +680,12 @@ class Loader:
             )
         return self.construct(t, factory=cast("Callable[[Config], T]", adapter))
 
-    def cache(self, name: str, *, max_entries: int = 64, max_bytes: int = 1 << 30) -> DerivedCache:
-        """Declare a model-generation-scoped derived cache. Memory-only, by construction."""
-        self._require_open("loader.cache")
-        if not name or not name.replace("_", "").isalnum():
-            raise ConformanceError(
-                f"cache name {name!r} must be a plain identifier", code="cache_name"
-            )
-        cache = DerivedCache(name, max_entries=max_entries, max_bytes=max_bytes, owner=self._owner)
-        self._caches.append(cache)
-        return cache
-
     def records(self) -> tuple[ConstructionRecord, ...]:
         return tuple(self._records)
 
     def constructed(self) -> tuple[object, ...]:
         """What this load built, exactly as the factory returned it — nothing wraps it."""
         return tuple(self._objects)
-
-    def caches(self) -> tuple[DerivedCache, ...]:
-        """Declared derived caches. They die with the generation (§1.3)."""
-        return tuple(self._caches)
 
     def close(self) -> None:
         """load/unload returned: the loader is dead. Holding one is not holding a capability."""

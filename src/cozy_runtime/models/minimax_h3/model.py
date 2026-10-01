@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import sys
 import math
+import sys
 import time
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -13,7 +13,6 @@ from cozy_runtime.author import (
     AdapterCompatibility,
     AttentionContext,
     Context,
-    DerivedCache,
     Loader,
     Model,
     concurrently,
@@ -27,7 +26,6 @@ from .official import (
     NumericalChecks,
     OfficialH3Pipeline,
     OfficialH3TurboLoRA,
-    ReferenceMemo,
     ScheduleFacts,
     Task,
     _validate_sol_dense_steps,
@@ -42,10 +40,6 @@ from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
 #: (H100 Ulysses-4 runs 1240-1252) and is never preferred. The VAEs keep Runtime's ranking.
 DIT_ATTENTION: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
 DIT_COMPONENTS: frozenset[str] = frozenset({"fl2va_dit", "ref2va_dit"})
-#: Reference latents one generation keeps (`ReferenceMemo`), least recently used first out. A
-#: 2048-edge image reference is ~6 MB of float32 latents, a 5 s video reference ~25 MB.
-REFERENCE_MEMO_ENTRIES = 256
-REFERENCE_MEMO_BYTES = 1 << 30
 
 
 def condition_references(
@@ -64,12 +58,21 @@ def condition_references(
     started = time.perf_counter()
     concurrently(
         partial(model.condition_text, task, text, checks=checks),
-        partial(model.condition_ref2va_media, task, state, checks=checks),
+        partial(condition_ref2va_media, model, task, state, checks=checks),
     )
     model.pipe.adopt_text(task, state, text)
     checks.telemetry.log(
         "h3 conditioning", wall_ms=round((time.perf_counter() - started) * 1000, 1)
     )
+
+
+def condition_ref2va_media(
+    model: H3Model, task: Task, state: Any, *, checks: NumericalChecks
+) -> None:
+    """Each image or video reference through the memoized `encode_reference`, outside any
+    other scope so that a hit stages no video VAE, then the soundtracks."""
+    visual = [model.encode_reference(*args) for args in model.pipe.reference_inputs(task, state)]
+    model.condition_ref2va_audio(task, state, visual, checks=checks)
 
 
 @placeable("text_encoder")
@@ -100,15 +103,6 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
 
     def load(self, loader: Loader) -> None:
         self.pipe = loader.construct(OfficialH3Pipeline, factory=build_h3_pipeline)
-        self._declare_caches(loader)
-
-    def _declare_caches(self, loader: Loader) -> None:
-        """The generation's reference latents (`ReferenceMemo`): memory only, bounded."""
-        self.reference_latents = loader.cache(
-            "reference_latents",
-            max_entries=REFERENCE_MEMO_ENTRIES,
-            max_bytes=REFERENCE_MEMO_BYTES,
-        )
 
     def unload(self, loader: Loader) -> None:
         return None
@@ -209,14 +203,31 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
         checks.component("video_vae", self.pipe.components["video_vae"])
         self.pipe.condition_media(task, state, checks=checks)
 
-    @uses_components("video_vae", "audio_vae")
-    def condition_ref2va_media(self, task: Task, state: Any, *, checks: NumericalChecks) -> None:
-        for name in ("video_vae", "audio_vae"):
-            checks.component(name, self.pipe.components[name])
-        cache: DerivedCache | None = getattr(self, "reference_latents", None)
-        memo = None if cache is None else ReferenceMemo(cache, self.checkpoint_ref)
-        reused, encoded = self.pipe.condition_media(task, state, checks=checks, memo=memo)
-        checks.telemetry.log("h3 reference latents", reused=reused, encoded=encoded)
+    @uses_components(
+        "video_vae",
+        memoize=True,
+        memo_dependencies=(
+            OfficialH3Pipeline.encode_reference,
+            "cozy_runtime.models.minimax_h3.vae_tiles",
+        ),
+    )
+    def encode_reference(
+        self,
+        pixels: Any,
+        pixel_mean: tuple[float, float, float],
+        pixel_std: tuple[float, float, float],
+        seed: int,
+    ) -> Any:
+        """One image or video reference's latents, a function of these values alone: a
+        reference repeated across a long-form piece's segments stages no video VAE."""
+        return self.pipe.encode_reference(pixels, pixel_mean, pixel_std, seed)
+
+    @uses_components("audio_vae")
+    def condition_ref2va_audio(
+        self, task: Task, state: Any, visual: Sequence[Any], *, checks: NumericalChecks
+    ) -> None:
+        checks.component("audio_vae", self.pipe.components["audio_vae"])
+        self.pipe.condition_media(task, state, checks=checks, visual=visual)
 
     @uses_components("fl2va_dit")
     def sample_fl2va(
@@ -249,7 +260,6 @@ class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
 
     def load(self, loader: Loader) -> None:
         self.pipe = loader.construct(OfficialH3Pipeline, factory=build_h3_turbo_base)
-        self._declare_caches(loader)
 
     @uses_components("fl2va_dit")
     def sample_fl2va_turbo(

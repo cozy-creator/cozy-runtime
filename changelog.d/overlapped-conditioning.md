@@ -13,6 +13,7 @@ and DiT shard. `spread(..., spare=True)` spares on every follower. Calls in flig
 follower never interleave; the attempt's execution record lists each spread's calls per rank
 and declines.
 
-H3 reference latents are memoized per generation (`loader.cache`, now least-recently-used at
-its bound) by the exact pixels, construction and encode parameters; audio is encoded every
-time. Image references that miss spread over the idle ranks.
+H3's image and video reference encode is a memoized method (`H3Model.encode_reference`,
+`@uses_components("video_vae", memoize=True)`) keyed by the exact pixels and encode
+parameters, so a repeated reference stages no video VAE; audio is encoded every time.
+`loader.cache` and `DerivedCache` are removed.

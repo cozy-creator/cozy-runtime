@@ -590,22 +590,12 @@ class DestinationSet:
     keys: tuple[str, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class DeclaredCache:
-    """A `loader.cache(...)` handle: memory-only, declared-bounded (§1.3)."""
-
-    name: str
-    max_entries: int
-    max_bytes: int
-
-
 _ROW_FIELDS: Mapping[type, frozenset[str]] = {
     LogicalTensor: frozenset(
         {"key", "component", "shape", "kind", "module_class", "alias_group", "dtype"}
     ),
     DerivedTensor: frozenset({"key", "component", "shape", "dtype"}),
     DestinationSet: frozenset({"component", "module_class", "training", "compiled", "keys"}),
-    DeclaredCache: frozenset({"name", "max_entries", "max_bytes"}),
 }
 
 
@@ -943,7 +933,6 @@ class Derivation:
     logical_tensors: tuple[LogicalTensor, ...]
     destination_sets: tuple[DestinationSet, ...]
     derived: tuple[DerivedTensor, ...]
-    caches: tuple[DeclaredCache, ...]
     component_use: Mapping[str, tuple[str, ...]]
     observations: Observations
 
@@ -1035,12 +1024,6 @@ def derive(
         logical_tensors=logical,
         destination_sets=destination_sets,
         derived=tuple(sorted(rich.derived, key=lambda d: d.key)),
-        caches=tuple(
-            sorted(
-                (DeclaredCache(c.name, c.max_entries, c.max_bytes) for c in loader.caches()),
-                key=lambda c: c.name,
-            )
-        ),
         component_use=_validate_component_use(constructed, component_use or {}),
         observations=seen,
     )

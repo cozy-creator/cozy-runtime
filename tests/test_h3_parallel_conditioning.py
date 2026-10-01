@@ -8,7 +8,6 @@ bitwise with one process running the same calls in sequence.
 
 from __future__ import annotations
 
-import functools
 import os
 import socket
 import sys
@@ -24,14 +23,17 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("diffusers")
 pytest.importorskip("transformers")
 
-from cozy_runtime.author import CapabilityError, DerivedCache, concurrently  # noqa: E402
+from cozy_runtime.author import concurrently  # noqa: E402
 from cozy_runtime.author.fakes import fake_telemetry  # noqa: E402
 from cozy_runtime.internal import spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.residency import ResidencyRefusal  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
-from cozy_runtime.models.minimax_h3.model import condition_references  # noqa: E402
+from cozy_runtime.models.minimax_h3.model import (  # noqa: E402
+    condition_ref2va_media,
+    condition_references,
+)
 from cozy_runtime.models.minimax_h3.official import NumericalChecks  # noqa: E402
 from test_staged_demand_pull import (  # noqa: E402
     CAPACITY,
@@ -48,10 +50,6 @@ FIXTURE = Path(__file__).parent / "testdata" / "h3_conditioning.py"
 def _checks(model: Any) -> tuple[NumericalChecks, Any]:
     telemetry = fake_telemetry()
     return NumericalChecks(telemetry, model.pipe.resident), telemetry
-
-
-def _logged(telemetry: Any, name: str) -> list[dict[str, Any]]:
-    return [dict(event.fields) for event in telemetry.events if event.name == name]
 
 
 def _outputs(state: Any) -> dict[str, Any]:
@@ -80,7 +78,7 @@ def sequential() -> dict[str, Any]:
     checks, _ = _checks(model)
     state = h3.start(model)
     model.condition_text(h3.TASK, state, checks=checks)
-    model.condition_ref2va_media(h3.TASK, state, checks=checks)
+    condition_ref2va_media(model, h3.TASK, state, checks=checks)
     return _outputs(state)
 
 
@@ -88,21 +86,28 @@ def sequential() -> dict[str, Any]:
 def test_reference_encode_is_the_official_block_and_its_memo_is_exact(
     sequential: dict[str, Any], device_kind: str
 ) -> None:
-    """The per-reference encode is Diffusers' reference encoder step, value for value, and a
-    memo hit hands back exactly what was encoded. Audio is never memoized."""
+    """The per-reference encode is Diffusers' reference encoder step, value for value. A
+    repeated reference is a memo hit: the same latents, no video-VAE scope. The voice is
+    encoded every time."""
     if device_kind == "cuda" and not torch.cuda.is_available():
         pytest.skip("needs a CUDA device")
     model = h3.model()
     for name in ("video_vae", "audio_vae"):
         model.pipe.components[name].to(device_kind)
-    checks, telemetry = _checks(model)
+    checks, _ = _checks(model)
     official = h3.start(model)
     model.pipe._run(h3.TASK, "vae_encoder", official, component="video_vae")
-    runs = []
+    voices: list[int] = []
+    model.pipe.components["audio_vae"].encoder.register_forward_pre_hook(
+        lambda *_: voices.append(1)
+    )
+    runs, scopes = [], []
     for _ in range(2):
         state = h3.start(model)
-        model.condition_ref2va_media(h3.TASK, state, checks=checks)
+        model.harness.calls.clear()
+        condition_ref2va_media(model, h3.TASK, state, checks=checks)
         runs.append(state)
+        scopes.append([call.method for call in model.harness.calls])
     for state in runs:
         for name in ("condition_latents", "audio_condition_latents"):
             ours, theirs = getattr(state, name), getattr(official, name)
@@ -112,29 +117,14 @@ def test_reference_encode_is_the_official_block_and_its_memo_is_exact(
             torch.equal(a, b)
             for a, b in zip(runs[0].condition_latents, sequential["condition_latents"], strict=True)
         )
-    # Two pictures and a clip are memoized; the voice is encoded every time.
-    assert _logged(telemetry, "h3 reference latents") == [
-        {"reused": 0, "encoded": 3},
-        {"reused": 3, "encoded": 0},
+    # Two pictures and a clip are encoded once; the second request stages only the audio VAE.
+    assert scopes == [
+        ["encode_reference"] * 3 + ["condition_ref2va_audio"],
+        ["condition_ref2va_audio"],
     ]
-    # The memo's own tensors never reach a request.
-    runs[1].condition_latents[0].zero_()
-    again = h3.start(model)
-    model.condition_ref2va_media(h3.TASK, again, checks=checks)
-    assert torch.equal(again.condition_latents[0], runs[0].condition_latents[0])
-
-
-def test_the_derived_cache_drops_its_least_recently_used_entry_at_its_bound() -> None:
-    model = h3.model()
-    cache = DerivedCache("probe", max_entries=2, max_bytes=1 << 20, owner=model)
-    with model._cozy_scope("condition_ref2va_media", ("video_vae", "audio_vae")):
-        for key in ("a", "b", "a", "c"):
-            cache.get(key, build=functools.partial(torch.full, (4,), ord(key)))
-        assert "a" in cache and "c" in cache and "b" not in cache
-        with pytest.raises(CapabilityError, match="exceeds its declared bound"):
-            cache.get("big", build=lambda: torch.zeros(1 << 19))
-    with pytest.raises(CapabilityError, match="outside an active component-use scope"):
-        cache.get("a", build=lambda: torch.zeros(1))
+    outcomes = [call.outcome for call in model._cozy_memo.engine.calls]
+    assert outcomes == ["miss"] * 3 + ["hit:memory"] * 3
+    assert len(voices) == 2
 
 
 def test_calls_that_hold_nothing_elsewhere_run_in_order_here() -> None:
@@ -194,8 +184,7 @@ def test_text_and_reference_conditioning_overlap_across_the_group(
     tmp_path: Path, degree: int, sequential: dict[str, Any]
 ) -> None:
     """Rank 1 runs the hosted conditioner while rank 0 encodes the references, and the
-    state is the sequential one bitwise. The pictures go to idle ranks, never to rank 1
-    while its conditioner call may arrive; the second request reuses every visual latent."""
+    state is the sequential one bitwise; the second request reuses every visual latent."""
     with Group(tmp_path, degree) as ranks:
         facts = ranks.leader.facts["sequence_parallel"]
         assert facts["hosted"] == {"text_encoder": 1}
@@ -219,7 +208,7 @@ def test_text_and_reference_conditioning_overlap_across_the_group(
         group.call_one = hosted  # type: ignore[method-assign]
         vae = model.pipe.components["video_vae"]
         handle = vae.encoder.register_forward_pre_hook(encode)
-        checks, telemetry = _checks(model)
+        checks, _ = _checks(model)
         state = h3.start(model)
         try:
             condition_references(model, h3.TASK, state, checks=checks)
@@ -227,19 +216,12 @@ def test_text_and_reference_conditioning_overlap_across_the_group(
             handle.remove()
             group.call_one = call_one  # type: ignore[method-assign]
         _assert_equal(_outputs(state), sequential)
-        log = group.spread_log["video_vae.encode_condition"]
-        assert log["spare"] is True
-        assert "1" not in log["calls"]
-        assert sum(log["calls"].values()) == 2
-        if degree == 4:
-            assert log["calls"] == {"0": 1, "2": 1}
-        assert sorted(group.rank_records) == list(range(1, min(degree, 3)))
+        assert "video_vae._encode_frames_clip" in group.spread_log
         again = h3.start(model)
         group.spread_log.clear()
         condition_references(model, h3.TASK, again, checks=checks)
         _assert_equal(_outputs(again), sequential)
-        assert "video_vae.encode_condition" not in group.spread_log
-        assert _logged(telemetry, "h3 reference latents")[-1] == {"reused": 3, "encoded": 0}
+        assert not group.spread_log, "every visual latent was a memo hit"
         assert not list((tmp_path / "attempt").rglob("tensor-*.raw"))
     assert not torch.distributed.is_initialized()
 

@@ -32,9 +32,8 @@ sys.path[:0] = [str(Path(__file__).parent), str(Path(__file__).parents[1])]
 
 from parallel_calls import h3_model  # type: ignore[import-not-found]  # noqa: E402
 
-from cozy_runtime.author import DerivedCache  # noqa: E402
 from cozy_runtime.author._decode import DecodedAudio  # noqa: E402
-from cozy_runtime.internal import accel  # noqa: E402
+from cozy_runtime.internal import accel, stage_memo  # noqa: E402
 from cozy_runtime.internal.executor import Executor, _capture_seal  # noqa: E402
 from cozy_runtime.internal.executor_commands import decode  # noqa: E402
 from cozy_runtime.internal.residency import ComponentResidency  # noqa: E402
@@ -140,13 +139,10 @@ def pipeline() -> Any:
 
 
 def model() -> Any:
-    """The runtime's own H3Model over the tiny pipeline, with its reference-latent memo."""
+    """The runtime's own H3Model over the tiny pipeline, memoizing as every generation does."""
     built: Any = H3Model.for_test(pipe=pipeline())
-    object.__setattr__(
-        built,
-        "reference_latents",
-        DerivedCache("reference_latents", max_entries=64, max_bytes=1 << 26, owner=built),
-    )
+    memo = stage_memo.GenerationMemo(torch, "", {}, "", "", {}, stage_memo.Engine())
+    object.__setattr__(built, "_cozy_memo", memo)
     return built
 
 

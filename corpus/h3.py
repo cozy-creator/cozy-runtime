@@ -235,10 +235,6 @@ class _H3Base(Model[H3Pipeline]):
 
     def _load(self, loader: Loader, *, task: Task) -> None:
         self.pipe = loader.construct(H3Pipeline, factory=lambda config: build_h3(config, task=task))
-        if self.pipe.structure != "baked":
-            # exactly one modulation source exists per bound tensor schema (§1.1.1); a baked
-            # construction never touches this cache
-            self.tables = loader.cache("adaln_modulation_tables", max_entries=8)
 
     @uses_components("text_encoder")
     def encode_presentation(self, tokens: int) -> int:
