@@ -73,6 +73,7 @@ var routes = func() map[string]*route {
 		"DescribeMachine": (*Machine).describeMachine, "ListModels": (*Machine).listModels,
 		"PreparePackageSet": (*Machine).preparePackageSet, "PrepareLocalPackage": (*Machine).prepareLocalPackage,
 		"PreparePrivatePlacement": (*Machine).preparePrivatePlacement, "LocalPackageUpload": (*Machine).localPackageUpload,
+		"ReadMachineLog": (*Machine).readMachineLog,
 	}
 	for method, handler := range own {
 		out["/"+podHost+"/"+method] = &route{method: service(podHost).Methods().ByName(protoreflect.Name(method)), handler: handler}

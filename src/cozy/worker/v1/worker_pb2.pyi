@@ -7,6 +7,11 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class MachineLog(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    MACHINE_LOG_UNSPECIFIED: _ClassVar[MachineLog]
+    MACHINE_LOG_TENSORFS_TRANSPORT: _ClassVar[MachineLog]
+
 class RunProductOp(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     RUN_PRODUCT_OP_UNSPECIFIED: _ClassVar[RunProductOp]
@@ -313,6 +318,8 @@ class WeightsFinalizeOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     WEIGHTS_FINALIZE_OUTCOME_UNSPECIFIED: _ClassVar[WeightsFinalizeOutcome]
     WEIGHTS_FINALIZE_OUTCOME_ADOPTED: _ClassVar[WeightsFinalizeOutcome]
     WEIGHTS_FINALIZE_OUTCOME_ABANDONED: _ClassVar[WeightsFinalizeOutcome]
+MACHINE_LOG_UNSPECIFIED: MachineLog
+MACHINE_LOG_TENSORFS_TRANSPORT: MachineLog
 RUN_PRODUCT_OP_UNSPECIFIED: RunProductOp
 RUN_PRODUCT_OP_SET: RunProductOp
 RUN_PRODUCT_OP_APPEND: RunProductOp
@@ -515,6 +522,22 @@ WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED: WeightsFinalizeDisposition
 WEIGHTS_FINALIZE_OUTCOME_UNSPECIFIED: WeightsFinalizeOutcome
 WEIGHTS_FINALIZE_OUTCOME_ADOPTED: WeightsFinalizeOutcome
 WEIGHTS_FINALIZE_OUTCOME_ABANDONED: WeightsFinalizeOutcome
+
+class MachineLogQuery(_message.Message):
+    __slots__ = ("claim", "log", "tail_bytes")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    LOG_FIELD_NUMBER: _ClassVar[int]
+    TAIL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    log: MachineLog
+    tail_bytes: int
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., log: _Optional[_Union[MachineLog, str]] = ..., tail_bytes: _Optional[int] = ...) -> None: ...
+
+class MachineLogChunk(_message.Message):
+    __slots__ = ("data",)
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    data: bytes
+    def __init__(self, data: _Optional[bytes] = ...) -> None: ...
 
 class ProtocolInfoRequest(_message.Message):
     __slots__ = ()

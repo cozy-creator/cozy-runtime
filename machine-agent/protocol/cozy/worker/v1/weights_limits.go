@@ -19,6 +19,7 @@ const MaxRetainedModelArtifactBytes = 4096
 const MaxModelResultPointerBytes = 1024
 const MaxActiveChildCalls = 32
 const MaxNativeByteReadChunkBytes = 32 << 10
+const MaxMachineLogChunkBytes = 64 << 10
 const MaxInputTreeManifestBytes = 1 << 20
 const MaxInputTreeChunkBytes = 1 << 20
 const MaxModelSourceHeaderBytes = MaxInlineControlBytes
