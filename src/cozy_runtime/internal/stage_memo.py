@@ -105,17 +105,26 @@ class Unmemoizable(Exception):
     """This call cannot be keyed or stored; it runs as if unmarked. `str()` is the reason."""
 
 
-def _bytes(tensor: Tensor, torch: ModuleType) -> bytes:
-    return tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+type Leaf = Tensor | np.ndarray[tuple[int, ...], np.dtype[np.generic]] | Image.Image
 
 
-def _flatten(value: object, torch: ModuleType, tensors: dict[str, Tensor], host: bool) -> object:
-    """`value` as a JSON structure with its tensors pulled out into `tensors`. Arguments
-    (`host`) admit only host tensors, so keying one never waits for a device; results admit
-    tensors anywhere. Anything else is `Unmemoizable`."""
+def _raw(leaf: Leaf, torch: ModuleType) -> memoryview:
+    """A leaf's bytes, without a copy where it is already contiguous on the host."""
+    if isinstance(leaf, np.ndarray):
+        return memoryview(np.ascontiguousarray(leaf)).cast("B")
+    if isinstance(leaf, Image.Image):
+        return memoryview(leaf.tobytes())
+    flat = leaf.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy()
+    return memoryview(flat)
 
-    def leaf(tensor: Tensor) -> str:
-        tensors[name := f"t{len(tensors)}"] = tensor.contiguous()
+
+def _flatten(value: object, torch: ModuleType, leaves: dict[str, Leaf], host: bool) -> object:
+    """`value` as a JSON structure with its tensors, arrays and images pulled out into
+    `leaves`. Arguments (`host`) admit only host tensors, so keying one never waits for a
+    device; results admit tensors anywhere. Anything else is `Unmemoizable`."""
+
+    def leaf(item: Leaf) -> str:
+        leaves[name := f"t{len(leaves)}"] = item
         return name
 
     def walk(value: object, depth: int) -> object:
@@ -131,12 +140,11 @@ def _flatten(value: object, torch: ModuleType, tensors: dict[str, Tensor], host:
                 raise Unmemoizable("tensor not a plain host tensor" if host else "tensor kind")
             if str(tensor.dtype).removeprefix("torch.") not in _DTYPES:
                 raise Unmemoizable(f"dtype {tensor.dtype}")
-            return ["t", leaf(tensor)]
-        if isinstance(value, (np.ndarray, Image.Image)):
-            raw: Tensor = torch.from_numpy(np.frombuffer(value.tobytes(), dtype=np.uint8).copy())
-            if isinstance(value, Image.Image):
-                return ["pil", value.mode, list(value.size), leaf(raw)]
-            return ["np", value.dtype.str, list(value.shape), leaf(raw)]
+            return ["t", leaf(tensor.contiguous())]
+        if isinstance(value, Image.Image):
+            return ["pil", value.mode, list(value.size), leaf(value)]
+        if isinstance(value, np.ndarray):
+            return ["np", value.dtype.str, list(value.shape), leaf(value)]
         if isinstance(value, enum.Enum):
             return ["e", _qualname(value), walk(value.value, depth + 1)]
         if value is None or isinstance(value, (bool, int, str)):
@@ -251,15 +259,23 @@ class Entry:
         return _rebuild(self.meta.structure, tensors)
 
 
-def _pack(structure: object, tensors: Mapping[str, Tensor], key: str, torch: ModuleType) -> Entry:
+def _pack(structure: object, leaves: Mapping[str, Leaf], key: str, torch: ModuleType) -> Entry:
     rows: dict[str, _Row] = {}
-    chunks: list[bytes] = []
+    chunks: list[memoryview] = []
+    devices: dict[str, str] = {}
     offset = 0
-    for name, tensor in tensors.items():
-        chunks.append(_bytes(tensor, torch))
-        dtype = _DTYPES[str(tensor.dtype).removeprefix("torch.")]
-        rows[name] = _Row(dtype, list(tensor.shape), (offset, offset := offset + len(chunks[-1])))
-    devices = {name: str(tensor.device) for name, tensor in tensors.items()}
+    for name, item in leaves.items():
+        chunks.append(_raw(item, torch))
+        size = offset + len(chunks[-1])
+        if isinstance(item, (np.ndarray, Image.Image)):
+            rows[name], devices[name] = _Row("U8", [len(chunks[-1])], (offset, size)), "cpu"
+        else:
+            dtype = _DTYPES[str(item.dtype).removeprefix("torch.")]
+            rows[name], devices[name] = (
+                _Row(dtype, list(item.shape), (offset, size)),
+                str(item.device),
+            )
+        offset = size
     probe = Entry(bytearray(b"".join(chunks)), _Meta(SCHEMA, key, "", structure, devices), rows, 0)
     meta = _Meta(SCHEMA, key, probe.digest(), structure, devices)
     head = msgspec.json.encode(
@@ -273,17 +289,26 @@ def _pack(structure: object, tensors: Mapping[str, Tensor], key: str, torch: Mod
 
 def encode(result: object, key: str, torch: ModuleType) -> tuple[Entry, object]:
     """The entry for `result`, and what the caller receives: the same structure with every
-    tensor contiguous, so a hit and a miss hand back one form."""
-    tensors: dict[str, Tensor] = {}
-    structure = _flatten(result, torch, tensors, host=False)
-    return _pack(structure, tensors, key, torch), _rebuild(structure, tensors)
+    tensor contiguous, so a hit and a miss hand back one form. A non-finite result is not
+    kept: a hit must never replay a diverged computation."""
+    leaves: dict[str, Leaf] = {}
+    structure = _flatten(result, torch, leaves, host=False)
+    floating = [t for t in leaves.values() if isinstance(t, torch.Tensor) and t.is_floating_point()]
+    if not all(bool(torch.isfinite(t.float()).all()) for t in floating):
+        raise Unmemoizable("non-finite result")
+    return _pack(structure, leaves, key, torch), _rebuild(structure, leaves)
 
 
 def arguments_digest(arguments: object, torch: ModuleType) -> str:
-    """The canonical digest of a call's bound arguments: what the key binds."""
-    tensors: dict[str, Tensor] = {}
-    structure = _flatten(arguments, torch, tensors, host=True)
-    return _pack(structure, tensors, "", torch).meta.sha256
+    """The canonical digest of a call's bound arguments, hashed in place: what the key binds."""
+    leaves: dict[str, Leaf] = {}
+    structure = _flatten(arguments, torch, leaves, host=True)
+    digest = hashlib.sha256(msgspec.json.encode(structure, order="sorted"))
+    for name, item in leaves.items():
+        shape = item.size if isinstance(item, Image.Image) else tuple(item.shape)
+        digest.update(f"{name}:{getattr(item, 'dtype', '')}:{shape}".encode())
+        digest.update(_raw(item, torch))
+    return "sha256:" + digest.hexdigest()
 
 
 def _type(qualname: str) -> Callable[..., object]:
@@ -303,7 +328,9 @@ def _rebuild(node: object, tensors: Mapping[str, object]) -> object:
     if kind == "t":
         return tensors[str(first)]
     if kind in ("np", "pil"):
-        raw = cast(Tensor, tensors[str(parts[3])]).numpy().tobytes()
+        if isinstance(stored := tensors[str(parts[3])], (np.ndarray, Image.Image)):
+            return stored  # a miss hands back its own value; the entry holds its bytes
+        raw = cast(Tensor, stored).numpy().tobytes()
         shape = tuple(cast(list[int], parts[2]))
         if kind == "pil":
             return Image.frombytes(str(first), (shape[0], shape[1]), raw)
