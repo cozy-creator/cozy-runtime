@@ -992,3 +992,36 @@ def test_callers_racing_for_one_installation_and_card_find_one_process(
     (slot,) = prespawns.slots.values()
     assert slot.started.wait(300) and slot.ready, slot.frames
     assert slot.supervision.spawns == 1
+
+
+def test_a_caller_arriving_while_the_replica_starts_starts_nothing_more(
+    warm: Callable[..., Warm],
+) -> None:
+    """Run 2531: the second of two queued calls asked for the installation's executor after the
+    first call's replica had claimed the slot and before its process was current. A second
+    slot on the replica's supervision was refused its spawn (`still owned`), reclaimed the
+    replica's process and closed its supervision, and the first run failed."""
+    machine = warm()
+    prespawns = machine.worker.prespawns
+
+    def ask() -> None:
+        prespawns.request_landing(INSTALLATION, _interface(), [{"path": "marco.models.model"}])
+
+    ask()
+    (slot,) = prespawns.slots.values()
+    assert prespawns.claim(INSTALLATION, (0,)) is slot  # its replica, while the process starts
+    ask()
+    assert list(prespawns.slots.values()) == [slot], "claimed, its replica not yet bound"
+    machine.worker._activating.add("machine-starting")
+    hosted = _replica(machine, slot, "machine-starting")
+    ask()
+    assert list(prespawns.slots.values()) == [slot], "bound, its process not yet current"
+    prespawns.settle(slot, "machine-starting")
+    ask()
+    assert prespawns.slots == {}, "settled, still activating"
+    machine.worker._activating.discard("machine-starting")
+    ask()
+    assert prespawns.slots == {}, "its replica's process holds the card"
+    executor = hosted.supervision.current
+    assert executor is not None and executor.alive() and executor is slot.executor
+    assert slot.ready and slot.supervision.spawns == 1

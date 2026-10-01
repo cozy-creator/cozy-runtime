@@ -198,8 +198,11 @@ class Prespawns:
         # a queued call) must find one slot, never each make a supervision for it.
         with self.starting:
             replica = self._replica(installation, ordinals)
-            if replica is not None and replica.supervision.current is not None:
-                return  # a replica's process holds (or is leaving) these cards: nothing to start
+            if replica is not None and (
+                replica.supervision.current is not None
+                or replica.placement.placement_id in self.worker._activating
+            ):
+                return  # its replica holds these cards, or is starting on them: nothing to start
             with self.lock:
                 slot = self.slots.get((installation, ordinals))
                 if slot is not None:
@@ -353,16 +356,18 @@ class Prespawns:
     def claim(self, installation: str, ordinals: Ordinals, sink: Emit | None = None) -> Slot | None:
         """The replica about to bind these cards takes the slot started for them; every other
         slot of its installation is now useless and yields. A slot started for no root sends
-        its phase rows to `sink`, the claiming execution's journal."""
+        its phase rows to `sink`, the claiming execution's journal. The slot stays known until
+        `settle`, so a caller arriving while the replica starts finds it and starts nothing."""
         with self.lock:
-            slot = self.slots.pop((installation, ordinals), None)
-            stale = [s for key, s in self.slots.items() if key[0] == installation]
+            slot = self.slots.get((installation, ordinals))
+            stale = [s for key, s in self.slots.items() if key[0] == installation and s is not slot]
+            if slot is not None:
+                slot.claimed.set()
         for other in stale:
             self._drop(other)
         if slot is not None:
             if sink is not None:
                 slot.attach(sink)
-            slot.claimed.set()
             if slot.executor is not None:
                 _nice(slot.executor, _WORKER)
         return slot
@@ -372,6 +377,9 @@ class Prespawns:
         its process to the replica at ordinary priority, or retire it so the replica starts
         its own."""
         slot.started.wait()
+        with self.lock:
+            if self.slots.get((slot.installation, slot.ordinals)) is slot:
+                del self.slots[(slot.installation, slot.ordinals)]
         executor = slot.executor
         worker = self.worker
         supervision = slot.supervision
@@ -386,8 +394,11 @@ class Prespawns:
         worker.note("warm", f"{placement_id!r} adopts prespawned epoch {executor.epoch}")
 
     def _drop(self, slot: Slot) -> None:
-        """Forget `slot` and reclaim its process off the caller's thread."""
+        """Forget `slot` and reclaim its process off the caller's thread. A claimed slot is
+        its replica's: `settle` reclaims a start that failed, and the replica starts its own."""
         with self.lock:
+            if slot.claimed.is_set():
+                return
             if self.slots.get((slot.installation, slot.ordinals)) is slot:
                 del self.slots[(slot.installation, slot.ordinals)]
         threading.Thread(target=self._retire, args=(slot,), daemon=True).start()
@@ -417,7 +428,8 @@ class Prespawns:
         with self.lock:
             slots, self.slots = list(self.slots.values()), {}
         for slot in slots:
-            self._retire(slot)
+            if not slot.claimed.is_set():
+                self._retire(slot)
 
 
 def _width(models: Sequence[object], readable: int) -> int:
