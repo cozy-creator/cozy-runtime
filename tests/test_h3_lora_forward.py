@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import os
+import socket
+import sys
 from collections.abc import Callable
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("peft")
+pytest.importorskip("diffusers")
+
+from cozy_runtime.internal import spawn  # noqa: E402
+from cozy_runtime.internal.executor import Executor  # noqa: E402
+from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
+from cozy_runtime.internal.seam import Channel  # noqa: E402
+from testdata import h3_lora_runtime  # noqa: E402
 
 if TYPE_CHECKING:
     from torch import Tensor, nn
@@ -16,14 +30,11 @@ if TYPE_CHECKING:
 @pytest.mark.parametrize("component", ["fl2va_dit", "ref2va_dit"])
 @pytest.mark.parametrize("turbo", [False, True])
 def test_real_h3_forward_matches_ordered_reference_adapters(component: str, turbo: bool) -> None:
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("peft")
-    pytest.importorskip("diffusers")
-    from cozy_runtime.internal.lora_composition import composer
-    from cozy_runtime.internal.lora_contract import FORMAT, Graph, Linear
     from diffusers.modular_pipelines.minimax_h3.before_denoise import MiniMaxH3PrepareLayoutStep
 
     from cozy_runtime.author import AdapterRef
+    from cozy_runtime.internal.lora_composition import composer
+    from cozy_runtime.internal.lora_contract import FORMAT, Graph, Linear
     from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
     from cozy_runtime.models.minimax_h3.turbo import (
         ATTENTION_KWARG,
@@ -204,3 +215,73 @@ def test_real_h3_forward_matches_ordered_reference_adapters(component: str, turb
         torch.set_num_threads(prior_threads)
         for hook in hooks:
             hook.remove()
+
+
+@pytest.mark.parametrize("degree", [2, 4])
+def test_a_prepared_lora_view_serves_its_exact_factors_on_every_gpu(
+    tmp_path: Path, degree: int
+) -> None:
+    """The production path end to end: the adapter-view child composes a real fp32 LoRA onto a
+    bf16 H3 checkpoint, the executor's bind/substrate/plane constructs and fills it, and the
+    group's real followers construct their own replica. Every GPU must hold the stored factors
+    and scale, a group must compute what one GPU does, and both what merged weights compute."""
+    root = tmp_path / "store"
+    view, values, factors = h3_lora_runtime.checkpoints(root)
+    model, backend = h3_lora_runtime.construct(root, view.digest)
+    held = h3_lora_runtime.adapters(model)
+    assert list(held) == h3_lora_runtime.targets(h3_lora_runtime.dit())
+    for path, (a, b, scaling, active) in held.items():
+        assert torch.equal(a, factors[path + ".lora_A.weight"]), path
+        assert torch.equal(b, factors[path + ".lora_B.weight"]), path
+        assert (scaling, active) == (h3_lora_runtime.SCALING, ("adapter_0",)), path
+
+    inputs = h3_lora_runtime.inputs()
+    one = model.denoise(inputs)
+    merged, plain = h3_lora_runtime.dit().eval(), h3_lora_runtime.dit().eval()
+    merged.load_state_dict(values)
+    plain.load_state_dict(values)
+    with torch.inference_mode():
+        for path in held:
+            layer = merged.get_submodule(path)
+            delta = factors[path + ".lora_B.weight"] @ factors[path + ".lora_A.weight"]
+            weight = values[path + ".weight"].float() + h3_lora_runtime.SCALING * delta
+            layer.weight.copy_(weight.to(layer.weight.dtype))
+        wanted, base = merged(**inputs), plain(**inputs)
+    for got, want, without in zip(one, wanted, base, strict=True):
+        effect = (want.float() - without.float()).norm()
+        assert (got.float() - want.float()).norm() < 0.05 * effect
+
+    fixture = Path(h3_lora_runtime.__file__)
+
+    def launch(module_argv: list[str], fd: int) -> spawn.Child:
+        return spawn.spawn_follower(
+            python=sys.executable,
+            module_argv=[str(fixture), *module_argv[2:], "--view", view.digest],
+            inherit_fd=fd,
+            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        )
+
+    group = RankGroup(degree=degree, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    ours, theirs = socket.socketpair()
+    leader: Any = Executor(Channel(ours), tmp_path, world=degree)
+    leader.device_kind = "cpu"
+    leader.group = group
+    leader._group_model_key = "fixture"
+    leader.backend = backend
+    try:
+        group.spawn()
+        group.form(torch, {})
+        leader.pg = group.pg
+        assert leader._install_group(torch, model) is None
+        mine = h3_lora_runtime.digest(held)
+        for rank in range(1, degree):
+            assert (tmp_path / f"adapters-{rank}.txt").read_text() == mine, f"GPU {rank}"
+        leader._attempt_spool = tmp_path / "attempt"
+        many = model.denoise(inputs)
+    finally:
+        group.close()
+        ours.close()
+        theirs.close()
+    for got, single in zip(many, one, strict=True):
+        torch.testing.assert_close(got, single, rtol=0.02, atol=0.02)
+    assert not torch.cuda.is_initialized()
