@@ -13,7 +13,7 @@ requires-python = ">=3.12"
 # what `worker-protocol/scripts/vendored-diff.sh` checks (#536d), and it is why the copy no
 # longer carries the old import rewrite.
 dependencies = [
-    "tensorfs>=0.3.80,<0.4",
+    "tensorfs>=0.3.84,<0.4",
     "cryptography>=45",
     "grpcio>=1.76",
     "msgspec>=0.19",
@@ -33,7 +33,7 @@ dev = [
     "cozy-eval==0.7.2",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.3.80,<0.4",
+    "tensorfs>=0.3.84,<0.4",
     "types-protobuf>=6.30",
     "av>=18.1,<19",
     # CI partitions this unchanged suite across independent delegated runners.
@@ -193,8 +193,8 @@ media = [
 ]
 # Runtime owns the model byte plane. Local package environments select this complete
 # capability; base worker images provide TensorFS from the same PyPI range.
-# 0.3.80 restores source custody after canceled pulls have already landed every byte.
-model-execution = ["tensorfs>=0.3.80,<0.4"]
+# 0.3.84 carries the weight plane (`tensorfs.plane`) that executors load weights through.
+model-execution = ["tensorfs>=0.3.84,<0.4"]
 adapters = [
     "peft>=0.20,<0.21",
     "torch>=2.13",
