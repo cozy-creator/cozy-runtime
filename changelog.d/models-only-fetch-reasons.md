@@ -1,0 +1,1 @@
+A models-only preparation refused by TensorFS now says why: the refusal carries TensorFS's code and its detail (the Hub's own message, the object that failed, a full disk's numbers), not the code alone. Stopping the machine cancels its models-only pulls at once, even while the Hub has not answered, and they end as "machine stopped", never as a transfer failure.
