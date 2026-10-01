@@ -42,7 +42,7 @@ from cozy_runtime.internal.worker.plan import (
 )
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
-from test_gpu_scheduler import Machine
+from test_gpu_scheduler import VIRTUAL, Machine, driverless
 
 needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 
@@ -194,9 +194,10 @@ def test_the_view_reads_no_driver() -> None:
 @pytest.fixture
 def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
     measured = accel.DeviceMemory("measured", TOTAL, TOTAL)
+    driverless(monkeypatch)
     monkeypatch.setattr(accel, "device_memory", lambda entry, kind: measured)
     with tempfile.TemporaryDirectory(prefix="cz-mem.", dir="/tmp") as root:
-        made = Machine(Path(root), "0,1,2,3", "boot-one")
+        made = Machine(Path(root), VIRTUAL, "boot-one")
         try:
             yield made
         finally:

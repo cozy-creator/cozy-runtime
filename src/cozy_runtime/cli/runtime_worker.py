@@ -151,7 +151,7 @@ def _run(
         raise LaunchRefusal("runtime_accelerator_backend_invalid", base.accelerator_backend)
     required = base.accelerator_backend == "cuda"
     gpus = (
-        readiness.runtime_gpus(config.child_base_env, required=required)
+        readiness.runtime_gpus(config.child_base_env, config.visible_devices, required=required)
         if virtual_gpus is None
         else readiness.validated_gpus(list(virtual_gpus), required=required)
     )

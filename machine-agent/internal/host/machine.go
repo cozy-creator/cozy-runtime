@@ -502,6 +502,16 @@ func (m *Machine) runtime(ctx context.Context) (*grpc.ClientConn, error) {
 		p, ready := m.proc, m.ready
 		m.mu.Unlock()
 		if p == nil || p.exited() {
+			if !m.launcherReady() {
+				// Boot holds admission until its startup check says whether an update is
+				// pending; until then the Runtime is starting, not updating.
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-m.initialized:
+				}
+				continue
+			}
 			if m.updating() {
 				return nil, unavailable("runtime_updating", "this machine is updating its Runtime; ask again when it is done")
 			}

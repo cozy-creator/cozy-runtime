@@ -129,8 +129,8 @@ def _host() -> str:
     return ""
 
 
-NO_CARD = _host()
-needs_card = pytest.mark.skipif(bool(NO_CARD), reason=NO_CARD or "")
+#: Asked only when the run opted in (`--real-gpu`), never at import: importing reaches no driver.
+needs_card = pytest.mark.real_gpu
 
 
 def free() -> int:
@@ -525,8 +525,8 @@ class Card:
 
 @pytest.fixture(scope="module")
 def store(tmp_path_factory: pytest.TempPathFactory) -> Store:
-    if NO_CARD:
-        pytest.skip(NO_CARD)
+    if why := _host():
+        pytest.skip(why)
     return write_store(tmp_path_factory.mktemp("gpu-store"), blocks=24, models=("p", "q", "r"))
 
 

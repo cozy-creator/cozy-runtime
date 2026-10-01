@@ -8,7 +8,7 @@ dependencies = [
     "diffusers==0.40.0",
     "msgspec>=0.19",
     "torch>=2.13,<3",
-    "triton==3.7.1",
+    "triton==3.8.0",
 ]
 
 [project.entry-points."cozy.application"]

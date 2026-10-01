@@ -185,6 +185,10 @@ class HeldManifests:
         with self._lock:
             return sorted(self._held)
 
+    def __contains__(self, digest: object) -> bool:
+        with self._lock:
+            return digest in self._held
+
     def hold(self, store: fill.Store, digest: str) -> tuple[tuple[str, int], ...]:
         """One verified walk of `digest`'s runtime closure: record the answer and return the
         closure's objects, or re-raise the store's refusal after recording the absence."""

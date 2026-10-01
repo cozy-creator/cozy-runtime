@@ -543,25 +543,29 @@ class _Loaded:
 _LOADED: dict[int, _Loaded] = {}
 
 
-def _job(device: Any) -> tuple[kernel_cache.Store, kernel_compile.Job]:
-    _require_triton()
-    _require_torch()
+def _store() -> kernel_cache.Store:
     store = kernel_cache.configured()
     if store is None:
         raise FusionUnavailable(
             "fusion_kernels_absent", "no machine kernel store: this executor has no rooted worker"
         )
+    return store
+
+
+def _job(device: Any) -> tuple[kernel_cache.Store, kernel_compile.Job]:
+    _require_torch()
     major, minor = torch.cuda.get_device_capability(device)
-    return store, job(major * 10 + minor)
+    return _store(), job(major * 10 + minor)
 
 
-def expect(device: Any) -> str:
-    """Worker boot: submit this device's compile without waiting; the state's line."""
+def expect(arch: int) -> str:
+    """Submit `arch`'s compile without waiting, before any device exists: the state's line.
+    Keyed in the process that will load it (its Triton and cache directory), so an executor
+    submits its own at start."""
     try:
-        store, found = _job(device)
+        return kernel_compile.submit(_store(), job(arch)).line()
     except FusionUnavailable as exc:
         return f"{exc.code}: {exc}"
-    return kernel_compile.submit(store, found).line()
 
 
 def load(device: Any, *, wait: bool = False) -> _Loaded:

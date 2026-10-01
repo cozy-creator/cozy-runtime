@@ -14,6 +14,7 @@ from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
 from cozy_runtime.protocol import documents
 from test_device_lanes import _config
+from test_gpu_scheduler import VIRTUAL, driverless
 from test_group_stage_residency import current_placement
 
 FIXTURE = Path(__file__).parent / "testdata/h3-public-binding-sets"
@@ -62,13 +63,14 @@ def test_public_alternative_entrypoints_preserve_the_joint_call_cost(
     assert all(len(b.model_bindings()) == 2 for b in bindings.values())
     assert len({b.construction_key() for b in bindings.values()}) == 1
     placement.device_pin = tuple(range(degree))
+    driverless(monkeypatch)
     monkeypatch.setattr(accel, "host_backend_family", lambda: "cuda")
     monkeypatch.setattr(
         accel, "device_memory", lambda *_: accel.DeviceMemory("measured", ROOM, ROOM)
     )
     worker = Worker(
         _config(tmp_path / "home"),
-        WorkerOptions(root=tmp_path / "worker", devices=",".join(map(str, range(degree)))),
+        WorkerOptions(root=tmp_path / "worker", devices=",".join(VIRTUAL.split(",")[:degree])),
         InMemoryControlHost(),
     )
     try:

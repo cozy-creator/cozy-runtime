@@ -8,6 +8,7 @@ row on every wake. Its exception fails this execution and nothing else (`crashed
 from __future__ import annotations
 
 import contextlib
+import functools
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
@@ -148,6 +149,9 @@ class Execution:
                     return
                 broker = self.worker.gpu
                 broker.want(grant_key, want)
+                if shape.kind == "serving":
+                    journal = functools.partial(self.worker._journal_row, self.request, row.ordinal)
+                    self.worker.prespawns.waiting(want, shape.interface, journal)
                 unit.wait_for(
                     lambda: broker.granted(grant_key) is not None or self._moved(row), due
                 )

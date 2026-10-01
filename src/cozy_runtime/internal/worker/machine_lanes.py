@@ -40,6 +40,7 @@ class Shape:
     template: tuple[str, str] = ("", "")
     refusal: str = ""
     gpus: int = 0  # the exact group width the owner submitted; 0 lets the scheduler choose
+    interface: bytes = b""  # the template's PackageInterface, for its executor's prespawn
 
 
 def shape(worker: Worker, owner: str, request: str) -> Shape:
@@ -48,6 +49,18 @@ def shape(worker: Worker, owner: str, request: str) -> Shape:
     root, parent = executions.scheduling_root(owner, request)
     desired = executions.prepared(owner, request).desired()
     return _shape(worker, root, parent, desired, executions.offer(owner, request))
+
+
+def recorded(worker: Worker, owner: str, request: str) -> Shape:
+    """What a journaled execution, finished or not, asked of the GPUs, from its own offer."""
+    executions = worker.executions
+    assert executions is not None
+    row = executions.row(owner, request)
+    if row is None:
+        return Shape(request, "cpu")
+    return _shape(
+        worker, "", "", executions.prepared(owner, request).desired(), row.attempt_offer()
+    )
 
 
 def _shape(
@@ -70,7 +83,14 @@ def _shape(
             for m in models
         )
         gpus = desired.placement_set.execution_gpus
-        found = Shape(root, "serving" if models else "cpu", degrees, template, gpus=gpus)
+        found = Shape(
+            root,
+            "serving" if models else "cpu",
+            degrees,
+            template,
+            gpus=gpus,
+            interface=row.package_interface,
+        )
     else:
         return Shape(root, "cpu")  # an owner-placed serving root already has its lane
     held = worker.engine.live.get(parent) if parent else None

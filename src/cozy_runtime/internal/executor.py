@@ -62,7 +62,6 @@ from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author._assets import GrantedInput
-from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._errors import (
@@ -446,6 +445,8 @@ class Executor:
         self.weights: Weights | None = None
         self.active = ""
         self.started = False
+        #: torch, the Runtime and the package are imported (`Start.import_only`); no device yet
+        self.imported = False
         self.package_warmed = False
         #: rank 0 only: each follower's own start ledger, in rank order
         self.follower_stages: list[list[Any]] = []
@@ -548,9 +549,9 @@ class Executor:
             case PrepareRequest():
                 return self.serve_request(command)
             case Invoke():
-                return self.serve_invoke(command)
+                return self._settled(self.serve_invoke(command))
             case RunJob():
-                return self.run_job(command)
+                return self._settled(self.run_job(command))
             case Probe():
                 return self.probe()
             case Vacate():
@@ -578,7 +579,11 @@ class Executor:
             "native_interfaces": native_interfaces.stated(),
             "model_adapters": ["peft_graph/1"],
             #: what the worker's memory manager may ask beyond the floor's commands
-            "memory": ["vacate_ranks", *([plane.CAPABILITY] if plane.available() else [])],
+            "memory": [
+                "import_only",
+                "vacate_ranks",
+                *([plane.CAPABILITY] if plane.available() else []),
+            ],
             "pgid": os.getpgrp(),
             "no_new_privs": _proc_status("NoNewPrivs"),
             "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
@@ -1117,10 +1122,15 @@ class Executor:
         package whose interface binds no model on any entrypoint imports no Torch at all,
         which is what keeps a weightless package servable on a cardless runner (cl-013).
         Idempotent: a started process answers with what it started as.
+
+        `import_only` (a prespawn, before the GPU grant) stops after the imports: no device
+        is initialized and `self.torch` stays unset, so the process holds no device memory
+        and reads as unstarted. The ordinary start that follows only initializes devices,
+        warms the package and forms the group.
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if self.started:
+        if self.started or (command.import_only and self.imported):
             return self._start_reply([], reused=True)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
         if command.devices != sealed_devices:
@@ -1177,6 +1187,8 @@ class Executor:
             stages.append((name, round((now - _mark[0]) * 1000, 1)))
             _mark[0] = now
 
+        imported = self.imported
+        warmup_error = ""
         try:
             if degree > 1 and self.rank == 0:
                 self.world = degree
@@ -1197,29 +1209,43 @@ class Executor:
             if model_bearing:
                 import torch
 
-                self.torch = torch
-                stage("torch_import")
-                try:
-                    refused = self._initialize_device(torch)
-                except RuntimeError as exc:
-                    refused = {
-                        "ok": False,
-                        "code": "accelerator_unavailable",
-                        "detail": f"the sealed devices {_SEALED.get('CUDA_VISIBLE_DEVICES')!r} "
-                        f"could not be initialized: {exc}"[:900],
-                    }
-                if refused is not None:
-                    self.poisoned = f"start refused: {refused['code']}"
-                    return self._close_after(refused)
-                stage("cuda_init")
-                for name in _CONSTRUCTION_MODULES:
-                    importlib.import_module(name)
-                stage("runtime_imports")
+                if not imported:
+                    stage("torch_import")
+                if not command.import_only:
+                    self.torch = torch
+                    try:
+                        refused = self._initialize_device(torch)
+                    except RuntimeError as exc:
+                        refused = {
+                            "ok": False,
+                            "code": "accelerator_unavailable",
+                            "detail": "the sealed devices "
+                            f"{_SEALED.get('CUDA_VISIBLE_DEVICES')!r} "
+                            f"could not be initialized: {exc}"[:900],
+                        }
+                    if refused is not None:
+                        self.poisoned = f"start refused: {refused['code']}"
+                        return self._close_after(refused)
+                    stage("cuda_init")
+                if not imported:
+                    for name in _CONSTRUCTION_MODULES:
+                        importlib.import_module(name)
+                    stage("runtime_imports")
             if self.discovered is None:
                 self._discover_provisioned(command.release())
-            stage("package_import")
-            warmup_error = self._warm_package()
-            stage("package_warmup")
+                stage("package_import")
+            compiles = (
+                self._expect_fusion() if model_bearing and self.rank == 0 and not imported else ""
+            )
+            if command.import_only:
+                if model_bearing and accel.initialized(torch, self.device_kind):
+                    self.poisoned = "the package import initialized a device before its grant"
+                    return self._close_after(
+                        self._refusal("cuda_initialized_before_runtime", self.poisoned)
+                    )
+            else:
+                warmup_error = self._warm_package()
+                stage("package_warmup")
             if self.group is not None:
                 replies = self.group.collect("start")
                 self.follower_stages = [list(reply.get("stages") or []) for reply in replies]
@@ -1230,8 +1256,9 @@ class Executor:
                             f"{reply.get('detail', '')}"[:800],
                             code="group_unformed",
                         )
-                self.pg = self.group.form(self.torch, _SEALED)
-                stage("group_form")
+                if not command.import_only:
+                    self.pg = self.group.form(self.torch, _SEALED)
+                    stage("group_form")
         except GroupRefusal as exc:
             return self._group_refusal(exc)
         except Exception:
@@ -1239,17 +1266,24 @@ class Executor:
             if self.group is not None:
                 self.group.close()
             raise
-        self.started = True
+        self.imported = True
+        self.started = not command.import_only
         took_ms = (time.perf_counter() - started) * 1000
+        # A prespawned process's record keeps its import legs beside the device start's.
         self.boot = {
             "started_unix_ms": int(time.time() * 1000 - took_ms),
             "ms": round(took_ms, 1),
-            "legs_ms": dict(stages),
+            "legs_ms": {**self.boot.get("legs_ms", {}), **dict(stages)},
         }
-        return self._start_reply(stages, warmup_error=warmup_error)
+        return self._start_reply(stages, warmup_error=warmup_error, compiles=compiles)
 
     def _start_reply(
-        self, stages: list[tuple[str, float]], *, reused: bool = False, warmup_error: str = ""
+        self,
+        stages: list[tuple[str, float]],
+        *,
+        reused: bool = False,
+        warmup_error: str = "",
+        compiles: str = "",
     ) -> dict[str, Any]:
         total = free = -1
         if self.torch is not None and accel.present(self.torch, self.device_kind):
@@ -1267,96 +1301,34 @@ class Executor:
             "warmed": not warmup_error,
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
+            **({"compiles": compiles} if compiles else {}),
         }
 
     def warm(self, command: Warm) -> dict[str, Any]:
-        """The startup warm (h3a-087): a started process with nothing constructed starts, on
-        every rank's own card, the compiles its first construction will want (the fused glue
-        and every kernel of the model's preferred chain and the ranked table), so they run
-        beside the weights' download. It returns at once: nothing here waits on a compile.
-
-        An optimization and never a verdict: the construction selects again for real."""
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if not self.started or self.torch is None or self.device_kind != "cuda":
-            return {"ok": True, "ranks": [], "skipped": "no started device process"}
-        started = time.perf_counter()
-        try:
-            if self.group is not None and self.rank == 0:
-                self.group.broadcast(executor_commands.encode(command))
-            rows = [self._warm_rank()]
-            if self.group is not None and self.rank == 0:
-                rows += [reply.get("rank_warm") or {} for reply in self.group.collect("warm")]
-        except GroupRefusal as exc:
-            return self._group_refusal(exc)
-        if self.rank > 0:
-            return {"ok": True, "rank_warm": rows[0]}
-        took = (time.perf_counter() - started) * 1000
-        if "started_unix_ms" in self.boot:
-            # The boot record spans the warm too: `cozy run show` reads one executor boot.
-            for name in ("fusion_compile", "attention_compile"):
-                self.boot["legs_ms"][name] = max(r.get("legs_ms", {}).get(name, 0.0) for r in rows)
-            self.boot["ms"] = round(time.time() * 1000 - self.boot["started_unix_ms"], 1)
-        return {"ok": True, "ranks": rows, "ms": round(took, 1)}
-
-    def _warm_rank(self) -> dict[str, Any]:
-        from cozy_runtime.internal import fusion
-        from cozy_runtime.internal.encoding import measure_device
-
-        legs: dict[str, float] = {}
-        mark = time.perf_counter()
-        device = measure_device(self.torch, self.rank if self.world > 1 else 0)
-        fused = ""
-        classes = self._model_classes()
-        if any(getattr(cls, "__fusion__", "refuse") in ("accept", "require") for cls in classes):
-            fused = fusion.expect(self._rank_device(self.torch))[:200]
-            legs["fusion_compile"] = round((time.perf_counter() - mark) * 1000, 1)
-        mark = time.perf_counter()
-        kernels = attention.expect(device, self._preferred_attention(classes, device))
-        # Launch checks' scratch goes back to the driver: the card may be another call's.
-        accel.release_cached(self.torch, self.device_kind)
-        legs["attention_compile"] = round((time.perf_counter() - mark) * 1000, 1)
-        return {
-            "rank": self.rank,
-            "legs_ms": legs,
-            "kernels": kernels,
-            **({"fusion": fused} if fused else {}),
-        }
+        """An older worker's startup warm: its compiles start with the process now
+        (`_expect_fusion`) and launch checks run at construction."""
+        return {"ok": True, "ranks": [], "skipped": "compiles start with the process"}
 
     def _model_classes(self) -> list[type[Model[Any]]]:
         module = getattr(self.discovered, "module", None)
         values = vars(module).values() if module is not None else ()
         return [v for v in values if isinstance(v, type) and issubclass(v, Model) and v != Model]
 
-    def _preferred_attention(self, classes: list[type[Model[Any]]], device: Any) -> list[str]:
-        """Each model class's stated preference, asked per declared component with the facts
-        a site would carry. A class whose choice needs its constructed state says nothing."""
-        order: list[str] = []
-        for cls in classes:
-            if cls.choose_attention is Model.choose_attention:
-                continue
-            components = {c for used in component_use(cls).values() for c in used}
-            for component in sorted(components):
-                context = AttentionContext(
-                    component,
-                    "",
-                    device.kind,
-                    device.name,
-                    device.sm,
-                    "bfloat16",
-                    128,
-                    self.world,
-                    (),
-                    "",
-                    "",
-                )
-                try:
-                    chosen = cls.choose_attention(object.__new__(cls), context)
-                except Exception:
-                    continue
-                names = [chosen] if isinstance(chosen, str) else list(chosen or ())
-                order += [name for name in names if isinstance(name, str) and name not in order]
-        return order
+    def _expect_fusion(self) -> str:
+        """Start the fused glue's compile for each sealed card's architecture, read from the
+        driver's management library: no device context, so it runs beside the wait for the
+        grant and the weights (h3a-087). Construction takes the build once it is ready."""
+        if not any(
+            getattr(cls, "__fusion__", "refuse") in ("accept", "require")
+            for cls in self._model_classes()
+        ):
+            return ""
+        try:
+            fusion = importlib.import_module("cozy_runtime.internal.fusion")
+            archs = sorted({accel.device_capability(entry) for entry in _sealed_entries()} - {0})
+            return "; ".join(f"fusion sm{arch} {fusion.expect(arch)}" for arch in archs)
+        except Exception as exc:  # an optimization, never the start's verdict
+            return f"fusion compile not started: {type(exc).__name__}: {exc}"[:300]
 
     def _close_after(self, reply: dict[str, Any]) -> dict[str, Any]:
         """A refusal after followers were commanded leaves them mid-protocol: the process
@@ -2822,9 +2794,13 @@ class Executor:
                 record.emit(
                     "confession", "attention.sol.kernel", fields.pop("source"), rank=0, **fields
                 )
-        self._emit_attention(
-            record, attention.observed(self._attention_roots()), "attention.restored"
+        # Nothing was swapped, so the restore left the sites exactly as the entry walk read them.
+        restored = (
+            served_attention
+            if swap is None and not pin and served_attention is not None
+            else attention.observed(self._attention_roots())
         )
+        self._emit_attention(record, restored, "attention.restored")
         # THE MODES THIS ATTEMPT RAN IN (weight-plane.md principle 7): decode tiling and batch
         # layout, each decided before its stage and recorded with the run.
         plane_facts = self._plane_facts()
@@ -3958,6 +3934,28 @@ class Executor:
             rows.append(row)
         return rows
 
+    def _device_figures(self) -> dict[str, int]:
+        """The card as its allocator and driver see it now. A process with no card (a CPU
+        executor, a gloo rank) has none; readers take absent as unknown."""
+        if self.torch is None or self.device_kind == "mps":
+            return {}
+        if not accel.present(self.torch, self.device_kind):
+            return {}
+        memory = accel.allocation(self.torch, self.device_kind)
+        return {
+            "device_free_bytes": memory["driver_free_bytes"],
+            "device_total_bytes": memory["driver_total_bytes"],
+            "allocator_bytes": memory["allocated_bytes"],
+            "reserved_bytes": memory["reserved_bytes"],
+        }
+
+    def _settled(self, reply: dict[str, Any]) -> dict[str, Any]:
+        """An attempt's reply carries the after-state a `Probe` would read next, so the
+        worker closes its ledger without another round trip; residency and RSS are already
+        in the reply."""
+        reply["after"] = {**self._device_figures(), "processes": self.process_incarnations()}
+        return reply
+
     def probe(self) -> dict[str, Any]:
         processes = self.process_incarnations()
         if self.torch is None:
@@ -3969,21 +3967,10 @@ class Executor:
                 "processes": processes,
                 "poisoned": self.poisoned,
             }
-        # A torch-bearing process with no card (a CPU executor, a gloo rank) has no device
-        # numbers to report; readers take absent as unknown.
-        device: dict[str, int] = {}
-        if self.device_kind != "mps" and accel.present(self.torch, self.device_kind):
-            memory = accel.allocation(self.torch, self.device_kind)
-            device = {
-                "device_free_bytes": memory["driver_free_bytes"],
-                "device_total_bytes": memory["driver_total_bytes"],
-                "allocator_bytes": memory["allocated_bytes"],
-                "reserved_bytes": memory["reserved_bytes"],
-            }
         return {
             "ok": True,
             "torch": True,
-            **device,
+            **self._device_figures(),
             "residency": self._active_residency(),
             "constructions": self.residency_document()["constructions"],
             "plane": self._plane_facts(),
@@ -4190,7 +4177,6 @@ _FOLLOWER_COMMANDS = frozenset(
     {
         "hello",
         "start",
-        "warm",
         "join",
         "load",
         "activate",

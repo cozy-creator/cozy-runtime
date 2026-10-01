@@ -180,6 +180,8 @@ class AttemptReply(msgspec.Struct, frozen=True, kw_only=True):
     """Request fields the package's types do not declare, dropped before decoding."""
     oversize_result_bytes: int = 0
     metrics: Metrics = Metrics()
+    #: The card and ranks after the cache went back; an older executor is probed instead.
+    after: dict[str, Json] | None = None
     plane: PlaneFacts | None = None
 
 

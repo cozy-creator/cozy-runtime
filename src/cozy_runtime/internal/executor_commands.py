@@ -43,7 +43,7 @@ class Residency(Command, frozen=True, kw_only=True, tag="residency"):
 
 
 class Warm(Command, frozen=True, kw_only=True, tag="warm"):
-    pass
+    """An older worker's startup warm. Never sent now; answered so that worker still runs."""
 
 
 class Join(Command, frozen=True, kw_only=True, tag="join"):
@@ -114,6 +114,9 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     sequence_parallel_degree: int = 1
     application: str = ""
     package_interface: str = ""
+    #: Import torch, the Runtime and the package and stop: no device is touched. Sent only to
+    #: an executor whose hello lists `import_only`; an older one would ignore it and start.
+    import_only: bool = False
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)

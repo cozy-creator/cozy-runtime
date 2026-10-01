@@ -20,7 +20,7 @@ from cozy_runtime.internal.executor_replies import PlaneFacts
 from cozy_runtime.internal.worker import child, prespawn
 from cozy_runtime.internal.worker.session import HostedPlacement, Tenant
 from cozy_runtime.protocol import worker_pb2 as pb
-from test_gpu_scheduler import Machine
+from test_gpu_scheduler import VIRTUAL, Machine
 from test_memory_manager import TOTAL, GiB, needs_executor
 from test_memory_manager import machine as machine
 
@@ -54,7 +54,7 @@ def contexts(
         accel,
         "device_memory",
         lambda entry, kind: accel.DeviceMemory(
-            "measured", TOTAL - occupied.get(int(entry), 0), TOTAL
+            "measured", TOTAL - occupied.get(VIRTUAL.split(",").index(entry), 0), TOTAL
         ),
     )
     document = pb.Placement()
@@ -137,7 +137,7 @@ def test_start_admits_the_full_group_before_allocating_a_new_context(
     with fresh.lane.device:
         assert machine.worker._start_executor(fresh, executor) == ""
     assert len(calls) == 1
-    assert calls[0].devices == "0,1" and calls[0].sequence_parallel_degree == 2
+    assert calls[0].devices == "64,65" and calls[0].sequence_parallel_degree == 2
     assert fresh.bindings == bindings and not fresh.failed_bindings
     assert executor.started and executor.alive() and old.alive()
     assert not occupied and cut(machine)

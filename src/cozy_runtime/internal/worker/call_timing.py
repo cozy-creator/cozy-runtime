@@ -182,8 +182,7 @@ class Timing:
             }
             if status:
                 document["status"] = status
-            root, _ = self.executions.scheduling_root(owner, request)
-            self.executions.record(owner, root, "call.phase", document)
+            self.executions.observe(owner, [(request, "call.phase", document)], rooted=True)
             if phase in ("paused", "terminal"):
                 del self.clocks[key]
             return clock.measurements()

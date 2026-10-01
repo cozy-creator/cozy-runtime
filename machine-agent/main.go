@@ -39,5 +39,5 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: cozy-machine [run | version --json]")
 		os.Exit(2)
 	}
-	os.Exit(host.Main(os.Stderr))
+	os.Exit(host.Main(host.Stamped(os.Stderr)))
 }

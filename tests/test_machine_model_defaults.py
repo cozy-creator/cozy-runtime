@@ -7,7 +7,6 @@ import json
 import threading
 import time
 from collections.abc import Callable
-from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -166,10 +165,13 @@ def test_unused_or_overridden_defaults_do_not_touch_catalog_or_storage(
     monkeypatch.setattr(fill, "tensorfs_module", forbidden)
     empty_peer = cast(Worker, SimpleNamespace())
     call = cast(Call, SimpleNamespace(parent_request="root"))
-    assert defaults.select(
-        empty_peer, "owner", call, target(), {"model": {}, "adapter": {}}, model_choices={}
-    ) == []
-    defaults.materialize(empty_peer, [], ExitStack())
+    assert (
+        defaults.select(
+            empty_peer, "owner", call, target(), {"model": {}, "adapter": {}}, model_choices={}
+        )
+        == []
+    )
+    defaults.materialize(empty_peer, [])
     worker = peer(captured())
     selected = defaults.select(worker, "owner", call, target(), {"model": {}, "adapter": None})
     assert (
@@ -182,9 +184,8 @@ def test_unused_or_overridden_defaults_do_not_touch_catalog_or_storage(
     assert not defaults.matches("H100", "")
 
 
-@pytest.mark.parametrize("reuse", [False, True])
 def test_serving_default_uses_real_catalog_input_pin_without_derived_provenance(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reuse: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root, manifest, length, store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
     operation = store.begin_operation("default-fixture", "proof", "adapter")
@@ -204,46 +205,46 @@ def test_serving_default_uses_real_catalog_input_pin_without_derived_provenance(
         raise AssertionError("an already verified exact native checkpoint was downloaded")
 
     monkeypatch.setattr(tensorfs, "pull", no_download)
-    with ExitStack() as read_access:
-        leases = set((root / "tmp/leases").glob("read-*.lease"))
-        defaults.materialize(worker, [row], None if reuse else read_access)
-        assert bool(set((root / "tmp/leases").glob("read-*.lease")) - leases) is not reuse
-        bindings, accesses = defaults.inputs([row])
-        spec = pb.InvocationSpec(
-            inputs=bindings,
-            serving=pb.ServingInvocationSpec(
-                entrypoint_binding_digest=BINDING,
-                attempt_binding_id=BINDING,
-                bindings_digest=BINDING,
-            ),
+    leases = set((root / "tmp/leases").glob("read-*.lease"))
+    defaults.materialize(worker, [row])
+    # Materializing leases nothing: admission's native root is what holds the bytes.
+    assert set((root / "tmp/leases").glob("read-*.lease")) == leases
+    bindings, accesses = defaults.inputs([row])
+    spec = pb.InvocationSpec(
+        inputs=bindings,
+        serving=pb.ServingInvocationSpec(
+            entrypoint_binding_digest=BINDING,
+            attempt_binding_id=BINDING,
+            bindings_digest=BINDING,
+        ),
+    )
+    raw, digest = documents.identity(spec)
+    offer = pb.AttemptOffer(
+        request_id="serving-child",
+        attempt_ordinal=1,
+        invocation_spec_canonical_bytes=raw,
+        invocation_spec_digest=digest,
+        grant=pb.DeliveryGrant(invocation_spec_digest=digest, inputs=accesses),
+    )
+    entries = grants.model_inputs(
+        grants.bind(documents.read(raw, pb.InvocationSpec), offer.grant, digest)
+    )
+    with pytest.raises(WorkspaceRefusal, match="not retained"), workspace.locked() as db:
+        Workspace.accept_in(db, "owner", offer)
+    with workspace.locked() as db:
+        assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 0
+    with machine_checkpoint_inputs.admission(workspace, "owner", offer.request_id):
+        machine_checkpoint_inputs.preflight(workspace, "owner", offer, entries)
+        for entry in entries.values():
+            machine_checkpoint_inputs.retain(workspace, "owner", offer, entry)
+        executions = Executions(workspace)
+        executions.submit(
+            "owner",
+            "serving-input",
+            b"x" * 32,
+            offer,
+            expected_execution_workspace_id=executions.workspace_id,
         )
-        raw, digest = documents.identity(spec)
-        offer = pb.AttemptOffer(
-            request_id="serving-child",
-            attempt_ordinal=1,
-            invocation_spec_canonical_bytes=raw,
-            invocation_spec_digest=digest,
-            grant=pb.DeliveryGrant(invocation_spec_digest=digest, inputs=accesses),
-        )
-        entries = grants.model_inputs(
-            grants.bind(documents.read(raw, pb.InvocationSpec), offer.grant, digest)
-        )
-        with pytest.raises(WorkspaceRefusal, match="not retained"), workspace.locked() as db:
-            Workspace.accept_in(db, "owner", offer)
-        with workspace.locked() as db:
-            assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 0
-        with machine_checkpoint_inputs.admission(workspace, "owner", offer.request_id):
-            machine_checkpoint_inputs.preflight(workspace, "owner", offer, entries)
-            for entry in entries.values():
-                machine_checkpoint_inputs.retain(workspace, "owner", offer, entry)
-            executions = Executions(workspace)
-            executions.submit(
-                "owner",
-                "serving-input",
-                b"x" * 32,
-                offer,
-                expected_execution_workspace_id=executions.workspace_id,
-            )
     with workspace.locked() as db:
         pin = db.execute(
             "SELECT * FROM execution_checkpoint_inputs WHERE recipient='serving-child'"
@@ -270,7 +271,7 @@ def test_unavailable_default_refuses_before_accelerator_discovery(
     with pytest.raises(WorkspaceRefusal, match="captured Model default is unavailable"):
         defaults.select(peer(captured()), "owner", call, target(), {"adapter": {}})
     # An open slot is read at the machine's own Hub; a machine without a grant has none.
-    with pytest.raises(WorkspaceRefusal, match="no Hub grant"):
+    with pytest.raises(WorkspaceRefusal, match="names no Hub"):
         defaults.select(peer({"model_defaults": []}), "owner", call, target(), {"adapter": {}})
 
 
@@ -378,13 +379,14 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
             machine_checkpoint_inputs.preflight(worker.workspace, "owner", child, entries)
         with worker.workspace.locked() as db:
             assert not db.execute("SELECT 1 FROM execution_checkpoint_inputs").fetchone()
-        # A resident construction skips only the early check; retention refuses it the same.
+        # A stale held index skips only the early check; retention refuses it the same.
+        held = {documents.spell(entry.digest) for entry in entries.values()}
         with (
             pytest.raises(WorkspaceRefusal, match=reason),
             machine_checkpoint_inputs.admission(worker.workspace, "owner", "child"),
         ):
             machine_checkpoint_inputs.preflight(
-                worker.workspace, "owner", child, entries, resident=True
+                worker.workspace, "owner", child, entries, held=held
             )
             for entry in entries.values():
                 machine_checkpoint_inputs.retain(worker.workspace, "owner", child, entry)
@@ -464,13 +466,12 @@ def test_cold_default_native_pull_requires_deployment_object_storage_host(
     }
     try:
         worker.config = cast(Any, SimpleNamespace(object_storage_hosts=()))
-        with ExitStack() as access, pytest.raises(WorkspaceRefusal, match="SOURCE_NOT_ALLOWED"):
-            defaults.materialize(worker, [row], access)
+        with pytest.raises(WorkspaceRefusal, match="SOURCE_NOT_ALLOWED"):
+            defaults.materialize(worker, [row])
         assert fetched == []
         worker.config = cast(Any, SimpleNamespace(object_storage_hosts=("127.0.0.1",)))
-        with ExitStack() as access:
-            defaults.materialize(worker, [row], access)
-            store.verify_checkpoint_source("proof/adapter", manifest, length)
+        defaults.materialize(worker, [row])
+        store.verify_checkpoint_source("proof/adapter", manifest, length)
         assert set(fetched) == {"/" + digest for digest in bodies}
     finally:
         server.shutdown()
@@ -554,10 +555,9 @@ def test_a_cold_preparation_pulls_its_slots_at_once(tmp_path: Path, fetch: str) 
     ]
     reported: list[tuple[int, int]] = []
     try:
-        with ExitStack() as access:
-            defaults.materialize(
-                worker, rows, access, progress=lambda done, whole: reported.append((done, whole))
-            )
+        defaults.materialize(
+            worker, rows, progress=lambda done, whole: reported.append((done, whole))
+        )
         for ref, (manifest, length) in refs.items():
             store.verify_checkpoint_source(ref.partition("@")[0], manifest, length)
     finally:
@@ -672,8 +672,7 @@ def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hu
             "repository": "fidika/private",
             "manifest": {"digest": manifest, "length": length},
         }
-        with ExitStack() as access:
-            defaults.materialize(worker, [row], access)
+        defaults.materialize(worker, [row])
         tensorfs.Store.open(str(root)).verify_checkpoint_source("fidika/private", manifest, length)
 
     grant = PublicationAuthority(own, "worker-1", token)

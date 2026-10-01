@@ -225,7 +225,9 @@ def prepare_package_set(
     )
 
 
-def landing_models(request: pb.PreparePackageSetRequest, interface: bytes) -> list[Json]:
+def landing_models(
+    request: pb.PreparePackageSetRequest | pb.PreparePrivatePlacementRequest, interface: bytes
+) -> list[Json]:
     """The model slots of every serving entrypoint the download set selects whole: what a
     root of this preparation constructs, and so the cards its executor starts on."""
     try:

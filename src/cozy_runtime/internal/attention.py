@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import site
 import sys
-import time
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -405,41 +404,6 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     if candidate.artifact:
         _STATES.setdefault(candidate.name, kernel_compile.State(candidate.artifact, "ready"))
     return ready
-
-
-def expect(device: DeviceFacts, preferred: Sequence[str] = ()) -> list[dict[str, Any]]:
-    """Start compiling, before any construction exists, every kernel this device's first
-    construction could select: the model's preference and the ranked table. Returns at once,
-    one state row per kernel; the compiles overlap the weights' download."""
-    rows: list[dict[str, Any]] = []
-    names = [*preferred, *(c.name for c in for_device(device))]
-    for name in dict.fromkeys(names):
-        candidate = BY_NAME.get(name)
-        if candidate is None:
-            continue
-        unsupported = _device_admits(candidate, device)
-        if unsupported:
-            rows.append({**_unsupported(name, unsupported).document(), "status": "unsupported"})
-            continue
-        started = time.perf_counter()
-        why = ""
-        try:
-            _resolve(candidate, device)
-            status = "ready"
-        except Exception as exc:
-            status = exc.code if isinstance(exc, AttentionRefusal) else type(exc).__name__
-            why = str(exc)[:300]
-        state = _STATES.get(name)
-        rows.append(
-            {
-                **({"detail": why} if why else {}),
-                **(state.document() if state is not None else {}),
-                "kernel": name,
-                "status": status,
-                "ms": round((time.perf_counter() - started) * 1000, 1),
-            }
-        )
-    return rows
 
 
 def pending(applied: Applied, device: DeviceFacts) -> list[str]:

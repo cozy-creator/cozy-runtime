@@ -335,7 +335,9 @@ class WorkerOptions:
     python: str = ""
     accelerator_backend: str = ""
     """Baked pod profile backend (`cuda`/`none`), or empty for local auto-detection."""
-    devices: str = "0"
+    devices: str = ""
+    """`CUDA_VISIBLE_DEVICES` entries this worker schedules; empty serves CPU only and asks no
+    GPU driver. The launcher (`runtime_worker`) always states its measured cards."""
     gpus: tuple[readiness.RuntimeGPU, ...] = ()
     """The measured inventory `devices` spans, in ordinal order, reported to the controller.
     Tests supply a virtual one here; nothing reads an environment variable for it."""
@@ -1032,6 +1034,7 @@ class Worker:
         # Captured machine executions persist their immutable receipt and restore this
         # same inventory after restart, independent of their code's publication origin.
         self.prepared_installations: dict[tuple[str, str, bytes], Placement] = {}
+        self._restore_placements()
         self.local_operations: dict[tuple[str, str], Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
@@ -1110,7 +1113,9 @@ class Worker:
                 workspace.store_root,
                 lambda target: workspace_memo.reclaim_unused(workspace, target_bytes=target),
             )
-        self.resolutions = machine_model_resolve.Resolutions()
+        self.resolutions = machine_model_resolve.Resolutions(
+            machine_model_resolve.supervised(self.root / "resolutions")
+        )
         self.workspace_service = (
             WorkspaceService(
                 self.workspace,
@@ -1687,6 +1692,11 @@ class Worker:
 
             from . import machine_materialization
 
+            # Its executor imports while the models are ensured, as a published package's does.
+            interface = prepared.document.package_interface
+            self.prespawns.request_landing(
+                revision, interface, package_prepare.landing_models(request, interface)
+            )
             machine_materialization.ensure(
                 self, request.download_delegation, native=request.native_models
             )
@@ -2089,6 +2099,7 @@ class Worker:
         stored = self._placement_from_entry(entries[0], result.placement_set.placement_set_digest)
         stored.installed = published[0]
         self.prepared_installations[stored.prepared_key] = stored
+        self.keep_placement(stored, result.placement_set.placement_set_canonical_bytes)
         self._collect_superseded_installations(published[0])
         return result
 
@@ -2149,14 +2160,6 @@ class Worker:
             if "gpu_name" not in facts.unreadable:
                 self._host_facts = facts
         return facts
-
-    def holds_construction(self, binding: str) -> bool:
-        """A live executor has built this exact entrypoint binding: its models are resident."""
-        supervisions = [self.supervision, *(hosted.supervision for hosted in self.hosted.values())]
-        return any(
-            s.current is not None and s.current.alive() and binding in s.current.loaded_bindings()
-            for s in supervisions
-        )
 
     def numerical_environment(self) -> bytes:
         from cozy_runtime.internal.numerical_environment import fingerprint
@@ -2340,6 +2343,9 @@ class Worker:
             self.execution(owner, request)
         for request in self.machine_calls.journal.unsettled_effects(owner):
             self.execution(owner, request)
+        if not owed:
+            # Off the boot path: readiness and the claim never wait on its journal read.
+            self.supervisor.spawn("prewarm", lambda _: self.prespawns.prewarm(owner))
 
     def submit_execution(
         self,
@@ -2409,7 +2415,9 @@ class Worker:
                     )
                     if catalog:
                         workspace = executions.workspace
-                        machine_checkpoint_inputs.preflight(workspace, owner, offer, catalog)
+                        machine_checkpoint_inputs.preflight(
+                            workspace, owner, offer, catalog, held=self.held_manifests
+                        )
                         for entry in catalog.values():
                             machine_checkpoint_inputs.retain(workspace, owner, offer, entry)
                 receipt = executions.submit(
@@ -2498,11 +2506,13 @@ class Worker:
         view: gpu_scheduler.Document,
         installations: dict[str, str],
     ) -> None:
-        """One scheduling pass's observations, journaled on the roots they concern."""
+        """One scheduling pass's observations, journaled on the roots they concern as one
+        deferred batch: the pass, and the grant it wakes, never wait on a commit."""
         self.prespawns.reconcile(roots, view, installations)
         if self.executions is None:
             return
         owner = self.fence.record_owner_id
+        rows: list[tuple[str, str, gpu_scheduler.Document]] = []
         for root, event, body in events:
             if event == "gpu.wait":
                 body = {**body, **self._waiting_call(owner, str(body["key"]))}
@@ -2510,8 +2520,10 @@ class Worker:
                 # `ordinals` index this worker's envelope; people name a GPU by nvidia-smi's
                 # number. `ordinals` stays for readers that predate `gpus`.
                 body = {**body, "gpus": [self.gpu_identity(o) for o in body["ordinals"]]}
-            with contextlib.suppress(WorkspaceRefusal):
-                self.executions.record(owner, root, event, body)
+            rows.append((root, event, body))
+        with contextlib.suppress(WorkspaceRefusal):
+            self.executions.observe(owner, rows)
+        for root, event, body in rows:
             if event == "gpu.wait":
                 self._gpu_waiting(owner, root, body, view)
 
@@ -2530,8 +2542,7 @@ class Worker:
             "tensorfs_version": str(executor.hello.get("tensorfs_version", "")),
         }
         with contextlib.suppress(WorkspaceRefusal):
-            root, _ = self.executions.scheduling_root(owner, attempt.request_id)
-            self.executions.record(owner, root, "executor", body)
+            self.executions.observe(owner, [(attempt.request_id, "executor", body)], rooted=True)
 
     def gpu_identity(self, ordinal: int) -> execution_evidence.GpuIdentity:
         """Envelope ordinal `ordinal` as the GPU a person names (`execution_evidence.identify`)."""
@@ -2670,10 +2681,10 @@ class Worker:
         lane = self.lanes.lane_of(placement_id)
         placement = self._placement_by_id(placement_id)
         if executor is not None and lane is not None and placement is not None:
-            # Its successor may already be starting beside this root's downloads.
+            # Its successor may already be importing, started while this root waited.
             warm = self.prespawns.claim(placement.installation_id, placement.device_pin or ())
             if warm is not None:
-                warm.started.wait()
+                self.prespawns.settle(warm, placement_id)
             self._rebuild_lane(lane, placement_id, executor, granted=True)
 
     def _cpu_job(self, job: pb.JobDirective) -> bool:
@@ -2976,7 +2987,7 @@ class Worker:
             machine_capture.restore(self, preparation)
         placement = self._placement_from_entry(row, desired.placement_set.placement_set_digest)
         placement.device_pin = pin
-        # The process started beside this replica's download (h3a-087), when there is one.
+        # The process imported ahead of this grant (`prespawn`), when there is one.
         journal = functools.partial(self._journal_row, request_id, attempt)
         warm = self.prespawns.claim(placement.installation_id, pin or (), journal)
         supervision = (
@@ -2996,14 +3007,8 @@ class Worker:
                 self.lanes.envelope.forget("")
                 self.job_slots.pop("envelope", None)
             self.accepted.mode = "serving"
-        # A claimed prespawn journals its own start; only a start this call pays is named here.
-        starting = (
-            self._call_phase(request_id, attempt, "Starting model executor")
-            if warm is None
-            else contextlib.nullcontext()
-        )
         try:
-            with starting:
+            with self._call_phase(request_id, attempt, "Starting model executor"):
                 if warm is not None:
                     self.prespawns.settle(warm, placement.placement_id)
                 current = self.supervision.current
@@ -4061,6 +4066,57 @@ class Worker:
             placement_set_digest,
             device_pin=self.accepted.device_pins.get(entry.placement_id),
         )
+
+    def keep_placement(self, stored: Placement, placement_set: bytes) -> None:
+        """Keep a published release's prepared placement beside its installation: a restarted
+        Runtime holds it without reading the release or preparing it again (a miss only costs
+        that). Immutable for its installation incarnation and this machine's SDK."""
+        root = self.options.install_root
+        kept = (
+            package_installation.kept_placements(root, stored.installed)
+            if root is not None and stored.installed is not None
+            else None
+        )
+        if kept is None or not stored.document.HasField("package"):
+            return
+        target = kept / (hashlib.sha256(placement_set).hexdigest() + ".json")
+        with contextlib.suppress(OSError):
+            if not target.is_file():
+                kept.mkdir(parents=True, exist_ok=True)
+                temporary = kept / f".{uuid.uuid4().hex}"
+                temporary.write_bytes(placement_set)
+                os.replace(temporary, target)
+                for other in kept.parent.iterdir():  # an earlier incarnation's
+                    if other != kept:
+                        shutil.rmtree(other, ignore_errors=True)
+
+    def _restore_placements(self) -> None:
+        """The placements an earlier process of this Runtime kept for the published releases
+        this machine still holds unchanged."""
+        root = self.options.install_root
+        if root is None:
+            return
+        prefix = package_installation.PUBLISHED_PREFIX
+        for directory in sorted((root / "installations").glob(prefix + "*")):
+            try:
+                installed = package_installation.open_installation(root, directory.name)
+            except package_environment.EnvironmentRefusal:
+                continue
+            kept = package_installation.kept_placements(root, installed)
+            if kept is None or package_installation.stale(root, installed.installation_id):
+                continue
+            for path in sorted(kept.glob("*.json")):
+                with contextlib.suppress(OSError, documents.DocumentError):
+                    raw = path.read_bytes()
+                    digest = documents.digest_of(raw)
+                    for entry in read_placement_set(
+                        pb.DesiredPlacementSet(
+                            placement_set_canonical_bytes=raw, placement_set_digest=digest
+                        )
+                    ):
+                        if entry.installation_id == installed.installation_id:
+                            stored = Placement(entry, digest, installed=installed)
+                            self.prepared_installations[stored.prepared_key] = stored
 
     def _apply_desired_state(self, desired: pb.DesiredWorkerState) -> None:
         """FULL REPLACE. A field absent means absent, never unchanged (§3).
@@ -6456,6 +6512,7 @@ class Worker:
         any rebuild it leaves behind, then its post phase. A fault is its terminal."""
         lane = self.lanes.by_id[attempt.lane_id]
         released: Released | None = None
+        left = False
         try:
             staged = self._stages(attempt)
             self.await_settled(attempt)
@@ -6472,6 +6529,14 @@ class Worker:
                         return
                     if self.enter(attempt) if staged else self.admit(attempt):
                         released = self.execute(attempt, lane)
+                    if released is not None:
+                        # A reusable executor left its cards and lane as the next attempt
+                        # finds them: both go before anything waits on the journal. One to
+                        # rebuild is reclaimed first (darkness 1514).
+                        if self._reusable(attempt):
+                            self._leave_gpus(attempt)
+                        else:
+                            self._finalizing(attempt)
                     # On REFUSALS too (#458): a poisoned generation refuses every attempt.
                     self._rebuild_lane(lane, attempt.placement_id)
                 finally:
@@ -6479,13 +6544,10 @@ class Worker:
         except Exception as exc:
             self._attempt_faulted(attempt, exc)
         finally:
-            # Per-GPU pid, card and interval (execution_evidence) prove where it ran.
-            self.gpu.release(
-                f"{attempt.request_id}#{attempt.attempt}",
-                ranks=attempt.execution.get("ranks", []),
-                gpus=attempt.execution.get("gpus", []),
-            )
-            self._capacity_changed()
+            if not left:
+                self._leave_gpus(attempt)
+        if left:
+            self._finalizing(attempt)
         if released is not None:
             with lane.posting:
                 self.finish(released)
@@ -6502,6 +6564,24 @@ class Worker:
             )
         if declared is not None and not declared.weightless:
             self.memory.prefill(attempt.placement_id, (declared.construction_key(),))
+
+    def _leave_gpus(self, attempt: AttemptRecord) -> None:
+        # Per-GPU pid, card and interval (execution_evidence) prove where it ran.
+        self.gpu.release(
+            f"{attempt.request_id}#{attempt.attempt}",
+            ranks=attempt.execution.get("ranks", []),
+            gpus=attempt.execution.get("gpus", []),
+        )
+        self._capacity_changed()
+
+    def _reusable(self, attempt: AttemptRecord) -> bool:
+        executor = attempt.executor
+        return (
+            executor is not None
+            and self.engine.supervision_for(attempt).owns(executor)
+            and executor.alive()
+            and not executor.poisoned
+        )
 
     def _rebuild_lane(
         self,
@@ -6849,27 +6929,16 @@ class Worker:
         A terminal built here is one the device phase itself produced (cancelled before
         dispatch, the executor died, the worker faulted) and is sent at once."""
         self._record_executor(attempt)
+        owner, timing = self.fence.record_owner_id, self.machine_calls
         try:
-            if self.machine_calls is not None:
-                self.machine_calls.run_timing.begin(
-                    self.fence.record_owner_id, attempt.request_id, attempt.attempt
-                )
-                self.machine_calls.timing.phase(
-                    self.fence.record_owner_id, attempt.request_id, attempt.attempt, "running"
-                )
+            if timing is not None:
+                timing.run_timing.begin(owner, attempt.request_id, attempt.attempt)
+                timing.timing.phase(owner, attempt.request_id, attempt.attempt, "running")
             try:
                 released = self.engine.execute(attempt)
             finally:
-                if self.machine_calls is not None:
-                    self.machine_calls.run_timing.end(
-                        self.fence.record_owner_id, attempt.request_id, attempt.attempt
-                    )
-                    self.machine_calls.timing.phase(
-                        self.fence.record_owner_id,
-                        attempt.request_id,
-                        attempt.attempt,
-                        "finalizing",
-                    )
+                if timing is not None:
+                    timing.run_timing.end(owner, attempt.request_id, attempt.attempt)
         except Exception as exc:
             self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
             try:
@@ -6878,9 +6947,11 @@ class Worker:
                 )
             except Exception as inner:
                 self.note("attempt", f"even ABANDONED could not be built: {inner}")
+                self._finalizing(attempt)
                 self.terminate(attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}")
                 return None
         if not isinstance(released, Released):
+            self._finalizing(attempt)
             self.settle(released)
             return None
         prepared = attempt.prepared
@@ -6896,6 +6967,12 @@ class Worker:
                 forget=code in DEVICE_SHORTFALL_CODES or code in GROUP_FAULT_CODES,
             )
         return released
+
+    def _finalizing(self, attempt: AttemptRecord) -> None:
+        if self.machine_calls is not None:
+            self.machine_calls.timing.phase(
+                self.fence.record_owner_id, attempt.request_id, attempt.attempt, "finalizing"
+            )
 
     def finish(self, released: Released) -> None:
         """POST PHASE -> OUTCOME -> SEND, on the lane's post thread.
@@ -7027,7 +7104,9 @@ class Worker:
         with self.control_lock:
             hosted = self.hosted.get(placement_id)
             supervision = hosted.supervision if hosted is not None else self.supervision
-            reclaimed = granted and supervision.current is None
+            # On its grant, a successor imported ahead of it (`prespawn`) is started too.
+            current = supervision.current
+            reclaimed = granted and (current is None or not current.started)
             if not reclaimed and (
                 supervision.current is not executor or (executor.alive() and not executor.poisoned)
             ):
