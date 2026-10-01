@@ -132,7 +132,9 @@ def load(
     for destination in walked.destinations:
         backend.fill(destination.key, destination.spec, live[destination.key])
     backend.commit()
-    residency = WeightResidency(weights, backend.components, {"run": ("stack",)})
+    residency = WeightResidency(
+        weights, backend.components, {"run": ("stack",)}, refine=backend.refine
+    )
     return SimpleNamespace(stack=stack, residency=residency, backend=backend)
 
 
@@ -255,6 +257,7 @@ def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> Non
     x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
     weights.set_budget(1 << 30)
     reference = run(model, x, passes=1)
+    torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()
     # Leave less than one block's activations free beside the fully resident weights.
     ballast = torch.empty(free - (48 << 20), dtype=torch.uint8, device="cuda")
@@ -262,6 +265,7 @@ def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> Non
         retried = run(model, x, passes=1)
     finally:
         del ballast
+        torch.cuda.empty_cache()
     assert weights.facts().oom_retries >= 1
     assert same(reference, retried)
 

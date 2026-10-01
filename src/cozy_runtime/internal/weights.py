@@ -1274,10 +1274,11 @@ class WeightResidency:
             try:
                 self._plan(method, local, budget)
             except self._budget_error as exc:
-                if getattr(exc, "pool", "") != "device":
+                if not _device_pool(exc):
                     raise self._shortfall(method, 0, budget, str(exc)) from None
-                # The driver had less than the budget (another process, or torch, holds it):
-                # plan again inside what it has now, never above the grant.
+                # The driver had less than the budget (another process, or torch's idle cache,
+                # holds it): plan again inside what it has now, never above the grant.
+                accel.release_cached(weights.torch, weights.kind)
                 budget = min(budget, weights.driver_budget(method))
                 try:
                     self._plan(method, local, budget)
@@ -1811,6 +1812,15 @@ def _stage_totals(weights: Weights, tag: str) -> tuple[int, int, int]:
         sum(row.stall_ns for row in rows),
         sum(row.streamed_bytes for row in rows),
     )
+
+
+def _device_pool(exc: BaseException) -> bool:
+    """A `BudgetExceeded` from the driver itself (no memory left to map), not the budget.
+    The plane names the pool only in its message today (W1 R23)."""
+    pool = getattr(exc, "pool", None)
+    if pool is not None:
+        return bool(pool == "device")
+    return str(exc).startswith("budget exceeded in device")
 
 
 def _versions(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[int, ...]:
