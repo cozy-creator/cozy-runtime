@@ -201,6 +201,9 @@ class Weights:
         self.clock = 0
         self.components: dict[str, Component] = {}
         self.activation: dict[str, int] = {}
+        #: methods whose stage fits itself to the room it finds (an image VAE's decode mode):
+        #: their activations never size a grant
+        self.adaptive: set[str] = set()
         self.oom_retries = 0
         self.modes: dict[str, str] = {}
         #: the CUDA context and library workspaces outside torch and the plane, measured once
@@ -229,6 +232,14 @@ class Weights:
         if vram == 0:
             accel.release_cached(self.torch, self.kind)
         return freed
+
+    def sizing(self) -> int:
+        """The largest measured activations a grant must leave room for (adaptive stages
+        make their own room)."""
+        return max(
+            (v for m, v in self.activation.items() if m not in self.adaptive),
+            default=max(self.activation.values(), default=0),
+        )
 
     def _apply(self, nbytes: int) -> int:
         nbytes = max(nbytes, 0)
@@ -260,7 +271,7 @@ class Weights:
             own = self.activation.get(method)
             if own is None:
                 return self.budget
-            return self.budget + max(max(self.activation.values()) - own, 0)
+            return self.budget + max(self.sizing() - own, 0)
         driver = self.driver_budget(method)
         return min(driver, self.ceiling) if self.ceiling >= 0 else driver
 
@@ -1577,7 +1588,12 @@ class WeightResidency:
                 if self.active
                 else None
             ),
-            "attempt_activation_peak_bytes": max(self.peaks.values(), default=0),
+            # what a grant must leave for activations: an adaptive stage (an image VAE's
+            # decode) fits itself to the room it finds, so its peak never sizes one
+            "attempt_activation_peak_bytes": max(
+                (v for m, v in self.peaks.items() if m not in weights.adaptive),
+                default=max(self.peaks.values(), default=0),
+            ),
             "attempt_activation_peaks": dict(self.peaks),
             # torch bytes this attempt's bindings moved: decoded resident weights and derived
             # leaf roles kept or dropped, the ledger's declared transition
@@ -1845,6 +1861,8 @@ class WeightResidency:
         default = int(root.tile_sample_min_size)
 
         def run(z: Any, *args: Any, **kwargs: Any) -> Any:
+            if self.active is not None:
+                weights.adaptive.add(self.active[0])
             pixels = int(z.shape[0]) * int(z.shape[-2]) * int(z.shape[-1]) * scale * scale
             free, evictable = self.room((name,))
             size = min((n for n in peaks if n >= pixels), default=0)

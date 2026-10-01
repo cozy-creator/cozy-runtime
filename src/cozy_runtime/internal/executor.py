@@ -316,9 +316,13 @@ def _trees(command: Invoke | RunJob) -> dict[str, tuple[Path, str]]:
 
 
 def _working_peak(peak: int, at_entry: int, residency: Mapping[str, Any]) -> int:
-    """The attempt's working memory: torch's peak over its bytes at entry (weights live in
-    the plane, outside torch), never below a scope's own measured activation peak."""
-    return max(int(peak) - int(at_entry), int(residency.get("attempt_activation_peak_bytes", 0)), 0)
+    """The attempt's working memory: on the plane, its scopes' measured activations (an
+    adaptive scope, such as an image VAE's decode, fits itself to the room it finds);
+    otherwise torch's peak over its bytes at entry, never below a scope's own peak."""
+    scoped = int(residency.get("attempt_activation_peak_bytes", 0))
+    if "plane" in residency and scoped > 0:
+        return scoped
+    return max(int(peak) - int(at_entry), scoped, 0)
 
 
 # --------------------------------------------------------------------------- state
