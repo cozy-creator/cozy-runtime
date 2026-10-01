@@ -2597,7 +2597,6 @@ class Executor:
             plan_rows=({**row.identity(), "component": row.component} for row in plan.tensors),
             adapters=(msgspec.to_builtins(row) for row in binding.adapters),
             roots=roots,
-            sites=attention.sites(roots),
             device=device_facts,
             world=self.world,
             sealed=_SEALED,
