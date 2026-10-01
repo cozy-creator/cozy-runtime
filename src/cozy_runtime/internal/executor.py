@@ -3755,20 +3755,21 @@ class Executor:
 
     def _stage_exit(self, stage: weight_stages.StageExit) -> None:
         """Report the scope's facts. A budget in the answer applies now: past its last stage,
-        with another job waiting, this executor unmaps its weights (they stay pinned)."""
-        answer = self._durable(
-            StageExit(
-                method=stage.method,
-                components=stage.components,
-                passes=max(stage.passes.values(), default=1),
-                wall_ns=stage.wall_ns,
-                growth_bytes=stage.growth_bytes,
-                stall_ns=stage.stall_ns,
-            ),
-            StageGo,
+        with a call waiting that lacks room, this executor unmaps its weights (they stay
+        pinned) and says so; the worker keeps the turn until then, so the next one measures
+        the room it really has."""
+        left = StageExit(
+            method=stage.method,
+            components=stage.components,
+            passes=max(stage.passes.values(), default=1),
+            wall_ns=stage.wall_ns,
+            growth_bytes=stage.growth_bytes,
+            stall_ns=stage.stall_ns,
         )
+        answer = self._durable(left, StageGo)
         if answer.ok and answer.budget_bytes >= 0:
             self.budget(Budget(vram_bytes=answer.budget_bytes))
+            self._durable(msgspec.structs.replace(left, yielded=True), StageGo)
 
     def _durable[A: Answer](self, request: Request, into: type[A]) -> A:
         """One DURABLE mid-attempt exchange. Blocks until the worker answers.

@@ -253,6 +253,28 @@ class MemoryManager:
             return self._start_plane(lane, tenant, row, stage, grow, why)
         return self._start_legacy(lane, tenant, row, grow, why)
 
+    def short(self, tenant: str, stage: StageNeed, gpus: Sequence[int]) -> bool:
+        """Whether `tenant`'s turn on `gpus` would find less room than its weights and
+        activations want, as the devices stand now. What cannot be told is short."""
+        row = self._row(tenant)
+        executor = row.executor() if row is not None else None
+        if row is None or executor is None or not plane_capable(executor):
+            return True
+        ledger = row.ledger
+        size = weights(ledger, stage.components)
+        if not size or not any(
+            lane.ordinals == tuple(gpus) and tenant in lane.rows for lane in self.lanes
+        ):
+            return True
+        grow = growth((stage.entrypoint, stage.cell), row.activation) or 0
+        committed = ledger.plane.committed_bytes if ledger.plane else 0
+        return any(
+            memory.state != "measured"
+            or reach(memory.free_bytes, committed, ledger.slack, grow)
+            < size + grow + weight_policy.MARGIN
+            for memory in self._lane(tenant, gpus).measure(self.kind).values()
+        )
+
     def yielded(
         self, tenant: str, gpus: Sequence[int], next_stage: StageNeed | None = None
     ) -> None:

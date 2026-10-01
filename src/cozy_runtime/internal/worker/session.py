@@ -167,6 +167,7 @@ from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority, origin_key
 from cozy_runtime.internal.worker.memory import MemoryManager, StageNeed, plane_capable
 from cozy_runtime.internal.worker.memory import Shortfall as MemoryShortfall
+from cozy_runtime.internal.worker.memory import holds as memory_holds
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,
@@ -1231,6 +1232,7 @@ class Worker:
             warm=self._warm,
             sets=self._weight_sets,
             turns=self._takes_turns,
+            holds=self._holds_weights,
             prefill=self._prefill_waiting,
             fault=self.fail_machine,
             note=lambda why: self.note("stages", why),
@@ -2775,15 +2777,8 @@ class Worker:
         replica = next(
             (
                 hosted
-                for hosted in list(self.hosted.values())
-                if (
-                    hosted.placement.installation_id,
-                    documents.spell(hosted.placement.bindings_digest)
-                    if hosted.placement.bindings_digest
-                    else "",
-                )
-                == template
-                and (executor := hosted.supervision.current) is not None
+                for hosted in self._replicas(template)
+                if (executor := hosted.supervision.current) is not None
                 and executor.loaded
                 and not executor.busy()
             ),
@@ -6623,6 +6618,8 @@ class Worker:
         if isinstance(budget, MemoryShortfall):
             self.stages.give(key)
             return refuse("device_shortfall", budget.detail)
+        if budget.evicted:
+            self.stages.resync()  # a tenant that holds no weights now may prepare ahead
         return StageGo(ok=True, budget_bytes=budget.plane_bytes)
 
     def _stage_exit(
@@ -6635,11 +6632,15 @@ class Worker:
         counted: bool,
     ) -> Reply:
         """A scope ended: its turn ends and its sample goes to the book. Past its last stage,
-        with another call waiting for these GPUs, the executor unmaps its weights at once (they
-        stay pinned), so the next turn starts with the room it needs."""
+        when the call wanting these GPUs next lacks room, the executor unmaps its weights (they
+        stay pinned) and says so, and only then does the turn pass: the next one measures the
+        room it has. A call with room beside these weights leaves them mapped."""
         if attempt is None:
             return StageGo(ok=True)
         key = _demand(attempt)
+        if request.yielded:
+            self.stages.yielded(key)
+            return StageGo(ok=True)
         sample = StageSample(
             kind=self.stages.kind(key, request.method, request.components),
             passes=request.passes,
@@ -6647,18 +6648,57 @@ class Worker:
             growth_bytes=request.growth_bytes,
             stall_ns=request.stall_ns,
         )
-        past = self.stages.exit(key, sample, counted=counted)
+        left = self.stages.exit(
+            key, sample, counted=counted, idle=functools.partial(self.memory.end, slot)
+        )
         self.memory.yielded(slot, lane.ordinals)
-        if not past:
+        if left.claim is None:
             return StageGo(ok=True)
-        self.memory.end(slot)
-        if not self.stages.contended(key):
+        if not self._short(left.claim, lane.ordinals):
+            self.stages.yielded(key)
             return StageGo(ok=True)
         row = lane.row(slot)
         if row.ledger.plane is not None:
             row.ledger.plane = msgspec.structs.replace(row.ledger.plane, committed_bytes=0)
-        self.stages.idle(key)
         return StageGo(ok=True, budget_bytes=0)
+
+    def _short(self, want: stage_scheduler.Want, gpus: tuple[int, ...]) -> bool:
+        """Whether the call wanting `gpus` next lacks room there beside what is mapped now;
+        one whose executor is not loaded yet is not known to fit."""
+        need = StageNeed(entrypoint=want.entrypoint, cell=want.cell)
+        return all(
+            self.memory.short(hosted.placement.placement_id, need, gpus)
+            for hosted in self._replicas(want.template)
+        )
+
+    def _replicas(self, template: tuple[str, str]) -> list[HostedPlacement]:
+        """This template's replicas, read without the control lock (the scheduler's pass)."""
+        return [
+            hosted
+            for hosted in list(self.hosted.values())
+            if (
+                hosted.placement.installation_id,
+                documents.spell(hosted.placement.bindings_digest)
+                if hosted.placement.bindings_digest
+                else "",
+            )
+            == template
+        ]
+
+    def _holds_weights(self, template: tuple[str, str], gpus: tuple[int, ...]) -> bool:
+        """Whether this template's loaded executor holds device weights on `gpus` (any of its
+        sets for a call not placed yet). The turn holder may need them, and only an idle
+        executor can be asked: such a call waits outside it and is dispatched at its turn."""
+        for hosted in self._replicas(template):
+            executor = hosted.supervision.current
+            lane = self.lanes.lane_of(hosted.placement.placement_id)
+            if executor is None or lane is None or not executor.loaded:
+                continue
+            row = lane.rows.get(hosted.placement.placement_id)
+            if (not gpus or lane.ordinals == gpus) and row is not None:
+                if memory_holds(row, executor, set(lane.ordinals)):
+                    return True
+        return False
 
     def _end_tenant(self, placement_id: str, executor: child.Executor, why: str) -> bool:
         """End a dead tenant for the memory manager: reclaimed now, so no byte it held is
@@ -6927,6 +6967,7 @@ class Worker:
         """The attempt's demand ends: a successful one teaches the cost book its stages."""
         # Per-GPU pid, card and interval (execution_evidence) prove where it ran.
         prepared = attempt.prepared
+        self.memory.end(attempt.placement_id)  # idle before the next turn measures the GPUs
         self.stages.release(
             _demand(attempt),
             ok=ok,

@@ -1138,6 +1138,28 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     assert machine.granted(shot) == [0, 1, 2, 3]
 
 
+@needs_executor
+def test_a_waiting_tenant_is_short_only_while_its_gpu_lacks_room_for_it(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What a call past its last stage is answered by. The tenant wanting its GPU next has
+    room for its 20 GiB beside what is mapped: the weights stay hot. It lacks room: they are
+    unmapped before the turn passes. What cannot be told is short."""
+    _shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    q0 = by_lane["lane-0"]
+    gpus = worker._lane_of(q0).ordinals
+    need = memory.StageNeed(entrypoint="generate")
+    assert worker.memory.short("machine-unknown", need, gpus)
+    if not memory.plane_capable(worker.hosted[q0].supervision.current):
+        assert worker.memory.short(q0, need, gpus), "an older executor is never told to stay"
+        return
+    machine.free["0"] = 30 * GiB  # type: ignore[attr-defined]
+    assert not worker.memory.short(q0, need, gpus)
+    machine.free["0"] = GiB  # type: ignore[attr-defined]
+    assert worker.memory.short(q0, need, gpus)
+
+
 _RANK = """
 import signal, sys, torch
 from cozy_runtime.internal import proctree

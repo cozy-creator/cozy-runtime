@@ -5,7 +5,8 @@ executor computes on it in place), its `WeightResidency`, the executor's turn ho
 durable lane over a socket pair, and on the other end the real Worker's handler, memory
 manager and stage scheduler. Each component-use scope asks the Worker for its turn and
 reports what it measured; the scheduler grants turns in order, learns the graph, and tells a
-call past its last stage to give its device bytes back when another call waits.
+call past its last stage to give its device bytes back when the call waiting lacks room,
+keeping the turn until they are unmapped.
 """
 
 from __future__ import annotations
@@ -151,10 +152,14 @@ def test_past_its_last_stage_a_call_gives_its_bytes_back_to_the_one_waiting(
     handler, _ = tenant(machine, "tenant-a", "A")
     executor = Seamed(tmp_path, handler)
     granted: list[Grant | None] = []
+    budgets: list[int] = []  # A's plane budget when B's turn came
     kind = worker.stages.kind("B#1", "render", ("transformer",))
-    waiting = threading.Thread(
-        target=lambda: granted.append(worker.stages.enter("B#1", kind, lambda: False))
-    )
+
+    def wait() -> None:
+        granted.append(worker.stages.enter("B#1", kind, lambda: False))
+        budgets.append(executor.weights.budget)
+
+    waiting = threading.Thread(target=wait)
     waiting.start()
     try:
         bound = time.monotonic() + 30  # a hang bound on a loaded box, not a budget
@@ -166,7 +171,7 @@ def test_past_its_last_stage_a_call_gives_its_bytes_back_to_the_one_waiting(
         executor.scope(x)  # A's one observed stage: then its CPU tail
         waiting.join(30)
         assert granted == [Grant((0,), True)]
-        assert executor.weights.budget == 0, "A unmapped its weights at its last exit"
+        assert budgets == [0], "B's turn came after A had unmapped, so B measures real room"
     finally:
         executor.close()
 

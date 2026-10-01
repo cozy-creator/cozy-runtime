@@ -186,6 +186,9 @@ class StageExit(_Request, frozen=True, kw_only=True, tag="stage_exit"):
     #: the allocator's peak during the scope above its bytes at entry
     growth_bytes: int = 0
     stall_ns: int = 0
+    #: the second half of an exit answered with a budget: that budget is applied, so the
+    #: turn the worker kept for it passes on
+    yielded: bool = False
 
 
 type _Tagged = (

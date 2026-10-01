@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import msgspec
 
@@ -117,6 +117,14 @@ class _Demand:
     entered: bool = False
 
 
+class Exit(NamedTuple):
+    """A scope's exit. Past its call's last observed stage; `claim` is the call wanting these
+    GPUs next, for which this one keeps its turn until `yielded`."""
+
+    past: bool = False
+    claim: Want | None = None
+
+
 class StageScheduler:
     """The policy, one pass per change, over every live demand and root lease."""
 
@@ -133,6 +141,7 @@ class StageScheduler:
         prefill: Callable[[str, tuple[str, str]], None],
         fault: Callable[[str], None],
         note: Callable[[str], None],
+        holds: Callable[[tuple[str, str], Ordinals], bool] = lambda template, gpus: False,
         book: Path | None = None,
     ) -> None:
         self.devices = devices
@@ -145,6 +154,8 @@ class StageScheduler:
         self.sets = sets
         #: whether an installation's executor takes stage turns (`stage/1`)
         self.turns = turns
+        #: whether a template's idle executor holds device weights on these GPUs
+        self.holds = holds
         #: fill a waiting demand's host tier, off the pass
         self.prefill = prefill
         self.book_path = book
@@ -378,27 +389,35 @@ class StageScheduler:
             demand.tenant = True
             return Grant(demand.gpus, start)
 
-    def exit(self, key: str, sample: StageSample, *, counted: bool = True) -> bool:
-        """A scope ended: its turn ends and its sample is kept for the book. True when the
-        demand is past its last observed stage, so its tenant may be idled."""
+    def exit(
+        self,
+        key: str,
+        sample: StageSample,
+        *,
+        counted: bool = True,
+        idle: Callable[[], None] = lambda: None,
+    ) -> Exit:
+        """A scope ended: its sample is kept for the book and its turn ends. Past its last
+        observed stage its tenant is idle (`idle()` says so before anyone can take the turn),
+        and with another call wanting these GPUs the turn stays its own until `yielded`."""
         with self.lock:
             demand = self.demands.get(key)
             if demand is None:
-                return False
+                return Exit()
             if demand.whole:
                 if counted:
                     demand.samples.append(sample)
-                return False
+                return Exit()
             if not counted:
                 self._free(key)
                 demand.since = time.monotonic()
-                past = False
+                left = Exit()
             else:
-                past = self._advance(demand, sample)
+                left = self._advance(demand, sample, idle)
         self.resync()
-        return past
+        return left
 
-    def _advance(self, demand: _Demand, sample: StageSample) -> bool:
+    def _advance(self, demand: _Demand, sample: StageSample, idle: Callable[[], None]) -> Exit:
         """Its sample with the CPU gap before it, its position past this call, its turn over."""
         now = time.monotonic()
         gap = int((demand.asked - demand.last_exit) * 1e9) if demand.last_exit else 0
@@ -407,33 +426,47 @@ class StageScheduler:
         demand.calls += 1
         if demand.at < len(demand.stages) and demand.calls >= demand.stages[demand.at].calls:
             demand.at, demand.calls = demand.at + 1, 0
-        self._free(demand.key)
         # Only a graph seen end to end says where a call is done with its GPUs; a call
         # learning its first graph keeps its claim, and its budget, to its release.
-        past = demand.graph.observed and demand.at >= len(demand.stages)
-        if past:
-            demand.tenant = False
-        return past
+        if not (demand.graph.observed and demand.at >= len(demand.stages)):
+            self._free(demand.key)
+            return Exit()
+        demand.tenant = False
+        idle()
+        claim = self._claimant(demand)
+        if claim is None:
+            self._free(demand.key)
+            return Exit(past=True)
+        # The next turn measures the GPU: this one stays until its executor has unmapped,
+        # or the Worker finds the claimant has room beside it.
+        demand.asking = False
+        return Exit(past=True, claim=claim.want)
 
-    def contended(self, key: str) -> bool:
-        """Another call wants a GPU of this one's set: it asks, holds, prepares or waits there."""
+    def yielded(self, key: str) -> None:
+        """The turn a call kept past its last stage passes on."""
         with self.lock:
-            demand = self.demands.get(key)
-            if demand is None:
-                return False
-            return any(
-                other is not demand
+            self._free(key)
+        self.resync()
+
+    def _claimant(self, demand: _Demand) -> _Demand | None:
+        """The earliest other call that asks, holds, prepares or waits on this one's GPUs."""
+        return min(
+            (
+                other
+                for other in self.demands.values()
+                if other is not demand
                 and set(other.gpus) & set(demand.gpus)
                 and (other.asking or other.dispatched or other.waiting is not None)
-                for other in self.demands.values()
-            )
+            ),
+            key=lambda other: (self.roots.get(other.want.root, (UNROOTED, 0))[0], other.arrival),
+            default=None,
+        )
 
-    def idle(self, key: str) -> None:
-        """The demand's tenant lost its budget (an idle cut): its next turn needs a new one."""
+    def contended(self, key: str) -> bool:
+        """Another call wants a GPU of this one's set."""
         with self.lock:
             demand = self.demands.get(key)
-            if demand is not None:
-                demand.tenant = False
+            return demand is not None and self._claimant(demand) is not None
 
     def give(self, key: str) -> None:
         """End a stage turn granted but not used (its budget was refused)."""
@@ -617,7 +650,9 @@ class StageScheduler:
         if want.exclusive or not want.template[0] or demand.whole:
             return False
         one = len(demand.gpus) == 1 if demand.gpus else max(want.widths, default=1) == 1
-        return one and self.turns(want.template[0])
+        # A call waiting inside its executor cannot be asked for its device bytes: one whose
+        # executor still holds weights waits outside it, idle, and is dispatched at its turn.
+        return one and self.turns(want.template[0]) and not self.holds(want.template, demand.gpus)
 
     def _blocking(self, alone: _Demand) -> str | None:
         """The root a device job waits behind: one whose call is live, or whose lease holds

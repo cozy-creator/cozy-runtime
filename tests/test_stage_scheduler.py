@@ -18,7 +18,13 @@ import pytest
 
 from cozy_runtime.internal.stages import CostBook, StageKind, StageSample, WeightSet
 from cozy_runtime.internal.worker.stage_policy import Gpu, Host, Machine
-from cozy_runtime.internal.worker.stage_scheduler import Event, Grant, StageScheduler, Want
+from cozy_runtime.internal.worker.stage_scheduler import (
+    Event,
+    Exit,
+    Grant,
+    StageScheduler,
+    Want,
+)
 
 GiB = 1 << 30
 SDXL = ("inst-sdxl", "sha256:sdxl")
@@ -43,6 +49,8 @@ class Shell:
         self.poked: list[str] = []
         #: whether executors take stage turns, as their hellos say once known
         self.turns = turns
+        #: templates whose idle executor holds device weights
+        self.holding: set[tuple[str, str]] = set()
         self.prefilled: list[str] = []
         self.gpus = [Gpu(ordinal=o, total=total) for o in range(devices)]
         self.host = Host(spawn_s=spawn_s)
@@ -54,6 +62,7 @@ class Shell:
             warm=lambda template: (warm or {}).get(template, ()),
             sets=lambda want: (sets or {}).get(want.template, {}),
             turns=lambda installation: self.turns,
+            holds=lambda template, gpus: template in self.holding,
             prefill=lambda key, template: self.prefilled.append(key),
             fault=self._fault,
             note=lambda why: None,
@@ -303,8 +312,8 @@ def ask(shell: Shell, key: str, method: str) -> tuple[threading.Thread, list[Gra
     return asking, got
 
 
-def run(shell: Shell, key: str, method: str) -> bool:
-    """One whole scope of `key`: its turn, then its exit. True when past its last stage."""
+def run(shell: Shell, key: str, method: str) -> Exit:
+    """One whole scope of `key`: its turn, then its exit."""
     asking, got = ask(shell, key, method)
     asking.join(30)
     assert got and got[0] is not None
@@ -330,18 +339,41 @@ def test_the_next_model_prepares_while_the_first_runs_its_stages_then_takes_the_
     assert shell.poked == ["S#1", "A#1"]
     assert gpus.taking_turns("A#1")
 
-    assert not run(shell, "S#1", "encode")
+    assert not run(shell, "S#1", "encode").past
     anima, got = ask(shell, "A#1", "render")  # Anima is ready before SDXL denoises
     assert shell.waiting() == {"A#1": ["S"]}
-    assert not run(shell, "S#1", "encode")
+    assert not run(shell, "S#1", "encode").past
     for _ in range(3):
-        assert not run(shell, "S#1", "denoise")
+        assert not run(shell, "S#1", "denoise").past
         assert not shell.demand("A#1")["running"], "no bubble in an unmeasured gap"
-    assert run(shell, "S#1", "decode")  # past its last stage: its tail holds nothing
-    assert gpus.contended("S#1"), "SDXL gives its device bytes back at once"
+    left = run(shell, "S#1", "decode")  # past its last stage, with Anima wanting the GPU
+    assert left.past and left.claim is not None and left.claim.template == ANIMA
+    # The turn stays SDXL's while its executor unmaps: Anima must not measure the GPU yet
+    # (run 2521 was given the room left beside 5.8 GB still mapped, and streamed its UNet).
+    assert shell.held() == {"S#1": (0,)} and not got
+    gpus.yielded("S#1")
     anima.join(30)
     assert got == [Grant((0,), True)]  # Anima's first turn: a budget of its own
     assert shell.held() == {"A#1": (0,)}
+
+
+def test_a_call_whose_executor_holds_weights_waits_outside_it_until_they_are_cut() -> None:
+    """A call waiting inside its executor cannot be asked for its device bytes. Anima's
+    executor still holds its weights from its last call, so its next call is not prepared
+    ahead of SDXL's turn: its executor stays idle, where SDXL can cut it. Once it holds
+    nothing the call prepares ahead."""
+    shell = Shell(1, turns=True)
+    shell.holding = {ANIMA}
+    gpus = shell.scheduler
+    gpus.open_root("S", 1)
+    gpus.open_root("A", 2)
+    gpus.want("S#1", Want(root="S", template=SDXL, entrypoint="generate"))
+    gpus.want("A#1", Want(root="A", template=ANIMA, entrypoint="generate"))
+    assert gpus.ready("S#1") and not gpus.ready("A#1")
+    assert [body["key"] for _root, body in shell.kinds("stage.prepare")] == ["S#1"]
+    shell.holding.clear()  # SDXL's first turn cut it
+    gpus.resync()
+    assert gpus.ready("A#1") and gpus.taking_turns("A#1")
 
 
 def test_a_turn_on_the_same_tenant_keeps_its_budget() -> None:
