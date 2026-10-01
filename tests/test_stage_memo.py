@@ -5,10 +5,13 @@ models below are synthetic, so the mechanism is proven general."""
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import msgspec
+import numpy as np
 import pytest
+from PIL import Image
 
 torch = pytest.importorskip("torch")
 
@@ -198,8 +201,6 @@ def test_value_gate_stores_only_costly_small_results(tmp_path: Path) -> None:
 
 
 def test_install_keys_each_component_and_never_fails_a_load() -> None:
-    from types import SimpleNamespace
-
     device = SimpleNamespace(kind="cpu", sm=0, name="cpu")
     header = {"components": {"text_encoder": {"w": {"parts": {"value": [1, 2]}}}}, "configs": {}}
 
@@ -230,3 +231,26 @@ def test_install_keys_each_component_and_never_fails_a_load() -> None:
     broken = Encoder.for_test()
     install(broken, {"text_encoder": {"components": {"text_encoder": object()}}})
     assert broken._cozy_memo is None, "an unreadable identity serves unmemoized"
+
+
+def test_arrays_and_images_key_and_round_trip_and_non_finite_results_are_not_kept() -> None:
+    class Imaging(Model[object]):
+        runs = 0
+
+        @uses_components("vae", memoize=True)
+        def embed(self, pixels: Any, image: Any, scale: float) -> tuple[Any, Any, Any]:
+            type(self).runs += 1
+            return torch.tensor([float(pixels.sum()) * scale]), image.convert("L"), pixels[:2]
+
+    model = Imaging.for_test()
+    object.__setattr__(model, "_cozy_memo", _model()._cozy_memo)
+    pixels = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    image = Image.fromarray(np.full((4, 4, 3), 7, dtype=np.uint8))
+    first = model.embed(pixels, image, 1.0)
+    second = model.embed(pixels.copy(), image.copy(), 1.0)
+    assert Imaging.runs == 1
+    assert second[1].tobytes() == first[1].tobytes() and second[1].mode == "L"
+    assert np.array_equal(second[2], first[2]) and second[2].dtype == np.uint8
+    model.embed(pixels, image, float("nan"))
+    model.embed(pixels, image, float("nan"))
+    assert Imaging.runs == 3, "a non-finite result is returned and never kept"
