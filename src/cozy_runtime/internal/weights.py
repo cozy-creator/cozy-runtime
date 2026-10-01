@@ -1271,6 +1271,10 @@ class WeightResidency:
             return
         try:
             budget = weights.stage_budget(method)
+            if method not in weights.activation:
+                # Activations first, and these are not measured yet: the stage's own weights
+                # are all the plane keeps; every other byte stays torch's until it is.
+                budget = min(budget, sum(self.components[n].layout.total for n in local))
             try:
                 self._plan(method, local, budget)
             except self._budget_error as exc:
