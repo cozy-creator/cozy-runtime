@@ -2153,14 +2153,6 @@ class Worker:
                 self._host_facts = facts
         return facts
 
-    def holds_construction(self, binding: str) -> bool:
-        """A live executor has built this exact entrypoint binding: its models are resident."""
-        supervisions = [self.supervision, *(hosted.supervision for hosted in self.hosted.values())]
-        return any(
-            s.current is not None and s.current.alive() and binding in s.current.loaded_bindings()
-            for s in supervisions
-        )
-
     def numerical_environment(self) -> bytes:
         from cozy_runtime.internal.numerical_environment import fingerprint
 
@@ -2412,7 +2404,9 @@ class Worker:
                     )
                     if catalog:
                         workspace = executions.workspace
-                        machine_checkpoint_inputs.preflight(workspace, owner, offer, catalog)
+                        machine_checkpoint_inputs.preflight(
+                            workspace, owner, offer, catalog, held=self.held_manifests
+                        )
                         for entry in catalog.values():
                             machine_checkpoint_inputs.retain(workspace, owner, offer, entry)
                 receipt = executions.submit(

@@ -1203,7 +1203,6 @@ def test_the_compatibility_check_overlaps_the_weight_download(
     def slow_download(
         worker: Any,
         rows: Any,
-        access: Any,
         *,
         cancellation: Any = None,
         progress: Any = None,

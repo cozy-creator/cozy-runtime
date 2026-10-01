@@ -59,7 +59,7 @@ def compose(
     if not native_base:
         closure.insert(0, dict(base))
     check()
-    machine_model_defaults.materialize(worker, closure, None)
+    machine_model_defaults.materialize(worker, closure)
     identity = (
         "sha256:"
         + hashlib.sha256(
