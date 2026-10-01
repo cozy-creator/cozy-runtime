@@ -23,6 +23,11 @@ from cozy_runtime.internal.parallel.group import RankGroup, SpreadLog
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 
 
+def _failed(what: str, exc: BaseException) -> str:
+    """The group's verdict names the failure that broke it."""
+    return f"{what} failed: {type(exc).__name__}: {exc}"[:600]
+
+
 def mirror_component(
     component: Any,
     *,
@@ -63,8 +68,8 @@ def mirror_component(
                         reply = _accept(name, group, follower.rank, frame)
                         attention_sol.record_rank(follower.rank, reply.sol_calls)
                     return result
-                except BaseException:
-                    group._break(f"mirrored component {name!r} failed")
+                except BaseException as exc:
+                    group._break(_failed(f"mirrored component {name!r}", exc))
                     raise
         finally:
             payloads.clear()
@@ -113,8 +118,8 @@ def _hosted(
             try:
                 frame = group.call_one(rank, msgspec.to_builtins(hosted))
                 reply = _accept(name, group, rank, frame)
-            except BaseException:
-                group._break(f"hosted component {name!r} failed")
+            except BaseException as exc:
+                group._break(_failed(f"hosted component {name!r}", exc))
                 raise
             residency = prepared[name][0]._cozy_residency
             if residency is not None:
@@ -219,8 +224,8 @@ def install_spread(
                 else:
                     finished[index] = result
                     calls[str(rank)] = calls.get(str(rank), 0) + 1
-        except BaseException:
-            group._break(f"spread {name!r}.{method} failed")
+        except BaseException as exc:
+            group._break(_failed(f"spread {name!r}.{method}", exc))
             raise
         finally:
             for _rank, _index, _args, payloads in sent:

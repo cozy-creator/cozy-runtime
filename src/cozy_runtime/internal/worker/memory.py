@@ -21,6 +21,10 @@ A call needs `peak - held` more free bytes on each of its devices. A shape never
 the peak of a measured shape at least as large on every axis (memory does not shrink as a shape
 grows); with none, or after a failure on the device, it needs the whole device: every idle
 tenant there goes, and the call measures what it really takes.
+
+A vacated process still holds its context (~2.7 GB per H100). For a call or a load still short
+once no idle tenant holds weights there, idle processes end too, least recently used first; an
+unknown need ends only those an earlier admission left without weights. Startup ends none.
 """
 
 from __future__ import annotations
@@ -88,6 +92,10 @@ def bound(shape: Shape, peaks: Mapping[Shape, dict[int, int]]) -> dict[int, int]
     return {o: min(peak.get(o, 0) for peak in covering) for o in covering[0]}
 
 
+def _holds(row: LaneRow, short: set[int]) -> bool:
+    return any(row.held.get(o, 0) for o in short) or (not row.held and bool(row.resident_bytes()))
+
+
 class MemoryManager:
     """Admission, eviction and reclaim over every tenant of every device."""
 
@@ -125,7 +133,7 @@ class MemoryManager:
         remain external, and a genuine startup refusal is never retried here.
         """
         with lane.device:
-            self.make_room(lane, slot, None, "executor startup")
+            self.make_room(lane, slot, None, "executor startup", end_idle=False)
             yield
 
     def need(self, lane: DeviceLane, slot: str, shape: Shape) -> Need:
@@ -165,12 +173,20 @@ class MemoryManager:
         return fits
 
     def make_room(
-        self, lane: DeviceLane, slot: str, need: Need, why: str, evicted: list[str] | None = None
+        self,
+        lane: DeviceLane,
+        slot: str,
+        need: Need,
+        why: str,
+        evicted: list[str] | None = None,
+        *,
+        end_idle: bool = True,
     ) -> dict[int, DeviceMemory]:
         """Evict idle tenants from `lane`'s short devices until `need` fits on every one:
-        dead tenants first (killed and reaped), then weights, least recently used first.
-        Returns the driver's picture once it fits or nothing is left to evict."""
+        dead tenants first (killed and reaped), then weights, then idle processes, least
+        recently used first. Returns the driver's picture once it fits or nothing is left."""
         tried: set[str] = set()
+        ended: set[str] = set()
         while True:
             measured = lane.measure(self.kind)
             if any(memory.state != "measured" for memory in measured.values()):
@@ -178,7 +194,18 @@ class MemoryManager:
             short = {o for o in lane.ordinals if need is None or measured[o].free_bytes < need[o]}
             if not short:
                 return measured
-            victim = self._victim(slot, short, tried)
+            # A need no device can meet ends nobody: the call runs staged in what is left. An
+            # unknown need ends only processes an earlier admission left without weights.
+            reachable = end_idle and (
+                need is None
+                or all(
+                    need[o] <= measured[o].total_bytes - lane.row(slot).held.get(o, 0)
+                    for o in short
+                )
+            )
+            victim = self._victim(
+                slot, short, tried, ended if reachable else None, again=need is not None
+            )
             if victim is None:
                 if need is not None:
                     self.note(
@@ -192,32 +219,48 @@ class MemoryManager:
                     )
                 return measured
             other, other_lane, row, executor = victim
-            tried.add(other)
-            if evicted is not None:
+            if evicted is not None and other not in evicted:
                 evicted.append(other)
             if executor.poisoned or not executor.alive():
+                tried.add(other)
                 why_dead = executor.poisoned or "exited"
                 if self.end(other, executor, f"reclaimed for {slot!r} on {why}: {why_dead}"):
                     row.held.clear()
                 continue
+            if other in tried or not _holds(row, short):
+                ended.add(other)
+                if self.end(other, executor, f"ended for {slot!r} on {why}: idle, no weights"):
+                    row.held.clear()
+                continue
+            tried.add(other)
             self._evict(other, other_lane, row, executor, slot, why, measured, short)
 
     def _victim(
-        self, slot: str, short: set[int], tried: set[str]
+        self, slot: str, short: set[int], tried: set[str], ended: set[str] | None, *, again: bool
     ) -> tuple[str, DeviceLane, LaneRow, child.Executor] | None:
         """The next tenant to give room on `short`: a dead one, else the least recently used
-        idle one holding bytes there. Never `slot`, never twice."""
+        idle one holding bytes there, else (`ended` given) the least recently used idle
+        process holding none, `again` including one this call vacated. Never `slot`."""
         dead = []
         idle = []
+        bare = []
         for other, lane, row in self.tenants(short):
             executor = row.supervision.current if row.supervision is not None else None
-            if other == slot or other in tried or executor is None:
+            if other == slot or executor is None:
                 continue
-            if executor.poisoned or not executor.alive():
+            dying = executor.poisoned or not executor.alive()
+            if other not in tried and dying:
                 dead.append((other, lane, row, executor))
-            elif any(row.held.get(o, 0) for o in short) or (not row.held and row.resident_bytes()):
+            elif other not in tried and _holds(row, short):
                 idle.append((other, lane, row, executor))
-        for tier in (dead, idle):
+            elif (
+                ended is not None
+                and other not in ended
+                and not dying
+                and (again or other not in tried)
+            ):
+                bare.append((other, lane, row, executor))
+        for tier in (dead, idle, bare):
             if tier:
                 return min(tier, key=lambda item: item[2].last_used)
         return None

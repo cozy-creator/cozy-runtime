@@ -173,6 +173,55 @@ def test_true_overload_stages_and_crashes_nothing(
 
 
 @needs_executor
+def test_idle_processes_end_lru_when_their_contexts_leave_a_device_short(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 2436: every vacated executor kept its context, seven left a card 19 GB short and
+    the forward ran out of memory. An unmeasured call ends the idle processes an earlier
+    admission left without weights, least recently used first, and vacates (keeps warm) the
+    rest; a measured need still short ends those too. The requester keeps its own."""
+    h3, qwen = long_form(machine, monkeypatch)
+    worker = machine.worker
+
+    def device_memory(entry: str, kind: str) -> accel.DeviceMemory:
+        ordinal = VIRTUAL.split(",").index(entry)
+        processes = sum(
+            1
+            for lane in worker.lanes.lanes
+            if ordinal in lane.ordinals
+            for row in lane.rows.values()
+            if row.executor() is not None
+        )
+        return accel.DeviceMemory(
+            "measured", TOTAL - held_on(machine, ordinal) - 3 * GiB * processes, TOTAL
+        )
+
+    def ended() -> list[str]:
+        return [
+            e.step.split("'")[1]
+            for e in worker.activity
+            if "reclaimed executor" in e.step and "idle, no weights" in e.step
+        ]
+
+    monkeypatch.setattr(accel, "device_memory", device_memory)
+    for placement in qwen[:3]:
+        worker._lane_of(placement).row(placement).held = {}
+        worker._lane_of(placement).row(placement).ledger.resident.clear()
+    for placement in (qwen[3], qwen[2], qwen[0], qwen[1]):
+        worker._lane_of(placement).touch(placement)
+    group = worker._lane_of(h3)
+    survivor = worker.hosted[h3].supervision.current
+    assert worker.memory.admit(group, h3, ("segment", "frames=500"), "unmeasured")
+    assert ended() == [qwen[2], qwen[0], qwen[1]]
+    assert vacated(machine) == [qwen[3]] and set(machine.executors()) == {h3, qwen[3]}
+    group.row(h3).peak[SHAPE] = dict.fromkeys(range(4), 75 * GiB)
+    assert worker.memory.admit(group, h3, SHAPE, "segment 2")
+    assert ended() == [qwen[2], qwen[0], qwen[1], qwen[3]]
+    assert set(machine.executors()) == {h3} and worker.hosted[h3].supervision.current is survivor
+    assert all(accel.device_memory(o, "cuda").free_bytes >= 55 * GiB for o in VIRTUAL.split(","))
+
+
+@needs_executor
 def test_a_calls_peak_is_what_the_driver_saw_and_a_device_failure_forgets_it(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

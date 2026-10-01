@@ -1,0 +1,1 @@
+An idle executor whose weights are already vacated still holds its device context (~2.7 GB per H100). A call or load still short of room now ends idle processes too, least recently used first (an unmeasured call ends only those an earlier admission left without weights), so a machine that served many distinct models no longer runs a forward out of memory.

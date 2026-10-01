@@ -1,0 +1,1 @@
+A failure inside a multi-GPU forward is the run's error again (with the follower's or GPU 0's own message), not a later `group_broken` refusal from restoring attention on the broken group; every applied adapter's ref, manifest digest, strength and target are recorded in the run's preparation lines.
