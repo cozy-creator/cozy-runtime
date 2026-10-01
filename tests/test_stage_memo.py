@@ -4,6 +4,8 @@ models below are synthetic, so the mechanism is proven general."""
 
 from __future__ import annotations
 
+import gc
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -102,6 +104,21 @@ def test_a_hit_runs_nothing_and_returns_the_same_bytes_in_the_same_form() -> Non
     model.encode("a red fox", 2.0)
     model.encode("a blue fox")
     assert Encoder.runs == 3
+
+
+def test_neither_a_miss_nor_a_hit_holds_its_result_past_the_call() -> None:
+    """The attempt ledger reads device bytes at the terminal. A result the memo still held,
+    even as uncollected garbage, reads there as a leak and costs the executor."""
+    model = _model()
+    gc.disable()
+    try:
+        for _ in ("miss", "hit"):
+            result = model.encode("a prompt nobody keeps")
+            held = weakref.ref(result.prompt)
+            del result
+            assert held() is None
+    finally:
+        gc.enable()
 
 
 def test_any_result_structure_round_trips() -> None:
