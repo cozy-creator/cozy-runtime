@@ -217,16 +217,18 @@ def test_real_h3_forward_matches_ordered_reference_adapters(component: str, turb
             hook.remove()
 
 
-@pytest.mark.parametrize("degree", [2, 4])
+@pytest.mark.parametrize(
+    ("degree", "dtype"), [(2, torch.float32), (4, torch.float32), (2, torch.float16)]
+)
 def test_a_prepared_lora_view_serves_its_exact_factors_on_every_gpu(
-    tmp_path: Path, degree: int
+    tmp_path: Path, degree: int, dtype: Any
 ) -> None:
     """The production path end to end: the adapter-view child composes a real fp32 LoRA onto a
     bf16 H3 checkpoint, the executor's bind/substrate/plane constructs and fills it, and the
     group's real followers construct their own replica. Every GPU must hold the stored factors
     and scale, a group must compute what one GPU does, and both what merged weights compute."""
     root = tmp_path / "store"
-    view, values, factors = h3_lora_runtime.checkpoints(root)
+    view, values, factors = h3_lora_runtime.checkpoints(root, dtype)
     model, backend = h3_lora_runtime.construct(root, view.digest)
     held = h3_lora_runtime.adapters(model)
     assert list(held) == h3_lora_runtime.targets(h3_lora_runtime.dit())
@@ -234,7 +236,6 @@ def test_a_prepared_lora_view_serves_its_exact_factors_on_every_gpu(
         assert torch.equal(a, factors[path + ".lora_A.weight"]), path
         assert torch.equal(b, factors[path + ".lora_B.weight"]), path
         assert (scaling, active) == (h3_lora_runtime.SCALING, ("adapter_0",)), path
-
     inputs = h3_lora_runtime.inputs()
     one = model.denoise(inputs)
     merged, plain = h3_lora_runtime.dit().eval(), h3_lora_runtime.dit().eval()
@@ -243,7 +244,9 @@ def test_a_prepared_lora_view_serves_its_exact_factors_on_every_gpu(
     with torch.inference_mode():
         for path in held:
             layer = merged.get_submodule(path)
-            delta = factors[path + ".lora_B.weight"] @ factors[path + ".lora_A.weight"]
+            delta = (
+                factors[path + ".lora_B.weight"].float() @ factors[path + ".lora_A.weight"].float()
+            )
             weight = values[path + ".weight"].float() + h3_lora_runtime.SCALING * delta
             layer.weight.copy_(weight.to(layer.weight.dtype))
         wanted, base = merged(**inputs), plain(**inputs)

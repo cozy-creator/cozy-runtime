@@ -74,7 +74,7 @@ CONFIG = {
 }
 RANK, ALPHA, STRENGTH = 4, 8.0, 0.8
 SCALING = STRENGTH * ALPHA / RANK
-_DTYPES = {torch.float32: "f32", torch.bfloat16: "bf16"}
+_DTYPES = {torch.float32: "f32", torch.bfloat16: "bf16", torch.float16: "f16"}
 
 
 def dit() -> Any:
@@ -106,6 +106,7 @@ class LoRAH3(Model[Pipe], encoded_leaves="accept"):
 
 def _write(store: Any, name: str, component: str, tensors: dict[str, Any]) -> ObjectRef:
     model = component != "adapter"
+    grant = sum(value.numel() * value.element_size() for value in tensors.values()) + (1 << 20)
     writer = store.begin_derived(
         weights_transaction_id(name, "create", "sha256:" + "1" * 64, "model"),
         1,
@@ -126,7 +127,7 @@ def _write(store: Any, name: str, component: str, tensors: dict[str, Any]) -> Ob
             },
             configs={"model": NativeConfig("add")} if model else {},
             order=tuple((component, key) for key in tensors),
-        ).native_arguments(1 << 26),
+        ).native_arguments(grant),
         work_fingerprint="sha256:" + "2" * 64,
     )
     for key, value in tensors.items():
@@ -138,8 +139,10 @@ def _write(store: Any, name: str, component: str, tensors: dict[str, Any]) -> Ob
     return ObjectRef("sha256:" + receipt["sha256"], receipt["length"])
 
 
-def checkpoints(root: Path) -> tuple[ObjectRef, dict[str, Any], dict[str, Any]]:
-    """Base and LoRA checkpoints in a real store, composed by the production child."""
+def checkpoints(
+    root: Path, dtype: Any = torch.float32
+) -> tuple[ObjectRef, dict[str, Any], dict[str, Any]]:
+    """Base and `dtype` LoRA checkpoints in a real store, composed by the production child."""
     store = tensorfs.Store.ensure(str(root))
     torch.manual_seed(0)
     base = dit()
@@ -155,10 +158,10 @@ def checkpoints(root: Path) -> tuple[ObjectRef, dict[str, Any], dict[str, Any]]:
         for role, shape in shapes.items():
             factors[f"{path}.lora_{role}.weight"] = torch.randn(shape, generator=generator)
         factors[path + ".alpha"] = torch.tensor(ALPHA)
-    with torch.no_grad():
-        for key, value in factors.items():
-            if key.endswith(".weight"):
-                value.mul_(0.3)
+    factors = {
+        key: (value * 0.3).to(dtype) if key.endswith(".weight") else value
+        for key, value in factors.items()
+    }
     step = PrepareAdapterView(
         identity="sha256:" + "3" * 64,
         base=_write(store, "base", COMPONENT, values),
