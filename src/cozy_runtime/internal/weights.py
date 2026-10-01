@@ -1451,6 +1451,8 @@ class WeightResidency:
             "allocator_delta_bytes": self._derived() - self.derived_at_open,
             "poisoned": self.poisoned,
             "refusals": self.refusals[-8:],
+            # the plane's counters (cumulative for this process): what streamed, how late
+            "plane": msgspec.to_builtins(weights.facts()),
         }
 
     # -- the stage
