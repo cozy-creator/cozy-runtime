@@ -22,7 +22,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.author._executor_requests import Handler, respond  # noqa: E402
+from cozy_runtime.author._executor_requests import (  # noqa: E402
+    Answer,
+    Handler,
+    StageEnter,
+    respond,
+)
 from cozy_runtime.internal import accel, plane  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
@@ -162,3 +167,28 @@ def test_past_its_last_stage_a_call_gives_its_bytes_back_to_the_one_waiting(
         assert executor.weights.budget == 0, "A unmapped its weights at its last exit"
     finally:
         executor.close()
+
+
+def test_a_cancel_answers_a_scope_waiting_for_its_turn(machine: Machine, tmp_path: Path) -> None:
+    worker = machine.worker
+    worker._turning.update({"inst-a": True, "inst-b": True})
+    worker.stages.open_root("A", 1)
+    worker.stages.open_root("B", 2)
+    worker.stages.want("A#1", Want(root="A", template=("inst-a", "b"), entrypoint="generate"))
+    worker.stages.want("B#1", Want(root="B", template=("inst-b", "b"), entrypoint="generate"))
+    handler, attempt = tenant(machine, "tenant-b", "B")
+    answers: list[object] = []
+    waiting = threading.Thread(
+        target=lambda: answers.append(handler(StageEnter(method="render", components=())))
+    )
+    waiting.start()
+    bound = time.monotonic() + 30  # a hang bound on a loaded box, not a budget
+    while not worker.stages.view()["demands"]["B#1"]["asking"]:
+        assert time.monotonic() < bound
+        time.sleep(0.01)
+    attempt.canceling = "client"
+    worker.stages.wake()
+    waiting.join(30)
+    assert len(answers) == 1
+    answer = answers[0]
+    assert isinstance(answer, Answer) and not answer.ok and answer.code == "cancelled"

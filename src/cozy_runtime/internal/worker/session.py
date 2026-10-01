@@ -6623,6 +6623,7 @@ class Worker:
             stall_ns=request.stall_ns,
         )
         past = self.stages.exit(key, sample, counted=counted)
+        self.memory.yielded(slot, lane.ordinals)
         if not past:
             return StageGo(ok=True)
         self.memory.end(slot)
@@ -6804,6 +6805,7 @@ class Worker:
             if staged:
                 self._prefill(attempt)
             with self._seat(lane, attempt.placement_id):
+                self._wake_on_cancel(attempt)
                 attempt.stage_turns = self._turns_for(attempt)
                 if not attempt.stage_turns:
                     self._whole_turn(attempt, lane)
@@ -6857,6 +6859,10 @@ class Worker:
                     root=attempt.request_id, widths=(len(lane.ordinals),), gpus=lane.ordinals
                 ),
             )
+        self.stages.take(key, stop=lambda: bool(attempt.canceling) or self.stop.is_set())
+
+    def _wake_on_cancel(self, attempt: AttemptRecord) -> None:
+        """A cancel reaches a call waiting for its turn, whole or a stage's, at once."""
         poke = attempt.poke
 
         def woken() -> None:
@@ -6864,7 +6870,6 @@ class Worker:
             self.stages.wake()
 
         attempt.poke = woken
-        self.stages.take(key, stop=lambda: bool(attempt.canceling) or self.stop.is_set())
 
     @contextlib.contextmanager
     def _starting(self, lane: DeviceLane, slot: str) -> Iterator[None]:
@@ -7135,6 +7140,7 @@ class Worker:
         """Mark the cancel; a STAGED attempt has nothing on the device, so its terminal is
         recorded now. Anything later is watched by the attempt's guard."""
         done = self.engine.cancel(message, failure=failure)
+        self.stages.wake()  # a scope waiting for its turn reads the mark now
         held = self.engine.live.get(message.request_id)
         if held is None or held.attempt != message.attempt_ordinal or not held.canceling:
             return done

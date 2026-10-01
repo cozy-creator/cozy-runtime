@@ -307,7 +307,8 @@ def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
             busy.add(job.key)
             _take(job.gpus, job, idle, claim, holder)
             for o in job.gpus:
-                free_at[o] += remaining_s(job, len(job.gpus))
+                if o in free_at:  # a device job also holds GPUs the driver cannot read
+                    free_at[o] += remaining_s(job, len(job.gpus))
 
     for job in order:
         if job.phase == "running":

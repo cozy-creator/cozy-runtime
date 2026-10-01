@@ -169,8 +169,6 @@ class Execution:
                 if placed is None:
                     return  # moved or past its deadline: the next pass decides
                 ordinals = placed
-                if not stages.taking_turns(grant_key):
-                    stages.take(grant_key)  # granted already: this thread is its holder
             self.calls.timing.phase(self.owner, self.request, row.ordinal, "preparing")
             attempt = self.worker.dispatch_machine(
                 unit, offered, ordinals, lambda: self._moved(row)

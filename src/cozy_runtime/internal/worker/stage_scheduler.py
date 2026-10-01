@@ -113,6 +113,8 @@ class _Demand:
     asked: float = 0.0
     #: the turn it asks for or holds is one of its call's stages (a load's warm is not)
     counted: bool = True
+    #: its attempt holds its whole turn in its device phase (not still dispatching)
+    entered: bool = False
 
 
 class StageScheduler:
@@ -254,7 +256,7 @@ class StageScheduler:
             if demand is None or not demand.gpus:
                 return True
             if demand.whole and demand.running:
-                demand.owner = threading.get_ident()
+                demand.owner, demand.entered = threading.get_ident(), True
                 return True
             demand.whole, demand.asking = True, True
         self.resync()
@@ -265,7 +267,7 @@ class StageScheduler:
                 if demand is not None:
                     demand.asking = False
                 return False
-            demand.owner = threading.get_ident()
+            demand.owner, demand.entered = threading.get_ident(), True
             return True
 
     @contextmanager
@@ -307,11 +309,13 @@ class StageScheduler:
             self.resync()
 
     def quiet(self, ordinals: Ordinals) -> bool:
-        """No whole turn runs on `ordinals`: an executor that recovers from an out-of-memory at a
-        block boundary holds them, if anyone does, so a new device context may start beside."""
+        """No whole turn's attempt is in its device phase on `ordinals`: an executor that
+        recovers from an out-of-memory at a block boundary holds them, if anyone does, or a call
+        still dispatching (whose own executor may be the one starting), so a new device context
+        may start beside."""
         with self.lock:
             return not any(
-                (d := self.demands.get(self.holder[o])) is not None and d.whole
+                (d := self.demands.get(self.holder[o])) is not None and d.whole and d.entered
                 for o in ordinals
                 if o in self.holder
             )
@@ -487,14 +491,16 @@ class StageScheduler:
             self.demands[prepare.job].gpus = self.demands[prepare.job].gpus or prepare.gpus
         for turn in plan.turns:
             demand = self.demands[turn.job]
-            if not demand.dispatched and alone is not None and alone is not demand:
+            if not demand.dispatched and alone is not None:
                 continue  # a device job waits to run alone: nothing new starts meanwhile
-            if demand.want.exclusive and self._others(demand):
-                continue
             demand.gpus = demand.gpus or turn.gpus
             self._grant(demand, turn, now, fresh)
         if alone is None:
             self._dispatch(plan, fresh)
+        elif not self._others(alone) and not self.holder:
+            # Worker-wide: every GPU of the envelope, readable or not, once nothing else runs.
+            alone.gpus = tuple(range(self.devices))
+            self._grant(alone, policy.Turn(alone.key, alone.gpus, 0), now, fresh)
         waits = {wait.job: wait for wait in plan.waits}
         for demand in self.demands.values():
             wait = waits.get(demand.key)
@@ -526,7 +532,8 @@ class StageScheduler:
         """Every live demand, every root's lease between its calls, and `extra` probes."""
         readable = {g.ordinal for g in machine.gpus}
         now = time.monotonic()
-        jobs = [self._job(d, readable, now) for d in (*self.demands.values(), *extra)]
+        demands = (d for d in (*self.demands.values(), *extra) if d.running or not d.want.exclusive)
+        jobs = [self._job(d, readable, now) for d in demands]
         jobs += [
             policy.Job(
                 key="lease:" + root,
