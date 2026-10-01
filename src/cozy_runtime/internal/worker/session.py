@@ -2572,7 +2572,10 @@ class Worker:
             self.executions.observe(owner, rows)
         for root, event, body in rows:
             if event == "gpu.wait":
-                self._gpu_waiting(owner, root, body)
+                # A call no durable execution holds (an owner-placed attempt) has no parent
+                # to tell; it waits all the same.
+                with contextlib.suppress(WorkspaceRefusal):
+                    self._gpu_waiting(owner, root, body)
 
     def _record_executor(self, attempt: AttemptRecord) -> None:
         """The SDK the attempt's executor loaded, as it stated in its hello, on the execution's
