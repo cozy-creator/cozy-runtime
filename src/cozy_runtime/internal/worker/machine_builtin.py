@@ -55,18 +55,22 @@ class Builtins:
     def _capture(self) -> machine_capture.Builtin:
         worker = self.worker
         root = Path(worker.options.install_root or "")
-        prepared = builtin_environment.prepare(root)
-        installed = prepared.installed
-        interface_raw = worker._describe_installed(
-            installed,
-            "cozy-runtime",
-            application=builtin_operations.APPLICATION,
-        )
-        package_interface.parse(interface_raw)
+        installed = builtin_environment.prepare(root)
         interface_path = (
             root / "installations" / installed.installation_id / "package-interface.json"
         )
-        package_interface.publish(interface_path, interface_raw)
+        try:
+            # Described by an earlier process of this same installed Runtime.
+            interface_raw = interface_path.read_bytes()
+            package_interface.parse(interface_raw)
+        except (OSError, package_interface.StalePackageInterface):
+            interface_raw = worker._describe_installed(
+                installed,
+                "cozy-runtime",
+                application=builtin_operations.APPLICATION,
+            )
+            package_interface.parse(interface_raw)
+            package_interface.publish(interface_path, interface_raw)
         package_prepare._stage_job_plans(
             interface_raw,
             root=worker.config.cozy_home / "job-plans",
