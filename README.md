@@ -231,6 +231,15 @@ host residence tier, and a re-stage is an ordinary cr-005 fill from the page-cac
 mapping. The `package-owns-no-residency` fence proves the vocabulary is unreachable from
 package code rather than merely unused.
 
+**Encoder results are memoized by marking the method.** `@uses_components(..., memoize=True)`
+(with `memo_dependencies`/`memo_version` as on `@invocable`) makes a method eligible; the
+Runtime looks the call up before the scope opens, so a hit stages nothing. The key is the
+method's code and declared helpers, the environment, the components' weights, the
+arguments (values: strings, numbers, host tensors, arrays, images, assets, records) and the
+numerics. A method drawing from the default RNG refuses `memo_rng`. Results go to the
+executor's LRU, and to the machine's disk tier only when small and measured costly to
+produce (`memo:` in runtime.yaml; tracker design `pipeline-memoization.md`).
+
 **Anima's CUDA optimization is an exact post-fill plan.** Runtime recognizes only
 `anima:AnimaModel` with Diffusers `0.40.0` and the exact Anima Base 1.0 Cosmos config. After
 TensorFS has filled the ordinary module tree, it installs fused RMSNorm + split-half RoPE,
