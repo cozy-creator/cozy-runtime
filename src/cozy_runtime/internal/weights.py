@@ -376,8 +376,12 @@ class Weights:
         return sum(component.regions[i].span for i in regions)
 
     def forget(self, construction: str) -> None:
+        """Close `construction`'s weight sets and give their device handles back to the
+        driver (the plane keeps released handles for reuse until a budget is set)."""
         for key in [key for key in self.components if key.startswith(construction + "/")]:
             self.close(self.components.pop(key))
+        if not self.host_only:
+            self.plane.set_vram_budget(self.index, self.applied)
 
     def close(self, component: Component) -> None:
         close_cursor(component)
