@@ -7,7 +7,7 @@ import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, ExitStack, nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Annotated, Protocol
 from urllib.parse import urlsplit
@@ -389,7 +389,6 @@ def closure(rows: Iterable[Mapping[str, object]]) -> list[Selected]:
 def materialize(
     worker: Worker,
     rows: Iterable[Mapping[str, object]],
-    access: ExitStack | None,
     *,
     downloading: Callable[[Selected], AbstractContextManager[Sample | None]] = (
         lambda _: nullcontext()
@@ -397,11 +396,11 @@ def materialize(
     cancellation: Cancellation | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> None:
-    """Verify exact sources; lease bytes only when the preparer will read them.
+    """Verify exact sources and pull what is absent; lease nothing.
 
-    A reused placement consumes its registered binding document. Its fresh child
-    admission still verifies and retains every checkpoint before submission. A cold
-    preparation pulls its slots at once and reports their summed bytes: run 1510 pulled
+    The placement check reads only heads, under its own leases, and admission verifies and
+    retains every checkpoint before submission. A cold preparation pulls its slots at once
+    and reports their summed bytes: run 1510 pulled
     H3's 1.6 GB turbo adapter after its 100 GB base, 46 s more before the first segment.
     `downloading` brackets one model's pull and may take its own byte samples.
     """
@@ -482,9 +481,6 @@ def materialize(
             landing = [pool.submit(land, row) for row in selected]
         for future in landing:
             future.result()
-        if access is not None:
-            for row in selected:
-                access.enter_context(store.acquire_cozytensors(row.manifest.digest))
     except facade.errors.Refusal as error:
         raise WorkspaceRefusal(
             "captured Model default materialization refused: " + str(error.code)

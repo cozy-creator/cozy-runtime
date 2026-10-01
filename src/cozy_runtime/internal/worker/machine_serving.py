@@ -727,11 +727,7 @@ class Serving:
                     grants.bind(documents.read(raw, pb.InvocationSpec), offer.grant, identity)
                 )
                 machine_checkpoint_inputs.preflight(
-                    workspace,
-                    owner,
-                    offer,
-                    catalog,
-                    resident=self.worker.holds_construction(binding),
+                    workspace, owner, offer, catalog, held=self.worker.held_manifests
                 )
                 for entry in catalog.values():
                     machine_checkpoint_inputs.retain(workspace, owner, offer, entry)
@@ -966,7 +962,6 @@ class Serving:
                 machine_model_defaults.materialize(
                     worker,
                     defaults,
-                    access if matched is None else None,
                     downloading=lambda row: self.fetching(call, request, target, row),
                     cancellation=cancellation,
                     progress=progress,

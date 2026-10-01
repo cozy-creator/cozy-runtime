@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Container, Iterator, Mapping
 from contextlib import contextmanager
 from functools import partial
 from typing import Literal
@@ -107,12 +107,13 @@ def preflight(
     offer: pb.AttemptOffer,
     entries: Mapping[str, BoundInput],
     *,
-    resident: bool = False,
+    held: Container[str] = (),
 ) -> None:
     """Validate every new catalog source before any new recipient root is created.
 
-    `resident`: a live executor already built this exact construction from these sources,
-    so only `retain`'s own native verification checks them again.
+    `held`: manifests this worker already holds verified complete (`HeldManifests`); only
+    `retain`'s own native verification checks them again, and `admission` releases what a
+    stale entry let through.
     """
     store = fill.store(workspace.store_root)
     for entry in entries.values():
@@ -133,7 +134,7 @@ def preflight(
                         continue
                     if row.state == "held":
                         raise WorkspaceRefusal("accepted catalog input lost its native root")
-            if resident:
+            if documents.spell(entry.digest) in held:
                 continue
             _native(
                 db,

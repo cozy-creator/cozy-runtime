@@ -453,7 +453,6 @@ class ReleaseRoots:
             machine_model_defaults.materialize(
                 worker,
                 models,
-                None,
                 progress=lambda done, total: self._note(
                     job, "downloading model weights", done, total
                 ),
