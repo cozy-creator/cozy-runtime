@@ -295,13 +295,19 @@ def test_a_real_card_holds_no_context_before_the_grant_and_serves_after_adoption
             # The fused glue's build the start submitted, keyed as the executor keys it.
             own = kernel_cache.namespace(kernels, os.geteuid())
             monkeypatch.setenv("TRITON_CACHE_DIR", str(own / "triton"))
-            store, found = kernel_cache.Store(own), fusion.job(arch)
-            deadline = time.monotonic() + 240  # the slot's patience, not a product rule
-            while kernel_compile.status(store, found).state not in ("ready", "failed"):
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(1)
-            seen["fusion_before_grant"] = kernel_compile.status(store, found).line()
+            try:
+                store, found = kernel_cache.Store(own), fusion.job(arch)
+            except fusion.FusionUnavailable as exc:
+                # This environment has no usable Triton: the start reported it; adoption is
+                # still what this test proves.
+                seen["fusion_before_grant"] = f"unavailable: {exc.code}"
+            else:
+                deadline = time.monotonic() + 240  # the slot's patience, not a product rule
+                while kernel_compile.status(store, found).state not in ("ready", "failed"):
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(1)
+                seen["fusion_before_grant"] = kernel_compile.status(store, found).line()
 
             # The grant adopts that process: its device start makes the context, and it serves.
             machine.finish(a1)
