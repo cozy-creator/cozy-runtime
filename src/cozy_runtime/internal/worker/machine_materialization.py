@@ -224,7 +224,11 @@ def ensure(
         if not origin:
             raise WorkspaceRefusal("model_access_absent: this checkpoint is not held locally")
 
+        def note(text: str) -> None:
+            worker.note("model_preparation", f"{row.model}: {text}")
+
         def progress(event: Mapping[str, object]) -> None:
+            asking(event)
             measured = sample(event)
             if measured is not None:
                 available, total = measured
@@ -232,7 +236,7 @@ def ensure(
                 worker.note("model_preparation", f"{available}/{total} bytes verified")
 
         try:
-            with observing(worker, model):
+            with observing(worker, model), machine_model_defaults.hub_waiting(note) as asking:
                 result = facade.ensure(
                     store,
                     row.model + "@" + row.manifest,

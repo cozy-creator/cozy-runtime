@@ -109,6 +109,23 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoConfig:
+    """`memo:` in the machine's runtime.yaml: memoized Model methods (tracker #298).
+
+    On by default and self-managing; a zero size turns its tier off. There is no switch and
+    no environment variable."""
+
+    #: each executor's in-memory tier; -1 is min(1 GiB, host memory / 16)
+    process_bytes: int = -1
+    #: the machine tier on disk
+    store_bytes: int = 2 << 30
+    #: the largest result written to disk: worth storing is costly to produce and small
+    entry_bytes: int = 512 << 10
+    #: how long an entry lives on disk
+    ttl_ms: int = 7 * 86_400_000
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerHostConfig:
     """The fixed product-host handoff to ``cozy-runtime-worker``.
 
@@ -137,6 +154,7 @@ class WorkerHostConfig:
     visible_devices: tuple[str, ...] | None = None
     """`CUDA_VISIBLE_DEVICES` entries, by index or GPU UUID: where the machine's GPUs are.
     None (unset) is every card; () (empty) is none, served CPU only."""
+    memo: MemoConfig = field(default_factory=MemoConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,6 +508,7 @@ def read_worker_host_config(
         bounded("COZY_WORKER_ID"),
     )
     parsed = WorkerHostConfig(
+        memo=read_memo_config(layout.runtime_settings),
         object_storage_hosts=parse_object_storage_hosts(
             env.get("TENSORHUB_OBJECT_STORAGE_HOSTS", "")
         ),
@@ -516,6 +535,39 @@ def read_worker_host_config(
         os.environ.pop("COZY_STORAGE_ADMISSION_FD", None)
     _worker_host_read = True
     return parsed
+
+
+_SIZE = re.compile(r"([0-9]+)\s*(|k|m|g|t)(i?)b?", re.IGNORECASE)
+_DURATION = re.compile(r"([0-9]+)\s*(ms|s|m|h|d|)", re.IGNORECASE)
+
+
+def read_memo_config(path: Path) -> MemoConfig:
+    """`memo:` from runtime.yaml, read once at Worker start. An absent file, section or
+    unreadable value keeps that default."""
+    try:
+        lines = path.read_text().splitlines()
+    except (FileNotFoundError, NotADirectoryError):
+        return MemoConfig()
+    values: dict[str, str] = {}
+    inside = False
+    for line in lines:
+        text = line.split("#", 1)[0].rstrip()
+        if not text.strip():
+            continue
+        if not text[0].isspace():
+            inside = text.strip() == "memo:"
+        elif inside:
+            key, _, value = text.strip().partition(":")
+            values[key.strip()] = value.strip().strip("'\"")
+    found: dict[str, int] = {}
+    for name in ("process_bytes", "store_bytes", "entry_bytes"):
+        if (match := _SIZE.fullmatch(values.get(name, ""))) is not None:
+            base = 1024 if match[3] or not match[2] else 1000
+            found[name] = int(match[1]) * base ** " kmgt".index(match[2].lower() or " ")
+    if (match := _DURATION.fullmatch(values.get("ttl", ""))) is not None:
+        unit = {"ms": 1, "s": 1000, "": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+        found["ttl_ms"] = int(match[1]) * unit[match[2].lower()]
+    return MemoConfig(**found)
 
 
 def _machine_publication_authority(path: Path, worker_id: str) -> tuple[str, str]:

@@ -45,6 +45,11 @@ class Layout:
         return self._at("var/lib/cozy/installs")
 
     @property
+    def runtime_settings(self) -> Path:
+        """The Runtime's settings file (`memo:`), written from the owner's config."""
+        return self._at("etc/cozy/runtime.yaml")
+
+    @property
     def machine_wheels(self) -> Path:
         """The Runtime and TensorFS wheels `cozy machine install` installed, kept verbatim."""
         return self._at("opt/cozy/wheels")

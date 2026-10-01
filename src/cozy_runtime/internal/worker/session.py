@@ -84,7 +84,7 @@ from cozy_runtime.internal import (
     tolerant,
     weights_sink,
 )
-from cozy_runtime.internal.config import RuntimeConfig
+from cozy_runtime.internal.config import MemoConfig, RuntimeConfig
 from cozy_runtime.internal.executor_commands import (
     Activate,
     Binding,
@@ -119,6 +119,7 @@ from cozy_runtime.internal.worker import (
     model_source_prepare,
     observe,
     prespawn,
+    stage_memo,
     store_gc,
     triage,
     weights,
@@ -395,6 +396,8 @@ class WorkerOptions:
     activity_owner: tuple[int, int] | None = None
     """The uid/gid each published activity file is handed to, the same handoff the readiness
     receipt makes. Absent keeps the writer's identity."""
+    memo: MemoConfig = field(default_factory=MemoConfig)
+    """`memo:` from runtime.yaml: memoized Model methods' tiers (tracker #298)."""
 
 
 @dataclass(slots=True)
@@ -1105,15 +1108,28 @@ class Worker:
             workspace_executions.Executions(self.workspace) if self.workspace else None
         )
         self._pressure_registration = None
+        self.stage_memo = (
+            stage_memo.MachineMemo(
+                options.tensorfs_root, self.root / "stage-memo", options.memo, self.note
+            )
+            if options.tensorfs_root is not None
+            else None
+        )
         if self.workspace is not None:
             from cozy_runtime.internal import storage_admission
 
             from . import workspace_memo
 
-            workspace = self.workspace
+            workspace, memo = self.workspace, self.stage_memo
+
+            def reclaim(target: int) -> object:
+                # Memoized results are the cheapest bytes to lose: they go first.
+                if memo is not None:
+                    memo.reclaim(target)
+                return workspace_memo.reclaim_unused(workspace, target_bytes=target)
+
             self._pressure_registration = storage_admission.register_workspace(
-                workspace.store_root,
-                lambda target: workspace_memo.reclaim_unused(workspace, target_bytes=target),
+                workspace.store_root, reclaim
             )
         self.resolutions = machine_model_resolve.Resolutions(
             machine_model_resolve.supervised(self.root / "resolutions")
@@ -1168,6 +1184,7 @@ class Worker:
             ),
         )
         self.engine.boot_id = self.fence.worker_boot_id
+        self.engine.stage_memo = self.stage_memo
         from cozy_runtime.internal.worker.calls import Calls
 
         self.model_transfer_lock = threading.Lock()
@@ -5650,6 +5667,9 @@ class Worker:
             sequence_parallel_degree=_rank_degree(lane, tenant.bindings.values()),
             application=first.application,
             package_interface=first.interface_path,
+            memo=self.stage_memo.settings()
+            if self.stage_memo is not None and "stage/1" in executor.hello.get("memo", ())
+            else None,
         )
         began = time.perf_counter()
         self.monitor.start(f"start:{placement_id}", "load")
@@ -7501,6 +7521,20 @@ class Worker:
             threading.Thread(
                 target=self._lane("report", self.reporter), daemon=True, name="report"
             ).start()
+            if self.stage_memo is not None and self.stage_memo.available:
+                memo = self.stage_memo
+                threading.Thread(
+                    target=self._lane(
+                        "maintenance",
+                        stage_memo.scheduled,
+                        self.stop,
+                        [(stage_memo.interval(memo.config), memo.maintain)],
+                        self.note,
+                        fatal=False,
+                    ),
+                    daemon=True,
+                    name="maintenance",
+                ).start()
             # The durable owner is known from the last boot: its work resumes from the
             # journal now. Otherwise the first accepted claim runs this one pass.
             self.reconcile_executions()
