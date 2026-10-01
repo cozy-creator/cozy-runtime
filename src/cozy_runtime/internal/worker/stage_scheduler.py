@@ -497,11 +497,16 @@ class StageScheduler:
             self._grant(demand, turn, now, fresh)
         if alone is None:
             self._dispatch(plan, fresh)
-        elif not self._others(alone) and not self.holder:
-            # Worker-wide: every GPU of the envelope, readable or not, once nothing else runs.
-            alone.gpus = tuple(range(self.devices))
-            self._grant(alone, policy.Turn(alone.key, alone.gpus, 0), now, fresh)
         waits = {wait.job: wait for wait in plan.waits}
+        if alone is not None:
+            blocker = self._blocking(alone)
+            if blocker is None:
+                # Worker-wide: every GPU of the envelope, readable or not, once nothing else
+                # runs and no other root holds GPUs between its calls.
+                alone.gpus = tuple(range(self.devices))
+                self._grant(alone, policy.Turn(alone.key, alone.gpus, 0), now, fresh)
+            else:
+                waits[alone.key] = policy.Wait(alone.key, blocker)
         for demand in self.demands.values():
             wait = waits.get(demand.key)
             if wait is None or demand.running or demand.key.startswith("hold:"):
@@ -596,11 +601,12 @@ class StageScheduler:
         one = len(demand.gpus) == 1 if demand.gpus else max(want.widths, default=1) == 1
         return one and self.turns(want.template[0])
 
-    def _others(self, demand: _Demand) -> bool:
-        return any(
-            d is not demand and d.dispatched and not d.key.startswith("hold:")
-            for d in self.demands.values()
-        )
+    def _blocking(self, alone: _Demand) -> str | None:
+        """The root a device job waits behind: one whose call is live, or whose lease holds
+        GPUs between its calls; None when it may run now."""
+        live = [d.want.root for d in self.demands.values() if d is not alone and d.dispatched]
+        leased = [r for r, held in self.leases.items() if held and r != alone.want.root]
+        return next(iter([*live, *leased]), None)
 
     def _alone(self) -> _Demand | None:
         """The first device job still waiting to run alone, if any."""
