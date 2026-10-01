@@ -295,6 +295,7 @@ class StageScheduler:
                 dispatched=True,
                 whole=True,
                 asking=True,
+                entered=True,
             )
         self.resync()
         try:
