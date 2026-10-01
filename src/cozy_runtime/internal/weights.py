@@ -1443,6 +1443,13 @@ class WeightResidency:
 
     def _entered(self, method: str) -> None:
         weights = self.weights
+        cudnn = weights.torch.backends.cudnn
+        if cudnn.benchmark:
+            # Autotuning times its candidates, and streaming copies share the GPU with them:
+            # the algorithm, and so the output bits, would follow the copies. Heuristics
+            # choose by shape alone.
+            cudnn.benchmark = False
+            weights.modes["cudnn.benchmark"] = "off (the package had turned it on)"
         self.baseline = accel.allocated(weights.torch, weights.kind)
         accel.reset_peak(weights.torch, weights.kind)
         self.entered_ns = time.perf_counter_ns()

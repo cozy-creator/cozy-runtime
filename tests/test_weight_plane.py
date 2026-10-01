@@ -309,10 +309,13 @@ def sdxl_unet() -> Any:
 
 
 @on_card
-def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path) -> None:
-    """The same process, the same free memory: SDXL's UNet resident, then streamed through
-    a tight budget, computes the same bits (the image-level difference under physical
-    ballast is then the kernels' choice under memory pressure, not the plane)."""
+@pytest.mark.parametrize("pressure", [False, True])
+def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool) -> None:
+    """SDXL's UNet resident, then streamed through a tight budget, computes the same bits.
+    Under pressure the streamed arm alone also has a ballast leaving only the plane's budget
+    and the resident run's measured activations free, as physical ballast does in G4: every
+    streamed lease's bytes are checked against the store (`verify_bytes`), so a difference
+    can only be the kernels' choice under memory pressure."""
     torch.manual_seed(11)
     values = {k: v.float() * 0.05 for k, v in sdxl_unet().state_dict().items()}
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
@@ -343,13 +346,38 @@ def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path) -> None:
         return out
 
     weights.set_budget(1 << 30)
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
     resident = steps()
+    peak = torch.cuda.max_memory_allocated() - base
     layout: weight_policy.Layout = model.residency.components["unet"].layout
     weights.set_budget(layout.common + 3 * layout.largest)
-    streamed = steps()
-    model.residency.unpark()
+    ballast = None
+    if pressure:
+        torch.cuda.empty_cache()
+        free, _ = torch.cuda.mem_get_info()
+        left = weights.budget + peak + weight_policy.MARGIN
+        ballast = torch.empty(max(free - left, 0), dtype=torch.uint8, device="cuda")
+    wrong: list[str] = []
+    acquire = model.residency._acquire
+
+    def checked(component: Any, index: int, stream: int) -> Any:
+        lease = acquire(component, index, stream)
+        wrong.extend(lease.verify_bytes())
+        return lease
+
+    model.residency._acquire = checked
+    try:
+        streamed = steps()
+    finally:
+        del model.residency._acquire
+        model.residency.unpark()
+        del ballast
+        torch.cuda.empty_cache()
+    assert not wrong, f"plane bytes differ from the store: {wrong[:8]}"
     assert weights.facts().streamed["unet"].resident_blocks < len(layout.blocks)
-    assert all(torch.equal(a, b) for a, b in zip(resident, streamed, strict=True))
+    exact = [torch.equal(a, b) for a, b in zip(resident, streamed, strict=True)]
+    assert all(exact), f"bytes exact, outputs not ({exact}): kernels chose by free memory"
 
 
 @on_card
