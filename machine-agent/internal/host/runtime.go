@@ -152,7 +152,7 @@ func (d *directLauncher) maintain(op string, args []string) (string, error) {
 		d.replacement = selected
 		return "replace", nil
 	}
-	return maintainWithAgent(d.root, d.current, op, args, d.agentExecutable)
+	return maintainWithAgent(d.root, d.current, op, args, d.agentExecutable, d.out)
 }
 
 func (d *directLauncher) launch(incarnation string) (*runtimeProcess, error) {
