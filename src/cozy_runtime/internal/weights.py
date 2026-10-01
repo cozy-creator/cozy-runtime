@@ -1282,6 +1282,10 @@ class WeightResidency:
         #: entered again and again (a denoise step per stage) is cyclic like a multi-pass one
         self.entries: dict[str, int] = {}
         self.repeats: dict[str, int] = {}
+        #: a repeating method's stage left open between its entries (its resident set bound,
+        #: its common leases and cursors live, the cursor already copying the next pass), and
+        #: the Worker's budget it was planned in
+        self.parked: tuple[str, tuple[str, ...], int] | None = None
         self._shortfall_error = (plane.error("Shortfall"), plane.error("BelowFloor"))
         self._budget_error = plane.error("BudgetExceeded")
         self._capacity = (*self._shortfall_error, self._budget_error)
@@ -1313,6 +1317,7 @@ class WeightResidency:
     def open_attempt(self, *_: object) -> None:
         """A new attempt: its activation peaks start empty. (Older Workers also send a
         placement rung and headroom; the plane has no rungs, so they are ignored.)"""
+        self.unpark()
         self.peaks.clear()
         self.entries.clear()
         self.last_shortfall = None
@@ -1337,9 +1342,19 @@ class WeightResidency:
             granted = self.turn(method, components)
             if granted is not None:
                 weights.set_budget(granted)
-        self.active = (method, local)
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
+        if self.parked is not None:
+            if self.parked == (method, local, weights.budget):
+                # The same stage again: its plan, leases and cursors carry on.
+                self.parked = None
+                self.active = (method, local)
+                for name in local:
+                    self.components[name].passes = 0
+                self._entered(method)
+                return
+            self.unpark()
+        self.active = (method, local)
         if weights.host_only:  # everything is bound in place already; no device to measure
             self.entered_ns = time.perf_counter_ns()
             return
@@ -1379,6 +1394,10 @@ class WeightResidency:
                 self._close(local)
             self.active = None
             raise
+        self._entered(method)
+
+    def _entered(self, method: str) -> None:
+        weights = self.weights
         self.baseline = accel.allocated(weights.torch, weights.kind)
         accel.reset_peak(weights.torch, weights.kind)
         self.entered_ns = time.perf_counter_ns()
@@ -1398,7 +1417,13 @@ class WeightResidency:
         weights = self.weights
         method, local = self.active
         try:
-            self._close(local)
+            if self.repeats.get(method, 0) > 1 and not weights.host_only:
+                # A repeating stage (a denoise step per entry) stays open for the next entry.
+                for name in local:
+                    self.components[name].last_passes = self.components[name].passes
+                self.parked = (method, local, weights.budget)
+            else:
+                self._close(local)
             weights.drain()
         finally:
             self.active = None
@@ -1440,6 +1465,7 @@ class WeightResidency:
 
     def host(self, name: str) -> None:
         """`name` lives on another GPU of the group: never held here."""
+        self.unpark()
         component = self.components.get(name)
         if component is not None:
             self._drop([component])
@@ -1459,12 +1485,14 @@ class WeightResidency:
 
     def shed(self) -> None:
         """Unmap every component outside the active scope (a hosted call's OOM retry)."""
+        self.unpark()
         held = set(self.active[1]) if self.active is not None else set()
         self._drop([c for name, c in self.components.items() if name not in held])
 
     def vacate(self) -> dict[str, Any]:
         """Unmap this construction's idle weights. They stay in the pinned tier; the next
         stage wants them back at link speed."""
+        self.unpark()
         idle = [c for c in self.components.values() if c.lease is None and c.cursor is None]
         freed = sum(self.weights.resident_bytes(c) for c in idle)
         self._drop(idle)
@@ -1485,19 +1513,22 @@ class WeightResidency:
         return fits
 
     def room(self, components: Sequence[str]) -> tuple[int, int]:
-        """(allocatable device bytes now, plane bytes a stage of `components` could unmap)."""
+        """(allocatable device bytes now, plane bytes a stage of `components` could unmap):
+        everything mapped but what is leased or held, and what `components` keep resident
+        (theirs is the stage's own set, just wanted)."""
         weights = self.weights
         memory = accel.allocation(weights.torch, weights.kind)
         free = memory["driver_free_bytes"] + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )
         device = plane.stats(weights.plane).device(weights.index)
-        floor = sum(
-            weight_policy.floor(self.components[name].layout)
+        own = sum(
+            self.components[name].regions[index].span
             for name in components
             if name in self.components
+            for index in self.components[name].resident
         )
-        movable = device.committed - device.leased_bytes - device.held_bytes - floor
+        movable = device.committed - device.leased_bytes - device.held_bytes - own
         return free, max(movable, 0)
 
     def document(self) -> dict[str, Any]:
@@ -1794,7 +1825,9 @@ class WeightResidency:
                 # convolutions outside any block hook cannot retry.
                 need = per_pixel[0] * pixels if per_pixel else free + evictable
                 if need > free:
-                    weights.shrink(need - free, self._floor((name,)))
+                    # never into what the stage holds (its own set may still be filling)
+                    mapped = plane.stats(weights.plane).device(weights.index).committed
+                    weights.shrink(need - free, max(mapped - evictable, self._floor((name,))))
             baseline = accel.allocated(weights.torch, weights.kind)
             accel.reset_peak(weights.torch, weights.kind)
             failed = False
@@ -1821,6 +1854,14 @@ class WeightResidency:
             return out
 
         return run
+
+    def unpark(self) -> None:
+        """Close a repeating stage left open: another stage, an attempt's end, or a budget
+        change comes first."""
+        if self.parked is not None:
+            local = self.parked[1]
+            self.parked = None
+            self._close(local)
 
     def _close(self, local: Sequence[str]) -> None:
         """End the stage for `local`: cursors closed, common leases released, and every region

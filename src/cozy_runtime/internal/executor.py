@@ -345,6 +345,10 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.open_attempt()
 
+    def unpark(self) -> None:
+        for row in self.rows.values():
+            row.unpark()
+
     def vacate(self) -> dict[str, Any]:
         freed = sum(int(row.vacate()["freed_bytes"]) for row in self.rows.values())
         return {"freed": {}, "held": {}, "freed_bytes": freed}
@@ -1069,6 +1073,8 @@ class Executor:
             return warm_generation(model, device=self._device(), cancel=lambda: bool(self.poisoned))
         finally:
             owner._attempt_spool = None
+            if self.residency is not None:
+                self.residency.unpark()
 
     def _warm_package(self) -> str:
         """Give the package its ONE chance to pay its deferred import cost off the lock.
@@ -2193,8 +2199,9 @@ class Executor:
             if capacity and self.world == 1:
                 backend.close()
             else:
-                backend.poison(())
                 self.poisoned = f"warm failed: {refused['detail']}"[:200]
+                with contextlib.suppress(Exception):  # the warm's own failure is the report
+                    backend.poison(())
             return {**refused, "state": backend.state}
         stage("warm")
         weights.measure_context()
@@ -2834,6 +2841,8 @@ class Executor:
         # tenant gives room by a budget cut, never by a per-request cache flush. A
         # WEIGHTLESS generation holds no stream, so its quiescence is structural.
         d2h_started = time.perf_counter()
+        if self.residency is not None:
+            self.residency.unpark()  # a repeating stage closes with its attempt
         if torch is not None:
             accel.drain(torch, self.device_kind)
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
