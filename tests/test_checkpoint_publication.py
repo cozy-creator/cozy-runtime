@@ -310,7 +310,9 @@ def hub_handler(hub: Hub) -> Callable[[BaseHTTPRequestHandler, str], None]:
         if answer is None:
             handler.close_connection = True
             return
-        reply(handler, *answer)
+        status, value = answer
+        # Tensorhub's error envelope: every refusal names its code under "error".
+        reply(handler, status, {"error": value} if status >= 400 else value)
 
     return handle
 

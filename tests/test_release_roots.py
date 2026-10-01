@@ -145,8 +145,12 @@ class Catalog:
                 elif url.path == f"/v1/models/{PACKAGE}/checkpoints/{manifest}":
                     body = catalog.served
                 else:
+                    missing = {"code": "route.not_found", "message": "no route GET " + url.path}
+                    raw = json.dumps({"error": missing}).encode()
                     self.send_response(404)
+                    self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
+                    self.wfile.write(raw)
                     return
                 raw = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(200)
