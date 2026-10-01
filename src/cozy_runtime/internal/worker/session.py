@@ -1167,7 +1167,6 @@ class Worker:
         from cozy_runtime.internal.worker.calls import Calls
 
         self.model_transfer_lock = threading.Lock()
-        self.model_transfers: dict[str, threading.Lock] = {}
         self.model_preparation_progress: dict[tuple[str, str], pb.PrepareModelProgress] = {}
         self.model_preparation_observers: dict[tuple[str, str], int] = {}
         self.calls = Calls(

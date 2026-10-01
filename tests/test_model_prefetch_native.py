@@ -146,7 +146,6 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             config=SimpleNamespace(object_storage_hosts=("127.0.0.1",)),
             control_lock=threading.RLock(),
             model_transfer_lock=threading.Lock(),
-            model_transfers={},
             model_preparation_progress={},
             model_preparation_observers={},
             prepared_installations={
