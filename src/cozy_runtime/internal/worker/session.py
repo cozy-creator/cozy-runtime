@@ -1092,8 +1092,6 @@ class Worker:
             owner=options.triage_owner,
         )
         self.stop = threading.Event()
-        #: cancels every native transfer tied to this process's life when it stops
-        self.transfers = fill.tensorfs_module().PullCancellation()
         from cozy_runtime.internal.worker.workspace import Workspace
         from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
 
@@ -1184,6 +1182,7 @@ class Worker:
         from cozy_runtime.internal.worker.calls import Calls
 
         self.model_transfer_lock = threading.Lock()
+        self.model_transfers: dict[str, threading.Lock] = {}
         self.model_preparation_progress: dict[tuple[str, str], pb.PrepareModelProgress] = {}
         self.model_preparation_observers: dict[tuple[str, str], int] = {}
         self.calls = Calls(
@@ -3991,7 +3990,6 @@ class Worker:
     def request_stop(self) -> None:
         """Wake every unit and the sender so the worker can leave; the host is the caller's."""
         self.stop.set()
-        self.transfers.cancel()
         self.outbound.put(None)
         self.supervisor.stop()
         with self.attempts_left:
@@ -4004,7 +4002,6 @@ class Worker:
         if not self.stop.is_set():
             self.restart_requested = True
             self.stop.set()
-            self.transfers.cancel()
 
     def request_idle_restart(self) -> bool:
         """An operator update cannot interrupt work admitted by a detached client."""

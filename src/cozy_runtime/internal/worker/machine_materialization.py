@@ -209,6 +209,8 @@ def ensure(
     origin = authority.origin if authority is not None else hub
 
     def land(row: pb.DownloadModelRef | pb.DownloadAdapterRef) -> None:
+        if worker.stop.is_set():
+            raise WorkspaceRefusal("machine stopped during model preparation")
         model = pb.DownloadModelRef(
             model=row.model, manifest=row.manifest, release=row.release, lane=row.lane
         )
@@ -223,8 +225,12 @@ def ensure(
             pass
         if not origin:
             raise WorkspaceRefusal("model_access_absent: this checkpoint is not held locally")
+        if "ensure/1" not in fill.capabilities():
+            raise WorkspaceRefusal("model_materialization_unsupported: TensorFS needs ensure/1")
 
         def progress(event: Mapping[str, object]) -> None:
+            if worker.stop.is_set():
+                raise WorkspaceRefusal("machine stopped during model preparation")
             measured = sample(event)
             if measured is not None:
                 available, total = measured
@@ -243,16 +249,13 @@ def ensure(
                     allowed_hosts=machine_model_defaults.storage_hosts(worker, origin),
                     allow_local=machine_model_defaults.local_development(worker),
                     keep=keep,
-                    cancellation=worker.transfers,
                     progress=progress,
                 )
                 raw = store.manifest(row.manifest)["manifest"]
                 store.verify_checkpoint_source(row.model, row.manifest, len(raw))
                 completed(worker, model, result)
         except facade.errors.Refusal as exc:
-            if worker.transfers.cancelled:
-                raise WorkspaceRefusal("machine stopped during model preparation") from exc
-            raise WorkspaceRefusal(f"model_materialization_refused: {exc}") from exc
+            raise WorkspaceRefusal(f"model_materialization_refused: {exc.code}") from exc
 
     with ThreadPoolExecutor(
         max_workers=min(8, len(selected)), thread_name_prefix="model-ensure"

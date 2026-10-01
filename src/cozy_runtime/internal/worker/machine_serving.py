@@ -8,7 +8,7 @@ import hashlib
 import threading
 import time
 import uuid
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -198,8 +198,6 @@ class Serving:
         self.observers: dict[str, Emit] = {}
         #: the tenth of its download each prefetch last narrated, until the download lands
         self.narrated: dict[str, int] = {}
-        #: the parent each paused preparation's transfer yielded to, by its source request
-        self.paused: dict[str, str] = {}
         # Read leases die with the old process, but durable temporary holds need
         # release through the existing journal after a worker restart.
         workspace = worker.workspace
@@ -250,13 +248,6 @@ class Serving:
         with contextlib.suppress(WorkspaceRefusal, OSError):
             self.worker.emit_progress(call.parent_request, request.parent_attempt_ordinal, frame)
 
-    def _stage(self, call: Call, request: pb.ChildCallRequest, name: str, scope: str = "") -> str:
-        """`name` under its call's step label (else `scope`): one line per step for clients."""
-        label = self.worker.calls.progress_label(
-            call.parent_request, request.parent_attempt_ordinal, call.call_index
-        )
-        return f"{label or scope} / {name}"[:120] if label or scope else name
-
     @contextlib.contextmanager
     def phase(
         self, call: Call, request: pb.ChildCallRequest, name: str, since: float = 0.0
@@ -264,9 +255,11 @@ class Serving:
         """Separate immutable preparation and per-child custody in the parent journal. `since`
         (a `perf_counter` reading) starts the timing at work done before the phase opened."""
         started = since or time.perf_counter()
-        self._progress(
-            call, request, {"kind": "progress", "stage": self._stage(call, request, name)}
+        label = self.worker.calls.progress_label(
+            call.parent_request, request.parent_attempt_ordinal, call.call_index
         )
+        stage = f"{label} / {name}"[:120] if label else name
+        self._progress(call, request, {"kind": "progress", "stage": stage})
         succeeded = False
         try:
             yield
@@ -336,24 +329,18 @@ class Serving:
             )
 
         record({"event": "start"})
-        failure: BaseException | None = None
+        completed = False
         try:
             with self.phase(call, request, "Downloading model weights"):
                 yield sample
-        except BaseException as error:
-            failure = error
-            raise
+            completed = True
         finally:
             elapsed = time.perf_counter() - started
             fields: dict[str, object] = {
                 "event": "end",
-                "completed": failure is None,
+                "completed": completed,
                 "elapsed_ms": round(elapsed * 1000, 3),
             }
-            if failure is not None:
-                fields["reason"] = str(failure) or type(failure).__name__
-                if call.child_request in self.paused:
-                    fields["paused_for"] = self.paused[call.child_request]
             if landed:
                 first, latest, total = landed
                 fields.update(bytes=latest, total_bytes=total, moved_bytes=latest - first)
@@ -503,11 +490,9 @@ class Serving:
             # A real call still warms its process while awaiting admission.
             warm()
 
-        def stop(demand: Hashable | None) -> None:
+        def stop() -> None:
             with cancellation_lock:
                 if active_token is not None:
-                    if isinstance(demand, tuple):  # (parent request, attempt)
-                        self.paused[source.child_request] = str(demand[0])
                     active_token.cancel()
 
         def load(cancelled: Callable[[], bool]) -> Prepared:
@@ -546,7 +531,6 @@ class Serving:
             finally:
                 with cancellation_lock:
                     active_token = None
-                self.paused.pop(source.child_request, None)
                 assert self.worker.workspace is not None
                 self._release_preparation(owner, source.child_request)
 
@@ -859,7 +843,6 @@ class Serving:
                         credentials=credentials,
                         note=lambda *_: None,
                         check=check_adapter_preparation,
-                        cancellation=cancellation,
                         native_base=original is not None,
                     )
                     if original is not None:
@@ -1013,9 +996,7 @@ class Serving:
                 if not stage:
                     stage.append(
                         StageProgress(
-                            self._stage(
-                                call, request, "Downloading model weights", target.entrypoint
-                            ),
+                            target.entrypoint + " / Downloading model weights",
                             lambda frame: self._progress(call, request, frame),
                         )
                     )

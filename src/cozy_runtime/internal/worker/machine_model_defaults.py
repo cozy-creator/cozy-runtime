@@ -413,8 +413,6 @@ def materialize(
     from . import machine_materialization
 
     pulled: dict[str, tuple[int, int]] = {}
-    # Neither held here nor sized by its pull: until none is, the whole is not known.
-    unsized = {row.manifest.digest for row in selected}
     lock = threading.Lock()
     keep = sorted({row.manifest.digest for row in selected})
 
@@ -426,13 +424,11 @@ def materialize(
             sample(available, total)
         if progress is None:
             return
-        with lock:  # one sum at a time, so they arrive in order
+        with lock:
             pulled[model.manifest] = (available, total)
-            if total:
-                unsized.discard(model.manifest)
-            if not unsized:
-                landed = sum(done for done, _ in pulled.values())
-                progress(landed, sum(size for _, size in pulled.values()))
+            landed = sum(done for done, _ in pulled.values())
+            whole = sum(size for _, size in pulled.values())
+        progress(landed, whole)
 
     def land(row: Selected) -> None:
         manifest = row.manifest
@@ -445,33 +441,49 @@ def materialize(
         )
         if cancellation is not None and cancellation.cancelled:
             raise WorkspaceRefusal("model preparation canceled")
-        # Existing cached custody is sufficient. A cold use fetches this exact checkpoint;
-        # only this machine's own Hub sees its worker capability.
-        try:
-            store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
-            machine_materialization.held(worker, model, store)
-            with lock:
-                unsized.discard(manifest.digest)
-            return
-        except facade.errors.Refusal:
-            pass
-        # TensorFS owns the fetch: one cancellable flight per manifest across processes, disk
-        # admission that never evicts this preparation's own models, the Hub CA.
-        with machine_materialization.observing(worker, model), downloading(row) as sample:
-            result = facade.ensure(
-                store,
-                row.repository + "@" + manifest.digest,
-                hub=row.public_origin,
-                credential=credential(worker, row.public_origin),
-                ca_file=hub_ca(worker, row.public_origin),
-                allowed_hosts=storage_hosts(worker, row.public_origin),
-                allow_local=local_development(worker),
-                keep=keep,
-                cancellation=cancellation,
-                progress=partial(machine_materialization.forward, partial(report, model, sample)),
-            )
-            machine_materialization.completed(worker, model, result)
-        store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
+        # Existing cached custody is sufficient. A cold use fetches this exact
+        # checkpoint; only this machine's own Hub sees its worker capability.
+        with worker.model_transfer_lock:
+            transfer = worker.model_transfers.setdefault(manifest.digest, threading.Lock())
+        with transfer:
+            if cancellation is not None and cancellation.cancelled:
+                raise WorkspaceRefusal("model preparation canceled")
+            try:
+                store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
+                machine_materialization.held(worker, model, store)
+            except facade.errors.Refusal:
+                with machine_materialization.observing(worker, model), downloading(row) as sample:
+                    moved = partial(report, model, sample)
+
+                    if "ensure/1" in fill.capabilities():
+                        # TensorFS owns the fetch: one flight per manifest, disk admission
+                        # that never evicts this preparation's own models, the Hub CA.
+                        result = facade.ensure(
+                            store,
+                            row.repository + "@" + manifest.digest,
+                            hub=row.public_origin,
+                            credential=credential(worker, row.public_origin),
+                            ca_file=hub_ca(worker, row.public_origin),
+                            allowed_hosts=storage_hosts(worker, row.public_origin),
+                            allow_local=local_development(worker),
+                            keep=keep,
+                            cancellation=cancellation,
+                            progress=partial(machine_materialization.forward, moved),
+                        )
+                        machine_materialization.completed(worker, model, result)
+                    else:
+                        facade.pull(
+                            store,
+                            row.public_origin,
+                            row.repository + "@" + manifest.digest,
+                            credential=credential(worker, row.public_origin),
+                            allowed_hosts=storage_hosts(worker, row.public_origin),
+                            allow_local=local_development(worker),
+                            streams=8,
+                            cancellation=cancellation,
+                            progress=moved,
+                        )
+                store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
 
     try:
         with ThreadPoolExecutor(len(selected), thread_name_prefix="model-pull") as pool:
@@ -479,10 +491,8 @@ def materialize(
         for future in landing:
             future.result()
     except facade.errors.Refusal as error:
-        if cancellation is not None and cancellation.cancelled:
-            raise WorkspaceRefusal("model preparation canceled") from error
         raise WorkspaceRefusal(
-            f"captured Model default materialization refused: {error}"
+            "captured Model default materialization refused: " + str(error.code)
         ) from error
 
 

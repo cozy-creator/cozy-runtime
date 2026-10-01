@@ -12,8 +12,7 @@ from dataclasses import dataclass, field
 @dataclass
 class _Entry[T]:
     load: Callable[[Callable[[], bool]], T]
-    #: cancels the running load; given the demanding interest when demand pauses it
-    stop: Callable[[Hashable | None], None]
+    stop: Callable[[], None]
     future: Future[T] = field(default_factory=Future)
     interests: dict[Hashable, bool] = field(default_factory=dict)
     cancel: threading.Event = field(default_factory=threading.Event)
@@ -66,7 +65,7 @@ class Preparations[T]:
         load: Callable[[Callable[[], bool]], T],
         *,
         speculative: bool,
-        cancel: Callable[[Hashable | None], None] = lambda _: None,
+        cancel: Callable[[], None] = lambda: None,
         stale: Callable[[T], bool] = lambda _: False,
     ) -> Future[T] | None:
         with self.lock:
@@ -110,7 +109,7 @@ class Preparations[T]:
                 if not entry.interests:
                     entry.paused = False  # abandoned work must not restart
                     entry.cancel.set()
-                    entry.stop(None)
+                    entry.stop()
                     if not entry.started:
                         entry.future.cancel()
                     if entry.future.done():
@@ -131,25 +130,15 @@ class Preparations[T]:
         if self.closed:
             return
         running = [e for e in self.entries.values() if e.started and not e.future.done()]
-        # The first awaited interest, if any: what a running hint is paused for.
-        demand = next(iter(self.demands), None)
-        if demand is None:
-            demand = next(
-                (
-                    interest
-                    for e in self.entries.values()
-                    if not e.future.done()
-                    for interest, wanted in e.interests.items()
-                    if wanted
-                ),
-                None,
-            )
-        if demand is not None:
+        demand = bool(self.demands) or any(
+            any(e.interests.values()) and not e.future.done() for e in self.entries.values()
+        )
+        if demand:
             for entry in running:
                 if not any(entry.interests.values()) and not entry.cancel.is_set():
                     entry.paused = True
                     entry.cancel.set()
-                    entry.stop(demand)
+                    entry.stop()
         candidates = sorted(
             (e for e in self.entries.values() if not e.started and not e.future.done()),
             key=lambda e: not any(e.interests.values()),
@@ -158,7 +147,7 @@ class Preparations[T]:
             if len(running) >= 2:
                 break
             if not any(entry.interests.values()) and (
-                demand is not None or any(not any(e.interests.values()) for e in running)
+                demand or any(not any(e.interests.values()) for e in running)
             ):
                 continue
             entry.started = True
@@ -190,7 +179,7 @@ class Preparations[T]:
             self.closed = True
             for entry in self.entries.values():
                 entry.cancel.set()
-                entry.stop(None)
+                entry.stop()
                 if not entry.started:
                     entry.future.cancel()
         self.pool.shutdown(wait=True)
