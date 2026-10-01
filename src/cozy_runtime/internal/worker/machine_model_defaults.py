@@ -5,16 +5,17 @@ from __future__ import annotations
 import ipaddress
 import re
 import threading
-from collections.abc import Callable, Iterable, Mapping
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Annotated, Protocol
 from urllib.parse import urlsplit
 
 import msgspec
 
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import fill, liveness
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -386,6 +387,34 @@ def closure(rows: Iterable[Mapping[str, object]]) -> list[Selected]:
     return out
 
 
+@contextmanager
+def hub_waiting(say: Callable[[str], None]) -> Iterator[Callable[[object], None]]:
+    """Until TensorFS reports anything past `resolving`, say `waiting for the Hub: Ns` at
+    doubling intervals from the sampling cadence: a wedged Hub is visible and cancellable,
+    a prompt one shows nothing, a long wait never floods a durable log, and it needs no
+    newer TensorFS. Nothing here acts on the Hub's answer; it only speaks."""
+    asked, done, resolving = time.monotonic(), threading.Event(), threading.Event()
+    resolving.set()
+
+    def speak() -> None:
+        wait = liveness.SAMPLE_SECONDS
+        while not done.wait(wait) and resolving.is_set():
+            say(f"waiting for the Hub: {time.monotonic() - asked:.0f}s")
+            wait *= 2
+
+    def observe(event: object) -> None:
+        if isinstance(event, Mapping) and event.get("phase") not in (None, "resolving"):
+            resolving.clear()
+
+    speaker = threading.Thread(target=speak, name="hub-wait", daemon=True)
+    speaker.start()
+    try:
+        yield observe
+    finally:
+        done.set()
+        speaker.join()
+
+
 def materialize(
     worker: Worker,
     rows: Iterable[Mapping[str, object]],
@@ -395,6 +424,7 @@ def materialize(
     ),
     cancellation: Cancellation | None = None,
     progress: Callable[[int, int], None] | None = None,
+    waiting: Callable[[str], None] | None = None,
 ) -> None:
     """Verify exact sources and pull what is absent; lease nothing.
 
@@ -457,7 +487,18 @@ def materialize(
             pass
         # TensorFS owns the fetch: one cancellable flight per manifest across processes, disk
         # admission that never evicts this preparation's own models, the Hub CA.
-        with machine_materialization.observing(worker, model), downloading(row) as sample:
+        say = (lambda text: waiting(f"{row.repository}: {text}")) if waiting else None
+        with (
+            machine_materialization.observing(worker, model),
+            downloading(row) as sample,
+            hub_waiting(say) if say else nullcontext(lambda _: None) as asking,
+        ):
+            forward = partial(machine_materialization.forward, partial(report, model, sample))
+
+            def event(observed: object) -> None:
+                asking(observed)
+                forward(observed)
+
             result = facade.ensure(
                 store,
                 row.repository + "@" + manifest.digest,
@@ -468,7 +509,7 @@ def materialize(
                 allow_local=local_development(worker),
                 keep=keep,
                 cancellation=cancellation,
-                progress=partial(machine_materialization.forward, partial(report, model, sample)),
+                progress=event,
             )
             machine_materialization.completed(worker, model, result)
         store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)

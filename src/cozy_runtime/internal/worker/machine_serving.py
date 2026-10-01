@@ -1030,6 +1030,14 @@ class Serving:
                     downloading=lambda row: self.fetching(call, request, target, row),
                     cancellation=cancellation,
                     progress=progress,
+                    waiting=lambda text: self._progress(
+                        call,
+                        request,
+                        {
+                            "kind": "progress",
+                            "stage": self._stage(call, request, text, target.entrypoint),
+                        },
+                    ),
                 )
                 if cancellation is not None and cancellation.cancelled:
                     raise WorkspaceRefusal("model preparation canceled")

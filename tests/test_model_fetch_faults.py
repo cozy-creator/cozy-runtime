@@ -4,6 +4,7 @@ a refusal naming TensorFS's code and its detail; none is bounded by a wall clock
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ from fault_hub import (
     Corrupt,
     Delay,
     FaultHub,
+    Gate,
     Reset,
     Rule,
     Stall,
@@ -154,3 +156,21 @@ def test_a_machine_stop_mid_transfer_ends_the_pull_as_stopped(tmp_path: Path, st
             pulling.result()
         assert "TRANSFER_FAILED" not in str(refusal.value)
         assert worker.workspace is not None and temps(worker.workspace.store_root) == []
+
+
+def test_a_hub_that_has_not_answered_shows_as_waiting_for_it(tmp_path: Path) -> None:
+    """No timer on a live Hub's answer, but the wait is on the machine's activity lane, so a
+    wedge is visible (and a stop cancels it, as above)."""
+    answered = threading.Event()
+    with machine(tmp_path, on("closure", 1, 1, Gate(answered))) as (worker, hub):
+        pulling = preparing(worker, hub)
+        point = hub.checkpoint
+        hub.until(
+            lambda: any(
+                row.step.startswith(f"{point.model}: waiting for the Hub: ")
+                for row in worker.activity
+            ),
+            lambda: len(worker.activity),
+        )
+        answered.set()
+        pulling.result()
