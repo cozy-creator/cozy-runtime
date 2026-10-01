@@ -2119,6 +2119,7 @@ const (
 	PodHost_ListPackages_FullMethodName                          = "/cozy.worker.v1.PodHost/ListPackages"
 	PodHost_ListModels_FullMethodName                            = "/cozy.worker.v1.PodHost/ListModels"
 	PodHost_DescribeMachine_FullMethodName                       = "/cozy.worker.v1.PodHost/DescribeMachine"
+	PodHost_ReadMachineLog_FullMethodName                        = "/cozy.worker.v1.PodHost/ReadMachineLog"
 )
 
 // PodHostClient is the client API for PodHost service.
@@ -2203,6 +2204,10 @@ type PodHostClient interface {
 	ListPackages(ctx context.Context, in *PackageListQuery, opts ...grpc.CallOption) (*PackageList, error)
 	ListModels(ctx context.Context, in *ModelListQuery, opts ...grpc.CallOption) (*ModelList, error)
 	DescribeMachine(ctx context.Context, in *DescribeMachineQuery, opts ...grpc.CallOption) (*MachineDescription, error)
+	// Wire 72: a bounded log the machine keeps on its own disk, oldest line first. The Host reads
+	// it, so it answers while the Runtime is stopped. A Host before 72 answers UNIMPLEMENTED, which
+	// callers report as a machine that predates the log, never as a failure of anything else.
+	ReadMachineLog(ctx context.Context, in *MachineLogQuery, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MachineLogChunk], error)
 }
 
 type podHostClient struct {
@@ -2654,6 +2659,25 @@ func (c *podHostClient) DescribeMachine(ctx context.Context, in *DescribeMachine
 	return out, nil
 }
 
+func (c *podHostClient) ReadMachineLog(ctx context.Context, in *MachineLogQuery, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MachineLogChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[7], PodHost_ReadMachineLog_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[MachineLogQuery, MachineLogChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_ReadMachineLogClient = grpc.ServerStreamingClient[MachineLogChunk]
+
 // PodHostServer is the server API for PodHost service.
 // All implementations must embed UnimplementedPodHostServer
 // for forward compatibility.
@@ -2736,6 +2760,10 @@ type PodHostServer interface {
 	ListPackages(context.Context, *PackageListQuery) (*PackageList, error)
 	ListModels(context.Context, *ModelListQuery) (*ModelList, error)
 	DescribeMachine(context.Context, *DescribeMachineQuery) (*MachineDescription, error)
+	// Wire 72: a bounded log the machine keeps on its own disk, oldest line first. The Host reads
+	// it, so it answers while the Runtime is stopped. A Host before 72 answers UNIMPLEMENTED, which
+	// callers report as a machine that predates the log, never as a failure of anything else.
+	ReadMachineLog(*MachineLogQuery, grpc.ServerStreamingServer[MachineLogChunk]) error
 	mustEmbedUnimplementedPodHostServer()
 }
 
@@ -2862,6 +2890,9 @@ func (UnimplementedPodHostServer) ListModels(context.Context, *ModelListQuery) (
 }
 func (UnimplementedPodHostServer) DescribeMachine(context.Context, *DescribeMachineQuery) (*MachineDescription, error) {
 	return nil, status.Error(codes.Unimplemented, "method DescribeMachine not implemented")
+}
+func (UnimplementedPodHostServer) ReadMachineLog(*MachineLogQuery, grpc.ServerStreamingServer[MachineLogChunk]) error {
+	return status.Error(codes.Unimplemented, "method ReadMachineLog not implemented")
 }
 func (UnimplementedPodHostServer) mustEmbedUnimplementedPodHostServer() {}
 func (UnimplementedPodHostServer) testEmbeddedByValue()                 {}
@@ -3529,6 +3560,17 @@ func _PodHost_DescribeMachine_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PodHost_ReadMachineLog_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(MachineLogQuery)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(PodHostServer).ReadMachineLog(m, &grpc.GenericServerStream[MachineLogQuery, MachineLogChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_ReadMachineLogServer = grpc.ServerStreamingServer[MachineLogChunk]
+
 // PodHost_ServiceDesc is the grpc.ServiceDesc for PodHost service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -3701,6 +3743,11 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			Handler:       _PodHost_LocalPackageUpload_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
+		},
+		{
+			StreamName:    "ReadMachineLog",
+			Handler:       _PodHost_ReadMachineLog_Handler,
+			ServerStreams: true,
 		},
 	},
 	Metadata: "cozy/worker/v1/worker.proto",

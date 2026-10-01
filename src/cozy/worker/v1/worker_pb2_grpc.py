@@ -2211,6 +2211,11 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DescribeMachineQuery.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineDescription.FromString,
                 _registered_method=True)
+        self.ReadMachineLog = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/ReadMachineLog',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineLogQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineLogChunk.FromString,
+                _registered_method=True)
 
 
 class PodHostServicer(object):
@@ -2488,6 +2493,15 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReadMachineLog(self, request, context):
+        """Wire 72: a bounded log the machine keeps on its own disk, oldest line first. The Host reads
+        it, so it answers while the Runtime is stopped. A Host before 72 answers UNIMPLEMENTED, which
+        callers report as a machine that predates the log, never as a failure of anything else.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PodHostServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -2685,6 +2699,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.DescribeMachine,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DescribeMachineQuery.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineDescription.SerializeToString,
+            ),
+            'ReadMachineLog': grpc.unary_stream_rpc_method_handler(
+                    servicer.ReadMachineLog,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineLogQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineLogChunk.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -3765,6 +3784,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/DescribeMachine',
             cozy_dot_worker_dot_v1_dot_worker__pb2.DescribeMachineQuery.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.MachineDescription.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadMachineLog(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ReadMachineLog',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineLogQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineLogChunk.FromString,
             options,
             channel_credentials,
             insecure,

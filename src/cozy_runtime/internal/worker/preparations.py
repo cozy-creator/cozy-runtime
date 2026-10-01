@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Hashable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 
@@ -20,6 +19,10 @@ class _Entry[T]:
     started: bool = False
     paused: bool = False
 
+    @property
+    def demanded(self) -> bool:
+        return any(self.interests.values())
+
 
 class Preparations[T]:
     """One future per immutable selection; demand promotes an already queued hint."""
@@ -31,33 +34,7 @@ class Preparations[T]:
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="machine-prepare")
         self.lock = threading.RLock()
         self.entries: dict[Hashable, _Entry[T]] = {}
-        # Real calls register before their callee environment is available. Their
-        # model selection cannot enter this queue yet, but already has priority.
-        self.demands: dict[Hashable, int] = {}
         self.closed = False
-
-    @contextmanager
-    def demand(self, interest: Hashable) -> Iterator[None]:
-        """Give an awaited call priority through installation and model preparation.
-
-        End this lease when the call is submitted, so hints can overlap its compute.
-        Several calls from one parent retain independent leases.
-        """
-        with self.lock:
-            if self.closed:
-                raise RuntimeError("preparation queue is closed")
-            self.demands[interest] = self.demands.get(interest, 0) + 1
-            self._schedule()
-        try:
-            yield
-        finally:
-            with self.lock:
-                remaining = self.demands.get(interest, 0) - 1
-                if remaining > 0:
-                    self.demands[interest] = remaining
-                else:
-                    self.demands.pop(interest, None)
-                self._schedule()
 
     def request(
         self,
@@ -104,7 +81,6 @@ class Preparations[T]:
 
     def retain(self, active: Callable[[Hashable], bool]) -> None:
         with self.lock:
-            self.demands = {k: v for k, v in self.demands.items() if active(k)}
             for key, entry in list(self.entries.items()):
                 entry.interests = {k: v for k, v in entry.interests.items() if active(k)}
                 if not entry.interests:
@@ -131,39 +107,29 @@ class Preparations[T]:
         if self.closed:
             return
         running = [e for e in self.entries.values() if e.started and not e.future.done()]
-        # The first awaited interest, if any: what a running hint is paused for.
-        demand = next(iter(self.demands), None)
-        if demand is None:
-            demand = next(
-                (
-                    interest
-                    for e in self.entries.values()
-                    if not e.future.done()
-                    for interest, wanted in e.interests.items()
-                    if wanted
-                ),
-                None,
-            )
-        if demand is not None:
-            for entry in running:
-                if not any(entry.interests.values()) and not entry.cancel.is_set():
-                    entry.paused = True
-                    entry.cancel.set()
-                    entry.stop(demand)
-        candidates = sorted(
+        queued = sorted(
             (e for e in self.entries.values() if not e.started and not e.future.done()),
-            key=lambda e: not any(e.interests.values()),
+            key=lambda e: not e.demanded,
         )
-        for entry in candidates:
+        for entry in queued:
             if len(running) >= 2:
                 break
-            if not any(entry.interests.values()) and (
-                demand is not None or any(not any(e.interests.values()) for e in running)
-            ):
-                continue
+            if not entry.demanded and any(not e.demanded for e in running):
+                continue  # one hint at a time
             entry.started = True
             running.append(entry)
             self.pool.submit(self._run, entry)
+        # A demand left waiting for a worker takes one hint's; a stopping hint is already
+        # giving its worker up.
+        waiting = [e for e in queued if e.demanded and not e.started]
+        hints = [e for e in running if not e.demanded]
+        yielding = sum(e.cancel.is_set() for e in hints)
+        for demand, hint in zip(
+            waiting[yielding:], [h for h in hints if not h.cancel.is_set()], strict=False
+        ):
+            hint.paused = True
+            hint.cancel.set()
+            hint.stop(next(interest for interest, wanted in demand.interests.items() if wanted))
 
     def _run(self, entry: _Entry[T]) -> None:
         try:
