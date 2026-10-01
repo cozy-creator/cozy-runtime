@@ -1,5 +1,6 @@
-"""The official H3 ref2va workflow's own blocks over tiny real VAEs, the bundled tokenizer and
-processor, and the conditioner's shape: everything the intake attention length depends on.
+"""The official H3 ref2va and keyframe-free fl2va workflows' own blocks over tiny real VAEs, the
+bundled tokenizer and processor, the conditioner's shape and a tiny real fl2va DiT: everything
+the intake attention length depends on.
 
 Run as a script, it is a short-lived process that starts `count` requests and returns while
 their intake statements may still be inside torch, as a CPU proof script does.
@@ -17,6 +18,7 @@ from diffusers import (
     AutoencoderKLMiniMaxH3Audio,
     MiniMaxH3Blocks,
     MiniMaxH3ModularPipeline,
+    MiniMaxH3Transformer3DModel,
 )
 from PIL import Image
 
@@ -52,19 +54,38 @@ def pipeline() -> official.OfficialH3Pipeline:
         device=torch.device("cpu"),
     )
     tokenizer, processor = official._processor()
-    blocks = MiniMaxH3Blocks().get_workflow("ref2va")
-    upstream = MiniMaxH3ModularPipeline(blocks=blocks)
-    upstream.register_components(tokenizer=tokenizer, processor=processor, vae=vae, audio_vae=audio)
+    blocks = {name: MiniMaxH3Blocks().get_workflow(name) for name in ("ref2va", "t2va")}
+    pipes = {name: MiniMaxH3ModularPipeline(blocks=workflow) for name, workflow in blocks.items()}
+    for upstream in pipes.values():
+        upstream.register_components(
+            tokenizer=tokenizer, processor=processor, vae=vae, audio_vae=audio
+        )
     pipe = official.OfficialH3Pipeline.__new__(official.OfficialH3Pipeline)
-    pipe._blocks = {"ref2va": blocks}
-    pipe._pipes = {"ref2va": upstream}
-    pipe._plans = {"ref2va": official.canonical_timestep_plan("ref2va")}
+    pipe._blocks = blocks
+    pipe._pipes = pipes
+    pipe._plans = {task: official.canonical_timestep_plan(task) for task in ("ref2va", "fl2va")}
     pipe._intake = official._IntakeLengths()
     pipe.components = {
         "text_encoder": conditioner,
         "video_vae": vae,
         "audio_vae": audio,
         "ref2va_dit": torch.nn.Linear(1, 1),
+        "fl2va_dit": MiniMaxH3Transformer3DModel(
+            num_attention_heads=1,
+            attention_head_dim=8,
+            hidden_size=8,
+            num_layers=1,
+            num_refiner_layers=1,
+            ffn_dim=16,
+            in_channels=1,
+            audio_in_channels=2,
+            patch_size=(1, 2, 2),
+            text_dim=8,
+            freq_dim=8,
+            time_embed_hidden_dim=8,
+            time_embed_dim=8,
+            rope_freq_dim=1,
+        ).eval(),
     }
     return pipe
 
