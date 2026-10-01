@@ -27,6 +27,7 @@ import tensorfs
 
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
+from cozy_runtime.author._stage_memo import inexact
 from cozy_runtime.internal import accel, canonical, plane, proctree, weight_policy
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
@@ -1928,6 +1929,7 @@ class WeightResidency:
                 self._room_for_decode(name, free, evictable, free + evictable)
             if mode == "tiled":
                 sides[pixels] = side
+                inexact()  # a tiled decode's arithmetic differs from an untiled one
             else:
                 peak = accel.peak_allocated(weights.torch, weights.kind) - baseline
                 peaks[pixels] = max(peaks.get(pixels, 0), peak)
