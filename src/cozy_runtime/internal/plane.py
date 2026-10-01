@@ -40,6 +40,7 @@ class HostStats(msgspec.Struct, frozen=True, kw_only=True):
     registered_bytes: int = 0
     fill_bytes: int = 0
     fill_ns: int = 0
+    disk_read_bytes: int = 0
     evictions: int = 0
 
 

@@ -457,6 +457,8 @@ class Weights:
             },
             h2d_bytes=copied,
             h2d_gbps=round(copied / copy_ns, 3) if copy_ns else 0.0,
+            disk_copy_bytes=device.disk_copy_bytes,
+            disk_read_bytes=held.host.disk_read_bytes,
             late=sum(row.late for row in stages),
             stall_ns=sum(row.stall_ns for row in stages),
             misses=device.misses,

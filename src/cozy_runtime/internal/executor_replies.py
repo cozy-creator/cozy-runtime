@@ -118,6 +118,10 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     streamed: dict[str, Streamed] = {}
     h2d_bytes: int = 0
     h2d_gbps: float = 0.0
+    #: of those, copied to the device straight from disk (the pinned tier did not hold them),
+    #: and the bytes the pinned tier read from disk: a return from the tier reads neither
+    disk_copy_bytes: int = 0
+    disk_read_bytes: int = 0
     late: int = 0
     stall_ns: int = 0
     misses: int = 0
