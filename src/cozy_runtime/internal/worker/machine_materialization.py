@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from cozy_runtime.internal import fill
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import machine_model_defaults, machine_model_resolve
@@ -19,6 +19,91 @@ if TYPE_CHECKING:
 
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _MANIFEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def _counter(value: object) -> int | None:
+    return value if type(value) is int and 0 <= value < 1 << 64 else None
+
+
+def _document_length(value: object) -> int | None:
+    return len(value) if isinstance(value, bytes) else None
+
+
+def snapshot(worker: Worker) -> list[pb.PrepareModelProgress]:
+    """Copy optional observations without waiting for preparation or transfer locks."""
+    with worker.model_transfer_lock:
+        return [
+            pb.PrepareModelProgress.FromString(row.SerializeToString())
+            for row in worker.model_preparation_progress.values()
+        ]
+
+
+def observe(
+    worker: Worker,
+    model: pb.DownloadModelRef,
+    available: object,
+    total: object,
+    *,
+    result: Mapping[str, object] | None = None,
+    begin: bool = False,
+) -> None:
+    """Retain native per-checkpoint observations; this owns no flight or cancellation."""
+    done, whole = _counter(available), _counter(total)
+    if done is None or whole is None or (whole and done > whole):
+        return
+    key = (model.model, model.manifest)
+    with worker.model_transfer_lock:
+        if begin or key not in worker.model_preparation_progress:
+            worker.model_preparation_progress[key] = pb.PrepareModelProgress(model=model)
+        row = worker.model_preparation_progress.pop(key)
+        row.total_bytes = max(row.total_bytes, whole)
+        row.transferred_bytes = max(row.transferred_bytes, done)
+        if result is not None:
+            for field, counter in (
+                ("origin_bytes", "bytes_fetched"),
+                ("cached_bytes", "bytes_cached"),
+                ("cache_written_bytes", "cache_written_bytes"),
+            ):
+                value = _counter(result.get(counter))
+                if value is not None:
+                    setattr(row, field, value)
+        worker.model_preparation_progress[key] = row
+        # Telemetry retains recent rows, with active transfers refreshed on each native
+        # sample. This is the existing model-slot display bound, never an admission cap.
+        while len(worker.model_preparation_progress) > weights_limits.MAX_MODEL_SLOT_PATHS:
+            del worker.model_preparation_progress[next(iter(worker.model_preparation_progress))]
+
+
+def completed(worker: Worker, model: pb.DownloadModelRef, result: object) -> None:
+    """A missing/malformed optional counter never changes the native operation's answer."""
+    if isinstance(result, Mapping):
+        total = result.get("bytes_total")
+        observe(worker, model, total, total, result=result)
+
+
+def held(worker: Worker, model: pb.DownloadModelRef, store: fill.Store) -> None:
+    """Read a verified native closure's availability, without transferring payloads."""
+    with worker.model_transfer_lock:
+        known = worker.model_preparation_progress.get((model.model, model.manifest))
+        total = known.total_bytes if known is not None else 0
+    if not total:
+        try:
+            observed = {}
+            for row in store.walk_cozytensors(model.manifest):
+                identity, size = row.get("id"), _counter(row.get("length"))
+                if not isinstance(identity, str) or size is None:
+                    return
+                observed[identity] = size
+            length = _document_length(store.manifest(model.manifest)["manifest"])
+            if length is None:
+                return
+            observed[model.manifest] = length
+            total = sum(observed.values())
+        except (fill.tensorfs_module().errors.Refusal, OSError, ValueError, KeyError, TypeError):
+            # Custody was already verified by the caller. An optional size read cannot
+            # turn that successful preparation into a second transfer or a refusal.
+            return
+    observe(worker, model, total, total)
 
 
 def models(
@@ -63,20 +148,18 @@ def ensure(
     authority = machine_model_resolve.registration(worker, hub)
     origin = authority.origin if authority is not None else hub
 
-    def progress(event: dict[str, object]) -> None:
-        if worker.stop.is_set():
-            raise WorkspaceRefusal("machine stopped during model preparation")
-        worker.note(
-            "model_preparation",
-            f"{event.get('bytes_done', 0)}/{event.get('bytes_total', 0)} bytes verified",
-        )
-
     def land(row: pb.DownloadModelRef | pb.DownloadAdapterRef) -> None:
         if worker.stop.is_set():
             raise WorkspaceRefusal("machine stopped during model preparation")
+        model = pb.DownloadModelRef(
+            model=row.model, manifest=row.manifest, release=row.release, lane=row.lane
+        )
+        if isinstance(row, pb.DownloadModelRef):
+            model.CopyFrom(row)
         try:
             raw = store.manifest(row.manifest)["manifest"]
             store.verify_checkpoint_source(row.model, row.manifest, len(raw))
+            held(worker, model, store)
             return
         except facade.errors.Refusal:
             pass
@@ -84,8 +167,18 @@ def ensure(
             raise WorkspaceRefusal("model_access_absent: this checkpoint is not held locally")
         if "ensure/1" not in fill.capabilities():
             raise WorkspaceRefusal("model_materialization_unsupported: TensorFS needs ensure/1")
+        observe(worker, model, 0, 0, begin=True)
+
+        def progress(event: Mapping[str, object]) -> None:
+            if worker.stop.is_set():
+                raise WorkspaceRefusal("machine stopped during model preparation")
+            available, total = event.get("bytes_done"), event.get("bytes_total")
+            if type(available) is int and type(total) is int:
+                observe(worker, model, available, total)
+                worker.note("model_preparation", f"{available}/{total} bytes verified")
+
         try:
-            facade.ensure(
+            result = facade.ensure(
                 store,
                 row.model + "@" + row.manifest,
                 hub=origin,
@@ -99,6 +192,7 @@ def ensure(
             )
             raw = store.manifest(row.manifest)["manifest"]
             store.verify_checkpoint_source(row.model, row.manifest, len(raw))
+            completed(worker, model, result)
         except facade.errors.Refusal as exc:
             raise WorkspaceRefusal(f"model_materialization_refused: {exc.code}") from exc
 

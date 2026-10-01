@@ -73,6 +73,7 @@ def peer(capture: dict[str, Any]) -> Worker:
             host_facts=lambda: hostfacts.measure("none"),
             model_transfer_lock=threading.Lock(),
             model_transfers={},
+            model_preparation_progress={},
             executions=SimpleNamespace(
                 capture_root=lambda *_: "root",
                 capture=lambda *_: capture,

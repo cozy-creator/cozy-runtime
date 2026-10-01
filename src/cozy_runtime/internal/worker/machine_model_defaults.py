@@ -410,23 +410,35 @@ def materialize(
     assert worker.workspace is not None
     facade = fill.tensorfs_module()
     store = fill.store(worker.workspace.store_root)
+    from . import machine_materialization
+
     pulled: dict[str, tuple[int, int]] = {}
     lock = threading.Lock()
     keep = sorted({row.manifest.digest for row in selected})
 
-    def report(digest: str, sample: Sample | None, available: int, total: int) -> None:
+    def report(
+        model: pb.DownloadModelRef, sample: Sample | None, available: int, total: int
+    ) -> None:
+        machine_materialization.observe(worker, model, available, total)
         if sample is not None:
             sample(available, total)
         if progress is None:
             return
         with lock:
-            pulled[digest] = (available, total)
+            pulled[model.manifest] = (available, total)
             landed = sum(done for done, _ in pulled.values())
             whole = sum(size for _, size in pulled.values())
         progress(landed, whole)
 
     def land(row: Selected) -> None:
         manifest = row.manifest
+        model = pb.DownloadModelRef(
+            model=row.repository,
+            manifest=manifest.digest,
+            release=row.release,
+            lane=row.lane,
+            slot=row.parameter,
+        )
         if cancellation is not None and cancellation.cancelled:
             raise WorkspaceRefusal("model preparation canceled")
         # Existing cached custody is sufficient. A cold use fetches this exact
@@ -438,17 +450,15 @@ def materialize(
                 raise WorkspaceRefusal("model preparation canceled")
             try:
                 store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
+                machine_materialization.held(worker, model, store)
             except facade.errors.Refusal:
+                machine_materialization.observe(worker, model, 0, 0, begin=True)
                 with downloading(row) as sample:
-                    moved = (
-                        None
-                        if progress is None and sample is None
-                        else partial(report, manifest.digest, sample)
-                    )
+                    moved = partial(report, model, sample)
                     if "ensure/1" in fill.capabilities():
                         # TensorFS owns the fetch: one flight per manifest, disk admission
                         # that never evicts this preparation's own models, the Hub CA.
-                        facade.ensure(
+                        result = facade.ensure(
                             store,
                             row.repository + "@" + manifest.digest,
                             hub=row.public_origin,
@@ -458,10 +468,9 @@ def materialize(
                             allow_local=local_development(worker),
                             keep=keep,
                             cancellation=cancellation,
-                            progress=None
-                            if moved is None
-                            else lambda event: moved(event["bytes_done"], event["bytes_total"]),
+                            progress=lambda event: moved(event["bytes_done"], event["bytes_total"]),
                         )
+                        machine_materialization.completed(worker, model, result)
                     else:
                         facade.pull(
                             store,

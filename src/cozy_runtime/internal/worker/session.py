@@ -1165,6 +1165,7 @@ class Worker:
 
         self.model_transfer_lock = threading.Lock()
         self.model_transfers: dict[str, threading.Lock] = {}
+        self.model_preparation_progress: dict[tuple[str, str], pb.PrepareModelProgress] = {}
         self.calls = Calls(
             self._machine_call,
             workspace=self.workspace,

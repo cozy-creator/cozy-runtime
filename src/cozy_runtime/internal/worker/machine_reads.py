@@ -280,6 +280,8 @@ def accelerator_backend(worker: Worker) -> str:
 
 def runtime(worker: Worker) -> pb.MachineRuntime:
     """This Runtime's half of `DescribeMachine`."""
+    from . import machine_materialization
+
     described = pb.MachineRuntime(
         version=_version("cozy-runtime"),
         wire_minor=WIRE_MINOR,
@@ -294,6 +296,7 @@ def runtime(worker: Worker) -> pb.MachineRuntime:
         resources=worker.resources(),
         execution_workspace_id=worker.executions.workspace_id if worker.executions else "",
         started_at_unix_ms=STARTED_MS,
+        preparation_progress=machine_materialization.snapshot(worker),
     )
     if worker.options.tensorfs_root is not None:
         described.store.CopyFrom(filesystem(worker.options.tensorfs_root))
