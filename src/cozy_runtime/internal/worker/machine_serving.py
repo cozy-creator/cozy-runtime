@@ -35,8 +35,8 @@ from . import (
     machine_child_target,
     machine_lanes,
     machine_model_defaults,
-    machine_models,
     machine_model_overrides,
+    machine_models,
     package_prepare,
     store_gc,
 )
@@ -859,6 +859,23 @@ class Serving:
                 for model in native
             }
             expected.update({row.parameter: msgspec.to_builtins(row.manifest) for row in selected})
+            components = {
+                row.parameter: row.composed.manifest
+                if row.composed is not None
+                else row.manifest.digest
+                for row in selected
+            }
+            components.update(
+                {
+                    parameter: str(manifest["digest"])
+                    for parameter, manifest in expected.items()
+                    if parameter not in components
+                }
+            )
+            adapters = {
+                row.parameter: [msgspec.to_builtins(adapter) for adapter in row.adapters]
+                for row in selected
+            }
             with worker.control_lock:
                 candidates = [
                     documents.body(value.document)
@@ -880,18 +897,47 @@ class Serving:
                     ),
                     None,
                 )
-                models = {row["id"]: row["manifest"] for row in candidate.get("models", [])}
+                models = {row["id"]: row for row in candidate.get("models", [])}
                 if entry is None:
                     continue
-                used = {slot["reference_model_id"] for slot in entry["slots"]}
+                used = {
+                    identifier
+                    for slot in entry["slots"]
+                    for identifier in (
+                        slot["reference_model_id"],
+                        *(row["model_id"] for row in slot.get("components", [])),
+                        *(row["model_id"] for row in slot.get("adapters", [])),
+                    )
+                }
                 if used != models.keys() or any(
-                    component["model_id"] != slot["reference_model_id"]
+                    models[component["model_id"]]["manifest"]["digest"]
+                    != components.get(slot["slot"])
                     for slot in entry["slots"]
                     for component in slot.get("components", [])
                 ):
                     continue
+                observed_adapters = {
+                    slot["slot"]: [
+                        {
+                            "component": row["component"],
+                            "model": models[row["model_id"]]["repo"],
+                            "manifest": models[row["model_id"]]["manifest"]["digest"],
+                            "release": models[row["model_id"]].get("version", ""),
+                            "lane": models[row["model_id"]].get("lane", ""),
+                            "source_component": row.get("source_component", "adapter"),
+                            "scale": row.get("scale", "1"),
+                        }
+                        for row in slot.get("adapters", [])
+                    ]
+                    for slot in entry["slots"]
+                }
+                if any(
+                    observed_adapters[slot] != adapters.get(slot, []) for slot in observed_adapters
+                ):
+                    continue
                 if {
-                    slot["slot"]: models[slot["reference_model_id"]] for slot in entry["slots"]
+                    slot["slot"]: models[slot["reference_model_id"]]["manifest"]
+                    for slot in entry["slots"]
                 } == expected:
                     matched = candidate
                     break
