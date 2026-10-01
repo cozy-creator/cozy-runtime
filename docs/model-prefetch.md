@@ -19,7 +19,9 @@ code/environment installation without model downloads.
 
 The local Runtime selects the exact models using the worker's GPU name and granted
 count, then shares bounded CPU/download work. Only one speculative preparation
-runs at once; a second worker remains available for demand. Identical model pulls
+runs at once; a second worker remains available for demand. A running hint pauses
+only when a demanded preparation is waiting for a worker, and resumes when one is
+free. Identical model pulls
 on this worker share a per-manifest transfer lock, and each pull uses at most eight
 streams. TensorFS owns bytes, object verification, cache, credentials, and native
 cancellation. Different manifests sharing individual objects are not guaranteed

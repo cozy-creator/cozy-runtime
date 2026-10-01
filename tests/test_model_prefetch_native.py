@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import hashlib
 import json
 import threading
 import time
+from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import msgspec
-import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
@@ -24,51 +23,61 @@ from cozy_runtime.internal.executor_replies import ObservationRow
 from cozy_runtime.internal.worker import store_gc, triage
 from cozy_runtime.internal.worker.attempts import AttemptEngine
 from cozy_runtime.internal.worker.machine_child_target import Target
-from cozy_runtime.internal.worker.machine_serving import Serving, arguments
+from cozy_runtime.internal.worker.machine_serving import Prepared, Serving, arguments
 from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from fault_hub import FaultHub, Watched, checkpoint, on, rate_limited
+from fault_hub import ASSET, HEADER, Checkpoint, FaultHub, Gate, Watched, checkpoint, on
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
 
 def _serving(
-    store_root: Path, origin: str, manifest: str, length: int, label: str = ""
-) -> tuple[Serving, Target, dict[str, Any], list[dict[str, Any]]]:
-    """A Serving over a real Workspace whose one Model default is `manifest` at `origin`;
-    its parent's progress frames land in the returned list. A call's step is `label`."""
-    checkpoint = {"digest": manifest, "length": length}
-    placement = {
-        "installation_id": "installed-model",
-        "package_interface": base64.b64encode(b"exact-interface").decode(),
-        "models": [{"id": "model", "manifest": checkpoint}],
-        "entrypoints": [
+    store_root: Path, *served: tuple[str, Checkpoint], label: str = ""
+) -> tuple[Serving, list[Target], list[dict[str, Any]], list[dict[str, Any]]]:
+    """A Serving over a real Workspace with one installation per `served` (Hub origin,
+    checkpoint) whose one Model defaults to that checkpoint; its parents' progress frames land
+    in the returned list. A call's step is `label`."""
+    placements: list[dict[str, Any]] = []
+    defaults: list[dict[str, Any]] = []
+    targets: list[Target] = []
+    for index, (origin, point) in enumerate(served):
+        installation = f"installed-{index}"
+        ref = {"digest": point.manifest, "length": point.length}
+        placement = {
+            "installation_id": installation,
+            "package_interface": base64.b64encode(b"exact-interface").decode(),
+            "models": [{"id": "model", "manifest": ref}],
+            "entrypoints": [
+                {
+                    "name": "generate",
+                    "slots": [
+                        {
+                            "slot": "model",
+                            "reference_model_id": "model",
+                            "components": [{"component": "unet", "model_id": "model"}],
+                            "stamps": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        placements.append(placement)
+        defaults.append(
             {
-                "name": "generate",
-                "slots": [
-                    {
-                        "slot": "model",
-                        "reference_model_id": "model",
-                        "components": [{"component": "unet", "model_id": "model"}],
-                        "stamps": [],
-                    }
-                ],
-            }
-        ],
-    }
-    capture = {
-        "model_defaults": [
-            {
-                "callee_installation_id": "installed-model",
+                "callee_installation_id": installation,
                 "entrypoint": "generate",
                 "parameter": "model",
                 "public_origin": origin,
-                "rungs": [{"gpu": "*", "repository": "proof/model", "manifest": checkpoint}],
+                "rungs": [{"gpu": "*", "repository": point.model, "manifest": ref}],
             }
-        ]
-    }
+        )
+        declaration = {"models": [{"path": "generate.models.model"}]}
+        targets.append(
+            Target(installation, "generate", declaration, {"placement": placement}, None, "")
+        )
+    capture = {"model_defaults": defaults}
     progress: list[dict[str, Any]] = []
     worker = cast(
         Worker,
@@ -86,7 +95,10 @@ def _serving(
             model_preparation_progress={},
             model_preparation_observers={},
             prepared_installations={
-                "model": SimpleNamespace(document=documents.from_body(placement, pb.Placement))
+                row["installation_id"]: SimpleNamespace(
+                    document=documents.from_body(row, pb.Placement)
+                )
+                for row in placements
             },
             calls=SimpleNamespace(progress_label=lambda *_: label),
             emit_progress=lambda _parent, _ordinal, frame: progress.append(frame),
@@ -94,21 +106,11 @@ def _serving(
             prespawns=SimpleNamespace(request=lambda *_: None),
         ),
     )
-    target = Target(
-        "installed-model",
-        "generate",
-        {"models": [{"path": "generate.models.model"}]},
-        {"placement": placement},
-        None,
-        "",
-    )
-    return Serving(worker), target, placement, progress
+    return Serving(worker), targets, placements, progress
 
 
-@pytest.mark.parametrize("preempt", [False, True])
 def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
     tmp_path: Path,
-    preempt: bool,
 ) -> None:
     source_root = tmp_path / "origin"
     source_root.mkdir()
@@ -159,23 +161,16 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             fetched.append(self.path)
             started.set()
             assert release.wait(5)
-            # A paused native pull closes the old request before its replacement.
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                self.answer(bodies[self.path.removeprefix("/")])
+            self.answer(bodies[self.path.removeprefix("/")])
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     store_root = tmp_path / "destination"
     store = tensorfs.Store.init(str(store_root))
-    if preempt:
-        # Already landed immutable bytes must survive pause/restart. The missing
-        # asset still uses a real, blocked HTTP transfer and PullCancellation.
-        header = tmp_path / "landed-header"
-        header.write_bytes(_HEADER)
-        store.put_file(str(header), "sha256:" + hashlib.sha256(_HEADER).hexdigest(), len(_HEADER))
-    serving, target, placement, progress = _serving(
-        store_root, f"http://localhost:{server.server_port}", manifest, length
+    point = Checkpoint("proof/model", manifest, length, bodies)
+    serving, (target,), (placement,), progress = _serving(
+        store_root, (f"http://localhost:{server.server_port}", point)
     )
     call = Call("parent", 0, 1, 1, b"", b"", "child", b"", False, b"", "", "")
     request = pb.ChildCallRequest(parent_attempt_ordinal=1)
@@ -183,21 +178,6 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         first = serving._shared("owner", call, target, request, {}, speculative=True)
         assert first is not None
         assert started.wait(5), first.exception() if first.done() else "native pull not started"
-        if preempt:
-            other = Call("other-parent", 0, 1, 1, b"", b"", "other-child", b"", False, b"", "", "")
-            with serving.demand(other):
-                # Let the current HTTP read yield so the native pull observes its
-                # cancellation. This fixture does not assume it aborts response headers.
-                release.set()
-                # Wait for native cancellation, not for an arbitrary amount of runtime.
-                deadline = time.monotonic() + 5
-                while serving.preparations.started():
-                    assert time.monotonic() < deadline
-                    time.sleep(0.001)
-                assert first is not None and not first.done()
-                assert store.contains(hashlib.sha256(_HEADER).hexdigest())
-            # This succeeds only if the resumed load got a NEW PullCancellation.
-            assert first.result(5).placement == placement
         # A's image becomes available later. It must not change the preparation key.
         _, models = arguments(
             target, canonical_json.encode({"image": "now-available", "model": None})
@@ -208,10 +188,7 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         prepared = joined.result(5)
         assert prepared.placement == placement
         store.verify_checkpoint_source("proof/model", manifest, length)
-        if preempt:
-            assert "/" + hashlib.sha256(_HEADER).hexdigest() not in fetched
-        else:
-            assert sorted(fetched) == sorted("/" + digest for digest in bodies)
+        assert sorted(fetched) == sorted("/" + digest for digest in bodies)
         assert not any(row.get("kind") == "progress" for row in progress)
         observations = [row.get("fields", {}) for row in progress]
         assert any(
@@ -224,19 +201,14 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
             row.get("unit") == "bytes" for row in observations if row.get("position") is not None
         )
         fetch = [row["fields"] for row in progress if row.get("name") == "model fetch"]
-        assert [row["event"] for row in fetch] == ["start", "end"] * (2 if preempt else 1)
-        if preempt:
-            assert fetch[1]["completed"] is False
-        start, end = fetch[-2:]
+        assert [row["event"] for row in fetch] == ["start", "end"]
+        start, end = fetch
         assert start["model"] == end["model"] == "proof/model" and start["manifest"] == manifest
         assert (
             start["prefetch"] is True and start["step"] == "" and start["entrypoint"] == "generate"
         )
         assert end["completed"] is True and end["bytes"] == end["total_bytes"] > 0
-        if preempt:
-            assert end["moved_bytes"] <= end["bytes"]
-        else:
-            assert end["moved_bytes"] == end["bytes"]
+        assert end["moved_bytes"] == end["bytes"]
         assert end["elapsed_ms"] > 0
         assert end["rate_bytes_per_second"] > 0
         # The exact finished selection serves every demand; nothing is prepared again.
@@ -263,37 +235,104 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         thread.join()
 
 
-def test_a_hint_paused_for_demand_says_so_where_its_fetch_ends(tmp_path: Path) -> None:
-    """Run 2322: demand paused a hint whose pull was waiting out a Hub's stated wait, and its
-    fetch ended `completed: false` with no reason. The 429 states 1 s, so this does not rest
-    on TensorFS's cancellable retry wait (unreleased after 0.3.80)."""
-    point = checkpoint(tmp_path / "origin")
-    with FaultHub(point, on("closure", 1, 1, rate_limited(1))) as hub:
-        store_root = tmp_path / "destination"
-        tensorfs.Store.init(str(store_root))
-        serving, target, placement, progress = _serving(
-            store_root, hub.origin, point.manifest, point.length
-        )
-        call = Call("parent", 0, 1, 1, b"", b"", "child", b"", False, b"", "", "")
-        request = pb.ChildCallRequest(parent_attempt_ordinal=1)
-        try:
-            hint = serving._shared("owner", call, target, request, {}, speculative=True)
-            assert hint is not None
-            hub.until(lambda: hub.asks("closure") == 1)
-            other = Call("other-parent", 0, 1, 1, b"", b"", "other", b"", False, b"", "", "")
-            with serving.demand(other):
-                hub.until(lambda: not serving.preparations.started(), lambda: len(progress))
-            assert Watched(hub, hint.result, lambda: len(progress)).result().placement == placement
-        finally:
-            serving.close()
-    paused, resumed = (
+def _ask(serving: Serving, parent: str, target: Target, *, speculative: bool) -> Future[Prepared]:
+    """`parent`'s preparation of `target`: a hint, or a demand."""
+    call = Call(parent, 0, 1, 1, b"", b"", parent + "-call", b"", False, b"", "", "")
+    request = pb.ChildCallRequest(parent_attempt_ordinal=1)
+    future = serving._shared("owner", call, target, request, {}, speculative=speculative)
+    assert future is not None
+    return future
+
+
+def _fetches(progress: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
+    """`model`'s `model fetch` records."""
+    return [
         row["fields"]
         for row in progress
-        if row.get("name") == "model fetch" and row["fields"]["event"] == "end"
+        if row.get("name") == "model fetch" and row["fields"]["model"] == model
+    ]
+
+
+def test_a_hint_keeps_pulling_while_a_demand_has_its_own_worker(tmp_path: Path) -> None:
+    """Run 2322: real calls paused the H3 hint 0.2 s into its ~100 GB though each pulled on the
+    pool's other worker, and the hint sat out the demand's 20-minute tail. A demand with a
+    worker of its own leaves a hint's transfer alone."""
+    hinted, demanded = (checkpoint(tmp_path / n, "proof/" + n, n + ".cozytensors") for n in "hd")
+    opened = threading.Event()
+    with (
+        FaultHub(hinted, on(hinted.manifest[7:], 1, 1, Gate(opened))) as hint_hub,
+        FaultHub(demanded) as demand_hub,
+    ):
+        store_root = tmp_path / "destination"
+        tensorfs.Store.init(str(store_root))
+        serving, (hint_target, demand_target), placements, progress = _serving(
+            store_root, (hint_hub.origin, hinted), (demand_hub.origin, demanded)
+        )
+        try:
+            hint = _ask(serving, "parent", hint_target, speculative=True)
+            hint_hub.until(lambda: hint_hub.asks(hinted.manifest[7:]) == 1)  # mid-GET
+            demand = _ask(serving, "caller", demand_target, speculative=False)
+            done = Watched(demand_hub, demand.result, lambda: len(progress)).result()
+            assert done.placement == placements[1]
+            opened.set()
+            Watched(hint_hub, hint.result, lambda: len(progress)).result()
+        finally:
+            serving.close()
+    fetched = [
+        (row["event"], row.get("completed"), row.get("paused_for"))
+        for row in _fetches(progress, hinted.model)
+    ]
+    assert fetched == [("start", None, None), ("end", True, None)], fetched
+    assert hint_hub.asks(hinted.manifest[7:]) == 1, hint_hub.log()
+
+
+def test_a_hint_yields_its_worker_to_a_demand_left_waiting(tmp_path: Path) -> None:
+    """The one pause left: a hint and a demand hold both workers and a second demand waits.
+    The hint's fetch ends `completed: false` saying why and for whom, and it resumes with a
+    fresh cancellation once a worker is free, its landed objects kept."""
+    hinted, first, second = (
+        checkpoint(tmp_path / n, "proof/" + n, n + ".cozytensors") for n in ("h", "a", "b")
     )
-    assert paused["completed"] is False and paused["paused_for"] == "other-parent", paused
+    held = threading.Event()
+    with (
+        FaultHub(hinted, on(hinted.manifest[7:], 1, 1, Gate(threading.Event()))) as hint_hub,
+        FaultHub(first, on(first.manifest[7:], 1, 1, Gate(held))) as first_hub,
+        FaultHub(second) as second_hub,
+    ):
+        store_root = tmp_path / "destination"
+        store = tensorfs.Store.init(str(store_root))
+        serving, targets, placements, progress = _serving(
+            store_root,
+            (hint_hub.origin, hinted),
+            (first_hub.origin, first),
+            (second_hub.origin, second),
+        )
+        try:
+            hint = _ask(serving, "parent", targets[0], speculative=True)
+            hint_hub.until(
+                lambda: (
+                    hint_hub.asks(hinted.manifest[7:]) == 1
+                    and store.contains(HEADER)
+                    and store.contains(ASSET)
+                )
+            )
+            running = _ask(serving, "first", targets[1], speculative=False)
+            first_hub.until(lambda: first_hub.asks(first.manifest[7:]) == 1)
+            waiting = _ask(serving, "second", targets[2], speculative=False)
+            Watched(second_hub, waiting.result, lambda: len(progress)).result()
+            resumed = Watched(hint_hub, hint.result, lambda: len(progress)).result()
+            assert resumed.placement == placements[0]
+            held.set()
+            Watched(first_hub, running.result, lambda: len(progress)).result()
+        finally:
+            serving.close()
+    paused, ended = (row for row in _fetches(progress, hinted.model) if row["event"] == "end")
+    assert paused["completed"] is False and paused["paused_for"] == "second", paused
     assert "cancel" in paused["reason"], paused
-    assert resumed["completed"] is True and "reason" not in resumed, resumed
+    assert ended["completed"] is True and "reason" not in ended, ended
+    # Only the cut GET is asked again.
+    asks = {route: hint_hub.asks(route) for route in hinted.bodies}
+    assert asks == {HEADER: 1, ASSET: 1, hinted.manifest[7:]: 2}, hint_hub.log()
 
 
 def test_a_called_download_reports_its_bytes_on_its_steps_line(tmp_path: Path) -> None:
@@ -304,8 +343,8 @@ def test_a_called_download_reports_its_bytes_on_its_steps_line(tmp_path: Path) -
     with FaultHub(point) as hub:
         store_root = tmp_path / "destination"
         tensorfs.Store.init(str(store_root))
-        serving, target, placement, progress = _serving(
-            store_root, hub.origin, point.manifest, point.length, label=step
+        serving, (target,), (placement,), progress = _serving(
+            store_root, (hub.origin, point), label=step
         )
         call = Call("parent", 3, 1, 1, b"", b"", "call-4", b"", False, b"", "", "")
         request = pb.ChildCallRequest(parent_attempt_ordinal=1)

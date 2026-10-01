@@ -398,12 +398,6 @@ class Serving:
     def close(self) -> None:
         self.preparations.close()
 
-    @contextlib.contextmanager
-    def demand(self, call: Call) -> Iterator[None]:
-        """Register a real call before resolving its possibly deferred installation."""
-        with self.preparations.demand((call.parent_request, call.parent_ordinal)):
-            yield
-
     def prefetch(self, parent: AttemptRecord, hint: ModelPrefetch) -> Answer:
         """A model-only hint; never accepts a child execution or chooses a GPU lane."""
         owner = self.worker.fence.record_owner_id
@@ -523,8 +517,8 @@ class Serving:
             try:
                 if cancelled():
                     raise WorkspaceRefusal("model preparation canceled")
-                # Warming belongs to scheduled work too: a hint held behind an awaited
-                # callee installation must not consume CPU preparing an executor yet.
+                # Warming belongs to scheduled work too: a queued hint must not consume
+                # CPU preparing an executor yet.
                 if speculative:
                     warm()
                 prepared = self._prepare(
