@@ -130,9 +130,7 @@ def test_model_scope_and_restore_use_actual_executor_roots(
         child.device_facts = _device()
         # Only the component registry is needed here; no storage operations are
         # substituted. Selection and execution use actual Diffusers processors.
-        child.backend = SimpleNamespace(
-            components={"dit": roots["dit"]}, parked={"vae": roots["vae"]}
-        )
+        child.backend = SimpleNamespace(roots=roots)
     parent = children[0]
     if aggregate:
         parent = Executor(None, tmp_path / "parent")  # type: ignore[arg-type]
@@ -179,7 +177,7 @@ def test_a_compiled_construction_serves_the_pin_it_was_prepared_with(tmp_path: P
     roots["dit"][0]._compiled_call_impl = lambda: None
     executor.attention_defaults = attention.snapshot(roots)
     executor.device_facts = _device()
-    executor.backend = SimpleNamespace(components=roots, parked={})
+    executor.backend = SimpleNamespace(roots=roots)
     assert executor._attention_plan("dit=sdpa") is None
     with pytest.raises(attention.AttentionRefusal, match="before compilation") as refused:
         executor._attention_plan("dit=flash-attn3")

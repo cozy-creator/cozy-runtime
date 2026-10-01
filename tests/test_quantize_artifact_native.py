@@ -28,12 +28,17 @@ from cozy_runtime.author import (
     invocable,
 )
 from cozy_runtime.author._errors import Outcome
+from cozy_runtime.author._loader import TensorSpec
 from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.derive import plan, quantize_artifact
 from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.microscale import encode_fp8_rowwise, encode_mxfp8
 from cozy_runtime.derive.quantization import prepare_source_quantization, quantization_additions
+from cozy_runtime.internal import plane
+from cozy_runtime.internal.encoding import TORCH_DTYPES
+from cozy_runtime.internal.fill import Checkpoint
+from cozy_runtime.internal.weights import PlaneBackend, Weights
 from native_weights import NativeExecution
 
 BOUND = 1 << 20
@@ -359,9 +364,8 @@ def test_quantized_encoding_keeps_the_source_precision_contract(
 
 def test_fp16_quantized_native_header_enters_fp16_fill(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
-    from cozy_runtime.author._loader import TensorSpec
-    from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend
-
+    if not plane.available():
+        pytest.skip("a TensorFS with the weight plane")
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "unet", "f16")
     result, outcome, _ = _run(
@@ -370,18 +374,14 @@ def test_fp16_quantized_native_header_enters_fp16_fill(tmp_path: Path) -> None:
     assert outcome.terminal == "succeeded" and result is not None
     checkpoint = Checkpoint(tmp_path / "store", result.manifest.digest)
     rows = checkpoint.rows("unet")
-    backend = StreamingFillBackend.for_script(
-        checkpoint,
+    backend = PlaneBackend.for_script(
+        {"unet": checkpoint},
         rows,
+        # The host tier alone: the fill's validation needs no card.
+        weights=Weights(torch, torch.device("cpu"), "cpu"),
+        construction="fp16-contract",
         release="fp16-contract-proof",
-        store="fixture",
-        snapshot=result.manifest.digest,
-        device="cpu",
         encoded_leaves="refuse",
-        window_bytes=1 << 20,
-        slots=2,
-        readers=1,
-        inflight=1,
     )
     try:
         backend.expect({"unet": [row.key for row in rows]})
@@ -391,11 +391,8 @@ def test_fp16_quantized_native_header_enters_fp16_fill(tmp_path: Path) -> None:
                 row.key, TensorSpec(row.shape, "float16", nbytes=row.nbytes), destinations[row.key]
             )
         assert set(backend.enqueued) == set(destinations)
-        # The CUDA staging ring is not part of this CPU preflight. Read through a
-        # real native lease and run the selected decoder into those exact admitted
-        # FP16 buffers; no fabricated header, provider or destination stands in.
-        from cozy_runtime.internal.encoding import TORCH_DTYPES
-
+        # Read through a real native lease and run the selected decoder into those exact
+        # admitted FP16 buffers; no fabricated header, provider or destination stands in.
         with store.acquire_cozytensors(result.manifest.digest) as lease:
             header = checkpoint.header_bytes
             for row in rows:

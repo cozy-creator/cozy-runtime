@@ -39,7 +39,7 @@ from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.readiness import RuntimeGPU
-from cozy_runtime.internal.worker import lanes, machine_model_defaults
+from cozy_runtime.internal.worker import lanes, machine_model_defaults, memory
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.gpu_scheduler import (
@@ -1189,9 +1189,9 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
 ) -> None:
     """Darkness 1513: the group's attempt freed only its lead card, and rank 3 refused
     `device_shortfall` beside an idle Qwen on card 3. A group short of room takes idle
-    co-tenants off EVERY rank's card, tightest first and LRU-first on each; it arbitrates
-    for `all_resident`, never stopping at a staged rung it would fit by evicting itself.
-    Their processes stay, and the caller is never its own victim."""
+    co-tenants off the rank cards it is short on, LRU-first: a plane executor's unmeasured
+    shape is admitted optimistically, so only the short card's neighbour is cut; an older
+    executor's has every card. Their processes stay, and the caller is never its own victim."""
     shot, by_lane = _warm_shot(machine, monkeypatch)
     worker = machine.worker
     before = machine.executors()
@@ -1199,7 +1199,8 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     worker._lane_of(q2).touch(q2)  # q2 is now the most recently used
 
     def vacated() -> list[str]:
-        return [e.step.split("'")[1] for e in worker.activity if " vacated " in e.step]
+        steps = [e.step for e in worker.activity]
+        return [s.split("'")[1] for s in steps if " vacated " in s or " cut to 0 B " in s]
 
     # The shot's shape was never measured, so it has every card of its group: every
     # rank's idle neighbour goes, least recently used first.
@@ -1222,12 +1223,16 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     )
     with group.device:
         worker._arbitrate_residency(attempt, slot)
-    assert vacated() == [q0, q1, q2]
+        worker.memory.end(h3)
+    assert hosted.supervision.current is not None
+    plane = memory.plane_capable(hosted.supervision.current)
+    first = [q0] if plane else [q0, q1, q2]
+    assert vacated() == first
     # Qwen on card 1 needs room: the idle H3 group is its only co-tenant there
     machine.free.pop("0")  # type: ignore[attr-defined]
     machine.free["1"] = GiB  # type: ignore[attr-defined]
     worker.memory.make_room(worker._lane_of(q1), q1, None, "a reference")
-    assert vacated() == [q0, q1, q2, h3]
+    assert vacated() == [*first, h3]
     assert machine.executors() == before, "vacated, not killed: every process is the same"
     assert all(
         h.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE

@@ -13,7 +13,6 @@ import socket
 import sys
 from fractions import Fraction
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -30,14 +29,12 @@ from transformers import Qwen3VLConfig
 
 sys.path[:0] = [str(Path(__file__).parent), str(Path(__file__).parents[1])]
 
-from parallel_calls import h3_model  # type: ignore[import-not-found]  # noqa: E402
+from parallel_calls import h3_model, prepared  # type: ignore[import-not-found]  # noqa: E402
 
 from cozy_runtime.author import DerivedCache  # noqa: E402
 from cozy_runtime.author._decode import DecodedAudio  # noqa: E402
-from cozy_runtime.internal import accel  # noqa: E402
 from cozy_runtime.internal.executor import Executor, _capture_seal  # noqa: E402
 from cozy_runtime.internal.executor_commands import decode  # noqa: E402
-from cozy_runtime.internal.residency import ComponentResidency  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.models.minimax_h3 import official  # noqa: E402
 from cozy_runtime.models.minimax_h3.conditioner import (  # noqa: E402
@@ -46,7 +43,6 @@ from cozy_runtime.models.minimax_h3.conditioner import (  # noqa: E402
 )
 from cozy_runtime.models.minimax_h3.model import H3Model  # noqa: E402
 from cozy_runtime.models.minimax_h3.vae_tiles import TileBatchedVideoVAE  # noqa: E402
-from test_staged_demand_pull import Backend, Device  # type: ignore[import-not-found]  # noqa: E402
 
 TASK: official.Task = "ref2va"
 #: settled component bytes for the hosting plan: rank 0's capacity holds the DiT and the VAEs, a
@@ -150,8 +146,9 @@ def model() -> Any:
     return built
 
 
-def roots(built: Any) -> dict[str, Any]:
-    return dict(built.pipe.components)
+def backend(built: Any) -> Any:
+    """The prepared construction `Executor._install_group` reads, at `SIZES`."""
+    return prepared(dict(built.pipe.components), SIZES)
 
 
 def references(pipe: Any) -> list[Any]:
@@ -192,29 +189,6 @@ def start(built: Any) -> Any:
     )
 
 
-def simulated(device: Device, resident: tuple[str, ...]) -> ComponentResidency:
-    """The real residency plane over a byte counter with H3's measured component sizes
-    (`test_staged_demand_pull`): its decisions are the pod's arithmetic, not a kernel's."""
-    backend = Backend(device)
-    for name in ("text_encoder", "ref2va_dit", "fl2va_dit", "video_vae", "audio_vae"):
-        backend.parked[name] = object()
-    for name in resident:
-        backend.stage(name)
-    backend.staged.clear()
-    return ComponentResidency(backend=backend, torch=None, placement="component_staged")
-
-
-def simulate(device: Device, patch: Any) -> None:
-    """Route the plane's device reads to `device`; `patch(module, name, value)` sets one."""
-    patch(accel, "allocation", device.allocation)
-    patch(accel, "allocated", lambda *_: device.allocated)
-    patch(accel, "peak_allocated", lambda *_: device.allocated)
-    patch(accel, "reset_peak", lambda *_: None)
-    patch(accel, "release_cached", lambda *_: None)
-    patch(accel, "synchronize", lambda *_: None)
-    patch(accel, "completion_event", lambda *_: SimpleNamespace(query=lambda: True))
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path)
@@ -222,8 +196,6 @@ def main() -> None:
     parser.add_argument("--world", type=int)
     parser.add_argument("--rank-fd", type=int)
     parser.add_argument("--leader")
-    # The home rank's card, in bytes: it holds the hosted conditioner and its DiT shard.
-    parser.add_argument("--home-capacity", type=int, default=0)
     args = parser.parse_args()
     torch.set_num_threads(1)
     _capture_seal()
@@ -231,14 +203,8 @@ def main() -> None:
     executor: Any = Executor(channel, args.root, rank=args.rank, world=args.world)
     executor.device_kind = "cpu"
     built = model()
-    if args.home_capacity and args.rank == 1:
-        device = Device(args.home_capacity)
-        simulate(device, setattr)
-        object.__setattr__(
-            built, "_cozy_residency", simulated(device, ("text_encoder", "ref2va_dit"))
-        )
     executor._group_model_key = "fixture"
-    executor.backend = SimpleNamespace(components=roots(built), parked={}, component_bytes=SIZES)
+    executor.backend = backend(built)
     executor.torch = torch
     executor.ready = True
     while (command := channel.recv()) is not None:

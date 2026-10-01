@@ -16,7 +16,6 @@ from msgspec import UNSET, UnsetType
 from cozy_runtime.author._assets import FileState, GrantedInput, InputMetadata
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
 from cozy_runtime.internal.canonical import Json
-from cozy_runtime.internal.fill import INFLIGHT, READERS, RING_SLOTS, WINDOW_BYTES
 
 _MANIFEST = Annotated[str, msgspec.Meta(pattern="^sha256:[0-9a-f]{64}$")]
 
@@ -66,6 +65,21 @@ class Vacate(Command, frozen=True, kw_only=True, tag="vacate"):
 
 class Restore(Command, frozen=True, kw_only=True, tag="restore"):
     names: tuple[str, ...] = ()
+
+
+class Budget(Command, frozen=True, kw_only=True, tag="budget"):
+    """This executor's weight-plane budgets (`weight_plane/1`). Lowering unmaps at once."""
+
+    #: -1 is no grant: each stage derives its own from what the driver has free
+    vram_bytes: int
+    #: -1 leaves the pinned host tier's budget as it is
+    pinned_bytes: int = -1
+
+
+class Prefetch(Command, frozen=True, kw_only=True, tag="prefetch"):
+    """Fill one loaded construction's host tier now, before its attempt holds the device."""
+
+    construction: str
 
 
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
@@ -155,11 +169,11 @@ class Binding(Release, frozen=True, kw_only=True):
     package: str = ""
     model: str = ""
     adapters: tuple[Adapter, ...] = ()
-    #: The TensorFS read ring; a test fixture shrinks it for tiny weights.
-    window_bytes: int = WINDOW_BYTES
-    slots: int = RING_SLOTS
-    readers: int = READERS
-    inflight: int = INFLIGHT
+    #: The read ring of executors before the weight plane; they index these directly.
+    window_bytes: int = 4 << 20
+    slots: int = 16
+    readers: int = 16
+    inflight: int = 8
 
     def parameter_names(self) -> tuple[str, ...]:
         """Every declared name for this shared construction, its primary first."""
@@ -203,6 +217,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: A follower's half: rank 0's hardware plan and, in a many-model load, which model.
     group: GroupHardware | UnsetType = UNSET
     model_key: str | UnsetType = UNSET
+    #: The worker keeps pinned host tiers (`HostTier` exchanges); older workers do not.
+    host_tier: bool = False
 
     def single(self) -> ModelLoad:
         return ModelLoad(
@@ -264,6 +280,9 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     entrypoint: str
     construction: str = ""
     attention_kernel: str = ""
+    #: The weight plane's device budget for this attempt; -1: the executor derives it.
+    plane_budget_bytes: int = -1
+    #: Read only by executors before the weight plane.
     placement: str = "all_resident"
     headroom_bytes: int = 0
     scope_headroom_bytes: dict[str, int] = {}
@@ -323,6 +342,8 @@ type KnownCommand = (
     | DescribeInstalled
     | Vacate
     | Restore
+    | Budget
+    | Prefetch
     | Unload
     | Activate
     | Attention

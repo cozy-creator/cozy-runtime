@@ -1,9 +1,11 @@
-"""A block floor must reach the real planner; aliases may not cross paging lifetimes."""
+"""A block floor must reach the real planner; regions are the innermost declared blocks, and
+aliases may not cross them."""
 
 from __future__ import annotations
 
 import pytest
 
+from cozy_runtime.internal import derive
 from cozy_runtime.internal.paging import partition
 from cozy_runtime.internal.worker.lanes import LaneSet
 from cozy_runtime.internal.worker.plan import DeclaredBinding, PreparedModel, PreparedRequest
@@ -74,6 +76,48 @@ def test_declared_blocks_with_shared_storage_are_not_independently_pageable() ->
         partition(model)
 
 
+def test_nested_declarations_page_the_innermost_blocks() -> None:
+    torch = pytest.importorskip("torch")
+
+    class Resnet(torch.nn.Module):  # type: ignore[name-defined,misc]  # optional real Torch
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = torch.nn.Linear(4, 4, device="meta")
+
+    class UpBlock(torch.nn.Module):  # type: ignore[name-defined,misc]  # optional real Torch
+        def __init__(self, resnets: int) -> None:
+            super().__init__()
+            self.resnets = torch.nn.ModuleList([Resnet() for _ in range(resnets)])
+            self.upsampler = torch.nn.Linear(4, 4, device="meta")
+
+    class Unet(torch.nn.Module):  # type: ignore[name-defined,misc]  # optional real Torch
+        # SDXL's shape: a declared up block around declared resnets.
+        _no_split_modules = ("UpBlock", "Resnet")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv_in = torch.nn.Linear(4, 4, device="meta")
+            self.up_blocks = torch.nn.ModuleList([UpBlock(2), UpBlock(0)])
+
+    layout = partition(Unet())
+    assert layout is not None
+    # An outer declaration keeps only its own weights (in `common`); one with no declared
+    # block inside is itself innermost.
+    assert [block.path for block in layout.blocks] == [
+        "up_blocks.0.resnets.0",
+        "up_blocks.0.resnets.1",
+        "up_blocks.1",
+    ]
+    assert set(layout.common.keys) == {
+        "conv_in.weight",
+        "conv_in.bias",
+        "up_blocks.0.upsampler.weight",
+        "up_blocks.0.upsampler.bias",
+    }
+    assert layout.blocks[2].keys == ("up_blocks.1.upsampler.weight", "up_blocks.1.upsampler.bias")
+    assert layout.total_bytes == 5 * 80 and layout.common.nbytes == 2 * 80
+
+
 def test_module_lists_without_a_declared_forward_boundary_are_not_guessed() -> None:
     torch = pytest.importorskip("torch")
     model = torch.nn.Sequential(torch.nn.Linear(4, 4, device="meta"))
@@ -83,8 +127,6 @@ def test_module_lists_without_a_declared_forward_boundary_are_not_guessed() -> N
 @pytest.mark.parametrize("substrate_name", ["meta_substrate", "serving_substrate"])
 def test_derived_rotary_initialization_keeps_checkpoint_mutation_guard(substrate_name: str) -> None:
     torch = pytest.importorskip("torch")
-    from cozy_runtime.internal import derive
-
     substrate = getattr(derive, substrate_name)
     # Upstream Qwen registers inv_freq, then its post_init copies the config-derived
     # values. It is not a checkpoint destination and serving must retain its values.

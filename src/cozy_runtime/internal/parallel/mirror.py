@@ -358,22 +358,7 @@ def _command(
         for key, (_model, root) in prepared.items()
         if key[0] in active and key[1] in active[key[0]][1]
     }
-    scopes = []
-    for key, (method, components) in active.items():
-        residency = models[key]._cozy_residency
-        scopes.append(
-            wire.Scope(key, method, components)
-            if residency is None
-            else wire.Scope(
-                key,
-                method,
-                components,
-                placement=residency.placement,
-                headroom_bytes=residency.headroom,
-                scope_headroom_bytes=residency.scope_headrooms,
-                measured_scopes=sorted(residency.measured),
-            )
-        )
+    scopes = [wire.Scope(key, method, components) for key, (method, components) in active.items()]
     payloads = wire.TensorSpool(directory / payloads_dir, references)
     command = wire.RunCommand(
         component=name,

@@ -258,13 +258,23 @@ class Executor:
                             _LOG.warning("dropped an executor progress frame: %r", exc)
                     continue
                 if frame.get("event") == "request":
-                    answer, handoff = respond(frame, on_request)
+                    try:
+                        received = (
+                            self.channel.recv_memfd() if frame.get("descriptor") is True else None
+                        )
+                    except SeamError as exc:
+                        raise ExecutorGone(f"seam: {exc}") from exc
+                    answer, handoff = respond(frame, on_request, received)
                     try:
                         self.channel.send(answer)
-                        if handoff is not None:
+                        if isinstance(handoff, int):
+                            self.channel.send_memfd(handoff)
+                        elif handoff is not None:
                             self.channel.send_descriptor(handoff)
                     finally:
-                        if handoff is not None:
+                        if isinstance(handoff, int):
+                            os.close(handoff)
+                        elif handoff is not None:
                             handoff.close()
                     continue
                 if "reply" not in frame and frame.get("event") is not None:
@@ -273,6 +283,10 @@ class Executor:
                 if frame.get("reply") != name:
                     raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
                 return frame
+
+    def busy(self) -> bool:
+        """A call holds the seam now (an attempt, a load): a new one would wait for it."""
+        return self._calls.locked()
 
     @contextlib.contextmanager
     def watched(self, what: str) -> Iterator[None]:

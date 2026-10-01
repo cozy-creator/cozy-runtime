@@ -1,6 +1,6 @@
 """Rank transport and mirrored execution, using real follower processes and gloo.
 
-The tiny model is constructed in the test; checkpoint fill and CUDA are separate gates.
+The tiny model is constructed in the test; the weight plane and CUDA are separate gates.
 The command transport, follower Executor.run, model wrappers, and collectives are real.
 """
 
@@ -11,6 +11,7 @@ import inspect
 import os
 import socket
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,33 +25,35 @@ from cozy_runtime.internal import (  # noqa: E402
     attention_sol,
     attention_ulysses,
     execution_evidence,
+    plane,
     spawn,
 )
-from cozy_runtime.internal.executor import (  # noqa: E402
-    Executor,
-    residence_ceiling,
-    settled_capacity,
-)
-from cozy_runtime.internal.fill import complete_device_envelope, price_envelope  # noqa: E402
+from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.parallel import cp, mirror, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
-from cozy_runtime.internal.worker.lanes import LaneSet  # noqa: E402
-from cozy_runtime.internal.worker.plan import (  # noqa: E402
-    DeclaredBinding,
-    PreparedModel,
-    PreparedRequest,
-)
 from testdata.parallel_calls import (  # noqa: E402
     HOSTED_CAPACITY,
+    HOSTED_SIZES,
     collective_model,
     h3_batch,
     h3_model,
     h3_turbo_inputs,
     hosted_model,
+    plane_residency,
+    prepared,
     spread_model,
 )
+
+
+@pytest.fixture(autouse=True)
+def _threads() -> Iterator[None]:
+    """Rank 0 computes with one thread, as every follower does: results compare bitwise."""
+    before = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(before)
 
 
 @pytest.mark.parametrize("shape", ["scalar", "offset", "transpose", "empty", "shared"])
@@ -102,8 +105,8 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         pytest.importorskip("diffusers")
     if kind == "h3-lora":
         pytest.importorskip("peft")
-    if kind == "staged" and not torch.cuda.is_available():
-        pytest.skip("native component residency requires CUDA; both replicas use one physical GPU")
+    if kind == "staged" and not plane.available():
+        pytest.skip("a TensorFS with the weight plane")
     fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
 
     def launch(module_argv: list[str], fd: int) -> spawn.Child:
@@ -119,11 +122,8 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         )
 
     group = RankGroup(degree=degree, backend="cpu:gloo", root=str(tmp_path), launch=launch)
-    model: Any = (
-        h3_model(adapters=kind == "h3-lora")
-        if is_h3
-        else collective_model(tmp_path / "rank-0" if kind == "staged" else None)
-    )
+    model: Any = h3_model(adapters=kind == "h3-lora") if is_h3 else collective_model()
+    plane_backend = plane_residency(tmp_path / "rank-0", model) if kind == "staged" else None
     if is_h3:
         with torch.no_grad():
             batches = [h3_batch(), h3_batch(mixed_lengths=True)]
@@ -153,7 +153,7 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
     )
     if kind == "h3-lora":
         roots["turbo_overlay"] = model.turbo_overlay
-    leader.backend = SimpleNamespace(components=roots, parked={})
+    leader.backend = prepared(roots)
     try:
         group.spawn()
         group.form(torch, {})
@@ -182,58 +182,9 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                 group=group,
                 spool=lambda: spool,
             )
-        if kind == "staged":
-            # Exercise the real group chooser, then carry its result through native
-            # CUDA residency and the follower's actual mirrored scope. The tiny
-            # capacity here is a conservative planner input, not a GPU limit claim.
-            lanes = LaneSet.from_envelope(
-                ",".join(str(rank) for rank in range(degree)), worker_pid=os.getpid()
-            )
-            row = lanes.group(tuple(range(degree))).row("fixture")
-            backend = model._cozy_residency.backend
-            row.ledger.observe_construction(
-                {
-                    "filled_bytes": 12,
-                    "allocator_bytes": 4,
-                    "reserved_bytes": 4,
-                    "resident": {name: backend.vram_charge[name] for name in backend.components},
-                    "parked": sorted(backend.parked),
-                    "evicted": {
-                        name: backend.component_memory[name].settled for name in backend.parked
-                    },
-                    "declared_scopes": {
-                        "sample": ["block", "overlay"],
-                        "fail_before_collective": ["block", "overlay"],
-                    },
-                    "device_free_bytes": 1,
-                    "device_total_bytes": 1024,
-                }
-            )
-            row.ledger.activations_by_cell["-"] = 37
-            row.ledger.activation_scopes_by_cell["-"] = {"sample": 11, "fail_before_collective": 13}
-            binding = DeclaredBinding(
-                entrypoint_binding_digest="sha256:" + "0" * 64,
-                entrypoint="sample",
-                model_class="ModelCalls",
-                model_binding_path="fixture",
-                model_parameter_name="model",
-                release="fixture/1",
-                logical_weight_bytes=12,
-            )
-            plan = row.chooser.choose(
-                binding,
-                PreparedModel(delivery_rung="verbatim"),
-                PreparedRequest.unresolved("sample", {}),
-                fits=False,
-            )
-            assert plan.placement == "component_staged"
         for attempt in ("attempt-a", "attempt-b"):
             spool = tmp_path / attempt
             leader._attempt_spool = spool
-            if kind == "staged":
-                model._cozy_residency.open_attempt(
-                    plan.placement, plan.headroom_bytes, dict(plan.scope_headroom_bytes)
-                )
             served: dict[str, set[str]] = {}
             if is_h3:
                 for batch, full_output in expected:
@@ -272,10 +223,7 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                         + [distributed_packed] * config.num_layers
                     )
             else:
-                state = SimpleNamespace(
-                    value=torch.tensor([2.0, 4.0, 8.0]),
-                    expected_stages=2 if kind == "staged" and attempt == "attempt-a" else 0,
-                )
+                state = SimpleNamespace(value=torch.tensor([2.0, 4.0, 8.0]))
                 steps: list[int] = []
                 rank_counts: dict[int, dict[str, int]] = {}
                 with attention_sol.observing(ranks=rank_counts):
@@ -322,8 +270,8 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
             assert not cp.in_gated_call()
     finally:
         group.close()
-        if model._cozy_residency is not None:
-            model._cozy_residency.backend.close()
+        if plane_backend is not None:
+            plane_backend.close()
         ours.close()
         theirs.close()
     assert not torch.distributed.is_initialized()
@@ -357,9 +305,7 @@ def test_a_placeable_component_runs_on_its_follower(tmp_path: Path, degree: int)
     leader.group = group
     leader._group_model_key = "fixture"
     roots = {"dit": model.dit, "text_encoder": model.text_encoder, "vae": model.vae}
-    leader.backend = SimpleNamespace(
-        components=roots, parked={}, component_bytes={"dit": 100, "text_encoder": 60, "vae": 30}
-    )
+    leader.backend = prepared(roots, HOSTED_SIZES)
     try:
         group.spawn()
         group.form(torch, {})
@@ -415,8 +361,9 @@ def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degre
     leader.device_kind = "cpu"
     leader.group = group
     leader._group_model_key = "fixture"
-    roots = {"dit": model.dit, "text_encoder": model.text_encoder, "vae": model.vae}
-    leader.backend = SimpleNamespace(components=roots, parked={})
+    leader.backend = prepared(
+        {"dit": model.dit, "text_encoder": model.text_encoder, "vae": model.vae}
+    )
     try:
         group.spawn()
         group.form(torch, {})
@@ -465,53 +412,6 @@ def test_hosting_plan_keeps_h3s_text_encoder_on_a_follower_only_when_rank_0_cann
     assert plan(capacity=140_000_000_000, world=2) == {}
     # A card too small for the conditioner beside a DiT shard keeps staging it on rank 0.
     assert plan(capacity=70_000_000_000, world=4) == {}
-
-
-def test_an_h100_hosts_h3s_text_encoder_once_the_fp8_dit_fill_has_settled() -> None:
-    """Runs 1435-1441 (4xH100, fp8-pruned): `residency.hosted` stayed empty and rank 0
-    staged the text encoder on every request. Each fp8 DiT fills as 41.2 GB of float
-    destinations beside its 20.1 GB encoded payload, then settles to 21.1 GB. That transient
-    comes off the fill ceiling, so the ceiling cannot hold the 51.5 GB encoder beside a DiT.
-    The settled card can."""
-    encoded, payload = 40_106_235_904, 20_053_117_952
-    rows = [
-        (dit, logical, stored, route, stored if route == "encoded_gemm" else 0, 0)
-        for dit in ("ref2va_dit", "fl2va_dit")
-        for logical, stored, route in (
-            (encoded, payload, "encoded_gemm"),
-            (1_052_879_308, 1_052_879_308, "verbatim"),
-        )
-    ]
-    sizes = {"ref2va_dit": 21_105_997_260, "fl2va_dit": 21_105_997_260}
-    for name, size in (
-        ("text_encoder", 51_506_192_496),
-        ("video_vae", 5_570_955_392),
-        ("audio_vae", 605_306_340),
-    ):
-        rows.append((name, size, size, "verbatim", 0, 0))
-        sizes[name] = size
-    envelope = complete_device_envelope(price_envelope(rows, 0), 0)
-    overhead = envelope["fill_overhead_bytes"]
-    assert overhead == payload
-    card = 84_000_000_000
-    fill_ceiling = residence_ceiling(
-        destinations=envelope["base_bytes"], authorized=card - overhead, allocatable=card - overhead
-    )
-    plan = functools.partial(
-        mirror.hosting_plan,
-        placeable=("text_encoder",),
-        sizes=sizes,
-        sharded={"ref2va_dit", "fl2va_dit"},
-        scopes={"condition_text": ("text_encoder",), "sample_ref2va": ("ref2va_dit",)},
-        world=4,
-    )
-    assert plan(capacity=fill_ceiling) == {}
-    capacity = settled_capacity(resident_budget=fill_ceiling, fill_overhead=overhead)
-    assert capacity == card
-    assert plan(capacity=capacity) == {"text_encoder": 1}
-    # A card that holds the whole construction keeps it on rank 0.
-    roomy = envelope["base_bytes"]
-    assert plan(capacity=settled_capacity(resident_budget=roomy, fill_overhead=overhead)) == {}
 
 
 def test_a_model_output_crosses_the_rank_seam(tmp_path: Path) -> None:

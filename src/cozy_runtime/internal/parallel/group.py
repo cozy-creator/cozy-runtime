@@ -496,6 +496,15 @@ class RankGroup:
                 f"{self.gpu(rank)} cannot be commanded: {exc}", code="group_broken"
             ) from exc
 
+    def memfd_to(self, rank: int, memfd: int) -> None:
+        """Hand follower `rank` one pinned host tier (right after the frame naming it)."""
+        try:
+            self.followers[rank - 1].channel.send_memfd(memfd)
+        except SeamError as exc:
+            raise GroupRefusal(
+                f"{self.gpu(rank)} cannot take a host tier: {exc}", code="group_broken"
+            ) from exc
+
     def reply_one(self, rank: int, name: str) -> dict[str, Any]:
         return self._reply(self.followers[rank - 1], name)
 

@@ -1,6 +1,7 @@
 """Checkpoint dtype is immutable constructor input, before census and allocation."""
 
 import io
+import mmap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,9 +13,10 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import Artifact, Config, ConformanceError, Loader
 from cozy_runtime.author._loader import TensorSpec
-from cozy_runtime.internal import derive_child
+from cozy_runtime.internal import derive_child, plane
 from cozy_runtime.internal.encoding import SPEC_PLAIN
-from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, tensor_schema_of
+from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of
+from cozy_runtime.internal.weights import PlaneBackend, Weights
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 
 torch = pytest.importorskip("torch")
@@ -72,9 +74,9 @@ def test_private_derive_request_carries_dtype_metadata() -> None:
     assert derive_child.read_request(msgspec.msgpack.encode(request.render())) == request
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="actual native streaming fill uses CUDA")
+@pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
 @pytest.mark.parametrize("dtype,width", [("f32", 4), ("f16", 2)])
-def test_native_checkpoint_fills_the_dtype_selected_constructor(
+def test_native_checkpoint_registers_the_dtype_selected_constructor(
     tmp_path: Path,
     dtype: str,
     width: int,
@@ -105,16 +107,11 @@ def test_native_checkpoint_fills_the_dtype_selected_constructor(
     manifest = "sha256:" + receipt["manifest"]["sha256"]
     checkpoint = Checkpoint(tmp_path / "store", manifest)
     rows = checkpoint.rows("linear")
-    backend = StreamingFillBackend.for_script(
-        checkpoint,
-        rows,
-        release="dtype-proof/1",
-        store="fixture",
-        snapshot=manifest,
-        window_bytes=4096,
-        slots=3,
-        readers=1,
-        inflight=1,
+    # The host tier alone: registration and the pinned fill need no card.
+    weights = Weights(torch, torch.device("cpu"), "cpu")
+    weights.set_budget(-1, pinned=64 << 20)
+    backend = PlaneBackend.for_script(
+        {"linear": checkpoint}, rows, weights=weights, construction="dtype", release="dtype/1"
     )
 
     class Pipeline:
@@ -133,14 +130,17 @@ def test_native_checkpoint_fills_the_dtype_selected_constructor(
             backend=backend,
         )
         model = loader.construct(Pipeline, factory=Pipeline)
-        layer = model.components["linear"]
-        assert torch.equal(layer.weight.cpu(), source)
-        assert layer.weight.numel() * layer.weight.element_size() == width * 6
+        # A CPU executor binds the registered bytes in place, in the selected dtype.
+        assert torch.equal(model.components["linear"].weight, source)
         assert loader.records()[0].filled_bytes == width * 6
-        assert backend.device_envelope()["destination_bytes"] == width * 6
-        assert torch.equal(
-            layer(torch.ones(2, device="cuda", dtype=selected_dtype)).cpu(),
-            torch.tensor([3, 7, 11], dtype=selected_dtype),
-        )
+        component = backend.components["linear"]
+        (region,) = component.regions
+        (weight,) = region.weights
+        ((offset, stored, shape),) = weight.parts.values()
+        assert (stored, shape) == (dtype, (3, 2))
+        weights.plane.want(component.ws, plane.PINNED).wait()
+        with mmap.mmap(component.ws.host_fd, component.ws.nbytes, prot=mmap.PROT_READ) as held:
+            start = region.offset + offset
+            assert held[start : start + width * 6] == source.numpy().tobytes()
     finally:
         backend.close()

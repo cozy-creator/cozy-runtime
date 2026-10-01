@@ -280,8 +280,8 @@ def invoke_with_fakes(
 # WEIGHTLESS FILL BACKENDS. The package declares WHICH components a method may touch;
 # it never learns HOW their bytes got there, and these two prove it: the same handler
 # runs on either and cannot observe which. They are DOUBLES and they lived under
-# `internal/` as if they were a runtime plane — production fills through cr-005's
-# `StreamingFillBackend` and has never called these (codex audit, adopted 2026-08-25).
+# `internal/` as if they were a runtime plane — production binds through the weight plane
+# (`internal/weights.py`) and has never called these (codex audit, adopted 2026-08-25).
 
 
 @dataclass(slots=True)
@@ -320,7 +320,7 @@ class _RecordingBackend:
         self.events.append(FillEvent(key, spec.nbytes, self.route))
 
     def commit(self) -> None:
-        """No device copies to fence — the freeze point is cr-005's `StreamingFillBackend`."""
+        """No device copies to fence: the weight plane (`internal/weights.py`) owns them."""
         return None
 
     def poison(self, keys: Sequence[str]) -> None:

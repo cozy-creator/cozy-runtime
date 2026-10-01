@@ -93,6 +93,44 @@ class Adjustment(msgspec.Struct, frozen=True, kw_only=True):
     reason: str = ""
 
 
+class Streamed(msgspec.Struct, frozen=True, kw_only=True):
+    """One component's streamed tail at its last stage: regions, resident prefix, window."""
+
+    blocks: int = 0
+    resident_blocks: int = 0
+    window: int = 0
+
+
+class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
+    """The executor's weight plane (`weight_plane/1`), as exact counters. Bytes are per device
+    of this rank; `-1` is unreadable, never zero."""
+
+    budget_bytes: int = -1
+    committed_bytes: int = -1
+    leased_bytes: int = -1
+    pinned_budget_bytes: int = -1
+    pinned_bytes: int = -1
+    #: CUDA context and runtime workspaces outside torch and the plane, measured at load
+    context_bytes: int = -1
+    #: torch's peak above its bytes at the attempt's start: activations and derived weights
+    activation_peak_bytes: int = -1
+    resident: dict[str, int] = {}
+    streamed: dict[str, Streamed] = {}
+    h2d_bytes: int = 0
+    h2d_gbps: float = 0.0
+    #: of those, copied to the device straight from disk (the pinned tier did not hold them),
+    #: and the bytes the pinned tier read from disk: a return from the tier reads neither
+    disk_copy_bytes: int = 0
+    disk_read_bytes: int = 0
+    late: int = 0
+    stall_ns: int = 0
+    misses: int = 0
+    evictions: int = 0
+    oom_retries: int = 0
+    #: The decode mode and CFG layout each stage chose, e.g. {"decode": "untiled"}
+    modes: dict[str, str] = {}
+
+
 class Metrics(msgspec.Struct, frozen=True, kw_only=True):
     handler_ms: float = 0.0
     device_lease_ms: float = 0.0
@@ -144,6 +182,7 @@ class AttemptReply(msgspec.Struct, frozen=True, kw_only=True):
     metrics: Metrics = Metrics()
     #: The card and ranks after the cache went back; an older executor is probed instead.
     after: dict[str, Json] | None = None
+    plane: PlaneFacts | None = None
 
 
 class PreparedReply(msgspec.Struct, frozen=True, kw_only=True):
@@ -186,6 +225,7 @@ _ADVISORY: dict[type, frozenset[str]] = {
             "ignored",
             "oversize_result_bytes",
             "metrics",
+            "plane",
         }
     ),
     PreparedReply: frozenset({"origin", "detail", "adjustments"}),

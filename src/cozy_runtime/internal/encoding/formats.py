@@ -524,11 +524,10 @@ SATURATION_MARGIN = 1.0 + 2.0**-10
 ROW_SCALE_FLOOR = 1e-12
 
 #: The ceiling on the f32 transient a rounding-correct rowwise decode is allowed to hold at
-#: once. It is NOT a tuning knob and NOT arbitrary: it is the fill plane's own staging slot
-#: size (`StreamingFillBackend.slot_bytes`, floored at 16 MiB), so this route's largest
-#: unledgered allocation is the same order as the one the fill plane already reserves per
-#: slot. A decode that held a full-width f32 copy of a 4 GiB weight would be a second
-#: residency the ledger never granted.
+#: once. It is NOT a tuning knob and NOT arbitrary: it is the weight plane's region grain
+#: (`weights.REGION_LIMIT`, 16 MiB), so this route's largest unledgered allocation is the
+#: same order as one streamed region. A decode that held a full-width f32 copy of a 4 GiB
+#: weight would be a second residency the ledger never granted.
 _CHUNK_BYTES = 16 << 20
 
 
