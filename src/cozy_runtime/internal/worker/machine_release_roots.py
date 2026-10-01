@@ -815,7 +815,7 @@ class ReleaseRoots:
             for held in installed.values()
         }
         assert worker.machine_calls is not None
-        steps = prepared.admission
+        steps = dict(prepared.admission)
         with _timed(steps, "builtins"):
             builtin = worker.machine_calls.builtins.capture()
         preparation = machine_capture.Preparation(

@@ -737,6 +737,17 @@ def test_a_restarted_runtime_holds_the_releases_it_prepared(
         assert progress[0].startswith("installing ") and "install" in admission
         assert (installs, checks) == ([""], [owned.installation_id])
 
+        _, _, warm_admission = run("warm")
+        assert "install" not in warm_admission and "install" in admission
+        assert (installs, checks) == ([""], [owned.installation_id])
+
+        kept = package_installation.kept_placements(machine.install_root, owned)
+        assert kept is not None
+        (kept / "malformed.json").write_bytes(b"{")
+        (kept / "obsolete.json").write_bytes(
+            b'{"format":"cozy.worker.v1.PlacementSet/1",'
+            b'"placements":[{"package_interface":{}}]}'
+        )
         machine.worker.shutdown()
         machine.boot()
         reads, progress, admission = run("restarted")
