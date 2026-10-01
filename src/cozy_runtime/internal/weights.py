@@ -163,6 +163,8 @@ class Component:
     numbers: dict[int, int] = field(default_factory=dict)
     #: a CPU executor's weight set, mapped from its pinned tier (the bytes it binds)
     mapping: Any = None
+    #: the pinned tier's fill in flight (a weight set closes only after it)
+    filling: Any = None
 
     def __post_init__(self) -> None:
         self.numbers = {region.index: i for i, region in enumerate(self.blocks)}
@@ -370,7 +372,9 @@ class Weights:
         if not regions:
             return 0
         try:
-            self.plane.want(component.ws, plane.PINNED, regions, priority=self.tick())
+            component.filling = self.plane.want(
+                component.ws, plane.PINNED, regions, priority=self.tick()
+            )
         except (plane.error("Shortfall"), plane.error("BelowFloor")):
             return 0
         return sum(component.regions[i].span for i in regions)
@@ -392,7 +396,17 @@ class Weights:
             unbind(region)
             region.views.clear()
         component.mapping = None
-        component.ws.close()
+        if component.filling is not None:
+            component.filling.wait()  # a filling tier refuses to close
+            component.filling = None
+        try:
+            component.ws.close()
+        except plane.error("LeaseViolation"):
+            # device copies still read its pinned tier (the plane's own stream): a rare
+            # close (refine, unload) waits for the device, then closes
+            self.torch.cuda.synchronize(self.device)
+            self.plane.set_vram_budget(self.index, self.applied)
+            component.ws.close()
 
     # -- facts
 
@@ -1215,6 +1229,10 @@ class WeightResidency:
         self.exit: Callable[[StageExit], None] | None = None
         self.entered_ns = 0
         self.stage_mark = (0, 0, 0)
+        #: stages of each method in this attempt, and the most any attempt has run: a method
+        #: entered again and again (a denoise step per stage) is cyclic like a multi-pass one
+        self.entries: dict[str, int] = {}
+        self.repeats: dict[str, int] = {}
         self._shortfall_error = (plane.error("Shortfall"), plane.error("BelowFloor"))
         self._budget_error = plane.error("BudgetExceeded")
         self._capacity = (*self._shortfall_error, self._budget_error)
@@ -1247,6 +1265,7 @@ class WeightResidency:
         """A new attempt: its activation peaks start empty. (Older Workers also send a
         placement rung and headroom; the plane has no rungs, so they are ignored.)"""
         self.peaks.clear()
+        self.entries.clear()
         self.last_shortfall = None
         self.derived_at_open = self._derived()
 
@@ -1270,6 +1289,8 @@ class WeightResidency:
             if granted is not None:
                 weights.set_budget(granted)
         self.active = (method, local)
+        self.entries[method] = self.entries.get(method, 0) + 1
+        self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
         if weights.host_only:  # everything is bound in place already; no device to measure
             self.entered_ns = time.perf_counter_ns()
             return
@@ -1477,7 +1498,11 @@ class WeightResidency:
                     if c.observed
                 },
                 costs=_costs(weights, components, method),
-                cyclic={name for name, c in components.items() if c.last_passes != 1},
+                cyclic={
+                    name
+                    for name, c in components.items()
+                    if c.last_passes != 1 or self.repeats.get(method, 0) > 1
+                },
             )
         except weight_policy.BelowFloor as exc:
             if name := self._refinable(exc.component, method):
@@ -1689,17 +1714,22 @@ class WeightResidency:
     def _decode(self, name: str, decode: Callable[..., Any]) -> Callable[..., Any]:
         """An image VAE's decode mode, decided before the call from what is free plus what the
         plane may unmap: untiled when its measured activations fit, else tiled with the tile
-        clamped to what is free. Unmeasured runs untiled (its blocks retry on OOM); only a
-        decode that cannot run untiled even with every idle weight unmapped runs again tiled.
-        The mode is recorded in the run's outputs."""
+        clamped to what is free. A size never measured at or above runs untiled (its blocks
+        retry on OOM; a fixed cost makes small decodes' per-pixel peaks overstate large ones);
+        only a decode that cannot run untiled even with every idle weight unmapped runs again
+        tiled. The mode is recorded in the run's outputs."""
         root = self.components[name].root
         weights = self.weights
+        #: pixels -> the untiled peak measured at that size
+        peaks: dict[int, int] = {}
         per_pixel: list[int] = []
         scale = 2 ** (len(root.config.block_out_channels) - 1)
 
         def run(z: Any, *args: Any, **kwargs: Any) -> Any:
             pixels = int(z.shape[0]) * int(z.shape[-2]) * int(z.shape[-1]) * scale * scale
             free, evictable = self.room((name,))
+            size = min((n for n in peaks if n >= pixels), default=0)
+            per_pixel[:] = [peaks[size] // size] if size else []
             mode = (
                 weight_policy.decode_mode(free, evictable, per_pixel[0] * pixels)
                 if per_pixel
@@ -1722,13 +1752,15 @@ class WeightResidency:
                     raise
                 failed = True
             if failed:  # outside `except`, so the failed call's frames are gone
+                # it needs more than all it had: the next decode of this size starts tiled
+                peaks[pixels] = max(peaks.get(pixels, 0), free + evictable + 1)
                 mode = "tiled"
                 free, _ = self.room((name,))
                 _tile(root, free // max(per_pixel[0] if per_pixel else 1, 1), scale)
                 out = decode(z, *args, **kwargs)
             elif mode == "untiled":
                 peak = accel.peak_allocated(weights.torch, weights.kind) - baseline
-                per_pixel[:] = [max([peak // max(pixels, 1), *per_pixel])]
+                peaks[pixels] = max(peaks.get(pixels, 0), peak)
             weights.modes[f"{name}.decode"] = mode
             return out
 

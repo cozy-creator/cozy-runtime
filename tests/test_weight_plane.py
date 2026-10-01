@@ -251,6 +251,22 @@ def test_the_execution_order_is_learned_then_streamed(card: Any) -> None:
 
 
 @on_card
+def test_a_stage_entered_once_per_step_keeps_a_resident_set(card: Any) -> None:
+    """SDXL's package enters its denoise scope once per step: each stage is one pass, and
+    the method repeating is what makes it cyclic, so it keeps blocks resident."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "steps")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    resident = run(model, x, passes=1)
+    weights.set_budget(tight(model))
+    steps = [run(model, x, passes=1)[0] for _ in range(3)]
+    facts = weights.facts().streamed["stack"]
+    assert 0 < facts.resident_blocks < BLOCKS and facts.window >= 1
+    assert all(same(resident, [step]) for step in steps)
+
+
+@on_card
 def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "oom")
