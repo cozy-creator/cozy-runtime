@@ -617,9 +617,10 @@ def retain_environment(
     *,
     package: str,
     release: str,
+    installation_id: str = "",
 ) -> InstalledEnvironment:
     """Retain the Runtime package's existing uv environment without copying its files."""
-    identifier = "install-" + uuid.uuid4().hex
+    identifier = installation_id or "install-" + uuid.uuid4().hex
     from cozy_runtime.internal.package_environment import interpreter_layout
 
     layout = interpreter_layout(python)
@@ -627,19 +628,17 @@ def retain_environment(
         identifier, Path(layout["prefix"]), Path(layout["purelib"]), python, package, release, True
     )
     directory = _directory(root, identifier)
-    directory.mkdir(parents=True, mode=0o711)
-    (directory / "installation.json").write_text(
-        json.dumps(
-            {
-                "package": package,
-                "release": release,
-                "python": str(python),
-                "generation": str(held.generation),
-                "site_packages": str(held.site_packages),
-            }
-        )
-        + "\n"
-    )
+    directory.mkdir(parents=True, exist_ok=bool(installation_id), mode=0o711)
+    record = {
+        "package": package,
+        "release": release,
+        "python": str(python),
+        "generation": str(held.generation),
+        "site_packages": str(held.site_packages),
+    }
+    temporary = directory / f".installation-{uuid.uuid4().hex}.json"
+    temporary.write_text(json.dumps(record) + "\n")
+    os.replace(temporary, directory / "installation.json")
     return held
 
 
