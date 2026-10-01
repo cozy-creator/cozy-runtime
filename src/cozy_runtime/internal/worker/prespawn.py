@@ -100,6 +100,8 @@ class Prespawns:
     def __init__(self, worker: Worker) -> None:
         self.worker = worker
         self.lock = threading.Lock()
+        #: serializes slot creation, never held while a process starts
+        self.starting = threading.Lock()
         self.slots: dict[tuple[str, Ordinals], Slot] = {}
 
     def waiting(self, key: str, want: Want, interface: bytes, emit: Emit) -> None:
@@ -192,46 +194,50 @@ class Prespawns:
         runs there; a later caller's rows follow the one it started."""
         if self.worker.options.install_root is None or not installation:
             return
-        replica = self._replica(installation, ordinals)
-        if replica is not None and replica.supervision.current is not None:
-            return  # a replica's process holds (or is leaving) these cards: nothing to start
-        with self.lock:
-            slot = self.slots.get((installation, ordinals))
-            if slot is not None:
-                slot.roots |= {root} - {""}
-        if slot is not None:
-            if emit is not None:
-                slot.attach(emit)
-            return
-        self._start(installation, interface, ordinals, {root} - {""}, emit, replica)
+        # One at a time: two callers for one installation and GPU set (the boot's prewarm and
+        # a queued call) must find one slot, never each make a supervision for it.
+        with self.starting:
+            replica = self._replica(installation, ordinals)
+            if replica is not None and replica.supervision.current is not None:
+                return  # a replica's process holds (or is leaving) these cards: nothing to start
+            with self.lock:
+                slot = self.slots.get((installation, ordinals))
+                if slot is not None:
+                    slot.roots |= {root} - {""}
+            if slot is None:
+                slot = self._slot(installation, ordinals, {root} - {""}, emit, replica)
+                threading.Thread(
+                    target=self._run,
+                    args=(slot, interface),
+                    name=f"prespawn-{installation}",
+                    daemon=True,
+                ).start()
+                return
+        if emit is not None:
+            slot.attach(emit)
 
-    def _start(
+    def _slot(
         self,
         installation: str,
-        interface: bytes,
         ordinals: Ordinals,
         roots: set[str],
         emit: Emit | None,
         replica: HostedPlacement | None,
-    ) -> None:
-        slot_id = "warm-" + _digest([installation, list(ordinals)])
+    ) -> Slot:
         if replica is not None:
             # A dead replica of these cards: its successor starts early, in its own slot.
             slot = Slot(installation, ordinals, roots, replica.supervision, sink=emit)
             slot.replica = replica.placement.placement_id
         else:
             supervision = self.worker._new_placement_supervision(
-                slot_id, uid_key=uid_key(installation, ordinals)
+                "warm-" + _digest([installation, list(ordinals)]),
+                uid_key=uid_key(installation, ordinals),
             )
             slot = Slot(installation, ordinals, roots, supervision, sink=emit)
             supervision.on_exit = functools.partial(_forget, supervision)
         with self.lock:
-            if (installation, ordinals) in self.slots:
-                return
             self.slots[(installation, ordinals)] = slot
-        threading.Thread(
-            target=self._run, args=(slot, interface), name=f"prespawn-{slot_id}", daemon=True
-        ).start()
+        return slot
 
     def _replica(self, installation: str, ordinals: Ordinals) -> HostedPlacement | None:
         """The replica of this installation already bound to these cards, alive or not."""

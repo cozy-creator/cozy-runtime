@@ -969,3 +969,26 @@ def test_an_executor_before_import_only_starts_is_only_spawned(
     assert prespawns.claim(installation, (0,)) is slot
     prespawns.settle(slot, "machine-older")
     assert slot.supervision.current is executor and executor.alive()
+
+
+def test_callers_racing_for_one_installation_and_card_find_one_process(
+    warm: Callable[..., Warm],
+) -> None:
+    """The boot's prewarm and a queued call ask for the same installation on the same card at
+    once: one slot, one supervision, one process (two once collided: `still owned`)."""
+    machine = warm()
+    prespawns = machine.worker.prespawns
+    ready = threading.Barrier(4)
+
+    def ask() -> None:
+        ready.wait()
+        prespawns.request_landing(INSTALLATION, _interface(), [{"path": "marco.models.model"}])
+
+    callers = [threading.Thread(target=ask) for _ in range(4)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(60)
+    (slot,) = prespawns.slots.values()
+    assert slot.started.wait(300) and slot.ready, slot.frames
+    assert slot.supervision.spawns == 1
