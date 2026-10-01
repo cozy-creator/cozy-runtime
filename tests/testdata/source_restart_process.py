@@ -246,9 +246,9 @@ try:
     first.wait(timeout=15)
     assert "model source cleanup" not in log.read_text(), log.read_text()
     summaries = [
-        json.loads(line.removeprefix("[worker] summary "))
+        json.loads(line.partition("[worker] summary ")[2])
         for line in log.read_text().splitlines()
-        if line.startswith("[worker] summary ")
+        if "[worker] summary " in line
     ]
     assert len(summaries) == 1 and summaries[0]["restart_requested"], log.read_text()
     assert tensorfs.Store.open(str(store_root)).model_source_operations() == before
