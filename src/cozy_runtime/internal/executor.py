@@ -3842,6 +3842,7 @@ class Executor:
         def own() -> int:
             freed = 0
             if (self.rank > 0 or 0 in chosen) and self.weights is not None and residents:
+                self._unpark()
                 freed = self.weights.vacate()
             if self.torch is not None:
                 accel.release_cached(self.torch, self.device_kind)
@@ -3867,12 +3868,14 @@ class Executor:
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         weights = self.weights
-        freed, refused = self._followers(
-            range(1, self.world),
-            command,
-            "budget",
-            lambda: weights.set_budget(command.vram_bytes, command.pinned_bytes) if weights else 0,
-        )
+
+        def own() -> int:
+            if weights is None:
+                return 0
+            self._unpark()  # a parked stage's holds would make a cut unreleasable
+            return weights.set_budget(command.vram_bytes, command.pinned_bytes)
+
+        freed, refused = self._followers(range(1, self.world), command, "budget", own)
         if refused:
             return refused
         return {"ok": True, "freed_bytes": freed, "plane": self._plane_facts()}
@@ -3893,6 +3896,12 @@ class Executor:
         if refused:
             return refused
         return {"ok": True, "filling_bytes": filling}
+
+    def _unpark(self) -> None:
+        """Close every construction's parked stage (a repeating method's open plan)."""
+        for child in self.constructions.values():
+            if child.residency is not None:
+                child.residency.unpark()
 
     def _followers(
         self, ranks: Any, command: Any, what: str, own: Callable[[], int]
