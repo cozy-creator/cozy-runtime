@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -99,18 +100,21 @@ try:
     # A restarted Runtime reopens its own operations and their interface: no describe.
     worker.shutdown()
     worker = boot()
-    described: list[str] = []
-    describe = worker._describe_in_slot
+    descriptions = 0
 
-    def counted(*args: Any, **kwargs: Any) -> bytes:
-        described.append(str(args[1]))
-        return describe(*args, **kwargs)
+    def counted[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+        def observe(*args: P.args, **kwargs: P.kwargs) -> R:
+            global descriptions
+            descriptions += 1
+            return function(*args, **kwargs)
 
-    worker._describe_in_slot = counted  # type: ignore[method-assign]
+        return observe
+
+    worker._describe_in_slot = counted(worker._describe_in_slot)  # type: ignore[method-assign]
     assert worker.machine_calls is not None
     again = worker.machine_calls.builtins.capture()
     assert (again.installation_id, again.placement) == (captured.installation_id, placement)
-    assert not described, described
+    assert descriptions == 0, descriptions
     held = [
         path.name
         for path in (root / "installs" / "installations").iterdir()

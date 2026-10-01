@@ -30,7 +30,79 @@ from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from fault_hub import FaultHub, Watched, checkpoint, on, rate_limited
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
+
+
+def _serving(
+    store_root: Path, origin: str, manifest: str, length: int, label: str = ""
+) -> tuple[Serving, Target, dict[str, Any], list[dict[str, Any]]]:
+    """A Serving over a real Workspace whose one Model default is `manifest` at `origin`;
+    its parent's progress frames land in the returned list. A call's step is `label`."""
+    checkpoint = {"digest": manifest, "length": length}
+    placement = {
+        "installation_id": "installed-model",
+        "package_interface": base64.b64encode(b"exact-interface").decode(),
+        "models": [{"id": "model", "manifest": checkpoint}],
+        "entrypoints": [
+            {
+                "name": "generate",
+                "slots": [
+                    {
+                        "slot": "model",
+                        "reference_model_id": "model",
+                        "components": [{"component": "unet", "model_id": "model"}],
+                        "stamps": [],
+                    }
+                ],
+            }
+        ],
+    }
+    capture = {
+        "model_defaults": [
+            {
+                "callee_installation_id": "installed-model",
+                "entrypoint": "generate",
+                "parameter": "model",
+                "public_origin": origin,
+                "rungs": [{"gpu": "*", "repository": "proof/model", "manifest": checkpoint}],
+            }
+        ]
+    }
+    progress: list[dict[str, Any]] = []
+    worker = cast(
+        Worker,
+        SimpleNamespace(
+            workspace=Workspace(store_root),
+            executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
+            options=SimpleNamespace(
+                accelerator_backend="none", publication_authority=None, hubs=()
+            ),
+            host_facts=lambda: hostfacts.measure("none"),
+            lanes=SimpleNamespace(entries=()),
+            config=SimpleNamespace(object_storage_hosts=("127.0.0.1",)),
+            control_lock=threading.RLock(),
+            model_transfer_lock=threading.Lock(),
+            model_preparation_progress={},
+            model_preparation_observers={},
+            prepared_installations={
+                "model": SimpleNamespace(document=documents.from_body(placement, pb.Placement))
+            },
+            calls=SimpleNamespace(progress_label=lambda *_: label),
+            emit_progress=lambda _parent, _ordinal, frame: progress.append(frame),
+            # This host harness has no GPUs; the process warm is `test_startup_warm`'s.
+            prespawns=SimpleNamespace(request=lambda *_: None),
+        ),
+    )
+    target = Target(
+        "installed-model",
+        "generate",
+        {"models": [{"path": "generate.models.model"}]},
+        {"placement": placement},
+        None,
+        "",
+    )
+    return Serving(worker), target, placement, progress
 
 
 @pytest.mark.parametrize("preempt", [False, True])
@@ -102,74 +174,15 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         header = tmp_path / "landed-header"
         header.write_bytes(_HEADER)
         store.put_file(str(header), "sha256:" + hashlib.sha256(_HEADER).hexdigest(), len(_HEADER))
-    checkpoint = {"digest": manifest, "length": length}
-    placement = {
-        "installation_id": "installed-model",
-        "package_interface": base64.b64encode(b"exact-interface").decode(),
-        "models": [{"id": "model", "manifest": checkpoint}],
-        "entrypoints": [
-            {
-                "name": "generate",
-                "slots": [
-                    {
-                        "slot": "model",
-                        "reference_model_id": "model",
-                        "components": [{"component": "unet", "model_id": "model"}],
-                        "stamps": [],
-                    }
-                ],
-            }
-        ],
-    }
-    capture = {
-        "model_defaults": [
-            {
-                "callee_installation_id": "installed-model",
-                "entrypoint": "generate",
-                "parameter": "model",
-                "public_origin": f"http://localhost:{server.server_port}",
-                "rungs": [{"gpu": "*", "repository": "proof/model", "manifest": checkpoint}],
-            }
-        ]
-    }
-    progress: list[dict[str, Any]] = []
-    worker = cast(
-        Worker,
-        SimpleNamespace(
-            workspace=Workspace(store_root),
-            executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
-            options=SimpleNamespace(
-                accelerator_backend="none", publication_authority=None, hubs=()
-            ),
-            host_facts=lambda: hostfacts.measure("none"),
-            lanes=SimpleNamespace(entries=()),
-            config=SimpleNamespace(object_storage_hosts=("127.0.0.1",)),
-            control_lock=threading.RLock(),
-            model_transfer_lock=threading.Lock(),
-            model_transfers={},
-            prepared_installations={
-                "model": SimpleNamespace(document=documents.from_body(placement, pb.Placement))
-            },
-            calls=SimpleNamespace(progress_label=lambda *_: ""),
-            emit_progress=lambda _parent, _ordinal, frame: progress.append(frame),
-            # This host harness has no GPUs; the process warm is `test_startup_warm`'s.
-            prespawns=SimpleNamespace(request=lambda *_: None),
-        ),
-    )
-    serving = Serving(worker)
-    target = Target(
-        "installed-model",
-        "generate",
-        {"models": [{"path": "generate.models.model"}]},
-        {"placement": placement},
-        None,
-        "",
+    serving, target, placement, progress = _serving(
+        store_root, f"http://localhost:{server.server_port}", manifest, length
     )
     call = Call("parent", 0, 1, 1, b"", b"", "child", b"", False, b"", "", "")
     request = pb.ChildCallRequest(parent_attempt_ordinal=1)
     try:
         first = serving._shared("owner", call, target, request, {}, speculative=True)
-        assert started.wait(5)
+        assert first is not None
+        assert started.wait(5), first.exception() if first.done() else "native pull not started"
         if preempt:
             other = Call("other-parent", 0, 1, 1, b"", b"", "other-child", b"", False, b"", "", "")
             with serving.demand(other):
@@ -248,6 +261,63 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_a_hint_paused_for_demand_says_so_where_its_fetch_ends(tmp_path: Path) -> None:
+    """Run 2322: demand paused a hint whose pull was waiting out a Hub's stated wait, and its
+    fetch ended `completed: false` with no reason. The 429 states 1 s, so this does not rest
+    on TensorFS's cancellable retry wait (unreleased after 0.3.80)."""
+    point = checkpoint(tmp_path / "origin")
+    with FaultHub(point, on("closure", 1, 1, rate_limited(1))) as hub:
+        store_root = tmp_path / "destination"
+        tensorfs.Store.init(str(store_root))
+        serving, target, placement, progress = _serving(
+            store_root, hub.origin, point.manifest, point.length
+        )
+        call = Call("parent", 0, 1, 1, b"", b"", "child", b"", False, b"", "", "")
+        request = pb.ChildCallRequest(parent_attempt_ordinal=1)
+        try:
+            hint = serving._shared("owner", call, target, request, {}, speculative=True)
+            assert hint is not None
+            hub.until(lambda: hub.asks("closure") == 1)
+            other = Call("other-parent", 0, 1, 1, b"", b"", "other", b"", False, b"", "", "")
+            with serving.demand(other):
+                hub.until(lambda: not serving.preparations.started(), lambda: len(progress))
+            assert Watched(hub, hint.result, lambda: len(progress)).result().placement == placement
+        finally:
+            serving.close()
+    paused, resumed = (
+        row["fields"]
+        for row in progress
+        if row.get("name") == "model fetch" and row["fields"]["event"] == "end"
+    )
+    assert paused["completed"] is False and paused["paused_for"] == "other-parent", paused
+    assert "cancel" in paused["reason"], paused
+    assert resumed["completed"] is True and "reason" not in resumed, resumed
+
+
+def test_a_called_download_reports_its_bytes_on_its_steps_line(tmp_path: Path) -> None:
+    """The download phase is named for the call's step; its byte samples were named for the
+    entrypoint, so a client drew them as a second line."""
+    point = checkpoint(tmp_path / "origin")
+    step = "Creating reference Subject-4"
+    with FaultHub(point) as hub:
+        store_root = tmp_path / "destination"
+        tensorfs.Store.init(str(store_root))
+        serving, target, placement, progress = _serving(
+            store_root, hub.origin, point.manifest, point.length, label=step
+        )
+        call = Call("parent", 3, 1, 1, b"", b"", "call-4", b"", False, b"", "", "")
+        request = pb.ChildCallRequest(parent_attempt_ordinal=1)
+        try:
+            prepared = serving._shared("owner", call, target, request, {}, speculative=False)
+            assert prepared is not None
+            assert Watched(hub, prepared.result).result().placement == placement
+        finally:
+            serving.close()
+    samples = [row for row in progress if row.get("kind") == "progress"]
+    assert any(row.get("position") == row.get("total") for row in samples), samples
+    assert {row["stage"] for row in samples} == {step + " / Downloading model weights"}
 
 
 def test_a_prefetch_narrates_each_hundredth_of_its_download_once() -> None:

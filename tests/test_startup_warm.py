@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -58,7 +59,11 @@ from test_end_to_end import NO_EXECUTOR
 from test_gpu_scheduler import MARCO, Machine
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
-pytestmark = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+NO_TORCH = importlib.util.find_spec("torch") is None
+pytestmark = [
+    pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or ""),
+    pytest.mark.skipif(NO_TORCH, reason="model-bearing executor imports require Torch"),
+]
 
 OWNER = "owner"
 INSTALLATION = "release-startup-warm-fixture"
@@ -100,7 +105,7 @@ def _attempt(name, real, answer):
 
 class _Guard(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path, target=None):
-        if name != "torch._C":
+        if name not in ("torch._C", "torch.cuda"):
             return None
         spec = next(
             (s for f in sys.meta_path if f is not self and hasattr(f, "find_spec")
@@ -117,10 +122,20 @@ class _Guard(importlib.abc.MetaPathFinder):
 
             def exec_module(self, module):
                 real.exec_module(module)
-                module._cuda_init = _attempt("_cuda_init", module._cuda_init, None)
-                module._cuda_getDeviceCount = _attempt(
-                    "_cuda_getDeviceCount", module._cuda_getDeviceCount, 0
+                # CPU Torch has no CUDA C entry points. Guard every entry point
+                # present in this build without fabricating driver operations.
+                entrypoints = (
+                    (("_cuda_init", "_cuda_init", None), ("_cuda_getDeviceCount", "_cuda_getDeviceCount", 0))
+                    if name == "torch._C"
+                    else (("_lazy_init", "_cuda_init", None), ("device_count", "_cuda_getDeviceCount", 0))
                 )
+                for entry, operation, answer in entrypoints:
+                    # CUDA builds retain the original C guard. CPU builds use
+                    # their existing public entry point for the same operation.
+                    if name == "torch.cuda" and hasattr(sys.modules['torch._C'], operation):
+                        continue
+                    if hasattr(module, entry):
+                        setattr(module, entry, _attempt(operation, getattr(module, entry), answer))
 
         spec.loader = Loader()
         return spec

@@ -1288,10 +1288,18 @@ def serve(payload: Request) -> Result:
             for index in indexes:
                 index.close()
             indexes.clear()
+            # This leg exercises cold recovery from the durable journal. Cache-hit
+            # recovery is covered separately; keep our optional cache out of this boot.
+            for directory in (environment / "installations").glob(
+                package_installation.PUBLISHED_PREFIX + "*"
+            ):
+                kept = directory / "placements"
+                if kept.is_dir():
+                    kept.rename(directory / "journal-recovery-cache")
             (root / "control.addr").unlink()
             worker = Worker(config, options, GrpcControlHost("127.0.0.1:0", root / "control.addr"))
-            assert not worker.prepared_installations and not worker.engine.jobs
             thread = threading.Thread(target=worker.run, daemon=True)
+            assert not worker.prepared_installations and not worker.engine.jobs
             thread.start()
             while not (root / "control.addr").exists():
                 assert thread.is_alive() and time.monotonic() < until

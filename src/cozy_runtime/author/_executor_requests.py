@@ -105,6 +105,28 @@ class Publish(_Request, frozen=True, kw_only=True, tag="publish"):
     parts: tuple[PublishPart, ...] = ()
 
 
+class StageMemoLookup(_Request, frozen=True, kw_only=True, tag="stage_memo_lookup"):
+    """A memoized method's key, before its scope opens: the Worker answers a `MemoEntry`."""
+
+    key: str
+    stage: str
+    numerics: str
+
+
+class StageMemoStore(_Request, frozen=True, kw_only=True, tag="stage_memo_store"):
+    """The outcome of a looked-up miss. `local` names the entry's spool file; empty means
+    nothing is stored and `reason` says why, which ends the key's in-flight claim."""
+
+    key: str
+    stage: str
+    numerics: str
+    local: str = ""
+    sha256: str = ""
+    length: int = 0
+    cost_ms: float = 0.0
+    reason: str = ""
+
+
 class TreeMember(_Request, frozen=True, kw_only=True, tag="tree_member"):
     tree: str
     path: str
@@ -181,6 +203,8 @@ type _Tagged = (
     | ModelPrefetch
     | TreeMember
     | Publish
+    | StageMemoLookup
+    | StageMemoStore
 )
 #: One request of a managed call to the worker's call lane.
 type CallRequest = (
@@ -273,6 +297,21 @@ class CallState(Answer, frozen=True, kw_only=True):
     progress: CallProgress | None = None
     #: The child's execution observation document.
     observation: object = None
+
+
+class MemoEntry(Answer, frozen=True, kw_only=True):
+    """A verified entry copied into the attempt's spool, or a miss (`local` empty)."""
+
+    local: str = ""
+    disputed: bool = False
+    #: what producing it cost its producer, measured
+    cost_ms: float = 0.0
+
+
+class MemoStored(Answer, frozen=True, kw_only=True):
+    stored: bool = False
+    reason: str = ""
+    disputed: bool = False
 
 
 class Published(Answer, frozen=True, kw_only=True):

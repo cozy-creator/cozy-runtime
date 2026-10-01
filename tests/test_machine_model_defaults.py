@@ -6,7 +6,8 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from fault_hub import HEADER, FaultHub, Gate, Stall, Watched, checkpoint, on, temps
 from test_device_lanes import _config
 from test_machine_execution import ack, complete, offer
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
@@ -72,7 +74,8 @@ def peer(capture: dict[str, Any]) -> Worker:
             ),
             host_facts=lambda: hostfacts.measure("none"),
             model_transfer_lock=threading.Lock(),
-            model_transfers={},
+            model_preparation_progress={},
+            model_preparation_observers={},
             executions=SimpleNamespace(
                 capture_root=lambda *_: "root",
                 capture=lambda *_: capture,
@@ -100,23 +103,6 @@ def target() -> Target:
         binding=None,
         operation_identity="",
     )
-
-
-@pytest.fixture(params=["ensure", "pull"])
-def fetch(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
-    """Both model fetch paths against the same Hub: TensorFS `ensure` where the installed
-    TensorFS names it, and `pull`, which the Runtime keeps for an older TensorFS."""
-    if request.param == "pull":
-        monkeypatch.setattr(fill, "capabilities", frozenset)
-    elif "ensure/1" not in fill.capabilities():
-        pytest.skip("the installed TensorFS has no ensure")
-    else:
-
-        def forbidden(*_: object, **__: object) -> None:
-            raise AssertionError("a TensorFS with ensure was asked to pull")
-
-        monkeypatch.setattr(tensorfs, "pull", forbidden)
-    return str(request.param)
 
 
 def test_default_capture_admits_any_order_and_open_slots_but_not_forged_rungs() -> None:
@@ -401,7 +387,7 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
 
 
 def test_cold_default_native_pull_requires_deployment_object_storage_host(
-    tmp_path: Path, fetch: str
+    tmp_path: Path,
 ) -> None:
     origin_root = tmp_path / "origin"
     origin_root.mkdir()
@@ -479,7 +465,7 @@ def test_cold_default_native_pull_requires_deployment_object_storage_host(
         thread.join()
 
 
-def test_a_cold_preparation_pulls_its_slots_at_once(tmp_path: Path, fetch: str) -> None:
+def test_a_cold_preparation_pulls_its_slots_at_once(tmp_path: Path) -> None:
     """Run 1510 pulled H3's turbo adapter only after its 100 GB base had landed. Here each
     slot's closure waits for the other's, which a one-after-another pull never shows."""
     refs: dict[str, tuple[str, int]] = {}
@@ -570,7 +556,7 @@ def test_a_cold_preparation_pulls_its_slots_at_once(tmp_path: Path, fetch: str) 
 
 
 def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hub_only(
-    tmp_path: Path, fetch: str
+    tmp_path: Path,
 ) -> None:
     """The machine's own Hub serves its owner's unpublished checkpoint only to the worker
     capability; another origin never sees it, and a refused or absent grant is surfaced
@@ -706,3 +692,85 @@ def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hu
         for server in servers:
             server.shutdown()
             server.server_close()
+
+
+def test_a_second_pull_of_one_checkpoint_waits_in_tensorfs_and_can_leave(tmp_path: Path) -> None:
+    """Two preparations of one checkpoint share TensorFS's flight. The one that waits shows
+    TensorFS's waiting samples and leaves when canceled, while the first still holds it."""
+    point = checkpoint(tmp_path / "origin")
+    with FaultHub(point, on(HEADER, 1, 1, Stall(after=10))) as hub:
+        root = tmp_path / "store"
+        tensorfs.Store.init(str(root))
+        worker = peer({})
+        worker.workspace = Workspace(root)
+        worker.config = cast(Any, SimpleNamespace(object_storage_hosts=("127.0.0.1",)))
+        row = {
+            "parameter": "model",
+            "public_origin": hub.origin,
+            "repository": point.model,
+            "manifest": {"digest": point.manifest, "length": point.length},
+        }
+        first, second = tensorfs.PullCancellation(), tensorfs.PullCancellation()
+        leading = Watched(hub, lambda: defaults.materialize(worker, [row], cancellation=first))
+        hub.until(lambda: hub.sent(HEADER) == 10)
+        waited: list[tuple[int, int]] = []
+        waiting = Watched(
+            hub,
+            lambda: defaults.materialize(
+                worker, [row], cancellation=second, progress=lambda *at: waited.append(at)
+            ),
+        )
+        hub.until(lambda: any(whole for _, whole in waited), lambda: len(waited))
+        second.cancel()
+        with pytest.raises(WorkspaceRefusal):
+            waiting.result()
+        assert leading.thread.is_alive() and hub.asks(HEADER) == 1, hub.log()
+        first.cancel()
+        with pytest.raises(WorkspaceRefusal):
+            leading.result()
+        defaults.materialize(worker, [row])
+        tensorfs.Store.open(str(root)).verify_checkpoint_source(
+            point.model, point.manifest, point.length
+        )
+        assert temps(root) == [] and hub.asks(HEADER) == 2, hub.log()
+
+
+def test_a_preparation_reports_its_whole_size_only_once_every_pull_has_one(
+    tmp_path: Path,
+) -> None:
+    """The adapter's Hub answers only after the base has its size: a sum of the base alone
+    would tell a watcher the whole download is the base."""
+    base = checkpoint(tmp_path / "base", "proof/base")
+    adapter = checkpoint(tmp_path / "adapter", "proof/adapter", path="adapter.cozytensors")
+    sized = threading.Event()
+
+    @contextmanager
+    def downloading(row: defaults.Selected) -> Iterator[defaults.Sample]:
+        yield lambda _, total: sized.set() if row.repository == base.model and total else None
+
+    root = tmp_path / "store"
+    tensorfs.Store.init(str(root))
+    worker = peer({})
+    worker.workspace = Workspace(root)
+    worker.config = cast(Any, SimpleNamespace(object_storage_hosts=("127.0.0.1",)))
+    reported: list[tuple[int, int]] = []
+    with FaultHub(base) as first, FaultHub(adapter, on("closure", 1, 1, Gate(sized))) as second:
+        rows = [
+            {
+                "parameter": point.model.removeprefix("proof/"),
+                "public_origin": hub.origin,
+                "repository": point.model,
+                "manifest": {"digest": point.manifest, "length": point.length},
+            }
+            for point, hub in ((base, first), (adapter, second))
+        ]
+        Watched(
+            second,
+            lambda: defaults.materialize(
+                worker, rows, downloading=downloading, progress=lambda *at: reported.append(at)
+            ),
+            first.reading,
+        ).result()
+    whole = reported[-1][1]
+    assert reported[-1][0] == whole and {size for _, size in reported} == {whole}, reported
+    assert [done for done, _ in reported] == sorted(done for done, _ in reported), reported
