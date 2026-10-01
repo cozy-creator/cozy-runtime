@@ -76,20 +76,20 @@ def certificate(path: Path) -> bytes:
     return der
 
 
-def runtime_gpus(child_env: tuple[tuple[str, str], ...], *, required: bool) -> list[RuntimeGPU]:
+def runtime_gpus(
+    child_env: tuple[tuple[str, str], ...], visible: tuple[str, ...] | None, *, required: bool
+) -> list[RuntimeGPU]:
     """Measure the driver's GPU inventory; the Runtime's own Python needs no torch for it.
 
     `required` is a CUDA base: an absent or unreadable driver refuses the boot. Otherwise a
     machine without NVIDIA tooling has no GPUs, and an unreadable driver serves CPU only
     with the reason on the worker's log.
 
-    `CUDA_VISIBLE_DEVICES`, where the machine's operator sets it, is where its GPUs are: the
-    inventory keeps only the entries it names, by index or GPU UUID. Empty is no GPU, served
-    CPU only without asking the driver, whatever the base.
+    `visible` is the host's `CUDA_VISIBLE_DEVICES` (`WorkerHostConfig.visible_devices`), where
+    the machine's operator sets it: the inventory keeps only the entries it names, by index or
+    GPU UUID. Empty is no GPU, served CPU only without asking the driver, whatever the base.
     """
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    entries = {entry.strip() for entry in (visible or "").split(",") if entry.strip()}
-    if visible is not None and not entries:
+    if visible == ():
         print(
             "[worker] CUDA_VISIBLE_DEVICES is empty; serving CPU only", file=sys.stderr, flush=True
         )
@@ -142,7 +142,8 @@ def runtime_gpus(child_env: tuple[tuple[str, str], ...], *, required: bool) -> l
     except ValueError as exc:
         raise LaunchRefusal("runtime_gpus_invalid", "nvidia-smi returned an invalid row") from exc
     if visible is not None:
-        rows = [row for row in rows if {str(row["device_index"]), row["device_uuid"]} & entries]
+        named = set(visible)
+        rows = [row for row in rows if {str(row["device_index"]), row["device_uuid"]} & named]
     return validated_gpus(rows, required=required and visible is None)
 
 
