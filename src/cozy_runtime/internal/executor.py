@@ -110,6 +110,7 @@ from cozy_runtime.internal import (
     prepare_diagnostics,
     proctree,
     sandbox,
+    stage_memo,
     tolerant,
 )
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
@@ -730,6 +731,7 @@ class Executor:
             "model_adapters": ["peft_graph/1"],
             #: what the worker's memory manager may ask beyond the floor's commands
             "memory": ["import_only", "vacate_ranks"],
+            "memo": [stage_memo.CAPABILITY],
             "pgid": os.getpgrp(),
             "no_new_privs": _proc_status("NoNewPrivs"),
             "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
@@ -1290,6 +1292,8 @@ class Executor:
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if command.memo is not None:
+            stage_memo.ENGINE.configure(command.memo)
         if self.started or (command.import_only and self.imported):
             return self._start_reply([], reused=True)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
@@ -2585,6 +2589,20 @@ class Executor:
             backend=backend, torch=torch, placement="all_resident", room=self._room
         )
         object.__setattr__(model, "_cozy_residency", self.residency)
+        stage_memo.install(
+            model,
+            torch=torch,
+            headers={name: checkpoints[name].header for name in present},
+            assets=config_checkpoint.header,
+            plan_rows=({**row.identity(), "component": row.component} for row in plan.tensors),
+            adapters=(msgspec.to_builtins(row) for row in binding.adapters),
+            roots=roots,
+            sites=attention.sites(roots),
+            device=device_facts,
+            world=self.world,
+            sealed=_SEALED,
+            fusion=fused.identity_document() if fused is not None else None,
+        )
         record = registry.generations()[0].record
         # THE CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
         # THE RESOLVED PLAN'S OWN DIGEST that says so. The plan digest binds the exact
@@ -3320,6 +3338,7 @@ class Executor:
         capture = None
         capture_result: dict[str, Any] | None = None
         record: AuthorAttempt | None = None
+        stage_memo.ENGINE.open(self._durable, spool)
         try:
             with (
                 attention.override(
@@ -3362,6 +3381,7 @@ class Executor:
             if record is None:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
+        stage_memo.ENGINE.close(record.emit)
         if served_attention is not None:
             self._emit_attention(record, served_attention, "attention.selected")
             if "sol-attn" in served_attention.totals():
