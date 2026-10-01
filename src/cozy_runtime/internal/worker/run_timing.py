@@ -47,37 +47,17 @@ class Timing:
 
     def begin(self, owner: str, request: str, attempt: int) -> None:
         with contextlib.suppress(Exception), self.lock:
-            root, _ = self.executions.scheduling_root(owner, request)
-            row = self.executions.row(owner, root)
-            assert row is not None
-            own = row if root == request else self.executions.row(owner, request)
-            if row.terminal or own is None or own.ordinal != attempt or own.terminal:
+            clock = self.executions.clock_root(owner, request, attempt)
+            if clock is None:
                 return
-            ancestor = request
-            with self.executions.workspace.locked() as db:
-                while ancestor != root:
-                    parent = db.execute(
-                        "SELECT c.parent_request,c.parent_ordinal,e.ordinal "
-                        "FROM execution_calls c JOIN executions e ON e.owner=c.owner "
-                        "AND e.request=c.parent_request WHERE c.owner=? AND c.child_request=?",
-                        (owner, ancestor),
-                    ).fetchone()
-                    if parent is None or parent[1] != parent[2]:
-                        return  # a prior parent attempt's late dispatch is not retry work
-                    ancestor = parent[0]
-            key = owner, root, row.ordinal
+            root, ordinal, recorded = clock
+            key = owner, root, ordinal
             run = self.runs.get(key)
             if run is None:
                 if root != request:
                     return  # an orphaned child cannot reopen its root's clock
                 # A recovered clock has no monotonic observation of its offline time.
-                with self.executions.workspace.locked() as db:
-                    prior = db.execute(
-                        "SELECT 1 FROM execution_events WHERE owner=? AND request=? "
-                        "AND ordinal=? AND kind='run.timing' LIMIT 1",
-                        key,
-                    ).fetchone()
-                run = _Run(self.monotonic(), complete=prior is None)
+                run = _Run(self.monotonic(), complete=not recorded)
                 self.runs[key] = run
             run.advance(self.monotonic())
             run.participants[request, attempt] = _Participant()
@@ -146,10 +126,8 @@ class Timing:
 
     def _snapshot(self, key: tuple[str, str, int], run: _Run, *, terminal: bool = False) -> None:
         owner, root, attempt = key
-        row = self.executions.row(owner, root)
-        if row is None or row.ordinal != attempt:
-            return  # late observations cannot be stamped onto a resumed attempt
         document: dict[str, Json] = {"attempt": attempt, "terminal": terminal}
         if run.complete and all(part.sequence for part in run.participants.values()):
             document["execution_ms"] = round(run.elapsed * 1000, 3)
-        self.executions.record(owner, root, "run.timing", document)
+        # Late observations cannot be stamped onto a resumed attempt: `ordinal` drops them.
+        self.executions.observe(owner, [(root, "run.timing", document)], ordinal=attempt)

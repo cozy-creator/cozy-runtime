@@ -1409,8 +1409,11 @@ class AttemptEngine:
             return self.finish_cancel(attempt, attempt.canceling)
         return self._run(attempt)
 
-    def reconcile(self, attempt: AttemptRecord) -> dict[str, Any]:
-        """Every byte class, before and after, with the executor's after-state re-read.
+    def reconcile(
+        self, attempt: AttemptRecord, after: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Every byte class, before and after, with the executor's after-state: the one its
+        attempt reply carried, or read by a `Probe` when there is none.
 
         The device numbers come from the process that owns the CUDA context, so a dead
         executor makes them UNREADABLE rather than zero (§3.6). That distinction is the
@@ -1435,10 +1438,11 @@ class AttemptEngine:
                 return self._unavailable_reconciliation(attempt, key)
             if not executor.poisoned and attempt.spool:
                 try:
-                    with executor.watched("probe"):
-                        probe = executor.call(Probe(), timeout=None)
-                        ledger.observe_probe(probe)
-                        processes = list(probe.get("processes") or [])
+                    if after is None:
+                        with executor.watched("probe"):
+                            after = executor.call(Probe(), timeout=None)
+                    ledger.observe_probe(after)
+                    processes = list(after.get("processes") or [])
                     ledger.device_process = self.device_process(executor.pid)
                 except ExecutorGone:
                     ledger.device_unreadable("the executor died before the ledger was read")
@@ -1948,7 +1952,8 @@ class AttemptEngine:
         # ONE ENVELOPE, ONE CLOSE, at release: the probe reads the executor's after-state
         # for THIS attempt, before the lane hands the device to the next one.
         if attempt.opened:
-            self.reconcile(attempt)
+            after = None if reply.after is None else {"residency": reply.residency, **reply.after}
+            self.reconcile(attempt, after)
             attempt.opened = {}
         attempt.state = "released"
         attempt.poke()

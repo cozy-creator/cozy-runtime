@@ -200,6 +200,7 @@ def test_worker_execution_boundary_excludes_preparation_and_postprocessing(
         settle=settled.append,
         note=lambda *_: None,
     )
+    worker._finalizing = lambda attempt: Worker._finalizing(cast(Any, worker), attempt)
     attempt = SimpleNamespace(request_id=call.child_request, attempt=1)
     Worker.execute(cast(Any, worker), cast(Any, attempt), cast(Any, object()))
     assert settled == [outcome]

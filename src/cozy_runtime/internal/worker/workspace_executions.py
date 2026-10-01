@@ -736,23 +736,92 @@ class Executions:
     def scheduling_root(self, owner: str, request: str) -> tuple[str, str]:
         """(root, parent): the original accepted ancestor orders descendants."""
         with self.workspace.locked() as db:
-            seen: list[str] = []
-            while request not in seen and len(seen) <= 32:
-                seen.append(request)
-                parent = db.execute(
-                    "SELECT parent_request FROM execution_calls WHERE owner=? AND child_request=?",
-                    (owner, request),
-                ).fetchone()
-                if parent is None:
-                    self._row(db, owner, request)
-                    return request, seen[1] if len(seen) > 1 else ""
-                request = parent[0]
+            return self._scheduling_root(db, owner, request)
+
+    def _scheduling_root(self, db: Journal, owner: str, request: str) -> tuple[str, str]:
+        seen: list[str] = []
+        while request not in seen and len(seen) <= 32:
+            seen.append(request)
+            parent = db.execute(
+                "SELECT parent_request FROM execution_calls WHERE owner=? AND child_request=?",
+                (owner, request),
+            ).fetchone()
+            if parent is None:
+                self._row(db, owner, request)
+                return request, seen[1] if len(seen) > 1 else ""
+            request = parent[0]
         raise WorkspaceRefusal("execution has no bounded scheduling ancestry")
+
+    def clock_root(self, owner: str, request: str, attempt: int) -> tuple[str, int, bool] | None:
+        """The run clock `request`'s attempt `attempt` joins, in one journal access: its root,
+        the root's attempt, and whether that attempt's clock already recorded. None when it
+        joins none: a terminal or superseded attempt, or a prior parent attempt's late
+        dispatch, which is not retry work."""
+        with self.workspace.locked() as db:
+            root, _ = self._scheduling_root(db, owner, request)
+            row = self._row(db, owner, root)
+            own = row if root == request else self._row(db, owner, request)
+            if row["state"] in TERMINAL or own["ordinal"] != attempt or own["state"] in TERMINAL:
+                return None
+            ancestor = request
+            while ancestor != root:
+                parent = db.execute(
+                    "SELECT c.parent_request,c.parent_ordinal,e.ordinal "
+                    "FROM execution_calls c JOIN executions e ON e.owner=c.owner "
+                    "AND e.request=c.parent_request WHERE c.owner=? AND c.child_request=?",
+                    (owner, ancestor),
+                ).fetchone()
+                if parent is None or parent[1] != parent[2]:
+                    return None
+                ancestor = parent[0]
+            recorded = db.execute(
+                "SELECT 1 FROM execution_events WHERE owner=? AND request=? "
+                "AND ordinal=? AND kind='run.timing' LIMIT 1",
+                (owner, root, row["ordinal"]),
+            ).fetchone()
+            return root, row["ordinal"], recorded is not None
 
     def record(self, owner: str, request: str, kind: str, document: Mapping[str, Json]) -> None:
         """Journal one bounded worker observation on an execution, terminal or not."""
         with self.workspace.locked() as db, transaction(db):
             self._event(db, self._row(db, owner, request), kind, canonical_json.encode(document))
+
+    def observe(
+        self,
+        owner: str,
+        events: Sequence[tuple[str, str, Mapping[str, Json]]],
+        *,
+        ordinal: int | None = None,
+        rooted: bool = False,
+    ) -> None:
+        """`record` for (request, kind, document) rows, in order, with the next journal access:
+        no commit on the caller's path, and every later access reads them first. `rooted`
+        journals each on its request's scheduling root. Rows for an execution that is gone,
+        or no longer at `ordinal`, are dropped."""
+        Workspace.owner(owner)
+        rows = [
+            (request, kind, canonical_json.encode(document)) for request, kind, document in events
+        ]
+        for request, _, raw in rows:
+            _id(request)
+            if len(raw) > MAX_EVENT_BYTES:
+                raise WorkspaceRefusal("execution event exceeds its metadata bound")
+        at_ms = self.clock_ms()
+
+        def write(db: Journal) -> None:
+            for request, kind, raw in rows:
+                if rooted:
+                    try:
+                        request, _ = self._scheduling_root(db, owner, request)
+                    except WorkspaceRefusal:
+                        continue
+                row = db.execute(
+                    "SELECT * FROM executions WHERE owner=? AND request=?", (owner, request)
+                ).fetchone()
+                if row is not None and ordinal in (None, row["ordinal"]):
+                    self._event(db, row, kind, raw, at_ms)
+
+        self.workspace.defer(write)
 
     def last_call_phase(self, owner: str, request: str, attempt: int) -> dict[str, Json] | None:
         """The latest observation of an inactive call, read only when its clock reopens."""

@@ -2498,11 +2498,13 @@ class Worker:
         view: gpu_scheduler.Document,
         installations: dict[str, str],
     ) -> None:
-        """One scheduling pass's observations, journaled on the roots they concern."""
+        """One scheduling pass's observations, journaled on the roots they concern as one
+        deferred batch: the pass, and the grant it wakes, never wait on a commit."""
         self.prespawns.reconcile(roots, view, installations)
         if self.executions is None:
             return
         owner = self.fence.record_owner_id
+        rows: list[tuple[str, str, gpu_scheduler.Document]] = []
         for root, event, body in events:
             if event == "gpu.wait":
                 body = {**body, **self._waiting_call(owner, str(body["key"]))}
@@ -2510,8 +2512,10 @@ class Worker:
                 # `ordinals` index this worker's envelope; people name a GPU by nvidia-smi's
                 # number. `ordinals` stays for readers that predate `gpus`.
                 body = {**body, "gpus": [self.gpu_identity(o) for o in body["ordinals"]]}
-            with contextlib.suppress(WorkspaceRefusal):
-                self.executions.record(owner, root, event, body)
+            rows.append((root, event, body))
+        with contextlib.suppress(WorkspaceRefusal):
+            self.executions.observe(owner, rows)
+        for root, event, body in rows:
             if event == "gpu.wait":
                 self._gpu_waiting(owner, root, body, view)
 
@@ -2530,8 +2534,7 @@ class Worker:
             "tensorfs_version": str(executor.hello.get("tensorfs_version", "")),
         }
         with contextlib.suppress(WorkspaceRefusal):
-            root, _ = self.executions.scheduling_root(owner, attempt.request_id)
-            self.executions.record(owner, root, "executor", body)
+            self.executions.observe(owner, [(attempt.request_id, "executor", body)], rooted=True)
 
     def gpu_identity(self, ordinal: int) -> execution_evidence.GpuIdentity:
         """Envelope ordinal `ordinal` as the GPU a person names (`execution_evidence.identify`)."""
@@ -6479,6 +6482,7 @@ class Worker:
         any rebuild it leaves behind, then its post phase. A fault is its terminal."""
         lane = self.lanes.by_id[attempt.lane_id]
         released: Released | None = None
+        left = False
         try:
             staged = self._stages(attempt)
             self.await_settled(attempt)
@@ -6492,21 +6496,45 @@ class Worker:
                     return
                 if self.enter(attempt) if staged else self.admit(attempt):
                     released = self.execute(attempt, lane)
+                if released is not None:
+                    # A reusable executor left its cards and lane as the next attempt finds
+                    # them: both go before anything waits on the journal. One to rebuild is
+                    # reclaimed first (darkness 1514).
+                    left = self._reusable(attempt)
+                    if left:
+                        self._leave_gpus(attempt)
+                    else:
+                        self._finalizing(attempt)
                 # On REFUSALS too (#458): a poisoned generation refuses every attempt.
                 self._rebuild_lane(lane, attempt.placement_id)
         except Exception as exc:
             self._attempt_faulted(attempt, exc)
         finally:
-            # Per-GPU pid, card and interval (execution_evidence) prove where it ran.
-            self.gpu.release(
-                f"{attempt.request_id}#{attempt.attempt}",
-                ranks=attempt.execution.get("ranks", []),
-                gpus=attempt.execution.get("gpus", []),
-            )
-            self._capacity_changed()
+            if not left:
+                self._leave_gpus(attempt)
+        if left:
+            self._finalizing(attempt)
         if released is not None:
             with lane.posting:
                 self.finish(released)
+
+    def _leave_gpus(self, attempt: AttemptRecord) -> None:
+        # Per-GPU pid, card and interval (execution_evidence) prove where it ran.
+        self.gpu.release(
+            f"{attempt.request_id}#{attempt.attempt}",
+            ranks=attempt.execution.get("ranks", []),
+            gpus=attempt.execution.get("gpus", []),
+        )
+        self._capacity_changed()
+
+    def _reusable(self, attempt: AttemptRecord) -> bool:
+        executor = attempt.executor
+        return (
+            executor is not None
+            and self.engine.supervision_for(attempt).owns(executor)
+            and executor.alive()
+            and not executor.poisoned
+        )
 
     def _rebuild_lane(
         self,
@@ -6854,28 +6882,17 @@ class Worker:
         A terminal built here is one the device phase itself produced (cancelled before
         dispatch, the executor died, the worker faulted) and is sent at once."""
         self._record_executor(attempt)
+        owner, timing = self.fence.record_owner_id, self.machine_calls
         with self.memory.watch(lane) as seen:
             try:
-                if self.machine_calls is not None:
-                    self.machine_calls.run_timing.begin(
-                        self.fence.record_owner_id, attempt.request_id, attempt.attempt
-                    )
-                    self.machine_calls.timing.phase(
-                        self.fence.record_owner_id, attempt.request_id, attempt.attempt, "running"
-                    )
+                if timing is not None:
+                    timing.run_timing.begin(owner, attempt.request_id, attempt.attempt)
+                    timing.timing.phase(owner, attempt.request_id, attempt.attempt, "running")
                 try:
                     released = self.engine.execute(attempt)
                 finally:
-                    if self.machine_calls is not None:
-                        self.machine_calls.run_timing.end(
-                            self.fence.record_owner_id, attempt.request_id, attempt.attempt
-                        )
-                        self.machine_calls.timing.phase(
-                            self.fence.record_owner_id,
-                            attempt.request_id,
-                            attempt.attempt,
-                            "finalizing",
-                        )
+                    if timing is not None:
+                        timing.run_timing.end(owner, attempt.request_id, attempt.attempt)
             except Exception as exc:
                 self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
                 try:
@@ -6884,11 +6901,13 @@ class Worker:
                     )
                 except Exception as inner:
                     self.note("attempt", f"even ABANDONED could not be built: {inner}")
+                    self._finalizing(attempt)
                     self.terminate(
                         attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}"
                     )
                     return None
         if not isinstance(released, Released):
+            self._finalizing(attempt)
             self.settle(released)
             return None
         prepared = attempt.prepared
@@ -6904,6 +6923,12 @@ class Worker:
                 forget=code in DEVICE_SHORTFALL_CODES or code in GROUP_FAULT_CODES,
             )
         return released
+
+    def _finalizing(self, attempt: AttemptRecord) -> None:
+        if self.machine_calls is not None:
+            self.machine_calls.timing.phase(
+                self.fence.record_owner_id, attempt.request_id, attempt.attempt, "finalizing"
+            )
 
     def finish(self, released: Released) -> None:
         """POST PHASE -> OUTCOME -> SEND, on the lane's post thread.

@@ -703,9 +703,9 @@ class Executor:
             case PrepareRequest():
                 return self.serve_request(command)
             case Invoke():
-                return self.serve_invoke(command)
+                return self._settled(self.serve_invoke(command))
             case RunJob():
-                return self.run_job(command)
+                return self._settled(self.run_job(command))
             case Probe():
                 return self.probe()
             case Vacate():
@@ -3390,9 +3390,13 @@ class Executor:
                 record.emit(
                     "confession", "attention.sol.kernel", fields.pop("source"), rank=0, **fields
                 )
-        self._emit_attention(
-            record, attention.observed(self._attention_roots()), "attention.restored"
+        # Nothing was swapped, so the restore left the sites exactly as the entry walk read them.
+        restored = (
+            served_attention
+            if swap is None and not pin and served_attention is not None
+            else attention.observed(self._attention_roots())
         )
+        self._emit_attention(record, restored, "attention.restored")
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = self.host._attempt_spool = None
         self.host._attempt_request = ""
@@ -4440,6 +4444,28 @@ class Executor:
             rows.append(row)
         return rows
 
+    def _device_figures(self) -> dict[str, int]:
+        """The card as its allocator and driver see it now. A process with no card (a CPU
+        executor, a gloo rank) has none; readers take absent as unknown."""
+        if self.torch is None or self.device_kind == "mps":
+            return {}
+        if not accel.present(self.torch, self.device_kind):
+            return {}
+        memory = accel.allocation(self.torch, self.device_kind)
+        return {
+            "device_free_bytes": memory["driver_free_bytes"],
+            "device_total_bytes": memory["driver_total_bytes"],
+            "allocator_bytes": memory["allocated_bytes"],
+            "reserved_bytes": memory["reserved_bytes"],
+        }
+
+    def _settled(self, reply: dict[str, Any]) -> dict[str, Any]:
+        """An attempt's reply carries the after-state a `Probe` would read next, so the
+        worker closes its ledger without another round trip; residency and RSS are already
+        in the reply."""
+        reply["after"] = {**self._device_figures(), "processes": self.process_incarnations()}
+        return reply
+
     def probe(self) -> dict[str, Any]:
         processes = self.process_incarnations()
         if self.torch is None:
@@ -4451,21 +4477,10 @@ class Executor:
                 "processes": processes,
                 "poisoned": self.poisoned,
             }
-        # A torch-bearing process with no card (a CPU executor, a gloo rank) has no device
-        # numbers to report; readers take absent as unknown.
-        device: dict[str, int] = {}
-        if self.device_kind != "mps" and accel.present(self.torch, self.device_kind):
-            memory = accel.allocation(self.torch, self.device_kind)
-            device = {
-                "device_free_bytes": memory["driver_free_bytes"],
-                "device_total_bytes": memory["driver_total_bytes"],
-                "allocator_bytes": memory["allocated_bytes"],
-                "reserved_bytes": memory["reserved_bytes"],
-            }
         return {
             "ok": True,
             "torch": True,
-            **device,
+            **self._device_figures(),
             "residency": self._active_residency(),
             "constructions": self.arbiter.document(self.active),
             "rss_bytes": _rss(),
