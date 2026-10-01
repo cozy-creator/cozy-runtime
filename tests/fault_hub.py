@@ -19,7 +19,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import tensorfs
+
 from cozy_runtime.internal import liveness
+from test_model_reader import model as written
+from test_model_reader import plain
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
 #: An observer outside the pull must not call it wedged before TensorFS's own ledger has had
@@ -78,7 +83,16 @@ class Gate:
     then: Fault | None = None
 
 
-Fault = Status | Reset | Truncate | Stall | Corrupt | Delay | Gate
+@dataclass(frozen=True)
+class Drip:
+    """A whole GET answered application-limited, `rate` bytes a second in 4 KiB pieces: bytes
+    keep arriving, so no silence rule fires. A ranged ask is answered honestly, as R2 serves
+    a fresh range apart from a stalled read (run 2322)."""
+
+    rate: int
+
+
+Fault = Status | Reset | Truncate | Stall | Corrupt | Delay | Gate | Drip
 
 
 def enveloped(code: int, error: str, message: str = "injected") -> Status:
@@ -146,6 +160,25 @@ def checkpoint(
     raw = origin.manifest(manifest)["manifest"].replace(b"model.cozytensors", path.encode())
     bodies = {hashlib.sha256(body).hexdigest(): body for body in (_HEADER, _ASSET, raw)}
     return Checkpoint(model, "sha256:" + hashlib.sha256(raw).hexdigest(), len(raw), bodies)
+
+
+def weights(tmp_path: Path, tensors: int, size: int, model: str = "proof/model") -> Checkpoint:
+    """A real checkpoint of `tensors` same-size tensor objects, written by TensorFS's own
+    derived writer: each big enough for a ranged hedge, and alike, so one's pace judges
+    another's."""
+    root = tmp_path / "store"
+    root.mkdir(parents=True)
+    store = tensorfs.Store.init(str(root))
+    values = {
+        f"blocks.{index}.weight": plain(np.full(size // 4, index + 1, dtype=np.float32))
+        for index in range(tensors)
+    }
+    manifest, length = written(store, "slow-tail", values)
+    bodies = {manifest.removeprefix("sha256:"): store.manifest(manifest)["manifest"]}
+    for row in store.walk_cozytensors(manifest):
+        hex_ = row["id"].removeprefix("sha256:")
+        bodies[hex_] = (root / "blobs" / hex_[:2] / hex_[2:4] / hex_).read_bytes()
+    return Checkpoint(model, manifest, length, bodies)
 
 
 @dataclass
@@ -319,6 +352,12 @@ class FaultHub:
                     ranged = (("Content-Range", f"bytes {start}-{end}/{len(body)}"),)
                     code, body = 206, body[start : end + 1]
                 self.head(code, len(body), ranged)
+                if isinstance(fault, Drip) and not spec:
+                    for at in range(0, len(body), 4096):
+                        time.sleep(4096 / fault.rate)
+                        if not self.write(body[at : at + 4096], route):
+                            return
+                    return
                 if isinstance(fault, Corrupt):
                     body = body[:-1] + bytes([body[-1] ^ 0xFF])
                 if not isinstance(fault, Reset | Truncate | Stall):
