@@ -41,7 +41,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from local_owner import LocalRecordOwner, LocalRequest
 from test_end_to_end import NO_EXECUTOR
-from test_gpu_scheduler import OWNER, GiB, Machine
+from test_gpu_scheduler import OWNER, VIRTUAL, GiB, Machine, driverless
 
 CPU_WORKFLOW = """import msgspec
 from cozy_runtime.author import App, Context, invocable
@@ -79,6 +79,7 @@ def test_a_queued_call_survives_another_roots_placement_removal(
     import test_job_preparation_isolation as fixture
     from conftest import image_python
 
+    driverless(monkeypatch)
     monkeypatch.setattr(accel, "device_memory", _measured)
     monkeypatch.setattr(fixture, "SOURCE", SERVING_WORKFLOW if call == "serving" else CPU_WORKFLOW)
     # Short: an executor's control socket lives under it and `sun_path` holds 108 bytes.
@@ -101,7 +102,7 @@ def test_a_queued_call_survives_another_roots_placement_removal(
             WorkerOptions(
                 **signed_claims.IDENTITY,
                 root=root / "worker",
-                devices="0,1,2,3",
+                devices=VIRTUAL,
                 python=str(image_python()),
                 install_root=environment,
                 artifact_cache=root / "artifacts",

@@ -38,7 +38,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from local_owner import LocalRecordOwner, LocalRequest
 from test_end_to_end import NO_EXECUTOR
-from test_gpu_scheduler import OWNER, GiB, Machine
+from test_gpu_scheduler import OWNER, VIRTUAL, GiB, Machine, driverless
 
 RELEASED = {"ordinals": [], "cause": "released_by_root"}
 
@@ -118,10 +118,11 @@ def _measured(entry: str, kind: str) -> accel.DeviceMemory:
 
 @pytest.fixture
 def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
+    driverless(monkeypatch)
     monkeypatch.setattr(accel, "device_memory", _measured)
     # Short: an executor's control socket lives under it and `sun_path` holds 108 bytes.
     with tempfile.TemporaryDirectory(prefix="cz-gpu.", dir="/tmp") as root:
-        made = Machine(Path(root), "0,1,2,3", "boot-one")
+        made = Machine(Path(root), VIRTUAL, "boot-one")
         try:
             yield made
         finally:
@@ -212,8 +213,9 @@ def test_a_restarted_worker_fails_a_dispatched_root_and_frees_its_gpus(
 ) -> None:
     """A root that was running when its worker went is never run again: the next worker
     ends it FAILED, so its lease and its release are gone with it and B starts at once."""
+    driverless(monkeypatch)
     monkeypatch.setattr(accel, "device_memory", _measured)
-    first = Machine(tmp_path, "0,1,2,3", "boot-release")
+    first = Machine(tmp_path, VIRTUAL, "boot-release")
     try:
         first.root("A")
         a1 = first.child("A", "h3")
@@ -222,7 +224,7 @@ def test_a_restarted_worker_fails_a_dispatched_root_and_frees_its_gpus(
         assert first.tick()["leases"] == {"A": [0, 1, 2, 3]}
     finally:
         first.close()
-    second = Machine(tmp_path, "0,1,2,3", "boot-release")
+    second = Machine(tmp_path, VIRTUAL, "boot-release")
     try:
         second.tick()
         assert second.executions.status(OWNER, "A").state == "failed"
@@ -278,6 +280,7 @@ def test_a_workflow_releases_from_its_executor_and_b_starts_during_its_cpu_tail(
     import test_job_preparation_isolation as fixture
     from conftest import image_python
 
+    driverless(monkeypatch)
     monkeypatch.setattr(accel, "device_memory", _measured)
     with tempfile.TemporaryDirectory(prefix="cz-rel.", dir="/tmp") as directory:
         root = Path(directory)
@@ -301,7 +304,7 @@ def test_a_workflow_releases_from_its_executor_and_b_starts_during_its_cpu_tail(
             WorkerOptions(
                 **signed_claims.IDENTITY,
                 root=root / "worker",
-                devices="0,1,2,3",
+                devices=VIRTUAL,
                 python=str(image_python()),
                 install_root=environment,
                 artifact_cache=root / "artifacts",

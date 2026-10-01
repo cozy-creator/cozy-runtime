@@ -331,7 +331,9 @@ class WorkerOptions:
     python: str = ""
     accelerator_backend: str = ""
     """Baked pod profile backend (`cuda`/`none`), or empty for local auto-detection."""
-    devices: str = "0"
+    devices: str = ""
+    """`CUDA_VISIBLE_DEVICES` entries this worker schedules; empty serves CPU only and asks no
+    GPU driver. The launcher (`runtime_worker`) always states its measured cards."""
     gpus: tuple[readiness.RuntimeGPU, ...] = ()
     """The measured inventory `devices` spans, in ordinal order, reported to the controller.
     Tests supply a virtual one here; nothing reads an environment variable for it."""

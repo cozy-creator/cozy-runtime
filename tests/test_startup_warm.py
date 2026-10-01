@@ -51,18 +51,12 @@ OWNER = "owner"
 INSTALLATION = "release-startup-warm-fixture"
 
 
-def _gpu() -> str:
-    if NO_EXECUTOR:
-        return NO_EXECUTOR
-    try:
-        import torch
-    except ImportError as exc:
-        return f"torch is absent: {exc}"
-    return "" if torch.cuda.is_available() else "no CUDA device"
-
-
-NO_GPU = _gpu()
-needs_gpu = pytest.mark.skipif(bool(NO_GPU), reason=NO_GPU or "")
+def needs_gpu(test: Callable[..., Any]) -> Callable[..., Any]:
+    """A real card, asked only when the run opted in (`--real-gpu`), never at import."""
+    marked: Callable[..., Any] = pytest.mark.real_gpu(
+        pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR)(test)
+    )
+    return marked
 
 
 def _interface(degrees: tuple[int, ...] = ()) -> bytes:

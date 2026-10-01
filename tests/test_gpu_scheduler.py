@@ -60,6 +60,8 @@ from test_end_to_end import NO_EXECUTOR
 
 GiB = 1 << 30
 OWNER = "owner"
+#: Four cards no host has: a test worker's executors are sealed where no GPU is.
+VIRTUAL = "64,65,66,67"
 H3 = [{"sequence_parallel": {"degrees": [2, 4, 7, 8]}}] * 2
 MARCO = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
 
@@ -656,20 +658,25 @@ def driverless(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def machine(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Iterator[Machine]:
-    if "real_gpu" not in request.node.keywords:
+    # Virtual cards no host has, unless the run opted in to its real ones.
+    real = "real_gpu" in request.node.keywords
+    devices = "0,1,2,3" if real else VIRTUAL
+    if not real:
         driverless(monkeypatch)
+    #: by GPU number in the envelope (0-3), as the tests name them
     unreadable: set[str] = set()
     free: dict[str, int] = {}
 
     def device_memory(entry: str, kind: str) -> accel.DeviceMemory:
-        if entry in unreadable:
+        gpu = str(devices.split(",").index(entry))
+        if gpu in unreadable:
             return accel.DeviceMemory("unreadable")
-        return accel.DeviceMemory("measured", free.get(entry, 80 * GiB), 80 * GiB)
+        return accel.DeviceMemory("measured", free.get(gpu, 80 * GiB), 80 * GiB)
 
     monkeypatch.setattr(accel, "device_memory", device_memory)
     # Short: an executor's control socket lives under it and `sun_path` holds 108 bytes.
     with tempfile.TemporaryDirectory(prefix="cz-gpu.", dir="/tmp") as root:
-        made = Machine(Path(root), "0,1,2,3", "boot-one")
+        made = Machine(Path(root), devices, "boot-one")
         made.unreadable = unreadable  # type: ignore[attr-defined]
         made.free = free  # type: ignore[attr-defined]
         try:
@@ -679,7 +686,7 @@ def machine(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> 
 
 
 def test_grants_name_each_gpu_as_nvidia_smi_does(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A worker launched on cards 4 and 6 schedules its envelope's ordinals 0 and 1. Its
+    """A worker launched on cards 64 and 66 schedules its envelope's ordinals 0 and 1. Its
     grant and release name each GPU by nvidia-smi's number and UUID in `gpus`, beside the
     `ordinals` older readers still take."""
     measured = accel.DeviceMemory("measured", 80 * GiB, 80 * GiB)
@@ -692,12 +699,12 @@ def test_grants_name_each_gpu_as_nvidia_smi_does(monkeypatch: pytest.MonkeyPatch
             device_uuid=f"GPU-{index}",
             driver_version="580.0",
             memory_bytes=80 * GiB,
-            pci_bus_id=f"00000000:0{index}:00.0",
+            pci_bus_id=f"00000000:{index:02x}:00.0",
         )
-        for index in (4, 6)
+        for index in (64, 66)
     )
     with tempfile.TemporaryDirectory(prefix="cz-gpu.", dir="/tmp") as root:
-        machine = Machine(Path(root), "4,6", "boot-one", gpus=inventory)
+        machine = Machine(Path(root), "64,66", "boot-one", gpus=inventory)
         try:
             machine.root("A")
             call = machine.child("A", "h3")
@@ -711,7 +718,7 @@ def test_grants_name_each_gpu_as_nvidia_smi_does(monkeypatch: pytest.MonkeyPatch
             }
         finally:
             machine.close()
-    named = [{"gpu": 4, "uuid": "GPU-4"}, {"gpu": 6, "uuid": "GPU-6"}]
+    named = [{"gpu": 64, "uuid": "GPU-64"}, {"gpu": 66, "uuid": "GPU-66"}]
     assert events["gpu.grant"] == {"key": call + "#1", "ordinals": [0, 1], "gpus": named}
     assert events["gpu.release"]["ordinals"] == [0, 1]
     assert events["gpu.release"]["gpus"] == named

@@ -50,6 +50,7 @@ from cozy_runtime.internal.worker.session import Worker, WorkerOptions, read_pla
 from cozy_runtime.internal.worker.supervisor import Unit
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from test_gpu_scheduler import VIRTUAL, driverless
 from test_job_slot_paths import _ASSET, _HEADER, _ref
 
 GiB = 1 << 30
@@ -160,6 +161,7 @@ class Machine:
 
         monkeypatch.setattr(Worker, "dispatch_machine", dispatch_job)
         monkeypatch.setattr(package_prepare, "_census", census)
+        driverless(monkeypatch)
         monkeypatch.setattr(
             accel,
             "device_memory",
@@ -183,7 +185,7 @@ class Machine:
                 tensorfs_root=self.store_root,
                 install_root=self.install_root,
                 artifact_cache=root / "artifacts",
-                devices="0,1,2,3",
+                devices=VIRTUAL,
             ),
             InMemoryControlHost(),
         )
