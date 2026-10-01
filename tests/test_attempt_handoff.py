@@ -328,7 +328,7 @@ def test_a_released_gpu_reaches_the_next_call_without_a_commit(
         try:
             release = machine.worker.stages.release
 
-            def timed_release(key: str, **facts: object) -> None:
+            def timed_release(key: str, **facts: Any) -> None:
                 """The first release of a call's grant, and the commits its pass made."""
                 at, before = time.perf_counter() * 1000, len(commits.durable)
                 release(key, **facts)

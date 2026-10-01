@@ -533,8 +533,8 @@ def test_the_book_learns_each_call_and_survives_a_restart(tmp_path: Path) -> Non
         ("denoise", 2),
         ("decode", 1),
     ]
-    exits = [body for _root, body in shell.kinds("stage.exit")]
-    assert len(exits) == 1 and len(exits[0]["stages"]) == 5
+    exits = [body["stages"] for _root, body in shell.kinds("stage.exit")]
+    assert [len(stages) for stages in exits if isinstance(stages, list)] == [5]
     # A restarted Worker places the next such call by what was learned.
     again = Shell(1, turns=True, book=path)
     again.scheduler.open_root("S", 1)

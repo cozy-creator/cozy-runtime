@@ -661,10 +661,12 @@ def test_each_waiting_root_imports_ahead_and_adopts_its_own_process_in_turn(
 
     for n, name in enumerate(names, start=1):
         machine.direct_root(f"D{n}", installation=name)
-    slots = [
-        _wait(lambda name=name: prespawns.slots.get((name, (0,))), f"{name}'s prespawn")
-        for name in names
-    ]
+
+    def slot(name: str) -> prespawn.Slot:
+        found: prespawn.Slot = _wait(lambda: prespawns.slots.get((name, (0,))), f"{name}'s slot")
+        return found
+
+    slots = [slot(name) for name in names]
     assert [s.roots for s in slots] == [{"D1"}, {"D2"}, {"D3"}]
     assert all(s.started.wait(300) and s.ready for s in slots)
     assert all(_placed(machine, f"D{n}") == [] for n in (1, 2, 3)), "A's lease holds the card"

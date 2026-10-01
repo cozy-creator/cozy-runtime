@@ -3702,7 +3702,9 @@ class Executor:
         return answer.descriptor if answer.ok else None
 
     @contextlib.contextmanager
-    def _turns(self, residency: Any, on: bool) -> Iterator[None]:
+    def _turns(
+        self, residency: WeightResidency | _CompositeResidency | None, on: bool
+    ) -> Iterator[None]:
         """`stage/1`: while on, each component-use scope of `residency` asks the worker for its
         turn before it plans and reports what it measured at its exit."""
         rows = (

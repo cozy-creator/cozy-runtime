@@ -54,10 +54,13 @@ from cozy_runtime.author._executor_requests import (
     CheckpointReceipt,
     DeviceRoom,
     Handler,
+    HostTier,
     Publish,
     Published,
     Reply,
     Request,
+    StageEnter,
+    StageExit,
     TreeMember,
     WriterAdopt,
     WriterOutput,
@@ -1612,8 +1615,8 @@ class AttemptEngine:
                 return self.publish(attempt, request)
             case Checkpoint():
                 return self.checkpoint_exchange(attempt, request)
-            case DeviceRoom():
-                return refuse("no_durable_exchange", "a job's executor is granted no device room")
+            case DeviceRoom() | HostTier() | StageEnter() | StageExit():
+                return refuse("no_durable_exchange", "a job's executor holds its whole turn")
             case TreeMember():
                 if self.calls is None:
                     return refuse("child_broker_absent", "no RecordOwner call lane")
