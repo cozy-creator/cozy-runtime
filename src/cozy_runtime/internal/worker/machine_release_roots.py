@@ -324,28 +324,28 @@ class ReleaseRoots:
         its Hub's catalog publishes at or above it serves the call, read once per package
         until the controller that publishes names it to `forget`."""
         package, _, release = locked.partition("@")
-        newest = self.worker.resolutions.newest
-        if (hub, package) not in newest:
-            try:
-                newest[(hub, package)] = machine_release_catalog.newest(
-                    machine_model_resolve.own(self.worker, hub=hub), package
-                )
-            except WorkspaceRefusal:
-                return locked
-        served = newest[(hub, package)]
+        try:
+            served = self._newest(hub, package)
+        except WorkspaceRefusal:
+            return locked
         return _key(package, served) if Version(served) > Version(release) else locked
+
+    def _newest(self, hub: str, package: str) -> str:
+        """A package's newest release at its Hub, read once until `forget` names it."""
+        held = self.worker.resolutions.of(package, hub)
+        if not held.newest:
+            newest = machine_release_catalog.newest(
+                machine_model_resolve.own(self.worker, hub=hub), package
+            )
+            held.keep(lambda kept: setattr(kept, "newest", newest))
+        return held.newest
 
     def describe(self, selection: pb.PackageSelection) -> pb.DescribedRelease:
         """A published release as this machine reads it: the newest when none is named, read
         once until the controller that publishes names the package to `forget`."""
         package, release = selection.package, selection.release
         hub = machine_model_resolve.hub_key(self.worker, selection.hub)
-        newest = self.worker.resolutions.newest
-        if not release:
-            release = newest.get((hub, package)) or machine_release_catalog.newest(
-                machine_model_resolve.own(self.worker, hub=hub), package
-            )
-            newest[(hub, package)] = release
+        release = release or self._newest(hub, package)
         key = _key(package, release)
         held = self._installed(key, hub)
         raw = (
