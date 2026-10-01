@@ -91,6 +91,11 @@ class Slot:
                 sink(frame)
 
 
+#: Installations prewarmed per GPU set at boot: the two it served last, the pair an
+#: alternating workload (SDXL, then Anima, then SDXL) comes back to after a restart.
+PREWARM = 2
+
+
 class Prespawns:
     def __init__(self, worker: Worker) -> None:
         self.worker = worker
@@ -155,15 +160,23 @@ class Prespawns:
             self._request(root, installation, interface, ordinals, emit)
 
     def prewarm(self, owner: str) -> None:
-        """A restarted machine's first calls pay no executor start either: each installation
-        a GPU set served most recently, read from this machine's own journal, starts importing
-        there for no call; a replica of it on that set adopts it."""
+        """A restarted machine's first calls pay no executor start either: the installations
+        each GPU set served most recently (`PREWARM`, the pair a workload alternates between),
+        read from this machine's own journal, start importing there for no call; a replica of
+        one on that set adopts it."""
         assert self.worker.executions is not None
+        chosen: dict[Ordinals, list[str]] = {}
+        readable = set(self.worker.readable_gpus())
         for request, ordinals in self.worker.executions.last_grants(owner):
+            served = chosen.setdefault(ordinals, [])
+            if len(served) >= PREWARM or not set(ordinals) <= readable:
+                continue
             try:
                 shape = machine_lanes.recorded(self.worker, owner, request)
-                if shape.kind == "serving" and set(ordinals) <= set(self.worker.readable_gpus()):
-                    self._request("", shape.template[0], shape.interface, ordinals, None)
+                installation = shape.template[0]
+                if shape.kind == "serving" and installation not in served:
+                    served.append(installation)
+                    self._request("", installation, shape.interface, ordinals, None)
             except Exception as exc:  # a missed saving, never the boot's failure
                 self.worker.note("warm", f"no prewarm from {request}: {exc!r}"[:256])
 

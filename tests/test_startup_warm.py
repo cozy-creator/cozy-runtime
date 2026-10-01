@@ -444,6 +444,18 @@ def _wait(condition: Callable[[], Any], what: str) -> Any:
     raise AssertionError(f"never observed: {what}")
 
 
+def _placed(machine: Warm, root: str) -> list[int]:
+    """The GPUs a direct root's call held its turn on, or was prepared on ahead of it."""
+    return next(
+        (
+            list(body["ordinals"])
+            for _, kind, body in machine.journal(root)
+            if kind in ("gpu.grant", "stage.prepare")
+        ),
+        [],
+    )
+
+
 def _call(parent: str) -> tuple[Call, pb.ChildCallRequest]:
     call = Call(parent, 0, 1, 1, b"", b"", "child-warm", b"", False, b"", "", "")
     return call, pb.ChildCallRequest(parent_attempt_ordinal=1)
@@ -543,7 +555,7 @@ def test_a_slow_download_overlaps_the_executor_imports(warm: Callable[..., Warm]
         executor = slot.executor
         assert executor is not None and executor.alive() and not executor.started
         assert executor.sealed_devices == CARDS[0] and _imported(executor)
-        assert machine.worker._warm((INSTALLATION, "any")) == (0,)
+        assert machine.worker._warm((INSTALLATION, "any")) == ((0,),)
         # Version skew: an older worker still sends its warm; the process answers and stays.
         reply = executor.call(WarmCommand())
         assert reply["ok"] and reply["skipped"] and executor.alive(), reply
@@ -586,7 +598,8 @@ def test_a_waiting_root_imports_while_another_root_holds_its_card_and_its_grant_
         assert slot.roots == {"D"} and slot.started.wait(300) and slot.ready
         executor = slot.executor
         assert executor is not None and executor.alive() and _imported(executor)
-        assert machine.granted("D") == [] and machine.worker.gpu.view()["leases"]["A"] == [0]
+        # A leases the card between its calls: D imports ahead but starts no device there.
+        assert machine.granted("D") == [] and machine.worker.stages.view()["leases"]["A"] == [0]
         prepared = _wait(
             lambda: machine.phases("D").get("Preparing model executor"), "D's prespawn phase"
         )
@@ -630,13 +643,12 @@ def test_a_waiting_root_imports_while_another_root_holds_its_card_and_its_grant_
         origin.close()
 
 
-def test_one_process_imports_ahead_per_card_for_the_root_served_first(
+def test_each_waiting_root_imports_ahead_and_adopts_its_own_process_in_turn(
     warm: Callable[..., Warm],
 ) -> None:
-    """Three roots of three installations wait behind A for the only card. One process
-    imports ahead, for the root first in line, and a started import keeps its place; each
-    claim starts the next one's in the scheduler's order, and every root adopts its own
-    process in turn. Never two unclaimed imports at once."""
+    """Three roots of three installations wait behind A for the only card. Each one's
+    process imports ahead at once (an import holds no GPU), and when A ends each root adopts
+    its own process in the scheduler's order: one spawn each, nothing spawned at a grant."""
     machine = warm()
     prespawns = machine.worker.prespawns
     names = [f"{INSTALLATION}-{n}" for n in (1, 2, 3)]
@@ -647,54 +659,27 @@ def test_one_process_imports_ahead_per_card_for_the_root_served_first(
     machine.tick()
     assert machine.granted(a1) == [0]
 
-    seen: list[prespawn.Slot] = []
-    peak = [0]
-    stop = threading.Event()
-
-    def watch() -> None:
-        while not stop.is_set():
-            with prespawns.lock:
-                current = [s for s in prespawns.slots.values() if s.installation in names]
-            peak[0] = max(peak[0], len(current))
-            seen.extend(s for s in current if all(s is not t for t in seen))
-            time.sleep(0.005)
-
-    watcher = threading.Thread(target=watch, daemon=True)
-    watcher.start()
-    try:
-        # D1 arrives first: its import starts, and the later roots queue behind it.
-        machine.direct_root("D1", installation=names[0])
-        _wait(lambda: seen, "D1's prespawn")
-        machine.direct_root("D2", installation=names[1])
-        machine.direct_root("D3", installation=names[2])
-        _wait(lambda: len(prespawns.asks) == 2, "D2 and D3 asking")
-        first = _wait(lambda: seen[0].started.is_set() and seen[0], "D1's import")
-        assert first.installation == names[0] and first.roots == {"D1"} and first.ready
-        assert list(prespawns.slots.values()) == [first]
-        assert sorted(prespawns.asks) == names[1:]
-
-        notes = len(machine.worker.activity)
-        machine.finish(a1)
-        machine.finish("A")
-        _wait(lambda: len(seen) == 3 and all(s.claimed.is_set() for s in seen), "every claim")
-        machine.tick()
-    finally:
-        stop.set()
-        watcher.join()
-    assert peak[0] == 1, f"{peak[0]} unclaimed imports at once"
-    assert [s.installation for s in seen] == names
-    assert [s.roots for s in seen] == [{"D1"}, {"D2"}, {"D3"}]
-    grants = [
-        [body["ordinals"] for _, kind, body in machine.journal(f"D{n}") if kind == "gpu.grant"]
-        for n in (1, 2, 3)
+    for n, name in enumerate(names, start=1):
+        machine.direct_root(f"D{n}", installation=name)
+    slots = [
+        _wait(lambda name=name: prespawns.slots.get((name, (0,))), f"{name}'s prespawn")
+        for name in names
     ]
-    assert grants == [[[0]], [[0]], [[0]]]
-    assert all(_attempts(machine, name) == [] for name in names)
-    assert all(s.ready and s.supervision.spawns == 1 for s in seen)
+    assert [s.roots for s in slots] == [{"D1"}, {"D2"}, {"D3"}]
+    assert all(s.started.wait(300) and s.ready for s in slots)
+    assert all(_placed(machine, f"D{n}") == [] for n in (1, 2, 3)), "A's lease holds the card"
+
+    notes = len(machine.worker.activity)
+    machine.finish(a1)
+    machine.finish("A")
+    _wait(lambda: all(s.claimed.is_set() for s in slots), "every claim")
+    machine.tick()
+    assert [_placed(machine, f"D{n}") for n in (1, 2, 3)] == [[0], [0], [0]]
+    assert all(s.supervision.spawns == 1 for s in slots)
     steps = [e.step for e in list(machine.worker.activity)[notes:]]
     adopted = [s for s in steps if "adopts prespawned epoch 1" in s]
     assert len(adopted) == 3 and not [s for s in steps if "spawning the device" in s], steps
-    assert prespawns.slots == {} and prespawns.asks == {}
+    assert prespawns.slots == {}
 
 
 def test_a_restarted_machine_prewarms_what_its_card_last_served(
@@ -754,8 +739,8 @@ def test_a_restarted_machine_prewarms_what_its_card_last_served(
             notes = len(second.worker.activity)
             second.direct_root("D2", origin.checkpoint)
             second.tick()
-            grants = [b["ordinals"] for _, k, b in second.journal("D2") if k == "gpu.grant"]
-            assert grants == [[0]] and slot.claimed.is_set() and slot.roots == {"D2"}
+            assert _placed(second, "D2") == [0]
+            assert slot.claimed.is_set() and slot.roots == {"D2"}
             assert slot.supervision.spawns == 1 and executor.epoch == 1
             steps = [e.step for e in list(second.worker.activity)[notes:]]
             assert [s for s in steps if "adopts prespawned epoch 1" in s], steps
@@ -887,11 +872,11 @@ def test_a_host_started_warm_is_adopted_by_the_direct_root_granted_its_card(
     assert prepared["started_unix_ms"] + prepared["elapsed_ms"] < submitted * 1000
 
 
-def test_a_host_started_warm_yields_to_a_root_of_another_installation(
+def test_a_host_started_warm_is_no_reservation_and_waits_for_its_own_root(
     warm: Callable[..., Warm],
 ) -> None:
-    """A process nobody adopted is not a reservation: another installation's root granted
-    its card takes it in the same scheduling pass."""
+    """A process nobody adopted holds no GPU: another installation's root placed on its card
+    runs there at once, and the process stays for the root of its own installation."""
     machine = warm()
     prespawns = machine.worker.prespawns
     prespawns.request_landing(INSTALLATION, _interface(), [{"path": "marco.models.model"}])
@@ -901,11 +886,11 @@ def test_a_host_started_warm_yields_to_a_root_of_another_installation(
     machine.serving("B", "qwen")
     machine.tick()
     assert machine.granted("B") == [0]
-    assert (INSTALLATION, (0,)) not in prespawns.slots and not slot.roots
-    _wait(
-        lambda: not executor.alive() and slot.supervision.current is None,
-        "the unadopted prespawn reclaimed off B's card",
-    )
+    assert prespawns.slots.get((INSTALLATION, (0,))) is slot and executor.alive()
+    machine.direct_root("D")
+    machine.tick()
+    assert machine.granted("D") == [0] and slot.roots == {"D"} and prespawns.slots == {}
+    assert slot.supervision.spawns == 1
 
 
 def test_a_dead_replica_starts_its_successor_while_its_root_waits(

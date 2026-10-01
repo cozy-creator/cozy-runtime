@@ -221,7 +221,7 @@ def test_captured_child_stack_builds_real_cpu_native_view_and_exact_census(tmp_p
             custody="canonical",
             encoded_leaves=False,
         )["ok"]
-        assert worker.gpu.view() == {"leases": {}, "grants": {}, "waiting": {}}
+        assert worker.stages.view() == {"leases": {}, "waiting": {}, "holders": {}, "demands": {}}
         assert not __import__("torch").cuda.is_initialized()
     finally:
         worker.shutdown()
@@ -300,7 +300,12 @@ def test_provider_adapter_acquisition_keeps_recognizable_token_transient(
                 ]
             )
             assert len(graph.layers) == 1 and graph.layers[0].strength == 0.5
-            assert worker.gpu.view() == {"leases": {}, "grants": {}, "waiting": {}}
+            assert worker.stages.view() == {
+                "leases": {},
+                "waiting": {},
+                "holders": {},
+                "demands": {},
+            }
     finally:
         worker.shutdown()
     for path in tmp_path.rglob("*"):

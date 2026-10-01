@@ -475,23 +475,8 @@ class StageScheduler:
 
     def _pass(self, fresh: list[str], prefills: list[tuple[str, tuple[str, str]]]) -> None:
         machine = self.machine()
-        readable = {g.ordinal for g in machine.gpus}
         now = time.monotonic()
-        jobs = [self._job(d, readable, now) for d in self.demands.values()]
-        jobs += [
-            policy.Job(
-                key="lease:" + root,
-                root=root,
-                priority=self.roots[root][0],
-                arrival=self.roots[root][1],
-                phase="gap",
-                gpus=tuple(sorted(held)),
-                lease=True,
-            )
-            for root, held in self.leases.items()
-            if held and root in self.roots
-        ]
-        plan = policy.decide(machine, jobs)
+        plan = policy.decide(machine, self._jobs(machine))
         alone = self._alone()
         for refusal in plan.refusals:
             demand = self.demands[refusal.job]
@@ -536,6 +521,26 @@ class StageScheduler:
             if waiting is not None and prefill.job not in self.prefilled and waiting.gpus:
                 self.prefilled.add(prefill.job)
                 prefills.append((prefill.job, waiting.want.template))
+
+    def _jobs(self, machine: policy.Machine, *extra: _Demand) -> list[policy.Job]:
+        """Every live demand, every root's lease between its calls, and `extra` probes."""
+        readable = {g.ordinal for g in machine.gpus}
+        now = time.monotonic()
+        jobs = [self._job(d, readable, now) for d in (*self.demands.values(), *extra)]
+        jobs += [
+            policy.Job(
+                key="lease:" + root,
+                root=root,
+                priority=self.roots[root][0],
+                arrival=self.roots[root][1],
+                phase="gap",
+                gpus=tuple(sorted(held)),
+                lease=True,
+            )
+            for root, held in self.leases.items()
+            if held and root in self.roots
+        ]
+        return jobs
 
     def _job(self, demand: _Demand, readable: set[int], now: float) -> policy.Job:
         want = demand.want
@@ -651,7 +656,7 @@ class StageScheduler:
                     live[o] = live.get(o, 0) + 1
         for prepare in plan.prepares:
             demand = self.demands[prepare.job]
-            if demand.dispatched or not self._early(demand):
+            if demand.dispatched or not self._early(demand) or self._kept(demand):
                 continue
             seat = (demand.want.template, demand.gpus)
             if seat in engaged or any(live.get(o, 0) >= SEATS for o in demand.gpus):
@@ -668,6 +673,17 @@ class StageScheduler:
                     {"key": demand.key, "ordinals": list(demand.gpus)},
                 )
             )
+
+    def _kept(self, demand: _Demand) -> bool:
+        """Its GPUs are kept from a new device context: another root leases one between its
+        calls (its weights stay as they are for its next call), or a whole turn holds one."""
+        for o in demand.gpus:
+            if any(o in held for r, held in self.leases.items() if r != demand.want.root):
+                return True
+            holder = self.demands.get(self.holder.get(o, ""))
+            if holder is not None and holder.whole and holder.want.root != demand.want.root:
+                return True
+        return False
 
     def _lease(self, root: str, ordinals: set[int], cause: str) -> None:
         if ordinals != self.leases.get(root, set()):
@@ -857,11 +873,8 @@ class StageScheduler:
         """Where a call like `want` would be placed now, for a start ahead of its submission."""
         with self.lock:
             machine = self.machine()
-            readable = {g.ordinal for g in machine.gpus}
             probe = _Demand("probe", want, next(self._arrival), [], StageGraph("", "", ()))
-            jobs = [self._job(d, readable, time.monotonic()) for d in self.demands.values()]
-            jobs.append(msgspec.structs.replace(self._job(probe, readable, 0.0), phase="ready"))
-            plan = policy.decide(machine, jobs)
+            plan = policy.decide(machine, self._jobs(machine, probe))
         for turn in plan.turns:
             if turn.job == "probe":
                 return turn.gpus

@@ -68,6 +68,6 @@ def test_cpu_worker_prepares_and_reuses_owned_adapter_view(tmp_path: Path) -> No
     ]
     # There is no accelerator to reserve on this worker; graph preparation still completed.
     assert worker.options.accelerator_backend == "none"
-    assert worker.gpu.view() == {"leases": {}, "grants": {}, "waiting": {}}
+    assert worker.stages.view() == {"leases": {}, "waiting": {}, "holders": {}, "demands": {}}
     assert not worker.engine.live
     assert worker.supervision.current is None

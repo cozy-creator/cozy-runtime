@@ -68,7 +68,7 @@ def test_later_invalid_adapter_cannot_publish_or_fall_back_to_the_base(tmp_path:
             machine_adapter_views.compose(worker, selected, stack, check=lambda: None)
         assert store.repo_get("local", "base") == before
         assert header(store, base) == original
-        assert worker.gpu.view() == {"leases": {}, "grants": {}, "waiting": {}}
+        assert worker.stages.view() == {"leases": {}, "waiting": {}, "holders": {}, "demands": {}}
         assert not worker.engine.live
         assert worker.supervision.current is None
         # Repeating the same invalid selection still refuses; no partly applied cached view

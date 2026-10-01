@@ -192,13 +192,10 @@ def test_a_load_without_an_assigned_ceiling_is_a_worker_defect() -> None:
 # --------------------------------------------------------------------------- step 3/4
 
 
-def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
-    """Fit is arithmetic over MEASURED bytes, in steps (cr-066, then cr-022): a
-    model-bearing placement takes a lane with room and no other model-bearing tenant; else
-    a lane with measured headroom BESIDE its tenants (co-residency); else a lane whose
-    measured TOTAL holds it alone (time-sliced sharing); else any readable lane (bounded
-    preparation). A lane the driver cannot read is never chosen. Choosing authorizes no
-    bytes, and binding takes exactly the chosen ordinals."""
+def test_placements_bind_exactly_or_are_refused_typed() -> None:
+    """Binding takes exactly the chosen ordinals and authorizes no bytes; a lane the driver
+    cannot read is never bound. Which ordinals an owner placement gets is the stage
+    scheduler's (`test_stage_scheduler`)."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
     assert len(lanes_.lanes) == 3 and lanes_.envelope.ordinals == (0, 1, 2) and lanes_.wide
     measured = {
@@ -206,30 +203,14 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
         1: accel.DeviceMemory("measured", 16 << 30, 24 << 30),
         2: accel.DeviceMemory("unreadable"),
     }
-
-    def place(name: str, declared: int, candidates: tuple[int, ...] = (0, 1, 2)) -> str:
-        ordinals = lanes_.choose(
-            candidates, 1, model_bearing=True, declared_bytes=declared, measured=measured
-        )
-        lane = lanes_.bind(name, ordinals, model_bearing=True, measured=measured)
-        lane.row(name).model_bearing = True
-        return lane.lane_id
-
-    assert place("big", 8 << 30) == "lane-1"  # step 1: the only empty lane with room
-    assert place("small", 2 << 30) == "lane-0"  # step 1 again: lane-0 is still empty
-    assert place("beside", 1 << 30) == "lane-0"  # step 2: headroom beside a tenant
-    assert place("shared", 6 << 30, (0,)) == "lane-0"  # step 3: its total holds it alone
-    assert place("huge", 32 << 30) == "lane-1"  # step 4: bounded preparation, fewest tenants
-    with pytest.raises(lanes.LaneRefusal) as refused:
-        lanes_.choose((2,), 1, model_bearing=True, declared_bytes=1 << 20, measured=measured)
-    assert refused.value.code == "device_lane_infeasible"
+    big = lanes_.bind("big", (1,), model_bearing=True, measured=measured)
+    assert big.lane_id == "lane-1"
+    assert lanes_.bind("beside", (1,), model_bearing=True, measured=measured) is big
     with pytest.raises(lanes.LaneRefusal) as refused:
         lanes_.bind("blind", (2,), model_bearing=True, measured=measured)
     assert refused.value.code == "device_pin_infeasible"
     assert "ordinal 2 ('2') free bytes unreadable" in refused.value.detail
     assert lanes_.lane_of("blind") is None
-    # weightless placements spread over the lanes with the fewest tenants
-    assert lanes_.choose((0, 1, 2), 1, model_bearing=False, declared_bytes=0, measured={}) == (2,)
     lanes_.release("big")
     assert lanes_.lane_of("big") is None and "big" not in lanes_.lanes[1].rows
 
