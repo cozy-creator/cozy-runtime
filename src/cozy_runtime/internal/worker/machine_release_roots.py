@@ -472,6 +472,7 @@ class ReleaseRoots:
                 machine_model_defaults.materialize(
                     worker,
                     models,
+                    cancellation=worker.transfers,
                     progress=lambda done, total: self._note(
                         job, "downloading model weights", done, total
                     ),
@@ -620,6 +621,7 @@ class ReleaseRoots:
                 credentials=credentials,
                 note=note,
                 check=check,
+                cancellation=self.worker.transfers,
             )
             if parameter in given and given[parameter].adapters
             else row

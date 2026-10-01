@@ -8,7 +8,7 @@ import hashlib
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -198,6 +198,8 @@ class Serving:
         self.observers: dict[str, Emit] = {}
         #: the tenth of its download each prefetch last narrated, until the download lands
         self.narrated: dict[str, int] = {}
+        #: the parent each paused preparation's transfer yielded to, by its source request
+        self.paused: dict[str, str] = {}
         # Read leases die with the old process, but durable temporary holds need
         # release through the existing journal after a worker restart.
         workspace = worker.workspace
@@ -329,18 +331,24 @@ class Serving:
             )
 
         record({"event": "start"})
-        completed = False
+        failure: BaseException | None = None
         try:
             with self.phase(call, request, "Downloading model weights"):
                 yield sample
-            completed = True
+        except BaseException as error:
+            failure = error
+            raise
         finally:
             elapsed = time.perf_counter() - started
             fields: dict[str, object] = {
                 "event": "end",
-                "completed": completed,
+                "completed": failure is None,
                 "elapsed_ms": round(elapsed * 1000, 3),
             }
+            if failure is not None:
+                fields["reason"] = str(failure) or type(failure).__name__
+                if call.child_request in self.paused:
+                    fields["paused_for"] = self.paused[call.child_request]
             if landed:
                 first, latest, total = landed
                 fields.update(bytes=latest, total_bytes=total, moved_bytes=latest - first)
@@ -490,9 +498,11 @@ class Serving:
             # A real call still warms its process while awaiting admission.
             warm()
 
-        def stop() -> None:
+        def stop(demand: Hashable | None) -> None:
             with cancellation_lock:
                 if active_token is not None:
+                    if isinstance(demand, tuple):  # (parent request, attempt)
+                        self.paused[source.child_request] = str(demand[0])
                     active_token.cancel()
 
         def load(cancelled: Callable[[], bool]) -> Prepared:
@@ -531,6 +541,7 @@ class Serving:
             finally:
                 with cancellation_lock:
                     active_token = None
+                self.paused.pop(source.child_request, None)
                 assert self.worker.workspace is not None
                 self._release_preparation(owner, source.child_request)
 
@@ -843,6 +854,7 @@ class Serving:
                         credentials=credentials,
                         note=lambda *_: None,
                         check=check_adapter_preparation,
+                        cancellation=cancellation,
                         native_base=original is not None,
                     )
                     if original is not None:
