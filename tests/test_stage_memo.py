@@ -195,3 +195,38 @@ def test_value_gate_stores_only_costly_small_results(tmp_path: Path) -> None:
     assert [name for name, _ in rows].count("memo.call") == 3
     (method,) = [fields for name, fields in rows if name == "memo.method"]
     assert method["misses"] == 3 and method["skips"] == "cheap=1,too_large=1"
+
+
+def test_install_keys_each_component_and_never_fails_a_load() -> None:
+    from types import SimpleNamespace
+
+    device = SimpleNamespace(kind="cpu", sm=0, name="cpu")
+    header = {"components": {"text_encoder": {"w": {"parts": {"value": [1, 2]}}}}, "configs": {}}
+
+    def install(model: Encoder, headers: dict[str, Any]) -> None:
+        stage_memo.install(
+            model,
+            torch=torch,
+            headers=headers,
+            assets=header,
+            plan_rows=[{"component": "text_encoder", "key": "w", "encoding": "plain/1"}],
+            adapters=[],
+            roots={"text_encoder": torch.nn.Linear(2, 2), "vae": torch.nn.Linear(2, 2)},
+            device=device,
+            world=1,
+            sealed={},
+            fusion=None,
+        )
+
+    model = Encoder.for_test()
+    install(model, {"text_encoder": header, "vae": header})
+    Encoder.runs = 0
+    memo = model._cozy_memo
+    assert isinstance(memo, stage_memo.GenerationMemo)
+    assert memo.components["text_encoder"] != memo.components["vae"]
+    model.encode("x")
+    model.encode("x")
+    assert Encoder.runs == 1
+    broken = Encoder.for_test()
+    install(broken, {"text_encoder": {"components": {"text_encoder": object()}}})
+    assert broken._cozy_memo is None, "an unreadable identity serves unmemoized"

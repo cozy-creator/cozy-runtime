@@ -20,6 +20,7 @@ import functools
 import hashlib
 import importlib.metadata
 import inspect
+import logging
 import os
 import struct
 import sys
@@ -47,14 +48,16 @@ from cozy_runtime.author._executor_requests import (
     StageMemoStore,
 )
 from cozy_runtime.author._stage_memo import exactness
+from cozy_runtime.internal import attention
 from cozy_runtime.internal.executor_commands import MemoSettings
 from cozy_runtime.internal.hostfacts import HostFacts
 from cozy_runtime.internal.memo_implementation import describe
-from cozy_runtime.internal.numerical_environment import NumericalEnvironmentRefusal, fingerprint
+from cozy_runtime.internal.numerical_environment import fingerprint
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
+_LOG = logging.getLogger(__name__)
 SCHEMA = "cozy.stage-memo/1"
 CAPABILITY = "stage/1"
 #: A written entry must cost this many times its measured read to produce.
@@ -691,7 +694,6 @@ def install(
     plan_rows: Iterable[Mapping[str, object]],
     adapters: Iterable[Mapping[str, object]],
     roots: Mapping[str, object],
-    sites: Iterable[tuple[str, object, object]],
     device: object,
     world: int,
     sealed: Mapping[str, str],
@@ -700,19 +702,49 @@ def install(
     """Give one constructed generation its memo, once per load. `headers` maps each component
     to the checkpoint header it fills from; `assets` is the header carrying assets and configs.
     In a group only GPU 0 runs package code and commands the others' module calls, so a hit
-    there skips the call on every GPU; the group's width is part of the numerics."""
-    kind, sm, gpu = (getattr(device, name) for name in ("kind", "sm", "name"))
+    there skips the call on every GPU; the group's width is part of the numerics. A
+    generation whose identity cannot be read serves unmemoized, never refused."""
     try:
-        numerical = fingerprint(
-            HostFacts(backend="" if kind == "cpu" else str(kind), gpu_sm=int(sm)),
-            threads=int(torch.get_num_threads()),
-            inherited=sealed,
-        ).hex()
-    except NumericalEnvironmentRefusal:
+        memo = _generation(
+            model,
+            torch,
+            headers,
+            assets,
+            list(plan_rows),
+            list(adapters),
+            roots,
+            device,
+            world,
+            sealed,
+            fusion,
+        )
+    except Exception as exc:  # the memo is an optimization: this load serves without it
+        _LOG.warning("stage memo off for %s: %s", type(model).__qualname__, exc)
         return
-    rows, adapter_rows = list(plan_rows), list(adapters)
+    object.__setattr__(model, "_cozy_memo", memo)
+
+
+def _generation(
+    model: object,
+    torch: ModuleType,
+    headers: Mapping[str, Mapping[str, object]],
+    assets: Mapping[str, object],
+    rows: list[Mapping[str, object]],
+    adapters: list[Mapping[str, object]],
+    roots: Mapping[str, object],
+    device: object,
+    world: int,
+    sealed: Mapping[str, str],
+    fusion: object,
+) -> GenerationMemo:
+    kind, sm, gpu = (getattr(device, name) for name in ("kind", "sm", "name"))
+    numerical = fingerprint(
+        HostFacts(backend="" if kind == "cpu" else str(kind), gpu_sm=int(sm)),
+        threads=int(torch.get_num_threads()),
+        inherited=sealed,
+    ).hex()
     processors: dict[str, list[object]] = {}
-    for component, _module, processor in sites:
+    for component, _module, processor in attention.sites(roots):
         processors.setdefault(component, []).append(processor)
 
     def weights(name: str) -> str:
@@ -725,11 +757,11 @@ def install(
                 tables.get(name) if isinstance(tables, Mapping) else None,
                 configs.get(name) if isinstance(configs, Mapping) else None,
                 sorted((r for r in rows if r.get("component") == name), key=str),
-                [r for r in adapter_rows if r.get("component") == name],
+                [r for r in adapters if r.get("component") == name],
             ]
         )
 
-    memo = GenerationMemo(
+    return GenerationMemo(
         torch=torch,
         environment=environment(type(model).__module__),
         components={name: weights(name) for name in roots},
@@ -737,4 +769,3 @@ def install(
         device=_hash([numerical, str(gpu), fusion, world]),
         sites={name: tuple(found) for name, found in processors.items()},
     )
-    object.__setattr__(model, "_cozy_memo", memo)
