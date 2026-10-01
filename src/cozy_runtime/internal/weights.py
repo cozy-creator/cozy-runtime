@@ -252,9 +252,14 @@ class Weights:
 
     def stage_budget(self, method: str) -> int:
         """The Worker's budget, else what the driver says (`driver_budget`) up to an older
-        Worker's ceiling."""
+        Worker's ceiling. The Worker's grant leaves room for the attempt's largest
+        activations; a stage whose own measured ones are smaller takes the difference (the
+        same device bytes, re-split per stage)."""
         if self.budget >= 0:
-            return self.budget
+            own = self.activation.get(method)
+            if own is None:
+                return self.budget
+            return self.budget + max(max(self.activation.values()) - own, 0)
         driver = self.driver_budget(method)
         return min(driver, self.ceiling) if self.ceiling >= 0 else driver
 
