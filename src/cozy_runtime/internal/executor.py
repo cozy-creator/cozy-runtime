@@ -65,8 +65,8 @@ from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._errors import (
-    CapabilityError,
     Cancelled,
+    CapabilityError,
     InvalidRequest,
     Outcome,
     classify,
@@ -117,6 +117,7 @@ from cozy_runtime.internal import (
     sandbox,
     tolerant,
 )
+from cozy_runtime.internal import weights as weight_stages
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
@@ -163,7 +164,6 @@ from cozy_runtime.internal.parallel.plan import (
     GroupRefusal,
     rank_invariant_digest,
 )
-from cozy_runtime.internal.stages import STAGE_TURNS
 from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
     RESULT_DOCUMENT,
@@ -171,7 +171,7 @@ from cozy_runtime.internal.seam import (
     SeamError,
     connect,
 )
-from cozy_runtime.internal import weights as weight_stages
+from cozy_runtime.internal.stages import STAGE_TURNS
 from cozy_runtime.internal.weights import (
     HostTiers,
     PlaneBackend,

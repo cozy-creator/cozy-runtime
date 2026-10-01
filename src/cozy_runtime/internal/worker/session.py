@@ -102,6 +102,7 @@ from cozy_runtime.internal.executor_commands import (
 )
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.lora_contract import CAPABILITY as LORA_CAPABILITY
+from cozy_runtime.internal.stages import STAGE_TURNS, StageSample, WeightSet
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -163,7 +164,6 @@ from cozy_runtime.internal.worker.lanes import (
 from cozy_runtime.internal.worker.ledger import Ledger, read_host_available, read_vmrss
 from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority, origin_key
-from cozy_runtime.internal.stages import STAGE_TURNS, StageSample, WeightSet
 from cozy_runtime.internal.worker.memory import MemoryManager, StageNeed, plane_capable
 from cozy_runtime.internal.worker.memory import Shortfall as MemoryShortfall
 from cozy_runtime.internal.worker.plan import (
@@ -1506,7 +1506,11 @@ class Worker:
             )
         width = max(
             set(range(1, len(candidates) + 1)).intersection(
-                *({1, *b.sequence_parallel_degrees()} for b in bindings.values() if not b.weightless)
+                *(
+                    {1, *b.sequence_parallel_degrees()}
+                    for b in bindings.values()
+                    if not b.weightless
+                )
             )
         )
         template = (
@@ -2278,9 +2282,7 @@ class Worker:
         """`ctx.release_gpus()`: the attempt's root ends its GPU lease now."""
         if self.executions is not None:
             owner = self.fence.record_owner_id
-            self.stages.release_root(
-                self.executions.scheduling_root(owner, attempt.request_id)[0]
-            )
+            self.stages.release_root(self.executions.scheduling_root(owner, attempt.request_id)[0])
 
     def _machine_call(
         self, attempt: AttemptRecord, request: pb.ChildCallRequest, action: str
@@ -2627,8 +2629,7 @@ class Worker:
             and placement.placement_id.startswith(machine_lanes.REPLICA)
             and placement.device_pin
             and placement.bindings_digest
-            and (placement.installation_id, documents.spell(placement.bindings_digest))
-            == template
+            and (placement.installation_id, documents.spell(placement.bindings_digest)) == template
         }
         return tuple(sorted(sets | set(self.prespawns.sets(template[0]))))
 
@@ -2769,9 +2770,7 @@ class Worker:
             return
         slot = replica.placement.placement_id
         keys = tuple(replica.supervision.current.loaded) if replica.supervision.current else ()
-        self.supervisor.spawn(
-            f"prefill:{key}:{slot}", lambda _: self.memory.prefill(slot, keys)
-        )
+        self.supervisor.spawn(f"prefill:{key}:{slot}", lambda _: self.memory.prefill(slot, keys))
 
     def _waiting_call(self, owner: str, key: str) -> dict[str, str]:
         """The waiting call's function and author label: what waits, not only for what."""
@@ -2792,7 +2791,11 @@ class Worker:
         if target is None:
             return
         others = [blocker for blocker in body["blocked_by"] if blocker != root]
-        why = "behind " + ", ".join(others) if others else "behind this run's other calls"
+        if others:
+            why = "behind " + ", ".join(others)
+        else:
+            held = self.stages.held_by(root)
+            why = f"{len(held)} in use by this run's other calls" if held else "behind itself"
         ordinals = list(body.get("ordinals") or ())
         where = (
             execution_evidence.gpu_names([self.lanes.entries[o] for o in ordinals])
@@ -6565,11 +6568,14 @@ class Worker:
             return refuse("stage_unscheduled", "only an attempt's scopes take turns")
         key = _demand(attempt)
         executor = attempt.executor
-        stopped = (
-            lambda: bool(attempt.canceling)
-            or self.stop.is_set()
-            or (executor is not None and not executor.alive())
-        )
+
+        def stopped() -> bool:
+            return (
+                bool(attempt.canceling)
+                or self.stop.is_set()
+                or (executor is not None and not executor.alive())
+            )
+
         prepared = attempt.prepared
         granted = self.stages.enter(
             key,
@@ -6849,7 +6855,12 @@ class Worker:
                 ),
             )
         poke = attempt.poke
-        attempt.poke = lambda: (poke(), self.stages.wake())
+
+        def woken() -> None:
+            poke()
+            self.stages.wake()
+
+        attempt.poke = woken
         self.stages.take(key, stop=lambda: bool(attempt.canceling) or self.stop.is_set())
 
     @contextlib.contextmanager

@@ -176,14 +176,15 @@ class StageScheduler:
         with self.lock:
             if self.roots.pop(root, None) is None:
                 return
-            self.leases.pop(root, None)
+            self._lease(root, set(), "stopped")
+            self.released.discard(root)
         self.resync()
 
     def release_root(self, root: str) -> None:
         """`root` is done with GPUs: its lease ends now. A call still on its GPUs keeps them to
         its release; its next call waits at its priority like any other. Idempotent."""
         with self.lock:
-            self.leases.pop(root, None)
+            self._lease(root, set(), "released_by_root")
             self.released.add(root)
         self.resync()
 
@@ -529,10 +530,10 @@ class StageScheduler:
                     )
                 )
         for prefill in plan.prefills:
-            demand = self.demands.get(prefill.job)
-            if demand is not None and prefill.job not in self.prefilled and demand.gpus:
+            waiting = self.demands.get(prefill.job)
+            if waiting is not None and prefill.job not in self.prefilled and waiting.gpus:
                 self.prefilled.add(prefill.job)
-                prefills.append((prefill.job, demand.want.template))
+                prefills.append((prefill.job, waiting.want.template))
 
     def _job(self, demand: _Demand, readable: set[int], now: float) -> policy.Job:
         want = demand.want
@@ -592,8 +593,12 @@ class StageScheduler:
         if demand.key.startswith("hold:"):
             return
         root = demand.want.root
+        for other, held in list(self.leases.items()):
+            if other != root and held & set(demand.gpus):
+                self._lease(other, held - set(demand.gpus), f"yielded to {demand.key}")
         if root in self.roots and root not in self.released and _child(demand.key, root):
-            self.leases.setdefault(root, set()).update(demand.gpus)
+            held = self.leases.get(root, set()) | set(demand.gpus)
+            self._lease(root, held, f"granted {demand.key}")
         first = not demand.granted
         if first:
             demand.granted = True
@@ -646,6 +651,21 @@ class StageScheduler:
             for o in demand.gpus:
                 live[o] = live.get(o, 0) + 1
             fresh.append(demand.key)
+            self.events.append(
+                (
+                    demand.want.root,
+                    "stage.prepare",
+                    {"key": demand.key, "ordinals": list(demand.gpus)},
+                )
+            )
+
+    def _lease(self, root: str, ordinals: set[int], cause: str) -> None:
+        if ordinals != self.leases.get(root, set()):
+            self.events.append((root, "gpu.lease", {"ordinals": sorted(ordinals), "cause": cause}))
+        if ordinals:
+            self.leases[root] = ordinals
+        else:
+            self.leases.pop(root, None)
 
     def _running(self, key: str) -> bool:
         demand = self.demands.get(key)
@@ -790,10 +810,25 @@ class StageScheduler:
                 return {**status, "phase": "holding", "ordinals": sorted(self.leases[request])}
             return status
 
+    def held_by(self, root: str) -> set[int]:
+        """GPUs a root's calls hold or are prepared on now."""
+        with self.lock:
+            return {
+                o
+                for d in self.demands.values()
+                if d.want.root == root and (d.running or d.dispatched)
+                for o in d.gpus
+            }
+
     def view(self) -> Document:
         with self.lock:
             return {
                 "leases": {root: sorted(held) for root, held in self.leases.items()},
+                "waiting": {
+                    key: [d.waiting[1] or d.want.root]
+                    for key, d in self.demands.items()
+                    if d.waiting is not None
+                },
                 "holders": {str(o): key for o, key in sorted(self.holder.items())},
                 "demands": {
                     key: {"gpus": list(d.gpus), "dispatched": d.dispatched, "whole": d.whole}

@@ -144,7 +144,12 @@ class Prespawns:
             return
         excluded = tuple(o for o in range(len(self.worker.lanes.entries)) if o not in readable)
         ordinals = self.worker.stages.predict(
-            Want(root=root or installation, widths=(width,), template=(installation, ""), exclude=excluded)
+            Want(
+                root=root or installation,
+                widths=(width,),
+                template=(installation, ""),
+                exclude=excluded,
+            )
         )
         if ordinals:
             self._request(root, installation, interface, ordinals, emit)

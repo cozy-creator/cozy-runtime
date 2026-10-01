@@ -16,15 +16,14 @@ import pytest
 
 from cozy_runtime.author import Model, uses_components
 from cozy_runtime.author._model import component_use
+from cozy_runtime.internal import weight_policy
 from cozy_runtime.internal.stages import (
     CostBook,
-    RegionSet,
     StageCost,
     StageKind,
     StageSample,
-    floor_bytes,
+    WeightSet,
     observed_graph,
-    stage_seconds,
     static_graph,
 )
 from cozy_runtime.internal.worker.stage_policy import (
@@ -38,6 +37,7 @@ from cozy_runtime.internal.worker.stage_policy import (
     Turn,
     Wait,
     decide,
+    floor,
     load_s,
     refusal,
 )
@@ -53,12 +53,12 @@ def ns(seconds: float) -> int:
 
 def sets(
     model: str, spec: dict[str, dict[str, list[int] | int]], *names: str
-) -> tuple[RegionSet, ...]:
+) -> tuple[WeightSet, ...]:
     rows = []
     for name in names:
         row = spec[name]
         assert isinstance(row["common"], int) and isinstance(row["blocks"], list)
-        rows.append(RegionSet(f"{model}:{name}", name, row["common"], tuple(row["blocks"])))
+        rows.append(WeightSet(f"{model}:{name}", name, row["common"], tuple(row["blocks"])))
     return tuple(rows)
 
 
@@ -69,7 +69,7 @@ def measured(wall: float, *, gap: float = 0.0, growth: int = 0, floor: int = 0) 
 def stage(
     model: str,
     method: str,
-    regions: tuple[RegionSet, ...],
+    regions: tuple[WeightSet, ...],
     calls: int = 1,
     cost: dict[int, StageCost] | None = None,
 ) -> JobStage:
@@ -180,7 +180,8 @@ class Sdxlish(Model[object]):
 
 def test_the_graph_is_inferred_from_the_scopes_a_package_already_declares() -> None:
     use = {"Sdxlish": component_use(Sdxlish)}
-    opaque = static_graph("sdxl/generate", SDXL["cell"], use)
+    declared = (c for names in use["Sdxlish"].values() for c in names)
+    opaque = static_graph("sdxl/generate", SDXL["cell"], "sdxl", declared)
     assert not opaque.observed and len(opaque.stages) == 1
     assert set(opaque.stages[0].kind.components) == {
         "text_encoder",
@@ -267,9 +268,9 @@ def test_a_failed_call_forgets_its_growth_but_keeps_the_graph_and_the_floor() ->
 
 
 def steady_pass(compute: list[float], sizes: list[int], resident: list[bool], link: float) -> float:
-    return stage_seconds(compute, sizes, resident, link, passes=2) - stage_seconds(
-        compute, sizes, resident, link, passes=1
-    )
+    """C2's per-region event model (`weight_policy.simulate`), two regions in flight."""
+    streamed = [not hot for hot in resident]
+    return weight_policy.simulate(sizes, compute, streamed, 2, link * 1e9)
 
 
 def proportional(step_s: float, sizes: list[int]) -> list[float]:
@@ -288,7 +289,8 @@ def test_overlapped_streaming_hides_the_tail_sdxl_streamed_synchronously_at_3_gi
     compute = proportional(SDXL["step_s"], sizes)
 
     pinned = steady_pass(compute, sizes, resident, LAPTOP["pinned_gbps"])
-    assert pinned == pytest.approx(SDXL["step_s"], rel=0.01)  # 2.64 GB at 11.9 GB/s hides
+    # 2.64 GB at 11.9 GB/s hides; what is left is the model's per-copy and per-block costs
+    assert pinned == pytest.approx(SDXL["step_s"], rel=0.02)
     assert SDXL["streamed_3gib"]["step_s"] > 2.5 * pinned  # the recorded synchronous step
 
     disk = steady_pass(compute, sizes, resident, LAPTOP["disk_gbps"])
@@ -333,6 +335,7 @@ def test_the_next_model_prepares_and_prefills_while_sdxl_denoises_then_takes_the
     machine = Machine((laptop(resident={unet.content: unet.total}),), laptop_host(*sdxl))
     running = Job(
         key="sdxl-1",
+        root="sdxl-1",
         priority=0,
         arrival=1,
         stages=sdxl,
@@ -341,7 +344,7 @@ def test_the_next_model_prepares_and_prefills_while_sdxl_denoises_then_takes_the
         gpus=(0,),
         warm=((0,),),
     )
-    queued = Job(key="anima-2", priority=0, arrival=2, stages=anima)
+    queued = Job(key="anima-2", root="anima-2", priority=0, arrival=2, stages=anima)
 
     plan = decide(machine, [running, queued])
     assert plan.turns == ()
@@ -352,12 +355,28 @@ def test_the_next_model_prepares_and_prefills_while_sdxl_denoises_then_takes_the
     assert plan.prefetches == (Prefetch("sdxl-1", (0,), 2),)  # SDXL's decode comes first
 
     decoding = Job(
-        key="sdxl-1", priority=0, arrival=1, stages=sdxl, phase="running", at=2, gpus=(0,)
+        key="sdxl-1",
+        root="sdxl-1",
+        priority=0,
+        arrival=1,
+        stages=sdxl,
+        phase="running",
+        at=2,
+        gpus=(0,),
     )
     assert decide(machine, [decoding, queued]).prefetches == (Prefetch("anima-2", (0,), 0),)
 
     # Past its last observed stage SDXL is on the CPU (pixels, WebP): it claims nothing.
-    tail = Job(key="sdxl-1", priority=0, arrival=1, stages=sdxl, phase="gap", at=3, gpus=(0,))
+    tail = Job(
+        key="sdxl-1",
+        root="sdxl-1",
+        priority=0,
+        arrival=1,
+        stages=sdxl,
+        phase="gap",
+        at=3,
+        gpus=(0,),
+    )
     assert decide(machine, [tail, queued]).turns == (Turn("anima-2", (0,), 0, False),)
 
 
@@ -374,8 +393,8 @@ def test_a_pinned_model_returns_at_link_speed_instead_of_the_recorded_refill() -
 def test_equal_priority_jobs_on_one_gpu_run_in_arrival_order() -> None:
     sdxl = sdxl_stages()
     machine = Machine((laptop(),), laptop_host(*sdxl))
-    first = Job(key="a", priority=0, arrival=1, stages=sdxl, gpus=(0,))
-    second = Job(key="b", priority=0, arrival=2, stages=sdxl, gpus=(0,))
+    first = Job(key="a", root="a", priority=0, arrival=1, stages=sdxl, gpus=(0,))
+    second = Job(key="b", root="b", priority=0, arrival=2, stages=sdxl, gpus=(0,))
     plan = decide(machine, [second, first])
     assert plan.turns == (Turn("a", (0,), 0, False),)
     assert plan.waits == (Wait("b", "a"),)
@@ -386,7 +405,7 @@ def test_equal_priority_jobs_on_one_gpu_run_in_arrival_order() -> None:
 
 def h3_long_form(gap: float) -> tuple[JobStage, ...]:
     """The next segment's first stage after the MP4 finish of the previous one."""
-    te = RegionSet("h3:text_encoder", "text_encoder", H3["text_encoder_bytes"])
+    te = WeightSet("h3:text_encoder", "text_encoder", H3["text_encoder_bytes"])
     return (
         stage(
             "h3",
@@ -416,21 +435,32 @@ def test_a_qwen_image_fills_the_h3_mp4_finish_gap_stage_by_stage() -> None:
     te = h3[0].sets[0]
     qwen = qwen_stages()
     machine = Machine((h100(0, {te.content: te.total}),), h100_host(*qwen))
-    h3_job = Job(key="h3", priority=0, arrival=1, stages=h3, phase="gap", gpus=(0,), warm=((0,),))
+    h3_job = Job(
+        key="h3", root="h3", priority=0, arrival=1, stages=h3, phase="gap", gpus=(0,), warm=((0,),)
+    )
 
-    fresh = Job(key="qwen", priority=0, arrival=2, stages=qwen)
+    fresh = Job(key="qwen", root="qwen", priority=0, arrival=2, stages=qwen)
     assert decide(machine, [h3_job, fresh]).turns == (Turn("qwen", (0,), 0, True),)
 
     # 1.6 s into the gap the 6.8 s loop plus 0.6 s of DiT load still ends before it does.
     h3_later = Job(
-        key="h3", priority=0, arrival=1, stages=h3, phase="gap", gpus=(0,), elapsed_s=1.6
+        key="h3", root="h3", priority=0, arrival=1, stages=h3, phase="gap", gpus=(0,), elapsed_s=1.6
     )
-    denoising = Job(key="qwen", priority=0, arrival=2, stages=qwen, at=1, gpus=(0,), warm=((0,),))
+    denoising = Job(
+        key="qwen", root="qwen", priority=0, arrival=2, stages=qwen, at=1, gpus=(0,), warm=((0,),)
+    )
     assert decide(machine, [h3_later, denoising]).turns == (Turn("qwen", (0,), 1, True),)
 
     # 12 s in, it would not: Qwen waits and H3's segment starts on time.
     h3_late = Job(
-        key="h3", priority=0, arrival=1, stages=h3, phase="gap", gpus=(0,), elapsed_s=12.0
+        key="h3",
+        root="h3",
+        priority=0,
+        arrival=1,
+        stages=h3,
+        phase="gap",
+        gpus=(0,),
+        elapsed_s=12.0,
     )
     plan = decide(machine, [h3_late, denoising])
     assert plan.turns == () and plan.waits == (Wait("qwen", "h3"),)
@@ -438,9 +468,15 @@ def test_a_qwen_image_fills_the_h3_mp4_finish_gap_stage_by_stage() -> None:
 
 def test_no_bubble_in_an_unmeasured_gap_or_over_the_next_stage() -> None:
     qwen = qwen_stages()
-    fresh = Job(key="qwen", priority=0, arrival=2, stages=qwen)
+    fresh = Job(key="qwen", root="qwen", priority=0, arrival=2, stages=qwen)
     unmeasured = Job(
-        key="h3", priority=0, arrival=1, stages=h3_long_form(gap=0.0), phase="gap", gpus=(0,)
+        key="h3",
+        root="h3",
+        priority=0,
+        arrival=1,
+        stages=h3_long_form(gap=0.0),
+        phase="gap",
+        gpus=(0,),
     )
     machine = Machine((h100(0),), h100_host(*qwen))
     plan = decide(machine, [unmeasured, fresh])
@@ -448,7 +484,7 @@ def test_no_bubble_in_an_unmeasured_gap_or_over_the_next_stage() -> None:
 
     h3 = h3_long_form(gap=H3["x264_finish_s"])
     crowded = h100(0, {h3[0].sets[0].content: H100["vram_bytes"] - 10**9})
-    busy = Job(key="h3", priority=0, arrival=1, stages=h3, phase="gap", gpus=(0,))
+    busy = Job(key="h3", root="h3", priority=0, arrival=1, stages=h3, phase="gap", gpus=(0,))
     assert decide(Machine((crowded,), h100_host(*qwen)), [busy, fresh]).turns == ()
 
 
@@ -456,10 +492,10 @@ def test_no_bubble_in_an_unmeasured_gap_or_over_the_next_stage() -> None:
 
 
 def h3_stages(*widths: int) -> tuple[JobStage, ...]:
-    te = RegionSet("h3:text_encoder", "text_encoder", H3["text_encoder_bytes"])
-    dit = RegionSet("h3:dit", "dit", 0, (H3["dit_block_bytes_derived"],) * H3["dit_blocks"])
-    video = RegionSet("h3:video_vae", "video_vae", H3["video_vae_bytes"])
-    audio = RegionSet("h3:audio_vae", "audio_vae", H3["audio_vae_bytes"])
+    te = WeightSet("h3:text_encoder", "text_encoder", H3["text_encoder_bytes"])
+    dit = WeightSet("h3:dit", "dit", 0, (H3["dit_block_bytes_derived"],) * H3["dit_blocks"])
+    video = WeightSet("h3:video_vae", "video_vae", H3["video_vae_bytes"])
+    audio = WeightSet("h3:audio_vae", "audio_vae", H3["audio_vae_bytes"])
     row = {w: H3["widths"][str(w)] for w in widths}
     return (
         stage(
@@ -502,6 +538,7 @@ def test_width_follows_recorded_ulysses_scaling_and_what_is_already_running(
     tail = stages[2].cost[2].wall_s + stages[3].cost[2].wall_s
     other = Job(
         key="other",
+        root="other",
         priority=0,
         arrival=1,
         stages=stages,
@@ -510,7 +547,7 @@ def test_width_follows_recorded_ulysses_scaling_and_what_is_already_running(
         gpus=(2, 3),
         elapsed_s=sample + tail - remaining,
     )
-    job = Job(key="next", priority=0, arrival=2, stages=stages, widths=(1, 2, 4))
+    job = Job(key="next", root="next", priority=0, arrival=2, stages=stages, widths=(1, 2, 4))
     plan = decide(four_h100(stages), [other, job])
     if now:
         assert plan.turns == (Turn("next", chosen, 0, False),)
@@ -522,7 +559,7 @@ def test_unmeasured_work_takes_the_widest_width_the_machine_forms() -> None:
     stages = h3_stages()  # no costs recorded yet
     plan = decide(
         four_h100(stages),
-        [Job(key="first", priority=0, arrival=1, stages=stages, widths=(1, 2, 4))],
+        [Job(key="first", root="first", priority=0, arrival=1, stages=stages, widths=(1, 2, 4))],
     )
     assert plan.turns == (Turn("first", (0, 1, 2, 3), 0, False),)
 
@@ -535,8 +572,8 @@ def test_independent_jobs_run_at_once_each_where_its_weights_are() -> None:
         laptop_host(*sdxl, *anima),
     )
     jobs = [
-        Job(key="sdxl", priority=0, arrival=1, stages=sdxl),
-        Job(key="anima", priority=0, arrival=2, stages=anima),
+        Job(key="sdxl", root="sdxl", priority=0, arrival=1, stages=sdxl),
+        Job(key="anima", root="anima", priority=0, arrival=2, stages=anima),
     ]
     assert decide(machine, jobs).turns == (
         Turn("sdxl", (1,), 0, False),
@@ -550,9 +587,9 @@ def test_independent_jobs_run_at_once_each_where_its_weights_are() -> None:
 def test_refused_only_below_the_floor_and_with_numbers() -> None:
     qwen = qwen_stages()
     encode = qwen[0].sets[0]
-    need = floor_bytes(qwen[0].sets, 0, 0)
-    assert need == encode.common + encode.largest
-    job = Job(key="qwen", priority=0, arrival=1, stages=qwen)
+    need = floor(qwen[0].sets, 0)
+    assert need == encode.common + max(encode.blocks)
+    job = Job(key="qwen", root="qwen", priority=0, arrival=1, stages=qwen)
 
     small = Machine((laptop(total=2 << 30),), laptop_host())
     refused = refusal(job, small)
@@ -571,6 +608,6 @@ def test_a_mode_specific_peak_never_refuses_sdxl_at_1_gib() -> None:
     sdxl = sdxl_stages()
     assert sdxl[2].cost[1].growth > 1 << 30
     one_gib = Machine((laptop(total=1 << 30),), laptop_host(*sdxl))
-    job = Job(key="sdxl", priority=0, arrival=1, stages=sdxl)
+    job = Job(key="sdxl", root="sdxl", priority=0, arrival=1, stages=sdxl)
     assert refusal(job, one_gib) is None
     assert decide(one_gib, [job]).turns == (Turn("sdxl", (0,), 0, False),)

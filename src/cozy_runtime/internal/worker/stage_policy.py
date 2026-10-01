@@ -257,7 +257,12 @@ def refusal(job: Job, machine: Machine) -> Refusal | None:
             kind = stage.kind
             named = f"stage {kind.method} ({', '.join(kind.components)}) needs {need} bytes per GPU"
             if worst is None or need - capacity < worst[0]:
-                worst = (need - capacity, need, capacity, f"{named}; GPU {ordinal} holds {capacity}")
+                worst = (
+                    need - capacity,
+                    need,
+                    capacity,
+                    f"{named}; GPU {ordinal} holds {capacity}",
+                )
             break
         else:
             return None
@@ -289,6 +294,8 @@ def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
     refusals: list[Refusal] = []
     idle = dict.fromkeys(gpus, True)
     claim: Claims = {}
+    #: gpu -> the job whose turn holds it now
+    holder: dict[int, Job] = {}
     #: gpu -> predicted seconds until a newly placed job could start there
     free_at = dict.fromkeys(gpus, 0.0)
     #: job -> the GPU set it holds, is placed on, or prepares on
@@ -298,7 +305,7 @@ def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
     for job in order:
         if job.phase == "running":
             busy.add(job.key)
-            _take(job.gpus, job, idle, claim)
+            _take(job.gpus, job, idle, claim, holder)
             for o in job.gpus:
                 free_at[o] += remaining_s(job, len(job.gpus))
 
@@ -317,7 +324,7 @@ def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
             if (refusing := refusal(job, machine)) is not None:
                 refusals.append(refusing)
                 continue
-            placed = _place(job, machine, idle, claim, free_at)
+            placed = _place(job, machine, idle, claim, holder, free_at)
             if isinstance(placed, Wait):
                 waits.append(placed)
                 continue
@@ -326,11 +333,11 @@ def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
             if bubble is not None and job.phase == "ready":
                 turns.append(Turn(job.key, chosen, job.at, bubble))
                 busy.add(job.key)
-                _take(chosen, job, idle, claim)
+                _take(chosen, job, idle, claim, holder)
             else:
                 prepares.append(Prepare(job.key, chosen))
                 if job.phase == "ready":
-                    waits.append(Wait(job.key, _blocker(chosen, claim, job)))
+                    waits.append(Wait(job.key, _blocker(chosen, claim, holder, job)))
             for o in chosen:
                 claim.setdefault(o, (job, 0.0))
                 free_at[o] += remaining_s(job, len(chosen))
@@ -344,9 +351,9 @@ def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
             if all(idle.get(o, False) for o in job.gpus) and fits is not None:
                 turns.append(Turn(job.key, job.gpus, job.at, fits))
                 busy.add(job.key)
-                _take(job.gpus, job, idle, claim)
+                _take(job.gpus, job, idle, claim, holder)
             else:
-                waits.append(Wait(job.key, _blocker(job.gpus, claim, job)))
+                waits.append(Wait(job.key, _blocker(job.gpus, claim, holder, job)))
         elif job.phase == "preparing":
             prepares.append(Prepare(job.key, job.gpus))
         wait = gap_left(job, width) if job.phase == "gap" else 0.0
@@ -376,16 +383,38 @@ def gap_left(job: Job, width: int) -> float:
     return max(0.0, gap_s(job.stages[job.at], width) - job.elapsed_s)
 
 
-def _take(chosen: Sequence[int], job: Job, idle: dict[int, bool], claim: Claims) -> None:
+def _take(
+    chosen: Sequence[int],
+    job: Job,
+    idle: dict[int, bool],
+    claim: Claims,
+    holder: dict[int, Job],
+) -> None:
     for o in chosen:
         idle[o] = False
+        holder[o] = job
         claim.setdefault(o, (job, 0.0))
 
 
-def _blocker(chosen: Sequence[int], claim: Claims, job: Job) -> str:
-    return next(
-        (claim[o][0].root for o in chosen if o in claim and claim[o][0].root != job.root), ""
-    )
+def _ahead(holder: Job, job: Job) -> bool:
+    """Whether `holder`'s claim keeps `job` off a GPU: another root's always; its own root's
+    only while that earlier call still waits for its turn (FIFO within a root). A root's own
+    gaps and holds never block its next call."""
+    if holder is job:
+        return False
+    if holder.root != job.root:
+        return True
+    return not holder.lease and holder.phase in ("ready", "preparing")
+
+
+def _blocker(chosen: Sequence[int], claim: Claims, holder: Mapping[int, Job], job: Job) -> str:
+    """The root `job` is named behind: one whose turn holds a GPU it needs (its own root when
+    only its own calls do), else the earliest root that claims one. Naming who holds before
+    who merely waits keeps two waiting roots from naming each other."""
+    held = [holder[o] for o in chosen if o in holder and holder[o] is not job]
+    if held:
+        return next((h.root for h in held if h.root != job.root), job.root)
+    return next((claim[o][0].root for o in chosen if o in claim and _ahead(claim[o][0], job)), "")
 
 
 def _bubble(
@@ -394,7 +423,7 @@ def _bubble(
     """False: `job` may start its stage on `chosen` outright. True: only as a bubble inside an
     earlier root's CPU gap, which it fits in time and beside that job's next stage in VRAM.
     None: it may not start now."""
-    holders = [claim[o] for o in chosen if o in claim and claim[o][0].root != job.root]
+    holders = [claim[o] for o in chosen if o in claim and _ahead(claim[o][0], job)]
     if not holders:
         return False
     if job.at >= len(job.stages) or any(wait <= 0.0 for _, wait in holders):
@@ -422,7 +451,12 @@ def _bubble(
 
 
 def _place(
-    job: Job, machine: Machine, idle: Mapping[int, bool], claim: Claims, free_at: Mapping[int, float]
+    job: Job,
+    machine: Machine,
+    idle: Mapping[int, bool],
+    claim: Claims,
+    holder: Mapping[int, Job],
+    free_at: Mapping[int, float],
 ) -> tuple[tuple[int, ...], bool | None] | Wait:
     """The set with the earliest predicted finish and whether it starts now (as a bubble or
     outright; None: it waits there). Unmeasured jobs take the widest width the machine forms.
@@ -441,14 +475,17 @@ def _place(
         for chosen in itertools.combinations(usable, width):
             now = all(idle[o] for o in chosen)
             bubble = _bubble(job, chosen, gpus, machine.host, claim) if now else None
-            start = 0.0 if bubble is not None else max(_free(o, job, claim, free_at) for o in chosen)
+            start = (
+                0.0 if bubble is not None else max(_free(o, job, claim, free_at) for o in chosen)
+            )
             spawn = 0.0 if chosen in job.warm else machine.host.spawn_s
             load = max(load_s(needed, gpus[o], machine.host) for o in chosen)
             finish = max(start, spawn) + load + (remaining_s(job, width) if measured else 0.0)
-            rows.append(((finish, -width, spawn + load, chosen), chosen, bubble, start))
+            rank = (finish, -width, spawn + load, chosen not in job.warm, chosen)
+            rows.append((rank, chosen, bubble, start))
     _, chosen, bubble, start = min(rows, key=lambda row: row[0])
     if bubble is None and start == INF and len(rows) > 1:
-        return Wait(job.key, _blocker(chosen, claim, job))
+        return Wait(job.key, _blocker(chosen, claim, holder, job))
     return chosen, bubble
 
 
