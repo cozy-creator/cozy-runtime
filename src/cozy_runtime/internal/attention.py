@@ -727,6 +727,11 @@ def _sites(roots: Mapping[str, object]) -> Iterator[tuple[str, Any, Any]]:
         yield component, module, processor
 
 
+def sites(roots: Mapping[str, object]) -> list[tuple[str, object, object]]:
+    """Every runtime-selectable attention site: (component, module, processor)."""
+    return list(_sites(roots))
+
+
 def _head_dim(module: Any) -> int:
     """This site's per-head dimension, or 0 when the module does not say.
 

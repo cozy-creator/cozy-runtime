@@ -95,6 +95,15 @@ class Release(msgspec.Struct, frozen=True, kw_only=True):
     package_interface: str = ""
 
 
+class MemoSettings(msgspec.Struct, frozen=True, kw_only=True):
+    """The Worker's answer to an executor that lists `memo: stage/1` (tracker #298)."""
+
+    #: The executor's in-memory tier; 0 turns it off, -1 is the executor's own default.
+    process_bytes: int = -1
+    #: The largest result the Worker's machine tier takes; 0 turns that tier off.
+    entry_bytes: int = 0
+
+
 class Start(Command, frozen=True, kw_only=True, tag="start"):
     devices: str = ""
     sequence_parallel_degree: int = 1
@@ -103,6 +112,8 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: Import torch, the Runtime and the package and stop: no device is touched. Sent only to
     #: an executor whose hello lists `import_only`; an older one would ignore it and start.
     import_only: bool = False
+    #: Absent from an older Worker: the executor keeps its in-memory tier at its default.
+    memo: MemoSettings | None = None
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)

@@ -54,6 +54,8 @@ from cozy_runtime.author._loader import (
     Scheduler,
     loading,
 )
+from cozy_runtime.author._memo import MemoDependency, declare
+from cozy_runtime.author._stage_memo import StageMemo, inexact, memoized
 
 _LOG = logging.getLogger(__name__)
 
@@ -270,12 +272,20 @@ def remote_scope(model: object) -> tuple[str, tuple[str, ...]] | None:
 
 def uses_components(
     *names: str,
+    memoize: bool = False,
+    memo_version: str | None = None,
+    memo_dependencies: tuple[MemoDependency, ...] = (),
 ) -> Callable[[Callable[Concatenate[M, P], R]], Callable[Concatenate[M, P], R]]:
     """Declare the possible heavyweight component set of ONE public `Model` method.
 
     A component-use contract, not a phase declaration: while this method executes, any
     branch may touch these components. Omitted means ALL (conservatively safe); explicitly
     empty REFUSES — a method touching no components is module code, not a Model method.
+
+    `memoize=True` marks an encoder-like method whose result is a pure function of its
+    code, declared helpers (`memo_dependencies`, `memo_version` as on `@invocable`), the
+    components' weights, its arguments and the numerics it runs under. The Runtime checks
+    for a stored result before the scope opens, so a hit stages nothing.
     """
     if not names:
         raise ConformanceError(
@@ -313,6 +323,9 @@ def uses_components(
             )
         _check_signature(fn)
         wrapper = _async_wrapper(fn, components) if _is_async(fn) else _sync_wrapper(fn, components)
+        if memoize or memo_version is not None or memo_dependencies:
+            declare(fn, memoize=memoize, version=memo_version, dependencies=memo_dependencies)
+            wrapper = memoized(fn, wrapper, components, is_async=_is_async(fn))
         declared: _Declared = cast("_Declared", wrapper)
         declared.__uses_components__ = components
         return wrapper
@@ -413,6 +426,7 @@ def _tiled_retry(model: Any, method: str, modules: list[Any]) -> Iterator[None]:
     if plane.torch is not None and plane.kind == "cuda":
         plane.torch.cuda.empty_cache()
     plane.backend.stage_log.append({"method": method, "action": "decode retried tiled after OOM"})
+    inexact()
     _LOG.warning("%s: decode retried tiled after OOM", method)
     untiled = [m for m in modules if not getattr(m, "use_tiling", False)]
     for module in untiled:
@@ -548,6 +562,8 @@ class Model[PipelineT]:
     reason a scope works without one: a test double has no bytes to stage."""
     _cozy_placement: Placement | None = None
     """Runtime-installed on the first GPU of a group that hosts a component on another."""
+    _cozy_memo: StageMemo | None = None
+    """Runtime-installed: where `memoize=True` methods look before their scope opens."""
 
     def __init_subclass__(cls, /, **keywords: str) -> None:
         """The class-keyword plane is exactly `encoded_leaves` and `fusion` (model-code-fit
