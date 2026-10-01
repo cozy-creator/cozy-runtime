@@ -69,6 +69,19 @@ def observe_await() -> None:
             activity.change(0, unknown=True)
 
 
+@contextlib.contextmanager
+def blocked() -> Iterator[None]:
+    """A wait for another call's turn is not this call's work."""
+    activity = _CURRENT.get()
+    if activity is not None:
+        activity.change(-1)
+    try:
+        yield
+    finally:
+        if activity is not None:
+            activity.change(1)
+
+
 def author_done() -> None:
     """Freeze an adapter's author clock before framework event-loop shutdown."""
     if (activity := _CURRENT.get()) is not None:

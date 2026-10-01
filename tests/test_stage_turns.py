@@ -22,6 +22,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from cozy_runtime.author._activity import observing  # noqa: E402
 from cozy_runtime.author._executor_requests import (  # noqa: E402
     Answer,
     Handler,
@@ -165,6 +166,41 @@ def test_past_its_last_stage_a_call_gives_its_bytes_back_to_the_one_waiting(
         waiting.join(30)
         assert granted == [Grant((0,), True)]
         assert executor.weights.budget == 0, "A unmapped its weights at its last exit"
+    finally:
+        executor.close()
+
+
+def test_a_scope_waiting_for_its_turn_is_not_counted_as_execution(
+    machine: Machine, tmp_path: Path
+) -> None:
+    worker = machine.worker
+    worker._turning.update({"inst-a": True, "inst-b": True})
+    worker.stages.open_root("A", 1)
+    worker.stages.open_root("B", 2)
+    worker.stages.want("A#1", Want(root="A", template=("inst-a", "b"), entrypoint="generate"))
+    worker.stages.want("B#1", Want(root="B", template=("inst-b", "b"), entrypoint="generate"))
+    kind = worker.stages.kind("A#1", "render", ("transformer",))
+    assert worker.stages.enter("A#1", kind, lambda: False) == Grant((0,), True)
+    handler, _ = tenant(machine, "tenant-b", "B")
+    executor = Seamed(tmp_path, handler)
+    active: list[bool] = []
+    x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(7)).half()
+
+    def call() -> None:
+        with observing(lambda _sequence, on, _known, _finished: active.append(on)):
+            executor.scope(x)
+
+    running = threading.Thread(target=call)
+    running.start()
+    try:
+        bound = time.monotonic() + 30  # a hang bound on a loaded box, not a budget
+        while not worker.stages.view()["demands"]["B#1"]["asking"]:
+            assert time.monotonic() < bound
+            time.sleep(0.01)
+        assert active == [True, False], "the wait behind A is not B's work"
+        worker.stages.release("A#1", ok=True)
+        running.join(30)
+        assert active == [True, False, True, False]
     finally:
         executor.close()
 

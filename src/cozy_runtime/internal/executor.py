@@ -61,6 +61,7 @@ import msgspec
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
+from cozy_runtime.author._activity import blocked
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
@@ -3744,7 +3745,10 @@ class Executor:
     def _stage_enter(self, method: str, components: tuple[str, ...]) -> int | None:
         """Wait for this scope's turn: the plane budget the worker granted, or None to keep the
         current one. A refusal is the scope's failure, with the worker's numbers."""
-        answer = self._durable(StageEnter(method=method, components=tuple(components)), StageGo)
+        with blocked():
+            answer = self._durable(
+                StageEnter(method=method, components=tuple(components)), StageGo
+            )
         if answer.ok:
             return answer.budget_bytes if answer.budget_bytes >= 0 else None
         if answer.code == "cancelled":
