@@ -101,9 +101,10 @@ class MachineMemo:
         self.config = config
         self.note = note
         store = fill.ensure_store(store_root)
-        #: TensorFS without keyed roots (older than this Runtime) keeps executors on tier 0
+        #: Keyed roots shipped in TensorFS 0.3.84. An older TensorFS keeps executors on their
+        #: in-process tier: the capability is detected, never required.
         self.available = config.store_bytes > 0 and hasattr(store, "put_keyed_root")
-        self.tensorfs = cast(KeyedRoots, store)
+        self.native = cast(KeyedRoots, store)
         self.rows: OrderedDict[str, Row] = OrderedDict()
         self.claims: dict[str, Claim] = {}
         self.disputed: set[tuple[str, str]] = set()
@@ -115,7 +116,7 @@ class MachineMemo:
             for stale in staging.iterdir():
                 stale.unlink(missing_ok=True)
             try:
-                roots = self.tensorfs.keyed_roots(SPACE)
+                roots = self.native.keyed_roots(SPACE)
             except Exception as exc:  # an unreadable tier is off, never a failed boot
                 note("memo", f"stage memo tier off: {exc}"[:400])
                 self.available, roots = False, []
@@ -238,11 +239,11 @@ class MachineMemo:
         if row.staged is not None:
             return row.staged.read_bytes()
         if not row.blob:
-            body = self.tensorfs.manifest(row.manifest)["manifest"]
+            body = self.native.manifest(row.manifest)["manifest"]
             (member,) = manifest_members(body, row.length)
             row.blob = member.blob.sha256
         raw = bytearray(row.length)
-        lease = self.tensorfs.acquire_manifest(row.manifest)
+        lease = self.native.acquire_manifest(row.manifest)
         try:
             lease.read_into("sha256:" + row.blob, row.length, 0, row.length, raw)
         finally:
@@ -262,7 +263,7 @@ class MachineMemo:
                 continue
             staged = row.staged
             try:
-                root = self.tensorfs.put_keyed_root(
+                root = self.native.put_keyed_root(
                     SPACE,
                     key,
                     payload_manifest(Blob(row.blob, row.length)),
@@ -342,7 +343,7 @@ class MachineMemo:
             if row.staged is not None:
                 row.staged.unlink(missing_ok=True)
             else:
-                committed += bool(self.tensorfs.drop_keyed_root(SPACE, key))
+                committed += bool(self.native.drop_keyed_root(SPACE, key))
             self._count("dropped")
         if committed:
             store_gc.collect(self.root)

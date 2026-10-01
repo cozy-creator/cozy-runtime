@@ -1,0 +1,1 @@
+Model downloads no longer wait out a slow tail or a wedged Hub: the TensorFS floor is 0.3.83. A few objects answered at a crawl (run 2322: eight objects at 6-50 KB/s for 15 minutes after a 400 MB/s body) are asked for again as fresh ranges, and a Hub that accepts a connection and never answers the handshake is asked again instead of hanging the pull.

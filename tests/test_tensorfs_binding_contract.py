@@ -120,6 +120,7 @@ CALLED: dict[str, str] = {
     "Store.put_file": "(self, /, path, expect=None, expect_length=None)",
     "Store.put_manifest": "(self, /, data, expect=None, expect_length=None)",
     "Store.acquire": "(self, /, manifest, objects)",
+    "Store.acquire_manifest": "(self, /, hex)",
     "Store.acquire_cozytensors": "(self, /, hex)",
     "Store.walk": "(self, /, hex)",
     "Store.walk_cozytensors": "(self, /, hex)",
@@ -176,6 +177,16 @@ CALLED: dict[str, str] = {
     "Batch.release": "(self, /)",
     "Batch.items": "(self, /)",
     "ReadPlan.items": "(self, /)",
+}
+
+#: Bindings cozy-runtime uses only where the installed TensorFS has them: the call site
+#: detects them and degrades without them, so absence is never a break and never a floor.
+#: Where present they keep the signature they were written against. Keyed roots (the
+#: stage memo's machine tier, `worker/stage_memo.py`) shipped in TensorFS 0.3.84.
+OPTIONAL: dict[str, str] = {
+    "Store.put_keyed_root": "(self, /, space, key, manifest_bytes, files)",
+    "Store.keyed_roots": "(self, /, space)",
+    "Store.drop_keyed_root": "(self, /, space, key)",
 }
 
 #: Non-callable crossings: read, never called, so they carry no signature to freeze. Their
@@ -242,6 +253,18 @@ def test_every_entry_point_cozy_runtime_calls_keeps_its_frozen_signature() -> No
         )
         + "\nFix the call site FIRST; re-freeze only once the caller agrees."
     )
+
+
+def test_optional_bindings_keep_their_signature_where_the_installed_tensorfs_has_them() -> None:
+    """An older TensorFS lacks them and the Runtime runs without; a newer one must not have
+    changed them under the call sites."""
+
+    drifted = {
+        name: (frozen, _signature(name))
+        for name, frozen in sorted(OPTIONAL.items())
+        if _exists(name) and _signature(name) != frozen
+    }
+    assert not drifted, f"tensorfs {tensorfs.__version__} changed an optional binding: {drifted}"
 
 
 def test_the_signature_check_would_notice_a_deleted_parameter() -> None:

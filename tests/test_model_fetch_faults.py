@@ -25,8 +25,10 @@ from fault_hub import (
     ALWAYS,
     ASSET,
     HEADER,
+    Checkpoint,
     Corrupt,
     Delay,
+    Drip,
     FaultHub,
     Gate,
     Reset,
@@ -39,15 +41,16 @@ from fault_hub import (
     on,
     temps,
     tunnel_404,
+    weights,
 )
 from test_device_lanes import _config
 
 
 @contextmanager
 def machine(
-    tmp_path: Path, *rules: Rule, lifetime: int = 3600
+    tmp_path: Path, *rules: Rule, lifetime: int = 3600, point: Checkpoint | None = None
 ) -> Iterator[tuple[Worker, FaultHub]]:
-    point = checkpoint(tmp_path / "origin")
+    point = point or checkpoint(tmp_path / "origin")
     with FaultHub(point, *rules, lifetime=lifetime) as hub:
         tensorfs.Store.init(str(tmp_path / "store"))
         authority = PublicationAuthority(
@@ -174,3 +177,27 @@ def test_a_hub_that_has_not_answered_shows_as_waiting_for_it(tmp_path: Path) -> 
         )
         answered.set()
         pulling.result()
+
+
+def test_a_dripping_object_does_not_hold_the_pull_to_its_crawl(tmp_path: Path) -> None:
+    """Run 2322: a 33 GB pull landed its body at 400 MB/s, then eight objects crawled at
+    6-50 KB/s for 15 minutes. Two objects here crawl at 16 KiB/s, 256 s each alone; the pull
+    must finish far inside that, by asking for their ranges afresh (TensorFS 0.3.82 on)."""
+    size, rate = 4 << 20, 16 << 10
+    point = weights(tmp_path / "origin", tensors=16, size=size)
+    parts = sorted(hex_ for hex_, body in point.bodies.items() if len(body) == size)
+    crawling = [on(hex_, 1, ALWAYS, Drip(rate)) for hex_ in parts[:2]]
+
+    def pull(root: Path, *rules: Rule) -> tuple[float, Path]:
+        with machine(root, *rules, point=point) as (worker, hub):
+            began = time.monotonic()
+            landed(worker, hub)
+            assert worker.workspace is not None
+            return time.monotonic() - began, Path(worker.workspace.store_root)
+
+    body, _ = pull(tmp_path / "body")
+    tail, store_root = pull(tmp_path / "tail", *crawling)
+    crawl = size / rate
+    assert tail < crawl / 4, f"the tail crawled: {tail:.1f} s against a {body:.1f} s body"
+    decisions = (store_root / "logs" / "transport.log").read_text()
+    assert " hedge " in decisions and " won " in decisions and "hedges_won=" in decisions
