@@ -1522,17 +1522,22 @@ class WeightResidency:
                 )
             except self._shortfall_error as exc:
                 raise self._shortfall(method, need, budget, str(exc)) from None
+        # Every eviction so far is past: its regions leave their bindings now, before the
+        # resident sets bind (a region evicted earlier and wanted again binds after this).
+        weights.drain()
+        stream = weights.stream()
+        for name, residence in placed.items():
+            component = components[name]
             # The resident set binds for the whole stage, ordered after its fills on the
             # compute stream: code that reads a resident weight outside its block's forward
             # sees real bytes, exactly as when the component was simply on the device.
-            stream = weights.stream()
             for index in component.resident:
                 lease = weights.plane.acquire(component.ws, weights.index, index, stream)
                 try:
                     bind(weights.torch, component.regions[index], lease)
                 finally:
                     lease.release()
-            if streams:
+            if residence.streamed and component.observed:
                 order = component.order
                 start = order.index(resume[name]) if name in resume else 0
                 try:
@@ -1548,7 +1553,6 @@ class WeightResidency:
                     )
                 except self._shortfall_error as exc:
                     raise self._shortfall(method, need, budget, str(exc)) from None
-        weights.drain()
 
     def _derived(self) -> int:
         return sum(
