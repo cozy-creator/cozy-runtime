@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json
+import os
 import tempfile
 import threading
 import time
@@ -26,7 +27,13 @@ import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import canonical, hostfacts, storage_admission
+from cozy_runtime.internal import (
+    canonical,
+    hostfacts,
+    package_environment,
+    package_installation,
+    storage_admission,
+)
 from cozy_runtime.internal.worker import (
     machine_model_defaults,
     machine_model_resolve,
@@ -138,8 +145,12 @@ class Catalog:
                 elif url.path == f"/v1/models/{PACKAGE}/checkpoints/{manifest}":
                     body = catalog.served
                 else:
+                    missing = {"code": "route.not_found", "message": "no route GET " + url.path}
+                    raw = json.dumps({"error": missing}).encode()
                     self.send_response(404)
+                    self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
+                    self.wfile.write(raw)
                     return
                 raw = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(200)
@@ -297,6 +308,19 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
             for event in machine.executions.events(OWNER, "first").events
             if event.kind == "resolved"
         ]
+        # Each admission step's wall time rides with the run, for `cozy run show`.
+        admission = resolved[0].pop("admission_ms")
+        assert admission.keys() == {
+            "closure",
+            "install",
+            "capture",
+            "resolve",
+            "prepare",
+            "builtins",
+            "submit",
+            "total",
+        }
+        assert admission["total"] >= admission["install"] + admission["prepare"]
         assert resolved == [
             {
                 "installation_id": state_installation(machine, "first"),
@@ -612,6 +636,120 @@ def test_a_placement_built_against_another_runtime_is_prepared_again(
         (directory / "installation.json").write_text(json.dumps(record))
         submit(machine, submission(machine, "after-update"))
         assert len(installs) == 2, "a placement built against another Runtime was reused"
+    finally:
+        catalog.close()
+
+
+def _owned(machine: Machine) -> package_installation.InstalledEnvironment:
+    """The release as a machine owns a published installation: its generation inside its
+    directory, its lock retained, built against this machine's SDK."""
+    identifier = package_installation.PUBLISHED_PREFIX + "owned"
+    directory = machine.install_root / "installations" / identifier
+    directory.mkdir(parents=True)
+    generation = directory / "venv"
+    generation.symlink_to(machine.installed.generation, target_is_directory=True)
+    (directory / "requirements.txt").write_bytes(LOCKED)
+    site = machine.installed.site_packages.relative_to(machine.installed.generation)
+    record = {
+        "package": PACKAGE,
+        "release": RELEASE,
+        "python": str(generation / "bin" / "python"),
+        "generation": str(generation),
+        "site_packages": str(generation / site),
+        "machine": package_installation.machine_sdk(),
+    }
+    (directory / "installation.json").write_text(json.dumps(record))
+    return package_installation.open_installation(machine.install_root, identifier)
+
+
+def test_a_restarted_runtime_holds_the_releases_it_prepared(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A published root prepared once outlives a Runtime restart: the first run after it
+    reads nothing at the Hub, installs nothing and checks no model again. What is kept
+    belongs to the installation's incarnation: a rebuilt installation is prepared anew."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    owned = _owned(machine)
+    installs: list[str] = []
+
+    def install(request: pb.PreparePackageSetRequest, **seams: Any) -> Any:
+        installs.append(request.hub)
+        models = documents.read(request.download_delegation, pb.DownloadDelegation)["models"]
+        return package_prepare._prepare_published(
+            package_name=PACKAGE,
+            release=RELEASE,
+            locked=package_environment.read_locked_requirements(LOCKED),
+            models=package_prepare.selections(models),
+            artifact_cache=seams["artifact_cache"],
+            tensorfs_root=seams["tensorfs_root"],
+            install_root=seams["install_root"],
+            python=owned.python,
+            interface=lambda _installed, _distribution: machine.interface,
+            verified=seams["verified"],
+            job_plan_root=seams["job_plan_root"],
+            base=None,
+            installed_environment=owned,
+            materialized=seams["materialized"],
+        )
+
+    monkeypatch.setattr(package_prepare, "prepare_package_set", install)
+    checks: list[str] = []
+    check = package_prepare.prepare_model_placement
+
+    def checked(**arguments: Any) -> Any:
+        checks.append(str(arguments["installed"].installation_id))
+        return check(**arguments)
+
+    monkeypatch.setattr(package_prepare, "prepare_model_placement", checked)
+    length = len(
+        tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+    )
+    catalog = Catalog(
+        machine.manifest, length, [{"gpu": "H100", "lane": LANE}], interface=machine.interface
+    )
+    # A release with no published callee: every read is its own.
+    catalog.releases[f"/v1/packages/{PACKAGE}/releases/{RELEASE}/locked-requirements"] = LOCKED
+
+    def run(name: str) -> tuple[list[str], list[str], dict[str, float]]:
+        catalog.serve(machine)
+        catalog.reads.clear()
+        receipt, progress = submit(machine, submission(machine, name))
+        assert receipt.request_id == name
+        (resolved,) = [
+            canonical_json.decode(event.body)
+            for event in machine.executions.events(OWNER, name).events
+            if event.kind == "resolved"
+        ]
+        assert resolved["installation_id"] == owned.installation_id
+        return [urlsplit(path).path for path in catalog.reads], progress, resolved["admission_ms"]
+
+    try:
+        reads, progress, admission = run("cold")
+        assert reads[:2] == [
+            f"/v1/packages/{PACKAGE}/releases/{RELEASE}",
+            f"/v1/packages/{PACKAGE}/releases/{RELEASE}/locked-requirements",
+        ]
+        assert progress[0].startswith("installing ") and "install" in admission
+        assert (installs, checks) == ([""], [owned.installation_id])
+
+        machine.worker.shutdown()
+        machine.boot()
+        reads, progress, admission = run("restarted")
+        assert (reads, progress, installs, len(checks)) == ([], [], [""], 1)
+        assert "install" not in admission
+
+        # The installation was rebuilt (its record replaced): what was kept is not its own.
+        record = owned.generation.parent / "installation.json"
+        os.utime(record, ns=(time.time_ns(), time.time_ns() + 1_000_000))
+        machine.worker.shutdown()
+        machine.boot()
+        _, progress, _ = run("rebuilt")
+        assert progress[0].startswith("installing ") and len(installs) == 2
     finally:
         catalog.close()
 

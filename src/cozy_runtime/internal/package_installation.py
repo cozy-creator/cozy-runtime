@@ -152,6 +152,16 @@ def described(
     return _directory(root, installed.installation_id) / "described" / name
 
 
+def kept_placements(root: Path, installed: InstalledEnvironment) -> Path | None:
+    """Where an owned environment incarnation keeps the placements this machine's Runtime
+    prepared over it, across Runtime restarts; None for an adopted, mutable environment."""
+    if installed.incarnation is None or not root.is_absolute():
+        return None
+    key = json.dumps([*installed.incarnation, str(installed.generation), machine_sdk()])
+    name = hashlib.sha256(key.encode()).hexdigest()
+    return _directory(root, installed.installation_id) / "placements" / name
+
+
 def _run(
     command: list[str], *, directory: Path, environment: dict[str, str], lock_fd: int = -1
 ) -> None:

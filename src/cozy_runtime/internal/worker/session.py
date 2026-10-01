@@ -1030,6 +1030,7 @@ class Worker:
         # Captured machine executions persist their immutable receipt and restore this
         # same inventory after restart, independent of their code's publication origin.
         self.prepared_installations: dict[tuple[str, str, bytes], Placement] = {}
+        self._restore_placements()
         self.local_operations: dict[tuple[str, str], Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
@@ -2096,6 +2097,7 @@ class Worker:
         stored = self._placement_from_entry(entries[0], result.placement_set.placement_set_digest)
         stored.installed = published[0]
         self.prepared_installations[stored.prepared_key] = stored
+        self.keep_placement(stored, result.placement_set.placement_set_canonical_bytes)
         self._collect_superseded_installations(published[0])
         return result
 
@@ -4062,6 +4064,57 @@ class Worker:
             placement_set_digest,
             device_pin=self.accepted.device_pins.get(entry.placement_id),
         )
+
+    def keep_placement(self, stored: Placement, placement_set: bytes) -> None:
+        """Keep a published release's prepared placement beside its installation: a restarted
+        Runtime holds it without reading the release or preparing it again (a miss only costs
+        that). Immutable for its installation incarnation and this machine's SDK."""
+        root = self.options.install_root
+        kept = (
+            package_installation.kept_placements(root, stored.installed)
+            if root is not None and stored.installed is not None
+            else None
+        )
+        if kept is None or not stored.document.HasField("package"):
+            return
+        target = kept / (hashlib.sha256(placement_set).hexdigest() + ".json")
+        with contextlib.suppress(OSError):
+            if not target.is_file():
+                kept.mkdir(parents=True, exist_ok=True)
+                temporary = kept / f".{uuid.uuid4().hex}"
+                temporary.write_bytes(placement_set)
+                os.replace(temporary, target)
+                for other in kept.parent.iterdir():  # an earlier incarnation's
+                    if other != kept:
+                        shutil.rmtree(other, ignore_errors=True)
+
+    def _restore_placements(self) -> None:
+        """The placements an earlier process of this Runtime kept for the published releases
+        this machine still holds unchanged."""
+        root = self.options.install_root
+        if root is None:
+            return
+        prefix = package_installation.PUBLISHED_PREFIX
+        for directory in sorted((root / "installations").glob(prefix + "*")):
+            try:
+                installed = package_installation.open_installation(root, directory.name)
+            except package_environment.EnvironmentRefusal:
+                continue
+            kept = package_installation.kept_placements(root, installed)
+            if kept is None or package_installation.stale(root, installed.installation_id):
+                continue
+            for path in sorted(kept.glob("*.json")):
+                with contextlib.suppress(OSError, documents.DocumentError):
+                    raw = path.read_bytes()
+                    digest = documents.digest_of(raw)
+                    for entry in read_placement_set(
+                        pb.DesiredPlacementSet(
+                            placement_set_canonical_bytes=raw, placement_set_digest=digest
+                        )
+                    ):
+                        if entry.installation_id == installed.installation_id:
+                            stored = Placement(entry, digest, installed=installed)
+                            self.prepared_installations[stored.prepared_key] = stored
 
     def _apply_desired_state(self, desired: pb.DesiredWorkerState) -> None:
         """FULL REPLACE. A field absent means absent, never unchanged (§3).

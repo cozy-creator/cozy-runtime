@@ -26,9 +26,11 @@ import (
 
 // maintain runs one op against the machine rooted at root; p is its current Runtime.
 func maintain(root string, p *runtimeProcess, op string, args []string) (string, error) {
-	return maintainWithAgent(root, p, op, args, "")
+	return maintainWithAgent(root, p, op, args, "", os.Stderr)
 }
-func maintainWithAgent(root string, p *runtimeProcess, op string, args []string, runningAgent string) (string, error) {
+
+// maintainWithAgent logs to log, the writer its launcher's Runtime output reaches.
+func maintainWithAgent(root string, p *runtimeProcess, op string, args []string, runningAgent string, log io.Writer) (string, error) {
 	switch op {
 	case "update-cleanup":
 		if len(args) != 1 || args[0] == "" {
@@ -60,7 +62,7 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 			return "", err
 		}
 		grant := &Grant{Root: root, StoreRoot: request.Store, Lifetime: request.Lifetime, agentSelection: request.Agent}
-		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
+		m := &Machine{grant: grant, layout: NewLayout(grant), log: log}
 		_, err := m.stagePair(context.Background(), request.Before, request.After, request.Candidate, request.Previous, request.Operation)
 		return "prepared", err
 	case "update-prepare":
@@ -76,7 +78,7 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 			return "", err
 		}
 		grant := &Grant{Root: root, StoreRoot: request.Store, Lifetime: request.Lifetime, agentSelection: request.Agent, agentBefore: previousAgent}
-		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
+		m := &Machine{grant: grant, layout: NewLayout(grant), log: log}
 		unlock, err := lockStartupWorker(root)
 		if err != nil {
 			return "", err
@@ -143,7 +145,7 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 			return "", err
 		}
 		grant := &Grant{Root: root, Lifetime: args[0], StoreRoot: args[1], agentBefore: previousAgent}
-		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
+		m := &Machine{grant: grant, layout: NewLayout(grant), log: log}
 		recovering := m.transactionPending()
 		if err := m.startupUpdate(context.Background()); err != nil {
 			return "", err

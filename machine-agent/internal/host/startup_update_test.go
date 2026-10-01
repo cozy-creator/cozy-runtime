@@ -620,11 +620,11 @@ esac`, before.Runtime, before.TensorFS, row.installed.Runtime, row.installed.Ten
 				if got, err := m.installedPair(); err != nil || got != row.installed {
 					t.Fatalf("metadata double: %+v %v", got, err)
 				}
-				answer, err := maintainWithAgent(root, nil, "startup-prepare", []string{"persistent", m.layout.Store}, "")
+				answer, err := maintainWithAgent(root, nil, "startup-prepare", []string{"persistent", m.layout.Store}, "", os.Stderr)
 				if err != nil || answer != "rolled_back" {
 					t.Fatalf("fresh recovery did not request application restoration: %q %v", answer, err)
 				}
-				answer, err = maintainWithAgent(root, nil, "startup-prepare", []string{"persistent", m.layout.Store}, "")
+				answer, err = maintainWithAgent(root, nil, "startup-prepare", []string{"persistent", m.layout.Store}, "", os.Stderr)
 				if err != nil || answer != "" {
 					t.Fatalf("historical rollback overrode a later bootstrap: %q %v", answer, err)
 				}
