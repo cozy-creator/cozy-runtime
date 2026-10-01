@@ -915,6 +915,7 @@ const (
 	RuntimePreparation_CheckpointTransfer_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/CheckpointTransfer"
 	RuntimePreparation_PrepareLocalPackage_FullMethodName              = "/cozy.worker.v1.RuntimePreparation/PrepareLocalPackage"
 	RuntimePreparation_PreparePrivatePlacement_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/PreparePrivatePlacement"
+	RuntimePreparation_CancelPreparation_FullMethodName                = "/cozy.worker.v1.RuntimePreparation/CancelPreparation"
 )
 
 // RuntimePreparationClient is the client API for RuntimePreparation service.
@@ -962,6 +963,8 @@ type RuntimePreparationClient interface {
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferRequest, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
 	PrepareLocalPackage(ctx context.Context, in *PrepareLocalPackageRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PreparePrivatePlacement(ctx context.Context, in *PreparePrivatePlacementRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
+	// Wire 73: as PodHost.CancelPreparation, forwarded with the Host's own Claim.
+	CancelPreparation(ctx context.Context, in *CancelPreparationCall, opts ...grpc.CallOption) (*CancelPreparationResult, error)
 }
 
 type runtimePreparationClient struct {
@@ -1244,6 +1247,16 @@ func (c *runtimePreparationClient) PreparePrivatePlacement(ctx context.Context, 
 	return out, nil
 }
 
+func (c *runtimePreparationClient) CancelPreparation(ctx context.Context, in *CancelPreparationCall, opts ...grpc.CallOption) (*CancelPreparationResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CancelPreparationResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_CancelPreparation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RuntimePreparationServer is the server API for RuntimePreparation service.
 // All implementations must embed UnimplementedRuntimePreparationServer
 // for forward compatibility.
@@ -1289,6 +1302,8 @@ type RuntimePreparationServer interface {
 	CheckpointTransfer(context.Context, *CheckpointTransferRequest) (*CheckpointTransferStatus, error)
 	PrepareLocalPackage(context.Context, *PrepareLocalPackageRequest) (*PreparePackageSetResult, error)
 	PreparePrivatePlacement(context.Context, *PreparePrivatePlacementRequest) (*PreparePackageSetResult, error)
+	// Wire 73: as PodHost.CancelPreparation, forwarded with the Host's own Claim.
+	CancelPreparation(context.Context, *CancelPreparationCall) (*CancelPreparationResult, error)
 	mustEmbedUnimplementedRuntimePreparationServer()
 }
 
@@ -1376,6 +1391,9 @@ func (UnimplementedRuntimePreparationServer) PrepareLocalPackage(context.Context
 }
 func (UnimplementedRuntimePreparationServer) PreparePrivatePlacement(context.Context, *PreparePrivatePlacementRequest) (*PreparePackageSetResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PreparePrivatePlacement not implemented")
+}
+func (UnimplementedRuntimePreparationServer) CancelPreparation(context.Context, *CancelPreparationCall) (*CancelPreparationResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelPreparation not implemented")
 }
 func (UnimplementedRuntimePreparationServer) mustEmbedUnimplementedRuntimePreparationServer() {}
 func (UnimplementedRuntimePreparationServer) testEmbeddedByValue()                            {}
@@ -1848,6 +1866,24 @@ func _RuntimePreparation_PreparePrivatePlacement_Handler(srv interface{}, ctx co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimePreparation_CancelPreparation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelPreparationCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).CancelPreparation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_CancelPreparation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).CancelPreparation(ctx, req.(*CancelPreparationCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RuntimePreparation_ServiceDesc is the grpc.ServiceDesc for RuntimePreparation service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1950,6 +1986,10 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PreparePrivatePlacement",
 			Handler:    _RuntimePreparation_PreparePrivatePlacement_Handler,
+		},
+		{
+			MethodName: "CancelPreparation",
+			Handler:    _RuntimePreparation_CancelPreparation_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
@@ -2093,6 +2133,7 @@ const (
 	PodHost_ProtocolInfo_FullMethodName                          = "/cozy.worker.v1.PodHost/ProtocolInfo"
 	PodHost_NumericalEnvironment_FullMethodName                  = "/cozy.worker.v1.PodHost/NumericalEnvironment"
 	PodHost_PreparePackageSet_FullMethodName                     = "/cozy.worker.v1.PodHost/PreparePackageSet"
+	PodHost_CancelPreparation_FullMethodName                     = "/cozy.worker.v1.PodHost/CancelPreparation"
 	PodHost_PrepareLocalPackage_FullMethodName                   = "/cozy.worker.v1.PodHost/PrepareLocalPackage"
 	PodHost_PreparePrivatePlacement_FullMethodName               = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
 	PodHost_ModelSourceFile_FullMethodName                       = "/cozy.worker.v1.PodHost/ModelSourceFile"
@@ -2171,6 +2212,9 @@ type PodHostClient interface {
 	ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error)
 	NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentCall, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
+	// Wire 73: detach one requester from its identified preparation. A Host or Runtime before 73
+	// answers UNIMPLEMENTED or capability_unavailable; the caller then only disconnects.
+	CancelPreparation(ctx context.Context, in *CancelPreparationCall, opts ...grpc.CallOption) (*CancelPreparationResult, error)
 	PrepareLocalPackage(ctx context.Context, in *PrepareLocalPackageCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	PreparePrivatePlacement(ctx context.Context, in *PreparePrivatePlacementCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	ModelSourceFile(ctx context.Context, in *ModelSourceFileCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ModelSourceFileStatus], error)
@@ -2356,6 +2400,16 @@ func (c *podHostClient) PreparePackageSet(ctx context.Context, in *PreparePackag
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_PreparePackageSetClient = grpc.ServerStreamingClient[PrepareEvent]
+
+func (c *podHostClient) CancelPreparation(ctx context.Context, in *CancelPreparationCall, opts ...grpc.CallOption) (*CancelPreparationResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CancelPreparationResult)
+	err := c.cc.Invoke(ctx, PodHost_CancelPreparation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func (c *podHostClient) PrepareLocalPackage(ctx context.Context, in *PrepareLocalPackageCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -2727,6 +2781,9 @@ type PodHostServer interface {
 	ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error)
 	NumericalEnvironment(context.Context, *NumericalEnvironmentCall) (*NumericalEnvironmentResult, error)
 	PreparePackageSet(*PreparePackageSetCall, grpc.ServerStreamingServer[PrepareEvent]) error
+	// Wire 73: detach one requester from its identified preparation. A Host or Runtime before 73
+	// answers UNIMPLEMENTED or capability_unavailable; the caller then only disconnects.
+	CancelPreparation(context.Context, *CancelPreparationCall) (*CancelPreparationResult, error)
 	PrepareLocalPackage(*PrepareLocalPackageCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	PreparePrivatePlacement(*PreparePrivatePlacementCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	ModelSourceFile(*ModelSourceFileCall, grpc.ServerStreamingServer[ModelSourceFileStatus]) error
@@ -2812,6 +2869,9 @@ func (UnimplementedPodHostServer) NumericalEnvironment(context.Context, *Numeric
 }
 func (UnimplementedPodHostServer) PreparePackageSet(*PreparePackageSetCall, grpc.ServerStreamingServer[PrepareEvent]) error {
 	return status.Error(codes.Unimplemented, "method PreparePackageSet not implemented")
+}
+func (UnimplementedPodHostServer) CancelPreparation(context.Context, *CancelPreparationCall) (*CancelPreparationResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelPreparation not implemented")
 }
 func (UnimplementedPodHostServer) PrepareLocalPackage(*PrepareLocalPackageCall, grpc.ServerStreamingServer[PrepareEvent]) error {
 	return status.Error(codes.Unimplemented, "method PrepareLocalPackage not implemented")
@@ -3141,6 +3201,24 @@ func _PodHost_PreparePackageSet_Handler(srv interface{}, stream grpc.ServerStrea
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_PreparePackageSetServer = grpc.ServerStreamingServer[PrepareEvent]
+
+func _PodHost_CancelPreparation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelPreparationCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).CancelPreparation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_CancelPreparation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).CancelPreparation(ctx, req.(*CancelPreparationCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 func _PodHost_PrepareLocalPackage_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(PrepareLocalPackageCall)
@@ -3625,6 +3703,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "NumericalEnvironment",
 			Handler:    _PodHost_NumericalEnvironment_Handler,
+		},
+		{
+			MethodName: "CancelPreparation",
+			Handler:    _PodHost_CancelPreparation_Handler,
 		},
 		{
 			MethodName: "ModelSourcePrepare",

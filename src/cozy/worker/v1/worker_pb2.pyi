@@ -1288,7 +1288,7 @@ class ProtocolInfoResult(_message.Message):
     def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
-    __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "python_requires", "python_version", "package_interface", "hub")
+    __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "python_requires", "python_version", "package_interface", "hub", "operation_id")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
     APPLICATION_FIELD_NUMBER: _ClassVar[int]
@@ -1299,6 +1299,7 @@ class PreparePackageSetCall(_message.Message):
     PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     HUB_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     package_set: DesiredPackageSet
     application: str
@@ -1309,7 +1310,24 @@ class PreparePackageSetCall(_message.Message):
     python_version: str
     package_interface: bytes
     hub: str
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ..., hub: _Optional[str] = ...) -> None: ...
+    operation_id: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ..., hub: _Optional[str] = ..., operation_id: _Optional[str] = ...) -> None: ...
+
+class CancelPreparationCall(_message.Message):
+    __slots__ = ("claim", "operation_id")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    operation_id: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., operation_id: _Optional[str] = ...) -> None: ...
+
+class CancelPreparationResult(_message.Message):
+    __slots__ = ("found", "model_progress")
+    FOUND_FIELD_NUMBER: _ClassVar[int]
+    MODEL_PROGRESS_FIELD_NUMBER: _ClassVar[int]
+    found: bool
+    model_progress: _containers.RepeatedCompositeFieldContainer[PrepareModelProgress]
+    def __init__(self, found: bool = ..., model_progress: _Optional[_Iterable[_Union[PrepareModelProgress, _Mapping]]] = ...) -> None: ...
 
 class PrepareLocalPackageCall(_message.Message):
     __slots__ = ("claim", "local_package_set", "hub")
@@ -1638,7 +1656,7 @@ class LocalPackageUploadChunk(_message.Message):
     def __init__(self, offset: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
 
 class PreparePackageSetRequest(_message.Message):
-    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root", "download_delegation_signature", "python_requires", "python_version", "package_interface", "models_landing", "hub")
+    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root", "download_delegation_signature", "python_requires", "python_version", "package_interface", "models_landing", "hub", "operation_id")
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     APPLICATION_FIELD_NUMBER: _ClassVar[int]
     MODEL_SLOT_PATHS_FIELD_NUMBER: _ClassVar[int]
@@ -1651,6 +1669,7 @@ class PreparePackageSetRequest(_message.Message):
     PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     MODELS_LANDING_FIELD_NUMBER: _ClassVar[int]
     HUB_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     download_delegation: bytes
     application: str
     model_slot_paths: _containers.RepeatedScalarFieldContainer[str]
@@ -1663,7 +1682,8 @@ class PreparePackageSetRequest(_message.Message):
     package_interface: bytes
     models_landing: bool
     hub: str
-    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ..., download_delegation_signature: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ..., models_landing: bool = ..., hub: _Optional[str] = ...) -> None: ...
+    operation_id: str
+    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ..., download_delegation_signature: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ..., models_landing: bool = ..., hub: _Optional[str] = ..., operation_id: _Optional[str] = ...) -> None: ...
 
 class ImageInventory(_message.Message):
     __slots__ = ("profile", "python", "distributions", "interpreters")

@@ -871,6 +871,11 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePlacementRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.FromString,
                 _registered_method=True)
+        self.CancelPreparation = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/CancelPreparation',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationResult.FromString,
+                _registered_method=True)
 
 
 class RuntimePreparationServicer(object):
@@ -1046,6 +1051,13 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CancelPreparation(self, request, context):
+        """Wire 73: as PodHost.CancelPreparation, forwarded with the Host's own Claim.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_RuntimePreparationServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -1178,6 +1190,11 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.PreparePrivatePlacement,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePlacementRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.SerializeToString,
+            ),
+            'CancelPreparation': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelPreparation,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationResult.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1899,6 +1916,33 @@ class RuntimePreparation(object):
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def CancelPreparation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/CancelPreparation',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class RuntimeWeightsStub(object):
     """Loopback-only Runtime-hosted weights seam. pod-supervisor is its only client and dials it on
@@ -2080,6 +2124,11 @@ class PodHostStub(object):
                 '/cozy.worker.v1.PodHost/PreparePackageSet',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
+                _registered_method=True)
+        self.CancelPreparation = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/CancelPreparation',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationResult.FromString,
                 _registered_method=True)
         self.PrepareLocalPackage = channel.unary_stream(
                 '/cozy.worker.v1.PodHost/PrepareLocalPackage',
@@ -2330,6 +2379,14 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CancelPreparation(self, request, context):
+        """Wire 73: detach one requester from its identified preparation. A Host or Runtime before 73
+        answers UNIMPLEMENTED or capability_unavailable; the caller then only disconnects.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PrepareLocalPackage(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -2569,6 +2626,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.PreparePackageSet,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.SerializeToString,
+            ),
+            'CancelPreparation': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelPreparation,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationResult.SerializeToString,
             ),
             'PrepareLocalPackage': grpc.unary_stream_rpc_method_handler(
                     servicer.PrepareLocalPackage,
@@ -3082,6 +3144,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/PreparePackageSet',
             cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CancelPreparation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/CancelPreparation',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CancelPreparationResult.FromString,
             options,
             channel_credentials,
             insecure,
