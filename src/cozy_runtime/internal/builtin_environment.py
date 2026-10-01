@@ -2,44 +2,28 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import importlib.metadata
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-from cozy_runtime import canonical_json
-from cozy_runtime.internal import builtin_operations, package_installation
-
-
-def sdk_identity() -> dict[str, str]:
-    return {"runtime_version": importlib.metadata.version("cozy-runtime")}
+from cozy_runtime.internal import package_installation
+from cozy_runtime.internal.package_environment import EnvironmentRefusal
 
 
-@dataclass(frozen=True)
-class Preparation:
-    installed: package_installation.InstalledEnvironment
-    sdk: dict[str, str]
-
-    def document(self) -> dict[str, Any]:
-        return {
-            "environment_python": str(self.installed.python),
-            "installation_id": self.installed.installation_id,
-            "runtime_version": self.sdk["runtime_version"],
-            "package_interface": canonical_json.decode(builtin_operations.document()),
-        }
-
-
-def prepare(
-    root: Path,
-    *,
-    dependency_cache: Path | None = None,
-) -> Preparation:
-    sdk = sdk_identity()
-    installed = package_installation.retain_environment(
+def prepare(root: Path) -> package_installation.InstalledEnvironment:
+    """This Runtime's interpreter as its operations' installation: one per installed Runtime,
+    named by its files, so every process of it reopens the interface described beside it."""
+    runtime = importlib.metadata.distribution("cozy-runtime")
+    identity = f"{sys.executable}\0{runtime.read_text('RECORD') or runtime.version}"
+    identifier = "runtime-operations-" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+    with contextlib.suppress(EnvironmentRefusal):
+        return package_installation.open_installation(root, identifier)
+    return package_installation.retain_environment(
         root,
         Path(sys.executable),
         package="runtime/operations",
-        release=sdk["runtime_version"],
+        release=runtime.version,
+        installation_id=identifier,
     )
-    return Preparation(installed, sdk)
