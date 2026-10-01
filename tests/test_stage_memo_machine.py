@@ -94,7 +94,7 @@ def test_entries_outlive_a_worker_restart_and_expire_after_their_ttl(tmp_path: P
     (row,) = restarted.rows.values()
     assert restarted.expire(now_ms=row.created_ms + 59_999) == 0
     assert restarted.expire(now_ms=row.created_ms + 60_000) == 1
-    assert not restarted.rows and not restarted.tensorfs.keyed_roots(SPACE)
+    assert not restarted.rows and not restarted.native.keyed_roots(SPACE)
     assert not (tmp_path / "store/roots/keyed" / SPACE).exists() or not any(
         (tmp_path / "store/roots/keyed" / SPACE).iterdir()
     ), "nothing is left behind"
