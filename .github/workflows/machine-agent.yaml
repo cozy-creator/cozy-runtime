@@ -17,7 +17,9 @@ jobs:
           cache-dependency-path: machine-agent/go.sum
       - uses: astral-sh/setup-uv@v7
       - name: Install Runtime decoder for public journal integration
-        run: uv sync --locked --no-dev
+        run: |
+          uv sync --locked --no-dev
+          uv pip install --python .venv/bin/python pytest
       - name: Machine API, lifecycle, and WebRTC tests
         working-directory: machine-agent
         run: COZY_RUNTIME_TEST_PYTHON="$GITHUB_WORKSPACE/.venv/bin/python" go test -race -p 2 ./...

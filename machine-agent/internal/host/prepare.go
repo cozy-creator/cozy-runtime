@@ -98,7 +98,17 @@ func (m *Machine) prepare(stream grpc.ServerStream, message proto.Message,
 		last = event
 		_ = stream.SendMsg(event)
 	}
+	observed, stopObserving := context.WithCancel(ctx)
+	progressDone := make(chan struct{})
+	var modelProgress []*pb.PrepareModelProgress
+	models := preparationModels(message)
+	go func() {
+		defer close(progressDone)
+		m.observePreparation(observed, conn, models, emit, &modelProgress)
+	}()
 	answer := work(ctx, conn, emit)
+	stopObserving()
+	<-progressDone
 	if ctx.Err() != nil {
 		return status.FromContextError(ctx.Err()).Err()
 	}
@@ -112,8 +122,13 @@ func (m *Machine) prepare(stream grpc.ServerStream, message proto.Message,
 	if answer.result.GetPlacementSet() == nil && answer.result.GetInstalledPackage() == nil {
 		return status.Error(codes.DataLoss, "the Runtime returned neither an installation nor a placement")
 	}
+	if len(modelProgress) > 0 {
+		if rows := m.preparationProgress(ctx, conn, models); len(rows) > 0 {
+			modelProgress = rows
+		}
+	}
 	emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, PlacementSet: answer.result.PlacementSet,
-		InstalledPackage: answer.result.InstalledPackage})
+		InstalledPackage: answer.result.InstalledPackage, ModelProgress: modelProgress})
 	return nil
 }
 

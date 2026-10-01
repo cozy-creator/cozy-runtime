@@ -75,6 +75,7 @@ except ConfigError as exc:
     print(exc.name)
     raise SystemExit(2)
 print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env),
+                  "visible_devices":cfg.visible_devices,
                   "hosts":runtime_config_from_host(cfg).object_storage_hosts,
                   "dependency_cache":str(runtime_config_from_host(cfg).dependency_cache),
                   "tensorfs":str(cfg.layout.tensorfs_root)}))
@@ -89,10 +90,26 @@ print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env)
     assert json.loads(result.stdout) == {
         "origin": "https://hub.example.test",
         "child": {"PATH": "/usr/bin:/bin"},
+        "visible_devices": None,
         "hosts": [".objects.example", "storage.example"],
         "dependency_cache": "/var/lib/cozy/dependencies",
         "tensorfs": "/var/lib/tensorfs",
     }
+    # The centralized boot reader freezes the operator mask independently of the
+    # erased device-child environment; later process-environment changes cannot replace it.
+    for visible in ("", "1", "GPU-a", "1,GPU-a"):
+        masked = subprocess.run(
+            [sys.executable, "-c", program],
+            input=json.dumps(
+                {"env": handoff | {"CUDA_VISIBLE_DEVICES": visible}, "path": str(path)}
+            ),
+            text=True,
+            capture_output=True,
+        )
+        assert masked.returncode == 0, masked.stderr
+        captured = json.loads(masked.stdout)
+        assert captured["visible_devices"] == [part for part in visible.split(",") if part]
+        assert "CUDA_VISIBLE_DEVICES" not in captured["child"]
     # The Host names the box's one Store; the rest of the layout stays under the root.
     named = subprocess.run(
         [sys.executable, "-c", program],
