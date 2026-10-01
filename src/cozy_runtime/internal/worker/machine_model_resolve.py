@@ -30,7 +30,7 @@ from cozy_runtime.author._model_defaults import default_ladder, reference
 from cozy_runtime.internal import egress, fill
 from cozy_runtime.protocol import documents
 
-from .machine_publication import PublicationRefusal, origin_key
+from .machine_publication import PublicationRefusal, hub_error, origin_key
 from .workspace import WorkspaceRefusal
 from .workspace_executions import ExecutionWorkspaceRefusal
 
@@ -328,10 +328,16 @@ class Catalog:
             )
         except egress.EgressRefusal as exc:
             raise WorkspaceRefusal(f"catalog read failed: {exc.code}") from exc
+        if status == 404 and hub_error(raw):
+            return None  # the Hub's own answer: it has no such document
         if status == 404:
-            return None
+            seen = re.search(rb"ERR_NGROK_\d{1,6}", raw)
+            raise WorkspaceRefusal(
+                f"the Hub at {self.origin} is unreachable: a tunnel or proxy in front of it "
+                f"answered 404 for {path[:200]}" + (f" ({seen[0].decode()})" if seen else "")
+            )
         if status != 200:
-            raise WorkspaceRefusal(f"catalog answered {status} {_code(raw)} for {path[:200]}")
+            raise WorkspaceRefusal(f"catalog answered {status} {hub_error(raw)} for {path[:200]}")
         return raw
 
     def get(self, path: str, limit: int = MAX_METADATA) -> object:
@@ -507,7 +513,11 @@ def own(worker: Worker, package: str = "", hub: str = "") -> Catalog:
     key = hub_key(worker, hub)
     authority = registration(worker, key)
     if authority is None:
-        raise WorkspaceRefusal("this machine has no Hub grant to read the catalog at")
+        # Empty never borrows one of a persistent machine's Hub grants (wire 69).
+        raise WorkspaceRefusal(
+            "this run names no Hub to read the model catalog at, and this machine has none "
+            "of its own; run it from a client logged in to the Hub its models come from"
+        )
     try:
         headers = authority.headers()
     except PublicationRefusal as exc:
@@ -528,15 +538,6 @@ def _version(row: _Release) -> tuple[int, Version | str]:
         return 1, Version(row.release)
     except InvalidVersion:
         return 0, row.release
-
-
-def _code(raw: bytes) -> str:
-    """The Hub's typed error code, e.g. worker.unauthorized or worker.ended, else ""."""
-    try:
-        error = json.loads(raw).get("error", {})
-        return str(error.get("code", ""))[:128] if isinstance(error, dict) else ""
-    except (ValueError, AttributeError):
-        return ""
 
 
 def _ladder(

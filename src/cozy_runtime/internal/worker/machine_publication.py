@@ -333,6 +333,15 @@ class _Refused(msgspec.Struct, frozen=True):
     error: _Failure = msgspec.field(default_factory=_Failure)
 
 
+def hub_error(raw: bytes) -> str:
+    """The Hub's typed error code, else "". Every Hub 404 names one; a tunnel or proxy in
+    front of a Hub it cannot reach (ngrok's offline-endpoint page) answers 404 with none."""
+    try:
+        return msgspec.json.decode(raw, type=_Refused).error.code[:128]
+    except msgspec.DecodeError:
+        return ""
+
+
 class _Report(msgspec.Struct, frozen=True):
     digest: str
     length: int
@@ -474,13 +483,16 @@ class MachinePublicationClient:
         if method != "GET":
             headers["X-Tensorhub-Reason"] = "explicit private script publication"
         try:
-            return egress.request_control_metadata(
+            status, raw = egress.request_control_metadata(
                 self.origin, self.context, method, path, body, headers, limit=_MAX_METADATA
             )
         except egress.EgressRefusal as exc:
             # URLs, signed headers and token strings never enter a retained error.
             status = 503 if exc.code == "control_transport_unavailable" else 409
             raise PublicationRefusal("publication." + exc.code, status=status) from exc
+        if status == 404 and not hub_error(raw):
+            raise PublicationRefusal("publication.hub_unreachable", status=503)
+        return status, raw
 
     def _renew(self) -> None:
         status, raw = self._exchange(
