@@ -134,6 +134,9 @@ class WorkerHostConfig:
     """The supervisor launch contract; absent keeps supported older Hosts working."""
     process_incarnation: str = ""
     """Fresh supervisor-minted child identity, never durable execution ownership."""
+    visible_devices: tuple[str, ...] | None = None
+    """`CUDA_VISIBLE_DEVICES` entries, by index or GPU UUID: where the machine's GPUs are.
+    None (unset) is every card; () (empty) is none, served CPU only."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +294,12 @@ def parse_object_storage_hosts(value: str) -> tuple[str, ...]:
             "use the deployment's explicit object storage hosts",
         )
     return hosts
+
+
+def parse_visible_devices(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    return tuple(entry.strip() for entry in value.split(",") if entry.strip())
 
 
 def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -496,6 +505,7 @@ def read_worker_host_config(
         layout=layout,
         control_mode=control_mode,
         process_incarnation=process_incarnation,
+        visible_devices=parse_visible_devices(env.get("CUDA_VISIBLE_DEVICES")),
         child_base_env=tuple(
             sorted(
                 (name, value) for name, value in env.items() if name in WORKER_CHILD_PLATFORM_ENV
