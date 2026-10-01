@@ -1888,6 +1888,7 @@ class WeightResidency:
                 else "untiled"
             )
             if mode == "tiled":
+                free = self._room_for_decode(name, free, evictable, free + evictable)
                 _tile(root, free // max(per_pixel[0], 1), scale, default)
             else:
                 root.disable_tiling()
@@ -1895,10 +1896,7 @@ class WeightResidency:
                 # room (all of them when this size was never measured), since a decode's
                 # convolutions outside any block hook cannot retry.
                 need = per_pixel[0] * pixels if per_pixel else free + evictable
-                if need > free:
-                    # never into what the stage holds (its own set may still be filling)
-                    mapped = plane.stats(weights.plane).device(weights.index).committed
-                    weights.shrink(need - free, max(mapped - evictable, self._floor((name,))))
+                self._room_for_decode(name, free, evictable, need)
             baseline = accel.allocated(weights.torch, weights.kind)
             accel.reset_peak(weights.torch, weights.kind)
             failed = False
@@ -1915,7 +1913,8 @@ class WeightResidency:
                 # it needs more than all it had: the next decode of this size starts tiled
                 peaks[pixels] = max(peaks.get(pixels, 0), free + evictable + 1)
                 mode = "tiled"
-                free, _ = self.room((name,))
+                free, evictable = self.room((name,))
+                free = self._room_for_decode(name, free, evictable, free + evictable)
                 _tile(root, free // max(peaks[pixels] // pixels, 1), scale, default)
                 out = decode(z, *args, **kwargs)
             elif mode == "untiled":
@@ -1958,6 +1957,17 @@ class WeightResidency:
                 weights.plane.prioritise(component.ws, weights.index, None, priority=idle)
         if failure is not None:
             raise failure
+
+    def _room_for_decode(self, name: str, free: int, evictable: int, need: int) -> int:
+        """Activations first: idle weights leave before a decode needs their room (never what
+        the stage holds, which may still be filling), since a decode's convolutions outside
+        any block hook cannot retry. Returns what is free after."""
+        if need <= free or evictable <= 0:
+            return free
+        weights = self.weights
+        mapped = plane.stats(weights.plane).device(weights.index).committed
+        weights.shrink(need - free, max(mapped - evictable, self._floor((name,))))
+        return self.room((name,))[0]
 
     def _floor(self, names: Sequence[str]) -> int:
         """The plane bytes `names` cannot run below at their current grain."""
@@ -2078,7 +2088,7 @@ def _image_vae(root: Any) -> bool:
 def _tile(root: Any, pixels: int, scale: int, default: int) -> None:
     """Tile an image VAE with the largest square tile, up to its own `default`, whose
     activations fit `pixels`."""
-    side = max(int(pixels**0.5) // 64 * 64, 256)
+    side = max(int(pixels**0.5) // 64 * 64, 128)
     root.enable_tiling()
     root.tile_sample_min_size = min(default, side)
     root.tile_latent_min_size = root.tile_sample_min_size // scale
