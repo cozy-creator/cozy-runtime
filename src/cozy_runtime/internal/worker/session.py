@@ -2336,7 +2336,8 @@ class Worker:
         for request in self.machine_calls.journal.unsettled_effects(owner):
             self.execution(owner, request)
         if not owed:
-            self.prespawns.prewarm(owner)
+            # Off the boot path: readiness and the claim never wait on its journal read.
+            self.supervisor.spawn("prewarm", lambda _: self.prespawns.prewarm(owner))
 
     def submit_execution(
         self,

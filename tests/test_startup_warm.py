@@ -49,7 +49,7 @@ from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
 from cozy_runtime.internal.worker.session import HostedPlacement, Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace_calls import Call
-from cozy_runtime.internal.worker.workspace_executions import TERMINAL
+from cozy_runtime.internal.worker.workspace_executions import TERMINAL, Executions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_cross_version_seam import _installation
@@ -698,12 +698,13 @@ def test_one_process_imports_ahead_per_card_for_the_root_served_first(
 
 
 def test_a_restarted_machine_prewarms_what_its_card_last_served(
-    warm: Callable[..., Warm],
+    warm: Callable[..., Warm], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A machine served D1 on its card, then restarted idle. At boot, from its own journal, it
     imports the installation that card last served, for no root; D2, the first root to ask for
     it, is granted the card and adopts that very process: no spawn and no import at its grant,
-    and its first driver call is the device start's."""
+    and its first driver call is the device start's. The boot's claim never waits on that
+    journal read, however slow a cold page cache makes it."""
     del warm  # its driver fakes only: both boots share one machine root
     with tempfile.TemporaryDirectory(prefix="cz-boot.", dir="/tmp") as raw:
         first = Warm(Path(raw), CARDS[0])
@@ -726,9 +727,23 @@ def test_a_restarted_machine_prewarms_what_its_card_last_served(
             origin.close()
             first.worker.shutdown()
 
-        # The worker process restarts within the machine's boot: same root, same journal.
+        # The worker process restarts within the machine's boot: same root, same journal. Its
+        # read of the last grants is held, as a cold page cache holds it (5.9 s measured on a
+        # 43 MB journal); the claim is accepted, and the worker ready, all the same.
+        reading, read = threading.Event(), threading.Event()
+        last_grants = Executions.last_grants
+
+        def cold(executions: Executions, owner: str) -> list[tuple[str, tuple[int, ...]]]:
+            reading.set()
+            assert read.wait(300)  # a hang bound on a loaded box, not a budget
+            return last_grants(executions, owner)
+
+        monkeypatch.setattr(Executions, "last_grants", cold)
         second = Warm(Path(raw), CARDS[0])
         try:
+            assert reading.wait(60) and not read.is_set(), "the claim waited on the prewarm"
+            assert second.worker.claim_ready.is_set()
+            read.set()
             prespawns = second.worker.prespawns
             slot = _wait(lambda: prespawns.slots.get((INSTALLATION, (0,))), "the boot's prewarm")
             assert not slot.roots and slot.started.wait(300) and slot.ready

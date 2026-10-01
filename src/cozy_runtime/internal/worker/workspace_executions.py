@@ -65,6 +65,8 @@ MAX_PROGRESS_EVENTS = 256
 MAX_EVENT_BYTES = 64 << 10
 MAX_PAGE = 256
 MAX_PAGE_BYTES = 256 << 10
+#: the journal rows a boot prewarm reads for the last grants: its cost, not a history bound
+GRANT_TAIL = 1 << 14
 TERMINAL = frozenset({"succeeded", "failed", "paused", "canceled"})
 #: Accepted and not terminal: work this machine still owes.
 OPEN = "('queued','running','pausing','canceling')"
@@ -767,13 +769,17 @@ class Executions:
         return cast(dict[str, Json], canonical_json.decode(row[0])) if row is not None else None
 
     def last_grants(self, owner: str) -> list[tuple[str, tuple[int, ...]]]:
-        """Each GPU set's most recent grant, newest first: the granted execution and its set."""
+        """Each GPU set's most recent grant, newest first: the granted execution and its set.
+        Only the journal's newest `GRANT_TAIL` rows are read, newest first by rowid (`+owner`
+        keeps the owner index out of the plan), so a long history costs nothing; a set whose
+        last grant is older than that is not prewarmed."""
         with self.workspace.locked() as db:
             rows = db.execute(
                 "SELECT json_extract(CAST(body AS TEXT),'$.key'), "
                 "json_extract(CAST(body AS TEXT),'$.ordinals') FROM execution_events "
-                "WHERE owner=? AND kind='gpu.grant' ORDER BY at_ms DESC, sequence DESC LIMIT ?",
-                (owner, MAX_PAGE),
+                "WHERE rowid > (SELECT MAX(rowid) FROM execution_events) - ? "
+                "AND +owner=? AND kind='gpu.grant' ORDER BY rowid DESC LIMIT ?",
+                (GRANT_TAIL, owner, MAX_PAGE),
             ).fetchall()
         latest: dict[tuple[int, ...], str] = {}
         for key, ordinals in rows:
