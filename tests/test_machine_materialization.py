@@ -10,10 +10,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import pytest
 import tensorfs
 
-from cozy_runtime.internal import fill
 from cozy_runtime.internal.worker import machine_materialization
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
@@ -25,8 +23,6 @@ from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
 
 def test_models_only_prepare_fetches_exact_checkpoint_then_works_offline(tmp_path: Path) -> None:
-    if "ensure/1" not in fill.capabilities():
-        pytest.skip("installed TensorFS lacks ensure/1")
     source = tmp_path / "source"
     source.mkdir()
     _, manifest, length, origin = _snapshot(source, include_asset=True, checkpoint_only=True)

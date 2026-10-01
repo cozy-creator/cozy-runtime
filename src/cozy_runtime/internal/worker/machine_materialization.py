@@ -223,8 +223,6 @@ def ensure(
             pass
         if not origin:
             raise WorkspaceRefusal("model_access_absent: this checkpoint is not held locally")
-        if "ensure/1" not in fill.capabilities():
-            raise WorkspaceRefusal("model_materialization_unsupported: TensorFS needs ensure/1")
 
         def progress(event: Mapping[str, object]) -> None:
             measured = sample(event)

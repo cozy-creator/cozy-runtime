@@ -1,0 +1,1 @@
+Two preparations of one checkpoint in a Runtime share TensorFS's own flight instead of a Python lock: the one that waits shows TensorFS's waiting samples and can be canceled, where it used to block silently until the first pull ended. The pre-`ensure` `tensorfs.pull` fallback is gone; the TensorFS floor (0.3.80) always has `ensure/1`.
