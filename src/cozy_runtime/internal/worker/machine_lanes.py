@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -12,7 +12,7 @@ import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import package_interface
-from cozy_runtime.internal.worker.gpu_scheduler import Ordinals, width_for
+from cozy_runtime.internal.worker.stage_scheduler import Ordinals, Want
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import Preparation
 from cozy_runtime.protocol import documents
@@ -41,6 +41,7 @@ class Shape:
     refusal: str = ""
     gpus: int = 0  # the exact group width the owner submitted; 0 lets the scheduler choose
     interface: bytes = b""  # the template's PackageInterface, for its executor's prespawn
+    entrypoint: str = ""  # the template entrypoint the call serves
 
 
 def shape(worker: Worker, owner: str, request: str) -> Shape:
@@ -90,6 +91,7 @@ def _shape(
             template,
             gpus=gpus,
             interface=row.package_interface,
+            entrypoint=name,
         )
     else:
         return Shape(root, "cpu")  # an owner-placed serving root already has its lane
@@ -105,28 +107,57 @@ def _shape(
     return found
 
 
-def unrunnable(found: Shape, readable: Sequence[int]) -> str:
-    """Why this machine can never run `found` on its `readable` GPUs; empty when it can."""
-    if found.refusal or found.kind != "serving":
+def widths(found: Shape, readable: int) -> tuple[int, ...] | str:
+    """The GPU counts `found` may run at on `readable` GPUs: each count every model slot
+    declares (one always is), or the owner's exact one. A count no slot set declares is
+    refused here; one the machine cannot form, the scheduler refuses with numbers."""
+    if found.refusal:
         return found.refusal
-    if not readable:
-        return "gpu_unavailable: no GPU on this worker is readable"
-    if not width_for(found.degrees, len(readable), found.gpus):
-        return (
-            f"gpu_count_unavailable: exactly {found.gpus} GPUs is not a group every model "
-            f"slot declares on {len(readable)} readable GPUs"
-        )
-    return ""
+    common = set.intersection(*({1, *d} for d in found.degrees)) if found.degrees else {1}
+    if found.gpus:
+        if found.gpus not in common:
+            return (
+                f"gpu_count_unavailable: exactly {found.gpus} GPUs is not a group every model "
+                "slot declares"
+            )
+        return (found.gpus,)
+    return tuple(sorted(w for w in common if w <= readable)) or (min(common),)
+
+
+def want(worker: Worker, found: Shape) -> Want | str:
+    """What a call of `found` asks of the stage scheduler, or why it can never ask."""
+    devices = len(worker.lanes.entries)
+    if found.kind == "job":  # a device job is worker-wide
+        return Want(root=found.root, widths=(devices,), exclusive=True)
+    readable = worker.readable_gpus()
+    allowed = widths(found, len(readable))
+    if isinstance(allowed, str):
+        return allowed
+    return Want(
+        root=found.root,
+        widths=allowed,
+        template=found.template,
+        exclude=tuple(o for o in range(devices) if o not in readable),
+        entrypoint=found.entrypoint,
+    )
 
 
 def admit(worker: Worker, parent: str, preparation: bytes, offered: pb.AttemptOffer) -> None:
-    """Refuse at admission what this machine can never run, so it is never queued."""
+    """Refuse at admission what this machine can never run, with numbers, so it is never
+    queued: below the measured floor of some stage at every width it may run at."""
     try:
         found = _shape(worker, "", parent, Preparation.read(preparation).desired(), offered)
     except Exception as exc:
         raise WorkspaceRefusal(f"gpu_shape_unreadable: {type(exc).__name__}: {exc}") from exc
-    if refusal := unrunnable(found, worker.readable_gpus() if found.kind == "serving" else ()):
-        raise WorkspaceRefusal(refusal)
+    if found.refusal:
+        raise WorkspaceRefusal(found.refusal)
+    if found.kind != "serving":
+        return
+    asked = want(worker, found)
+    if isinstance(asked, str):
+        raise WorkspaceRefusal(asked)
+    if (refused := worker.stages.refuse(asked)) is not None:
+        raise WorkspaceRefusal(f"no_capacity: {refused.detail}")
 
 
 def _selected(desired: pb.DesiredWorkerState, placement_id: str) -> pb.Placement:

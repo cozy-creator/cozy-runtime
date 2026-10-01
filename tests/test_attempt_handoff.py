@@ -326,16 +326,16 @@ def test_a_released_gpu_reaches_the_next_call_without_a_commit(
     with tempfile.TemporaryDirectory(prefix="cz-handoff.", dir="/tmp") as raw:
         machine = Machine(Path(raw), CARD, "boot-one")
         try:
-            release = machine.worker.gpu.release
+            release = machine.worker.stages.release
 
-            def timed_release(key: str, **facts: object) -> None:
+            def timed_release(key: str, **facts: Any) -> None:
                 """The first release of a call's grant, and the commits its pass made."""
                 at, before = time.perf_counter() * 1000, len(commits.durable)
                 release(key, **facts)
                 mine = sum(1 for t, _ in commits.durable[before:] if t == threading.get_ident())
                 released.setdefault(key.rpartition("#")[0], (at, mine))
 
-            machine.worker.gpu.release = timed_release  # type: ignore[method-assign]
+            machine.worker.stages.release = timed_release  # type: ignore[method-assign]
             machine.root("A")
             committed = len(commits.durable)
             calls = [machine.child("A", "qwen") for _ in range(RUNS)]

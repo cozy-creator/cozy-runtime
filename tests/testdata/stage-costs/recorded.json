@@ -1,0 +1,161 @@
+{
+ "about": "Recorded real-run facts for the stage policy tests. Every value is measured unless its `source` says derived. Extracted 2026-09-30 from Runtime receipts in ~/cozy_v2/outputs/comfy-cozy-memory-20260929 (runs 2071-2094 on 0.19.0-6660, R19 runs 1914-1936), the owner run database (H3 runs 569/570/575/2003, Qwen child calls), and paging.partition run on each architecture built on meta (bytes equal the checkpoint components).",
+ "machines": {
+  "rtx4070_laptop": {
+   "vram_bytes": 8585740288,
+   "context_bytes": 195035136,
+   "pinned_gbps": 11.9,
+   "disk_gbps": 1.7,
+   "cache_gbps": 8.71,
+   "source": "nvidia-smi total; CUDA context from receipts; pinned H2D microbenchmark; disk single-thread; TensorFS warm read (tfs-007/018)",
+   "executor_start_s": 4.5,
+   "executor_start_source": "SDXL 'Starting executor' spawn + imports, run 2071 (E/analysis-fresh8-refill-grouped/boundaries.log)"
+  },
+  "h100_sxm": {
+   "vram_bytes": 85520809984,
+   "link_gbps": 25.1,
+   "source": "nvidia-smi total; median of 355 in-run staging copies (H3 runs)",
+   "executor_start_s": 17.557674,
+   "executor_start_source": "H3 run 2149 request.log 'Starting model executor' elapsed_ms"
+  }
+ },
+ "sdxl": {
+  "cell": "height=1024,steps=20,width=1024",
+  "source": "run 2077 (8 GB alternating, 1605 MHz) and partition on meta",
+  "unet": {
+   "common": 108326408,
+   "blocks": [4510080, 4510080, 20010240, 20010240, 20010240, 20010240, 13116160, 16392960, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 49169920, 62277120, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 98329600, 98329600, 81943040, 20010240, 20010240, 20010240, 20010240, 20010240, 20010240, 33602560, 25408000, 21310720, 8814080, 6764800, 6764800, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 69511680, 62277120, 62277120]
+  },
+  "text_encoder": {
+   "common": 3072,
+   "blocks": [76009576, 14175744, 14175744, 14175744, 14175744, 14175744, 14175744, 14175744, 14175744, 14175744, 14175744, 14175744, 14175744]
+  },
+  "text_encoder_2": {
+   "common": 3281920,
+   "blocks": [126682216, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880, 39354880]
+  },
+  "vae": {
+   "common": 167307726,
+   "blocks": []
+  },
+  "encode_s": 0.675644,
+  "encode_calls": 2,
+  "step_s": 0.600212,
+  "first_step_s": 1.518404,
+  "steps": 20,
+  "decode_s": 0.128221,
+  "unet_growth": 461373440,
+  "decode_growth": 3061841920,
+  "streamed_3gib": {
+   "keep": 41,
+   "tail_bytes_per_step": 2641721600,
+   "step_s": 1.527502,
+   "source": "run 1921 (R19, synchronous pageable copies, 1605 MHz)"
+  }
+ },
+ "anima": {
+  "cell": "height=1024,steps=30,width=1024",
+  "source": "run 2078 (8 GB alternating, 1485 MHz); run 2075 encoders resident",
+  "transformer": {
+   "common": 37244928,
+   "blocks": [138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056, 138413056]
+  },
+  "text_encoder": {
+   "common": 311167232,
+   "blocks": [31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888, 31461888]
+  },
+  "text_conditioner": {
+   "common": 269327424,
+   "blocks": [],
+   "note": "block split unrecorded: all common (conservative)"
+  },
+  "vae": {
+   "common": 253785062,
+   "blocks": []
+  },
+  "encode_s": 0.769138,
+  "step_s": 1.675386,
+  "first_step_s": 1.560106,
+  "steps": 30,
+  "calls_per_step": 2,
+  "decode_s": 2.377,
+  "transformer_growth": 278921216,
+  "streamed_3gib": {
+   "keep": 13,
+   "tail_bytes_per_step": 4152391680,
+   "step_s": 3.425028,
+   "source": "run 1924 (R19, synchronous pageable copies)"
+  }
+ },
+ "h3": {
+  "cell": "frames=362,height=768,steps=30,width=1344",
+  "source": "fp8 FA3 runs 569 (1 GPU), 575 (2), 570 (4) on H100 SXM; long_form run 2003",
+  "dit_fp8_bytes": 21105747968,
+  "dit_blocks": 50,
+  "dit_block_bytes_derived": 422114959,
+  "text_encoder_bytes": 51506191840,
+  "video_vae_bytes": 10415475968,
+  "audio_vae_bytes": 605306340,
+  "widths": {
+   "1": {
+    "encode_s": 3.896718,
+    "step_s": 29.429812,
+    "decode_video_s": 20.639083,
+    "decode_audio_s": 1.490705
+   },
+   "2": {
+    "encode_s": 3.51358,
+    "step_s": 15.398309,
+    "decode_video_s": 20.92079,
+    "decode_audio_s": 0.743234
+   },
+   "4": {
+    "encode_s": 4.406802,
+    "step_s": 7.835342,
+    "decode_video_s": 21.138168,
+    "decode_audio_s": 0.909365
+   }
+  },
+  "denoise_growth_w1": 14472009728,
+  "x264_finish_s": 13.0,
+  "x264_source": "tracker h3-inference-speed.md \u00a71 (MP4 finish after decode, measured 2026-09-07)",
+  "long_form_segment": {
+   "condition_s": 5.279,
+   "denoise_s": 27.016,
+   "steps_s": [
+    11.971,
+    2.426,
+    2.438,
+    2.425,
+    1.938,
+    1.941,
+    1.928,
+    1.945
+   ],
+   "decode_video_s": 3.202,
+   "decode_audio_s": 0.087,
+   "export_context_s": 2.409
+  }
+ },
+ "qwen_image_2": {
+  "cell": "height=1024,steps=40,width=1024",
+  "source": "H100 SXM medians of 29 child calls inside H3 long_form jobs (derived from progress-event timestamps)",
+  "text_encoder": {
+   "common": 2819171728,
+   "blocks": [30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 30479008, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864, 385892864]
+  },
+  "transformer": {
+   "common": 271589632,
+   "blocks": [436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128, 436208128]
+  },
+  "vae": {
+   "common": 1350961616,
+   "blocks": []
+  },
+  "encode_s": 0.825,
+  "step_s": 0.1465,
+  "first_step_s": 1.1022,
+  "steps": 40,
+  "decode_s": 0.376
+ }
+}

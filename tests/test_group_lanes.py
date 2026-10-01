@@ -27,7 +27,6 @@ from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 from cozy_runtime.internal.worker import lane_wire, lanes
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.gpu_scheduler import width_for
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
@@ -47,6 +46,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import PACKAGE, WEIGHTLESS, _config, _workspace
 from test_end_to_end import NO_EXECUTOR
 from test_gpu_scheduler import driverless
+from test_stage_scheduler import Shell
 
 needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 
@@ -75,17 +75,16 @@ MEASURED = {
 # --------------------------------------------------------------------- bookkeeping
 
 
-def test_a_group_lane_overlaps_its_device_lanes_and_shares_their_locks() -> None:
+def test_a_group_lane_overlaps_its_device_lanes() -> None:
     """A group lane over K devices joins the device lanes instead of replacing them: its
-    seal names all K entries, its id joins the ordinals, and its device lock is the K
-    device locks, so a device runs one attempt whichever lane it comes from."""
+    seal names all K entries and its id joins the ordinals. Which lane's call runs on a
+    device when is the stage scheduler's turn (`test_stage_scheduler`)."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
     group = lanes_.group((0, 1))
     assert group.lane_id == "lane-0+1" and group.ordinals == (0, 1) and group.devices == "0,1"
     assert group.group and group.degree == 2 and group.entries == ("0", "1")
     assert lanes_.group((0, 1)) is group
     assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-0+1", "lane-1", "lane-2"]
-    assert group.locks == (lanes_.by_id["lane-0"].locks[0], lanes_.by_id["lane-1"].locks[0])
     assert lanes_.envelope.ordinals == (0, 1, 2), "the job's envelope lane is untouched"
     assert [lane.lane_id for lane in lanes_.sharing(lanes_.by_id["lane-1"])] == [
         "lane-1",
@@ -135,20 +134,16 @@ def test_a_group_binds_exactly_or_refuses_typed() -> None:
 def _place(
     envelope: str, pin: tuple[int, ...] | None, degrees: tuple[int, ...]
 ) -> tuple[lanes.LaneSet, lanes.DeviceLane]:
-    """An owner-placed placement, as `_assign_lane` places one without a scheduler grant."""
+    """An owner-placed placement, as `_assign_lane` places one: its widest declared degree
+    within its pin, on the set the stage scheduler would place a call of it."""
     lanes_ = lanes.LaneSet.from_envelope(envelope, worker_pid=os.getpid())
     measured = {
         ordinal: accel.DeviceMemory("measured", 6 * GiB, 8 * GiB)
         for ordinal in range(len(lanes_.entries))
     }
     candidates = pin or tuple(range(len(lanes_.entries)))
-    ordinals = lanes_.choose(
-        candidates,
-        width_for([degrees], len(candidates)),
-        model_bearing=True,
-        declared_bytes=GiB,
-        measured=measured,
-    )
+    width = max(set(range(1, len(candidates) + 1)) & {1, *degrees})
+    ordinals = Shell(len(lanes_.entries)).scheduler.choose(candidates, width, ("inst", "b"))
     return lanes_, lanes_.bind("p", ordinals, model_bearing=True, measured=measured)
 
 

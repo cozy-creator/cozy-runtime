@@ -42,12 +42,6 @@ from cozy_runtime.internal.readiness import RuntimeGPU
 from cozy_runtime.internal.worker import lanes, machine_model_defaults, memory
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.gpu_scheduler import (
-    Demand,
-    GpuScheduler,
-    model_degrees,
-    width_for,
-)
 from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
@@ -67,16 +61,6 @@ MARCO = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
 
 
 # ------------------------------------------------------------------------------ policy
-
-
-def test_width_is_the_largest_declared_degree_the_machine_forms() -> None:
-    # base + LoRA both (2,4,7,8): never an undeclared width; the rest of the cards stay free
-    assert [width_for(model_degrees(H3), n) for n in range(1, 10)] == [1, 2, 2, 4, 4, 4, 7, 8, 8]
-    # an exact count is the width when declared and formed, else none
-    exact = [width_for(model_degrees(H3), 4, count) for count in range(1, 9)]
-    assert exact == [1, 2, 0, 4, 0, 0, 0, 0]
-    assert width_for(model_degrees([{}]), 4) == 1  # no declaration is its declared truth
-    assert width_for(model_degrees([{"sequence_parallel": {"degrees": "2"}}]), 4) == 1
 
 
 def test_default_ladder_picks_the_widest_rung_so_h3_is_one_four_gpu_group(
@@ -130,93 +114,14 @@ def test_default_ladder_picks_the_widest_rung_so_h3_is_one_four_gpu_group(
     call = SimpleNamespace(parent_request="parent")
     selected = machine_model_defaults.select(worker, OWNER, call, target, {})  # type: ignore[arg-type]
     assert [row["gpus"] for row in selected] == [4, 4]
-    assert width_for(model_degrees(H3), len(worker.lanes.entries)) == 4
     worker.lanes = SimpleNamespace(entries=("0", "1"))
     selected = machine_model_defaults.select(worker, OWNER, call, target, {})  # type: ignore[arg-type]
     assert [row["gpus"] for row in selected] == [2, 2]
 
 
-def test_a_root_keeps_its_lease_through_the_gap_and_the_head_waiter_reserves() -> None:
-    gpus = GpuScheduler(4)
-    roots = {"A": 1, "B": 2}
-    assert gpus.sync(roots, [Demand("a1#1", "A", 4)]) == {"a1#1": (0, 1, 2, 3)}
-    assert gpus.sync(roots, [Demand("b1#1", "B", 1)]) == {}  # a1 ended: A's gap
-    assert gpus.view()["leases"] == {"A": [0, 1, 2, 3]}
-    assert gpus.view()["waiting"] == {"b1#1": ["A"]}
-    grants = gpus.sync(roots, [Demand("a2#1", "A", 4), Demand("b1#1", "B", 1)])
-    assert grants == {"a2#1": (0, 1, 2, 3)}  # A's next child reuses its own ordinals
-    assert gpus.sync({"B": 2}, [Demand("b1#1", "B", 1)]) == {"b1#1": (0,)}  # A stopped
-    # Nothing moves a younger holder: an older root waits for it and reserves what frees.
-    gpus = GpuScheduler(4)
-    assert gpus.sync({"Y": 5}, [Demand("y#1", "Y", 2)]) == {"y#1": (0, 1)}
-    live = [Demand("y#1", "Y", 2), Demand("o#1", "O", 4), Demand("z#1", "Z", 1)]
-    assert gpus.sync({"O": 1, "Y": 5, "Z": 9}, live) == {"y#1": (0, 1)}
-    assert gpus.view()["leases"] == {"Y": [0, 1], "O": [2, 3]}  # Z cannot take a reserved GPU
-    assert gpus.sync({"O": 1, "Z": 9}, live[1:]) == {"o#1": (0, 1, 2, 3)}
-
-
-def test_two_fanned_out_roots_take_their_group_calls_in_order_and_name_no_cycle() -> None:
-    """Runs 1572 and 1573: each root's references leased the cards they ran on, then each
-    root's 4-GPU call waited behind the other's lease, forever. The older root's call takes
-    the younger's idle cards and waits only on calls actually on them; the younger's is
-    named behind its own calls while the older waits on those, then behind the older."""
-    gpus = GpuScheduler(4)
-    roots = {"A": 1, "B": 2}
-    refs = [Demand(f"{r}{n}#1", r.upper(), 1) for n in (1, 2) for r in "ab"]
-    for arrived in range(1, 5):
-        gpus.sync(roots, refs[:arrived])
-    assert gpus.view()["leases"] == {"A": [0, 2], "B": [1, 3]}
-    gpus.release("a1#1")
-    gpus.release("a2#1")
-    live = [refs[1], refs[3], Demand("sa#1", "A", 4), Demand("sb#1", "B", 4)]
-    assert gpus.sync(roots, live) == {"b1#1": (1,), "b2#1": (3,)}
-    assert gpus.view()["waiting"] == {"sa#1": ["B"], "sb#1": ["B"]}
-    gpus.release("b1#1")
-    assert gpus.sync(roots, live) == {"b2#1": (3,)}
-    assert gpus.view()["leases"] == {"A": [0, 1, 2], "B": [3]}  # A reserves B's idle card
-    gpus.release("b2#1")
-    assert gpus.sync(roots, live) == {"sa#1": (0, 1, 2, 3)}
-    assert gpus.view()["waiting"] == {"sb#1": ["A"]} and gpus.view()["leases"] == {
-        "A": [0, 1, 2, 3]
-    }
-    gpus.release("sa#1")
-    assert gpus.sync(roots, live) == {}  # A's gap holds against the younger B
-    assert gpus.sync({"B": 2}, live) == {"sb#1": (0, 1, 2, 3)}  # A ended
-    leases = [body for root, kind, body in gpus.drain() if (root, kind) == ("B", "gpu.lease")]
-    assert [body["cause"] for body in leases].count("yielded to sa#1") == 2
-
-
-def test_fifo_within_a_root_warm_first_and_release_before_the_next_tick() -> None:
-    gpus = GpuScheduler(4)
-    roots = {"A": 1}
-    demands = [Demand("h3#1", "A", 4), Demand("qwen#1", "A", 1)]
-    gpus.sync(roots, [Demand("ref#1", "A", 1)])
-    assert gpus.sync(roots, [Demand("ref#1", "A", 1), *demands]) == {"ref#1": (0,)}
-    gpus.release("ref#1")
-    assert gpus.sync(roots, [Demand("ref#1", "A", 1), *demands])["h3#1"] == (0, 1, 2, 3)
-    # warm: the placement already resident on ordinal 2 is granted there
-    gpus = GpuScheduler(4)
-    assert gpus.sync({"A": 1}, [Demand("q#1", "A", 1, warm=(2,))]) == {"q#1": (2,)}
-    # excluded ordinals (unreadable, or held by a direct offer) are never granted
-    assert gpus.sync({"A": 1}, [Demand("q#2", "A", 3, exclude=(2,))]) == {"q#2": (0, 1, 3)}
-
-
-def test_a_stopped_roots_attempt_keeps_its_devices_until_it_leaves_them() -> None:
-    gpus = GpuScheduler(2)
-    assert gpus.sync({"A": 1}, [Demand("a#1", "A", 2)]) == {"a#1": (0, 1)}
-    # A was cancelled; its attempt is still on the device
-    assert gpus.sync({"B": 2}, [Demand("a#1", "A", 2), Demand("b#1", "B", 1)]) == {"a#1": (0, 1)}
-    ranks = [{"rank": r, "pid": 70 + r, "ordinal": r, "start_us": 1, "end_us": 2} for r in (0, 1)]
-    gpus.release("a#1", ranks=ranks)
-    assert gpus.sync({"B": 2}, [Demand("a#1", "A", 2), Demand("b#1", "B", 1)]) == {"b#1": (0,)}
-    events = gpus.drain()
-    kinds = [kind for _root, kind, _body in events]
-    assert kinds.count("gpu.grant") == 2 and "gpu.wait" in kinds
-    exit_ = next(body for _root, kind, body in events if kind == "gpu.release")
-    assert exit_ == {"key": "a#1", "ordinals": [0, 1], "cause": "exited", "ranks": ranks}
-
-
-def test_a_group_and_singletons_share_devices_and_execute_one_at_a_time() -> None:
+def test_a_group_and_singletons_bind_overlapping_lanes() -> None:
+    """Lanes overlap: a group over 0-3 and the device lanes under it. Which one runs on a
+    device when is the stage scheduler's (`test_stage_scheduler`)."""
     lane_set = lanes.LaneSet.from_envelope("0,1,2,3", worker_pid=os.getpid())
     ok = accel.DeviceMemory("measured", 80 * GiB, 80 * GiB)
     measured = dict.fromkeys(range(4), ok)
@@ -229,28 +134,6 @@ def test_a_group_and_singletons_share_devices_and_execute_one_at_a_time() -> Non
     ]
     assert all(lane_set.lane_of(p) is not None for p in ("h3", "q0", "q1", "q2"))
 
-    def free(lane: lanes.DeviceLane) -> bool:
-        """Whether this thread could take `lane`'s devices now (never waits)."""
-        taken = [lock for lock in lane.locks if lock.acquire(blocking=False)]
-        for lock in taken:
-            lock.release()
-        return len(taken) == len(lane.locks)
-
-    # H3 on the card holds devices 0-3: no Qwen enters, so none arbitrates it away
-    on_card, leave = threading.Event(), threading.Event()
-
-    def run() -> None:
-        with group.device:
-            on_card.set()
-            leave.wait()
-
-    attempt = threading.Thread(target=run)
-    attempt.start()
-    on_card.wait()
-    assert not any(free(q) for q in qwen) and not free(lane_set.by_id["lane-3"])
-    leave.set()
-    attempt.join()
-    assert all(free(q) for q in qwen) and free(group)
     with pytest.raises(lanes.LaneRefusal) as refused:
         lane_set.bind(
             "wide",
@@ -609,23 +492,25 @@ class Machine:
         while not self.worker.supervisor.quiet_now():
             assert time.monotonic() < bound, self.worker.supervisor.keys("")
             time.sleep(0.01)
-        return self.worker.gpu.view()
+        return self.worker.stages.view()
 
     def journal(self, root: str) -> list[tuple[int, str, dict[str, Any]]]:
-        """The root's gpu.* observations, in journal order."""
+        """The root's gpu.* and stage.* observations, in journal order."""
         page = self.executions.events(OWNER, root)
         return [
             (event.sequence, event.kind, canonical_json.decode(event.body))
             for event in page.events
-            if event.kind.startswith("gpu.")
+            if event.kind.startswith(("gpu.", "stage."))
         ]
 
     def granted(self, request: str) -> list[int]:
+        """The GPUs a call holds its turn on, or was prepared on ahead of its first stage
+        turn (an executor that takes stage turns)."""
         return next(
             (
                 list(body["ordinals"])
                 for _seq, root_kind, body in self._all()
-                if root_kind == "gpu.grant" and body["key"] == request + "#1"
+                if root_kind in ("gpu.grant", "stage.prepare") and body["key"] == request + "#1"
             ),
             [],
         )
@@ -751,7 +636,15 @@ def test_an_older_root_holds_all_four_gpus_through_its_gap_and_b_starts_after(
     )
     b_grant = next(seq for seq, kind, body in machine.journal("B") if kind == "gpu.grant")
     b_wait = [body for _, kind, body in machine.journal("B") if kind == "gpu.wait"]
-    assert b_wait == [{"key": b1 + "#1", "width": 4, "blocked_by": ["A"], "function": "h3"}]
+    assert b_wait == [
+        {
+            "key": b1 + "#1",
+            "width": 4,
+            "ordinals": [0, 1, 2, 3],
+            "blocked_by": ["A"],
+            "function": "h3",
+        }
+    ]
     # B's grant is written after A's release; both journals share one workspace clock order
     a_release_at = next(
         e.at_ms for e in machine.executions.events(OWNER, "A").events if e.sequence == released
@@ -804,7 +697,9 @@ def test_a_fifth_reference_waits_on_its_own_runs_calls_and_names_itself(
         time.sleep(0.01)
     waits = [body for _, kind, body in machine.journal("C") if kind == "gpu.wait"]
     fifth = references[4] + "#1"
-    assert waits == [{"key": fifth, "width": 1, "blocked_by": ["C"], "function": "qwen"}]
+    assert waits == [
+        {"key": fifth, "width": 1, "ordinals": [], "blocked_by": ["C"], "function": "qwen"}
+    ]
     downloaded.set()
     machine.tick()
     # Each call's executor start is its own timed phase on the parent's record, never folded
@@ -849,10 +744,10 @@ def test_cancel_while_waiting_takes_no_grant_and_the_next_root_starts(machine: M
     b1 = machine.child("B", "h3")
     c1 = machine.child("C", "qwen")
     machine.tick()
-    assert b1 + "#1" in machine.worker.gpu.view()["waiting"]
+    assert b1 + "#1" in machine.worker.stages.view()["waiting"]
     machine.control(b1, "cancel")
     machine.tick()
-    assert b1 + "#1" not in machine.worker.gpu.view()["waiting"] and machine.granted(b1) == []
+    assert b1 + "#1" not in machine.worker.stages.view()["waiting"] and machine.granted(b1) == []
     machine.control("A", "cancel")
     machine.finish(a1, pb.OUTCOME_STATUS_CANCELED)
     machine.finish("A", pb.OUTCOME_STATUS_CANCELED)
@@ -876,8 +771,9 @@ def test_a_submitted_exact_width_is_the_group_and_leaves_the_rest_free(
     machine.serving("D", "h3", gpus=8)
     machine.await_granted("A", "B")
     assert machine.granted("A") == [0, 1] and machine.granted("B") == [2, 3]
-    view = machine.worker.gpu.view()
-    assert view["leases"] == {"A": [0, 1], "B": [2, 3]} and not view["waiting"]
+    view = machine.worker.stages.view()
+    assert view["holders"] == {"0": "A#1", "1": "A#1", "2": "B#1", "3": "B#1"}
+    assert not view["waiting"]
     downloaded.set()
     machine.tick()
     for refused, gpus in (("C", 3), ("D", 8)):
@@ -897,7 +793,7 @@ def test_work_this_machine_can_never_run_is_refused_at_admission(machine: Machin
             machine.serving(request, "h3", gpus=gpus, admit=True)
         assert not machine.executions.owns(OWNER, request)
     machine.unreadable.update({"0", "1", "2", "3"})  # type: ignore[attr-defined]
-    with pytest.raises(WorkspaceRefusal, match="gpu_unavailable"):
+    with pytest.raises(WorkspaceRefusal, match="no_capacity: needs 1 GPUs; this machine reads 0"):
         machine.serving("E", "qwen", admit=True)
     assert not machine.executions.owns(OWNER, "E")
 
@@ -1141,10 +1037,11 @@ def test_two_long_forms_fanned_out_on_one_machine_both_run_their_group_calls(
     for root in "AB":
         calls = [body for _, kind, body in machine.journal(root) if kind == "gpu.release"]
         assert len(calls) == 3 and all(body["cause"] == "exited" for body in calls), calls
-    assert said("A") == ["Waiting for GPU (needs 4, behind B)"]
+    # Each wait names the GPUs it is placed on, as nvidia-smi numbers them.
+    assert said("A") == ["Waiting for GPU (GPUs 64-67, behind B)"]
     assert said("B") == [
-        "Waiting for GPU (needs 4, 2 in use by this run's other calls)",
-        "Waiting for GPU (needs 4, behind A)",
+        "Waiting for GPU (GPUs 64-67, 2 in use by this run's other calls)",
+        "Waiting for GPU (GPUs 64-67, behind A)",
     ]
     # B is named behind A only once A no longer waits on B: A's grant ends its wait.
     a_granted = next(
@@ -1221,7 +1118,7 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     attempt = AttemptRecord(
         shot, 2, b"", {"serving": {"entrypoint_binding_digest": digest}}, placement_id=h3
     )
-    with group.device:
+    with worker.stages.hold(group.ordinals, "the shot's turn"):
         worker._arbitrate_residency(attempt, slot)
         worker.memory.end(h3)
     assert hosted.supervision.current is not None
@@ -1239,6 +1136,28 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
         for h in worker.hosted.values()
     )
     assert machine.granted(shot) == [0, 1, 2, 3]
+
+
+@needs_executor
+def test_a_waiting_tenant_is_short_only_while_its_gpu_lacks_room_for_it(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What a call past its last stage is answered by. The tenant wanting its GPU next has
+    room for its 20 GiB beside what is mapped: the weights stay hot. It lacks room: they are
+    unmapped before the turn passes. What cannot be told is short."""
+    _shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    q0 = by_lane["lane-0"]
+    gpus = worker._lane_of(q0).ordinals
+    need = memory.StageNeed(entrypoint="generate")
+    assert worker.memory.short("machine-unknown", need, gpus)
+    if not memory.plane_capable(worker.hosted[q0].supervision.current):
+        assert worker.memory.short(q0, need, gpus), "an older executor is never told to stay"
+        return
+    machine.free["0"] = 30 * GiB  # type: ignore[attr-defined]
+    assert not worker.memory.short(q0, need, gpus)
+    machine.free["0"] = GiB  # type: ignore[attr-defined]
+    assert worker.memory.short(q0, need, gpus)
 
 
 _RANK = """
@@ -1312,9 +1231,9 @@ def test_a_broken_group_is_reaped_before_its_cards_are_granted_again(
     assert _card_rows(rank.pid)[rank.pid] == "present"
     others = {p: e for p, e in machine.executors().items() if p != h3}
     # The failed handler's reply poisons the generation; run_attempt then rebuilds its
-    # lane under the device hold it took for the attempt.
+    # lane inside the whole turn it holds for the attempt.
     hosted.supervision.invalidate(broken, "failed/group_broken")
-    with group.device:
+    with worker.stages.hold(group.ordinals, "the failed attempt's turn"):
         worker._rebuild_lane(group, h3)
         for pid in (broken.pid, rank.pid):
             assert not Path(f"/proc/{pid}").exists(), f"pid {pid} is alive or unreaped"

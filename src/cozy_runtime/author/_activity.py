@@ -11,6 +11,7 @@ import contextlib
 import functools
 import selectors
 import threading
+import time
 import weakref
 from collections.abc import Callable, Iterator
 from concurrent.futures import Executor, Future
@@ -22,6 +23,7 @@ _REGISTRY_LOCK = threading.Lock()
 _BASELINE: weakref.WeakSet[threading.Thread] | None = None
 _POOL_THREADS: weakref.WeakSet[threading.Thread] = weakref.WeakSet()
 _CURRENT: ContextVar[Activity | None] = ContextVar("cozy_executor_activity", default=None)
+_WAITED = threading.local()
 
 
 def _owned[T](call: Callable[[], T]) -> T:
@@ -67,6 +69,26 @@ def observe_await() -> None:
             supported = False
         if not supported:
             activity.change(0, unknown=True)
+
+
+@contextlib.contextmanager
+def blocked() -> Iterator[None]:
+    """A wait for another call's turn is not this call's work."""
+    activity = _CURRENT.get()
+    if activity is not None:
+        activity.change(-1)
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        _WAITED.seconds = getattr(_WAITED, "seconds", 0.0) + time.perf_counter() - start
+        if activity is not None:
+            activity.change(1)
+
+
+def work_clock() -> float:
+    """`perf_counter` less this thread's waits for a turn: what stage and step timers read."""
+    return time.perf_counter() - getattr(_WAITED, "seconds", 0.0)
 
 
 def author_done() -> None:

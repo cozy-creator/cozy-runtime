@@ -2,8 +2,8 @@
 
 ONE manager per Worker decides; each executor's weight plane moves the bytes. A TENANT is one
 placement's executor over its lane's devices; a rank group is one tenant with rank-symmetric
-budgets. A tenant in its turn (`start` .. `end`) holds its devices; every other tenant there
-is idle.
+budgets. The stage scheduler grants turns; a tenant from its turn's `start` to its `end` is
+active and never cut; every other tenant there is idle, and one mid-call is never cut either.
 
 `start` reads the driver once and gives activations first: the plane gets what is free after
 the shape's activation growth, banked from what executors report and never sampled. A shape
@@ -17,8 +17,7 @@ never refused); a dead one by being ended. Below the window-1 floor `start` answ
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Collection, Mapping, Sequence
 
 import msgspec
 
@@ -214,14 +213,6 @@ class MemoryManager:
 
     # ------------------------------------------------------------------ the scheduler's calls
 
-    @contextmanager
-    def starting(self, lane: DeviceLane, slot: str) -> Iterator[None]:
-        """Admit a new device context under the same physical locks as a call: idle tenants
-        of these devices are cut before CUDA or the rank group initializes."""
-        with lane.device:
-            self.make_room(lane, slot, None, "executor startup")
-            yield
-
     def view(self) -> MemoryView:
         """Every device's latest reading and every tenant's plane facts; reads no driver."""
         return MemoryView(
@@ -261,6 +252,28 @@ class MemoryManager:
         if executor is not None and plane_capable(executor):
             return self._start_plane(lane, tenant, row, stage, grow, why)
         return self._start_legacy(lane, tenant, row, grow, why)
+
+    def short(self, tenant: str, stage: StageNeed, gpus: Sequence[int]) -> bool:
+        """Whether `tenant`'s turn on `gpus` would find less room than its weights and
+        activations want, as the devices stand now. What cannot be told is short."""
+        row = self._row(tenant)
+        executor = row.executor() if row is not None else None
+        if row is None or executor is None or not plane_capable(executor):
+            return True
+        ledger = row.ledger
+        size = weights(ledger, stage.components)
+        if not size or not any(
+            lane.ordinals == tuple(gpus) and tenant in lane.rows for lane in self.lanes
+        ):
+            return True
+        grow = growth((stage.entrypoint, stage.cell), row.activation) or 0
+        committed = ledger.plane.committed_bytes if ledger.plane else 0
+        return any(
+            memory.state != "measured"
+            or reach(memory.free_bytes, committed, ledger.slack, grow)
+            < size + grow + weight_policy.MARGIN
+            for memory in self._lane(tenant, gpus).measure(self.kind).values()
+        )
 
     def yielded(
         self, tenant: str, gpus: Sequence[int], next_stage: StageNeed | None = None
@@ -485,6 +498,8 @@ class MemoryManager:
             executor = row.supervision.current if row.supervision is not None else None
             if other == slot or other in tried or executor is None:
                 continue
+            if executor.busy() and executor.alive() and not executor.poisoned:
+                continue  # mid-call (an attempt's tail, a load): a cut would wait for it
             if executor.poisoned or not executor.alive():
                 dead.append((other, lane, row, executor))
             elif other not in self.active and holds(row, executor, short & set(lane.ordinals)):
