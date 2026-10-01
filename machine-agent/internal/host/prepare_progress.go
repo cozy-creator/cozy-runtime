@@ -80,8 +80,9 @@ func preparationModels(message proto.Message) []preparationModel {
 }
 
 func (selected preparationModel) matches(model *pb.DownloadModelRef) bool {
-	return selected.manifest != "" && selected.manifest == model.GetManifest() &&
-		(selected.repository == "" || strings.EqualFold(selected.repository, model.GetModel()))
+	// A bare CID authorizes bytes, not another caller's repository label.
+	return selected.repository != "" && selected.manifest != "" && selected.manifest == model.GetManifest() &&
+		strings.EqualFold(selected.repository, model.GetModel())
 }
 
 func (m *Machine) preparationProgress(ctx context.Context, conn *grpc.ClientConn, models []preparationModel) []*pb.PrepareModelProgress {
@@ -100,7 +101,7 @@ func (m *Machine) preparationProgress(ctx context.Context, conn *grpc.ClientConn
 		for _, selected := range models {
 			if selected.matches(row.GetModel()) {
 				projected := proto.Clone(row).(*pb.PrepareModelProgress)
-				projected.Model = &pb.DownloadModelRef{Model: row.GetModel().GetModel(), Manifest: row.GetModel().GetManifest()}
+				projected.Model = &pb.DownloadModelRef{Model: selected.repository, Manifest: selected.manifest}
 				if labels := selected.labels; labels != nil {
 					projected.Model.Release, projected.Model.Lane = labels.Release, labels.Lane
 					projected.Model.Package, projected.Model.Slot = labels.Package, labels.Slot

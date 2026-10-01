@@ -286,7 +286,7 @@ def test_model_defaults_use_the_same_observable_native_availability(
                         "public_origin": machine.request.hub,
                     }
                 ],
-                None,
+                progress=None,
             )
         except BaseException as exc:
             failures.append(exc)
@@ -368,7 +368,7 @@ def test_both_native_routes_share_active_progress_without_reset(
                         "public_origin": machine.request.hub,
                     }
                 ],
-                None,
+                progress=None,
             )
         except BaseException as error:
             failures.append(error)

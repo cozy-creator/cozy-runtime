@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +24,7 @@ type progressFixture struct {
 	Address               string `json:"address"`
 	Request               string `json:"request"`
 	Manifest              string `json:"manifest"`
+	ManifestLength        uint64 `json:"manifest_length"`
 	AlternateManifest     string `json:"alternate_manifest"`
 	FirstAdapterManifest  string `json:"first_adapter_manifest"`
 	SecondAdapterManifest string `json:"second_adapter_manifest"`
@@ -423,6 +426,22 @@ func TestSharedCheckpointProgressKeepsCallerLabelsAndRevisionIsolated(t *testing
 	_, differentCall := makeCall("private/next", "next.models.video", "", fixture.AlternateManifest)
 	if rows := m.preparationProgress(ctx, conn, preparationModels(differentCall)); len(rows) != 0 {
 		t.Fatalf("different real checkpoint borrowed the active revision: %v", rows)
+	}
+	// Runtime accepts exact immutable manifests without a repository. Its bytes
+	// do not authorize copying a repository label from another caller's flight.
+	digest, err := hex.DecodeString(strings.TrimPrefix(fixture.Manifest, "sha256:"))
+	if err != nil || fixture.ManifestLength == 0 {
+		t.Fatalf("fixture needs its real immutable manifest identity: %v", err)
+	}
+	bareCall := &pb.PreparePrivatePlacementCall{PrivatePlacementSet: &pb.DesiredPrivatePlacementSet{
+		ModelChoices: []*pb.ModelChoice{{Parameter: "bare.models.base",
+			Manifest: &pb.Ref{Digest: digest, Length: fixture.ManifestLength}}},
+	}}
+	if _, err := canonical.Bytes(bareCall); err != nil {
+		t.Fatalf("valid bare-CID choice failed typed admission: %v", err)
+	}
+	if rows := m.preparationProgress(ctx, conn, preparationModels(bareCall)); len(rows) != 0 {
+		t.Fatalf("bare CID disclosed another caller's repository label: %v", rows)
 	}
 	_ = os.WriteFile(filepath.Join(root, "release"), nil, 0600)
 	for range 2 {
