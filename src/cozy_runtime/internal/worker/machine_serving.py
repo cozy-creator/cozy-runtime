@@ -250,6 +250,13 @@ class Serving:
         with contextlib.suppress(WorkspaceRefusal, OSError):
             self.worker.emit_progress(call.parent_request, request.parent_attempt_ordinal, frame)
 
+    def _stage(self, call: Call, request: pb.ChildCallRequest, name: str, scope: str = "") -> str:
+        """`name` under its call's step label (else `scope`): one line per step for clients."""
+        label = self.worker.calls.progress_label(
+            call.parent_request, request.parent_attempt_ordinal, call.call_index
+        )
+        return f"{label or scope} / {name}"[:120] if label or scope else name
+
     @contextlib.contextmanager
     def phase(
         self, call: Call, request: pb.ChildCallRequest, name: str, since: float = 0.0
@@ -257,11 +264,9 @@ class Serving:
         """Separate immutable preparation and per-child custody in the parent journal. `since`
         (a `perf_counter` reading) starts the timing at work done before the phase opened."""
         started = since or time.perf_counter()
-        label = self.worker.calls.progress_label(
-            call.parent_request, request.parent_attempt_ordinal, call.call_index
+        self._progress(
+            call, request, {"kind": "progress", "stage": self._stage(call, request, name)}
         )
-        stage = f"{label} / {name}"[:120] if label else name
-        self._progress(call, request, {"kind": "progress", "stage": stage})
         succeeded = False
         try:
             yield
@@ -1008,7 +1013,9 @@ class Serving:
                 if not stage:
                     stage.append(
                         StageProgress(
-                            target.entrypoint + " / Downloading model weights",
+                            self._stage(
+                                call, request, "Downloading model weights", target.entrypoint
+                            ),
                             lambda frame: self._progress(call, request, frame),
                         )
                     )

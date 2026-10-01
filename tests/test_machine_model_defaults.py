@@ -6,7 +6,8 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,7 +30,7 @@ from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from fault_hub import HEADER, FaultHub, Stall, Watched, checkpoint, on, temps
+from fault_hub import HEADER, FaultHub, Gate, Stall, Watched, checkpoint, on, temps
 from test_device_lanes import _config
 from test_machine_execution import ack, complete, offer
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
@@ -732,3 +733,44 @@ def test_a_second_pull_of_one_checkpoint_waits_in_tensorfs_and_can_leave(tmp_pat
             point.model, point.manifest, point.length
         )
         assert temps(root) == [] and hub.asks(HEADER) == 2, hub.log()
+
+
+def test_a_preparation_reports_its_whole_size_only_once_every_pull_has_one(
+    tmp_path: Path,
+) -> None:
+    """The adapter's Hub answers only after the base has its size: a sum of the base alone
+    would tell a watcher the whole download is the base."""
+    base = checkpoint(tmp_path / "base", "proof/base")
+    adapter = checkpoint(tmp_path / "adapter", "proof/adapter", path="adapter.cozytensors")
+    sized = threading.Event()
+
+    @contextmanager
+    def downloading(row: defaults.Selected) -> Iterator[defaults.Sample]:
+        yield lambda _, total: sized.set() if row.repository == base.model and total else None
+
+    root = tmp_path / "store"
+    tensorfs.Store.init(str(root))
+    worker = peer({})
+    worker.workspace = Workspace(root)
+    worker.config = cast(Any, SimpleNamespace(object_storage_hosts=("127.0.0.1",)))
+    reported: list[tuple[int, int]] = []
+    with FaultHub(base) as first, FaultHub(adapter, on("closure", 1, 1, Gate(sized))) as second:
+        rows = [
+            {
+                "parameter": point.model.removeprefix("proof/"),
+                "public_origin": hub.origin,
+                "repository": point.model,
+                "manifest": {"digest": point.manifest, "length": point.length},
+            }
+            for point, hub in ((base, first), (adapter, second))
+        ]
+        Watched(
+            second,
+            lambda: defaults.materialize(
+                worker, rows, downloading=downloading, progress=lambda *at: reported.append(at)
+            ),
+            first.reading,
+        ).result()
+    whole = reported[-1][1]
+    assert reported[-1][0] == whole and {size for _, size in reported} == {whole}, reported
+    assert [done for done, _ in reported] == sorted(done for done, _ in reported), reported
