@@ -1315,6 +1315,11 @@ def test_warm_serving_keeps_ordered_lora_views_and_reuses_the_same_preparation(
     from cozy_runtime.internal import census_cache
     from test_lora_composition import Value, model
 
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
     machine = published
     store = tensorfs.Store.open(str(machine.store_root))
     base = model(
