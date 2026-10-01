@@ -1302,3 +1302,120 @@ def test_the_compatibility_check_overlaps_the_weight_download(
         assert window < 2.4, f"the check and the download took {window:.2f} s: one after the other"
     finally:
         catalog.close()
+
+
+def test_warm_serving_keeps_ordered_lora_views_and_reuses_the_same_preparation(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real shared serving preparation, native LoRA writer and source custody.
+
+    The existing routing fixture supplies device facts and the construction census;
+    its accepted roots are held without executing. This is no GPU qualification.
+    """
+    from cozy_runtime.internal import census_cache
+    from test_lora_composition import Value, model
+
+    machine = published
+    store = tensorfs.Store.open(str(machine.store_root))
+    base = model(
+        store,
+        machine.root,
+        "reuse-base",
+        "transformer",
+        {"proj.weight": Value((2, 3), (1, 2, 3, 4, 5, 6))},
+        b'{"input":3,"output":2}',
+    )
+    first = model(
+        store,
+        machine.root,
+        "reuse-first",
+        "adapter",
+        {
+            "proj.lora_A.weight": Value((1, 3), (1, 0, 2)),
+            "proj.lora_B.weight": Value((2, 1), (3, 4)),
+        },
+    )
+    second = model(
+        store,
+        machine.root,
+        "reuse-second",
+        "adapter",
+        {
+            "proj.lora_A.weight": Value((2, 3), (1, 1, 0, 0, 1, 2), "f16"),
+            "proj.lora_B.weight": Value((2, 2), (1, 2, 3, 4), "f16"),
+        },
+    )
+    monkeypatch.setattr(
+        package_prepare,
+        "_census",
+        lambda *_: (
+            lambda wanted: {
+                path: census_cache.Census(("transformer",), (), True, "") for path in wanted
+            }
+        ),
+    )
+    for name, artifact in (("reuse-base", base), ("reuse-first", first), ("reuse-second", second)):
+        store.replace_local(
+            None,
+            name,
+            artifact.tensorfs_receipt_digest,
+            artifact.manifest.digest,
+            artifact.manifest.length,
+        )
+    length = base.manifest.length
+    catalog = Catalog(base.manifest.digest, length, [], interface=machine.interface)
+    catalog.serve(machine)
+    preparations: list[int] = []
+    prepare = package_prepare.prepare_model_placement
+
+    def counted(**kwargs: Any) -> Any:
+        preparations.append(len(kwargs["models"][0].get("adapters", [])))
+        return prepare(**kwargs)
+
+    monkeypatch.setattr(package_prepare, "prepare_model_placement", counted)
+    views: dict[str, str] = {}
+    try:
+        for name, stack in (
+            ("baseline", ()),
+            ("stack", ((first, "0.5"), (second, "-0.25"))),
+            ("repeat", ((first, "0.5"), (second, "-0.25"))),
+            ("reverse", ((second, "-0.25"), (first, "0.5"))),
+            ("zero", ((first, "0"), (second, "-0.25"))),
+            ("baseline-after", ()),
+        ):
+            request = submission(machine, "lora-" + name)
+            choice = request.release_root.models.add(
+                parameter="model",
+                repository="local/reuse-base",
+                manifest=pb.Ref(digest=documents.raw(base.manifest.digest), length=length),
+            )
+            for adapter, scale in stack:
+                choice.adapters.add(
+                    component="transformer",
+                    model="local/reuse-first" if adapter == first else "local/reuse-second",
+                    manifest=adapter.manifest.digest,
+                    source_component="adapter",
+                    scale=scale,
+                )
+            receipt, _ = submit(machine, request)
+            prepared = machine.executions.preparation(OWNER, receipt.request_id)
+            placement = next(iter(prepared["installations"].values()))["placement"]
+            models = {row["id"]: row for row in placement["models"]}
+            slot = next(entry for entry in placement["entrypoints"] if entry["name"] == "touch")[
+                "slots"
+            ][0]
+            assert models[slot["reference_model_id"]]["manifest"]["digest"] == base.manifest.digest
+            adapters = slot.get("adapters", [])
+            assert [
+                (models[row["model_id"]]["manifest"]["digest"], row["scale"]) for row in adapters
+            ] == [(artifact.manifest.digest, scale) for artifact, scale in stack]
+            views[name] = models[slot["components"][0]["model_id"]]["manifest"]["digest"]
+            assert (views[name] != base.manifest.digest) == bool(stack)
+            if name == "repeat":
+                assert preparations == [0, 2], "the same adapted binding was prepared again"
+        assert views["repeat"] == views["stack"]
+        assert views["reverse"] != views["stack"] and views["zero"] != views["stack"]
+        assert views["baseline-after"] == views["baseline"]
+        assert preparations == [0, 2, 2, 2], "baseline or adapted warm preparation was not reused"
+    finally:
+        catalog.close()
