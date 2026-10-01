@@ -271,7 +271,7 @@ def test_unavailable_default_refuses_before_accelerator_discovery(
     with pytest.raises(WorkspaceRefusal, match="captured Model default is unavailable"):
         defaults.select(peer(captured()), "owner", call, target(), {"adapter": {}})
     # An open slot is read at the machine's own Hub; a machine without a grant has none.
-    with pytest.raises(WorkspaceRefusal, match="no Hub grant"):
+    with pytest.raises(WorkspaceRefusal, match="names no Hub"):
         defaults.select(peer({"model_defaults": []}), "owner", call, target(), {"adapter": {}})
 
 

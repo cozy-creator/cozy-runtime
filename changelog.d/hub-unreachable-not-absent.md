@@ -1,0 +1,1 @@
+A 404 that carries no Hub error (a dead tunnel or proxy in front of the Hub, e.g. ngrok's ERR_NGROK_3200) is the Hub being unreachable: a catalog read refuses naming the origin instead of reporting "no release", and a publication call answers the transient `publication.hub_unreachable` instead of a 404 that settles a finalize as never arrived.
