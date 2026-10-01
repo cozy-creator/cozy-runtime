@@ -17,6 +17,9 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("peft")
 pytest.importorskip("diffusers")
 
+from torch.utils._python_dispatch import TorchDispatchMode  # noqa: E402
+from torch.utils._pytree import tree_leaves  # noqa: E402
+
 from cozy_runtime.internal import spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
@@ -129,14 +132,10 @@ def test_real_h3_forward_matches_ordered_reference_adapters(component: str, turb
         factors: tuple[tuple[Tensor, Tensor, float], ...],
     ) -> Callable[[nn.Module, tuple[Tensor, ...], Tensor], Tensor]:
         def apply(_module: nn.Module, operands: tuple[Tensor, ...], output: Tensor) -> Tensor:
-            value = operands[0]
-            result = output
+            # The exact update, in float64; served updates round once into the output.
+            value, result = operands[0].double(), output.double()
             for a, b, scaling in factors:
-                value = value.to(a.dtype)
-                result = (
-                    result
-                    + torch.nn.functional.linear(torch.nn.functional.linear(value, a), b) * scaling
-                )
+                result += value @ a.double().T @ b.double().T * scaling
             return result.to(output.dtype)
 
         return apply
@@ -192,7 +191,7 @@ def test_real_h3_forward_matches_ordered_reference_adapters(component: str, turb
             baseline = original(**inputs)
             for got, want in zip(observed, wanted, strict=True):
                 assert torch.isfinite(got).all()
-                torch.testing.assert_close(got, want, rtol=0, atol=0)
+                torch.testing.assert_close(got, want)
             assert all(
                 not torch.equal(got, plain) for got, plain in zip(observed, baseline, strict=True)
             )
@@ -288,3 +287,61 @@ def test_a_prepared_lora_view_serves_its_exact_factors_on_every_gpu(
     for got, single in zip(many, one, strict=True):
         torch.testing.assert_close(got, single, rtol=0.02, atol=0.02)
     assert not torch.cuda.is_initialized()
+
+
+class _Outputs(TorchDispatchMode):  # type: ignore[misc]
+    """Every tensor each dispatched op produces: what a forward allocates, by dtype and size."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[tuple[Any, int]] = []
+
+    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
+        kwargs = kwargs or {}
+        held = {
+            t.untyped_storage().data_ptr()
+            for t in tree_leaves((args, kwargs))
+            if isinstance(t, torch.Tensor)
+        }
+        out = func(*args, **kwargs)
+        self.seen += [
+            (t.dtype, t.numel())
+            for t in tree_leaves(out)
+            if isinstance(t, torch.Tensor) and t.untyped_storage().data_ptr() not in held
+        ]
+        return out
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_a_lora_update_accumulates_in_place_at_the_activation_precision(
+    tmp_path: Path, dtype: Any
+) -> None:
+    """Factors keep their stored dtype, yet a bf16 activation is never copied to it and no
+    full-width update is materialized (#1077): the only temporaries are rank-wide. The served
+    projection stays within bf16 rounding of the exact merged weight."""
+    root = tmp_path / "store"
+    view, values, factors = h3_lora_runtime.checkpoints(root, dtype)
+    model, _ = h3_lora_runtime.construct(root, view.digest)
+    dit = model.pipe.components[h3_lora_runtime.COMPONENT]
+    residency: Any = model._cozy_residency
+    rows = 4096
+    residency.admit("denoise", (h3_lora_runtime.COMPONENT,))
+    try:
+        for path in h3_lora_runtime.targets(dit):
+            layer = dit.get_submodule(path)
+            x = torch.randn(rows, layer.in_features, generator=torch.Generator().manual_seed(5))
+            x = x.to(torch.bfloat16)
+            with torch.inference_mode(), _Outputs() as outputs:
+                got = layer(x)
+            # Only the base output is full width; views and the in-place update allocate nothing.
+            wide = [(kind, n) for kind, n in outputs.seen if n > rows * h3_lora_runtime.RANK]
+            assert wide == [(torch.bfloat16, rows * layer.out_features)], (path, wide)
+            a, b = (factors[f"{path}.lora_{role}.weight"].double() for role in "AB")
+            weight = values[path + ".weight"].double() + h3_lora_runtime.SCALING * (b @ a)
+            want = x.double() @ weight.T
+            base = x.double() @ values[path + ".weight"].double().T
+            error = (got.double() - want).norm()
+            assert error < 2**-8 * want.norm(), path
+            assert error < 0.01 * (want - base).norm(), path
+    finally:
+        residency.release("denoise", (h3_lora_runtime.COMPONENT,))
