@@ -1722,7 +1722,7 @@ class WeightResidency:
                 out = decode(z, *args, **kwargs)
             elif mode == "untiled":
                 peak = accel.peak_allocated(weights.torch, weights.kind) - baseline
-                per_pixel[:] = [max(peak // max(pixels, 1), *per_pixel)]
+                per_pixel[:] = [max([peak // max(pixels, 1), *per_pixel])]
             weights.modes[f"{name}.decode"] = mode
             return out
 
