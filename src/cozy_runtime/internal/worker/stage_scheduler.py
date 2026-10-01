@@ -246,6 +246,23 @@ class StageScheduler:
             demand = self.demands.get(key)
             return demand is not None and demand.dispatched and not demand.whole
 
+    def turn_taking(self, key: str) -> bool:
+        """At device entry, for an executor that takes stage turns on one GPU: a call given a
+        whole turn before its executor's capability was known gives that turn back and goes
+        stage by stage, so the next call can prepare beside it. False for a device job."""
+        with self.lock:
+            demand = self.demands.get(key)
+            if demand is None or not demand.dispatched or demand.want.exclusive:
+                return False
+            if demand.whole:
+                if demand.entered or len(demand.gpus) != 1:
+                    return False
+                demand.whole = False
+                self._free(key)
+                demand.since = time.monotonic()
+        self.resync()
+        return True
+
     # ------------------------------------------------------------------ whole turns
 
     def take(self, key: str, stop: Callable[[], bool] = lambda: False) -> bool:

@@ -41,6 +41,8 @@ class Shell:
     ) -> None:
         self.events: list[Event] = []
         self.poked: list[str] = []
+        #: whether executors take stage turns, as their hellos say once known
+        self.turns = turns
         self.prefilled: list[str] = []
         self.gpus = [Gpu(ordinal=o, total=total) for o in range(devices)]
         self.host = Host(spawn_s=spawn_s)
@@ -51,7 +53,7 @@ class Shell:
             machine=lambda: Machine(tuple(self.gpus), self.host),
             warm=lambda template: (warm or {}).get(template, ()),
             sets=lambda want: (sets or {}).get(want.template, {}),
-            turns=lambda installation: turns,
+            turns=lambda installation: self.turns,
             prefill=lambda key, template: self.prefilled.append(key),
             fault=self._fault,
             note=lambda why: None,
@@ -355,6 +357,23 @@ def test_a_turn_on_the_same_tenant_keeps_its_budget() -> None:
     again, got = ask(shell, "S#1", "denoise")
     again.join(30)
     assert got == [Grant((0,), False)], "a parked denoise stage keeps its plan"
+
+
+def test_a_whole_turn_given_before_its_executor_was_known_is_given_back_at_entry() -> None:
+    """A restarted machine's first call wants the GPU before any executor said `stage/1`: it
+    is dispatched with a whole turn. At its device entry its executor takes stage turns, so it
+    gives the whole turn back, and the next model prepares beside it."""
+    shell = Shell(1)
+    gpus = shell.scheduler
+    gpus.open_root("A", 1)
+    gpus.open_root("S", 2)
+    gpus.want("A#1", Want(root="A", template=ANIMA, entrypoint="generate"))
+    gpus.want("S#1", Want(root="S", template=SDXL, entrypoint="generate"))
+    assert shell.held() == {"A#1": (0,)} and not gpus.ready("S#1")
+    shell.turns = True  # the prespawned executors' hellos arrive
+    assert gpus.turn_taking("A#1")
+    assert shell.held() == {} and gpus.ready("S#1"), "SDXL prepares while Anima runs"
+    assert gpus.view()["waiting"] == {}
 
 
 def test_one_executor_serves_one_call_at_a_time_and_one_more_prepares_per_gpu() -> None:

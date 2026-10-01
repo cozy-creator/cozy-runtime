@@ -2685,7 +2685,7 @@ class Worker:
             and STAGE_TURNS in executor.hello.get("memory", ())
             and lane is not None
             and len(lane.ordinals) == 1
-            and self.stages.taking_turns(_demand(attempt))
+            and self.stages.turn_taking(_demand(attempt))
         )
 
     def _attempt_executor(self, attempt: AttemptRecord) -> child.Executor | None:
