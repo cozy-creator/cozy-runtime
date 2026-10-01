@@ -47,6 +47,7 @@ import inspect
 from pathlib import Path
 
 import tensorfs
+import tensorfs.plane
 
 from cozy_runtime.internal.worker import model_source_prepare
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -177,6 +178,31 @@ CALLED: dict[str, str] = {
     "Batch.release": "(self, /)",
     "Batch.items": "(self, /)",
     "ReadPlan.items": "(self, /)",
+    # The weight plane (`tensorfs.plane`, 0.3.84): what `internal/plane.py`, `internal/weights.py`
+    # and `worker/host_tier.py` call.
+    "plane.Plane": (
+        "(devices, readers=8, copy_streams=1, slab_bytes=Ellipsis, staging_buffers=4, "
+        "staging_bytes=Ellipsis, direct_io=True)"
+    ),
+    "plane.Plane.source": "(self, /, store, lease)",
+    "plane.Plane.register": "(self, /, name, source, plan, regions, host_fd=None)",
+    "plane.Plane.set_vram_budget": "(self, /, device, nbytes)",
+    "plane.Plane.set_pinned_budget": "(self, /, nbytes)",
+    "plane.Plane.want": "(self, /, ws, tier, regions=None, priority=0, pin=False)",
+    "plane.Plane.prioritise": "(self, /, ws, tier, regions=None, priority=0, pin=None)",
+    "plane.Plane.drop": "(self, /, ws, tier, regions=None)",
+    "plane.Plane.acquire": "(self, /, ws, device, region, stream, priority=None)",
+    "plane.Plane.stream": (
+        "(self, /, ws, device, order, window, repeat=1, priority=0, tag='denoise', ring_bytes=None)"
+    ),
+    "plane.Plane.events": "(self, /)",
+    "plane.Plane.stats": "(self, /)",
+    "plane.WeightSet.close": "(self, /)",
+    "plane.Ticket.wait": "(self, /)",
+    "plane.Lease.release": "(self, /, stream=None)",
+    "plane.Lease.view": "(self, /)",
+    "plane.Cursor.acquire": "(self, /, region, stream)",
+    "plane.Cursor.close": "(self, /)",
 }
 
 #: Bindings cozy-runtime uses only where the installed TensorFS has them: the call site
