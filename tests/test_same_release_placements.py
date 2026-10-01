@@ -449,7 +449,8 @@ def test_a_serving_root_waits_behind_a_job_of_its_own_release(machine: Machine) 
         ),
     )
     machine.tick()
-    assert machine.worker.gpu.view()["leases"] == {"A": [0, 1, 2, 3]}
+    holders = machine.worker.stages.view()["holders"]
+    assert holders == {"0": "A#1", "1": "A#1", "2": "A#1", "3": "A#1"}
 
     # The serving root reuses its own earlier preparation, as a pod host answers an
     # identical preparation from its retained result without reaching Runtime.
@@ -470,15 +471,11 @@ def test_a_serving_root_waits_behind_a_job_of_its_own_release(machine: Machine) 
     assert held["placement"]["bindings_digest"] == documents.spell(served.bindings_digest)
     machine.tick()
     waits = [body for _, kind, body in machine.journal("B") if kind == "gpu.wait"]
-    assert waits == [{"key": "B#1", "width": 1, "blocked_by": ["A"]}]
+    assert waits == [{"key": "B#1", "width": 1, "ordinals": [], "blocked_by": ["A"]}]
 
     machine.finish("A")
     machine.tick()
-    released = next(
-        seq
-        for seq, kind, body in machine.journal("A")
-        if kind == "gpu.lease" and not body["ordinals"]
-    )
+    released = next(seq for seq, kind, _ in machine.journal("A") if kind == "gpu.release")
     grant = next(body for _, kind, body in machine.journal("B") if kind == "gpu.grant")
     assert grant["key"] == "B#1" and len(grant["ordinals"]) == 1
     at = {e.sequence: e.at_ms for e in machine.executions.events(OWNER, "A").events}

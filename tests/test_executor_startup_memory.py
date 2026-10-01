@@ -8,6 +8,7 @@ seams, so this CPU proof does not claim a GPU OOM.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -132,9 +133,9 @@ def test_start_admits_the_full_group_before_allocating_a_new_context(
     calls, _ = allocation(machine, fresh, monkeypatch, idle, occupied)
     bindings = dict(fresh.bindings)
     assert fresh.lane.measure(machine.worker.memory.kind)[1].free_bytes == 225 << 20
-    # An attempt can already hold the lane when its new context needs admission:
-    # the shared physical RLocks must be safely re-entered.
-    with fresh.lane.device:
+    # An attempt can already hold its GPUs' turn when its new context needs admission:
+    # the turn is re-entered, never waited for.
+    with machine.worker.stages.hold(fresh.lane.ordinals, "an attempt's turn"):
         assert machine.worker._start_executor(fresh, executor) == ""
     assert len(calls) == 1
     assert calls[0].devices == "64,65" and calls[0].sequence_parallel_degree == 2
@@ -159,24 +160,18 @@ def test_start_waits_for_active_work_before_vacating_its_memory(
     executor = fresh.supervision.current
     assert executor is not None
     calls, called = allocation(machine, fresh, monkeypatch, idle, occupied)
-    active, leave, waiting = threading.Event(), threading.Event(), threading.Event()
-    lock = fresh.lane.device.locks[0]
-
-    class ObservedLock:
-        def acquire(self) -> bool:
-            if threading.current_thread() is starter:
-                waiting.set()
-            return lock.acquire()
-
-        def release(self) -> None:
-            lock.release()
-
-    monkeypatch.setattr(fresh.lane.device, "locks", (ObservedLock(), *fresh.lane.device.locks[1:]))
+    active, leave = threading.Event(), threading.Event()
+    stages = machine.worker.stages
 
     def executing() -> None:
-        with idle.lane.device:
+        # Work that recovers from no out-of-memory holds the GPUs: a whole turn.
+        with stages.hold(idle.lane.ordinals, "active work"):
             active.set()
             leave.wait()
+
+    def waiting() -> bool:
+        demands = stages.view()["demands"]
+        return any("executor startup" in key for key in demands)
 
     result: list[str] = []
     holder = threading.Thread(target=executing)
@@ -187,7 +182,10 @@ def test_start_waits_for_active_work_before_vacating_its_memory(
     assert active.wait(10)
     try:
         starter.start()
-        assert waiting.wait(10), "startup never acquired the shared physical locks"
+        bound = time.monotonic() + 10  # a hang bound on a loaded box, not a budget
+        while not waiting():
+            assert time.monotonic() < bound, "startup never asked for its turn"
+            time.sleep(0.01)
         assert not called.is_set() and not calls
         assert occupied == HELD
     finally:
@@ -231,10 +229,9 @@ def test_unmanaged_or_unreadable_startup_oom_refuses_once_with_its_original_reas
     assert idle.supervision.current is not None and idle.supervision.current.alive()
 
 
-def test_prespawn_admission_uses_the_same_ordered_physical_locks(machine: Machine) -> None:
+def test_a_prespawn_lane_is_no_placement(machine: Machine) -> None:
     lane = prespawn._lane(machine.worker, (0, 1))
-    physical = tuple(machine.worker.lanes.by_id[f"lane-{o}"].locks[0] for o in (0, 1))
-    assert lane.locks == physical and lane.device.locks == physical
+    assert lane.ordinals == (0, 1) and lane.devices == "64,65"
     # The temporary startup lane is not another placement or scheduler grant.
     assert not lane.placements and lane.lane_id not in machine.worker.lanes.composition
 

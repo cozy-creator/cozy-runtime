@@ -386,7 +386,9 @@ class StageScheduler:
         if demand.at < len(demand.stages) and demand.calls >= demand.stages[demand.at].calls:
             demand.at, demand.calls = demand.at + 1, 0
         self._free(demand.key)
-        past = demand.at >= len(demand.stages)
+        # Only a graph seen end to end says where a call is done with its GPUs; a call
+        # learning its first graph keeps its claim, and its budget, to its release.
+        past = demand.graph.observed and demand.at >= len(demand.stages)
         if past:
             demand.tenant = False
         return past
@@ -555,7 +557,7 @@ class StageScheduler:
             root=want.root,
             priority=MAINTENANCE if maintenance else root[0] if root else UNROOTED,
             arrival=demand.arrival,
-            stages=tuple(demand.stages),
+            stages=self._predicted(demand),
             phase=phase,
             at=demand.at,
             elapsed_s=now - demand.since,
@@ -564,6 +566,14 @@ class StageScheduler:
             warm=self.warm(want.template) if want.template[0] else (),
             exclude=want.exclude,
         )
+
+    def _predicted(self, demand: _Demand) -> tuple[policy.JobStage, ...]:
+        """The stages the policy plans by: a graph not yet observed end to end ends in one
+        more unmeasured stage, so the call keeps its claim through every gap until it ends."""
+        if demand.graph.observed:
+            return tuple(demand.stages)
+        tail = policy.JobStage(kind=StageKind(_model(demand.want), "*", ()))
+        return (*demand.stages, tail)
 
     def _early(self, demand: _Demand) -> bool:
         """Whether this demand prepares ahead of its turn: its executor on its set takes stage
@@ -831,7 +841,14 @@ class StageScheduler:
                 },
                 "holders": {str(o): key for o, key in sorted(self.holder.items())},
                 "demands": {
-                    key: {"gpus": list(d.gpus), "dispatched": d.dispatched, "whole": d.whole}
+                    key: {
+                        "gpus": list(d.gpus),
+                        "dispatched": d.dispatched,
+                        "whole": d.whole,
+                        "asking": d.asking,
+                        "running": d.running,
+                        "stage": d.at,
+                    }
                     for key, d in self.demands.items()
                 },
             }
