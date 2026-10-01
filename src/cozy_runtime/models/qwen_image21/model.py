@@ -151,6 +151,10 @@ def _prefix_cache_fits(
     return bool(prefix_cache_bytes(transformer, prefix) < free + unused)
 
 
+#: Runtime code the encoders read beyond their own bodies: their memo key binds it.
+_ENCODER_CODE = (_StagedPipeline, build_processor)
+
+
 class QwenImage21Model(Model[QwenImage21Graph]):
     graph: QwenImage21Graph
     processor: Any
@@ -168,7 +172,7 @@ class QwenImage21Model(Model[QwenImage21Graph]):
             scheduler=FlowMatchEulerDiscreteScheduler.from_config(self.graph.scheduler_config),
         )
 
-    @uses_components("text_encoder")
+    @uses_components("text_encoder", memoize=True, memo_dependencies=_ENCODER_CODE)
     def encode(self, prompt: str) -> tuple[Any, Any]:
         encoder = self.graph.components["text_encoder"]
         with torch.inference_mode():
@@ -177,7 +181,7 @@ class QwenImage21Model(Model[QwenImage21Graph]):
             )
         return embeds, mask
 
-    @uses_components("vae")
+    @uses_components("vae", memoize=True, memo_dependencies=_ENCODER_CODE)
     def encode_reference_images(self, images: list[Any]) -> tuple[list[Any], torch.Tensor]:
         """Encode each reference once, using upstream's 1 MP conditioning size."""
         if not 1 <= len(images) <= 10:
@@ -205,7 +209,7 @@ class QwenImage21Model(Model[QwenImage21Graph]):
                 )
         return resized, torch.cat(packed, dim=1)
 
-    @uses_components("text_encoder")
+    @uses_components("text_encoder", memoize=True, memo_dependencies=_ENCODER_CODE)
     def encode_image_prompt(self, prompt: str, images: list[Any]) -> tuple[Any, Any, Any]:
         """Encode the instruction and ordered reference images as one condition."""
         encoder = self.graph.components["text_encoder"]
