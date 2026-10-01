@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import queue
+import struct
 import threading
 import time
 from collections.abc import Generator, Iterator
@@ -37,6 +38,9 @@ class ProgressMachine:
     request: pb.PreparePackageSetRequest
     manifest: str
     manifest_length: int
+    alternate_manifest: str
+    first_adapter_manifest: str
+    second_adapter_manifest: str
     total: int
     source_blocked: threading.Event
     release_source: threading.Event
@@ -56,6 +60,36 @@ def running_progress_machine(tmp_path: Path) -> Generator[ProgressMachine, None,
     bodies = {hashlib.sha256(body).hexdigest(): body for body in (_HEADER, _ASSET)}
     objects = [{"sha256": key, "length": len(body)} for key, body in bodies.items()]
     bodies[manifest.removeprefix("sha256:")] = origin.manifest(manifest)["manifest"]
+    primary_total = sum(map(len, bodies.values()))
+    revisions = {manifest: objects}
+
+    def variant(value: float) -> str:
+        header = _HEADER[:-4] + struct.pack("<f", value)
+        header_id = hashlib.sha256(header).hexdigest()
+        raw = json.dumps(
+            {
+                "entries": [
+                    {
+                        "blob": {"sha256": header_id, "length": len(header)},
+                        "kind": "cozytensors",
+                        "path": "model.cozytensors",
+                    }
+                ]
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        identity = "sha256:" + hashlib.sha256(raw).hexdigest()
+        bodies[header_id] = header
+        bodies[identity.removeprefix("sha256:")] = raw
+        revisions[identity] = [
+            {"sha256": header_id, "length": len(header)},
+            {"sha256": hashlib.sha256(_ASSET).hexdigest(), "length": len(_ASSET)},
+        ]
+        return identity
+
+    first_adapter_manifest, second_adapter_manifest = variant(1.0), variant(2.0)
+    alternate_manifest = variant(3.0)
     blocked, release = threading.Event(), threading.Event()
     gets: list[str] = []
 
@@ -73,13 +107,22 @@ def running_progress_machine(tmp_path: Path) -> Generator[ProgressMachine, None,
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             assert self.headers["Authorization"] == "Bearer execution-access"
             if self.path == "/v1/tensorfs/closure":
-                assert request["ref"] == "proof/adapter@" + manifest
+                repository, selected = request["ref"].split("@", 1)
+                assert repository in {
+                    "proof/adapter",
+                    "proof/first-adapter",
+                    "proof/second-adapter",
+                }
+                assert selected in revisions
                 response = {
                     "complete": True,
                     "lane": "bf16",
-                    "model": "proof/adapter",
-                    "manifest": {"sha256": manifest.removeprefix("sha256:"), "length": length},
-                    "objects": objects,
+                    "model": repository,
+                    "manifest": {
+                        "sha256": selected.removeprefix("sha256:"),
+                        "length": len(bodies[selected.removeprefix("sha256:")]),
+                    },
+                    "objects": revisions[selected],
                     "presign_max_digests": 10,
                     "release": "1.0.0",
                     "scope": "runtime",
@@ -162,7 +205,10 @@ def running_progress_machine(tmp_path: Path) -> Generator[ProgressMachine, None,
             request,
             manifest,
             length,
-            sum(map(len, bodies.values())),
+            alternate_manifest,
+            first_adapter_manifest,
+            second_adapter_manifest,
+            primary_total,
             blocked,
             release,
             gets,
@@ -254,7 +300,9 @@ def test_model_defaults_use_the_same_observable_native_availability(
         assert machine.source_blocked.wait(10), failures
         settle(lambda: bool(machine.rows()) and machine.rows()[0].transferred_bytes > 0)
         observed = machine.rows()[0]
-        assert observed.model.slot == "model"
+        assert (
+            not observed.model.slot and not observed.model.package and not observed.model.adapters
+        )
         assert 0 < observed.transferred_bytes < observed.total_bytes == machine.total
     finally:
         machine.release_source.set()
@@ -275,6 +323,14 @@ def test_malformed_optional_counters_do_not_refuse_native_preparation(
     for value in invalid:
         machine_materialization.observe(machine.worker, before.model, value, value, begin=True)
         machine_materialization.completed(machine.worker, before.model, {"bytes_total": value})
+
+        def rejected_callback(_: int, __: int) -> None:
+            pytest.fail("a malformed native sample reached the observer callback")
+
+        machine_materialization.forward(
+            rejected_callback, {"bytes_done": value, "bytes_total": value}
+        )
+    machine_materialization.forward(lambda *_: pytest.fail("missing counters were forwarded"), {})
     machine_materialization.completed(machine.worker, before.model, None)
     machine_materialization.completed(machine.worker, before.model, {})
     machine_materialization.observe(
@@ -288,3 +344,64 @@ def test_malformed_optional_counters_do_not_refuse_native_preparation(
     machine.release_source.set()
     assert prepared.result(timeout=30).HasField("placement_set")
     assert machine.rows()[0].transferred_bytes == machine.total
+
+
+def test_both_native_routes_share_active_progress_without_reset(
+    progress_machine: ProgressMachine,
+) -> None:
+    machine = progress_machine
+    prepared = machine.prepare.PreparePackageSet.future(machine.request)
+    assert machine.source_blocked.wait(10)
+    settle(lambda: bool(machine.rows()) and machine.rows()[0].transferred_bytes > 0)
+    before = machine.rows()[0]
+    failures: list[BaseException] = []
+
+    def joined() -> None:
+        try:
+            machine_model_defaults.materialize(
+                machine.worker,
+                [
+                    {
+                        "parameter": "second",
+                        "repository": "proof/adapter",
+                        "manifest": {"digest": machine.manifest, "length": machine.manifest_length},
+                        "public_origin": machine.request.hub,
+                    }
+                ],
+                None,
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    waiter = threading.Thread(target=joined)
+    waiter.start()
+    key = ("proof/adapter", machine.manifest)
+    try:
+        settle(lambda: machine.worker.model_preparation_observers.get(key, 0) == 2)
+        after = machine.rows()[0]
+        assert (
+            after.transferred_bytes >= before.transferred_bytes
+            and after.total_bytes == before.total_bytes
+        )
+        machine_materialization.observe(machine.worker, before.model, before.total_bytes + 1, 0)
+        assert machine.rows()[0].transferred_bytes <= machine.rows()[0].total_bytes
+    finally:
+        machine.release_source.set()
+        waiter.join(30)
+    assert not failures and not waiter.is_alive()
+    assert prepared.result(timeout=30).HasField("placement_set")
+    assert not machine.worker.model_preparation_observers
+    assert machine.rows()[0].transferred_bytes == machine.total
+
+
+def test_ended_incomplete_observation_cannot_impersonate_a_live_transfer(
+    progress_machine: ProgressMachine,
+) -> None:
+    machine = progress_machine
+    model = pb.DownloadModelRef(model="proof/adapter", manifest=machine.manifest)
+    with pytest.raises(RuntimeError, match="explicit test refusal"):
+        with machine_materialization.observing(machine.worker, model):
+            machine_materialization.observe(machine.worker, model, 10, 100)
+            assert machine.rows()[0].transferred_bytes == 10
+            raise RuntimeError("explicit test refusal")
+    assert not machine.rows() and not machine.worker.model_preparation_observers

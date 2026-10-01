@@ -20,6 +20,9 @@ try:
                 "address": machine.address,
                 "request": base64.b64encode(machine.request.SerializeToString()).decode(),
                 "manifest": machine.manifest,
+                "alternate_manifest": machine.alternate_manifest,
+                "first_adapter_manifest": machine.first_adapter_manifest,
+                "second_adapter_manifest": machine.second_adapter_manifest,
                 "total": machine.total,
             }
         )

@@ -74,6 +74,7 @@ def peer(capture: dict[str, Any]) -> Worker:
             model_transfer_lock=threading.Lock(),
             model_transfers={},
             model_preparation_progress={},
+            model_preparation_observers={},
             executions=SimpleNamespace(
                 capture_root=lambda *_: "root",
                 capture=lambda *_: capture,

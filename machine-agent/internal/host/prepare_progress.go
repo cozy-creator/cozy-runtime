@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -20,7 +21,10 @@ const preparationSampleInterval = 2 * time.Second
 // drops a sample; it never imposes a deadline on the preparation RPC or native work.
 const preparationObservationBudget = preparationSampleInterval
 
-type preparationModel struct{ repository, manifest string }
+type preparationModel struct {
+	repository, manifest string
+	labels               *pb.DownloadModelRef
+}
 
 func preparationModels(message proto.Message) []preparationModel {
 	var delegation []byte
@@ -35,22 +39,28 @@ func preparationModels(message proto.Message) []preparationModel {
 		choices = selected.GetModelChoices()
 	}
 	var models []preparationModel
-	add := func(repository, manifest string) {
-		if repository != "" || manifest != "" {
-			models = append(models, preparationModel{repository, manifest})
+	add := func(model *pb.DownloadModelRef) {
+		// An unresolved repository choice is not an exact checkpoint. Optional
+		// progress waits for exact resolution rather than borrowing another revision.
+		if len(model.GetManifest()) == len("sha256:")+64 && strings.HasPrefix(model.Manifest, "sha256:") {
+			labels := proto.Clone(model).(*pb.DownloadModelRef)
+			labels.Adapters = nil
+			models = append(models, preparationModel{model.Model, model.Manifest, labels})
 		}
 	}
 	adapters := func(rows []*pb.DownloadAdapterRef) {
 		for _, row := range rows {
-			add(row.GetModel(), row.GetManifest())
+			add(&pb.DownloadModelRef{Model: row.Model, Manifest: row.Manifest, Release: row.Release, Lane: row.Lane})
 		}
 	}
 	if len(delegation) > 0 {
 		selected := &pb.DownloadDelegation{}
 		if _, err := canonical.Read(delegation, selected); err == nil {
-			for _, model := range selected.Models {
-				add(model.GetModel(), model.GetManifest())
-				adapters(model.GetAdapters())
+			if err := json.Unmarshal(delegation, selected); err == nil {
+				for _, model := range selected.Models {
+					add(model)
+					adapters(model.GetAdapters())
+				}
 			}
 		}
 	}
@@ -62,15 +72,16 @@ func preparationModels(message proto.Message) []preparationModel {
 		if len(choice.GetManifest().GetDigest()) == 32 {
 			manifest = "sha256:" + hex.EncodeToString(choice.Manifest.Digest)
 		}
-		add(choice.GetRepository(), manifest)
+		add(&pb.DownloadModelRef{Model: choice.Repository, Manifest: manifest, Release: choice.Release,
+			Lane: choice.Lane, Slot: choice.Parameter})
 		adapters(choice.GetAdapters())
 	}
 	return models
 }
 
 func (selected preparationModel) matches(model *pb.DownloadModelRef) bool {
-	return (selected.repository == "" || strings.EqualFold(selected.repository, model.GetModel())) &&
-		(selected.manifest == "" || selected.manifest == model.GetManifest())
+	return selected.manifest != "" && selected.manifest == model.GetManifest() &&
+		(selected.repository == "" || strings.EqualFold(selected.repository, model.GetModel()))
 }
 
 func (m *Machine) preparationProgress(ctx context.Context, conn *grpc.ClientConn, models []preparationModel) []*pb.PrepareModelProgress {
@@ -88,8 +99,13 @@ func (m *Machine) preparationProgress(ctx context.Context, conn *grpc.ClientConn
 	for _, row := range described.GetRuntime().GetPreparationProgress() {
 		for _, selected := range models {
 			if selected.matches(row.GetModel()) {
-				observed = append(observed, proto.Clone(row).(*pb.PrepareModelProgress))
-				break
+				projected := proto.Clone(row).(*pb.PrepareModelProgress)
+				projected.Model = &pb.DownloadModelRef{Model: row.GetModel().GetModel(), Manifest: row.GetModel().GetManifest()}
+				if labels := selected.labels; labels != nil {
+					projected.Model.Release, projected.Model.Lane = labels.Release, labels.Lane
+					projected.Model.Package, projected.Model.Slot = labels.Package, labels.Slot
+				}
+				observed = append(observed, projected)
 			}
 		}
 	}

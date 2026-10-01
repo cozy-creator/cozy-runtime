@@ -19,10 +19,13 @@ import (
 )
 
 type progressFixture struct {
-	Address  string `json:"address"`
-	Request  string `json:"request"`
-	Manifest string `json:"manifest"`
-	Total    uint64 `json:"total"`
+	Address               string `json:"address"`
+	Request               string `json:"request"`
+	Manifest              string `json:"manifest"`
+	AlternateManifest     string `json:"alternate_manifest"`
+	FirstAdapterManifest  string `json:"first_adapter_manifest"`
+	SecondAdapterManifest string `json:"second_adapter_manifest"`
+	Total                 uint64 `json:"total"`
 }
 
 func nativeProgressFixture(t *testing.T, python string) (progressFixture, string) {
@@ -126,7 +129,7 @@ func TestPreparationSamplerReadsSharedNativeTransferAfterObserverReconnect(t *te
 		prepared <- err
 	}()
 	m := &Machine{claims: &claims{claim: progressClaim(t)}}
-	models := []preparationModel{{"proof/adapter", fixture.Manifest}}
+	models := []preparationModel{{repository: "proof/adapter", manifest: fixture.Manifest}}
 	events := make(chan *pb.PrepareEvent, 4)
 	observe, detach := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -214,7 +217,7 @@ func TestPreparationOnOlderRuntimeHasOnlyAnObservationGap(t *testing.T) {
 		}
 	}
 	m := &Machine{claims: &claims{claim: progressClaim(t)}}
-	models := []preparationModel{{"proof/adapter", fixture.Manifest}}
+	models := []preparationModel{{repository: "proof/adapter", manifest: fixture.Manifest}}
 	described, err := pb.NewWorkerControlClient(conn).DescribeMachine(ctx, &pb.DescribeMachineQuery{Claim: m.claims.claim})
 	if err != nil || described.GetRuntime().GetWireMinor() != 70 {
 		t.Fatalf("test requires the actual older wire70 Runtime: %v, %v", described, err)
@@ -288,7 +291,7 @@ func TestBlockedPreparationObservationDoesNotDelayNativeSuccess(t *testing.T) {
 		}
 	}
 	m := &Machine{claims: &claims{claim: progressClaim(t)}}
-	models := []preparationModel{{"proof/adapter", fixture.Manifest}}
+	models := []preparationModel{{repository: "proof/adapter", manifest: fixture.Manifest}}
 	observed := make(chan []*pb.PrepareModelProgress, 1)
 	go func() { observed <- m.preparationProgress(ctx, conn, models) }()
 	select {
@@ -322,4 +325,117 @@ func TestBlockedPreparationObservationDoesNotDelayNativeSuccess(t *testing.T) {
 		t.Fatal("post-success observation exceeded its read budget")
 	}
 	_ = os.WriteFile(filepath.Join(root, "release-description"), nil, 0600)
+}
+
+func TestSharedCheckpointProgressKeepsCallerLabelsAndRevisionIsolated(t *testing.T) {
+	python := os.Getenv("COZY_RUNTIME_TEST_PYTHON")
+	if python == "" {
+		t.Skip("set COZY_RUNTIME_TEST_PYTHON to this Runtime's interpreter")
+	}
+	fixture, root := nativeProgressFixture(t, python)
+	conn, err := grpc.NewClient(fixture.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	raw, _ := base64.StdEncoding.DecodeString(fixture.Request)
+	request := &pb.PreparePackageSetRequest{}
+	if err := proto.Unmarshal(raw, request); err != nil {
+		t.Fatal(err)
+	}
+	delegation := &pb.DownloadDelegation{}
+	if _, err := canonical.Read(request.DownloadDelegation, delegation); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(request.DownloadDelegation, delegation); err != nil {
+		t.Fatal(err)
+	}
+	makeCall := func(pkg, slot, adapter, manifest string) (*pb.PreparePackageSetRequest, *pb.PreparePackageSetCall) {
+		selected := proto.Clone(delegation).(*pb.DownloadDelegation)
+		selected.Models[0].Package, selected.Models[0].Slot = pkg, slot
+		selected.Models[0].Manifest = manifest
+		if adapter != "" {
+			adapterManifest := fixture.FirstAdapterManifest
+			if adapter == "proof/second-adapter" {
+				adapterManifest = fixture.SecondAdapterManifest
+			}
+			selected.Models[0].Adapters = []*pb.DownloadAdapterRef{{Model: adapter, Manifest: adapterManifest}}
+		}
+		body, err := canonical.Bytes(selected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prepared := proto.Clone(request).(*pb.PreparePackageSetRequest)
+		prepared.DownloadDelegation = body
+		return prepared, &pb.PreparePackageSetCall{PackageSet: &pb.DesiredPackageSet{DownloadDelegation: body}}
+	}
+	first, firstCall := makeCall("private/first", "first.models.character", "proof/first-adapter", fixture.Manifest)
+	second, secondCall := makeCall("private/second", "second.models.scene", "proof/second-adapter", fixture.Manifest)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	ended := make(chan error, 2)
+	go func() { _, err := pb.NewRuntimePreparationClient(conn).PreparePackageSet(ctx, first); ended <- err }()
+	for {
+		if _, err := os.Stat(filepath.Join(root, "blocked")); err == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("shared base did not reach the native barrier")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	go func() { _, err := pb.NewRuntimePreparationClient(conn).PreparePackageSet(ctx, second); ended <- err }()
+	m := &Machine{claims: &claims{claim: progressClaim(t)}}
+	for _, call := range []*pb.PreparePackageSetCall{firstCall, secondCall} {
+		rows := m.preparationProgress(ctx, conn, preparationModels(call))
+		if len(rows) == 0 {
+			t.Fatal("actual authenticated read lost shared base progress")
+		}
+		for _, row := range rows {
+			if len(row.GetModel().GetAdapters()) != 0 {
+				t.Fatal("another caller's adapter stack escaped a shared source row")
+			}
+			if row.GetModel().GetModel() == "proof/adapter" {
+				selected := &pb.DownloadDelegation{}
+				_ = json.Unmarshal(call.PackageSet.DownloadDelegation, selected)
+				if row.Model.Package != selected.Models[0].Package || row.Model.Slot != selected.Models[0].Slot {
+					t.Fatalf("shared row retained another caller's labels: %v", row)
+				}
+			}
+		}
+	}
+	shared, err := pb.NewWorkerControlClient(conn).DescribeMachine(ctx, &pb.DescribeMachineQuery{Claim: m.claims.claim})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range shared.Runtime.PreparationProgress {
+		ref := row.GetModel()
+		if ref.GetPackage() != "" || ref.GetSlot() != "" || ref.GetRelease() != "" || ref.GetLane() != "" || len(ref.GetAdapters()) != 0 {
+			t.Fatalf("shared telemetry contains request-owned labels: %v", ref)
+		}
+	}
+	// A repository-only choice and an exact different revision cannot borrow this flight.
+	if rows := m.preparationProgress(ctx, conn, []preparationModel{{repository: "proof/adapter"}}); len(rows) != 0 {
+		t.Fatalf("unresolved choice borrowed another checkpoint: %v", rows)
+	}
+	_, differentCall := makeCall("private/next", "next.models.video", "", fixture.AlternateManifest)
+	if rows := m.preparationProgress(ctx, conn, preparationModels(differentCall)); len(rows) != 0 {
+		t.Fatalf("different real checkpoint borrowed the active revision: %v", rows)
+	}
+	_ = os.WriteFile(filepath.Join(root, "release"), nil, 0600)
+	for range 2 {
+		if err := <-ended; err != nil {
+			t.Fatal(err)
+		}
+	}
+	alternate, _ := makeCall("private/next", "next.models.video", "", fixture.AlternateManifest)
+	if _, err := pb.NewRuntimePreparationClient(conn).PreparePackageSet(ctx, alternate); err != nil {
+		t.Fatal(err)
+	}
+	rows := m.preparationProgress(ctx, conn, preparationModels(differentCall))
+	if len(rows) != 1 || rows[0].Model.Manifest != fixture.AlternateManifest || rows[0].Model.Slot != "next.models.video" {
+		t.Fatalf("resolved revision did not preserve its caller's own labels: %v", rows)
+	}
 }

@@ -452,9 +452,9 @@ def materialize(
                 store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
                 machine_materialization.held(worker, model, store)
             except facade.errors.Refusal:
-                machine_materialization.observe(worker, model, 0, 0, begin=True)
-                with downloading(row) as sample:
+                with machine_materialization.observing(worker, model), downloading(row) as sample:
                     moved = partial(report, model, sample)
+
                     if "ensure/1" in fill.capabilities():
                         # TensorFS owns the fetch: one flight per manifest, disk admission
                         # that never evicts this preparation's own models, the Hub CA.
@@ -468,7 +468,7 @@ def materialize(
                             allow_local=local_development(worker),
                             keep=keep,
                             cancellation=cancellation,
-                            progress=lambda event: moved(event["bytes_done"], event["bytes_total"]),
+                            progress=partial(machine_materialization.forward, moved),
                         )
                         machine_materialization.completed(worker, model, result)
                     else:

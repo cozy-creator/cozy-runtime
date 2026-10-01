@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from cozy_runtime.internal import fill
@@ -29,6 +30,22 @@ def _document_length(value: object) -> int | None:
     return len(value) if isinstance(value, bytes) else None
 
 
+def sample(event: object) -> tuple[int, int] | None:
+    if not isinstance(event, Mapping):
+        return None
+    done, total = _counter(event.get("bytes_done")), _counter(event.get("bytes_total"))
+    if done is None or total is None or (total and done > total):
+        return None
+    return done, total
+
+
+def forward(progress: Callable[[int, int], None], event: object) -> None:
+    """The native callback validates optional data before calling any observer."""
+    measured = sample(event)
+    if measured is not None:
+        progress(*measured)
+
+
 def snapshot(worker: Worker) -> list[pb.PrepareModelProgress]:
     """Copy optional observations without waiting for preparation or transfer locks."""
     with worker.model_transfer_lock:
@@ -46,16 +63,21 @@ def observe(
     *,
     result: Mapping[str, object] | None = None,
     begin: bool = False,
-) -> None:
+) -> pb.PrepareModelProgress | None:
     """Retain native per-checkpoint observations; this owns no flight or cancellation."""
     done, whole = _counter(available), _counter(total)
     if done is None or whole is None or (whole and done > whole):
-        return
+        return None
     key = (model.model, model.manifest)
     with worker.model_transfer_lock:
         if begin or key not in worker.model_preparation_progress:
-            worker.model_preparation_progress[key] = pb.PrepareModelProgress(model=model)
+            worker.model_preparation_progress[key] = pb.PrepareModelProgress(
+                model=pb.DownloadModelRef(model=model.model, manifest=model.manifest)
+            )
         row = worker.model_preparation_progress.pop(key)
+        if whole == 0 and row.total_bytes and done > row.total_bytes:
+            worker.model_preparation_progress[key] = row
+            return None
         row.total_bytes = max(row.total_bytes, whole)
         row.transferred_bytes = max(row.transferred_bytes, done)
         if result is not None:
@@ -71,7 +93,45 @@ def observe(
         # Telemetry retains recent rows, with active transfers refreshed on each native
         # sample. This is the existing model-slot display bound, never an admission cap.
         while len(worker.model_preparation_progress) > weights_limits.MAX_MODEL_SLOT_PATHS:
-            del worker.model_preparation_progress[next(iter(worker.model_preparation_progress))]
+            old = next(
+                (
+                    identity
+                    for identity in worker.model_preparation_progress
+                    if identity not in worker.model_preparation_observers
+                ),
+                None,
+            )
+            if old is None:
+                break
+            del worker.model_preparation_progress[old]
+        return row
+
+
+@contextmanager
+def observing(worker: Worker, model: pb.DownloadModelRef) -> Iterator[None]:
+    key = (model.model, model.manifest)
+    with worker.model_transfer_lock:
+        if key not in worker.model_preparation_observers:
+            worker.model_preparation_progress[key] = pb.PrepareModelProgress(
+                model=pb.DownloadModelRef(model=model.model, manifest=model.manifest)
+            )
+        worker.model_preparation_observers[key] = worker.model_preparation_observers.get(key, 0) + 1
+    try:
+        yield
+    finally:
+        with worker.model_transfer_lock:
+            remaining = worker.model_preparation_observers[key] - 1
+            if remaining:
+                worker.model_preparation_observers[key] = remaining
+            else:
+                del worker.model_preparation_observers[key]
+                row = worker.model_preparation_progress.get(key)
+                if row is not None and (
+                    not row.total_bytes or row.transferred_bytes < row.total_bytes
+                ):
+                    # A canceled/failed flight has no live owner. Keep completed availability,
+                    # but do not let a historical partial row impersonate a new download.
+                    del worker.model_preparation_progress[key]
 
 
 def completed(worker: Worker, model: pb.DownloadModelRef, result: object) -> None:
@@ -167,32 +227,33 @@ def ensure(
             raise WorkspaceRefusal("model_access_absent: this checkpoint is not held locally")
         if "ensure/1" not in fill.capabilities():
             raise WorkspaceRefusal("model_materialization_unsupported: TensorFS needs ensure/1")
-        observe(worker, model, 0, 0, begin=True)
 
         def progress(event: Mapping[str, object]) -> None:
             if worker.stop.is_set():
                 raise WorkspaceRefusal("machine stopped during model preparation")
-            available, total = event.get("bytes_done"), event.get("bytes_total")
-            if type(available) is int and type(total) is int:
+            measured = sample(event)
+            if measured is not None:
+                available, total = measured
                 observe(worker, model, available, total)
                 worker.note("model_preparation", f"{available}/{total} bytes verified")
 
         try:
-            result = facade.ensure(
-                store,
-                row.model + "@" + row.manifest,
-                hub=origin,
-                lane=row.lane,
-                credential=machine_model_defaults.credential(worker, origin),
-                ca_file=machine_model_defaults.hub_ca(worker, origin),
-                allowed_hosts=machine_model_defaults.storage_hosts(worker, origin),
-                allow_local=machine_model_defaults.local_development(worker),
-                keep=keep,
-                progress=progress,
-            )
-            raw = store.manifest(row.manifest)["manifest"]
-            store.verify_checkpoint_source(row.model, row.manifest, len(raw))
-            completed(worker, model, result)
+            with observing(worker, model):
+                result = facade.ensure(
+                    store,
+                    row.model + "@" + row.manifest,
+                    hub=origin,
+                    lane=row.lane,
+                    credential=machine_model_defaults.credential(worker, origin),
+                    ca_file=machine_model_defaults.hub_ca(worker, origin),
+                    allowed_hosts=machine_model_defaults.storage_hosts(worker, origin),
+                    allow_local=machine_model_defaults.local_development(worker),
+                    keep=keep,
+                    progress=progress,
+                )
+                raw = store.manifest(row.manifest)["manifest"]
+                store.verify_checkpoint_source(row.model, row.manifest, len(raw))
+                completed(worker, model, result)
         except facade.errors.Refusal as exc:
             raise WorkspaceRefusal(f"model_materialization_refused: {exc.code}") from exc
 
