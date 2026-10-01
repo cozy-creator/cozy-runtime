@@ -285,7 +285,10 @@ class MemoryManager:
         current = row.ledger.plane.pinned_budget_bytes if row.ledger.plane else -1
         try:
             with executor.watched("prefill"):
-                if pinned >= 0 and pinned != current:
+                # Only ever raised here: a tenant about to run keeps the tier it has (shrinking
+                # it sent SDXL's streamed blocks to disk run after run); idle tenants give
+                # theirs back when cut.
+                if pinned >= 0 and pinned > current:
                     # no device grant: its attempt carries one when it holds the device
                     command = executor_commands.Budget(vram_bytes=-1, pinned_bytes=pinned)
                     self.observe(row, executor, executor.call(command, timeout=None))
