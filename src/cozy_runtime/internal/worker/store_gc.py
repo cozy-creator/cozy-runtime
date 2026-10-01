@@ -72,7 +72,7 @@ def collect_worker(worker: Worker) -> pb.CollectStoreGarbageResult:
                 )
     if not worker.options.owns_tensorfs_store:
         return collect(root)
-    if not worker.preparation_lock.acquire(blocking=False):
+    if worker.explicit_preparations.live() or not worker.preparation_lock.acquire(blocking=False):
         return pb.CollectStoreGarbageResult(store_busy=True)
     try:
         if not worker.control_lock.acquire(blocking=False):

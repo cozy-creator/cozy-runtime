@@ -168,6 +168,7 @@ def _run(
     )
     worker = Worker(runtime_config, options, host)
     host.preparer = worker.prepare_package_set
+    host.preparations = worker.explicit_preparations
     host.model_source_preparer = worker.prepare_model_source
     host.model_source_releaser = worker.release_model_source
     host.derived_retainer = worker.retain_derived_result

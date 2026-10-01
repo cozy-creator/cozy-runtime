@@ -109,6 +109,7 @@ from cozy_runtime.internal.worker import (
     machine_byte_inputs,
     machine_capture,
     machine_lanes,
+    machine_materialization,
     machine_model_defaults,
     machine_model_resolve,
     machine_release_catalog,
@@ -147,6 +148,7 @@ from cozy_runtime.internal.worker.control import (
     ControlHost,
     WatchFanout,
 )
+from cozy_runtime.internal.worker.explicit_preparations import ExplicitPreparations
 from cozy_runtime.internal.worker.gpu_scheduler import GpuBroker, width_for
 from cozy_runtime.internal.worker.lanes import (
     DeviceLane,
@@ -1186,6 +1188,7 @@ class Worker:
         self.model_transfer_lock = threading.Lock()
         self.model_preparation_progress: dict[tuple[str, str], pb.PrepareModelProgress] = {}
         self.model_preparation_observers: dict[tuple[str, str], int] = {}
+        self.explicit_preparations = ExplicitPreparations(self)
         self.calls = Calls(
             self._machine_call,
             workspace=self.workspace,
@@ -1660,9 +1663,18 @@ class Worker:
     # ------------------------------------------------------------------ plumbing
 
     def prepare_package_set(
-        self, request: pb.PreparePackageSetRequest
+        self,
+        request: pb.PreparePackageSetRequest,
+        cancellation: machine_model_defaults.Cancellation | None = None,
     ) -> pb.PreparePackageSetResult:
-        return self._prepare_package(request, local=False)
+        """An identified requester's models-only preparation lands outside the lock."""
+        if (
+            cancellation is not None
+            and not request.models_landing
+            and not documents.parse(request.download_delegation, pb.DownloadDelegation).packages
+        ):
+            return self._prepare_models(request, cancellation)
+        return self._prepare_package(request, local=False, cancellation=cancellation)
 
     def prepare_local_package(
         self, request: pb.PrepareLocalPackageRequest
@@ -1782,6 +1794,7 @@ class Worker:
         request: pb.PreparePackageSetRequest | pb.PrepareLocalPackageRequest,
         *,
         local: bool,
+        cancellation: machine_model_defaults.Cancellation | None = None,
     ) -> pb.PreparePackageSetResult:
         """Derive one local PlacementSet while package imports stay in the isolated executor."""
 
@@ -1803,32 +1816,24 @@ class Worker:
                         self.note("warning", warning)
             if not local:
                 assert isinstance(request, pb.PreparePackageSetRequest)
-                return self._prepare_materialized_package(request)
+                return self._prepare_materialized_package(request, cancellation)
             assert isinstance(request, pb.PrepareLocalPackageRequest)
             return self._prepare_local_in(request)
 
     def _prepare_materialized_package(
-        self, request: pb.PreparePackageSetRequest
+        self,
+        request: pb.PreparePackageSetRequest,
+        cancellation: machine_model_defaults.Cancellation | None = None,
     ) -> pb.PreparePackageSetResult:
         """Runtime owns model acquisition, including the models-only preparation lane."""
         from concurrent.futures import ThreadPoolExecutor
-
-        from . import machine_materialization
 
         selected = documents.parse(request.download_delegation, pb.DownloadDelegation)
         # Older Hosts may still ask for a code-only warm phase before their own transfer.
         if request.models_landing:
             return self._prepare_published(request)
         if not selected.packages:
-            if request.application or request.locked_requirements:
-                raise WorkspaceRefusal("models-only preparation cannot name package requirements")
-            machine_materialization.ensure(self, request.download_delegation, hub=request.hub)
-            raw, digest = documents.identity(pb.PlacementSet())
-            return pb.PreparePackageSetResult(
-                placement_set=pb.DesiredPlacementSet(
-                    placement_set_canonical_bytes=raw, placement_set_digest=digest
-                )
-            )
+            return self._prepare_models(request, cancellation)
         if selected.models:
             landing = pb.PreparePackageSetRequest()
             landing.CopyFrom(request)
@@ -1836,9 +1841,28 @@ class Worker:
             # Package installation/prespawn overlaps disk transfer, as on either deployment.
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="package-prepare") as pool:
                 installed = pool.submit(self._prepare_published, landing)
-                machine_materialization.ensure(self, request.download_delegation, hub=request.hub)
+                machine_materialization.ensure(
+                    self, request.download_delegation, hub=request.hub, cancellation=cancellation
+                )
                 installed.result()
         return self._prepare_published(request)
+
+    def _prepare_models(
+        self,
+        request: pb.PreparePackageSetRequest,
+        cancellation: machine_model_defaults.Cancellation | None,
+    ) -> pb.PreparePackageSetResult:
+        if request.application or request.locked_requirements:
+            raise WorkspaceRefusal("models-only preparation cannot name package requirements")
+        machine_materialization.ensure(
+            self, request.download_delegation, hub=request.hub, cancellation=cancellation
+        )
+        raw, digest = documents.identity(pb.PlacementSet())
+        return pb.PreparePackageSetResult(
+            placement_set=pb.DesiredPlacementSet(
+                placement_set_canonical_bytes=raw, placement_set_digest=digest
+            )
+        )
 
     def _execution_publication_authority(
         self, owner: str, request: str
@@ -3992,6 +4016,7 @@ class Worker:
         """Wake every unit and the sender so the worker can leave; the host is the caller's."""
         self.stop.set()
         self.transfers.cancel()
+        self.explicit_preparations.cancel_all()
         self.outbound.put(None)
         self.supervisor.stop()
         with self.attempts_left:
@@ -4005,6 +4030,7 @@ class Worker:
             self.restart_requested = True
             self.stop.set()
             self.transfers.cancel()
+            self.explicit_preparations.cancel_all()
 
     def request_idle_restart(self) -> bool:
         """An operator update cannot interrupt work admitted by a detached client."""
@@ -4014,7 +4040,7 @@ class Worker:
                 attempt.state in (*self.engine.PRE_RELEASE, "released")
                 for attempt in list(self.engine.history.values())
             )
-            preparing = self.preparation_lock.locked()
+            preparing = self.preparation_lock.locked() or bool(self.explicit_preparations.live())
             accepted = not (active_executions or active_attempts or preparing)
             self.restart_sequence += 1
             document = {
@@ -7587,6 +7613,7 @@ class Worker:
         # owner-authorized release operation after its last dependency is gone.
         with self.preparation_lock:
             pass
+        self.explicit_preparations.drain()
         # Every executor goes first, so every attempt on one ends and its unit records it;
         # the primary slot's supervision, which holds the worker-root lease, closes LAST: a
         # successor that takes the lease knows this process has left its journal rows alone.

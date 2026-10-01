@@ -33,6 +33,8 @@ try:
             machine.release_source.set()
         if machine.source_blocked.is_set():
             (root / "blocked").touch()
+        if machine.aborted:
+            (root / "aborted").touch()
         if (root / "hold-description").exists():
             # A real authenticated read stalls on Runtime's owner lock. Model-only
             # preparation does not acquire it, so its native transfer remains independent.

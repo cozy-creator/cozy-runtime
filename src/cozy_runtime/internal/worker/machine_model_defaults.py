@@ -29,10 +29,12 @@ if TYPE_CHECKING:
 
 
 class Cancellation(Protocol):
-    """TensorFS's pull cancellation token, as a preparation checks it between checkpoints."""
+    """One requester's TensorFS pull cancellation token."""
 
     @property
     def cancelled(self) -> bool: ...
+
+    def cancel(self) -> None: ...
 
 
 class Manifest(msgspec.Struct, frozen=True):

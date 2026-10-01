@@ -63,7 +63,7 @@ var routes = func() map[string]*route {
 		"RetainByteTree", "ReleaseByteTree", "ReadByteTreeObject", "NativeArtifactTransfer", "ForgetPackage"} {
 		add(podHost, method, preparation, "Workspace"+method)
 	}
-	for _, method := range []string{"ImportInputTree", "RecordOperationResult", "LookupOperation", "PruneOperationCache"} {
+	for _, method := range []string{"ImportInputTree", "RecordOperationResult", "LookupOperation", "PruneOperationCache", "CancelPreparation"} {
 		add(podHost, method, preparation, method)
 	}
 	out["/"+podHost+"/SubmitMachineExecution"].work = true

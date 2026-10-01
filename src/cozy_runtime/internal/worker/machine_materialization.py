@@ -18,6 +18,11 @@ from .workspace import WorkspaceRefusal
 if TYPE_CHECKING:
     from .session import Worker
 
+
+class PreparationCancelled(Exception):
+    code = "preparation_cancelled"
+
+
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _MANIFEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
@@ -191,12 +196,15 @@ def ensure(
     *,
     hub: str = "",
     native: Iterable[pb.NativeModelBinding] = (),
+    cancellation: machine_model_defaults.Cancellation | None = None,
 ) -> None:
     """Ensure each exact selected checkpoint, retaining the entire preparation's closure.
 
     TensorFS owns shared flights, disk admission, transfer retry and integrity. A cache hit
     needs no Hub. A miss uses only the machine's scoped authority for the selected Hub.
+    `cancellation` is this requester's token; a shared flight continues for the others.
     """
+    token = worker.transfers if cancellation is None else cancellation
     selected = models(delegation, native)
     if not selected:
         return
@@ -247,7 +255,7 @@ def ensure(
                     allowed_hosts=machine_model_defaults.storage_hosts(worker, origin),
                     allow_local=machine_model_defaults.local_development(worker),
                     keep=keep,
-                    cancellation=worker.transfers,
+                    cancellation=token,
                     progress=progress,
                 )
                 raw = store.manifest(row.manifest)["manifest"]
@@ -256,6 +264,8 @@ def ensure(
         except facade.errors.Refusal as exc:
             if worker.transfers.cancelled:
                 raise WorkspaceRefusal("machine stopped during model preparation") from exc
+            if token.cancelled:
+                raise PreparationCancelled("the requester cancelled this preparation") from exc
             raise WorkspaceRefusal(f"model_materialization_refused: {exc}") from exc
 
     with ThreadPoolExecutor(

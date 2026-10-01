@@ -12,7 +12,7 @@ from collections.abc import Callable, Hashable, Iterator, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 import msgspec
 
@@ -93,13 +93,6 @@ class _Default(msgspec.Struct, frozen=True):
     manifest: ObjectRef
     adapters: tuple[package_prepare.AdapterSelection, ...] = ()
     composed: package_prepare.CheckpointSelection | None = None
-
-
-class _Cancellation(Protocol):
-    @property
-    def cancelled(self) -> bool: ...
-
-    def cancel(self) -> None: ...
 
 
 @dataclass
@@ -482,7 +475,7 @@ class Serving:
         )
         tensorfs = fill.tensorfs_module()
         cancellation_lock = threading.Lock()
-        active_token: _Cancellation | None = None
+        active_token: machine_model_defaults.Cancellation | None = None
 
         def warm() -> None:
             self.worker.prespawns.request(
@@ -767,7 +760,7 @@ class Serving:
         *,
         model_arguments: dict[str, ModelArtifact] | None = None,
         defaults: list[dict[str, object]] | None = None,
-        cancellation: _Cancellation | None = None,
+        cancellation: machine_model_defaults.Cancellation | None = None,
         retention_prefix: str = "input/",
         model_choices: Mapping[str, pb.ModelChoice] | None = None,
     ) -> Prepared:

@@ -165,6 +165,7 @@ def idle_worker(queue: Preparations[bytes]) -> Worker:
             supervisor=SimpleNamespace(keys=lambda _prefix: []),
             machine_calls=SimpleNamespace(serving=SimpleNamespace(preparations=queue)),
             preparation_lock=threading.Lock(),
+            explicit_preparations=SimpleNamespace(live=list),
             placement=None,
             hosted={},
         ),

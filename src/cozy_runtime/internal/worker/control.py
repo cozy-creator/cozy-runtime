@@ -33,6 +33,7 @@ import sys
 import threading
 from collections.abc import Callable, Iterator
 from concurrent import futures
+from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
@@ -44,6 +45,7 @@ from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionR
 from cozy_runtime.internal.worker.model_source_prepare import ModelSourceRefusal
 from cozy_runtime.internal.worker.package_prepare import PreparationRefusal
 from cozy_runtime.internal.worker.servicer_context import ServicerContext
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
 from cozy_runtime.internal.worker.workspace_rpc import WorkspaceRPC
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
@@ -150,6 +152,16 @@ class RuntimeWeightsHost(Protocol):
     def upload(self, request: pb.WeightsUploadRequest) -> pb.WeightsUploadResult: ...
 
 
+class Preparations(Protocol):
+    """Requester-identified explicit preparations (wire 73)."""
+
+    def submit(
+        self, request: pb.PreparePackageSetRequest
+    ) -> Future[pb.PreparePackageSetResult]: ...
+
+    def cancel(self, claim: pb.Claim, operation_id: str) -> pb.CancelPreparationResult: ...
+
+
 class _RuntimeWeightsServicer:
     # Not a subclass for the same reason as `_Servicer`: the generated base is untyped.
     def __init__(self, weights: RuntimeWeightsHost) -> None:
@@ -206,6 +218,7 @@ class GrpcControlHost:
         store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
         weights: RuntimeWeightsHost | None = None,
         workspace_service: WorkspaceService | None = None,
+        preparations: Preparations | None = None,
     ) -> None:
         self.listen = listen
         self.addr_file = addr_file
@@ -220,6 +233,7 @@ class GrpcControlHost:
         self.numerical_environment = numerical_environment
         self.store_collector = store_collector
         self.workspace_service = workspace_service
+        self.preparations = preparations
         self.checkpoint_pager = checkpoint_pager
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
@@ -243,6 +257,7 @@ class GrpcControlHost:
         loopback_services = (
             self.workspace_service is not None
             or self.preparer is not None
+            or self.preparations is not None
             or self.model_source_preparer is not None
             or self.model_source_releaser is not None
             or self.derived_retainer is not None
@@ -275,6 +290,7 @@ class GrpcControlHost:
                 self.numerical_environment,
                 self.store_collector,
                 self.workspace_service,
+                self.preparations,
             ),
             server,
         )
@@ -434,8 +450,10 @@ class _PreparationServicer(WorkspaceRPC):
         numerical_environment: Callable[[], bytes] | None = None,
         store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
         workspace_service: WorkspaceService | None = None,
+        preparations: Preparations | None = None,
     ) -> None:
         self.package_handler = package_handler
+        self.preparations = preparations
         self.model_source_handler = model_source_handler
         self.local_package_handler = local_package_handler
         self.unpublished_placement_handler = unpublished_placement_handler
@@ -498,7 +516,33 @@ class _PreparationServicer(WorkspaceRPC):
     def PreparePackageSet(
         self, request: pb.PreparePackageSetRequest, context: ServicerContext
     ) -> pb.PreparePackageSetResult:
-        return _prepared(context, self.package_handler, request, "package preparation")
+        if not request.operation_id or self.preparations is None:
+            return _prepared(context, self.package_handler, request, "package preparation")
+        try:
+            work = self.preparations.submit(request)
+        except Exception as exc:
+            _refuse(context, exc)
+        # A disconnect detaches this waiter; only CancelPreparation stops identified work.
+        settled = threading.Event()
+        work.add_done_callback(lambda _: settled.set())
+        if context.add_callback(settled.set):
+            settled.wait()
+        if not work.done():
+            context.abort(grpc.StatusCode.CANCELLED, "detached; the preparation continues")
+        try:
+            return work.result()
+        except Exception as exc:
+            _refuse(context, exc)
+
+    def CancelPreparation(
+        self, request: pb.CancelPreparationCall, context: ServicerContext
+    ) -> pb.CancelPreparationResult:
+        if self.preparations is None:
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "preparation cancellation is unavailable")
+        try:
+            return self.preparations.cancel(request.claim, request.operation_id)
+        except Exception as exc:
+            _custody_failure(context, exc, "preparation cancellation", WorkspaceRefusal)
 
     def PrepareModelSource(
         self, request: pb.PrepareModelSourceRequest, context: ServicerContext

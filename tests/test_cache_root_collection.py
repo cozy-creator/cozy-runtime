@@ -21,6 +21,7 @@ def worker(tmp_path: Path, *, owns: bool = True) -> Any:
         options=SimpleNamespace(tensorfs_root=tmp_path, owns_tensorfs_store=owns),
         control_lock=RLock(),
         preparation_lock=Lock(),
+        explicit_preparations=SimpleNamespace(live=list),
         placement=None,
         pending=None,
         hosted={},

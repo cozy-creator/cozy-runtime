@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import queue
+import select
+import socket
 import struct
 import threading
 import time
@@ -45,6 +47,7 @@ class ProgressMachine:
     source_blocked: threading.Event
     release_source: threading.Event
     gets: list[str]
+    aborted: list[str]
     channel: grpc.Channel
     address: str
 
@@ -92,6 +95,7 @@ def running_progress_machine(tmp_path: Path) -> Generator[ProgressMachine, None,
     alternate_manifest = variant(3.0)
     blocked, release = threading.Event(), threading.Event()
     gets: list[str] = []
+    aborted: list[str] = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_: object) -> None:
@@ -146,7 +150,11 @@ def running_progress_machine(tmp_path: Path) -> Generator[ProgressMachine, None,
             gets.append(digest)
             if bodies[digest] == _ASSET:
                 blocked.set()
-                assert release.wait(30), "test did not release its blocked final object"
+                while not release.wait(0.02):
+                    readable, _, _ = select.select([self.connection], [], [], 0)
+                    if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                        aborted.append(digest)  # the client closed its fetch
+                        return
             self.answer(bodies[digest])
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -180,6 +188,7 @@ def running_progress_machine(tmp_path: Path) -> Generator[ProgressMachine, None,
         host,
     )
     host.preparer = worker.prepare_package_set
+    host.preparations = worker.explicit_preparations
     runtime_thread = threading.Thread(target=worker.run, daemon=True)
     runtime_thread.start()
     settle(lambda: (tmp_path / "address").exists() or not runtime_thread.is_alive())
@@ -212,6 +221,7 @@ def running_progress_machine(tmp_path: Path) -> Generator[ProgressMachine, None,
             blocked,
             release,
             gets,
+            aborted,
             channel,
             address,
         )
@@ -244,6 +254,7 @@ def test_shared_preparation_progress_survives_observer_detach(
     before = machine.rows()[0]
     assert 0 < before.transferred_bytes < before.total_bytes == machine.total
     assert machine.worker.preparation_lock.locked()
+    assert not machine.worker.explicit_preparations.live()  # unidentified: as before wire 73
     assert first.cancel()  # detach observation of the unary call; native work keeps ownership
     with grpc.insecure_channel(machine.address) as reconnected:
         second = rpc.RuntimePreparationStub(reconnected).PreparePackageSet.future(machine.request)

@@ -153,7 +153,8 @@ func (m *Machine) preparePackageSet(stream grpc.ServerStream) error {
 		request := &pb.PreparePackageSetRequest{DownloadDelegation: desired, InstallRoot: m.layout.Installs,
 			Application: call.Application, PythonRequires: call.PythonRequires, PythonVersion: call.PythonVersion,
 			ModelSlotPaths: call.ModelSlotPaths, ImageInventory: call.ImageInventory,
-			LockedRequirements: call.LockedRequirements, PackageInterface: call.PackageInterface, Hub: call.Hub}
+			LockedRequirements: call.LockedRequirements, PackageInterface: call.PackageInterface, Hub: call.Hub,
+			OperationId: call.OperationId}
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED})
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARING})
 		var trailer metadata.MD
