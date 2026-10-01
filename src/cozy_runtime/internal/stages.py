@@ -1,43 +1,54 @@
-"""Stage graphs, their measured costs, and the cost model the scheduler predicts with.
+"""Stage graphs, their measured costs, and the cost book the scheduler predicts with.
 
 A stage is one component-use scope call (`@uses_components`), the one declaration a package
-already makes. Its weight sets and ordered regions come from the construction census and
-`paging.partition`; its width from `@sequence_parallel`. The order of stages, their call and
-pass counts, compute per region, activation growth and CPU gaps are measured from real runs
-and kept per shape cell (`PreparedRequest.cell`), so nothing is authored twice and nothing is
-estimated that a run can measure. A graph nobody has observed yet is one opaque stage.
+already makes. Its weight sets come from the plane's layouts; its width from
+`@sequence_parallel`. The order of stages, their call counts, activation growth and CPU gaps
+are measured from real runs and kept per shape cell (`PreparedRequest.cell`), so nothing is
+authored twice and nothing is estimated that a run can measure. A graph nobody has observed
+yet is one opaque stage.
 
-Pure and torch-free: `worker/stage_policy.py` decides, the executor's residency fills
-`StageSample` at each scope exit, and the memory policy chooses resident sets.
+Pure and torch-free: `worker/stage_policy.py` decides, the Worker fills `StageSample` from each
+`StageExit` a `stage/1` executor sends, and `weight_policy` prices a stage's streaming.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 import msgspec
 
+from cozy_runtime.internal import weight_policy
+
 GB = 1e9
+#: An executor capability: the worker may grant it a turn per component-use scope.
+STAGE_TURNS = "stage/1"
 
 
-class RegionSet(msgspec.Struct, frozen=True):
-    """One weight set's regions in forward order: `common`, then its blocks. A component
-    `paging.partition` cannot split is all `common`: it is resident whenever it runs."""
+class WeightSet(msgspec.Struct, frozen=True):
+    """One component's weight set as the plane registered it: its content id (the plane key a
+    tier and residency are reported under) and its layout's region sizes."""
 
     content: str
     component: str
     common: int
     blocks: tuple[int, ...] = ()
+    #: (common, largest region) at the sub-block grain, when finer than `blocks`
+    fine: tuple[int, int] | None = None
+
+    @property
+    def layout(self) -> weight_policy.Layout:
+        return weight_policy.Layout(self.common, self.blocks, self.fine)
 
     @property
     def total(self) -> int:
         return self.common + sum(self.blocks)
 
     @property
-    def largest(self) -> int:
-        return max(self.blocks, default=0)
+    def floor(self) -> int:
+        """Common and one ring of the largest region, at the finest grain offered."""
+        return weight_policy.floor(self.layout)
 
 
 class StageKind(msgspec.Struct, frozen=True):
@@ -123,15 +134,12 @@ def observed_graph(entrypoint: str, cell: str, samples: Iterable[StageSample]) -
     return StageGraph(entrypoint, cell, tuple(stages), observed=True)
 
 
-def static_graph(
-    entrypoint: str, cell: str, use: Mapping[str, Mapping[str, tuple[str, ...]]]
-) -> StageGraph:
-    """Before any run: one opaque stage over every component the call's models declare
-    (`component_use` per model identity). It interleaves with nothing until measured."""
-    components = tuple(
-        dict.fromkeys(c for methods in use.values() for names in methods.values() for c in names)
+def static_graph(entrypoint: str, cell: str, model: str, components: Iterable[str]) -> StageGraph:
+    """Before any run: one opaque stage over every component the call's models declare. It
+    interleaves with nothing until measured; an executor before `stage/1` stays one."""
+    return StageGraph(
+        entrypoint, cell, (Stage(StageKind(model, "*", tuple(dict.fromkeys(components)))),)
     )
-    return StageGraph(entrypoint, cell, (Stage(StageKind("*", "*", components)),))
 
 
 class CostBook:
@@ -195,51 +203,3 @@ class CostBook:
         book.costs = {(r.model, r.method, r.cell, r.width): r.cost for r in held.costs}
         book.graphs = {(g.entrypoint, g.cell): g for g in held.graphs}
         return book
-
-
-# --------------------------------------------------------------------------- cost model
-
-
-def floor_bytes(sets: Iterable[RegionSet], growth: int, context: int) -> int:
-    """The least VRAM a stage runs in: every common region, one block streaming through one
-    slot (no overlap), its activations at the cheapest rung and the CUDA context. Refusal
-    happens only below it."""
-    held = list(sets)
-    largest = max((s.largest for s in held), default=0)
-    return sum(s.common for s in held) + largest + growth + context
-
-
-def stage_seconds(
-    compute: Sequence[float],
-    sizes: Sequence[int],
-    resident: Sequence[bool],
-    link_gbps: float,
-    *,
-    window: int = 2,
-    passes: int = 1,
-) -> float:
-    """Predicted span of `passes` cycles over the regions (compute seconds and bytes each).
-
-    Slot-ring model: a streamed region's copy starts after the previous copy and after the
-    slot it reuses (the region `window` streamed places earlier) is released; its compute
-    starts after the previous region's and after its copy. Resident regions never wait. The
-    first pass starts cold; later passes prefetch across the wrap, so pass 2's span is the
-    steady pass. Stall = max(0, streamed / link - overlap) falls out of this, per region.
-    """
-    rate = max(link_gbps, 1e-9) * GB
-    released: list[float] = []
-    copy_end = done = 0.0
-    spans: list[float] = []
-    for _ in range(min(passes, 2)):
-        start = done
-        for c, size, hot in zip(compute, sizes, resident, strict=True):
-            ready = 0.0
-            if not hot:
-                slot = released[-window] if len(released) >= window else 0.0
-                copy_end = max(copy_end, slot) + size / rate
-                ready = copy_end
-            done = max(done, ready) + c
-            if not hot:
-                released.append(done)
-        spans.append(done - start)
-    return spans[0] + (passes - 1) * spans[-1]

@@ -208,6 +208,9 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     model_key: str | UnsetType = UNSET
     #: The worker keeps pinned host tiers (`HostTier` exchanges); older workers do not.
     host_tier: bool = False
+    #: The worker grants a turn per component-use scope (`stage/1`): `StageEnter` before each
+    #: scope plans, `StageExit` after it. Older workers never set it.
+    stages: bool = False
 
     def single(self) -> ModelLoad:
         return ModelLoad(
@@ -271,6 +274,8 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     attention_kernel: str = ""
     #: The weight plane's device budget for this attempt; -1: the executor derives it.
     plane_budget_bytes: int = -1
+    #: Each component-use scope asks for its turn (`stage/1`, as `Load.stages`).
+    stages: bool = False
     #: Read only by executors before the weight plane.
     placement: str = "all_resident"
     headroom_bytes: int = 0

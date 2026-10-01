@@ -63,6 +63,9 @@ from cozy_runtime.author._executor_requests import (
     Reply,
     Request,
     Room,
+    StageEnter,
+    StageExit,
+    StageGo,
     refuse,
 )
 from cozy_runtime.internal import (
@@ -105,7 +108,6 @@ from cozy_runtime.internal.worker import (
     child,
     downloads,
     execution_unit,
-    gpu_scheduler,
     grants,
     internal_calls,
     lane_wire,
@@ -119,6 +121,8 @@ from cozy_runtime.internal.worker import (
     model_source_prepare,
     observe,
     prespawn,
+    stage_policy,
+    stage_scheduler,
     store_gc,
     triage,
     weights,
@@ -148,17 +152,18 @@ from cozy_runtime.internal.worker.control import (
     ControlHost,
     WatchFanout,
 )
-from cozy_runtime.internal.worker.gpu_scheduler import GpuBroker, width_for
 from cozy_runtime.internal.worker.host_tier import HostTiers
 from cozy_runtime.internal.worker.lanes import (
     DeviceLane,
     LaneRefusal,
     LaneRow,
     LaneSet,
+    lane_id_for,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_host_available, read_vmrss
 from cozy_runtime.internal.worker.machine_owner_memo import OwnerMemo
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority, origin_key
+from cozy_runtime.internal.stages import STAGE_TURNS, StageSample, WeightSet
 from cozy_runtime.internal.worker.memory import MemoryManager, StageNeed, plane_capable
 from cozy_runtime.internal.worker.memory import Shortfall as MemoryShortfall
 from cozy_runtime.internal.worker.plan import (
@@ -760,6 +765,16 @@ def _slot(slot: pb.Slot, known: set[str]) -> str:
     return _identifier(slot.slot, "Slot.slot")
 
 
+def _demand(attempt: AttemptRecord) -> str:
+    """The stage scheduler's name for an attempt's GPU call."""
+    return f"{attempt.request_id}#{attempt.attempt}"
+
+
+def _succeeded(released: Released) -> bool:
+    outcome = released.reply.outcome
+    return outcome is not None and outcome.terminal == "succeeded"
+
+
 def _rank_degree(lane: DeviceLane, bindings: Iterable[DeclaredBinding]) -> int:
     """The executor's world: the group lane's K for a model-bearing placement, else 1.
     A weightless package has nothing to shard, so it runs one rank whatever the seal's
@@ -1151,7 +1166,9 @@ class Worker:
             tensorfs_root=options.tensorfs_root,
             inventory=options.gpus,
             room=lambda attempt: self._room(
-                self.lanes.by_id[self.engine.slot_of(attempt).lane_id], attempt.placement_id
+                self.lanes.by_id[self.engine.slot_of(attempt).lane_id],
+                attempt.placement_id,
+                attempt=attempt,
             ),
             work_fingerprint=lambda attempt: weights_sink.work_fingerprint(
                 attempt.spec,
@@ -1186,13 +1203,23 @@ class Worker:
             self.engine.products = Products(self.workspace, self.executions, self.calls)
         if self.executions is not None:
             self.executions.changed = self._journal_changed
-        self.gpu = GpuBroker(
+        self.stages = stage_scheduler.StageScheduler(
             len(self.lanes.entries),
-            granted_to=lambda key: self.supervisor.poke(execution_unit.key(key.rpartition("#")[0])),
+            poke=lambda key: self.supervisor.poke(execution_unit.key(key.rpartition("#")[0])),
             observed=self._gpu_observed,
+            machine=self._stage_machine,
             warm=self._warm,
+            sets=self._weight_sets,
+            turns=self._takes_turns,
+            prefill=self._prefill_waiting,
             fault=self.fail_machine,
+            note=lambda why: self.note("stages", why),
+            book=self.root / "stage-costs.json",
         )
+        #: installation -> whether its executors take stage turns, once one said in its hello
+        self._turning: dict[str, bool] = {}
+        #: the latest measured executor start (spawn, imports, device init), for placement
+        self._spawn_s = 0.0
         self.prespawns = prespawn.Prespawns(self)
         self._dead_replicas: dict[str, child.Executor] = {}
         from .machine_sources import Sources as MachineSources
@@ -1400,15 +1427,12 @@ class Worker:
     ) -> bool:
         """Bind one placement to a lane, or latch a typed lane refusal.
 
-        A machine replica runs on exactly its scheduler grant. A placement the owner sent
-        runs at the largest degree its bindings declare within its pin (or the envelope),
-        chosen by measured fit. The row remembers `supervision`, the slot the lane asks to
-        vacate when a co-tenant needs the card (cr-022).
+        A machine replica runs on exactly its scheduler placement. A placement the owner sent
+        runs at the largest degree its bindings declare within its pin (or the envelope), on
+        the set the stage scheduler would place such a call. The row remembers `supervision`,
+        the slot the lane asks to vacate when a co-tenant needs the card (cr-022).
         """
         model_bearing = any(not binding.weightless for binding in bindings.values())
-        # A placement executes one entrypoint at a time. Each binding already sums
-        # its independent model slots; other entrypoints are alternative calls.
-        declared = max((binding.logical_weight_bytes for binding in bindings.values()), default=0)
         measured: dict[int, accel.DeviceMemory] = {}
         if model_bearing:
             kind = accel.host_backend_family()
@@ -1417,19 +1441,16 @@ class Worker:
         pin = placement.device_pin
         try:
             if placement.placement_id.startswith(machine_lanes.REPLICA):
-                ordinals = pin or ()  # its scheduler grant exactly; none for weightless work
+                ordinals = pin or ()  # its scheduler placement exactly; none for weightless work
             else:
                 candidates = pin or tuple(range(len(self.lanes.entries)))
-                degrees = [
-                    b.sequence_parallel_degrees() for b in bindings.values() if not b.weightless
-                ]
-                ordinals = self.lanes.choose(
-                    candidates,
-                    width_for(degrees, len(candidates)) if model_bearing else 1,
-                    model_bearing=model_bearing,
-                    declared_bytes=declared,
-                    measured=measured,
-                )
+                if not set(candidates) <= set(range(len(self.lanes.entries))):
+                    raise LaneRefusal(
+                        "device_pin_infeasible",
+                        f"{list(candidates)} names ordinals outside this worker's "
+                        f"{len(self.lanes.entries)}-device envelope",
+                    )
+                ordinals = self._owner_ordinals(placement, bindings, candidates, model_bearing)
             lane = self.lanes.bind(
                 placement.placement_id, ordinals, model_bearing=model_bearing, measured=measured
             )
@@ -1465,6 +1486,34 @@ class Worker:
             + ")",
         )
         return True
+
+    def _owner_ordinals(
+        self,
+        placement: Placement,
+        bindings: Mapping[str, DeclaredBinding],
+        candidates: tuple[int, ...],
+        model_bearing: bool,
+    ) -> tuple[int, ...]:
+        """An owner-placed placement's devices among `candidates`: a weightless one the device
+        lane with the fewest placements; a model's, its widest declared group, where the
+        scheduler would place a call of it."""
+        if not model_bearing:
+            return (
+                min(
+                    candidates,
+                    key=lambda o: (len(self.lanes.by_id[lane_id_for((o,))].placements), o),
+                ),
+            )
+        width = max(
+            set(range(1, len(candidates) + 1)).intersection(
+                *({1, *b.sequence_parallel_degrees()} for b in bindings.values() if not b.weightless)
+            )
+        )
+        template = (
+            placement.installation_id,
+            documents.spell(placement.bindings_digest) if placement.bindings_digest else "",
+        )
+        return self.stages.choose(candidates, width, template)
 
     def _release_lane(self, placement_id: str) -> None:
         placement = self._placement_by_id(placement_id)
@@ -1620,6 +1669,7 @@ class Worker:
         )
 
     def _hosted_executor_exited(self, placement_id: str, executor: child.Executor) -> None:
+        self.stages.wake()  # a scope waiting for its turn in this executor stops waiting
         with self.control_lock:
             hosted = self.hosted.get(placement_id)
             if hosted is None:
@@ -2228,7 +2278,9 @@ class Worker:
         """`ctx.release_gpus()`: the attempt's root ends its GPU lease now."""
         if self.executions is not None:
             owner = self.fence.record_owner_id
-            self.gpu.release_root(self.executions.scheduling_root(owner, attempt.request_id)[0])
+            self.stages.release_root(
+                self.executions.scheduling_root(owner, attempt.request_id)[0]
+            )
 
     def _machine_call(
         self, attempt: AttemptRecord, request: pb.ChildCallRequest, action: str
@@ -2499,24 +2551,17 @@ class Worker:
         self.execution(owner, executions.scheduling_root(owner, request_id)[0])
         return executions.status(owner, request_id)
 
-    def _gpu_observed(
-        self,
-        events: list[gpu_scheduler.Event],
-        roots: dict[str, int],
-        view: gpu_scheduler.Document,
-        installations: dict[str, str],
-    ) -> None:
+    def _gpu_observed(self, events: list[stage_scheduler.Event]) -> None:
         """One scheduling pass's observations, journaled on the roots they concern as one
-        deferred batch: the pass, and the grant it wakes, never wait on a commit."""
-        self.prespawns.reconcile(roots, view, installations)
-        if self.executions is None:
+        deferred batch: the pass, and the turn it wakes, never wait on a commit."""
+        if self.executions is None or not events:
             return
         owner = self.fence.record_owner_id
-        rows: list[tuple[str, str, gpu_scheduler.Document]] = []
+        rows: list[tuple[str, str, stage_scheduler.Document]] = []
         for root, event, body in events:
             if event == "gpu.wait":
                 body = {**body, **self._waiting_call(owner, str(body["key"]))}
-            if event in ("gpu.grant", "gpu.release") and not body.get("gpus"):
+            if event in ("gpu.grant", "gpu.release", "stage.turn") and not body.get("gpus"):
                 # `ordinals` index this worker's envelope; people name a GPU by nvidia-smi's
                 # number. `ordinals` stays for readers that predate `gpus`.
                 body = {**body, "gpus": [self.gpu_identity(o) for o in body["ordinals"]]}
@@ -2525,7 +2570,7 @@ class Worker:
             self.executions.observe(owner, rows)
         for root, event, body in rows:
             if event == "gpu.wait":
-                self._gpu_waiting(owner, root, body, view)
+                self._gpu_waiting(owner, root, body)
 
     def _record_executor(self, attempt: AttemptRecord) -> None:
         """The SDK the attempt's executor loaded, as it stated in its hello, on the execution's
@@ -2560,32 +2605,172 @@ class Worker:
         )
 
     def gpu_status(self, request: str) -> pb.MachineExecutionGpu:
-        """What the GPU scheduler holds for this execution and, for a root, its calls."""
+        """What the stage scheduler holds for this execution and, for a root, its calls."""
 
         def on_device(key: str) -> bool:
             held = self.engine.live.get(key.rpartition("#")[0])
             return held is not None and held.state in ON_DEVICE
 
-        return pb.MachineExecutionGpu(**self.gpu.status(request, on_device))
+        return pb.MachineExecutionGpu(**self.stages.status(request, on_device))
 
-    def _warm(self, template: tuple[str, str]) -> tuple[int, ...]:
-        """Ordinals where a replica of this template is resident, or where its installation's
-        process was started beside the download, so a grant reuses it."""
-        placements = [self.placement, *(hosted.placement for hosted in self.hosted.values())]
-        return tuple(
-            sorted(
-                {
-                    ordinal
-                    for placement in placements
-                    if placement is not None
-                    and placement.placement_id.startswith(machine_lanes.REPLICA)
-                    and placement.bindings_digest
-                    and (placement.installation_id, documents.spell(placement.bindings_digest))
-                    == template
-                    for ordinal in placement.device_pin or ()
-                }
-                | set(self.prespawns.ordinals(template[0]))
+    # ------------------------------------------------------------------ the scheduler's facts
+
+    def _warm(self, template: tuple[str, str]) -> tuple[tuple[int, ...], ...]:
+        """GPU sets where a replica of this template has a live executor, or where its
+        installation's process was started ahead of its call, so placement reuses it. Read
+        without the control lock: the scheduler's pass must never wait on it."""
+        placements = [self.placement, *(hosted.placement for hosted in list(self.hosted.values()))]
+        sets = {
+            tuple(placement.device_pin)
+            for placement in placements
+            if placement is not None
+            and placement.placement_id.startswith(machine_lanes.REPLICA)
+            and placement.device_pin
+            and placement.bindings_digest
+            and (placement.installation_id, documents.spell(placement.bindings_digest))
+            == template
+        }
+        return tuple(sorted(sets | set(self.prespawns.sets(template[0]))))
+
+    def _takes_turns(self, installation: str) -> bool:
+        """Whether this installation's executors take a turn per stage (`stage/1`), as the
+        hello of one of its live processes (a replica's, or one started ahead) says."""
+        known = self._turning.get(installation)
+        if known is not None:
+            return known
+        hellos = [
+            executor.hello
+            for hosted in list(self.hosted.values())
+            if hosted.placement.installation_id == installation
+            and (executor := hosted.supervision.current) is not None
+        ] + self.prespawns.hellos(installation)
+        if not hellos:
+            return False
+        turning = self._turning[installation] = any(
+            STAGE_TURNS in hello.get("memory", ()) for hello in hellos
+        )
+        return turning
+
+    def _turns_for(self, attempt: AttemptRecord) -> bool:
+        """This attempt runs stage by stage: its demand takes turns and its executor (one GPU)
+        speaks `stage/1`. Anything else holds one turn from its device entry to its exit."""
+        executor = attempt.executor or self._attempt_executor(attempt)
+        lane = self.lanes.by_id.get(attempt.lane_id)
+        return (
+            executor is not None
+            and STAGE_TURNS in executor.hello.get("memory", ())
+            and lane is not None
+            and len(lane.ordinals) == 1
+            and self.stages.taking_turns(_demand(attempt))
+        )
+
+    def _attempt_executor(self, attempt: AttemptRecord) -> child.Executor | None:
+        hosted = self.hosted.get(attempt.placement_id)
+        supervision = hosted.supervision if hosted is not None else self.supervision
+        return supervision.current
+
+    def _stage_machine(self) -> stage_policy.Machine:
+        """The GPUs the driver reads now (at the latest admission, else once here) with what
+        each tenant keeps there, and the Worker's pinned host tier, by content."""
+        view = self.memory.view()
+        seen = dict(view.devices)
+        family = accel.host_backend_family()
+        resident: dict[int, dict[str, int]] = {}
+        link: dict[int, float] = {}
+        context: dict[int, int] = {}
+        for tenant in view.tenants:
+            plane = tenant.plane
+            if plane is None:
+                continue
+            active = self._tenant_construction(tenant.tenant)
+            for o in tenant.gpus:
+                held = resident.setdefault(o, {})
+                for component, size in plane.resident.items():
+                    key = f"{active}#{component}"
+                    held[key] = held.get(key, 0) + size
+                if plane.h2d_gbps > 0:
+                    link[o] = plane.h2d_gbps
+                context[o] = max(context.get(o, 0), plane.context_bytes)
+        gpus = []
+        for o, entry in enumerate(self.lanes.entries):
+            if o not in seen:
+                memory = accel.device_memory(entry, family)
+                if memory.state != "measured":
+                    continue
+                seen[o] = (memory.free_bytes, memory.total_bytes)
+            gpus.append(
+                stage_policy.Gpu(
+                    ordinal=o,
+                    total=seen[o][1],
+                    context=context.get(o, 0),
+                    link_gbps=link.get(o, 0.0),
+                    resident=resident.get(o, {}),
+                )
             )
+        return stage_policy.Machine(
+            tuple(gpus),
+            stage_policy.Host(pinned=self.host_tiers.contents(), spawn_s=self._spawn_s),
+        )
+
+    def _tenant_construction(self, slot: str) -> str:
+        hosted = self.hosted.get(slot)
+        supervision = hosted.supervision if hosted is not None else self.supervision
+        executor = supervision.current
+        return executor.active if executor is not None else ""
+
+    def _weight_sets(self, want: stage_scheduler.Want) -> dict[str, WeightSet]:
+        """A call's weight sets by component, as a replica of its template registered them:
+        each component's layout under its construction's content id."""
+        for hosted in list(self.hosted.values()):
+            placement = hosted.placement
+            if (
+                placement.installation_id,
+                documents.spell(placement.bindings_digest) if placement.bindings_digest else "",
+            ) != want.template:
+                continue
+            binding = next(
+                (b for b in hosted.bindings.values() if b.entrypoint == want.entrypoint), None
+            )
+            lane = self.lanes.lane_of(placement.placement_id)
+            if binding is None or lane is None or placement.placement_id not in lane.rows:
+                continue
+            layouts = lane.rows[placement.placement_id].ledger.layouts
+            if layouts:
+                key = binding.construction_key()
+                return {
+                    name: WeightSet(
+                        f"{key}#{name}", name, layout.common, layout.blocks, layout.fine
+                    )
+                    for name, layout in layouts.items()
+                }
+        return {}
+
+    def _prefill_waiting(self, key: str, template: tuple[str, str]) -> None:
+        """A placed call waiting for its turn: its tenant fills the host tier of the
+        construction it will run, when that executor has it loaded, off the pass's thread."""
+        replica = next(
+            (
+                hosted
+                for hosted in list(self.hosted.values())
+                if (
+                    hosted.placement.installation_id,
+                    documents.spell(hosted.placement.bindings_digest)
+                    if hosted.placement.bindings_digest
+                    else "",
+                )
+                == template
+                and (executor := hosted.supervision.current) is not None
+                and executor.loaded
+                and not executor.busy()
+            ),
+            None,
+        )
+        if replica is None:
+            return
+        slot = replica.placement.placement_id
+        keys = tuple(replica.supervision.current.loaded) if replica.supervision.current else ()
+        self.supervisor.spawn(
+            f"prefill:{key}:{slot}", lambda _: self.memory.prefill(slot, keys)
         )
 
     def _waiting_call(self, owner: str, key: str) -> dict[str, str]:
@@ -2597,9 +2782,7 @@ class Worker:
         label = self.calls.progress_label(call.parent_request, call.parent_ordinal, call.call_index)
         return {"function": call.target().export, **({"label": label} if label else {})}
 
-    def _gpu_waiting(
-        self, owner: str, root: str, body: gpu_scheduler.Document, view: gpu_scheduler.Document
-    ) -> None:
+    def _gpu_waiting(self, owner: str, root: str, body: stage_scheduler.Document) -> None:
         """Once per transition, tell the waiting call's parent (or root) why it waits. A root's
         own calls holding the cards are not a run it is behind."""
         assert self.executions is not None
@@ -2609,20 +2792,17 @@ class Worker:
         if target is None:
             return
         others = [blocker for blocker in body["blocked_by"] if blocker != root]
-        if others or not body["blocked_by"]:
-            why = "behind " + (", ".join(others) or "released devices")
-        else:
-            held = {
-                o
-                for held_by, ordinals in view["grants"].values()
-                if held_by == root
-                for o in ordinals
-            }
-            why = f"{len(held)} in use by this run's other calls"
+        why = "behind " + ", ".join(others) if others else "behind this run's other calls"
+        ordinals = list(body.get("ordinals") or ())
+        where = (
+            execution_evidence.gpu_names([self.lanes.entries[o] for o in ordinals])
+            if ordinals
+            else f"needs {body['width']}"
+        )
         self.emit_progress(
             target.request_id,
             target.attempt,
-            {"kind": "progress", "stage": f"Waiting for GPU (needs {body['width']}, {why})"[:120]},
+            {"kind": "progress", "stage": f"Waiting for GPU ({where}, {why})"[:120]},
         )
 
     def _defer_rebuild(self, placement_id: str) -> child.Executor | None:
@@ -4712,7 +4892,7 @@ class Worker:
             lane = self._lane_of(placement_id)
             for key in keys:
                 label = key.removeprefix("sha256:")[:12]
-                with lane.device:
+                with self._seat(lane, placement_id):
                     with self.control_lock:
                         referenced = any(
                             binding.construction_key() == key for binding in self.bindings.values()
@@ -5610,7 +5790,7 @@ class Worker:
                     f"{placement_id!r}: replacing the device executor "
                     f"({executor.poisoned or 'sealed to other devices or exited'})"[:256],
                 )
-                with lane.device:
+                with self._seat(lane, placement_id):
                     executor = tenant.supervision.replace(
                         executor,
                         imposed=self.imposed(lane),
@@ -5650,7 +5830,7 @@ class Worker:
         self.monitor.start(f"start:{placement_id}", "load")
         try:
             admission = (
-                self.memory.starting(lane, tenant.slot)
+                self._starting(lane, tenant.slot)
                 if any(not binding.weightless for binding in tenant.bindings.values())
                 else contextlib.nullcontext()
             )
@@ -5686,6 +5866,7 @@ class Worker:
                 self.note("recovery", f"start refusal reclaim failed: {exc}")
             return f"{reply.get('code') or 'executor_start_refused'}: {detail}"
         self.monitor.end(f"start:{placement_id}", "started")
+        self._spawn_s = executor.ready_at - executor.spawned_at + took / 1000
         executor.started = dict(reply)
         stages = reply.get("stages") or ()
         self.note(
@@ -5749,7 +5930,7 @@ class Worker:
             )
         if load:
             with self._call_phase(attempt.request_id, attempt.attempt, "Loading model weights"):
-                self._load_construction(tenant, executor, key, group)
+                self._load_construction(tenant, executor, key, group, attempt=attempt)
         if executor.active != key:
             self._activate_construction(tenant, executor, key)
 
@@ -5786,8 +5967,11 @@ class Worker:
         group: list[DeclaredBinding],
         *,
         attention_pin: str = "",
+        attempt: AttemptRecord | None = None,
     ) -> None:
-        """Build one construction in the live process. Raises the attempt's refusal."""
+        """Build one construction in the live process. Raises the attempt's refusal. An
+        attempt that takes stage turns loads beside whoever holds the GPU: its construction
+        maps nothing until its warm scopes are granted their turns."""
         lane, slot = tenant.lane, tenant.slot
         placement_id = tenant.placement.placement_id
         first = group[0]
@@ -5803,7 +5987,8 @@ class Worker:
         label = key.removeprefix("sha256:")[:12]
         if not first.weightless:
             lane.touch(slot)
-        if not first.weightless:
+        turns = attempt is not None and attempt.stage_turns
+        if not first.weightless and not turns:
             # Idle tenants of every device give room for the weights first: an executor before
             # the plane fills them onto the device, and a plane executor's `Model.warm` stages
             # them. A plane tenant gives room by a budget cut, so its bytes stay pinned.
@@ -5831,7 +6016,7 @@ class Worker:
             attention_pin=attention_pin,
         )
         if plane_capable(executor):
-            command = msgspec.structs.replace(command, host_tier=True)
+            command = msgspec.structs.replace(command, host_tier=True, stages=turns)
         subject = f"load:{label}"
         began = time.perf_counter()
         self.monitor.start(subject, "load")
@@ -5842,7 +6027,7 @@ class Worker:
                 on_progress=lambda frame: self.monitor.advance(
                     subject, int(frame.get("position", 0) or 0)
                 ),
-                on_request=self._room(lane, slot, key),
+                on_request=self._room(lane, slot, key, attempt=attempt, warm=True),
             )
         except ExecutorGone as exc:
             self.monitor.end(subject, "executor_gone")
@@ -6212,24 +6397,18 @@ class Worker:
         took. The caller holds the lane's devices, so every other tenant there is idle and
         none is mid-load. Below the floor the attempt is refused with both numbers."""
         serving = attempt.spec.get("serving")
-        if serving is None or self.accepted.mode != "serving":
-            return
+        if serving is None or self.accepted.mode != "serving" or attempt.stage_turns:
+            return  # stage by stage: each turn brings its budget (`_stage_enter`)
         declared = slot.bindings.get(str(serving.get("entrypoint_binding_digest", "")))
         if declared is None or declared.weightless:
             return
         lane = self.lanes.by_id[slot.lane_id]
         tenant = attempt.placement_id
         why = f"attempt {attempt.request_id}#{attempt.attempt}"
-        prepared = attempt.prepared
-        stage = (
-            StageNeed(entrypoint=prepared.entrypoint, cell=prepared.cell())
-            if prepared
-            else StageNeed(entrypoint=declared.entrypoint)
-        )
-        granted = self.memory.start(tenant, stage, lane.ordinals, why)
+        granted = self.memory.start(tenant, self._stage_need(attempt, declared), lane.ordinals, why)
         if isinstance(granted, MemoryShortfall):
             raise AttemptRefusal(
-                "device_shortfall", granted.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+                "device_shortfall", granted.detail, cause=CAUSE.CAUSE_CODE_NO_CAPACITY
             )
         attempt.room, attempt.plane_budget_bytes = granted.whole, granted.plane_bytes
         row = lane.row(tenant)
@@ -6328,12 +6507,25 @@ class Worker:
                 + "; ".join(f"{name}: {reason}" for name, reason in sorted(held.items()))[:300],
             )
 
-    def _room(self, lane: DeviceLane, slot: str, construction: str = "") -> Handler:
-        """Answer an executor's load or activation exchanges: a plane executor's pinned host
-        tiers of the `construction` it loads (kept here across executors), and an older
-        executor's room: idle tenants of every device of its lane give theirs back."""
+    def _room(
+        self,
+        lane: DeviceLane,
+        slot: str,
+        construction: str = "",
+        *,
+        attempt: AttemptRecord | None = None,
+        warm: bool = False,
+    ) -> Handler:
+        """Answer an executor's load, activation or attempt exchanges: an attempt's stage
+        turns (`stage/1`; a load's warm scopes take turns the attempt's graph never counts), a
+        plane executor's pinned host tiers of the `construction` it loads (kept here across
+        executors), and an older executor's room: idle tenants of its lane give theirs back."""
 
         def answer(request: Request) -> Reply:
+            if isinstance(request, StageEnter):
+                return self._stage_enter(attempt, lane, slot, request, counted=not warm)
+            if isinstance(request, StageExit):
+                return self._stage_exit(attempt, lane, slot, request, counted=not warm)
             if isinstance(request, HostTier):
                 if not construction or not request.name.startswith(f"{construction}#"):
                     if request.memfd >= 0:
@@ -6351,6 +6543,87 @@ class Worker:
                 return refuse(exc.code, exc.detail)
 
         return answer
+
+    def _stage_need(self, attempt: AttemptRecord, declared: DeclaredBinding | None) -> StageNeed:
+        prepared = attempt.prepared
+        if prepared is not None:
+            return StageNeed(entrypoint=prepared.entrypoint, cell=prepared.cell())
+        return StageNeed(entrypoint=declared.entrypoint if declared is not None else "")
+
+    def _stage_enter(
+        self,
+        attempt: AttemptRecord | None,
+        lane: DeviceLane,
+        slot: str,
+        request: StageEnter,
+        *,
+        counted: bool,
+    ) -> Reply:
+        """One scope's turn: it waits for the GPU, then gets a budget when its tenant needs one
+        (its first turn, or after it was idled). Below the floor it is refused with numbers."""
+        if attempt is None:
+            return refuse("stage_unscheduled", "only an attempt's scopes take turns")
+        key = _demand(attempt)
+        executor = attempt.executor
+        stopped = (
+            lambda: bool(attempt.canceling)
+            or self.stop.is_set()
+            or (executor is not None and not executor.alive())
+        )
+        prepared = attempt.prepared
+        granted = self.stages.enter(
+            key,
+            self.stages.kind(key, request.method, request.components),
+            stopped,
+            counted=counted,
+            cell=prepared.cell() if prepared is not None else "",
+        )
+        if granted is None:
+            if attempt.canceling:
+                return refuse("cancelled", "cancelled while waiting for its turn")
+            return refuse("stage_unscheduled", f"{key} holds no GPU call to take a turn in")
+        if not granted.start:
+            return StageGo(ok=True)
+        need = self._stage_need(attempt, attempt.declared)
+        budget = self.memory.start(slot, need, lane.ordinals, f"{key} {request.method}")
+        if isinstance(budget, MemoryShortfall):
+            self.stages.give(key)
+            return refuse("device_shortfall", budget.detail)
+        return StageGo(ok=True, budget_bytes=budget.plane_bytes)
+
+    def _stage_exit(
+        self,
+        attempt: AttemptRecord | None,
+        lane: DeviceLane,
+        slot: str,
+        request: StageExit,
+        *,
+        counted: bool,
+    ) -> Reply:
+        """A scope ended: its turn ends and its sample goes to the book. Past its last stage,
+        with another call waiting for these GPUs, the executor unmaps its weights at once (they
+        stay pinned), so the next turn starts with the room it needs."""
+        if attempt is None:
+            return StageGo(ok=True)
+        key = _demand(attempt)
+        sample = StageSample(
+            kind=self.stages.kind(key, request.method, request.components),
+            passes=request.passes,
+            wall_ns=request.wall_ns,
+            growth_bytes=request.growth_bytes,
+            stall_ns=request.stall_ns,
+        )
+        past = self.stages.exit(key, sample, counted=counted)
+        if not past:
+            return StageGo(ok=True)
+        self.memory.end(slot)
+        if not self.stages.contended(key):
+            return StageGo(ok=True)
+        row = lane.row(slot)
+        if row.ledger.plane is not None:
+            row.ledger.plane = msgspec.structs.replace(row.ledger.plane, committed_bytes=0)
+        self.stages.idle(key)
+        return StageGo(ok=True, budget_bytes=0)
 
     def _end_tenant(self, placement_id: str, executor: child.Executor, why: str) -> bool:
         """End a dead tenant for the memory manager: reclaimed now, so no byte it held is
@@ -6521,7 +6794,10 @@ class Worker:
             self.await_settled(attempt)
             if staged:
                 self._prefill(attempt)
-            with lane.device:
+            with self._seat(lane, attempt.placement_id):
+                attempt.stage_turns = self._turns_for(attempt)
+                if not attempt.stage_turns:
+                    self._whole_turn(attempt, lane)
                 try:
                     # A cancel or its deadline may have taken a staged attempt off the queue
                     # while it waited for the device: then its terminal is already sent.
@@ -6534,7 +6810,7 @@ class Worker:
                         # finds them: both go before anything waits on the journal. One to
                         # rebuild is reclaimed first (darkness 1514).
                         if self._reusable(attempt):
-                            self._leave_gpus(attempt)
+                            self._leave_gpus(attempt, ok=_succeeded(released))
                         else:
                             self._finalizing(attempt)
                     # On REFUSALS too (#458): a poisoned generation refuses every attempt.
@@ -6545,12 +6821,50 @@ class Worker:
             self._attempt_faulted(attempt, exc)
         finally:
             if not left:
-                self._leave_gpus(attempt)
+                self._leave_gpus(attempt, ok=released is not None and _succeeded(released))
         if left:
             self._finalizing(attempt)
         if released is not None:
             with lane.posting:
                 self.finish(released)
+
+    def _seat(self, lane: DeviceLane, placement_id: str) -> threading.RLock:
+        """The tenant's executor, one user at a time: an attempt from entry to its rebuild,
+        or a replacement or unload of that executor. GPUs are the stage scheduler's."""
+        return lane.row(placement_id).seat
+
+    def _whole_turn(self, attempt: AttemptRecord, lane: DeviceLane) -> None:
+        """Hold one turn on the attempt's GPUs from its device entry to its release: an
+        executor that takes no stage turns (an older Runtime, a group, a job). A placement
+        the owner sent, which no unit queued, asks here on exactly its lane. A cancel while
+        waiting proceeds to entry, which ends it without touching the device."""
+        key = _demand(attempt)
+        if not lane.ordinals:
+            return
+        if not self.stages.known(key):
+            self.stages.want(
+                key,
+                stage_scheduler.Want(
+                    root=attempt.request_id, widths=(len(lane.ordinals),), gpus=lane.ordinals
+                ),
+            )
+        poke = attempt.poke
+        attempt.poke = lambda: (poke(), self.stages.wake())
+        self.stages.take(key, stop=lambda: bool(attempt.canceling) or self.stop.is_set())
+
+    @contextlib.contextmanager
+    def _starting(self, lane: DeviceLane, slot: str) -> Iterator[None]:
+        """A new device context on `lane`: idle tenants there give room first. It starts beside
+        a running turn only when that turn's executor recovers from an out-of-memory at a block
+        boundary; otherwise it waits for a turn of its own."""
+        hold = (
+            contextlib.nullcontext()
+            if self.stages.quiet(lane.ordinals)
+            else self.stages.hold(lane.ordinals, f"executor startup {slot}")
+        )
+        with hold:
+            self.memory.make_room(lane, slot, None, "executor startup")
+            yield
 
     def _prefill(self, attempt: AttemptRecord) -> None:
         """While a staged attempt waits for its devices, its plane executor fills the host
@@ -6565,10 +6879,14 @@ class Worker:
         if declared is not None and not declared.weightless:
             self.memory.prefill(attempt.placement_id, (declared.construction_key(),))
 
-    def _leave_gpus(self, attempt: AttemptRecord) -> None:
+    def _leave_gpus(self, attempt: AttemptRecord, *, ok: bool = False) -> None:
+        """The attempt's demand ends: a successful one teaches the cost book its stages."""
         # Per-GPU pid, card and interval (execution_evidence) prove where it ran.
-        self.gpu.release(
-            f"{attempt.request_id}#{attempt.attempt}",
+        prepared = attempt.prepared
+        self.stages.release(
+            _demand(attempt),
+            ok=ok,
+            cell=prepared.cell() if prepared is not None else "",
             ranks=attempt.execution.get("ranks", []),
             gpus=attempt.execution.get("gpus", []),
         )
@@ -6591,11 +6909,12 @@ class Worker:
         *,
         granted: bool = False,
     ) -> None:
-        """Rebuild under the lane's device hold, so no attempt enters a half-built executor:
-        the exact dead `executor`, or whatever the last attempt left in need."""
-        with lane.device:
-            if lane.lane_id.startswith("cpu-"):
-                return
+        """Rebuild under the tenant's seat, so no attempt enters a half-built executor: the
+        exact dead `executor`, or whatever the last attempt left in need. A new device context
+        takes its own turn (`_starting`)."""
+        if lane.lane_id.startswith("cpu-"):
+            return
+        with self._seat(lane, placement_id):
             if lane is self.lanes.orchestration:
                 self._rebuild_orchestration()
             elif executor is None:

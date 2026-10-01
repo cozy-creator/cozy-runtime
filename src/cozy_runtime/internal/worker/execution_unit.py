@@ -1,8 +1,9 @@
 """One machine execution, root or child, as its own supervised unit.
 
 The unit runs its execution start to finish on one thread: a child's call phase, the wait
-for its GPU grant, its attempt inline, and its settlement into its parent. It re-reads its
-row on every wake. Its exception fails this execution and nothing else (`crashed`).
+until the stage scheduler lets its GPU call go (placed and next on its GPUs, or holding its
+whole turn), its attempt inline, and its settlement into its parent. It re-reads its row on
+every wake. Its exception fails this execution and nothing else (`crashed`).
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ from typing import TYPE_CHECKING, Literal
 
 from cozy_runtime.internal.worker import machine_lanes
 from cozy_runtime.internal.worker.attempts import safe
-from cozy_runtime.internal.worker.gpu_scheduler import Want, width_for
 from cozy_runtime.internal.worker.supervisor import Unit, fault_text
 from cozy_runtime.internal.worker.workspace_calls import CallFenced
 from cozy_runtime.internal.worker.workspace_executions import (
@@ -141,24 +141,36 @@ class Execution:
         grant_key = f"{self.request}#{row.ordinal}"
         ordinals: tuple[int, ...] = ()
         attempt = None
+        stages = self.worker.stages
         try:
             if shape.kind != "cpu":
-                want = self._want(shape)
+                want = machine_lanes.want(self.worker, shape)
                 if isinstance(want, str):
                     self._refuse(offered, want)
                     return
-                broker = self.worker.gpu
-                broker.want(grant_key, want)
+                stages.want(grant_key, want)
                 if shape.kind == "serving":
                     journal = functools.partial(self.worker._journal_row, self.request, row.ordinal)
-                    self.worker.prespawns.waiting(want, shape.interface, journal)
+                    self.worker.prespawns.waiting(grant_key, want, shape.interface, journal)
                 unit.wait_for(
-                    lambda: broker.granted(grant_key) is not None or self._moved(row), due
+                    lambda: (
+                        stages.ready(grant_key)
+                        or stages.refused(grant_key) is not None
+                        or self._moved(row)
+                    ),
+                    due,
                 )
-                granted = broker.granted(grant_key)
-                if granted is None:
+                if (refused := stages.refused(grant_key)) is not None:
+                    self.worker.refuse(
+                        offered, "no_capacity", refused.detail, pb.CAUSE_CODE_NO_CAPACITY
+                    )
+                    return
+                placed = stages.placed(grant_key)
+                if placed is None:
                     return  # moved or past its deadline: the next pass decides
-                ordinals = granted
+                ordinals = placed
+                if not stages.taking_turns(grant_key):
+                    stages.take(grant_key)  # granted already: this thread is its holder
             self.calls.timing.phase(self.owner, self.request, row.ordinal, "preparing")
             attempt = self.worker.dispatch_machine(
                 unit, offered, ordinals, lambda: self._moved(row)
@@ -167,7 +179,7 @@ class Execution:
                 self.worker.run_attempt(attempt)
         finally:
             if attempt is None and shape.kind != "cpu":
-                self.worker.gpu.release(grant_key)
+                stages.release(grant_key)
 
     def _fail(self, why: str) -> None:
         """End this execution FAILED: an undispatched attempt gets the terminal; a recorded
@@ -237,13 +249,13 @@ class Execution:
             root, _ = self.executions.scheduling_root(self.owner, self.request)
             self.is_root = root == self.request
         if self.is_root and not self.root_open:
-            self.worker.gpu.open_root(self.request, row.priority)
+            self.worker.stages.open_root(self.request, row.priority)
             self.root_open = True
 
     def _close_root(self) -> None:
         if self.root_open:
             self.root_open = False
-            self.worker.gpu.close_root(self.request)
+            self.worker.stages.close_root(self.request)
 
     def _shaped(self, row: ExecutionRow) -> machine_lanes.Shape:
         if self.shape is None or self.shaped != row.ordinal:
@@ -255,20 +267,6 @@ class Execution:
                 )
             self.shaped = row.ordinal
         return self.shape
-
-    def _want(self, shape: machine_lanes.Shape) -> Want | str:
-        devices = len(self.worker.lanes.entries)
-        if shape.kind != "serving":  # a device job is worker-wide
-            return Want(shape.root, devices)
-        readable = self.worker.readable_gpus()
-        if refusal := machine_lanes.unrunnable(shape, readable):
-            return refusal
-        return Want(
-            shape.root,
-            width_for(shape.degrees, len(readable), shape.gpus),
-            shape.template,
-            tuple(sorted(set(range(devices)) - set(readable))),
-        )
 
     def _moved(self, row: ExecutionRow) -> bool:
         """Whether what this queued wait rests on changed: a control, or its parent."""

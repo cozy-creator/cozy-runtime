@@ -1,25 +1,29 @@
 """The stage scheduler's decision core: pure, typed, one pass per change.
 
 Inputs are facts. The machine: each GPU's capacity and what is resident on it, the host tier
-and the link, cache and disk rates the weight plane measured. The jobs: priority, arrival,
-their predicted stage graph with measured costs, where they are placed and where they are in
-the graph. The output is one `Plan`: which stage turns start now on which GPUs, where an
-unplaced job goes and at what width, which jobs prepare early (executor, meta construction,
-host fill), which stages get their first regions prefetched, and typed refusals with
-numbers. The shell applies a plan through the memory policy; this module applies nothing.
+and the link, cache and disk rates the weight plane measured. The jobs: one per GPU call of an
+execution, with its root's priority, its arrival, its predicted stage graph with measured
+costs, where it is placed and where it is in the graph. The output is one `Plan`: which stage
+turns start now on which GPUs, where an unplaced job goes and at what width, which placed jobs
+prepare ahead of their turn (executor, construction, host fill), which stages get their first
+regions prefetched, and typed refusals with numbers. The shell applies a plan; this module
+applies nothing.
 
-1. Order is (priority, arrival). A job runs one stage at a time on its whole GPU set, and a
-   stage is never preempted: turns change hands only at stage boundaries.
-2. A GPU's turn goes to the earliest-ordered job that wants it. A later job gets a turn there
-   only inside a bubble: the GPU is idle, the earlier job is in a CPU gap, and the later
-   stage (with its load) is predicted to end before that gap does, beside the earlier job's
-   next stage rather than over it.
-3. An unplaced job takes the GPU set, width included, with the earliest predicted finish:
-   when the set frees up, plus the load of bytes not resident there from the fastest tier
-   holding them, plus an executor start where none is warm, plus its run at that width.
-   Unmeasured work predicts nothing, so the widest set the machine forms wins (today's rule).
-4. A job waiting for a set prepares on it and is prefilled into the host tier; each GPU's next
-   turn holder has its next stage's first regions prefetched into spare VRAM.
+1. Order is (priority, arrival): a root's calls share its priority, so a root's calls are
+   contiguous and never block each other. A job runs one stage at a time on its whole GPU set,
+   and a stage is never preempted: turns change hands only at stage boundaries.
+2. A GPU's turn goes to the earliest-ordered root that claims it. A later root gets a turn there
+   only inside a bubble: the GPU is idle, the earlier job is in a measured CPU gap, and the
+   later stage (with its load) is predicted to end before that gap does, beside the earlier
+   job's next stage rather than over it. A root keeps its GPUs between its calls (a lease) until
+   it ends or releases them. A job past its last observed stage claims nothing.
+3. An unplaced job takes the GPU set, width included, with the earliest predicted finish: when
+   the set frees up, plus the load of bytes not resident there from the fastest tier holding
+   them, plus an executor start where none is warm, plus its run at that width. Unmeasured work
+   takes the widest width the machine forms; while no set's finish is known and none is free,
+   it waits unplaced rather than guess between sets.
+4. A placed job waiting for its turn prepares there and is prefilled into the host tier; each
+   GPU's next turn holder has its next stage's first regions prefetched into spare VRAM.
 5. A job is refused only when no GPU could ever hold some stage's floor, on measured facts.
 """
 
@@ -32,10 +36,10 @@ from typing import Literal
 
 import msgspec
 
-from cozy_runtime.internal.stages import GB, RegionSet, StageCost, StageKind, floor_bytes
+from cozy_runtime.internal.stages import GB, StageCost, StageKind, WeightSet
 
 INF = math.inf
-Phase = Literal["ready", "running", "gap", "released"]
+Phase = Literal["preparing", "ready", "running", "gap", "released"]
 
 
 class Gpu(msgspec.Struct, frozen=True, kw_only=True):
@@ -43,8 +47,8 @@ class Gpu(msgspec.Struct, frozen=True, kw_only=True):
     total: int
     context: int = 0
     """Bytes no tenant can budget: CUDA contexts and processes outside this Worker."""
-    link_gbps: float
-    """Achieved pinned host-to-device rate (plane EWMA)."""
+    link_gbps: float = 0.0
+    """Achieved pinned host-to-device rate (plane EWMA); 0 is unmeasured."""
     resident: Mapping[str, int] = {}
     """Weight-set content id -> bytes in VRAM here."""
 
@@ -53,10 +57,10 @@ class Host(msgspec.Struct, frozen=True, kw_only=True):
     pinned: Mapping[str, int] = {}
     cached: Mapping[str, int] = {}
     """Page-cache bytes per content (sampled)."""
-    cache_gbps: float
-    disk_gbps: float
+    cache_gbps: float = 0.0
+    disk_gbps: float = 0.0
     spawn_s: float = 0.0
-    """Measured executor start: spawn, imports and meta construction."""
+    """Measured executor start: spawn, imports and meta construction; 0 is unmeasured."""
 
 
 class Machine(msgspec.Struct, frozen=True):
@@ -66,7 +70,7 @@ class Machine(msgspec.Struct, frozen=True):
 
 class JobStage(msgspec.Struct, frozen=True, kw_only=True):
     kind: StageKind
-    sets: tuple[RegionSet, ...]
+    sets: tuple[WeightSet, ...] = ()
     calls: int = 1
     cost: Mapping[int, StageCost] = {}
     """Width -> measured cost at this request's cell. Empty: never measured."""
@@ -74,16 +78,16 @@ class JobStage(msgspec.Struct, frozen=True, kw_only=True):
 
 class Job(msgspec.Struct, frozen=True, kw_only=True):
     key: str
+    root: str = ""
     priority: int
     arrival: int
-    stages: tuple[JobStage, ...]
+    stages: tuple[JobStage, ...] = ()
     phase: Phase = "ready"
-    """ready: wants its next turn (an unplaced job wants placement). gap: between stages on the
-    CPU. released: no further GPU work (`ctx.release_gpus()` or done)."""
+    """preparing: placed and getting ready (executor, construction), not asking for a turn yet.
+    ready: wants its next turn (an unplaced job wants placement). running: holds a turn. gap:
+    between stages on the CPU. released: no further GPU work."""
     at: int = 0
-    """The stage running, wanted, or next after the gap. A job in its gap past the last
-    observed stage claims nothing: its GPUs are free, and a stage it did not predict waits for
-    its turn in order like any other (the shell appends it before asking)."""
+    """The stage running, wanted, or next after the gap."""
     elapsed_s: float = 0.0
     """Time already spent in the running stage or the current gap."""
     widths: tuple[int, ...] = (1,)
@@ -91,6 +95,10 @@ class Job(msgspec.Struct, frozen=True, kw_only=True):
     """The placed set, fixed for the job's life."""
     warm: tuple[tuple[int, ...], ...] = ()
     """GPU sets where this job's installation already has a live executor."""
+    lease: bool = False
+    """A root's hold between its calls: it claims its GPUs at its order, with no measured gap."""
+    exclude: tuple[int, ...] = ()
+    """GPUs it can never use (unreadable to it)."""
 
 
 class Turn(msgspec.Struct, frozen=True):
@@ -101,6 +109,8 @@ class Turn(msgspec.Struct, frozen=True):
 
 
 class Prepare(msgspec.Struct, frozen=True):
+    """A placed job waiting for its turn on `gpus`, in order: it may get ready there now."""
+
     job: str
     gpus: tuple[int, ...]
 
@@ -119,6 +129,7 @@ class Prefill(msgspec.Struct, frozen=True):
 class Wait(msgspec.Struct, frozen=True):
     job: str
     blocked_by: str
+    """The root whose claim it waits behind; "" when nothing names one."""
 
 
 class Refusal(msgspec.Struct, frozen=True):
@@ -136,6 +147,10 @@ class Plan(msgspec.Struct, frozen=True, kw_only=True):
     prefills: tuple[Prefill, ...] = ()
     waits: tuple[Wait, ...] = ()
     refusals: tuple[Refusal, ...] = ()
+
+
+#: gpu -> (the earliest-ordered job claiming it, seconds until it wants it: 0 now, else its gap)
+Claims = dict[int, tuple[Job, float]]
 
 
 # --------------------------------------------------------------------------- predictions
@@ -172,9 +187,15 @@ def floor_growth(stage: JobStage, width: int) -> int:
     return cost.floor_growth if cost is not None else 0
 
 
-def load_s(sets: Iterable[RegionSet], gpu: Gpu, host: Host) -> float:
+def floor(sets: Iterable[WeightSet], activation: int) -> int:
+    """The least VRAM a stage runs in: each weight set's floor at its finest grain and the
+    activation it needs at the memory policy's cheapest rung."""
+    return sum(s.floor for s in sets) + activation
+
+
+def load_s(sets: Iterable[WeightSet], gpu: Gpu, host: Host) -> float:
     """Upper bound: bytes not resident on `gpu`, moved from the fastest tier holding them,
-    with no overlap credited."""
+    with no overlap credited. A rate never measured prices nothing: ranking only."""
     seconds = 0.0
     for s in sets:
         missing = max(0, s.total - gpu.resident.get(s.content, 0))
@@ -184,12 +205,15 @@ def load_s(sets: Iterable[RegionSet], gpu: Gpu, host: Host) -> float:
             rate = min(gpu.link_gbps, host.cache_gbps)
         else:
             rate = min(gpu.link_gbps, host.disk_gbps)
-        seconds += missing / (max(rate, 1e-9) * GB)
+        if rate > 0:
+            seconds += missing / (rate * GB)
     return seconds
 
 
 def remaining_s(job: Job, width: int) -> float:
     """Predicted time until `job` is done with its GPUs; INF when any part is unmeasured."""
+    if job.lease:
+        return INF
     total = 0.0
     for i, stage in enumerate(job.stages[job.at :], start=job.at):
         run = run_s(stage, width)
@@ -208,26 +232,42 @@ def remaining_s(job: Job, width: int) -> float:
 def refusal(job: Job, machine: Machine) -> Refusal | None:
     """Refuse only when, at every allowed width, some stage's floor exceeds what the `width`-th
     largest GPU can hold. Activations count only at the cheapest rung the memory policy has
-    measured; an estimate never refuses."""
-    usable = sorted((g.total - g.context for g in machine.gpus), reverse=True)
+    measured; an estimate never refuses. No width the machine forms refuses too."""
+    usable = sorted(
+        ((g.total - g.context, g.ordinal) for g in machine.gpus if g.ordinal not in job.exclude),
+        reverse=True,
+    )
+    if not any(w <= len(usable) for w in job.widths):
+        return Refusal(
+            job.key,
+            "NO_CAPACITY",
+            f"needs {' or '.join(map(str, job.widths))} GPUs; this machine reads {len(usable)}",
+            max(job.widths, default=0),
+            len(usable),
+        )
     worst: tuple[int, int, int, str] | None = None
     for width in job.widths:
-        capacity = usable[width - 1] if len(usable) >= width else 0
-        needs = [(floor_bytes(s.sets, floor_growth(s, width), 0), s.kind) for s in job.stages]
-        need, kind = max(needs, key=lambda row: row[0])
-        if need <= capacity:
+        if width > len(usable):
+            continue
+        capacity, ordinal = usable[width - 1]
+        for stage in job.stages:
+            need = floor(stage.sets, floor_growth(stage, width))
+            if need <= capacity:
+                continue
+            kind = stage.kind
+            named = f"stage {kind.method} ({', '.join(kind.components)}) needs {need} bytes per GPU"
+            if worst is None or need - capacity < worst[0]:
+                worst = (need - capacity, need, capacity, f"{named}; GPU {ordinal} holds {capacity}")
+            break
+        else:
             return None
-        if worst is None or need - capacity < worst[0]:
-            named = f"{kind.method} ({', '.join(kind.components)})"
-            worst = (need - capacity, need, capacity, named)
     if worst is None:
         return None
-    _, need, capacity, stage = worst
+    _, need, capacity, detail = worst
     return Refusal(
         job.key,
         "NO_CAPACITY",
-        f"stage {stage} needs {need} bytes per GPU (every common region, the largest block and "
-        f"activations at the cheapest rung); the largest usable GPU holds {capacity}",
+        f"{detail} (every weight set's floor and activations at the cheapest rung)",
         need,
         capacity,
     )
@@ -236,18 +276,19 @@ def refusal(job: Job, machine: Machine) -> Refusal | None:
 # --------------------------------------------------------------------------- the pass
 
 
+def _rank(job: Job) -> tuple[int, int, str]:
+    return (job.priority, job.arrival, job.key)
+
+
 def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
     gpus = {g.ordinal: g for g in machine.gpus}
-    order = sorted(
-        (j for j in jobs if j.phase != "released"), key=lambda j: (j.priority, j.arrival, j.key)
-    )
+    order = sorted((j for j in jobs if j.phase != "released"), key=_rank)
     turns: list[Turn] = []
     prepares: list[Prepare] = []
     waits: list[Wait] = []
     refusals: list[Refusal] = []
     idle = dict.fromkeys(gpus, True)
-    #: gpu -> (the earliest-ordered job that wants it, seconds until it does: 0 now, else its gap)
-    claim: dict[int, tuple[Job, float]] = {}
+    claim: Claims = {}
     #: gpu -> predicted seconds until a newly placed job could start there
     free_at = dict.fromkeys(gpus, 0.0)
     #: job -> the GPU set it holds, is placed on, or prepares on
@@ -265,40 +306,54 @@ def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
         if job.phase == "running":
             target[job.key] = job.gpus
             continue
+        if job.lease:
+            for o in job.gpus:
+                if o in gpus:
+                    claim.setdefault(o, (job, 0.0))
+            continue
         if not job.gpus:
+            if job.phase not in ("ready", "preparing"):
+                continue
             if (refusing := refusal(job, machine)) is not None:
                 refusals.append(refusing)
                 continue
             placed = _place(job, machine, idle, claim, free_at)
-            if placed is None:
+            if isinstance(placed, Wait):
+                waits.append(placed)
                 continue
             chosen, bubble = placed
             target[job.key] = chosen
-            if bubble is not None:
+            if bubble is not None and job.phase == "ready":
                 turns.append(Turn(job.key, chosen, job.at, bubble))
                 busy.add(job.key)
                 _take(chosen, job, idle, claim)
-                for o in chosen:
-                    free_at[o] += remaining_s(job, len(chosen))
             else:
                 prepares.append(Prepare(job.key, chosen))
-                waits.append(Wait(job.key, _blocker(chosen, claim, job)))
+                if job.phase == "ready":
+                    waits.append(Wait(job.key, _blocker(chosen, claim, job)))
+            for o in chosen:
+                claim.setdefault(o, (job, 0.0))
+                free_at[o] += remaining_s(job, len(chosen))
             continue
         target[job.key] = job.gpus
         width = len(job.gpus)
-        if job.at >= len(job.stages):
+        if job.at >= len(job.stages) and job.phase == "gap":
             continue  # past its last observed stage: it claims nothing until it asks again
         if job.phase == "ready":
             fits = _bubble(job, job.gpus, gpus, machine.host, claim)
-            if all(idle[o] for o in job.gpus) and fits is not None:
+            if all(idle.get(o, False) for o in job.gpus) and fits is not None:
                 turns.append(Turn(job.key, job.gpus, job.at, fits))
                 busy.add(job.key)
                 _take(job.gpus, job, idle, claim)
             else:
                 waits.append(Wait(job.key, _blocker(job.gpus, claim, job)))
+        elif job.phase == "preparing":
+            prepares.append(Prepare(job.key, job.gpus))
+        wait = gap_left(job, width) if job.phase == "gap" else 0.0
         for o in job.gpus:
-            claim.setdefault(o, (job, 0.0 if job.phase == "ready" else gap_left(job, width)))
-            free_at[o] += remaining_s(job, width)
+            claim.setdefault(o, (job, wait))
+            if o in free_at:
+                free_at[o] += remaining_s(job, width)
 
     refused = {r.job for r in refusals}
     return Plan(
@@ -308,7 +363,7 @@ def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
         prefills=tuple(
             Prefill(j.key, missing)
             for j in order
-            if j.key not in refused and (missing := _unpinned(j, machine.host))
+            if j.key not in refused and not j.lease and (missing := _unpinned(j, machine.host))
         ),
         waits=tuple(waits),
         refusals=tuple(refusals),
@@ -316,48 +371,49 @@ def decide(machine: Machine, jobs: Sequence[Job]) -> Plan:
 
 
 def gap_left(job: Job, width: int) -> float:
+    if job.at >= len(job.stages):
+        return 0.0
     return max(0.0, gap_s(job.stages[job.at], width) - job.elapsed_s)
 
 
-def _take(
-    chosen: Sequence[int], job: Job, idle: dict[int, bool], claim: dict[int, tuple[Job, float]]
-) -> None:
+def _take(chosen: Sequence[int], job: Job, idle: dict[int, bool], claim: Claims) -> None:
     for o in chosen:
         idle[o] = False
         claim.setdefault(o, (job, 0.0))
 
 
-def _blocker(chosen: Sequence[int], claim: Mapping[int, tuple[Job, float]], job: Job) -> str:
-    return next((claim[o][0].key for o in chosen if o in claim and claim[o][0] is not job), "")
+def _blocker(chosen: Sequence[int], claim: Claims, job: Job) -> str:
+    return next(
+        (claim[o][0].root for o in chosen if o in claim and claim[o][0].root != job.root), ""
+    )
 
 
 def _bubble(
-    job: Job,
-    chosen: Sequence[int],
-    gpus: Mapping[int, Gpu],
-    host: Host,
-    claim: Mapping[int, tuple[Job, float]],
+    job: Job, chosen: Sequence[int], gpus: Mapping[int, Gpu], host: Host, claim: Claims
 ) -> bool | None:
     """False: `job` may start its stage on `chosen` outright. True: only as a bubble inside an
-    earlier job's CPU gap, which it fits in time and beside that job's next stage in VRAM.
+    earlier root's CPU gap, which it fits in time and beside that job's next stage in VRAM.
     None: it may not start now."""
-    holders = [claim[o] for o in chosen if o in claim and claim[o][0] is not job]
+    holders = [claim[o] for o in chosen if o in claim and claim[o][0].root != job.root]
     if not holders:
         return False
+    if job.at >= len(job.stages) or any(wait <= 0.0 for _, wait in holders):
+        return None
     stage = job.stages[job.at]
     width = len(chosen)
     run = run_s(stage, width)
-    if run is None or any(wait <= 0.0 for _, wait in holders):
+    if run is None:
         return None
     load = max(load_s(stage.sets, gpus[o], host) for o in chosen)
     if run + load > min(wait for _, wait in holders):
         return None
-    need = floor_bytes(stage.sets, growth(stage, width), 0)
+    need = floor(stage.sets, growth(stage, width))
     for o in chosen:
         g = gpus[o]
         kept = sum(
             g.resident.get(s.content, 0)
             for holder, _ in holders
+            if holder.at < len(holder.stages)
             for s in holder.stages[holder.at].sets
         )
         if need + kept > g.total - g.context:
@@ -366,37 +422,42 @@ def _bubble(
 
 
 def _place(
-    job: Job,
-    machine: Machine,
-    idle: Mapping[int, bool],
-    claim: Mapping[int, tuple[Job, float]],
-    free_at: Mapping[int, float],
-) -> tuple[tuple[int, ...], bool | None] | None:
+    job: Job, machine: Machine, idle: Mapping[int, bool], claim: Claims, free_at: Mapping[int, float]
+) -> tuple[tuple[int, ...], bool | None] | Wait:
     """The set with the earliest predicted finish and whether it starts now (as a bubble or
-    outright; None: it waits). Unmeasured jobs take the widest width the machine forms."""
+    outright; None: it waits there). Unmeasured jobs take the widest width the machine forms.
+    While no set's finish is known and none can start, the job waits unplaced."""
     gpus = {g.ordinal: g for g in machine.gpus}
-    widths = [w for w in job.widths if w <= len(gpus)]
+    usable = sorted(o for o in gpus if o not in job.exclude)
+    widths = [w for w in job.widths if w <= len(usable)]
     if not widths:
-        return None
+        return Wait(job.key, "")
     measured = any(run_s(s, w) is not None for s in job.stages for w in widths)
     if not measured:
         widths = [max(widths)]
     needed = {s.content: s for st in job.stages[job.at :] for s in st.sets}.values()
-    best: tuple[tuple[float, int, float, tuple[int, ...]], tuple[int, ...], bool | None] | None
-    best = None
+    rows = []
     for width in widths:
-        for chosen in itertools.combinations(sorted(gpus), width):
+        for chosen in itertools.combinations(usable, width):
             now = all(idle[o] for o in chosen)
             bubble = _bubble(job, chosen, gpus, machine.host, claim) if now else None
-            start = 0.0 if bubble is not None else max(free_at[o] for o in chosen)
+            start = 0.0 if bubble is not None else max(_free(o, job, claim, free_at) for o in chosen)
             spawn = 0.0 if chosen in job.warm else machine.host.spawn_s
             load = max(load_s(needed, gpus[o], machine.host) for o in chosen)
-            ready = max(start, spawn) + load
-            finish = ready + (remaining_s(job, width) if measured else 0.0)
-            rank = (finish, -width, spawn + load, chosen)
-            if best is None or rank < best[0]:
-                best = (rank, chosen, bubble)
-    return None if best is None else (best[1], best[2])
+            finish = max(start, spawn) + load + (remaining_s(job, width) if measured else 0.0)
+            rows.append(((finish, -width, spawn + load, chosen), chosen, bubble, start))
+    _, chosen, bubble, start = min(rows, key=lambda row: row[0])
+    if bubble is None and start == INF and len(rows) > 1:
+        return Wait(job.key, _blocker(chosen, claim, job))
+    return chosen, bubble
+
+
+def _free(o: int, job: Job, claim: Claims, free_at: Mapping[int, float]) -> float:
+    """When GPU `o` frees up for `job`: never, while another root leases it."""
+    held = claim.get(o)
+    if held is not None and held[0].lease and held[0].root != job.root:
+        return INF
+    return free_at[o]
 
 
 def _prefetches(
@@ -408,7 +469,7 @@ def _prefetches(
     chosen: dict[int, Prefetch] = {}
     for job in order:
         stage = job.at + 1 if job.key in busy else job.at
-        if stage >= len(job.stages) or job.key not in target:
+        if job.lease or stage >= len(job.stages) or job.key not in target:
             continue
         for o in target[job.key]:
             if o not in chosen:

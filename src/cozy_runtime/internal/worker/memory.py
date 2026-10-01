@@ -2,8 +2,8 @@
 
 ONE manager per Worker decides; each executor's weight plane moves the bytes. A TENANT is one
 placement's executor over its lane's devices; a rank group is one tenant with rank-symmetric
-budgets. A tenant in its turn (`start` .. `end`) holds its devices; every other tenant there
-is idle.
+budgets. The stage scheduler grants turns; a tenant from its turn's `start` to its `end` is
+active and never cut; every other tenant there is idle, and one mid-call is never cut either.
 
 `start` reads the driver once and gives activations first: the plane gets what is free after
 the shape's activation growth, banked from what executors report and never sampled. A shape
@@ -17,8 +17,7 @@ never refused); a dead one by being ended. Below the window-1 floor `start` answ
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Collection, Mapping, Sequence
 
 import msgspec
 
@@ -213,14 +212,6 @@ class MemoryManager:
         return list(found.values())
 
     # ------------------------------------------------------------------ the scheduler's calls
-
-    @contextmanager
-    def starting(self, lane: DeviceLane, slot: str) -> Iterator[None]:
-        """Admit a new device context under the same physical locks as a call: idle tenants
-        of these devices are cut before CUDA or the rank group initializes."""
-        with lane.device:
-            self.make_room(lane, slot, None, "executor startup")
-            yield
 
     def view(self) -> MemoryView:
         """Every device's latest reading and every tenant's plane facts; reads no driver."""
@@ -485,6 +476,8 @@ class MemoryManager:
             executor = row.supervision.current if row.supervision is not None else None
             if other == slot or other in tried or executor is None:
                 continue
+            if executor.busy() and executor.alive() and not executor.poisoned:
+                continue  # mid-call (an attempt's tail, a load): a cut would wait for it
             if executor.poisoned or not executor.alive():
                 dead.append((other, lane, row, executor))
             elif other not in self.active and holds(row, executor, short & set(lane.ordinals)):
