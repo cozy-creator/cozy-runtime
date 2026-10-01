@@ -33,7 +33,23 @@ jobs:
       - name: Torch-gated test files
         run: |
           mapfile -t files < <(grep -lE '(importorskip|find_spec)\(\s*"(torch|diffusers|transformers)|needs_torch|NO_TORCH|SkipTest\(' tests/test_*.py)
-          .venv/bin/python -m pytest -rs "${files[@]}"
+          sudo systemd-run --wait --pipe --collect \
+            --unit="cozy-runtime-torch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            --setenv="UV_CACHE_DIR=$UV_CACHE_DIR" \
+            --setenv="UV_PYTHON_INSTALL_DIR=$UV_PYTHON_INSTALL_DIR" \
+            --setenv="OMP_NUM_THREADS=$OMP_NUM_THREADS" --setenv="MKL_NUM_THREADS=$MKL_NUM_THREADS" \
+            .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main(sys.argv[1:]))' \
+            -rs --junitxml=torch-pytest-results.xml "${files[@]}"
+      - name: Torch test receipt
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: torch-pytest-results
+          path: torch-pytest-results.xml
+          if-no-files-found: error
       # The executor runs as another UID only when the worker is root, as on a pod. Every
       # proof that needs that crossing runs here, from a tree that UID can traverse.
       - name: Pod executor UID boundary
