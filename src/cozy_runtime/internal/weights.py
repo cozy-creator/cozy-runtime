@@ -59,6 +59,8 @@ from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
 
 #: The largest region at the sub-block grain (proving-cpu.md C2: SDXL runs at 1 GiB).
 REGION_LIMIT = 16 << 20
+#: The smallest image VAE decode tile side, in pixels.
+MIN_TILE = 128
 _REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB)")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
 #: The TensorFS planning window a weight set's read plan is cut into.
@@ -1864,63 +1866,72 @@ class WeightResidency:
         """An image VAE's decode mode, decided before the call from what is free plus what the
         plane may unmap: untiled when its measured activations fit, else tiled with the tile
         clamped to what is free. A size never measured at or above runs untiled (its blocks
-        retry on OOM; a fixed cost makes small decodes' per-pixel peaks overstate large ones);
-        only a decode that cannot run untiled even with every idle weight unmapped runs again
-        tiled. The mode is recorded in the run's outputs."""
+        retry on OOM; a fixed cost makes small decodes' per-pixel peaks overstate large ones).
+        A decode that cannot run untiled even with every idle weight unmapped runs again tiled,
+        and a tile that does not fit runs again at half the side, down to the smallest tile.
+        The mode is recorded in the run's outputs."""
         root = self.components[name].root
         weights = self.weights
         #: pixels -> the untiled peak measured at that size
         peaks: dict[int, int] = {}
-        per_pixel: list[int] = []
+        #: pixels -> the tile side that last fit
+        sides: dict[int, int] = {}
         scale = 2 ** (len(root.config.block_out_channels) - 1)
         default = int(root.tile_sample_min_size)
 
         def run(z: Any, *args: Any, **kwargs: Any) -> Any:
             if self.active is not None:
                 weights.adaptive.add(self.active[0])
-            pixels = int(z.shape[0]) * int(z.shape[-2]) * int(z.shape[-1]) * scale * scale
+            height, width = int(z.shape[-2]) * scale, int(z.shape[-1]) * scale
+            pixels = int(z.shape[0]) * height * width
             free, evictable = self.room((name,))
             size = min((n for n in peaks if n >= pixels), default=0)
-            per_pixel[:] = [peaks[size] // size] if size else []
+            per_pixel = peaks[size] // size if size else 0
             mode = (
-                weight_policy.decode_mode(free, evictable, per_pixel[0] * pixels)
-                if per_pixel
+                weight_policy.decode_mode(free, evictable, per_pixel * pixels)
+                if size
                 else "untiled"
             )
-            if mode == "tiled":
-                free = self._room_for_decode(name, free, evictable, free + evictable)
-                _tile(root, free // max(per_pixel[0], 1), scale, default)
-            else:
-                root.disable_tiling()
-                # Activations first: idle weights leave before an untiled decode needs their
-                # room (all of them when this size was never measured), since a decode's
-                # convolutions outside any block hook cannot retry.
-                need = per_pixel[0] * pixels if per_pixel else free + evictable
-                self._room_for_decode(name, free, evictable, need)
+            # Activations first: idle weights leave before a decode needs their room (all of
+            # them unless a measured untiled peak says less), since a decode's convolutions
+            # outside any block hook cannot retry.
+            need = per_pixel * pixels if mode == "untiled" and size else free + evictable
+            free = self._room_for_decode(name, free, evictable, need)
+            # a tile under half the image, so tiling always lowers the peak
+            largest = _side(min(default, min(height, width) // 2))
+            side = min(_side(free // max(per_pixel, 1)), sides.get(pixels, largest), largest)
             baseline = accel.allocated(weights.torch, weights.kind)
             accel.reset_peak(weights.torch, weights.kind)
-            failed = False
-            try:
-                out = decode(z, *args, **kwargs)
-            except Exception as exc:
-                capacity = is_device_oom(exc) or (
-                    isinstance(exc, ResidencyRefusal) and exc.code == "device_shortfall"
-                )
-                if mode == "tiled" or not capacity:
-                    raise
-                failed = True
-            if failed:  # outside `except`, so the failed call's frames are gone
+            while True:
+                if mode == "tiled":
+                    _tile(root, side, scale)
+                else:
+                    root.disable_tiling()
+                try:
+                    out = decode(z, *args, **kwargs)
+                    break
+                except Exception as exc:
+                    capacity = is_device_oom(exc) or (
+                        isinstance(exc, ResidencyRefusal) and exc.code == "device_shortfall"
+                    )
+                    if not capacity or (mode == "tiled" and side <= MIN_TILE):
+                        raise
+                # outside `except`, so the failed call's frames are gone
+                accel.release_cached(weights.torch, weights.kind)
+                if mode == "tiled":
+                    side = _side(side // 2)
+                    continue
                 # it needs more than all it had: the next decode of this size starts tiled
                 peaks[pixels] = max(peaks.get(pixels, 0), free + evictable + 1)
                 mode = "tiled"
                 free, evictable = self.room((name,))
-                free = self._room_for_decode(name, free, evictable, free + evictable)
-                _tile(root, free // max(peaks[pixels] // pixels, 1), scale, default)
-                out = decode(z, *args, **kwargs)
-            elif mode == "untiled":
+                self._room_for_decode(name, free, evictable, free + evictable)
+            if mode == "tiled":
+                sides[pixels] = side
+            else:
                 peak = accel.peak_allocated(weights.torch, weights.kind) - baseline
                 peaks[pixels] = max(peaks.get(pixels, 0), peak)
-            weights.modes[f"{name}.decode"] = mode
+            weights.modes[f"{name}.decode"] = f"tiled {side}" if mode == "tiled" else mode
             # The decode's transient activations go back to the driver: kept in torch's
             # cache they shrink the next grant, and the weights the decode unmapped come
             # back into exactly that room.
@@ -2085,10 +2096,13 @@ def _image_vae(root: Any) -> bool:
     )
 
 
-def _tile(root: Any, pixels: int, scale: int, default: int) -> None:
-    """Tile an image VAE with the largest square tile, up to its own `default`, whose
-    activations fit `pixels`."""
-    side = max(int(pixels**0.5) // 64 * 64, 128)
+def _side(pixels: int) -> int:
+    """The largest tile side, a multiple of 64 and at least the smallest tile, whose square
+    is at most `pixels`."""
+    return max(int(max(pixels, 0) ** 0.5) // 64 * 64, MIN_TILE)
+
+
+def _tile(root: Any, side: int, scale: int) -> None:
     root.enable_tiling()
-    root.tile_sample_min_size = min(default, side)
-    root.tile_latent_min_size = root.tile_sample_min_size // scale
+    root.tile_sample_min_size = side
+    root.tile_latent_min_size = side // scale
