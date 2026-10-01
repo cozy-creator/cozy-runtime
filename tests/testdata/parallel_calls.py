@@ -102,9 +102,15 @@ def collective_model() -> ModelCalls:
         assert model._cozy_active[1] == ("block", "overlay")
         residency: Any = model._cozy_residency
         if residency is not None:
-            # This rank's own stage is admitted and its weights are bound on the card.
+            # This rank's own stage is admitted and its weights are bound (on the card, or in
+            # the host tier without one).
             assert residency.active is not None and residency.active[1] == ("block", "overlay")
-            assert model.block.weight.is_cuda and model.overlay.weight.is_cuda
+            assert (
+                model.block.weight.is_cuda
+                == model.overlay.weight.is_cuda
+                == torch.cuda.is_available()
+            )
+            assert float(model.block.weight) == 2.0 and float(model.overlay.weight) == 1.0
         return (args[0].to(model.overlay.weight.device) + model.overlay.weight, *args[1:]), kwargs
 
     model.block.register_forward_pre_hook(check_scope, with_kwargs=True)
@@ -133,7 +139,10 @@ def plane_residency(root: Path, model: ModelCalls) -> PlaneBackend:
         writer.add_part(name, "weight", "value", io.BytesIO(struct.pack("<f", value)))
     writer.add_config("model", io.BytesIO(b"{}"))
     checkpoint = Checkpoint(root / "store", "sha256:" + writer.commit()["manifest"]["sha256"])
-    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    # Every rank's plane on the one card; without one, each rank computes in its host tier.
+    on_card = torch.cuda.is_available()
+    device = torch.device("cuda", 0) if on_card else torch.device("cpu")
+    weights = Weights(torch, device, device.type)
     backend = PlaneBackend.for_script(
         dict.fromkeys(values, checkpoint),
         [row for name in values for row in checkpoint.rows(name)],

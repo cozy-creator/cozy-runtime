@@ -105,8 +105,8 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         pytest.importorskip("diffusers")
     if kind == "h3-lora":
         pytest.importorskip("peft")
-    if kind == "staged" and not (torch.cuda.is_available() and plane.available()):
-        pytest.skip("the weight plane on a CUDA card; every rank's plane uses one physical GPU")
+    if kind == "staged" and not plane.available():
+        pytest.skip("a TensorFS with the weight plane")
     fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
 
     def launch(module_argv: list[str], fd: int) -> spawn.Child:
