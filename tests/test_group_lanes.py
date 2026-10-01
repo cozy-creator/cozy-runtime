@@ -46,6 +46,7 @@ from cozy_runtime.internal.worker.session import (
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import PACKAGE, WEIGHTLESS, _config, _workspace
 from test_end_to_end import NO_EXECUTOR
+from test_gpu_scheduler import driverless
 
 needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 
@@ -197,19 +198,24 @@ def test_per_device_rows_and_the_min_ceiling() -> None:
     # a generation change clears the rows with everything else
     ledger.begin_generation(0)
     assert ledger.devices == {} and ledger.device_free == -1
-    # the real card: its own reading, folded alone, is itself
+
+
+@pytest.mark.real_gpu
+def test_a_real_cards_reading_folds_to_itself() -> None:
+    """Card 0's own reading, folded alone, is itself; beside a card no host has, unreadable."""
     real = accel.device_memory("0", accel.host_backend_family())
-    if real.state == "measured":
-        assert lanes.fold_memory({0: real}) == real
-        one = lanes.LaneSet.from_envelope("0", worker_pid=os.getpid()).lanes[0]
-        assert one.memory(accel.host_backend_family()).total_bytes == real.total_bytes
-        assert (
-            lanes.LaneSet.from_envelope("0,1", worker_pid=os.getpid())
-            .group((0, 1))
-            .memory(accel.host_backend_family())
-            .state
-            == "unreadable"
-        ), "one unreadable card makes the group unreadable"
+    if real.state != "measured":
+        pytest.skip("no driver-readable device 0 on this host")
+    assert lanes.fold_memory({0: real}) == real
+    one = lanes.LaneSet.from_envelope("0", worker_pid=os.getpid()).lanes[0]
+    assert one.memory(accel.host_backend_family()).total_bytes == real.total_bytes
+    assert (
+        lanes.LaneSet.from_envelope("0,64", worker_pid=os.getpid())
+        .group((0, 1))
+        .memory(accel.host_backend_family())
+        .state
+        == "unreadable"
+    ), "one unreadable card makes the group unreadable"
 
 
 def _worker_slot(degrees: tuple[int, ...]) -> WorkerSlot:
@@ -294,13 +300,16 @@ def _lane_rows(target: pb.ObservedWorkerState | pb.WorkerSnapshotBody) -> list[d
     ]
 
 
-def test_a_pin_through_the_worker_binds_a_group_without_moving_admission() -> None:
+def test_a_pin_through_the_worker_binds_a_group_without_moving_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """`_assign_lane` reads the accepted pin and the bindings' declared degrees; a refusal
     latches the placement typed and leaves the lanes exactly as they were."""
+    driverless(monkeypatch)
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0,1"),
+            WorkerOptions(root=root / "worker", devices="64,65"),
             InMemoryControlHost(),
         )
         try:
@@ -320,7 +329,7 @@ def test_a_pin_through_the_worker_binds_a_group_without_moving_admission() -> No
             fault = worker.engine.faults[-1]
             assert fault.reason == "device_group_infeasible", fault
             assert fault.kind == pb.FaultKind.FAULT_KIND_CONFIG_REFUSED
-            assert "ordinal 1 ('1') free bytes unreadable" in fault.detail
+            assert "ordinal 1 ('65') free bytes unreadable" in fault.detail
             assert placement.lane_id == "" and len(worker.lanes.lanes) == 2
             assert worker.admission_epoch == epoch
             # a weightless placement pinned to one device lands on it, no bump
@@ -510,18 +519,21 @@ def _weightless_start(body: dict[str, Any], interface: Path, **extra: Any) -> St
 
 
 @needs_executor
-def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group() -> None:
+def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driverless(monkeypatch)
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0,1"),
+            WorkerOptions(root=root / "worker", devices="64,65"),
             InMemoryControlHost(),
         )
         try:
-            single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
+            single = lanes.DeviceLane("lane-0", (0,), "64", worker_pid=os.getpid())
             described = worker.supervision.spawn(imposed=worker.imposed(single))
             assert not described.ready_bindings and not described.loaded
-            assert described.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0"
+            assert described.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "64"
             group = worker.lanes.group((0, 1))
             tenant = Tenant(_placement("candidate"), worker.supervision, {}, {}, group, "candidate")
             prepared = worker._own_executor(tenant)
@@ -530,7 +542,7 @@ def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group(
                 "the package-describe process retained its single-GPU seal"
             )
             assert not described.alive()
-            assert prepared.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
+            assert prepared.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "64,65"
             assert worker.supervision.devices == group.entries
             assert worker._own_executor(tenant) is prepared, "unchanged seals should still reuse"
         finally:
@@ -543,14 +555,15 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both(
     monkeypatch: pytest.MonkeyPatch, readable: bool
 ) -> None:
     """THE K-DEVICE SEAL, read from the child's own `/proc` environment: a group lane's
-    executor carries `CUDA_VISIBLE_DEVICES=0,1` and `NCCL_NVLS_ENABLE=0`; a device lane's
+    executor carries `CUDA_VISIBLE_DEVICES=64,65` and `NCCL_NVLS_ENABLE=0`; a device lane's
     carries no NVLS row. The degree is checked against the seal before any weight moves;
     a weightless package refuses to shard. Retirement proves the actual process is gone
     and retains a driver observation for each sealed device. Explicit driver fixtures
     cover a readable device and a CPU-only host without probing physical GPUs."""
+    driverless(monkeypatch)
     expected = {
-        "0": accel.ProcessMemory("absent", 0) if readable else accel.ProcessMemory("unreadable"),
-        "1": accel.ProcessMemory("unreadable"),
+        "64": accel.ProcessMemory("absent", 0) if readable else accel.ProcessMemory("unreadable"),
+        "65": accel.ProcessMemory("unreadable"),
     }
     device_reads: list[tuple[set[int], tuple[str, ...]]] = []
 
@@ -571,7 +584,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both(
         config = _config(root / "home")
         worker = Worker(
             config,
-            WorkerOptions(root=root / "worker", devices="0,1"),
+            WorkerOptions(root=root / "worker", devices="64,65"),
             InMemoryControlHost(),
         )
         found = discover_installed(WEIGHTLESS)
@@ -580,26 +593,26 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both(
         interface.parent.mkdir()
         interface.write_bytes(package_interface.canonical_bytes(body))
         group = worker.lanes.group((0, 1))
-        assert worker.imposed(group)["CUDA_VISIBLE_DEVICES"] == "0,1"
+        assert worker.imposed(group)["CUDA_VISIBLE_DEVICES"] == "64,65"
         assert worker.imposed(group)["NCCL_NVLS_ENABLE"] == "0"
         # the wide envelope lane a job takes IS a group lane (K = the envelope), so its
         # seal carries the row too; a ONE-device lane's seal is exactly what it was
         assert worker.imposed(worker.lanes.envelope)["NCCL_NVLS_ENABLE"] == "0"
-        single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
+        single = lanes.DeviceLane("lane-0", (0,), "64", worker_pid=os.getpid())
         assert "NCCL_NVLS_ENABLE" not in worker.imposed(single)
-        assert worker.imposed(single)["CUDA_VISIBLE_DEVICES"] == "0"
+        assert worker.imposed(single)["CUDA_VISIBLE_DEVICES"] == "64"
         executor = worker.supervision.spawn(imposed=worker.imposed(group))
         try:
             environ = Path(f"/proc/{executor.pid}/environ").read_bytes().split(b"\0")
             rows = dict(row.split(b"=", 1) for row in environ if b"=" in row)
-            assert rows[b"CUDA_VISIBLE_DEVICES"] == b"0,1", rows
+            assert rows[b"CUDA_VISIBLE_DEVICES"] == b"64,65", rows
             assert rows[b"NCCL_NVLS_ENABLE"] == b"0", rows
-            assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
+            assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "64,65"
             assert executor.hello["rank"] == 0 and executor.hello["world"] == 1
-            assert worker.supervision.devices == ("0", "1")
-            command = _weightless_start(body, interface, devices="0,1")
+            assert worker.supervision.devices == ("64", "65")
+            command = _weightless_start(body, interface, devices="64,65")
             # the seal fences the devices before the degree is even read
-            other = executor.call(msgspec.structs.replace(command, devices="0"), timeout=60.0)
+            other = executor.call(msgspec.structs.replace(command, devices="64"), timeout=60.0)
             assert other["code"] == "env_seal_broken", other
         finally:
             evidence = worker.supervision.retire_current(executor, "seal arm done")
@@ -608,7 +621,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both(
         assert evidence.members == (executor.pid,)
         assert evidence.device == accel.ProcessMemory("absent", 0), evidence
         assert evidence.devices == expected, evidence
-        assert device_reads == [({executor.pid}, ("0", "1"))]
+        assert device_reads == [({executor.pid}, ("64", "65"))]
         # degree checks, each on a fresh executor (a refused start poisons its epoch)
         for extra, code in (
             ({"sequence_parallel_degree": 3}, "sequence_parallel_degree_mismatch"),
@@ -617,11 +630,11 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both(
             executor = worker.supervision.spawn(imposed=worker.imposed(group))
             try:
                 reply = executor.call(
-                    _weightless_start(body, interface, devices="0,1", **extra), timeout=60.0
+                    _weightless_start(body, interface, devices="64,65", **extra), timeout=60.0
                 )
                 assert reply["code"] == code, reply
                 if code == "sequence_parallel_degree_mismatch":
-                    assert "sealed to 2 device(s) ('0,1')" in reply["detail"], reply
+                    assert "sealed to 2 device(s) ('64,65')" in reply["detail"], reply
             finally:
                 worker.supervision.retire_current(executor, "degree arm done")
             assert not executor.alive()
@@ -629,15 +642,16 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both(
 
 
 @needs_executor
-def test_degree_one_is_a_plain_executor() -> None:
+def test_degree_one_is_a_plain_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     """A degenerate group on one card is byte-identical in behaviour to a plain executor:
     the same weightless start with `sequence_parallel_degree: 1` and without it answers
     the same reply (timing aside), and neither spawns a rank."""
+    driverless(monkeypatch)
     with _workspace() as root:
         config = _config(root / "home")
         worker = Worker(
             config,
-            WorkerOptions(root=root / "worker", devices="0"),
+            WorkerOptions(root=root / "worker", devices="64"),
             InMemoryControlHost(),
         )
         found = discover_installed(WEIGHTLESS)
@@ -650,7 +664,7 @@ def test_degree_one_is_a_plain_executor() -> None:
             executor = worker.supervision.spawn(imposed=worker.imposed(worker.lanes.lanes[0]))
             try:
                 reply = executor.call(
-                    _weightless_start(body, interface, devices="0", **extra), timeout=120.0
+                    _weightless_start(body, interface, devices="64", **extra), timeout=120.0
                 )
                 assert reply["ok"], reply
                 children = subprocess.run(
@@ -934,7 +948,7 @@ def test_a_sharded_forward_outside_the_gate_refuses() -> None:
 
 
 @needs_executor
-def test_a_seal_width_change_is_a_replacement_not_a_reuse() -> None:
+def test_a_seal_width_change_is_a_replacement_not_a_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
     """THE DEFECT: a live executor is sealed ONCE, at spawn, and cannot be re-sealed.
 
     A placement that starts on a one-device lane and is then assigned the K-device group
@@ -949,27 +963,28 @@ def test_a_seal_width_change_is_a_replacement_not_a_reuse() -> None:
     `Executor.sealed_devices` records what the process was actually sealed with, so both
     reuse paths can ask the question cr-066 answers: does this process serve THIS lane?
     """
+    driverless(monkeypatch)
     with _workspace() as root:
         config = _config(root / "home")
         worker = Worker(
             config,
-            WorkerOptions(root=root / "worker", devices="0,1"),
+            WorkerOptions(root=root / "worker", devices="64,65"),
             InMemoryControlHost(),
         )
         group = worker.lanes.group((0, 1))
-        single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
+        single = lanes.DeviceLane("lane-0", (0,), "64", worker_pid=os.getpid())
         executor = worker.supervision.spawn(imposed=worker.imposed(single))
         try:
             # what the child really got, and what we recorded, are the same string
-            assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0"
-            assert executor.sealed_devices == "0"
+            assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "64"
+            assert executor.sealed_devices == "64"
             # it MATCHES the lane it was spawned for, so an ordinary reuse still reuses
             assert executor.sealed_devices == single.devices
             # and it does NOT match the group lane, which is the whole fix: the reuse
             # branch in `_own_executor` now falls through to `replace` instead of handing
             # a one-card process to a two-card prepare
             assert executor.sealed_devices != group.devices
-            assert group.devices == "0,1"
+            assert group.devices == "64,65"
             # the width change also adds the NVLS row a group communicator needs
             # (pgw#929), which a reused one-device process would never have carried
             assert "NCCL_NVLS_ENABLE" not in worker.imposed(single)
@@ -979,22 +994,23 @@ def test_a_seal_width_change_is_a_replacement_not_a_reuse() -> None:
 
 
 @needs_executor
-def test_a_group_sealed_executor_records_both_ordinals() -> None:
+def test_a_group_sealed_executor_records_both_ordinals(monkeypatch: pytest.MonkeyPatch) -> None:
     """The same record, taken from the other side: spawned FOR the group, it says so."""
+    driverless(monkeypatch)
     with _workspace() as root:
         config = _config(root / "home")
         worker = Worker(
             config,
-            WorkerOptions(root=root / "worker", devices="0,1"),
+            WorkerOptions(root=root / "worker", devices="64,65"),
             InMemoryControlHost(),
         )
         group = worker.lanes.group((0, 1))
         executor = worker.supervision.spawn(imposed=worker.imposed(group))
         try:
-            assert executor.sealed_devices == "0,1" == group.devices
-            assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
+            assert executor.sealed_devices == "64,65" == group.devices
+            assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "64,65"
             # and it is not reusable for a one-card lane either -- the rule is symmetric
-            single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
+            single = lanes.DeviceLane("lane-0", (0,), "64", worker_pid=os.getpid())
             assert executor.sealed_devices != single.devices
         finally:
             worker.supervision.close()

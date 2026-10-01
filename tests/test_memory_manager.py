@@ -24,7 +24,7 @@ from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
 from cozy_runtime.internal.worker.memory import Watch
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
-from test_gpu_scheduler import Machine
+from test_gpu_scheduler import VIRTUAL, Machine, driverless
 
 needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 
@@ -49,12 +49,13 @@ def machine(monkeypatch: pytest.MonkeyPatch) -> Iterator[Machine]:
     box: list[Machine] = []
 
     def device_memory(entry: str, kind: str) -> accel.DeviceMemory:
-        used = held_on(box[0], int(entry)) if box else 0
+        used = held_on(box[0], VIRTUAL.split(",").index(entry)) if box else 0
         return accel.DeviceMemory("measured", TOTAL - used, TOTAL)
 
+    driverless(monkeypatch)
     monkeypatch.setattr(accel, "device_memory", device_memory)
     with tempfile.TemporaryDirectory(prefix="cz-mem.", dir="/tmp") as root:
-        made = Machine(Path(root), "0,1,2,3", "boot-one")
+        made = Machine(Path(root), VIRTUAL, "boot-one")
         box.append(made)
         try:
             yield made
@@ -105,7 +106,7 @@ def test_a_group_evicts_the_idle_tenant_of_every_device_it_needs(
     group.row(h3).peak[SHAPE] = dict.fromkeys(range(4), 61 * GiB)
     assert worker.memory.admit(group, h3, SHAPE, "segment 2")
     assert sorted(vacated(machine)) == sorted(qwen)
-    assert all(accel.device_memory(str(o), "cuda").free_bytes >= 41 * GiB for o in range(4))
+    assert all(accel.device_memory(o, "cuda").free_bytes >= 41 * GiB for o in VIRTUAL.split(","))
     assert machine.executors() == before, "vacated, not killed"
     assert group.row(h3).held == dict.fromkeys(range(4), 20 * GiB), "the requester kept its own"
 
@@ -270,7 +271,7 @@ def test_a_group_that_can_name_its_ranks_gives_back_only_the_cards_a_call_needs(
     lane.row(qwen[3]).peak[SHAPE] = {3: 70 * GiB}
     assert worker.memory.admit(lane, qwen[3], SHAPE, "a reference")
     steps = [e.step for e in worker.activity if " vacated " in e.step]
-    assert len(steps) == 1 and f"{h3!r}" in steps[0] and "vacated GPU 3 for " in steps[0], steps
+    assert len(steps) == 1 and f"{h3!r}" in steps[0] and "vacated GPU 67 for " in steps[0], steps
     assert group.row(h3).held == dict.fromkeys(range(3), 20 * GiB)
     assert group.row(h3).emptied == {3}
 

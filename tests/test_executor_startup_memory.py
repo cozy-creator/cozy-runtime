@@ -110,7 +110,7 @@ def test_start_admits_the_full_group_before_allocating_a_new_context(
     with fresh.lane.device:
         assert machine.worker._start_executor(fresh, executor) == ""
     assert len(calls) == 1
-    assert calls[0].devices == "0,1" and calls[0].sequence_parallel_degree == 2
+    assert calls[0].devices == "64,65" and calls[0].sequence_parallel_degree == 2
     assert fresh.bindings == bindings and not fresh.failed_bindings
     assert executor.started and executor.alive() and old.alive()
     assert idle.row().held == {} and idle.row().emptied == {0, 1}

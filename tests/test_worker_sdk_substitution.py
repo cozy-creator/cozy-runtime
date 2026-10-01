@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -12,7 +11,6 @@ from pathlib import Path
 import pytest
 
 import cozy_runtime
-from cozy_runtime.internal.worker import lanes
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from test_device_lanes import _config, _workspace
@@ -39,11 +37,11 @@ def test_executor_handshake_accepts_compatible_protocol_with_other_package_metad
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0"),
+            WorkerOptions(root=root / "worker"),
             InMemoryControlHost(),
         )
         try:
-            lane = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
+            lane = worker.lanes.lanes[0]
             same = worker.supervision.spawn(imposed=worker.imposed(lane))
             assert same.hello["runtime_version"] == cozy_runtime.__version__
             worker.supervision.retire_current(same, "handshake proof")
