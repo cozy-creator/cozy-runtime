@@ -70,7 +70,15 @@ class Delay:
     then: Fault | None = None
 
 
-Fault = Status | Reset | Truncate | Stall | Corrupt | Delay
+@dataclass(frozen=True)
+class Gate:
+    """Hold the answer until `opened` is set (or the hub closes), then answer with `then`."""
+
+    opened: threading.Event
+    then: Fault | None = None
+
+
+Fault = Status | Reset | Truncate | Stall | Corrupt | Delay | Gate
 
 
 def enveloped(code: int, error: str, message: str = "injected") -> Status:
@@ -128,13 +136,16 @@ class Checkpoint:
     bodies: dict[str, bytes]
 
 
-def checkpoint(tmp_path: Path, model: str = "proof/model") -> Checkpoint:
-    """`test_model_runtime_closure`'s checkpoint: a manifest, its header and one asset."""
+def checkpoint(
+    tmp_path: Path, model: str = "proof/model", path: str = "model.cozytensors"
+) -> Checkpoint:
+    """`test_model_runtime_closure`'s checkpoint: a manifest, its header and one asset. Another
+    `path` names the same bytes under a distinct manifest."""
     tmp_path.mkdir(parents=True, exist_ok=True)
-    _, manifest, length, origin = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
-    bodies = {hashlib.sha256(body).hexdigest(): body for body in (_HEADER, _ASSET)}
-    bodies[manifest.removeprefix("sha256:")] = origin.manifest(manifest)["manifest"]
-    return Checkpoint(model, manifest, length, bodies)
+    _, manifest, _, origin = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
+    raw = origin.manifest(manifest)["manifest"].replace(b"model.cozytensors", path.encode())
+    bodies = {hashlib.sha256(body).hexdigest(): body for body in (_HEADER, _ASSET, raw)}
+    return Checkpoint(model, "sha256:" + hashlib.sha256(raw).hexdigest(), len(raw), bodies)
 
 
 @dataclass
@@ -166,6 +177,9 @@ class FaultHub:
         with self.changed:
             for held in self.held:
                 held.shutdown(socket.SHUT_RDWR)  # a stalled answer ends with its hub
+        for rule in self.rules:
+            if isinstance(rule.fault, Gate):
+                rule.fault.opened.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
@@ -288,6 +302,9 @@ class FaultHub:
             def answer(self, fault: Fault | None, body: bytes = b"", route: str = "") -> None:
                 if isinstance(fault, Delay):
                     time.sleep(fault.seconds)
+                    fault = fault.then
+                elif isinstance(fault, Gate):
+                    fault.opened.wait()
                     fault = fault.then
                 if isinstance(fault, Status):
                     raw = fault.body() if callable(fault.body) else fault.body

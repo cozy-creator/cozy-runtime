@@ -35,10 +35,10 @@ from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
 
 def _serving(
-    store_root: Path, origin: str, manifest: str, length: int
+    store_root: Path, origin: str, manifest: str, length: int, label: str = ""
 ) -> tuple[Serving, Target, dict[str, Any], list[dict[str, Any]]]:
     """A Serving over a real Workspace whose one Model default is `manifest` at `origin`;
-    its parent's progress frames land in the returned list."""
+    its parent's progress frames land in the returned list. A call's step is `label`."""
     checkpoint = {"digest": manifest, "length": length}
     placement = {
         "installation_id": "installed-model",
@@ -88,7 +88,7 @@ def _serving(
             prepared_installations={
                 "model": SimpleNamespace(document=documents.from_body(placement, pb.Placement))
             },
-            calls=SimpleNamespace(progress_label=lambda *_: ""),
+            calls=SimpleNamespace(progress_label=lambda *_: label),
             emit_progress=lambda _parent, _ordinal, frame: progress.append(frame),
             # This host harness has no GPUs; the process warm is `test_startup_warm`'s.
             prespawns=SimpleNamespace(request=lambda *_: None),
@@ -294,6 +294,30 @@ def test_a_hint_paused_for_demand_says_so_where_its_fetch_ends(tmp_path: Path) -
     assert paused["completed"] is False and paused["paused_for"] == "other-parent", paused
     assert "cancel" in paused["reason"], paused
     assert resumed["completed"] is True and "reason" not in resumed, resumed
+
+
+def test_a_called_download_reports_its_bytes_on_its_steps_line(tmp_path: Path) -> None:
+    """The download phase is named for the call's step; its byte samples were named for the
+    entrypoint, so a client drew them as a second line."""
+    point = checkpoint(tmp_path / "origin")
+    step = "Creating reference Subject-4"
+    with FaultHub(point) as hub:
+        store_root = tmp_path / "destination"
+        tensorfs.Store.init(str(store_root))
+        serving, target, placement, progress = _serving(
+            store_root, hub.origin, point.manifest, point.length, label=step
+        )
+        call = Call("parent", 3, 1, 1, b"", b"", "call-4", b"", False, b"", "", "")
+        request = pb.ChildCallRequest(parent_attempt_ordinal=1)
+        try:
+            prepared = serving._shared("owner", call, target, request, {}, speculative=False)
+            assert prepared is not None
+            assert Watched(hub, prepared.result).result().placement == placement
+        finally:
+            serving.close()
+    samples = [row for row in progress if row.get("kind") == "progress"]
+    assert any(row.get("position") == row.get("total") for row in samples), samples
+    assert {row["stage"] for row in samples} == {step + " / Downloading model weights"}
 
 
 def test_a_prefetch_narrates_each_hundredth_of_its_download_once() -> None:

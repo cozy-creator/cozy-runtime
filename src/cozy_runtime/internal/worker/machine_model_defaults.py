@@ -413,6 +413,8 @@ def materialize(
     from . import machine_materialization
 
     pulled: dict[str, tuple[int, int]] = {}
+    # Neither held here nor sized by its pull: until none is, the whole is not known.
+    unsized = {row.manifest.digest for row in selected}
     lock = threading.Lock()
     keep = sorted({row.manifest.digest for row in selected})
 
@@ -424,11 +426,13 @@ def materialize(
             sample(available, total)
         if progress is None:
             return
-        with lock:
+        with lock:  # one sum at a time, so they arrive in order
             pulled[model.manifest] = (available, total)
-            landed = sum(done for done, _ in pulled.values())
-            whole = sum(size for _, size in pulled.values())
-        progress(landed, whole)
+            if total:
+                unsized.discard(model.manifest)
+            if not unsized:
+                landed = sum(done for done, _ in pulled.values())
+                progress(landed, sum(size for _, size in pulled.values()))
 
     def land(row: Selected) -> None:
         manifest = row.manifest
@@ -446,6 +450,8 @@ def materialize(
         try:
             store.verify_checkpoint_source(row.repository, manifest.digest, manifest.length)
             machine_materialization.held(worker, model, store)
+            with lock:
+                unsized.discard(manifest.digest)
             return
         except facade.errors.Refusal:
             pass
