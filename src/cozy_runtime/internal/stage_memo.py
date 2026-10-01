@@ -118,64 +118,66 @@ def _raw(leaf: Leaf, torch: ModuleType) -> memoryview:
     return memoryview(flat)
 
 
-def _flatten(value: object, torch: ModuleType, leaves: dict[str, Leaf], host: bool) -> object:
+def _flatten(
+    value: object, torch: ModuleType, leaves: dict[str, Leaf], host: bool, depth: int = 0
+) -> object:
     """`value` as a JSON structure with its tensors, arrays and images pulled out into
     `leaves`. Arguments (`host`) admit only host tensors, so keying one never waits for a
-    device; results admit tensors anywhere. Anything else is `Unmemoizable`."""
+    device; results admit tensors anywhere. Anything else is `Unmemoizable`.
+
+    A plain recursive function, never a closure: a closure that names itself is a reference
+    cycle holding `leaves`, which would keep a result's device tensors allocated until the
+    collector next ran, past the end of the attempt."""
 
     def leaf(item: Leaf) -> str:
         leaves[name := f"t{len(leaves)}"] = item
         return name
 
-    def walk(value: object, depth: int) -> object:
-        if depth > 16:
-            raise Unmemoizable("nesting")
-        if isinstance(value, torch.Tensor):
-            tensor = cast(Tensor, value)
-            if (
-                type(value) is not torch.Tensor
-                or tensor.is_sparse
-                or (host and str(tensor.device) != "cpu")
-            ):
-                raise Unmemoizable("tensor not a plain host tensor" if host else "tensor kind")
-            if str(tensor.dtype).removeprefix("torch.") not in _DTYPES:
-                raise Unmemoizable(f"dtype {tensor.dtype}")
-            return ["t", leaf(tensor.contiguous())]
-        if isinstance(value, Image.Image):
-            return ["pil", value.mode, list(value.size), leaf(value)]
-        if isinstance(value, np.ndarray):
-            return ["np", value.dtype.str, list(value.shape), leaf(value)]
-        if isinstance(value, enum.Enum):
-            return ["e", _qualname(value), walk(value.value, depth + 1)]
-        if value is None or isinstance(value, (bool, int, str)):
-            return ["v", value]
-        if isinstance(value, float):
-            return ["f", value.hex()]
-        if isinstance(value, (bytes, bytearray, memoryview)):
-            return ["b", bytes(value).hex()]
-        if isinstance(value, Asset) and host and value.digest:
-            return ["a", type(value).__name__, value.digest]
-        if isinstance(value, tuple) and hasattr(value, "_fields"):
-            return ["n", _qualname(value), [walk(v, depth + 1) for v in value]]
-        if type(value) in (tuple, list):
-            items = cast(Sequence[object], value)
-            return [type(value).__name__, [walk(v, depth + 1) for v in items]]
-        if type(value) is dict and all(isinstance(k, str) for k in value):
-            return ["dict", [[k, walk(v, depth + 1)] for k, v in value.items()]]
-        if isinstance(value, msgspec.Struct) or dataclasses.is_dataclass(value):
-            fields = (
-                value.__struct_fields__
-                if isinstance(value, msgspec.Struct)
-                else [f.name for f in dataclasses.fields(cast("DataclassInstance", value))]
-            )
-            return [
-                "r",
-                _qualname(value),
-                [[f, walk(getattr(value, f), depth + 1)] for f in fields],
-            ]
-        raise Unmemoizable(f"{'argument' if host else 'result'} of type {type(value).__name__}")
+    def walk(item: object) -> object:
+        return _flatten(item, torch, leaves, host, depth + 1)
 
-    return walk(value, 0)
+    if depth > 16:
+        raise Unmemoizable("nesting")
+    if isinstance(value, torch.Tensor):
+        tensor = cast(Tensor, value)
+        if (
+            type(value) is not torch.Tensor
+            or tensor.is_sparse
+            or (host and str(tensor.device) != "cpu")
+        ):
+            raise Unmemoizable("tensor not a plain host tensor" if host else "tensor kind")
+        if str(tensor.dtype).removeprefix("torch.") not in _DTYPES:
+            raise Unmemoizable(f"dtype {tensor.dtype}")
+        return ["t", leaf(tensor.contiguous())]
+    if isinstance(value, Image.Image):
+        return ["pil", value.mode, list(value.size), leaf(value)]
+    if isinstance(value, np.ndarray):
+        return ["np", value.dtype.str, list(value.shape), leaf(value)]
+    if isinstance(value, enum.Enum):
+        return ["e", _qualname(value), walk(value.value)]
+    if value is None or isinstance(value, (bool, int, str)):
+        return ["v", value]
+    if isinstance(value, float):
+        return ["f", value.hex()]
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return ["b", bytes(value).hex()]
+    if isinstance(value, Asset) and host and value.digest:
+        return ["a", type(value).__name__, value.digest]
+    if isinstance(value, tuple) and hasattr(value, "_fields"):
+        return ["n", _qualname(value), [walk(v) for v in value]]
+    if type(value) in (tuple, list):
+        items = cast(Sequence[object], value)
+        return [type(value).__name__, [walk(v) for v in items]]
+    if type(value) is dict and all(isinstance(k, str) for k in value):
+        return ["dict", [[k, walk(v)] for k, v in value.items()]]
+    if isinstance(value, msgspec.Struct) or dataclasses.is_dataclass(value):
+        fields = (
+            value.__struct_fields__
+            if isinstance(value, msgspec.Struct)
+            else [f.name for f in dataclasses.fields(cast("DataclassInstance", value))]
+        )
+        return ["r", _qualname(value), [[f, walk(getattr(value, f))] for f in fields]]
+    raise Unmemoizable(f"{'argument' if host else 'result'} of type {type(value).__name__}")
 
 
 def _qualname(value: object) -> str:
