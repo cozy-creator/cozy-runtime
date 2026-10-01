@@ -496,6 +496,51 @@ def bind(torch: Any, region: Region, lease: Any) -> None:
     region.bound = address
 
 
+_UNBOUND: dict[int, type] = {}
+
+
+def unbound(torch: Any, tensor: Any, device: Any) -> Any:
+    """The stand-in a weight holds while no plane bytes are bound to it: its shape, dtype and
+    execution device, so code can ask where a component lives (a package placing its inputs
+    beside an encoder's embedding), while any computation on it raises."""
+    kind = _UNBOUND.get(id(torch))
+    if kind is None:
+        kind = _UNBOUND[id(torch)] = _unbound_type(torch)
+    held = kind(tuple(tensor.shape), tensor.dtype, device)
+    if isinstance(tensor, torch.nn.Parameter):
+        return torch.nn.Parameter(held, requires_grad=False)
+    return held
+
+
+def _unbound_type(torch: Any) -> type:
+    aten = torch.ops.aten
+
+    class Unbound(torch.Tensor):  # type: ignore[misc]
+        @staticmethod
+        def __new__(cls, shape: tuple[int, ...], dtype: Any, device: Any) -> Any:
+            return torch.Tensor._make_wrapper_subclass(cls, shape, dtype=dtype, device=device)
+
+        @classmethod
+        def __torch_dispatch__(
+            cls, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
+        ) -> Any:
+            if func in (aten.detach.default, aten.alias.default):
+                return args[0]
+            if func is aten._to_copy.default:
+                held, options = args[0], kwargs or {}
+                return cls(
+                    tuple(held.shape),
+                    options.get("dtype") or held.dtype,
+                    options.get("device") or held.device,
+                )
+            raise RuntimeError(
+                f"{func}: a weight is read while no plane bytes are bound to it (outside its "
+                "block's forward, or after its stage)"
+            )
+
+    return Unbound
+
+
 def unbind(region: Region) -> None:
     for table, name, tensor in region.unbound:
         table[name] = tensor
@@ -1059,11 +1104,15 @@ class PlaneBackend:
                 if key in self.leaves:
                     weight.leaf, weight.replaced, weight.derived_roles = self.leaves[key]
                     region.unbound.extend(
-                        (weight.leaf._buffers, role, tensor)
+                        (weight.leaf._buffers, role, unbound(self.torch, tensor, weights.device))
                         for role, tensor in weight.leaf.roles().items()
                     )
-                region.unbound.extend((table, attr, table[attr]) for table, attr, _ in weight.sites)
+                region.unbound.extend(
+                    (table, attr, unbound(self.torch, table[attr], weights.device))
+                    for table, attr, _ in weight.sites
+                )
                 region.weights.append(weight)
+            unbind(region)
             regions.append(region)
         common = regions[0] if kept[0][0] == 0 else None
         blocks = [region for region in regions if region is not common]
@@ -1724,6 +1773,7 @@ class WeightResidency:
         peaks: dict[int, int] = {}
         per_pixel: list[int] = []
         scale = 2 ** (len(root.config.block_out_channels) - 1)
+        default = int(root.tile_sample_min_size)
 
         def run(z: Any, *args: Any, **kwargs: Any) -> Any:
             pixels = int(z.shape[0]) * int(z.shape[-2]) * int(z.shape[-1]) * scale * scale
@@ -1736,9 +1786,15 @@ class WeightResidency:
                 else "untiled"
             )
             if mode == "tiled":
-                _tile(root, free // max(per_pixel[0], 1), scale)
+                _tile(root, free // max(per_pixel[0], 1), scale, default)
             else:
                 root.disable_tiling()
+                # Activations first: idle weights leave before an untiled decode needs their
+                # room (all of them when this size was never measured), since a decode's
+                # convolutions outside any block hook cannot retry.
+                need = per_pixel[0] * pixels if per_pixel else free + evictable
+                if need > free:
+                    weights.shrink(need - free, self._floor((name,)))
             baseline = accel.allocated(weights.torch, weights.kind)
             accel.reset_peak(weights.torch, weights.kind)
             failed = False
@@ -1756,7 +1812,7 @@ class WeightResidency:
                 peaks[pixels] = max(peaks.get(pixels, 0), free + evictable + 1)
                 mode = "tiled"
                 free, _ = self.room((name,))
-                _tile(root, free // max(per_pixel[0] if per_pixel else 1, 1), scale)
+                _tile(root, free // max(peaks[pixels] // pixels, 1), scale, default)
                 out = decode(z, *args, **kwargs)
             elif mode == "untiled":
                 peak = accel.peak_allocated(weights.torch, weights.kind) - baseline
@@ -1786,6 +1842,14 @@ class WeightResidency:
                 weights.plane.prioritise(component.ws, weights.index, None, priority=idle)
         if failure is not None:
             raise failure
+
+    def _floor(self, names: Sequence[str]) -> int:
+        """The plane bytes `names` cannot run below at their current grain."""
+        return sum(
+            weight_policy.floor(replace(self.components[n].layout, fine=None))
+            for n in names
+            if n in self.components
+        )
 
     def _drop(self, components: Sequence[Component]) -> None:
         weights = self.weights
@@ -1895,9 +1959,10 @@ def _image_vae(root: Any) -> bool:
     )
 
 
-def _tile(root: Any, pixels: int, scale: int) -> None:
-    """Tile an image VAE with the largest square tile whose activations fit `pixels`."""
+def _tile(root: Any, pixels: int, scale: int, default: int) -> None:
+    """Tile an image VAE with the largest square tile, up to its own `default`, whose
+    activations fit `pixels`."""
     side = max(int(pixels**0.5) // 64 * 64, 256)
     root.enable_tiling()
-    root.tile_sample_min_size = min(root.tile_sample_min_size, side)
+    root.tile_sample_min_size = min(default, side)
     root.tile_latent_min_size = root.tile_sample_min_size // scale
