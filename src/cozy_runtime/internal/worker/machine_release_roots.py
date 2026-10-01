@@ -13,9 +13,10 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -101,11 +102,13 @@ class _Prepared:
     placement_set: bytes = b""  # a served root's prepared placement, as its set's exact bytes
     hub: str = ""  # the Hub the root's run came from, as `hub_key` spells it
     model_choices: tuple[pb.ModelChoice, ...] = ()
+    admission: dict[str, float] = field(default_factory=dict)  # ms per step, journaled
 
 
 @dataclass
 class _Job:
     request: bytes
+    began: float = field(default_factory=time.monotonic)
     version: int = 0
     progress: str = "preparing"
     moved: int = 0
@@ -118,6 +121,16 @@ class _Job:
 
 def _key(package: str, release: str) -> str:
     return f"{package}@{release}"
+
+
+@contextmanager
+def _timed(steps: dict[str, float], name: str) -> Iterator[None]:
+    """One admission step's wall time, journaled with the run as `admission_ms`."""
+    began = time.monotonic()
+    try:
+        yield
+    finally:
+        steps[name] = round((time.monotonic() - began) * 1000, 1)
 
 
 class ReleaseRoots:
@@ -169,7 +182,7 @@ class ReleaseRoots:
         if job.error is not None:
             raise job.error
         assert job.result is not None
-        return self._accept(owner, request, job.result)
+        return self._accept(owner, request, job.result, job.began)
 
     def _wait(self, job: _Job, context: ServicerContext) -> None:
         """Until the job finishes or reports news, or the caller goes away."""
@@ -386,10 +399,13 @@ class ReleaseRoots:
         assert worker.machine_calls is not None
         hub = machine_model_resolve.hub_key(worker, root.hub)
         key, captured = self._root(root)
-        installed, edges = self._closure(key, hub, captured)
+        steps: dict[str, float] = {}
+        with _timed(steps, "closure"):
+            installed, edges = self._closure(key, hub, captured)
         if key not in installed:
             self._note(job, f"installing {key}")
-            installed[key] = self._install(self._facts(key, hub))
+            with _timed(steps, "install"):
+                installed[key] = self._install(self._facts(key, hub))
         prepared = installed[key]
         body = package_interface.read_bytes(prepared.interface, "release root")
         section, kind = ("jobs", "job") if root.job else ("entrypoints", "inference entrypoint")
@@ -429,7 +445,8 @@ class ReleaseRoots:
             hub=hub,
             model_choices=tuple(root.models),
         )
-        _, _, _, choices = self._capture(scope)
+        with _timed(steps, "capture"):
+            _, _, _, choices = self._capture(scope)
         selected_root = pb.ReleaseRoot()
         selected_root.CopyFrom(root)
         selected_root.ClearField("models")
@@ -442,21 +459,23 @@ class ReleaseRoots:
             raise WorkspaceRefusal(
                 "model_adapters_require_serving: target a serving child's qualified model slot"
             )
-        models = self._resolve(
-            selected_root,
-            declaration,
-            machine_source_models.credentials(request.source_credentials),
-            lambda stage, done, total: self._note(job, stage, done, total),
-        )
+        with _timed(steps, "resolve"):
+            models = self._resolve(
+                selected_root,
+                declaration,
+                machine_source_models.credentials(request.source_credentials),
+                lambda stage, done, total: self._note(job, stage, done, total),
+            )
         if root.job:
             # A job reads its Models as inputs: land each catalog checkpoint here now.
-            machine_model_defaults.materialize(
-                worker,
-                models,
-                progress=lambda done, total: self._note(
-                    job, "downloading model weights", done, total
-                ),
-            )
+            with _timed(steps, "prepare"):
+                machine_model_defaults.materialize(
+                    worker,
+                    models,
+                    progress=lambda done, total: self._note(
+                        job, "downloading model weights", done, total
+                    ),
+                )
             return _Prepared(
                 key,
                 target,
@@ -467,6 +486,7 @@ class ReleaseRoots:
                 edges,
                 hub=hub,
                 model_choices=scope.model_choices,
+                admission=steps,
             )
         serving = worker.machine_calls.serving
         call = Call(
@@ -485,15 +505,16 @@ class ReleaseRoots:
         )
         serving.observers[call.child_request] = lambda frame: self._progress(job, frame)
         try:
-            ready = serving._prepare(
-                owner,
-                call,
-                target,
-                pb.ChildCallRequest(),
-                model_arguments={},
-                defaults=models,
-                retention_prefix="preparation/",
-            )
+            with _timed(steps, "prepare"):
+                ready = serving._prepare(
+                    owner,
+                    call,
+                    target,
+                    pb.ChildCallRequest(),
+                    model_arguments={},
+                    defaults=models,
+                    retention_prefix="preparation/",
+                )
             ready.access.close()
         finally:
             serving.observers.pop(call.child_request, None)
@@ -513,6 +534,7 @@ class ReleaseRoots:
             placement_set,
             hub,
             scope.model_choices,
+            steps,
         )
 
     def _resolve(
@@ -642,6 +664,7 @@ class ReleaseRoots:
         )
         with worker.control_lock:
             worker.prepared_installations[stored.prepared_key] = stored
+        worker.keep_placement(stored, placement_set)
 
     def _capture(
         self, prepared: _Prepared
@@ -718,7 +741,7 @@ class ReleaseRoots:
         return raw, digest, {key: held for key, held in installed.items() if key in keys}, choices
 
     def _accept(
-        self, owner: str, request: pb.MachineExecutionSubmit, prepared: _Prepared
+        self, owner: str, request: pb.MachineExecutionSubmit, prepared: _Prepared, began: float
     ) -> pb.MachineExecutionReceipt:
         worker, root = self.worker, request.release_root
         executions = worker.executions
@@ -792,27 +815,32 @@ class ReleaseRoots:
             for held in installed.values()
         }
         assert worker.machine_calls is not None
+        steps = prepared.admission
+        with _timed(steps, "builtins"):
+            builtin = worker.machine_calls.builtins.capture()
         preparation = machine_capture.Preparation(
             installations=installations,
             state=base64.b64encode(desired.SerializeToString(deterministic=True)).decode(),
-            runtime_builtin=worker.machine_calls.builtins.capture(),
+            runtime_builtin=builtin,
             hub=prepared.hub,
             account=root.owner or request.account,
             entrypoint=root.entrypoint,
         )
         worker.machine_sources.hold(owner, offer.request_id, request.source_credentials)
-        receipt = worker.submit_execution(
-            request.claim,
-            request.submission_id,
-            capture_digest,
-            offer,
-            expected_execution_workspace_id=request.expected_execution_workspace_id,
-            capture_document=capture,
-            preparation=preparation.encode(),
-            publication_authorization_id=request.publication_authorization_id,
-            arguments=canonical_json.decode(payload) if root.job else None,
-            owner_memo=request.owner_memo,
-        )
+        with _timed(steps, "submit"):
+            receipt = worker.submit_execution(
+                request.claim,
+                request.submission_id,
+                capture_digest,
+                offer,
+                expected_execution_workspace_id=request.expected_execution_workspace_id,
+                capture_document=capture,
+                preparation=preparation.encode(),
+                publication_authorization_id=request.publication_authorization_id,
+                arguments=canonical_json.decode(payload) if root.job else None,
+                owner_memo=request.owner_memo,
+            )
+        steps["total"] = round((time.monotonic() - began) * 1000, 1)
         worker.machine_sources.declare(owner, offer.request_id)
         executions.record(
             owner,
@@ -825,6 +853,7 @@ class ReleaseRoots:
                 "models": [
                     {name: row[name] for name in RECORDED if name in row} for row in prepared.models
                 ],
+                "admission_ms": steps,
             },
         )
         return self._receipt(receipt)
