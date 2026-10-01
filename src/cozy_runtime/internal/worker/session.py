@@ -1108,7 +1108,9 @@ class Worker:
                 workspace.store_root,
                 lambda target: workspace_memo.reclaim_unused(workspace, target_bytes=target),
             )
-        self.resolutions = machine_model_resolve.Resolutions()
+        self.resolutions = machine_model_resolve.Resolutions(
+            machine_model_resolve.supervised(self.root / "resolutions")
+        )
         self.workspace_service = (
             WorkspaceService(
                 self.workspace,

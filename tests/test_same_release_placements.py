@@ -167,6 +167,12 @@ class Machine:
             "device_memory",
             lambda entry, kind: accel.DeviceMemory("measured", 80 * GiB, 80 * GiB),
         )
+        self.root, self.monkeypatch = root, monkeypatch
+        self.boot()
+
+    def boot(self) -> None:
+        """This machine's Runtime over its roots: a second call is a restarted Runtime."""
+        root, monkeypatch = self.root, self.monkeypatch
         base = {
             k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"
         }

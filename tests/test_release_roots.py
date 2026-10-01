@@ -1123,6 +1123,69 @@ def test_a_root_names_an_unpublished_installation_the_machine_holds(
             machine.worker.shutdown()
 
 
+def test_a_captured_roots_model_is_read_once_and_kept_across_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A captured root naming its Model's repository without a lane reads that release's lanes
+    and the lane's checkpoint once. A warm run, and the first run of a restarted Runtime, read
+    nothing: the reads outlive the process. A controller that changes the model names it to
+    `forget` (in any case), and the next run reads it once more."""
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    with tempfile.TemporaryDirectory(prefix="cz-root.", dir="/tmp") as directory:
+        machine = Machine(Path(directory), monkeypatch, "private")
+        machine.running = _Held()
+        raw = tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+        catalog = Catalog(
+            machine.manifest, len(raw), [{"gpu": "H100", "lane": LANE}], interface=machine.interface
+        )
+
+        def run(name: str) -> list[str]:
+            # What the controller sends first whenever the machine answers the root absent.
+            captured = machine.worker.prepare_local_package(
+                pb.PrepareLocalPackageRequest(
+                    operation_id="sync",
+                    package=pb.DevelopmentPackage(
+                        package=PACKAGE,
+                        release=RELEASE,
+                        installation_id=machine.installed.installation_id,
+                    ),
+                    files=[pb.LocalPackageFile(filename="tenant-1.0.0-py3-none-any.whl")],
+                    install_root=str(machine.install_root),
+                )
+            ).installed_package
+            catalog.serve(machine)
+            root = submission(machine, name)
+            root.release_root.ClearField("release")
+            root.release_root.installation_id = captured.installation_id
+            root.release_root.models.add(parameter="model", repository=PACKAGE)
+            catalog.reads.clear()
+            receipt, _ = submit(machine, root)
+            assert receipt.request_id == name
+            return [urlsplit(path).path for path in catalog.reads]
+
+        read = [f"/v1/models/{PACKAGE}", "/v1/models/resolve"]
+        try:
+            assert run("cold") == read
+            assert run("warm") == []
+            machine.worker.shutdown()
+            machine.boot()
+            assert run("restarted") == []
+            machine.worker.resolutions.forget("other/model")
+            assert run("unrelated") == []
+            machine.worker.resolutions.forget(PACKAGE.upper())
+            assert run("changed") == read
+            machine.worker.shutdown()
+            machine.boot()
+            assert run("changed-restarted") == []
+        finally:
+            catalog.close()
+            machine.worker.shutdown()
+
+
 def test_a_roots_download_progress_reaches_its_submitter(
     published: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
