@@ -171,6 +171,7 @@ def test_real_model_pull_joins_across_future_payloads_and_reuses_cpu_binding(
     request = pb.ChildCallRequest(parent_attempt_ordinal=1)
     try:
         first = serving._shared("owner", call, target, request, {}, speculative=True)
+        assert first is not None
         assert started.wait(5), first.exception() if first.done() else "native pull not started"
         if preempt:
             other = Call("other-parent", 0, 1, 1, b"", b"", "other-child", b"", False, b"", "", "")

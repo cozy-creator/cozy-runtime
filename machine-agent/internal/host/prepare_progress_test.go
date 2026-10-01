@@ -47,15 +47,19 @@ func nativeProgressFixture(t *testing.T, python string) (progressFixture, string
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
+	exited := make(chan struct{})
+	var exitErr error
+	go func() {
+		exitErr = cmd.Wait()
+		close(exited)
+	}()
 	t.Cleanup(func() {
 		_ = os.WriteFile(filepath.Join(root, "finish"), nil, 0600)
 		select {
-		case err := <-exited:
-			if err != nil {
+		case <-exited:
+			if exitErr != nil {
 				body, _ := os.ReadFile(log.Name())
-				t.Errorf("Runtime fixture: %v\n%s", err, body)
+				t.Errorf("Runtime fixture: %v\n%s", exitErr, body)
 			}
 		case <-time.After(30 * time.Second):
 			t.Error("test Runtime did not settle its explicit finish")
@@ -72,9 +76,9 @@ func nativeProgressFixture(t *testing.T, python string) (progressFixture, string
 			}
 		}
 		select {
-		case err := <-exited:
+		case <-exited:
 			body, _ := os.ReadFile(log.Name())
-			t.Fatalf("Runtime fixture exited before ready: %v\n%s", err, body)
+			t.Fatalf("Runtime fixture exited before ready: %v\n%s", exitErr, body)
 		default:
 		}
 		time.Sleep(10 * time.Millisecond)
