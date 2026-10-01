@@ -356,14 +356,13 @@ class Calls:
                 self.worker.machine_sources.run(unit, owner, call, request)
                 return False
             self.timing.phase(owner, child, 1, "preparing", parent_attempt=call.parent_ordinal)
-            with self.serving.demand(call):
-                target = machine_child_target.resolve(self.worker, parent, call)
-                self._check_ancestors(owner, parent, target, request.request_canonical_bytes)
-                submitted = (
-                    self.serving.submit(unit, owner, call, target, request)
-                    if target.binding is None
-                    else self._job(owner, parent, call, target, request)
-                )
+            target = machine_child_target.resolve(self.worker, parent, call)
+            self._check_ancestors(owner, parent, target, request.request_canonical_bytes)
+            submitted = (
+                self.serving.submit(unit, owner, call, target, request)
+                if target.binding is None
+                else self._job(owner, parent, call, target, request)
+            )
             if submitted:
                 self.timing.phase(owner, child, 1, "queued", parent_attempt=call.parent_ordinal)
             else:

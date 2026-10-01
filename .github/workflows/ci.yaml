@@ -14,6 +14,7 @@ on:
       - "src/cozy_runtime/internal/worker/machine_model_resolve.py"
       - "src/cozy_runtime/internal/worker/machine_models.py"
       - "src/cozy_runtime/internal/worker/machine_serving.py"
+      - "src/cozy_runtime/internal/worker/machine_release_roots.py"
       - "src/cozy_runtime/internal/worker/machine_adapter_views.py"
       - "src/cozy_runtime/internal/worker/preparations.py"
       - "src/cozy_runtime/internal/fill.py"
@@ -25,6 +26,8 @@ on:
       - "tests/test_machine_materialization.py"
       - "tests/test_machine_model_defaults.py"
       - "tests/test_model_runtime_closure.py"
+      - "tests/test_model_reader.py"
+      - "tests/test_release_roots.py"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/ci.yaml"
@@ -36,6 +39,7 @@ on:
       - "src/cozy_runtime/internal/worker/machine_model_resolve.py"
       - "src/cozy_runtime/internal/worker/machine_models.py"
       - "src/cozy_runtime/internal/worker/machine_serving.py"
+      - "src/cozy_runtime/internal/worker/machine_release_roots.py"
       - "src/cozy_runtime/internal/worker/machine_adapter_views.py"
       - "src/cozy_runtime/internal/worker/preparations.py"
       - "src/cozy_runtime/internal/fill.py"
@@ -47,6 +51,8 @@ on:
       - "tests/test_machine_materialization.py"
       - "tests/test_machine_model_defaults.py"
       - "tests/test_model_runtime_closure.py"
+      - "tests/test_model_reader.py"
+      - "tests/test_release_roots.py"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/ci.yaml"
@@ -67,9 +73,19 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12
       - run: uv sync --locked
-      - run: >-
-          uv run pytest -q tests/test_model_fetch_faults.py tests/test_machine_materialization.py
-          tests/test_model_prefetch_native.py tests/test_machine_model_defaults.py
+      # Delegated like the full suite: preparation tests start real executors in cgroups.
+      - run: |
+          sudo systemd-run --wait --pipe --collect \
+            --unit="cozy-runtime-model-fetch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            --setenv="UV_CACHE_DIR=$UV_CACHE_DIR" \
+            --setenv="UV_PYTHON_INSTALL_DIR=$(uv python dir)" \
+            .venv/bin/python -m pytest -q \
+            tests/test_model_fetch_faults.py tests/test_machine_materialization.py \
+            tests/test_model_prefetch_native.py tests/test_machine_model_defaults.py \
+            tests/test_release_roots.py
   quality:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
