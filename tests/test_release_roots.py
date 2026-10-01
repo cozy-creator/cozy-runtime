@@ -15,7 +15,7 @@ import json
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -1365,23 +1365,28 @@ def test_warm_serving_keeps_ordered_lora_views_and_reuses_the_same_preparation(
     length = base.manifest.length
     catalog = Catalog(base.manifest.digest, length, [], interface=machine.interface)
     catalog.serve(machine)
-    preparations: list[int] = []
-    prepare = package_prepare.prepare_model_placement
+    preparations = 0
 
-    def counted(**kwargs: Any) -> Any:
-        preparations.append(len(kwargs["models"][0].get("adapters", [])))
-        return prepare(**kwargs)
+    def counted[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+        def observe(*args: P.args, **kwargs: P.kwargs) -> R:
+            nonlocal preparations
+            preparations += 1
+            return function(*args, **kwargs)
 
-    monkeypatch.setattr(package_prepare, "prepare_model_placement", counted)
+        return observe
+
+    monkeypatch.setattr(
+        package_prepare, "prepare_model_placement", counted(package_prepare.prepare_model_placement)
+    )
     views: dict[str, str] = {}
     try:
-        for name, stack in (
-            ("baseline", ()),
-            ("stack", ((first, "0.5"), (second, "-0.25"))),
-            ("repeat", ((first, "0.5"), (second, "-0.25"))),
-            ("reverse", ((second, "-0.25"), (first, "0.5"))),
-            ("zero", ((first, "0"), (second, "-0.25"))),
-            ("baseline-after", ()),
+        for name, stack, expected_preparations in (
+            ("baseline", (), 1),
+            ("stack", ((first, "0.5"), (second, "-0.25")), 2),
+            ("repeat", ((first, "0.5"), (second, "-0.25")), 2),
+            ("reverse", ((second, "-0.25"), (first, "0.5")), 3),
+            ("zero", ((first, "0"), (second, "-0.25")), 4),
+            ("baseline-after", (), 4),
         ):
             request = submission(machine, "lora-" + name)
             choice = request.release_root.models.add(
@@ -1411,11 +1416,10 @@ def test_warm_serving_keeps_ordered_lora_views_and_reuses_the_same_preparation(
             ] == [(artifact.manifest.digest, scale) for artifact, scale in stack]
             views[name] = models[slot["components"][0]["model_id"]]["manifest"]["digest"]
             assert (views[name] != base.manifest.digest) == bool(stack)
-            if name == "repeat":
-                assert preparations == [0, 2], "the same adapted binding was prepared again"
+            assert preparations == expected_preparations, f"{name}: unexpected preparation count"
         assert views["repeat"] == views["stack"]
         assert views["reverse"] != views["stack"] and views["zero"] != views["stack"]
         assert views["baseline-after"] == views["baseline"]
-        assert preparations == [0, 2, 2, 2], "baseline or adapted warm preparation was not reused"
+        assert preparations == 4, "baseline or adapted warm preparation was not reused"
     finally:
         catalog.close()
