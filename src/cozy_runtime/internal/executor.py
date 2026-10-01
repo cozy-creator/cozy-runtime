@@ -3746,9 +3746,7 @@ class Executor:
         """Wait for this scope's turn: the plane budget the worker granted, or None to keep the
         current one. A refusal is the scope's failure, with the worker's numbers."""
         with blocked():
-            answer = self._durable(
-                StageEnter(method=method, components=tuple(components)), StageGo
-            )
+            answer = self._durable(StageEnter(method=method, components=tuple(components)), StageGo)
         if answer.ok:
             return answer.budget_bytes if answer.budget_bytes >= 0 else None
         if answer.code == "cancelled":
