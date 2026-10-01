@@ -98,10 +98,11 @@ class Weight:
 
 @dataclass(frozen=True, slots=True)
 class Views:
-    """A region's typed views at one address: the writes that bind them, and each weight's
-    stored parts by role (what decode and derived leaf roles read)."""
+    """A region's typed views at one address: the writes that bind them (destination, the
+    view, and the object written: a Parameter over it, or the view itself), and each
+    weight's stored parts by role (what decode and derived leaf roles read)."""
 
-    writes: list[tuple[dict[str, Any], str, Any]]
+    writes: list[tuple[dict[str, Any], str, Any, Any]]
     parts: list[dict[str, Any]]
 
 
@@ -494,8 +495,23 @@ def bind(torch: Any, region: Region, lease: Any) -> None:
         views = region.views[address] = _views(torch, region, torch.from_dlpack(lease.view()))
     moved = region.bound != address
     if moved:
-        for table, name, tensor in views.writes:
-            table[name] = tensor
+        for i, (table, name, tensor, value) in enumerate(views.writes):
+            want = getattr(table.get(name), "dtype", tensor.dtype)
+            if want != tensor.dtype:
+                # The component was converted (a package's `module.to(dtype)`): honour it.
+                converted = tensor.to(want)
+                parameter = value is not tensor
+                table[name] = (
+                    torch.nn.Parameter(converted, requires_grad=False) if parameter else converted
+                )
+                continue
+            if value is not tensor and (
+                value.dtype != tensor.dtype or value.data_ptr() != tensor.data_ptr()
+            ):
+                # a conversion rewrote the cached Parameter's data: bind a fresh one
+                value = torch.nn.Parameter(tensor, requires_grad=False)
+                views.writes[i] = (table, name, tensor, value)
+            table[name] = value
     if region.transforms and (moved or lease.ring_offset is not None):
         region.derived = _transform(torch, region, views.parts)
     region.bound = address
@@ -517,10 +533,19 @@ def unbound(torch: Any, tensor: Any, device: Any) -> Any:
     return held
 
 
+def _retyped(standin: Any, dtype: Any) -> Any:
+    held = standin.to(dtype)
+    return type(standin).parameter(held) if getattr(standin, "_is_param", False) else held
+
+
 def _unbound_type(torch: Any) -> type:
     aten = torch.ops.aten
 
     class Unbound(torch.Tensor):  # type: ignore[misc]
+        @staticmethod
+        def parameter(held: Any) -> Any:
+            return torch.nn.Parameter(held, requires_grad=False)
+
         @staticmethod
         def __new__(cls, shape: tuple[int, ...], dtype: Any, device: Any) -> Any:
             return torch.Tensor._make_wrapper_subclass(cls, shape, dtype=dtype, device=device)
@@ -547,8 +572,10 @@ def _unbound_type(torch: Any) -> type:
 
 
 def unbind(region: Region) -> None:
-    for table, name, tensor in region.unbound:
-        table[name] = tensor
+    """Put the stand-ins back, keeping a dtype the component was converted to meanwhile."""
+    for table, name, standin in region.unbound:
+        dtype = getattr(table.get(name), "dtype", standin.dtype)
+        table[name] = standin if dtype == standin.dtype else _retyped(standin, dtype)
     region.derived = []
     region.bound = None
 
@@ -577,7 +604,7 @@ def close_cursor(component: Component) -> None:
 
 
 def _views(torch: Any, region: Region, base: Any) -> Views:
-    writes: list[tuple[dict[str, Any], str, Any]] = []
+    writes: list[tuple[dict[str, Any], str, Any, Any]] = []
     parts: list[dict[str, Any]] = []
     for weight in region.weights:
         typed = {
@@ -591,10 +618,10 @@ def _views(torch: Any, region: Region, base: Any) -> Views:
             (tensor,) = typed.values()
             for table, name, parameter in weight.sites:
                 value = torch.nn.Parameter(tensor, requires_grad=False) if parameter else tensor
-                writes.append((table, name, value))
+                writes.append((table, name, tensor, value))
         elif weight.route == "encoded_gemm":
             writes.extend(
-                (weight.leaf._buffers, role, tensor)
+                (weight.leaf._buffers, role, tensor, tensor)
                 for role, tensor in typed.items()
                 if role not in weight.derived_roles
             )
@@ -1594,6 +1621,12 @@ class WeightResidency:
                 self._refine(name)
                 return self._plan(method, local, budget, resume)
             raise self._shortfall(method, exc.needed, exc.available, str(exc)) from None
+        # One block at a time streams with no overlap: regions of at most 16 MiB let the
+        # same budget hold a window of several.
+        crawl = [n for n, r in placed.items() if r.streamed and r.window == 1]
+        if name := next((n for n in crawl if self._refinable(n, method)), ""):
+            self._refine(name)
+            return self._plan(method, local, budget, resume)
         need = sum(r.vram_bytes(components[n].layout) for n, r in placed.items())
         if self.spare and need > budget:
             raise ResidencyRefusal("device_spared", f"{method}() declined: needs {need} B")

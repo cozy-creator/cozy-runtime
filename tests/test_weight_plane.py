@@ -267,6 +267,23 @@ def test_a_stage_entered_once_per_step_keeps_a_resident_set(card: Any) -> None:
 
 
 @on_card
+def test_a_component_converted_with_to_streams_in_that_dtype(card: Any) -> None:
+    """SDXL upcasts its VAE with `module.to(dtype)` while parts of it stream: streamed blocks
+    bind in the converted dtype, exactly as the resident ones compute."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "dtype")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float32)
+    weights.set_budget(1 << 30)
+    model.stack.to(torch.float32)
+    resident = run(model, x)
+    weights.set_budget(tight(model))
+    streamed = run(model, x)
+    assert weights.facts().streamed["stack"].resident_blocks < BLOCKS
+    assert all(s.dtype == torch.float32 for s in streamed)
+    assert all(torch.equal(a, b) for a, b in zip(resident, streamed, strict=True))
+
+
+@on_card
 def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "oom")
