@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, runtime_checkable
 
 from cozy_runtime.author import _codec
+from cozy_runtime.author._activity import work_clock
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -1187,14 +1188,14 @@ class Telemetry(_Bound):
         # The mark starts HERE, at callback construction, so the FIRST step has an interval
         # too. Starting it at the first call would silently drop step 0 from the count — and
         # on a one-step request that is the whole measurement.
-        attempt._step_mark = time.perf_counter()
+        attempt._step_mark = work_clock()
         capture = _capture_clock.get()
         if capture is not None:
             capture.schedule(total)
 
         def on_step(step: int) -> None:
             self._ctx.raise_if_cancelled()
-            now = time.perf_counter()
+            now = work_clock()
             mark = attempt._step_mark
             if mark and name is not None:
                 attempt.attribution.step(name, (now - mark) * 1000)
@@ -1344,13 +1345,13 @@ class Telemetry(_Bound):
                 stage,
                 overall_fraction=self._overall(bounds[0]) if bounds is not None else None,
             )
-        start = time.perf_counter()
+        start = work_clock()
         succeeded = False
         try:
             yield
             succeeded = True
         finally:
-            elapsed = (time.perf_counter() - start) * 1000
+            elapsed = (work_clock() - start) * 1000
             if stage is not None:
                 self._attempt.attribution.stage(stage, elapsed)
                 self._attempt.emit("stage", stage, round(elapsed, 3))

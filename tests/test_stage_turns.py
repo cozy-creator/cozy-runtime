@@ -22,7 +22,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.author._activity import observing  # noqa: E402
+from cozy_runtime.author._activity import observing, work_clock  # noqa: E402
 from cozy_runtime.author._executor_requests import (  # noqa: E402
     Answer,
     Handler,
@@ -91,8 +91,9 @@ class Seamed:
                 residency.release("run", ("stack",))
 
     def close(self) -> None:
-        self.worker.sock.close()
+        self.worker.sock.shutdown(socket.SHUT_RDWR)  # the answering thread reads its end
         self.answering.join(10)
+        self.worker.sock.close()
 
 
 def tenant(machine: Machine, slot: str, request: str) -> tuple[Handler, AttemptRecord]:
@@ -186,9 +187,13 @@ def test_a_scope_waiting_for_its_turn_is_not_counted_as_execution(
     active: list[bool] = []
     x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(7)).half()
 
+    clocks: list[tuple[float, float]] = []  # the scope's wall, and what its timers read
+
     def call() -> None:
         with observing(lambda _sequence, on, _known, _finished: active.append(on)):
+            wall, work = time.perf_counter(), work_clock()
             executor.scope(x)
+            clocks.append((time.perf_counter() - wall, work_clock() - work))
 
     running = threading.Thread(target=call)
     running.start()
@@ -197,10 +202,14 @@ def test_a_scope_waiting_for_its_turn_is_not_counted_as_execution(
         while not worker.stages.view()["demands"]["B#1"]["asking"]:
             assert time.monotonic() < bound
             time.sleep(0.01)
+        seen = time.perf_counter()
         assert active == [True, False], "the wait behind A is not B's work"
+        held = time.perf_counter() - seen
         worker.stages.release("A#1", ok=True)
         running.join(30)
         assert active == [True, False, True, False]
+        ((wall, work),) = clocks
+        assert wall - work >= held, "stage and step timers leave the wait out too"
     finally:
         executor.close()
 
