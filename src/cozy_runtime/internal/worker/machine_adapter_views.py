@@ -42,6 +42,7 @@ def compose(
     adapters: Sequence[Adapter],
     *,
     check: Callable[[], None],
+    cancellation: machine_model_defaults.Cancellation | None = None,
     native_base: bool = False,
 ) -> dict[str, Json]:
     """Keep the original base reference and return one ordinary composed component view.
@@ -59,7 +60,7 @@ def compose(
     if not native_base:
         closure.insert(0, dict(base))
     check()
-    machine_model_defaults.materialize(worker, closure)
+    machine_model_defaults.materialize(worker, closure, cancellation=cancellation)
     identity = (
         "sha256:"
         + hashlib.sha256(

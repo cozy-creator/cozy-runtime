@@ -139,6 +139,7 @@ def apply(
     credentials: Mapping[str, str],
     note: machine_source_models.Note,
     check: Callable[[], None],
+    cancellation: machine_model_defaults.Cancellation | None = None,
     native_base: bool = False,
 ) -> dict[str, Json]:
     if not choice.adapters:
@@ -176,7 +177,7 @@ def apply(
         )
     note("preparing model adapters", 0, 0)
     return machine_adapter_views.compose(
-        worker, base, adapters, check=check, native_base=native_base
+        worker, base, adapters, check=check, cancellation=cancellation, native_base=native_base
     )
 
 

@@ -473,8 +473,10 @@ def materialize(
         for future in landing:
             future.result()
     except facade.errors.Refusal as error:
+        if cancellation is not None and cancellation.cancelled:
+            raise WorkspaceRefusal("model preparation canceled") from error
         raise WorkspaceRefusal(
-            "captured Model default materialization refused: " + str(error.code)
+            f"captured Model default materialization refused: {error}"
         ) from error
 
 

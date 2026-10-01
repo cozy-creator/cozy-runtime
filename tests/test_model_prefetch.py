@@ -215,7 +215,7 @@ def test_last_interest_cancels_native_work_and_activity_lasts_until_it_stops() -
     worker = idle_worker(queue)
     try:
         first = queue.request(
-            "B", "parent-one", transfer, speculative=True, cancel=native_cancel.set
+            "B", "parent-one", transfer, speculative=True, cancel=lambda _: native_cancel.set()
         )
         queue.request("B", "parent-two", transfer, speculative=False)
         assert started.wait(5) and activity.active_work(worker)
@@ -304,7 +304,9 @@ def test_running_hint_yields_and_promoted_demand_keeps_its_shared_future() -> No
         return "verified bytes retained across pause"
 
     try:
-        shared = queue.request("next", "hint-parent", prepare, speculative=True, cancel=cancel.set)
+        shared = queue.request(
+            "next", "hint-parent", prepare, speculative=True, cancel=lambda _: cancel.set()
+        )
         assert started.wait(5)
         with queue.demand("real-parent"):
             assert cancel.is_set() and shared is not None and not shared.done()
@@ -334,7 +336,9 @@ def test_another_demand_never_cancels_preparation_with_a_real_interest() -> None
         return "shared"
 
     try:
-        hint = queue.request("same", "hint", prepare, speculative=True, cancel=canceled.set)
+        hint = queue.request(
+            "same", "hint", prepare, speculative=True, cancel=lambda _: canceled.set()
+        )
         assert started.wait(5)
         actual = queue.request("same", "actual", prepare, speculative=False)
         assert actual is hint
@@ -397,7 +401,9 @@ def test_abandoning_a_paused_hint_does_not_restart_it() -> None:
         raise InterruptedError("no remaining consumers")
 
     try:
-        hint = queue.request("next", "hint", prepare, speculative=True, cancel=cancel.set)
+        hint = queue.request(
+            "next", "hint", prepare, speculative=True, cancel=lambda _: cancel.set()
+        )
         assert started.wait(5)
         with queue.demand("actual"):
             assert cancel.is_set()
