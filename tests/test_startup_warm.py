@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -58,7 +59,11 @@ from test_end_to_end import NO_EXECUTOR
 from test_gpu_scheduler import MARCO, Machine
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
-pytestmark = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+NO_TORCH = importlib.util.find_spec("torch") is None
+pytestmark = [
+    pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or ""),
+    pytest.mark.skipif(NO_TORCH, reason="model-bearing executor imports require Torch"),
+]
 
 OWNER = "owner"
 INSTALLATION = "release-startup-warm-fixture"
