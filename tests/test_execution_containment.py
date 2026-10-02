@@ -399,12 +399,36 @@ def test_started_failure_ends_failed_never_retried(
         os.kill(m.worker.engine.live[leaf].executor_pid, signal.SIGKILL)
         state, ordinal, body = m.settle(leaf)
         assert (state, ordinal) == ("failed", 1), body
-        assert body.execution_started and body.safe_message
+        assert body.execution_started
+        assert "the executor was killed by SIGKILL during 'run_job'" in body.safe_message
         state, ordinal, body = m.settle("root")
         assert (state, ordinal, body.status) == ("failed", 1, pb.OUTCOME_STATUS_FAILED), body
         assert m.worker.phase != pb.WorkerPhase.WORKER_PHASE_FAILED
         # Never run again: the leaf entered its author code exactly once.
         assert gate.with_suffix(".entered").read_text() == "x"
+        m.idle()
+
+
+def test_an_executor_killed_by_a_signal_is_named_and_the_worker_serves_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with machine(monkeypatch) as m:
+        gate = tmp_path / "never"
+        m.submit("root", segments=1, gate=str(gate))
+        m.wait(lambda: gate.with_suffix(".entered").exists())
+        (leaf,) = m.children("root")
+        # What a read fault on a mapped weight page does to the process that took it.
+        os.kill(m.worker.engine.live[leaf].executor_pid, signal.SIGBUS)
+        state, _, body = m.settle(leaf)
+        assert state == "failed", body
+        assert body.safe_message == (
+            "executor invalidated: the executor was killed by SIGBUS during 'run_job': a read "
+            "fault on mapped weights (a disk read error, or a store object changed under its "
+            "mapping)"
+        )
+        assert m.settle("root")[0] == "failed"
+        m.submit("after", segments=1)
+        assert m.settle("after")[0] == "succeeded"
         m.idle()
 
 

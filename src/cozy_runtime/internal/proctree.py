@@ -1225,6 +1225,31 @@ def reap_child(process: ProcessIdentity) -> int | None:
     return status if pid else None
 
 
+def dying(process: ProcessIdentity) -> bool:
+    """Whether this birth has let go of its memory. The kernel does that first, then closes
+    the process's descriptors, then reports its exit: such a process will exit."""
+    try:
+        return same_process(process) and not Path(f"/proc/{process.pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+
+
+def peek_child_exit(process: ProcessIdentity) -> int | None:
+    """One exact child zombie's wait status, read WITHOUT reaping: its PID stays pinned."""
+    if process_state(process) != "Z":
+        return None
+    try:
+        info = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    except ChildProcessError:
+        return None
+    if info is None:
+        return None
+    # wait(2)'s encoding, so this reads exactly like the status `reap_child` returns later.
+    if info.si_code == os.CLD_EXITED:
+        return info.si_status << 8
+    return info.si_status | (0x80 if info.si_code == os.CLD_DUMPED else 0)
+
+
 def progress_burn(pid: int, tid: int = 0) -> int:
     """The progress meter: CPU nanoseconds PLUS every byte moved — read from and written to
     storage, and read from or written through any descriptor (`rchar`/`wchar`, which is how
