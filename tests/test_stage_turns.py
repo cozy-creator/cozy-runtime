@@ -38,7 +38,7 @@ from cozy_runtime.internal.executor_replies import PlaneFacts  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.stages import StageKind, StageSample  # noqa: E402
 from cozy_runtime.internal.weights import Weights  # noqa: E402
-from cozy_runtime.internal.worker.attempts import AttemptRecord  # noqa: E402
+from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptRefusal  # noqa: E402
 from cozy_runtime.internal.worker.stage_scheduler import Grant, Want  # noqa: E402
 from test_gpu_scheduler import VIRTUAL, GiB, Machine, driverless  # noqa: E402
 from test_weight_plane import HIDDEN, Stack, load, write_checkpoint  # noqa: E402
@@ -279,6 +279,45 @@ def test_a_device_start_waits_for_room_until_the_call_in_flight_is_past_its_stag
     free["bytes"] = GiB  # as the driver reads once A's weights are unmapped
     starting.join(30)
     assert started == [GiB] and "tenant-b" not in worker.memory.wanted
+
+
+def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 2609: Anima's load ran out of device memory beside a running SDXL and its request
+    was refused without ever starting. For an attempt that takes stage turns such a shortfall
+    is the room the call in flight holds: the worker waits until that call is past its stages
+    and loads again; the request is refused only when nobody was in flight to wait for."""
+    worker = machine.worker
+    worker.stages.open_root("X", 1)
+    worker.stages.want("X#1", Want(root="X", template=("inst-x", "b"), entrypoint="generate"))
+    kind = worker.stages.kind("X#1", "denoise", ("unet",))
+    assert worker.stages.enter("X#1", kind, lambda: False) is not None  # X computes
+    _, attempt = tenant(machine, "tenant-b", "B")
+    attempt.stage_turns = True
+    loads: list[bool] = []  # each load: whether X was still in flight
+
+    def load(_attempt: AttemptRecord) -> None:
+        loads.append(bool(worker.stages.view()["demands"].get("X#1")))
+        if len(loads) == 1:
+            raise AttemptRefusal("device_out_of_memory", "CUDA out of memory")
+
+    monkeypatch.setattr(worker, "_ensure_once", load)
+    monkeypatch.setattr(worker, "_rebuild_lane", lambda lane, slot: None)
+    loading = threading.Thread(target=worker._ensure_construction, args=(attempt,), daemon=True)
+    loading.start()
+    bound = time.monotonic() + 30  # a hang bound on a loaded box, not a budget
+    while not loads:
+        assert time.monotonic() < bound
+        time.sleep(0.01)
+    assert loading.is_alive(), "it waits for the call in flight, and refuses nothing"
+    worker.stages.release("X#1")
+    loading.join(30)
+    assert loads == [True, False], "loaded again once X was past"
+    # Alone on the GPU the same shortfall is the request's own: refused, with its reason.
+    loads.clear()
+    with pytest.raises(AttemptRefusal, match="CUDA out of memory"):
+        worker._ensure_construction(attempt)
 
 
 def test_a_scope_waiting_for_its_turn_is_not_counted_as_execution(
