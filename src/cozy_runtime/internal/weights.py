@@ -232,6 +232,9 @@ class Weights:
         #: one GPU of a group: a block's forward holds collectives the other GPUs are already
         #: in, so it can never run again; its ops recover one by one instead
         self.grouped = False
+        #: the GPUs of its group: each pins its own weights, so each takes this share of a
+        #: host budget the Worker states for the whole group
+        self.world = 1
         #: blocks in their forward now (their leases pin their own weights)
         self.running = 0
         #: a group's stage whose activations are not measured yet runs its first pass at the
@@ -432,7 +435,7 @@ class Weights:
             return
         if self.pinned < 0:
             total = sum(c.ws.nbytes for c in self.components.values())
-            self._pin(min(total, max(_host_available(), 0) // 2))
+            self._pin(min(total, max(_host_available(), 0) // 2 // self.world))
         self._fill(component)
 
     def _bind_host(self, component: Component) -> None:

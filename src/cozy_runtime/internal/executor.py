@@ -1958,6 +1958,7 @@ class Executor:
                 # One GPU of a group: its blocks hold the group's collectives, so they
                 # recover from an out-of-memory op by op, never by running a block again.
                 host.weights.grouped = self.world > 1
+                host.weights.world = self.world
                 if self.rank == 0:
                     host.weights.cell = host._budget_cell()
             except plane.Unavailable as exc:
@@ -3967,7 +3968,9 @@ class Executor:
             if weights is None:
                 return 0
             self._unpark()  # a parked stage's holds would make a cut unreleasable
-            return weights.set_budget(command.vram_bytes, command.pinned_bytes)
+            # The pinned budget is the group's: every GPU pins its own weights in host memory.
+            pinned = command.pinned_bytes // self.world if command.pinned_bytes >= 0 else -1
+            return weights.set_budget(command.vram_bytes, pinned)
 
         freed, refused = self._followers(self._plane_ranks(), command, "budget", own)
         if refused:

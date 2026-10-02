@@ -320,6 +320,8 @@ def test_the_plane_budget_reaches_the_followers_that_answer_it(
         group.dial_back(seal_snapshot(env))
         assert [plane.CAPABILITY in f.memory for f in group.followers] == [not before_plane]
         assert leader.budget(Budget(vram_bytes=-1, pinned_bytes=1 << 20))["ok"]
+        # every GPU pins its own weights: each takes its share of the group's host budget
+        assert leader.weights.pinned == 1 << 19
         assert leader.prefetch(Prefetch(construction="parallel-test"))["ok"]
         assert not group.broken
     finally:
