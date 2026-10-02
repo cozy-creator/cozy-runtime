@@ -485,6 +485,11 @@ def materialize(
             return
         except facade.errors.Refusal:
             pass
+        if not row.public_origin:
+            raise WorkspaceRefusal(
+                f"model_access_absent: {row.repository}@{manifest.digest} is not held here, "
+                "and this machine is registered at no Hub the run names to take it at"
+            )
         # TensorFS owns the fetch: one cancellable flight per manifest across processes, disk
         # admission that never evicts this preparation's own models, the Hub CA.
         say = (lambda text: waiting(f"{row.repository}: {text}")) if waiting else None

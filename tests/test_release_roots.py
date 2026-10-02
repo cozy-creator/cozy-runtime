@@ -49,6 +49,7 @@ from cozy_runtime.internal.worker.workspace_rpc import WorkspaceRPC
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_diffusers_upload_configs import PROFILE, _registry, _repository
+from test_model_runtime_closure import _ASSET, _HEADER, _ref
 from test_same_release_placements import (
     LANE,
     LOCKED,
@@ -88,11 +89,36 @@ class Catalog:
         self.private = False
         self.grant = ("worker", "token")  # the machine's registration at this Hub
         self.presented: list[tuple[str, str, str]] = []
+        self.closures: list[str] = []  # each checkpoint TensorFS asked this Hub to name
         catalog = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_: Any) -> None:
                 pass
+
+            def do_POST(self) -> None:
+                asked = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                assert self.path == "/v1/tensorfs/closure", self.path  # nothing is presigned
+                catalog.closures.append(asked["ref"])
+                raw = json.dumps(
+                    {
+                        "complete": True,
+                        "lane": "",
+                        "release": "",
+                        "model": asked["ref"].partition("@")[0],
+                        "manifest": {"sha256": manifest.removeprefix("sha256:"), "length": length},
+                        "objects": sorted(
+                            (_ref(_HEADER), _ref(_ASSET)), key=lambda row: row["sha256"]
+                        ),
+                        "presign_max_digests": 10,
+                        "scope": "runtime",
+                        "server_time_unix": int(time.time()),
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
 
             def do_GET(self) -> None:
                 catalog.reads.append(self.path)
@@ -1245,6 +1271,42 @@ def test_the_owners_unpublished_checkpoint_resolves_with_the_worker_capability(
         with pytest.raises(Refused, match=r"catalog answered 401 worker\.ended"):
             submit(machine, submission(machine, "ended"))
         assert catalog.presented == [("/v1/models/resolve", "worker", "ended")], catalog.presented
+    finally:
+        catalog.close()
+
+
+def test_a_pinned_checkpoint_held_without_its_repository_is_taken_at_the_runs_hub(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The machine that uploaded a checkpoint holds its manifest and bytes but no custody of
+    the repository it published into. A run pinning that checkpoint reads no catalog and
+    takes custody at the run's Hub with one closure read: no download step, no byte moved."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    store = tensorfs.Store.open(str(machine.store_root))
+    length = len(store.manifest(machine.manifest)["manifest"])
+    catalog = Catalog(machine.manifest, length, [], interface=machine.interface)
+    catalog.serve(machine)
+    uploaded = "cozytest/uploaded"
+    with pytest.raises(tensorfs.errors.Refusal):
+        store.verify_checkpoint_source(uploaded, machine.manifest, length)
+    request = submission(machine, "pinned")
+    request.release_root.models.append(
+        pb.ModelChoice(
+            parameter="model",
+            repository=uploaded,
+            manifest=pb.Ref(digest=documents.raw(machine.manifest)),
+        )
+    )
+    try:
+        assert submit(machine, request)[0].request_id == "pinned"
+        assert catalog.closures == [uploaded + "@" + machine.manifest]
+        assert not any("/v1/models/" in path for path in catalog.reads), catalog.reads
+        store.verify_checkpoint_source(uploaded, machine.manifest, length)
     finally:
         catalog.close()
 
