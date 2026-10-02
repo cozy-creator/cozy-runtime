@@ -1,0 +1,1 @@
+A run that pins a checkpoint whose manifest this machine holds without its repository's custody (the pod that just uploaded it) takes that custody at the run's Hub with one closure read. It was refused `SOURCE_NOT_ALLOWED: source URL is empty` until `cozy model download` ran first. A machine registered at no Hub the run names refuses `model_access_absent`.

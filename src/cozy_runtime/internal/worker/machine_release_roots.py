@@ -586,12 +586,15 @@ class ReleaseRoots:
             for model, parameter in zip(slots, parameters, strict=True)
             if parameter not in sourced and not (parameter in pins and pins[parameter]["length"])
         ]
-        # Pinned and sourced slots read nothing; an open one reads the run's Hub.
-        catalog = (
-            machine_model_resolve.own(self.worker, root.package, root.hub)
-            if open_slots
-            else machine_model_resolve.Catalog("")
-        )
+        # Pinned and sourced slots read no catalog; an open one reads the run's Hub. A pinned
+        # checkpoint held without its repository's custody is still taken at that Hub.
+        if open_slots:
+            catalog = machine_model_resolve.own(self.worker, root.package, root.hub)
+        else:
+            here = machine_model_resolve.registration(
+                self.worker, machine_model_resolve.hub_key(self.worker, root.hub)
+            )
+            catalog = machine_model_resolve.Catalog("" if here is None else here.origin)
         fits = machine_model_defaults.catalog_fits(machine_model_defaults.fitter(self.worker))
         laddered = [
             model

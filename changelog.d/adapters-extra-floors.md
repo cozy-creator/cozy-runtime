@@ -1,0 +1,1 @@
+`cozy-runtime[adapters]` now floors `transformers>=5.16.1` and `tokenizers>=0.23.1`. Without them a package depending on the extra resolved, since huggingface-hub 2.1.1, to transformers 4.12.2 and a tokenizers with no wheel, and its install failed in a source build.

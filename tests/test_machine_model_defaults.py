@@ -688,6 +688,12 @@ def test_a_private_checkpoint_is_pulled_with_the_worker_capability_at_its_own_hu
                 materialize(name, own, authority)
             presented = ("", "") if authority is None else ("worker-1", "e" * 43)
             assert own_seen == [("/v1/tensorfs/closure", *presented)], own_seen
+
+        # A row naming no Hub cannot be taken anywhere: refused as that, with nothing asked.
+        own_seen.clear()
+        with pytest.raises(WorkspaceRefusal, match="model_access_absent: fidika/private@sha256:"):
+            materialize("unnamed", "", grant)
+        assert own_seen == []
     finally:
         for server in servers:
             server.shutdown()
