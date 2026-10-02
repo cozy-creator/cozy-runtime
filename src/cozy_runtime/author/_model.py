@@ -150,7 +150,7 @@ EXCLUDED_KEYWORDS: Mapping[str, str] = {
 _RUNTIME_MEMBERS = frozenset(
     {
         "load",
-        "warm",  # reserved: packages built before 0.18.101 define one; nothing calls it
+        "warm",  # reserved: packages built for an older Runtime define one; nothing calls it
         "unload",
         "for_request",
         "for_test",

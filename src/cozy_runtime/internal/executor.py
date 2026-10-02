@@ -397,7 +397,7 @@ class _CompositeResidency:
         }
 
 
-#: Model classes that still define `warm` (packages built before 0.18.101), noted once each.
+#: Model classes that still define `warm` (packages built for an older Runtime), noted once each.
 _WARM_NOTED: set[type] = set()
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm

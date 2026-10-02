@@ -294,7 +294,7 @@ class Warmed(Model[Pipeline]):
 
 
 def test_warm_stays_a_reserved_member_and_not_a_scope() -> None:
-    """Packages built before 0.18.101 define `warm`: it is no public method of theirs, and
+    """Packages built for an older Runtime define `warm`: it is no public method of theirs, and
     `@uses_components` still refuses it, so their interfaces describe as they did."""
     with pytest.raises(ConformanceError) as refused:
 
