@@ -283,6 +283,11 @@ class AttemptRefusal(Exception):
         self.origin = origin
 
 
+class DeviceExhausted(AttemptRefusal):
+    """Every idle byte of the GPU was given and nothing is ahead of the attempt, and it still
+    does not fit: a FAILED terminal naming what did not fit, never a refusal for size."""
+
+
 @dataclass(frozen=True, slots=True)
 class JobModel:
     """One descriptor parameter joined to one held TensorFS Manifest for this attempt."""
@@ -753,6 +758,15 @@ class AttemptEngine:
             origin,
             f"{code}: {detail}",
         )
+
+    def end_held(self, attempt: AttemptRecord, exc: AttemptRefusal) -> pb.AttemptOutcome:
+        """The terminal of a held attempt stopped before it ran: FAILED when the GPU could not
+        hold it (`DeviceExhausted`), else REFUSED."""
+        if isinstance(exc, DeviceExhausted):
+            return self.outcome(
+                attempt, STATUS.OUTCOME_STATUS_FAILED, exc.cause, exc.origin, str(exc)
+            )
+        return self.refuse_held(attempt, exc.code, exc.detail, exc.cause, exc.origin)
 
     # ------------------------------------------------------------------ prepare/accept
 

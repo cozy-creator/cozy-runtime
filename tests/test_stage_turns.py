@@ -32,13 +32,19 @@ from cozy_runtime.author._executor_requests import (  # noqa: E402
     StageGo,
     respond,
 )
-from cozy_runtime.internal import accel, plane  # noqa: E402
+from cozy_runtime.internal import accel, plane, weight_policy  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
+from cozy_runtime.internal.executor_replies import PlaneFacts  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.stages import StageKind, StageSample  # noqa: E402
 from cozy_runtime.internal.weights import Weights  # noqa: E402
-from cozy_runtime.internal.worker.attempts import AttemptRecord  # noqa: E402
+from cozy_runtime.internal.worker.attempts import (  # noqa: E402
+    AttemptRecord,
+    AttemptRefusal,
+    DeviceExhausted,
+)
 from cozy_runtime.internal.worker.stage_scheduler import Grant, Want  # noqa: E402
+from cozy_runtime.protocol import worker_pb2 as pb  # noqa: E402
 from test_gpu_scheduler import VIRTUAL, GiB, Machine, driverless  # noqa: E402
 from test_weight_plane import HIDDEN, Stack, load, write_checkpoint  # noqa: E402
 
@@ -218,6 +224,160 @@ def test_a_nested_scope_neither_ends_the_turn_nor_unmaps_the_outer_scopes_weight
     handler(StageExit(method="sample_turbo", components=("base",), yielded=True))
     waiting.join(30)
     assert granted == [Grant((0,), True)]
+
+
+def _driver(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """The GPU's free bytes as the driver reports them now, for the test to move."""
+    free = {"bytes": 80 * GiB}
+    monkeypatch.setattr(
+        accel,
+        "device_memory",
+        lambda entry, kind: accel.DeviceMemory("measured", free["bytes"], 80 * GiB),
+    )
+    return free
+
+
+def test_a_device_start_waits_for_room_until_the_call_in_flight_is_past_its_stages(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs 2600/2601: SDXL filled a 6 GiB pool, the Anima executor prepared beside it could
+    not create its CUDA context, and the running SDXL died. A new device context now starts
+    only when the driver shows room for it. With a call in flight on a full GPU it waits until
+    that call is past its stages, not for a clock, and takes nothing from it meanwhile."""
+    free = _driver(monkeypatch)
+    worker = machine.worker
+    worker._turning["inst-a"] = True
+    kind = StageKind("inst-a/generate", "denoise", ("unet",))
+    worker.stages.book.record("inst-a/generate", "c", [StageSample(kind=kind, wall_ns=10**6)] * 2)
+    worker.stages.open_root("A", 1)
+    worker.stages.want(
+        "A#1", Want(root="A", template=("inst-a", "b"), entrypoint="generate", cell="c")
+    )
+    handler, _ = tenant(machine, "tenant-a", "A")
+    lane = worker.lanes.by_id["lane-0"]
+    mib = 1 << 20
+    row = lane.row("tenant-a")
+    row.model_bearing, row.ledger.plane = True, PlaneFacts(context_bytes=180 * mib)
+    assert worker.memory.context_need(lane) == {0: 360 * mib + weight_policy.MARGIN}
+
+    def step() -> None:
+        assert handler(StageEnter(method="denoise", components=("unet",))).ok
+        handler(StageExit(method="denoise", components=("unet",)))
+
+    assert handler(StageEnter(method="denoise", components=("unet",))).ok  # A computes
+    free["bytes"] = 10 * mib
+    started: list[int] = []
+
+    def start() -> None:
+        with worker._starting(lane, "tenant-b"):
+            started.append(free["bytes"])
+
+    starting = threading.Thread(target=start, daemon=True)
+    starting.start()
+    bound = time.monotonic() + 30  # a hang bound on a loaded box, not a budget
+    while "tenant-b" not in worker.memory.wanted:
+        assert time.monotonic() < bound
+        time.sleep(0.01)
+    handler(StageExit(method="denoise", components=("unet",)))
+    assert not started, "between A's stages: A is still in flight, and the GPU is still full"
+    step()  # A's last stage: past it, A's tenant is idle
+    free["bytes"] = GiB  # as the driver reads once A's weights are unmapped
+    starting.join(30)
+    assert started == [GiB] and "tenant-b" not in worker.memory.wanted
+
+
+def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs 2609 and 2628: Anima's first load ran out of device memory beside SDXL, and its
+    request was refused without ever starting; the same request a minute later ran. Nothing
+    of it had run, so the worker loads again: once every call of another model ahead of it
+    has left the GPU, or when the shortfall is one it had not met (its executor measured what
+    it lacked). The same shortfall twice with nobody ahead of it is the request's own."""
+    worker = machine.worker
+    worker._turning["inst-b"] = True
+    worker.stages.open_root("X", 1)
+    worker.stages.open_root("B", 2)
+    worker.stages.want("X#1", Want(root="X", template=("inst-x", "b"), entrypoint="generate"))
+    worker.stages.want("B#1", Want(root="B", template=("inst-b", "b"), entrypoint="generate"))
+    kind = worker.stages.kind("X#1", "denoise", ("unet",))
+    assert worker.stages.enter("X#1", kind, lambda: False) is not None  # X computes
+    _, attempt = tenant(machine, "tenant-b", "B")
+    attempt.stage_turns = True
+    loads: list[bool] = []  # each load: whether X was still in flight
+
+    def load(_attempt: AttemptRecord) -> None:
+        loads.append(bool(worker.stages.view()["demands"].get("X#1")))
+        if len(loads) == 1:
+            raise AttemptRefusal(
+                "device_out_of_memory",
+                "CUDA out of memory",
+                cause=pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+            )
+
+    monkeypatch.setattr(worker, "_ensure_once", load)
+    monkeypatch.setattr(worker, "_rebuild_lane", lambda lane, slot: None)
+    unmapped: list[str] = []
+    monkeypatch.setattr(worker.memory, "unmap", lambda tenant, why: unmapped.append(tenant))
+    loading = threading.Thread(target=worker._ensure_construction, args=(attempt,), daemon=True)
+    loading.start()
+    bound = time.monotonic() + 30  # a hang bound on a loaded box, not a budget
+    while not loads:
+        assert time.monotonic() < bound
+        time.sleep(0.01)
+    assert loading.is_alive(), "it waits for the call ahead of it, and refuses nothing"
+    worker.stages.exit("X#1", StageSample(kind=kind, wall_ns=1))
+    assert loading.is_alive(), "past its stages is not enough: its attempt's tail still runs"
+    worker.stages.release("X#1")
+    loading.join(30)
+    assert loads == [True, False], "loaded again once X was past"
+    assert unmapped == ["tenant-b"], "what the refused load left mapped is unmapped first"
+    # Alone on the GPU: a new shortfall is tried again (the executor measured what it
+    # lacked); the same one twice is the request's own, refused with its reason.
+    shortfalls = iter(["the decode ran out of memory", "a block ran out of memory"])
+    tries: list[str] = []
+
+    def short(_attempt: AttemptRecord) -> None:
+        tries.append(next(shortfalls, "a block ran out of memory"))
+        raise AttemptRefusal(
+            "device_shortfall", tries[-1], cause=pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+        )
+
+    monkeypatch.setattr(worker, "_ensure_once", short)
+    evicted: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        worker.memory,
+        "make_room",
+        lambda lane, slot, need, why, contexts=False: evicted.append((slot, contexts)) or {},
+    )
+    with pytest.raises(DeviceExhausted, match="a block ran out of memory"):
+        worker._ensure_construction(attempt)
+    assert evicted == [("tenant-b", True)] * 2, "idle weights and idle contexts go before each try"
+    statuses: list[int] = []
+    monkeypatch.setattr(
+        worker.engine, "outcome", lambda attempt, status, *rest: statuses.append(status)
+    )
+    worker.engine.end_held(
+        attempt, DeviceExhausted("device_shortfall", "x", cause=pb.CAUSE_CODE_NO_CAPACITY)
+    )
+    worker.engine.end_held(
+        attempt, AttemptRefusal("other", "x", cause=pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE)
+    )
+    assert statuses == [pb.OUTCOME_STATUS_FAILED, pb.OUTCOME_STATUS_REFUSED], (
+        "never REFUSED for size"
+    )
+    assert tries == [
+        "the decode ran out of memory",
+        "a block ran out of memory",
+        "a block ran out of memory",
+    ]
+    # An attempt holding a whole turn (an older executor, a group) never waits for others while
+    # it holds the GPU, and is never refused for size either.
+    attempt.stage_turns, tries[:] = False, []
+    shortfalls = iter(["a block ran out of memory"])
+    with pytest.raises(DeviceExhausted, match="every idle byte"):
+        worker._ensure_construction(attempt)
+    assert tries == ["a block ran out of memory", "a block ran out of memory"]
 
 
 def test_a_scope_waiting_for_its_turn_is_not_counted_as_execution(

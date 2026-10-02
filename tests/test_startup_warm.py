@@ -49,6 +49,7 @@ from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
 from cozy_runtime.internal.worker.session import HostedPlacement, Worker, WorkerOptions
+from cozy_runtime.internal.worker.stage_scheduler import Want
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_executions import TERMINAL, Executions
 from cozy_runtime.protocol import WIRE_MINOR, documents
@@ -98,6 +99,9 @@ def _attempt(name, real, answer):
         if not REFUSE:
             return real(*args, **kwargs)
         if answer is None:
+            if os.path.exists(LOG + ".oom"):  # one start finds the device full, then it has room
+                os.unlink(LOG + ".oom")
+                raise RuntimeError("CUDA error: out of memory")
             raise RuntimeError(f"{{name}}: this test environment reaches no CUDA driver")
         return answer
     return attempt
@@ -1097,3 +1101,41 @@ def test_an_executor_of_a_worker_that_sees_no_gpu_never_asks_the_cuda_driver(
         assert not [node for node in held if node.startswith("/dev/nvidia")]
     finally:
         supervision.close()
+
+
+def test_a_start_out_of_device_memory_beside_a_call_in_flight_is_started_again(
+    warm: Callable[..., Warm],
+) -> None:
+    """Run 2601: Anima's prepared executor could not create its CUDA context beside a running
+    SDXL, the start was recorded as a refusal, and the request failed without ever starting.
+    Such a start is now the room the call in flight holds, not a verdict: nothing is recorded
+    against the placement, the worker waits until that call is past its stages, and a fresh
+    process starts again. (This fixture has no card, so the second start ends there.)"""
+    machine = warm()
+    worker = machine.worker
+    worker.stages.open_root("X", 1)
+    other = Want(root="X", template=("another-installation", "b"), entrypoint="generate")
+    worker.stages.want("X#1", other)
+    kind = worker.stages.kind("X#1", "denoise", ("unet",))
+    assert worker.stages.enter("X#1", kind, lambda: False) is not None  # X computes on GPU 0
+    hosted = _replica(machine, None, "machine-short")
+    installed = (worker.options.install_root or Path()) / "installations" / INSTALLATION
+    (installed / "cuda-attempts.log.oom").touch()
+    latches: list[tuple[str, bool]] = []
+    starting = threading.Thread(
+        target=lambda: latches.append(worker._prepare_generation(worker._tenant("machine-short"))),
+        daemon=True,
+    )
+    starting.start()
+    (first,) = _wait(lambda: _attempts(machine), "the first start reaching the driver")
+    assert first[1] == "_cuda_init"
+    assert starting.is_alive() and not latches, "it waits for the call in flight"
+    assert not hosted.failed_bindings and not [
+        fault for fault in worker.engine.faults if fault.reason == "device_out_of_memory"
+    ], "an out-of-memory beside a running call is recorded against nothing"
+    worker.stages.release("X#1")
+    starting.join(300)
+    ((latch, _reused),) = latches
+    assert "accelerator_unavailable" in latch, latch
+    assert [name for _pid, name in _attempts(machine)] == ["_cuda_init", "_cuda_init"]
+    assert len({pid for pid, _name in _attempts(machine)}) == 2 and hosted.supervision.spawns == 2
