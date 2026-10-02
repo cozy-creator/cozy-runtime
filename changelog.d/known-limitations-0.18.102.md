@@ -1,0 +1,4 @@
+0.18.102 fixes the limitation 0.18.101 shipped with: a warm run no longer ends `device_shortfall` at its VAE decode when about 3 GiB of device memory is free and a second model is resident (run 3143); the decode makes room and completes. Still open:
+- A multi-GPU group that cannot form stalls for about 11 minutes and the run ends REFUSED with "Retained preparation is unavailable" rather than FAILED with the cause. The one cause seen, NCCL peer memory over PCI, was fixed in 0.18.101.
+- An executor's first run is slower than its later ones (SDXL on an L4: 9.6 s, then 8.5 s, then 7.9–8.0 s), as in 0.18.101.
+- Stage times are not comparable with 0.18.101's: a stage's clock now covers its own device work, so SDXL's `denoise` reads about 0.2 s longer while the run's GPU turn is unchanged (8.06 s against 8.07 s on the same pod).
