@@ -1312,6 +1312,39 @@ def test_one_gpu_of_a_group_never_runs_a_block_twice(tmp_path: Path) -> None:
 
 
 @on_card
+def test_a_group_gpus_denoise_keeps_a_resident_set_after_a_one_pass_warm_up(card: Any) -> None:
+    """Run 2963 (H3 on 2x A40): the leader GPU ran the whole denoise with every DiT block
+    streamed through a window of two, nothing resident, while the other GPU kept half the
+    blocks on the card. Placed again at its second pass, the stage was judged run-once
+    because the component's last stage (the warm-up) had made one pass. A stage on its
+    second pass is cyclic."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "leader")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+
+    def staged(method: str, passes: int) -> list[Any]:
+        model.residency.admit(method, ("stack",))
+        try:
+            with torch.inference_mode():
+                return [model.stack(x) for _ in range(passes)]
+        finally:
+            model.residency.release(method, ("stack",))
+
+    weights.set_budget(1 << 30)
+    resident = staged("reference", 3)
+    model.residency.open_attempt()
+    weights.grouped = True
+    weights.activation.clear()  # a fresh executor's first request: nothing measured
+    layout: weight_policy.Layout = model.residency.components["stack"].layout
+    weights.set_budget(layout.common + (BLOCKS // 2 + 2) * layout.largest)
+    staged("warm", 1)
+    denoised = staged("denoise", 3)
+    kept = weights.facts().streamed["stack"].resident_blocks
+    assert 0 < kept < BLOCKS, kept
+    assert same(resident, denoised)
+
+
+@on_card
 def test_an_op_outside_every_block_runs_again_after_weights_leave(card: Any) -> None:
     """Package arithmetic between component calls allocates too: when it cannot, idle and
     then resident weights are unmapped and that one op runs again."""
