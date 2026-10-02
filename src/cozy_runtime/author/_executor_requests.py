@@ -166,6 +166,29 @@ class HostTier(_Request, frozen=True, kw_only=True, tag="host_tier"):
     memfd: int = -1
 
 
+class HostTierPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """The native traversal/partition produced by the existing model library."""
+
+    manifest: str
+    name: str
+    layout: str
+    traversal: tuple[tuple[str, str], ...]
+    components: tuple[str, ...]
+    regions: tuple[tuple[str, ...], ...]
+    parts: tuple[str, ...] = ()
+
+
+class HostTierPrepare(_Request, frozen=True, kw_only=True, tag="host_tier_prepare"):
+    """Small control envelope; a sealed memfd contains one typed HostTierPlan."""
+
+    manifest: str
+    name: str
+    layout: str
+    sha256: str
+    length: Annotated[int, msgspec.Meta(ge=0)]
+    memfd: int = -1
+
+
 class ModelSourceRead(_Request, frozen=True, kw_only=True, tag="model_source_read"):
     """One selected model source blob; header/assets/objects cross through readonly fds."""
 
@@ -211,6 +234,7 @@ class StageExit(_Request, frozen=True, kw_only=True, tag="stage_exit"):
 type _Tagged = (
     DeviceRoom
     | HostTier
+    | HostTierPrepare
     | ModelSourceRead
     | BudgetCell
     | StageEnter
@@ -444,7 +468,7 @@ def respond(
             request = decode(frame)
         except CapabilityError as exc:
             reply = refuse(exc.code, exc.message)
-    if isinstance(request, HostTier | BudgetCell):
+    if isinstance(request, HostTier | HostTierPrepare | BudgetCell):
         # The descriptor is only ever the one that arrived: a number on the wire is not.
         request = msgspec.structs.replace(request, memfd=-1 if received is None else received)
     elif received is not None:
@@ -454,7 +478,7 @@ def respond(
         try:
             reply = handler(request)
         except Exception as exc:  # answered, so the executor's exchange stays in step
-            if isinstance(request, HostTier | BudgetCell) and request.memfd >= 0:
+            if isinstance(request, HostTier | HostTierPrepare | BudgetCell) and request.memfd >= 0:
                 with contextlib.suppress(OSError):
                     os.close(request.memfd)
             reply = refuse("request_failed", f"{type(exc).__name__}: {exc}"[:400])

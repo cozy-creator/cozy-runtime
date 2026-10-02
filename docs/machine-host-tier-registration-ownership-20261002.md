@@ -10,3 +10,7 @@
 - Owned files: new `internal/host_tiers.py`, narrow request/Load/HostTiers prepare additions
   and CPU source/transport tests/docs. No worker port or model implementation.
 - No GPU/NVML/rental/process management; root owns hardware qualification.
+- Draft PR: https://github.com/cozy-creator/cozy-runtime/pull/1112
+- Paired owner: cozy-machine PR18/native host plane; wire/header prerequisite e9c520a.
+- 46 actual SDK/source/native CPU gates pass; checksum and readonly integrity unchanged.
+- Preserve original local-safe env/wheel, old candidate/profiler envs and primary checkouts.

@@ -220,6 +220,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     model_key: str | UnsetType = UNSET
     #: The worker keeps pinned host tiers (`HostTier` exchanges); older workers do not.
     host_tier: bool = False
+    #: host_tiers.owner/1: register typed partitions before adopting machine-created tiers.
+    host_tier_owner: bool = False
     #: The worker grants a turn per component-use scope (`stage/1`): `StageEnter` before each
     #: scope plans, `StageExit` after it. Older workers never set it.
     stages: bool = False

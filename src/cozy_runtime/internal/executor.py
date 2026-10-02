@@ -82,6 +82,8 @@ from cozy_runtime.author._executor_requests import (
     DeviceRoom,
     Handoff,
     HostTier,
+    HostTierPlan,
+    HostTierPrepare,
     Publish,
     Published,
     Request,
@@ -113,6 +115,7 @@ from cozy_runtime.internal import (
     child_env,
     execution_evidence,
     executor_commands,
+    host_tiers,
     image_vae,
     kernel_cache,
     model_config,
@@ -604,6 +607,7 @@ class Executor:
                 "import_only",
                 "vacate_ranks",
                 *([plane.CAPABILITY, STAGE_TURNS] if plane.available() else []),
+                *([host_tiers.CAPABILITY] if host_tiers.available() and self.world == 1 else []),
                 *(
                     [model_sources.CAPABILITY]
                     if model_sources.available() and self.world == 1 else []
@@ -1388,6 +1392,9 @@ class Executor:
         it touched the process leaves the other constructions serving; one that commanded
         followers or raised poisons the process.
         """
+        if command.host_tier_owner and (self.world != 1 or not host_tiers.available()):
+            return {"ok": False, "code": "host_tier_owner_unavailable",
+                    "detail": "machine host partition registration is unavailable"}
         if command.descriptor_sources and (self.world != 1 or not model_sources.available()):
             return {"ok": False, "code": "model_source_unavailable",
                     "detail": "descriptor model sources are not qualified for this executor"}
@@ -1987,7 +1994,7 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            tiers=self._tiers(command.host_tier),
+            tiers=self._tiers(command.host_tier, command.host_tier_owner),
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
@@ -2352,6 +2359,8 @@ class Executor:
                     else UNSET,
                     sequence_parallel_degree=max(self.world, 1),
                     host_tier=command.host_tier,
+                    host_tier_owner=command.host_tier_owner,
+                    descriptor_sources=command.descriptor_sources,
                 ),
                 optional_attention_scope=True,
             )
@@ -3679,19 +3688,21 @@ class Executor:
         """One product onto the run's output log, durable before this returns."""
         return self._durable(request, Published)
 
-    def _tiers(self, worker: bool) -> HostTiers | None:
+    def _tiers(self, worker: bool, machine_owner: bool = False) -> HostTiers | None:
         """Where this rank's pinned tiers come from: a follower adopts its leader's (one copy
         for K ranks); rank 0 asks and offers the worker's when it keeps them, and shares every
         tier with its followers."""
         host = self.host
         if self.rank > 0:
             return HostTiers(ask=self._leader_tier, offer=lambda *_: None)
+        worker = worker or machine_owner
         if not worker and self.group is None:
             return None
         return HostTiers(
             ask=host._ask_tier if worker else lambda *_: None,
             offer=host._offer_tier if worker else lambda *_: None,
             share=self._share_tier,
+            prepare=host._prepare_tier if machine_owner else None,
         )
 
     def _share_tier(self, name: str, layout: str, memfd: int) -> None:
@@ -3719,6 +3730,11 @@ class Executor:
         """The pinned host tier the worker keeps for exactly this weight set's layout."""
         answer = self._durable(HostTier(name=name, layout=layout), Tier)
         return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
+
+    def _prepare_tier(self, plan: HostTierPlan) -> None:
+        """Offer native plan metadata; older owners refuse the optional cache operation."""
+        with host_tiers.sealed_plan(plan) as request:
+            self._durable(request, Answer)
 
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
@@ -3807,7 +3823,8 @@ class Executor:
         body = encode_request(request)
         sending = (
             request.memfd
-            if (isinstance(request, HostTier) and request.offer) or isinstance(request, BudgetCell)
+            if ((isinstance(request, HostTier) and request.offer)
+                or isinstance(request, (BudgetCell, HostTierPrepare)))
             else -1
         )
         body.pop("memfd", None)

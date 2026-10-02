@@ -28,6 +28,7 @@ import msgspec
 import tensorfs
 
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
+from cozy_runtime.author._executor_requests import HostTierPlan
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._stage_memo import inexact
 from cozy_runtime.internal import (
@@ -1489,26 +1490,29 @@ class PlaneBackend:
         kept = [(index, group) for index, group in enumerate(members) if group]
         checkpoint = self.checkpoints[name]
         skipped = self.skipped.get(name, ())
+        traversal = [(name, self.plan[key].name) for key in keys] + [(name, key) for key in skipped]
         plan = checkpoint.read_plan(
-            [(name, self.plan[key].name) for key in keys] + [(name, key) for key in skipped],
+            traversal,
             READ_WINDOW,
             (name,),
         )
+        parts = [self.plan[key].role_what(part.role)
+                 for key in keys for part in self.plan[key].encoded.parts] if skipped else []
         if skipped:
             # The plan names every stored tensor; only what the code builds is read or mapped.
-            plan = plan.select(
-                [
-                    self.plan[key].role_what(part.role)
-                    for key in keys
-                    for part in self.plan[key].encoded.parts
-                ]
-            )
+            plan = plan.select(parts)
         weights = self.weights
         key = f"{self.construction}/{name}"
         ids = [[f"{name}/{self.plan[k].name}" for k in group] for _, group in kept]
         digest = canonical.digest({"manifest": checkpoint.manifest_id, "regions": ids})
         tiers = None if fine else self.tiers
         with store_refusals(f"registering {name}"):
+            if tiers is not None and tiers.prepare is not None:
+                tiers.prepare(HostTierPlan(
+                    manifest=checkpoint.manifest_id, name=key, layout=digest,
+                    traversal=tuple(traversal), components=(name,),
+                    regions=tuple(tuple(region) for region in ids), parts=tuple(parts),
+                ))
             source_key = (checkpoint.manifest_id if checkpoint.source_provider is None else
                           f"{checkpoint.manifest_id}/{name}")
             source = self.sources.get(source_key)
@@ -1612,6 +1616,7 @@ class HostTiers:
     ask: Callable[[str, str], int | None]
     offer: Callable[[str, str, int], None]
     share: Callable[[str, str, int], None] = lambda name, layout, memfd: None
+    prepare: Callable[[HostTierPlan], None] | None = None
 
 
 class _Span(msgspec.Struct, frozen=True):
