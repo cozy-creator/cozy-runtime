@@ -84,6 +84,7 @@ from cozy_runtime.author._executor_requests import (
     Publish,
     Published,
     Request,
+    SourceBlob,
     StageEnter,
     StageExit,
     StageGo,
@@ -112,6 +113,7 @@ from cozy_runtime.internal import (
     executor_commands,
     kernel_cache,
     model_config,
+    model_sources,
     native_interfaces,
     package_interface,
     plane,
@@ -597,6 +599,10 @@ class Executor:
                 "import_only",
                 "vacate_ranks",
                 *([plane.CAPABILITY, STAGE_TURNS] if plane.available() else []),
+                *(
+                    [model_sources.CAPABILITY]
+                    if model_sources.available() and self.world == 1 else []
+                ),
             ],
             "memo": [stage_memo.CAPABILITY],
             "pgid": os.getpgrp(),
@@ -1393,6 +1399,9 @@ class Executor:
         it touched the process leaves the other constructions serving; one that commanded
         followers or raised poisons the process.
         """
+        if command.descriptor_sources and (self.world != 1 or not model_sources.available()):
+            return {"ok": False, "code": "model_source_unavailable",
+                    "detail": "descriptor model sources are not qualified for this executor"}
         if self.rank > 0:
             return self._follower_load(command)
         if self.poisoned:
@@ -1846,8 +1855,12 @@ class Executor:
             reference=True,
         )
         vmap = reference.snapshot_map()
+        source_provider = None
+        if command.descriptor_sources:
+            source_provider = model_sources.BrokeredModelSources(self.host._durable)
         checkpoints = {
-            name: Checkpoint(reference.store, vmap.get(name, reference.snapshot)) for name in names
+            name: Checkpoint(reference.store, vmap.get(name, reference.snapshot),
+                             source_provider=source_provider) for name in names
         }
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
@@ -1885,7 +1898,7 @@ class Executor:
                 if checkpoint.manifest_id == reference.snapshot
             ),
             None,
-        ) or Checkpoint(reference.store, reference.snapshot)
+        ) or Checkpoint(reference.store, reference.snapshot, source_provider=source_provider)
         config_bytes = model_config.construction_config(config_checkpoint.header.get("configs"))
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
@@ -3810,6 +3823,7 @@ class Executor:
         separate lane from progress on purpose: a durable fact must not be sheddable, and
         the lossy lane's whole contract is that it may shed.
         """
+        source_descriptor = -1
         body = encode_request(request)
         sending = (
             request.memfd
@@ -3835,7 +3849,10 @@ class Executor:
                 )
             handoff = issubclass(into, Handoff)
             if frame.get("descriptor") is True:
-                if issubclass(into, Tier):
+                if issubclass(into, SourceBlob):
+                    source_descriptor = self.channel.recv_readonly_file()
+                    frame["descriptor"] = source_descriptor
+                elif issubclass(into, Tier):
                     frame["descriptor"] = self.channel.recv_memfd()
                 elif not handoff:
                     self.channel.close()
@@ -3847,6 +3864,8 @@ class Executor:
         try:
             return tolerant.read(frame, into, ("progress", "observation"))[0]
         except msgspec.ValidationError as exc:
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
 
     def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool, bool], None]:
