@@ -6521,6 +6521,9 @@ class Worker:
             # A GROUP's K ranks form an NCCL communicator (cr-068); NVLS multicast is off
             # BEFORE it forms, by the seal, and every rank asserts it (pgw#929).
             imposed["NCCL_NVLS_ENABLE"] = "0"
+            # GPU-to-GPU peer memory only over NVLink: over PCI the communicator hung at
+            # formation 4 times in 10 (run 2852); those GPUs go through host shared memory.
+            imposed["NCCL_P2P_LEVEL"] = "NVL"
         # The FILL runs in the executor, so its capture directory has to cross the seal or
         # it instruments the one process that never reserves a destination. Projected only
         # when one is configured: an empty value is an imposition of nothing.
