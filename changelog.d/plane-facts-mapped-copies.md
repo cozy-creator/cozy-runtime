@@ -1,0 +1,1 @@
+Weight plane facts name the bytes copied to the device straight from the page cache (`mapped_copy_bytes`, TensorFS 0.3.92); `h2d_bytes` already includes them, and the pinned tier's link rate no longer blends them in.

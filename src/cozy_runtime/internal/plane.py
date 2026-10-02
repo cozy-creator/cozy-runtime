@@ -59,6 +59,10 @@ class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):
     host_copy_ns: int = 0
     disk_copy_bytes: int = 0
     disk_copy_ns: int = 0
+    #: of the host pair, the copies from mappings of objects the page cache held; the rest
+    #: came from the pinned tier (TensorFS 0.3.92; 0 before)
+    mapped_copy_bytes: int = 0
+    mapped_copy_ns: int = 0
     misses: int = 0
     evictions: int = 0
     evicted_bytes: int = 0
