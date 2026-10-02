@@ -28,6 +28,8 @@ from cozy_runtime.author._executor_requests import (  # noqa: E402
     Answer,
     Handler,
     StageEnter,
+    StageExit,
+    StageGo,
     respond,
 )
 from cozy_runtime.internal import accel, plane  # noqa: E402
@@ -174,6 +176,48 @@ def test_past_its_last_stage_a_call_gives_its_bytes_back_to_the_one_waiting(
         assert budgets == [0], "B's turn came after A had unmapped, so B measures real room"
     finally:
         executor.close()
+
+
+def test_a_nested_scope_neither_ends_the_turn_nor_unmaps_the_outer_scopes_weights(
+    machine: Machine,
+) -> None:
+    """H3 turbo on one GPU with another call waiting: the inner scope's exit used to end the
+    call's turn, and past its last stage it was answered budget 0, which unmapped the outer
+    scope's weights while that scope was open. Only the outer scope's exit ends the turn."""
+    worker = machine.worker
+    worker._turning.update({"inst-a": True, "inst-b": True})
+    outer = StageKind("inst-a/generate", "sample_turbo", ("base",))
+    worker.stages.book.record("inst-a/generate", "c", [StageSample(kind=outer, wall_ns=10**6)])
+    worker.stages.open_root("A", 1)
+    worker.stages.open_root("B", 2)
+    worker.stages.want(
+        "A#1", Want(root="A", template=("inst-a", "b"), entrypoint="generate", cell="c")
+    )
+    worker.stages.want("B#1", Want(root="B", template=("inst-b", "b"), entrypoint="generate"))
+    handler, _ = tenant(machine, "tenant-a", "A")
+    first = handler(StageEnter(method="sample_turbo", components=("base",)))
+    assert isinstance(first, StageGo) and first.ok
+    nested = handler(StageEnter(method="sample", components=("lora",)))
+    assert isinstance(nested, StageGo) and nested.ok and nested.budget_bytes == -1
+    granted: list[Grant | None] = []
+    kind = worker.stages.kind("B#1", "render", ("transformer",))
+    waiting = threading.Thread(
+        target=lambda: granted.append(worker.stages.enter("B#1", kind, lambda: False)),
+        daemon=True,  # a failed assertion must not leave the run waiting on it
+    )
+    waiting.start()
+    bound = time.monotonic() + 30  # a hang bound on a loaded box, not a budget
+    while not worker.stages.view()["demands"]["B#1"]["asking"]:
+        assert time.monotonic() < bound
+        time.sleep(0.01)
+    inner = handler(StageExit(method="sample", components=("lora",)))
+    assert isinstance(inner, StageGo) and inner.budget_bytes == -1, "the outer scope is open"
+    assert not granted and worker.stages.view()["holders"] == {"0": "A#1"}
+    last = handler(StageExit(method="sample_turbo", components=("base",)))
+    assert isinstance(last, StageGo) and last.budget_bytes == 0 and not granted
+    handler(StageExit(method="sample_turbo", components=("base",), yielded=True))
+    waiting.join(30)
+    assert granted == [Grant((0,), True)]
 
 
 def test_a_scope_waiting_for_its_turn_is_not_counted_as_execution(
