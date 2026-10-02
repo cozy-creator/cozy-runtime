@@ -91,7 +91,7 @@ def test_a_full_length_statement_reaches_sol_before_any_forward(
     dit = pipe.components["fl2va_dit"]
     sol = attention._member(attention.BY_NAME["sol-attn"])
     for _component, _module, processor in attention.sites({"": dit}):
-        processor._attention_backend = sol
+        setattr(processor, "_attention_backend", sol)  # noqa: B010
     submitted: list[tuple[int, Any, int]] = []
     monkeypatch.setattr(attention_sol, "specialize", lambda *call: submitted.append(call))
     try:

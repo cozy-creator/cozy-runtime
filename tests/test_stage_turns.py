@@ -300,11 +300,15 @@ def test_a_device_start_waits_for_room_until_the_call_in_flight_is_past_its_stag
     row.model_bearing, row.ledger.plane = True, PlaneFacts(context_bytes=180 * mib)
     assert worker.memory.context_need(lane) == {0: 360 * mib + weight_policy.MARGIN}
 
+    def enter() -> None:
+        go = handler(StageEnter(method="denoise", components=("unet",)))
+        assert isinstance(go, Answer) and go.ok
+
     def step() -> None:
-        assert handler(StageEnter(method="denoise", components=("unet",))).ok
+        enter()
         handler(StageExit(method="denoise", components=("unet",)))
 
-    assert handler(StageEnter(method="denoise", components=("unet",))).ok  # A computes
+    enter()  # A computes
     free["bytes"] = 10 * mib
     started: list[int] = []
 
@@ -385,11 +389,14 @@ def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
 
     monkeypatch.setattr(worker, "_ensure_once", short)
     evicted: list[tuple[str, bool]] = []
-    monkeypatch.setattr(
-        worker.memory,
-        "make_room",
-        lambda lane, slot, need, why, contexts=False: evicted.append((slot, contexts)) or {},
-    )
+
+    def make_room(
+        lane: object, slot: str, need: object, why: object, contexts: bool = False
+    ) -> dict[int, int]:
+        evicted.append((slot, contexts))
+        return {}
+
+    monkeypatch.setattr(worker.memory, "make_room", make_room)
     with pytest.raises(DeviceExhausted, match="a block ran out of memory"):
         worker._ensure_construction(attempt)
     assert evicted == [("tenant-b", True)] * 2, "idle weights and idle contexts go before each try"

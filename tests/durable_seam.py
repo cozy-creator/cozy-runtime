@@ -30,6 +30,7 @@ def seam(handler: Handler) -> Exchange:
             frame = worker.recv()
             assert frame is not None
             answer, handoff = respond(frame, handler)
+            assert handoff is None or isinstance(handoff, socket.socket)
             try:
                 worker.send(answer)
                 if handoff is not None:

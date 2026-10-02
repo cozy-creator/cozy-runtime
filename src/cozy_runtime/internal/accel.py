@@ -26,7 +26,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from cozy_runtime.internal.config import sees_no_gpu
 
@@ -367,7 +367,7 @@ def synchronize(torch: Any, kind: str) -> None:
 
 
 @contextmanager
-def readable(*tensors: object) -> Iterator[tuple[object, ...]]:
+def readable[*Ts](*tensors: *Ts) -> Iterator[tuple[*Ts]]:
     """The operands of a kernel launched outside torch's dispatch (Triton, the compiled
     extension), which reads them by pointer. A weight with no plane bytes bound is a stand-in
     with nothing behind its pointer: its plane maps and holds it for the launch, or refuses
@@ -378,7 +378,7 @@ def readable(*tensors: object) -> Iterator[tuple[object, ...]]:
         return
     reading = getattr(type(standins[0]), "reading")  # noqa: B009
     with reading(standins, "a kernel launch") as read:
-        yield tuple(read.operand(t) for t in tensors)
+        yield cast("tuple[*Ts]", tuple(read.operand(t) for t in tensors))
 
 
 def drain(torch: Any, kind: str) -> None:
