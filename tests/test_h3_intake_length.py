@@ -27,6 +27,7 @@ from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3VideoReference  # no
 from PIL import Image  # noqa: E402
 
 from cozy_runtime.author import _attention_scope  # noqa: E402
+from cozy_runtime.internal import attention, attention_sol  # noqa: E402
 from cozy_runtime.models.minimax_h3 import official  # noqa: E402
 from cozy_runtime.models.minimax_h3.conditioner import PresentationLength  # noqa: E402
 from testdata import h3_intake  # noqa: E402
@@ -78,6 +79,36 @@ def test_h3_states_its_attention_length_at_intake_exactly(video: bool) -> None:
     pipe.condition_media("ref2va", state)
     pipe._run("ref2va", "denoise.prepare_layout", state)
     assert tokens == state.get("token_tags").numel() > 0
+
+
+def test_a_full_length_statement_reaches_sol_before_any_forward(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 362-frame clip passes upstream's 15.0 s layout ceiling only under the runtime's
+    `_CEILING_S`. Without it (Runtime 0.18.99) every full-length fl2va statement failed, and
+    Sol's length compile waited for the first dense step instead of starting at intake."""
+    pipe = h3_intake.pipeline()
+    dit = pipe.components["fl2va_dit"]
+    sol = attention._member(attention.BY_NAME["sol-attn"])
+    for _component, _module, processor in attention.sites({"": dit}):
+        processor._attention_backend = sol
+    submitted: list[tuple[int, Any, int]] = []
+    monkeypatch.setattr(attention_sol, "specialize", lambda *call: submitted.append(call))
+    try:
+        state = pipe.start_fl2va(
+            prompt="two swordsmen circle each other in a sunlit courtyard",
+            first_frame=None,
+            last_frame=None,
+            generator=torch.Generator().manual_seed(1),
+            steps=pipe._plans["fl2va"].steps[0],
+            frames=official.MAX_FRAMES,
+        )
+        official._settle_intake(state)
+    finally:
+        pipe.close()
+    assert "no intake attention length" not in capsys.readouterr().err
+    ((tokens, device, step),) = submitted
+    assert step == -1 and device == torch.device("cpu") and tokens > 0
 
 
 def test_a_short_lived_process_exits_cleanly_with_statements_in_flight() -> None:

@@ -1337,7 +1337,10 @@ class OfficialH3Pipeline:
             scratch.set("audio_condition_latents", audio)
         elif "denoise.no_keyframe_anchors" in blocks:
             blocks["denoise.no_keyframe_anchors"](pipe, scratch)
-        blocks["denoise.prepare_layout"](_ScopedPipeline(pipe, shell), scratch)
+        # Under `denoise`'s ceiling: upstream's own refuses a full-length (362-frame) clip.
+        blocks["denoise.prepare_layout"](
+            _ScopedPipeline(pipe, shell, overrides={"max_duration": _CEILING_S}), scratch
+        )
         return int(scratch.get("token_tags").numel())
 
     def _expect(self, task: Task, state: Any) -> None:
