@@ -24,7 +24,7 @@ from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
 from cozy_runtime.author._loader import census  # noqa: E402
-from cozy_runtime.internal import plane, weight_policy  # noqa: E402
+from cozy_runtime.internal import accel, plane, weight_policy  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
@@ -37,7 +37,7 @@ from cozy_runtime.internal.weights import (  # noqa: E402
 from cozy_runtime.internal.weights_sink import weights_transaction_id  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
-on_card = pytest.mark.skipif(not torch.cuda.is_available(), reason="a CUDA card")
+on_card = pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card")
 
 HIDDEN = 2048
 BLOCKS = 8

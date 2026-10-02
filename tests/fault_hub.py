@@ -164,7 +164,7 @@ def checkpoint(
 
 def weights(tmp_path: Path, tensors: int, size: int, model: str = "proof/model") -> Checkpoint:
     """A real checkpoint of `tensors` same-size tensor objects, written by TensorFS's own
-    derived writer: each big enough for a ranged hedge, and alike, so one's pace judges
+    derived writer: each big enough to have a body rate, and alike, so one's pace judges
     another's."""
     root = tmp_path / "store"
     root.mkdir(parents=True)

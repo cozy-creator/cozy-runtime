@@ -29,6 +29,7 @@ import msgspec
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._attention_scope import _EXPECTED
 from cozy_runtime.internal import (
+    accel,
     attention_sol,
     attention_ulysses,
     execution_evidence,
@@ -431,7 +432,7 @@ def _expected(live_tokens: int, module: Any) -> None:
     import torch
 
     device = next((p.device for p in module.parameters() if p.device.type != "meta"), None)
-    if device is None and torch.cuda.is_available():
+    if device is None and accel.present(torch, "cuda"):
         device = torch.device("cuda", torch.cuda.current_device())
     if device is not None:
         attention_sol.expect(live_tokens, device)

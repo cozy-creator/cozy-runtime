@@ -305,7 +305,8 @@ def ask(shell: Shell, key: str, method: str) -> tuple[threading.Thread, list[Gra
     got: list[Grant | None] = []
     kind = shell.scheduler.kind(key, method, (method,))
     asking = threading.Thread(
-        target=lambda: got.append(shell.scheduler.enter(key, kind, lambda: False))
+        target=lambda: got.append(shell.scheduler.enter(key, kind, lambda: False)),
+        daemon=True,  # a failed assertion must not leave the run waiting on it
     )
     asking.start()
     until(lambda: bool(got) or bool(shell.demand(key)["asking"]))
@@ -374,6 +375,35 @@ def test_a_call_whose_executor_holds_weights_waits_outside_it_until_they_are_cut
     shell.holding.clear()  # SDXL's first turn cut it
     gpus.resync()
     assert gpus.ready("A#1") and gpus.taking_turns("A#1")
+
+
+def test_a_turn_belongs_to_the_calls_outermost_open_scope() -> None:
+    """H3 turbo opens its LoRA sampler's scope inside its base model's. The inner scope asks
+    and is answered at once, and its exit ends nothing: the call keeps its GPU until the outer
+    scope closes, and only then does the next call's turn come. The book learns the outer
+    scope as the stage."""
+    shell = Shell(1, turns=True)
+    gpus = shell.scheduler
+    gpus.open_root("H", 1)
+    gpus.open_root("S", 2)
+    gpus.want("H#1", Want(root="H", template=ANIMA, entrypoint="generate"))
+    gpus.want("S#1", Want(root="S", template=SDXL, entrypoint="generate"))
+    outer, got = ask(shell, "H#1", "sample_turbo")
+    outer.join(30)
+    assert got == [Grant((0,), True)]
+    inner = gpus.kind("H#1", "sample", ("lora",))
+    assert gpus.enter("H#1", inner, lambda: False) == Grant((0,), False)
+    waiting, granted = ask(shell, "S#1", "encode")
+    assert gpus.exit("H#1", StageSample(kind=inner, wall_ns=1)) == Exit()
+    assert shell.held() == {"H#1": (0,)} and not granted, "the outer scope is still open"
+    gpus.exit("H#1", StageSample(kind=gpus.kind("H#1", "sample_turbo", ("sample_turbo",))))
+    assert shell.held() == {}, "the outer scope's exit ends the turn"
+    gpus.release("H#1", ok=True, cell="c")  # a first graph keeps its claim to its release
+    waiting.join(30)
+    assert granted == [Grant((0,), True)]
+    graph = gpus.book.graph(f"{ANIMA[0]}/generate", "c")
+    assert graph is not None
+    assert [(stage.kind.method, stage.calls) for stage in graph.stages] == [("sample_turbo", 1)]
 
 
 def test_a_turn_on_the_same_tenant_keeps_its_budget() -> None:

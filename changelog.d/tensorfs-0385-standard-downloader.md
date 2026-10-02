@@ -1,0 +1,1 @@
+Model downloads finish their tail at about the body's speed: the TensorFS floor is 0.3.85. Hub pulls are fixed 8 MiB ranged requests, up to 512 at once, and a request that fails, goes silent or runs far slower than its peers is restarted on a fresh connection. A 101 GB H3 checkpoint that took 1,169 s cold on 0.3.82 lands in 197 s.

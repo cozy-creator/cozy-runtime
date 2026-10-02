@@ -16,7 +16,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author._loader import census
 from cozy_runtime.derive.microscale import encode_fp8_rowwise
-from cozy_runtime.internal import plane
+from cozy_runtime.internal import accel, plane
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE, LeafProvider
 from cozy_runtime.internal.fill import Checkpoint, FillRefusal
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights
@@ -25,7 +25,8 @@ from cozy_runtime.internal.weights_sink import weights_transaction_id
 torch = pytest.importorskip("torch")
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not plane.available(), reason="the weight plane on a CUDA card"
+    not accel.present(torch, "cuda") or not plane.available(),
+    reason="the weight plane on a CUDA card",
 )
 
 WIDTH = 1024
