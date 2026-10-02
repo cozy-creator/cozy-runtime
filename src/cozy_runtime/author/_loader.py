@@ -632,7 +632,9 @@ class ConstructionRecord:
     filled: int
     filled_bytes: int
     ignored_extras: tuple[str, ...] = ()
-    """LOCAL-custody extras the code does not consume: warned, ignored and CONFESSED."""
+    """Stored tensors the code does not build: skipped, never loaded, and CONFESSED."""
+    ignored_warnings: tuple[str, ...] = ()
+    """One line per checkpoint that stores such tensors: count, bytes and the first keys."""
     fit: dict[str, object] | None = None
     """The `ok` Fit document this construction was judged by, verbatim; None where no
     header was there to judge against (derive mode)."""
@@ -746,6 +748,7 @@ class Loader:
         if fit is not None and not fit.get("ok"):
             raise ModelFitRefused(fit, self._artifact.unnormalized)
         ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
+        warned = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("warnings", ())))
         _legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()
         filled, filled_bytes = self._fill(walked, obj)
@@ -757,6 +760,7 @@ class Loader:
             filled=filled,
             filled_bytes=filled_bytes,
             ignored_extras=ignored,
+            ignored_warnings=warned,
             fit=dict(fit) if fit is not None else None,
             stage_ms=tuple(_legs),
             weightless=_weightless,

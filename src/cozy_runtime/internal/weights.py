@@ -1025,6 +1025,9 @@ class PlaneBackend:
         self.sources: dict[str, Source] = {}
         self.state = "open"
         self.expected: dict[str, frozenset[str]] = {}
+        #: component -> stored tensors the code does not build: named in its read plan,
+        #: selected out of it, so never read or mapped
+        self.skipped: dict[str, list[str]] = {}
         self.enqueued: dict[str, TensorLike] = {}
         self.roots: dict[str, Module] = {}
         self.components: dict[str, Component] = {}
@@ -1182,6 +1185,7 @@ class PlaneBackend:
         observations = canonical.write(observed_capability_records(self.probe))
         verdict: dict[str, object] | None = None
         ignored: list[str] = []
+        warnings: list[str] = []
         routes = {"verbatim": 0, "decoded_float": 0, "encoded_gemm": 0}
         for checkpoint, constructed in by_checkpoint.values():
             members = set(constructed)
@@ -1209,7 +1213,11 @@ class PlaneBackend:
             if not fit.get("ok"):
                 return fit
             verdict = fit
-            ignored.extend(str(k) for k in fit.get("ignored", ()))  # type: ignore[attr-defined]
+            extras = [str(k) for k in fit.get("ignored", ())]  # type: ignore[attr-defined]
+            ignored.extend(extras)
+            if extras:
+                # One line per checkpoint. A TensorFS before 0.3.90 lists the keys only.
+                warnings.append(str(fit.get("warning") or self._skipped_line(extras)))
             counted: Mapping[str, int] = fit.get("routes", {})  # type: ignore[assignment]
             for route in routes:
                 routes[route] += int(counted.get(route, 0))
@@ -1217,11 +1225,23 @@ class PlaneBackend:
             return None
         for full in ignored:
             component, _, key = full.partition("/")
+            self.skipped.setdefault(component, []).append(key)
             if component in self.expected:
                 self.expected[component] -= {f"{component}.{key}"}
         if len(by_checkpoint) > 1:
             verdict = {**verdict, "ignored": ignored, "routes": routes}
-        return verdict
+        return {**verdict, "warnings": warnings}
+
+    def _skipped_line(self, extras: Sequence[str]) -> str:
+        """TensorFS 0.3.90's warning for the stored tensors fit skipped: how many, how many
+        bytes, and the first five."""
+        rows = (self.plan.get(full.replace("/", ".", 1)) for full in extras)
+        nbytes = sum(row.stored_nbytes for row in rows if row is not None)
+        more = f", and {len(extras) - 5} more" if len(extras) > 5 else ""
+        return (
+            f"{len(extras)} stored tensor(s) the code does not build were skipped, not "
+            f"loaded: {nbytes} B ({', '.join(extras[:5])}{more})"
+        )
 
     def materialize(
         self, obj: object, walked: Census, *, encoded_leaves: str = "refuse"
@@ -1400,9 +1420,21 @@ class PlaneBackend:
             members[_unit_of(path, units)].append(key)
         kept = [(index, group) for index, group in enumerate(members) if group]
         checkpoint = self.checkpoints[name]
+        skipped = self.skipped.get(name, ())
         plan = checkpoint.read_plan(
-            [(name, self.plan[key].name) for key in keys], READ_WINDOW, (name,)
+            [(name, self.plan[key].name) for key in keys] + [(name, key) for key in skipped],
+            READ_WINDOW,
+            (name,),
         )
+        if skipped:
+            # The plan names every stored tensor; only what the code builds is read or mapped.
+            plan = plan.select(
+                [
+                    self.plan[key].role_what(part.role)
+                    for key in keys
+                    for part in self.plan[key].encoded.parts
+                ]
+            )
         weights = self.weights
         key = f"{self.construction}/{name}"
         ids = [[f"{name}/{self.plan[k].name}" for k in group] for _, group in kept]

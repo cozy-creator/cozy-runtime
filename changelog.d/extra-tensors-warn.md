@@ -1,0 +1,1 @@
+A checkpoint that stores tensors the model code no longer builds loads instead of refusing (`extra_tensor`). The extra tensors are skipped, never read or mapped, and the load says so once per checkpoint: how many, how many bytes, and the first few keys. Needs TensorFS 0.3.90, which is now the floor; every tensor the code builds must still be stored at its shape and dtype.

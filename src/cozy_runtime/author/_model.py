@@ -1138,6 +1138,7 @@ def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
         filled=sum(r.filled for r in records),
         filled_bytes=sum(r.filled_bytes for r in records),
         ignored_extras=tuple(e for r in records for e in r.ignored_extras),
+        ignored_warnings=tuple(w for r in records for w in r.ignored_warnings),
         fit=next((r.fit for r in records if r.fit is not None), None),
     )
 
