@@ -1,0 +1,1 @@
+An executor creates the GPU libraries' handles and first kernels at device start, while the card has room, and a cuBLAS or cuDNN status inside a stage is run again once with room made from the stage's weights: with no warm render at load, a model's first GEMM could land in a stage whose budget left the library nothing and fail as `CUBLAS_STATUS_INTERNAL_ERROR` (run 3095).

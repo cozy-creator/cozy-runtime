@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, cast
 import msgspec
 import tensorfs
 
-from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
+from cozy_runtime.author._errors import RuntimeFailure, is_device_oom, is_library_refusal
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._stage_memo import inexact
 from cozy_runtime.internal import (
@@ -910,13 +910,12 @@ def _recovery_type(torch: ModuleType) -> type:
                 seen.mutated = any(
                     _storage(value) in seen.storages for value in _written(func, args, kwargs)
                 )
+            refused = False
             while True:
                 try:
                     return func(*args, **kwargs)
                 except Exception as exc:
-                    if not is_device_oom(exc):
-                        raise
-                    need = _requested(exc)
+                    need, refused = _room_for(exc, refused)
                 # outside `except`, so the failed op's frames are gone
                 self.weights.make_room(need, (*args, *kwargs.values()), str(func))
 
@@ -2338,6 +2337,8 @@ class WeightResidency:
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
             versions = _versions(args, kwargs)
+            # a library's refusal is answered once: by its op where ops recover one by one
+            refused = weights.grouped or region.mutates is not False
             while True:
                 stream = weights.stream()
                 try:
@@ -2359,9 +2360,8 @@ class WeightResidency:
                         finally:
                             weights.running -= 1
                     except Exception as exc:
-                        if not is_device_oom(exc):
-                            raise
-                        need = _requested(exc) or region.span
+                        need, refused = _room_for(exc, refused)
+                        need = need or region.span
                 finally:
                     # Outside its lease only a stage-resident region stays bound: any other
                     # read finds the stand-in (`Weights.reading`), never a stale address.
@@ -2692,6 +2692,18 @@ def _requested(exc: BaseException) -> int:
     """The allocation torch could not make, from its own message."""
     found = _REQUESTED.search(str(exc))
     return int(float(found.group(1)) * _UNITS[found.group(2)]) if found else 0
+
+
+def _room_for(exc: BaseException, refused: bool) -> tuple[int, bool]:
+    """The room to make before a failed op runs again, and whether a library's refusal has now
+    been answered: out of device memory, what torch asked for; a cuBLAS or cuDNN status, the
+    libraries' own room, once (`refused`: the same op already had it). Anything else, and a
+    second refusal, is the op's own failure and raises."""
+    if is_device_oom(exc):
+        return _requested(exc), refused
+    if refused or not is_library_refusal(exc):
+        raise exc
+    return weight_policy.LIBRARY_ROOM, True
 
 
 def _image_vae(root: Module) -> bool:

@@ -23,8 +23,9 @@ import ctypes
 import subprocess
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any, Literal
 
 from cozy_runtime.internal.config import sees_no_gpu
@@ -397,6 +398,25 @@ def initialize(torch: Any, kind: str) -> None:
         raise RuntimeError("this process sees no GPU (CUDA_VISIBLE_DEVICES is empty)")
     if kind == "cuda":
         torch.cuda.init()
+
+
+def first_launches(torch: ModuleType, kind: str) -> None:
+    """Create the GPU libraries' handles, workspaces and first kernels while the device has
+    room. cuBLAS and cuDNN take device memory for themselves at a first launch, and inside a
+    stage whose budget left none they fail under names that are not out-of-memory (run 3095:
+    CUBLAS_STATUS_INTERNAL_ERROR in a block's first Linear, beside another model's weights)."""
+    if kind != "cuda":
+        return
+    conv = torch.nn.functional
+    with torch.inference_mode():
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            a = torch.ones(8, 8, dtype=dtype, device="cuda")
+            kernel = a[:3, :3]
+            with suppress(RuntimeError):  # a card without this dtype
+                torch.mm(a, a)
+                conv.conv2d(a.view(1, 1, 8, 8), kernel.reshape(1, 1, 3, 3))
+                conv.conv3d(a.view(1, 1, 1, 8, 8), kernel.reshape(1, 1, 1, 3, 3))
+        torch.cuda.synchronize()
 
 
 def initialized(torch: Any, kind: str) -> bool:
