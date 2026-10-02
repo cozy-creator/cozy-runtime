@@ -313,7 +313,8 @@ def test_the_plane_budget_reaches_the_followers_that_answer_it(
     leader: Any = Executor(Channel(ours), tmp_path, world=2)
     leader.device_kind = "cpu"
     leader.group = group
-    leader.weights = model._cozy_residency.weights
+    residency: Any = model._cozy_residency
+    leader.weights = residency.weights
     try:
         group.spawn()
         group.dial_back(seal_snapshot(env))

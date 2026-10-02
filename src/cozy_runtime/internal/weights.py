@@ -138,6 +138,9 @@ class Region:
     bound: int | None = None
     #: decoded tensors and derived leaf roles kept alive while bound
     derived: list[Tensor] = field(default_factory=list)
+    #: whether its forward writes into its inputs in place, learned on its first run: such a
+    #: block can never run again, so its ops recover from out-of-memory one by one
+    mutates: bool | None = None
 
     @property
     def transforms(self) -> bool:
@@ -337,16 +340,17 @@ class Weights:
         }
 
     @contextmanager
-    def recovering(self) -> Iterator[None]:
+    def recovering(self, watch: frozenset[int] | None = None) -> Iterator[Any]:
         """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
-        unmaps weights and runs again. A block runs with this off and retries as a unit."""
+        unmaps weights and runs again. With `watch` (storage addresses), the mode also notes
+        whether any op wrote into one of them (`.mutated`)."""
         if self.host_only:
-            yield
+            yield None
             return
         if self._recovery is None:
             self._recovery = _recovery_type(self.torch)
-        with self._recovery(self):
-            yield
+        with self._recovery(self, watch) as mode:
+            yield mode
 
     def make_room(self, need: int, operands: Sequence[object]) -> None:
         """An op outside every block ran out of device memory: unmap `need` bytes of weights,
@@ -688,14 +692,20 @@ def _recovery_type(torch: ModuleType) -> type:
         """Every torch op outside a block: one that runs out of device memory runs again
         after weights were unmapped for it (retry the op, never the run)."""
 
-        def __init__(self, weights: Weights) -> None:
+        def __init__(self, weights: Weights, watch: frozenset[int] | None = None) -> None:
             super().__init__()
             self.weights = weights
+            self.watch = watch
+            self.mutated = False
 
         def __torch_dispatch__(
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
+            if self.watch and not self.mutated and func._schema.is_mutable:
+                self.mutated = any(
+                    _storage(value) in self.watch for value in _written(func, args, kwargs)
+                )
             while True:
                 try:
                     return func(*args, **kwargs)
@@ -707,6 +717,25 @@ def _recovery_type(torch: ModuleType) -> type:
                 self.weights.make_room(need, (*args, *kwargs.values()))
 
     return Recovery
+
+
+def _written(func: Any, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Iterator[Any]:
+    """The arguments an op writes into (`Tensor(a!)` in its schema, `out=` included)."""
+    for index, argument in enumerate(func._schema.arguments):
+        if argument.alias_info is not None and argument.alias_info.is_write:
+            yield args[index] if index < len(args) else kwargs.get(argument.name)
+
+
+def _storage(value: object) -> int:
+    pointer = getattr(value, "untyped_storage", None)
+    return int(pointer().data_ptr()) if pointer is not None else -1
+
+
+def _tensor_operands(operands: Sequence[object]) -> Iterator[object]:
+    for value in operands:
+        for item in value if isinstance(value, (tuple, list)) else (value,):
+            if hasattr(item, "untyped_storage"):
+                yield item
 
 
 def _pointers(operands: Sequence[object]) -> Iterator[int]:
@@ -1968,10 +1997,22 @@ class WeightResidency:
 
         def run(*args: Any, **kwargs: Any) -> Any:
             try:
-                if weights.grouped:  # its ops recover one by one (`Weights.make_room`)
-                    return attempt(*args, **kwargs)
-                with self._quiet():  # the block retries as a unit, not op by op
-                    return attempt(*args, **kwargs)
+                if region.mutates is False and not weights.grouped:
+                    with self._quiet():  # the block retries as a unit, not op by op
+                        return attempt(*args, **kwargs)
+                # Its first run, a block that writes into its inputs, or one GPU of a group:
+                # its ops recover one by one, and the first run learns whether it writes.
+                inputs = (*args, *kwargs.values())
+                watch = (
+                    frozenset(_storage(v) for v in _tensor_operands(inputs))
+                    if region.mutates is None
+                    else None
+                )
+                with weights.recovering(watch) as mode:
+                    out = attempt(*args, **kwargs)
+                if region.mutates is None and mode is not None:
+                    region.mutates = bool(mode.mutated)
+                return out
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc
 
@@ -2007,13 +2048,14 @@ class WeightResidency:
                     if lease.ring_offset is not None:
                         unbind(region)
                     lease.release()
-                if weights.grouped:
+                if weights.grouped or region.mutates is not False:
                     raise self._shortfall(
                         self.active[0] if self.active else "",
                         need,
                         0,
                         f"{component.name}.{region.path} ran out of memory outside torch's "
-                        "own ops, inside a call its group shares, so it cannot run again",
+                        "own ops, and it shares its call with its group or writes into its "
+                        "inputs, so it cannot run again",
                     )
                 if _versions(args, kwargs) != versions:
                     raise self._shortfall(

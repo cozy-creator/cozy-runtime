@@ -440,6 +440,45 @@ def test_the_worker_lowers_a_running_stage_at_its_next_block(card: Any) -> None:
     assert same(reference, outputs)
 
 
+class WritingBlock(Block):
+    """A block that writes its result into its input (a VAE's in-place activations)."""
+
+    def forward(self, x: Any) -> Any:
+        return x.add_(torch.tanh(self.out(torch.tanh(self.proj(x * self.norm)))))
+
+
+class WritingStack(Stack):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([WritingBlock() for _ in range(BLOCKS)])
+
+
+@on_card
+def test_a_block_that_writes_its_inputs_recovers_op_by_op(card: Any) -> None:
+    """Runs 2619-2623 (Anima's VAE at 6 GiB): a block that ran out of memory after writing
+    into its input in place could not run again, and the load was refused. Its first run
+    learns that it writes; from then on its ops recover one by one and it never runs twice,
+    in inference mode too, where torch keeps no version counter to tell."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "writes", factory=WritingStack)
+    x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    reference = run(model, x, passes=1)
+    blocks = model.residency.components["stack"].blocks
+    assert all(region.mutates for region in blocks)
+    retries = weights.facts().oom_retries
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    ballast = torch.empty(free - (48 << 20), dtype=torch.uint8, device="cuda")
+    try:
+        retried = run(model, x, passes=1)
+    finally:
+        del ballast
+        torch.cuda.empty_cache()
+    assert weights.facts().oom_retries > retries
+    assert same(reference, retried)
+
+
 @on_card
 def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> None:
     weights = card.weights
@@ -491,7 +530,7 @@ def h3_dit() -> Any:
     from cozy_runtime.internal.lora_contract import FORMAT, Graph, Linear
     from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
 
-    dit = AdaLNPrunedMiniMaxH3Transformer(
+    dit: Any = AdaLNPrunedMiniMaxH3Transformer(
         table_timesteps=H3_TIMES,
         table_block_keys=H3_KEYS,
         num_attention_heads=4,
@@ -508,8 +547,8 @@ def h3_dit() -> Any:
         time_embed_hidden_dim=16,
         time_embed_dim=8,
         rope_freq_dim=1,
-    ).eval()
-    dit.install_lora_consumers()
+    )
+    dit.eval().install_lora_consumers()
     paths = [
         f"transformer_blocks.{block}.{site}"
         for block in range(H3_LAYERS)

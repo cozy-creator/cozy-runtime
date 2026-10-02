@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from typing import Any
 
 import pytest
 
@@ -250,7 +251,7 @@ def test_start_ends_an_idle_tenant_whose_executor_is_already_gone(
     old.close()
     reclaim = machine.worker.memory.reclaim
 
-    def ended(*args: object) -> None:
+    def ended(*args: Any) -> None:
         occupied.clear()  # the driver frees a dead process's memory
         reclaim(*args)
 
