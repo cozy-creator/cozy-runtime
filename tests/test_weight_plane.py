@@ -517,6 +517,39 @@ def test_budgets_cut_and_raised_while_streaming_stay_exact(card: Any) -> None:
 
 
 @on_card
+def test_a_cut_waits_for_the_kernels_that_read_what_it_unmaps(card: Any) -> None:
+    """A stage's resident set holds no lease while its kernels run: they are queued long
+    before they read. A cut at a block boundary, with the GPU far behind the host, must not
+    unmap what queued kernels still read (else a fault, or another tenant's bytes read)."""
+    from cozy_runtime.internal import budget_cell
+
+    weights = card.weights
+    model = load(weights, card.checkpoint, "behind")
+    x = torch.randn(32768, HIDDEN, device="cuda", dtype=torch.float16)  # slow kernels
+    weights.set_budget(1 << 30)
+    reference = run(model, x, passes=1)
+    layout: weight_policy.Layout = model.residency.components["stack"].layout
+    cell, fd = budget_cell.Cell.create()
+    worker = budget_cell.Cell(fd)
+    os.close(fd)
+    weights.cell = cell
+    out = []
+    model.residency.admit("run", ("stack",))
+    try:
+        with torch.inference_mode():
+            for i in range(12):
+                worker.ask(layout.common if i % 2 else 1 << 30)  # the cut lands mid-pass
+                out.append(model.stack(x))
+        torch.cuda.synchronize()
+    finally:
+        model.residency.release("run", ("stack",))
+        weights.cell = None
+        cell.close()
+        worker.close()
+    assert all(same(reference, [o]) for o in out)
+
+
+@on_card
 def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
     """The 3 GiB freeze (W5, 21:53): an allocation retried about 40 times in 1.3 s while the
     driver's free bytes never grew, each retry unmapping weights, closing and remapping the

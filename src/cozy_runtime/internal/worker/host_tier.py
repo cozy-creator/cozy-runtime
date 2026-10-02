@@ -1,11 +1,12 @@
 """The machine's pinned host tier: each weight set's memfd, kept across executors.
 
 An executor's weight plane fills one memfd per weight set (its layout plus a state page that
-marks which regions are Ready) and offers it here. The Worker keeps it, so a replacement
-executor, or another package's executor registering the same layout, adopts the filled
-regions instead of reading the disk (weight-plane.md §3). Pinned memory is unreclaimable, so
-the tier keeps at most half of what the host has, closing the least recently used first:
-page cache and disk stay beneath it.
+marks which regions are Ready) and offers it here. The Worker keeps it, holding a claim on its
+regions (`plane.hold_tier`), so a replacement executor, or another package's executor
+registering the same layout, adopts the filled regions instead of reading the disk
+(weight-plane.md §3). Pinned memory is unreclaimable, so the tiers held here count in this
+budget: at most half of what the host has, the least recently used released first (which
+frees what no executor claims). Page cache and disk stay beneath it.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from cozy_runtime.author._executor_requests import (
     Tier,
     refuse,
 )
+from cozy_runtime.internal import plane
 
 
 @dataclass(slots=True)
@@ -54,10 +56,13 @@ class HostTiers:
         if request.offer:
             if request.memfd < 0:
                 return refuse("host_tier_absent", "an offer arrived without its memfd")
-            kept = Held(request.memfd, _resident(request.memfd), self.clock)  # may raise: not kept
+            # either raising leaves the offered memfd to the caller, which closes it
+            nbytes = _resident(request.memfd)
+            kept = Held(plane.hold_tier(request.memfd), nbytes, self.clock)
+            os.close(request.memfd)  # the hold is its own descriptor
             prior = self.held.pop(key, None)
             if prior is not None:
-                os.close(prior.fd)
+                plane.release_tier(prior.fd)
             self.held[key] = kept
             self._trim()
             return Answer(ok=True)
@@ -90,12 +95,12 @@ class HostTiers:
                 row.nbytes = _resident(row.fd)
         while self.held and self._nbytes() > (max(self.available(), 0) + self._nbytes()) // 2:
             key = min(self.held, key=lambda k: self.held[k].used)
-            os.close(self.held.pop(key).fd)
+            plane.release_tier(self.held.pop(key).fd)
 
     def close(self) -> None:
         with self.lock:
             for row in self.held.values():
-                os.close(row.fd)
+                plane.release_tier(row.fd)
             self.held.clear()
 
 
