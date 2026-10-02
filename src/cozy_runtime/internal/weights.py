@@ -2136,14 +2136,11 @@ class WeightResidency:
         opened = weights.opened()
         components = {key: component for key, (_, _, component) in opened.items()}
         method = weights.open[-1][1]
-        # A component that cannot refine now (mid-stage) has no finer floor: its share of the
-        # budget is never below what its current grain needs.
-        layouts = {
-            key: c.planned if opened[key][0]._refinable(c) else replace(c.planned, fine=None)
-            for key, c in components.items()
-        }
-        try:
-            placed = weight_policy.stage(
+
+        def stage(
+            layouts: Mapping[str, weight_policy.Layout],
+        ) -> dict[str, weight_policy.Residence]:
+            return weight_policy.stage(
                 layouts,
                 budget,
                 orders={
@@ -2158,6 +2155,21 @@ class WeightResidency:
                     if c.last_passes != 1 or row.repeats.get(tag, 0) > 1
                 },
             )
+
+        # Every component keeps its grain while the budget holds each one's floor at it: a
+        # larger component never takes the room a smaller one needs to stay whole (H3's
+        # turbo LoRA beside its DiT, run 2947). Only when those floors do not fit does a
+        # component that can still refine count at its finer floor, and move to it.
+        layouts = {key: replace(c.planned, fine=None) for key, c in components.items()}
+        try:
+            try:
+                placed = stage(layouts)
+            except weight_policy.BelowFloor:
+                layouts = {
+                    key: c.planned if opened[key][0]._refinable(c) else layouts[key]
+                    for key, c in components.items()
+                }
+                placed = stage(layouts)
         except weight_policy.BelowFloor as exc:
             if exc.component in opened and opened[exc.component][0]._refine(exc.component):
                 return self._plan(budget, resume)
