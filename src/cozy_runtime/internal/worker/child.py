@@ -93,10 +93,6 @@ HELLO_SECONDS = 10.0
 #: 100 GB context whose teardown takes a minute is moving the whole time and is waited for.
 RECLAIM_SAMPLE_SECONDS = 0.25
 
-#: The kernel closes a dying process's descriptors before its exit is reportable; one that
-#: closed its seam without dying is waited for this long, then reported with no cause.
-EXIT_SETTLE_SECONDS = 2.0
-
 #: The weight plane copies to the device from read-only file mappings.
 SIGBUS_MEANS = (
     ": a read fault on mapped weights (a disk read error, or a store object changed under "
@@ -336,7 +332,10 @@ class Executor:
             contextlib.suppress(OSError),
             contextlib.closing(proctree.observe_process_exit(self.process)) as exited,
         ):
-            if exited.wait(EXIT_SETTLE_SECONDS):
+            # Its seam closed before its exit is reportable. One that is exiting is waited for,
+            # however long its device teardown takes; one that only closed its seam is not.
+            if proctree.dying(self.process):
+                exited.wait()
                 status = proctree.peek_child_exit(self.process)
         if status is None:
             status = self.exit_status

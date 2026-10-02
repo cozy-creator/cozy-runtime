@@ -67,14 +67,15 @@ def test_exit_peek_reads_how_a_child_ended_without_reaping(sig: signal.Signals |
     observer = proctree.observe_process_exit(process)
     ended = -sig if sig else 23
     try:
-        assert not observer.wait(0.05)
+        assert not proctree.dying(process)
         assert proctree.peek_child_exit(process) is None, "still running"
         assert child.stdin is not None
         if sig:
             os.kill(child.pid, sig)
         else:
             child.stdin.close()
-        assert observer.wait(5)
+        observer.wait()
+        assert proctree.dying(process)
         status = proctree.peek_child_exit(process)
         assert status is not None and os.waitstatus_to_exitcode(status) == ended
         # Still the same unreaped zombie: the peek repeats, and the one real reap answers.
