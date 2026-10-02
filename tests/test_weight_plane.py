@@ -624,14 +624,12 @@ def test_h3_with_its_loras_computes_on_the_pinned_tier(tmp_path: Path) -> None:
 
 
 @on_card
-@pytest.mark.parametrize("grouped", [False, True])
-def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path, grouped: bool) -> None:
+def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
     """Run 2549: H3's DiT with a request LoRA under the turbo LoRA ran out of device memory.
     Here its weights get a budget far below their size, and mid-denoise another allocation
     takes the room its activations had. It still computes the fully resident run's bits: the
     turbo LoRA's stage shares the DiT's budget, blocks stream, and the allocation that fails
-    unmaps weights and runs again. One GPU of a group (run 2589) recovers op by op: its
-    block holds the group's collectives and never runs twice."""
+    unmaps weights and runs again."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
     dit, turbo = h3_models(weights, tmp_path, "h3")
@@ -639,30 +637,15 @@ def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path, grouped:
     layout: weight_policy.Layout = dit.residency.components["fl2va_dit"].layout
     overlay = turbo.residency.components["fl2va_turbo"].layout.total
     weights.set_budget(1 << 30)
-    torch.cuda.reset_peak_memory_stats()
-    before = torch.cuda.memory_allocated()
-    resident = h3_denoise(weights, dit, turbo, inputs, lambda step: None)
-    peak = torch.cuda.max_memory_allocated() - before
+    resident, peak = h3_reference(weights, dit, turbo, inputs)
     assert weights.facts().streamed["fl2va_dit"].resident_blocks == len(layout.blocks)
 
     spare = 6 * layout.largest  # what an out-of-memory retry can still unmap
     weights.set_budget(weight_policy.floor(layout) + overlay + spare)
     assert weights.budget < (layout.total + overlay) // 2
     was = weights.facts()
-    weights.grouped = grouped
-    calls = {"block": 0}
-    block = dit.stack.transformer_blocks[0].attn
-    block.register_forward_hook(lambda *_: calls.__setitem__("block", calls["block"] + 1))
-
-    def squeeze(step: int) -> Any:
-        if step != 1:
-            return None
-        torch.cuda.empty_cache()
-        free, _ = torch.cuda.mem_get_info()
-        return torch.empty(free - peak // 2, dtype=torch.uint8, device="cuda")
-
     try:
-        paged = h3_denoise(weights, dit, turbo, inputs, squeeze)
+        paged = h3_denoise(weights, dit, turbo, inputs, squeezing(1, peak))
     finally:
         torch.cuda.empty_cache()
     now = weights.facts()
@@ -670,7 +653,66 @@ def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path, grouped:
     assert now.h2d_bytes > was.h2d_bytes and now.evictions > was.evictions
     assert now.oom_retries > was.oom_retries
     assert same(list(resident), list(paged))
-    assert not grouped or calls["block"] == 3  # once per evaluation: no block ran again
+
+
+def h3_reference(weights: Weights, dit: Any, turbo: Any, inputs: dict[str, Any]) -> Any:
+    """The fully resident denoise and its activation peak."""
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    resident = h3_denoise(weights, dit, turbo, inputs, lambda step: None)
+    return resident, torch.cuda.max_memory_allocated() - before
+
+
+def squeezing(at: int, peak: int) -> Any:
+    """Before evaluation `at`, another allocation takes all but half the activations' room."""
+
+    def squeeze(step: int) -> Any:
+        if step != at:
+            return None
+        torch.cuda.empty_cache()
+        free, _ = torch.cuda.mem_get_info()
+        return torch.empty(free - peak // 2, dtype=torch.uint8, device="cuda")
+
+    return squeeze
+
+
+@on_card
+def test_one_gpu_of_a_group_never_runs_a_block_twice(tmp_path: Path) -> None:
+    """Run 2589 (2x A40): a block that ran out of memory was run again, but in a group it
+    holds collectives the other GPUs are already in, and the group hung. One GPU of a group
+    runs an unmeasured stage's first pass at the floor and grows at the second by what it
+    measured; an op that still runs out of memory unmaps idle weights and that op runs again."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    dit, turbo = h3_models(weights, tmp_path, "h3")
+    (tmp_path / "idle").mkdir()
+    idle = load(weights, write_checkpoint(tmp_path / "idle")[0], "idle")
+    inputs = h3_inputs("cuda")
+    layout: weight_policy.Layout = dit.residency.components["fl2va_dit"].layout
+    weights.set_budget(1 << 30)
+    resident, peak = h3_reference(weights, dit, turbo, inputs)
+    calls = {"block": 0}
+    block = dit.stack.transformer_blocks[0].attn
+    block.register_forward_hook(lambda *_: calls.__setitem__("block", calls["block"] + 1))
+
+    weights.grouped = True
+    weights.activation.clear()  # a fresh executor's first request: nothing measured
+    grown = h3_denoise(weights, dit, turbo, inputs, lambda step: None)
+    assert same(list(resident), list(grown)) and calls["block"] == 3
+    assert weights.facts().streamed["fl2va_dit"].resident_blocks == len(layout.blocks)
+    assert weights.facts().h2d_bytes > 0  # the first pass streamed every block
+
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    run(idle, x, passes=1)
+    held = weights.resident_bytes(idle.residency.components["stack"])
+    retries = weights.facts().oom_retries
+    try:
+        squeezed = h3_denoise(weights, dit, turbo, inputs, squeezing(1, peak))
+    finally:
+        torch.cuda.empty_cache()
+    assert weights.facts().oom_retries > retries
+    assert weights.resident_bytes(idle.residency.components["stack"]) < held
+    assert same(list(resident), list(squeezed)) and calls["block"] == 6
 
 
 @on_card

@@ -220,6 +220,9 @@ class Weights:
         self.grouped = False
         #: blocks in their forward now (their leases pin their own weights)
         self.running = 0
+        #: a group's stage whose activations are not measured yet runs its first pass at the
+        #: floor, and is placed again at its second with what that pass measured
+        self.growing = False
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
 
@@ -1528,7 +1531,15 @@ class WeightResidency:
             if method not in weights.activation:
                 # Activations first, and these are not measured yet: the open stages' own
                 # weights are all the plane keeps; every other byte stays torch's until it is.
-                budget = min(budget, sum(c.layout.total for _, _, c in weights.opened().values()))
+                # One GPU of a group keeps only a streaming window for the first pass (its
+                # blocks cannot run again after an out-of-memory), then grows by what it measured.
+                own = [component.layout for _, _, component in weights.opened().values()]
+                weights.growing = weights.grouped
+                budget = min(
+                    budget,
+                    # a window of two blocks: one more than the floor, so nothing refines
+                    sum(o.common + 2 * o.largest if weights.grouped else o.total for o in own),
+                )
             try:
                 self._plan(budget)
             except self._budget_error as exc:
@@ -1566,6 +1577,28 @@ class WeightResidency:
             with suppress(ValueError):
                 self.weights.open.remove((self, *self.active))
         self.active = None
+        if not self.weights.open:
+            self.weights.growing = False
+
+    def _grow(self) -> None:
+        """A group's unmeasured stage begins its second pass: place the open stages again
+        with the activations the first pass measured, inside what the driver has now."""
+        weights = self.weights
+        weights.growing = False
+        for row, method, _ in weights.open:
+            if row.baseline >= 0:
+                peak = accel.peak_allocated(weights.torch, weights.kind) - row.baseline
+                weights.activation[method] = max(weights.activation.get(method, 0), peak, 0)
+        method = weights.open[-1][1]
+        budget = min(weights.stage_budget(method), weights.driver_budget(method))
+        if budget <= weights.applied:
+            return  # no room to grow into: the floor's plan carries on
+        for _, _, component in weights.opened().values():
+            close_cursor(component)
+        try:
+            self._plan(budget)
+        except self._budget_error as exc:
+            raise self._shortfall(method, 0, budget, str(exc)) from None
 
     def _entered(self, method: str) -> None:
         weights = self.weights
@@ -1900,7 +1933,10 @@ class WeightResidency:
                 raise self._poison(exc) from exc
 
         def attempt(*args: Any, **kwargs: Any) -> Any:
+            passes = component.passes
             self._observe(component, region.index)
+            if weights.growing and component.passes == 2 > passes:
+                self._grow()
             versions = _versions(args, kwargs)
             while True:
                 stream = weights.stream()
