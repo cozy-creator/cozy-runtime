@@ -242,6 +242,9 @@ class Weights:
         self.growing = False
         #: the Worker's mid-call budget (`budget_cell`): read at every block boundary
         self.cell: budget_cell.Cell | None = None
+        #: asks the Worker for `bytes` free on this GPU from its other tenants (`DeviceRoom`);
+        #: None in a process without a Worker
+        self.room: Callable[[int], None] | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
 
@@ -356,7 +359,7 @@ class Weights:
         with self._recovery(self, seen):
             yield seen
 
-    def make_room(self, need: int, operands: Sequence[object]) -> None:
+    def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
         """An op outside every block ran out of device memory: unmap `need` bytes of weights,
         idle ones first. An operand that is itself a weight must still be mapped after."""
         read = [
@@ -394,7 +397,7 @@ class Weights:
                 "device_shortfall",
                 f"an allocation of {need} B needed the room of the weights the same op reads",
             )
-        self.progressed(before, need)
+        self.progressed(before, need, op)
 
     def allocatable(self) -> int:
         """Device bytes torch can allocate now: the driver's free plus its own idle cache."""
@@ -403,15 +406,19 @@ class Weights:
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )
 
-    def progressed(self, before: int, need: int) -> None:
-        """An out-of-memory retry runs again only when unmapping gave the driver memory back:
-        the same failure, retried at the same free bytes, churns maps on a full card."""
+    def progressed(self, before: int, need: int, op: str = "") -> None:
+        """An out-of-memory retry runs again only when memory came back: first this process's
+        own unmapping, else the Worker's (its other tenants on this GPU give theirs). The same
+        failure retried at the same free bytes would churn maps on a full card."""
         after = self.allocatable()
+        if after <= before and self.room is not None:
+            self.room(need + weight_policy.MARGIN)
+            after = self.allocatable()
         if after <= before:
             raise ResidencyRefusal(
                 "device_shortfall",
-                f"an allocation of {need} B: unmapping weights gave no device memory back "
-                f"({after} B allocatable before and after)",
+                f"{op or 'an allocation'} of {need} B: nothing on this GPU could give device "
+                f"memory back ({after} B allocatable before and after)",
             )
 
     def drain(self) -> None:
@@ -738,7 +745,7 @@ def _recovery_type(torch: ModuleType) -> type:
                         raise
                     need = _requested(exc)
                 # outside `except`, so the failed op's frames are gone
-                self.weights.make_room(need, (*args, *kwargs.values()))
+                self.weights.make_room(need, (*args, *kwargs.values()), str(func))
 
     return Recovery
 
