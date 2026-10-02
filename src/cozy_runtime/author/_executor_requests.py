@@ -166,6 +166,15 @@ class HostTier(_Request, frozen=True, kw_only=True, tag="host_tier"):
     memfd: int = -1
 
 
+class ModelSourceRead(_Request, frozen=True, kw_only=True, tag="model_source_read"):
+    """One selected model source blob; header/assets/objects cross through readonly fds."""
+
+    manifest: str
+    role: Literal["header", "asset", "object"]
+    name: str = ""
+    length: Annotated[int, msgspec.Meta(ge=0)] = 0
+
+
 class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
     """The executor's plane budget cell (`internal/budget_cell.py`; its memfd follows this
     request): the Worker lowers a running call's budget through it, at a block boundary."""
@@ -202,6 +211,7 @@ class StageExit(_Request, frozen=True, kw_only=True, tag="stage_exit"):
 type _Tagged = (
     DeviceRoom
     | HostTier
+    | ModelSourceRead
     | BudgetCell
     | StageEnter
     | StageExit
@@ -252,6 +262,20 @@ class Tier(Answer, frozen=True, kw_only=True):
 
     held: bool = False
     descriptor: int = -1
+
+
+class SourceBlob(Answer, frozen=True, kw_only=True):
+    """A model byte identity followed by one readonly regular descriptor, never a socket."""
+
+    sha256: str = ""
+    length: Annotated[int, msgspec.Meta(ge=0)] = 0
+    descriptor: int = -1
+
+    def __post_init__(self) -> None:
+        if self.ok and (len(self.sha256) != 64 or any(
+            c not in "0123456789abcdef" for c in self.sha256
+        )):
+            raise ValueError("source blob identity requires lowercase SHA-256")
 
 
 class StageGo(Answer, frozen=True, kw_only=True):

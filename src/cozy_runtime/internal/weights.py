@@ -1229,7 +1229,8 @@ class PlaneBackend:
         before construction."""
         self.expected = {name: frozenset(keys) for name, keys in sets.items()}
         for name in sets:
-            self.leases.acquire(name)
+            if self.checkpoints[name].source_provider is None:
+                self.leases.acquire(name)
         self.stats["leases"] = self.leases.document()
 
     def fit(self, walked: Census, *, encoded_leaves: str) -> Mapping[str, object] | None:
@@ -1400,6 +1401,10 @@ class PlaneBackend:
         self.components.clear()
         self.sources.clear()
         self.leases.release()
+        providers = {id(c.source_provider): c.source_provider for c in self.checkpoints.values()
+                     if c.source_provider is not None}
+        for provider in providers.values():
+            provider.close()
 
     # -- construction internals
 
@@ -1504,11 +1509,17 @@ class PlaneBackend:
         digest = canonical.digest({"manifest": checkpoint.manifest_id, "regions": ids})
         tiers = None if fine else self.tiers
         with store_refusals(f"registering {name}"):
-            source = self.sources.get(checkpoint.manifest_id)
+            source_key = (checkpoint.manifest_id if checkpoint.source_provider is None else
+                          f"{checkpoint.manifest_id}/{name}")
+            source = self.sources.get(source_key)
             if source is None:
-                source = self.sources[checkpoint.manifest_id] = plane.source(
-                    weights.plane, checkpoint.store, self.leases.take(name)
-                )
+                if checkpoint.source_provider is not None:
+                    source = checkpoint.source_provider.source(weights.plane,
+                                                               checkpoint.manifest_id, plan)
+                else:
+                    assert checkpoint.store is not None
+                    source = plane.source(weights.plane, checkpoint.store, self.leases.take(name))
+                self.sources[source_key] = source
             held = tiers.ask(key, digest) if tiers is not None else None
             try:
                 ws = weights.plane.register(key, source, plan, ids, host_fd=held)

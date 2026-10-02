@@ -36,6 +36,7 @@ from cozy_runtime.internal.encoding import (
     aliases,
     measure_runtime,
 )
+from cozy_runtime.internal.model_sources import ModelSourceProvider
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.resolution import (
     PlanRefusal,
@@ -324,12 +325,19 @@ class Checkpoint:
     verified per object in Python; none of that survives, and none of it needs to.
     """
 
-    def __init__(self, root: str | Path, manifest_id: str) -> None:
+    def __init__(self, root: str | Path, manifest_id: str, *,
+                 source_provider: ModelSourceProvider | None = None) -> None:
         self.root = str(root)
         self.manifest_id = manifest_id
+        self.source_provider = source_provider
         with store_refusals(f"opening manifest {manifest_id[:23]}"):
-            self.store = store(self.root)
-            header = self.store.manifest(manifest_id)["header"]
+            self.store: Store | None
+            if source_provider is None:
+                self.store = store(self.root)
+                header = self.store.manifest(manifest_id)["header"]
+            else:
+                self.store = None
+                header = source_provider.header(manifest_id)
             if header is None:
                 raise _refuse("checkpoint_unreadable", f"{manifest_id}: no cozytensors header")
             self.header_bytes = header
@@ -463,6 +471,9 @@ class Checkpoint:
 
     def acquire(self) -> ReadLease:
         """A verified read lease over this snapshot's CozyTensors runtime closure."""
+        if self.store is None:
+            raise FillRefusal("machine-owned source has no local catalog lease",
+                              code="model_source_unavailable")
         with store_refusals(f"acquiring a lease on {self.manifest_id[:23]}"):
             lease = self.store.acquire_cozytensors(self.manifest_id)
         return lease
@@ -472,6 +483,8 @@ class Checkpoint:
         names = sorted(self.header["assets"])
         if not names:
             return {}
+        if self.source_provider is not None:
+            return self.source_provider.assets(self.manifest_id, names)
         with (
             store_refusals(f"reading model assets from {self.manifest_id[:23]}"),
             self.acquire() as lease,
