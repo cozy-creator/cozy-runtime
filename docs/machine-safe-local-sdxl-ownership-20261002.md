@@ -13,3 +13,7 @@
   candidate worktrees/environments remain retained. No arbitrary peer floor/environment switches.
 - Root alone operates local GPU/inference/NVML/processes/rentals. DCE owns coherent native
   TensorFS safety integration/CPU packaging; this task performs CPU source checks/packaging only.
+- Draft PR: https://github.com/cozy-creator/cozy-runtime/pull/1111
+- Coherent native checkpoint822c950/.3.91 plus descriptor/mmap API; CPU41 checks pass.
+- Pure SDK100 wheelSHA464faea80fead21657827821960e16b797fcecc4be4e806ee32ec11eec84c5d0.
+- All4 safety commits verified ancestors; current safety code unchanged by source diff.

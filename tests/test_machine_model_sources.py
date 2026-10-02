@@ -22,7 +22,12 @@ from cozy_runtime.author._executor_requests import (
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import Load
 from cozy_runtime.internal.fill import Checkpoint
-from cozy_runtime.internal.model_sources import CAPABILITY, BrokeredModelSources, available
+from cozy_runtime.internal.model_sources import (
+    CAPABILITY,
+    BrokeredModelSources,
+    VerificationLimits,
+    available,
+)
 from cozy_runtime.internal.seam import Channel, SeamError
 
 
@@ -188,3 +193,137 @@ def test_malformed_source_answer_closes_received_capability(tmp_path: Path):
     finally:
         local.close()
         remote.close()
+
+
+def test_single_worker_oversized_object_keeps_full_checks_and_coalesces(tmp_path: Path):
+    _store, manifest, lease, files, header_file, data = owner_model(tmp_path)
+    requests = []
+    caller = threading.get_ident()
+
+    def exchange(request, into):
+        assert threading.get_ident() == caller  # all control exchanges stay serialized here
+        assert into is SourceBlob
+        requests.append(request)
+        path = header_file if request.role == "header" else files[request.name]
+        body = path.read_bytes()
+        return SourceBlob(ok=True, sha256=hashlib.sha256(body).hexdigest(), length=len(body),
+                          descriptor=os.open(path, os.O_RDONLY | os.O_CLOEXEC))
+
+    before = len(list(Path("/proc/self/fd").iterdir()))
+    provider = BrokeredModelSources(exchange, limits=VerificationLimits(1, 1, 1024))
+    checkpoint = Checkpoint("", manifest, source_provider=provider)
+    plan = checkpoint.read_plan([("linear", "weight")], 4096, ["linear"])
+    p = native_plane.Plane(devices=[], readers=1, direct_io=False)
+    source = provider.source(p, manifest, plan)
+    second = provider.source(p, manifest, plan)
+    assert sum(request.role == "object" for request in requests) == 1
+    ws = p.register("linear", source, plan, [["linear/weight"]])
+    p.set_pinned_budget(ws.nbytes)
+    p.want(ws, "pinned").wait()
+    with mmap.mmap(ws.host_fd, ws.nbytes, access=mmap.ACCESS_READ) as mapping:
+        part = ws.parts[0]
+        assert mapping[part["offset"]:part["offset"] + part["nbytes"]] == data
+    ws.close()
+    del source, second
+    provider.close()
+    p.close()
+    assert len(list(Path("/proc/self/fd").iterdir())) == before
+    lease.release()
+
+
+def test_parallel_verification_rejects_corrupt_grant_and_closes_all_received_fds(tmp_path: Path):
+    _store, manifest, lease, files, header_file, _data = owner_model(tmp_path)
+    original = next(iter(files))
+    wrong = tmp_path / "corrupt-immutable-export"
+    wrong.write_bytes(b"x" * files[original].stat().st_size)
+    wrong.chmod(0o444)
+    received = []
+
+    def exchange(request, into):
+        assert into is SourceBlob
+        path = header_file if request.role == "header" else wrong
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        received.append(fd)
+        sha256 = (hashlib.sha256(header_file.read_bytes()).hexdigest()
+                  if request.role == "header" else request.name.removeprefix("sha256:"))
+        return SourceBlob(ok=True, sha256=sha256, length=path.stat().st_size, descriptor=fd)
+
+    before = len(list(Path("/proc/self/fd").iterdir()))
+    provider = BrokeredModelSources(exchange, limits=VerificationLimits(2, 4, 128 << 20))
+    checkpoint = Checkpoint("", manifest, source_provider=provider)
+    plan = checkpoint.read_plan([("linear", "weight")], 4096, ["linear"])
+    p = native_plane.Plane(devices=[], readers=1, direct_io=False)
+    with pytest.raises(native_plane.Invalid, match="identity"):
+        provider.source(p, manifest, plan)
+    assert not provider.descriptors
+    assert len(list(Path("/proc/self/fd").iterdir())) == before
+    for fd in received:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    provider.close()
+    p.close()
+    lease.release()
+
+
+def test_parallel_failure_drains_pending_imports_without_partial_cache(tmp_path: Path):
+    store = tensorfs.Store.init(tmp_path / "owner")
+    plain = next(value for name, value in tensorfs.seed_digests() if name == "plain/1")
+    count, length = 6, 8 << 20
+    payloads = {f"w{n}": n.to_bytes(8, "little") + b"w" * (length - 8) for n in range(count)}
+    targets = {"many": {"drop": [], "add": {
+        key: {"logical_dtype": "u8", "shape": [length], "encoding": plain,
+              "parts": {"value": {"dtype": "u8", "shape": [length]}}}
+        for key in payloads
+    }}}
+    digest = "sha256:" + hashlib.sha256(b"bounded pending native failure fixture").hexdigest()
+    writer = store.begin_derived(digest, 1, {}, targets, {}, [("many", key) for key in payloads],
+                                 count * length * 2, work_fingerprint=digest)
+    for key, body in payloads.items():
+        writer.add_part("many", key, "value", io.BytesIO(body))
+    manifest = writer.commit()["manifest"]["sha256"]
+    header = store.manifest(manifest)["header"]
+    lease = store.acquire_cozytensors(manifest)
+    exported = {}
+    for object_id, object_length in lease.objects:
+        body = bytearray(object_length)
+        lease.read_into(object_id, object_length, 0, object_length, body)
+        path = tmp_path / object_id.removeprefix("sha256:")
+        path.write_bytes(body)
+        path.chmod(0o444)
+        exported[object_id] = path
+    corrupted = tmp_path / "bad-export"
+    checkpoint_header = tmp_path / "header"
+    checkpoint_header.write_bytes(header)
+    checkpoint_header.chmod(0o444)
+    offered = []
+
+    def exchange(request, into):
+        assert into is SourceBlob
+        if request.role == "header":
+            path, sha = checkpoint_header, hashlib.sha256(header).hexdigest()
+        else:
+            if not offered:
+                corrupted.write_bytes(b"z" * request.length)
+                corrupted.chmod(0o444)
+            path = corrupted if not offered else exported[request.name]
+            sha = request.name.removeprefix("sha256:")
+            offered.append(request)
+        return SourceBlob(ok=True, sha256=sha, length=path.stat().st_size,
+                          descriptor=os.open(path, os.O_RDONLY | os.O_CLOEXEC))
+
+    baseline = len(list(Path("/proc/self/fd").iterdir()))
+    provider = BrokeredModelSources(exchange, limits=VerificationLimits(2, 4, 32 << 20))
+    checkpoint = Checkpoint("", manifest, source_provider=provider)
+    plan = checkpoint.read_plan([("many", key) for key in payloads], 4 << 20, ["many"])
+    p = native_plane.Plane(devices=[], readers=1, direct_io=False)
+    with pytest.raises(native_plane.Invalid, match="identity"):
+        provider.source(p, manifest, plan)
+    assert len(offered) >= 2  # more than the failing import was actually submitted
+    assert not provider.descriptors
+    assert len(list(Path("/proc/self/fd").iterdir())) == baseline
+    # A retained exception traceback cannot keep completed-but-unpublished mappings alive.
+    assert not any(str(tmp_path) in row and row.split()[1] == "r--p"
+                   for row in Path("/proc/self/maps").read_text().splitlines())
+    provider.close()
+    p.close()
+    lease.release()
