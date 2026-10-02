@@ -202,6 +202,10 @@ class GroupHardware(msgspec.Struct, frozen=True, kw_only=True):
     devices: tuple[str, ...]
 
 
+#: An executor capability: it applies `Load.pinned_bytes` before its weights register.
+LOAD_PINNED = "load_pinned/1"
+
+
 class Load(Command, frozen=True, kw_only=True, tag="load"):
     """Construct and fill one construction: one model (`binding`) or several (`models`)."""
 
@@ -223,6 +227,9 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: The worker grants a turn per component-use scope (`stage/1`): `StageEnter` before each
     #: scope plans, `StageExit` after it. Older workers never set it.
     stages: bool = False
+    #: The pinned host tier's budget (`LOAD_PINNED`), applied before any weight set registers,
+    #: so a fill never pins past it; -1: none, the executor sizes its tier from the host.
+    pinned_bytes: int = -1
 
     def single(self) -> ModelLoad:
         return ModelLoad(

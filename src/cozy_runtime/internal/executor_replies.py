@@ -123,8 +123,8 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     disk_copy_bytes: int = 0
     mapped_copy_bytes: int = 0
     #: bytes this executor process read from storage since it started (`/proc/self/io`;
-    #: TensorFS 0.3.92, always 0 before): a gate compares a delta across a return
-    disk_read_bytes: int = 0
+    #: TensorFS 0.3.92): a gate compares a delta across a return. -1: not counted
+    disk_read_bytes: int = -1
     late: int = 0
     stall_ns: int = 0
     misses: int = 0

@@ -585,8 +585,11 @@ class Weights:
         if self.host_only:
             self._bind_host(component)
             return
+        share = self.host_share()
         if self.pinned < 0:
-            self._pin(max(self.host_share(), 0))
+            self._pin(max(share, 0))
+        else:  # the Worker's budget, inside what the host has now
+            self._pin(self.pinned if share < 0 else min(self.pinned, share))
         self._fill(component)
 
     def _bind_host(self, component: Component) -> None:
