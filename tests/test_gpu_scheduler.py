@@ -1165,14 +1165,18 @@ def test_a_tenants_budget_leaves_what_an_executor_waiting_to_start_wants(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """While an executor waits to start on a GPU, a call that takes its first turn there is
-    budgeted around the room that executor wants, so the room it waits for is not taken."""
+    budgeted around the room that executor wants, so the room it waits for is not taken. A
+    stage whose activations were never measured gets no grant: it measures them first."""
     _shot, by_lane = _warm_shot(machine, monkeypatch)
     worker = machine.worker
     q0 = by_lane["lane-0"]
     lane = worker._lane_of(q0)
     if not memory.plane_capable(worker.hosted[q0].supervision.current):
         return
-    need = memory.StageNeed(entrypoint="generate")
+    unmeasured = worker.memory.start(q0, memory.StageNeed(entrypoint="generate"), lane.ordinals)
+    worker.memory.end(q0)
+    assert isinstance(unmeasured, memory.Budget) and unmeasured.plane_bytes == -1
+    need = memory.StageNeed(entrypoint="generate", activation_bytes=0)
     machine.free["0"] = 30 * GiB  # type: ignore[attr-defined]
 
     def budget() -> dict[int, int]:

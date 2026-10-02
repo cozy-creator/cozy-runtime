@@ -40,6 +40,7 @@ from cozy_runtime.internal.stages import StageKind, StageSample  # noqa: E402
 from cozy_runtime.internal.weights import Weights  # noqa: E402
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptRefusal  # noqa: E402
 from cozy_runtime.internal.worker.stage_scheduler import Grant, Want  # noqa: E402
+from cozy_runtime.protocol import worker_pb2 as pb  # noqa: E402
 from test_gpu_scheduler import VIRTUAL, GiB, Machine, driverless  # noqa: E402
 from test_weight_plane import HIDDEN, Stack, load, write_checkpoint  # noqa: E402
 
@@ -300,7 +301,11 @@ def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
     def load(_attempt: AttemptRecord) -> None:
         loads.append(bool(worker.stages.view()["demands"].get("X#1")))
         if len(loads) == 1:
-            raise AttemptRefusal("device_out_of_memory", "CUDA out of memory")
+            raise AttemptRefusal(
+                "device_out_of_memory",
+                "CUDA out of memory",
+                cause=pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+            )
 
     monkeypatch.setattr(worker, "_ensure_once", load)
     monkeypatch.setattr(worker, "_rebuild_lane", lambda lane, slot: None)

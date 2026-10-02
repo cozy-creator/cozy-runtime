@@ -6139,6 +6139,10 @@ class Worker:
             reply = {"ok": False, "code": "executor_gone_during_prepare", "detail": str(exc)}
         took = (time.perf_counter() - began) * 1000
         if not reply.get("ok"):
+            if reply.get("plane") is not None:
+                # What a refused load left mapped is cuttable: the next grant must see it.
+                with self.control_lock:
+                    self.memory.observe(tenant.row(), executor, reply)
             self._load_refused(tenant, executor, group, label, reply, took)
             code = str(reply.get("code") or "construction_load_refused")
             raise AttemptRefusal(

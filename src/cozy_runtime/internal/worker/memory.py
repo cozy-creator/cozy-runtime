@@ -440,6 +440,16 @@ class MemoryManager:
             self.note("residency", f"{lane.lane_id}: unreadable; {tenant!r} derives its budget")
             return Budget(evicted=tuple(evicted))
         ledger.observe_devices(lane.device_facts(read))
+        if banked is None:
+            # Activations unmeasured: the executor keeps only the stage's own weights and
+            # measures them first; a grant here would hand their room to weights.
+            self.note(
+                "residency",
+                f"{lane.lane_id}: {tenant!r} starts {why} ({stage.entrypoint} "
+                f"{stage.cell or '-'}, activations unmeasured): it derives its budget; "
+                f"cut {evicted or 'nobody'}",
+            )
+            return Budget(evicted=tuple(evicted))
         # The grant must hold the weights' floor itself: that is the refusal line.
         least = floor_bytes(ledger.layouts, stage.components)
         # What an executor waiting to start beside it wants stays free, down to the floor.
@@ -462,11 +472,11 @@ class MemoryManager:
             return Shortfall(
                 needed=dict.fromkeys(available, floor), available=available, detail=detail
             )
-        if evicted or banked is None:
+        if evicted:
             self.note(
                 "residency",
                 f"{lane.lane_id}: {tenant!r} starts {why} ({stage.entrypoint} {stage.cell or '-'}, "
-                + (f"{grow} B of activations" if banked is not None else "activations unmeasured")
+                + f"{grow} B of activations"
                 + "): budget "
                 + ", ".join(f"{self._gpu(lane, o)} {b} B" for o, b in sorted(budget.items()))
                 + f"; cut {evicted or 'nobody'}",
