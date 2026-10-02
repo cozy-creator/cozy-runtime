@@ -1353,7 +1353,8 @@ def _memory_cgroups() -> Iterator[tuple[Path, tuple[str, ...], str]]:
             limits, usage = ("memory.high", "memory.max"), "memory.current"
         else:
             leaf = _cgroup_v1_controller_path("memory")
-            top = next(parent for parent in (leaf, *leaf.parents) if parent.name == "memory")
+            # the controller's mount; a container's own cgroup is mounted there itself
+            top = next((p for p in (leaf, *leaf.parents) if p.name == "memory"), leaf)
             limits, usage = ("memory.limit_in_bytes",), "memory.usage_in_bytes"
     except (ContainmentUnavailable, OSError, StopIteration):
         return
