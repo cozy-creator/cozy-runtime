@@ -398,7 +398,7 @@ class MemoryManager:
         device), for a load or an older executor that asks for room."""
 
         def short(o: int, memory: DeviceMemory) -> bool:
-            return need is None or memory.free_bytes < need[o]
+            return need is None or memory.free_bytes < need.get(o, 0)
 
         measured, _ = self._give(lane, slot, short, why)
         if need is not None and (
@@ -408,7 +408,7 @@ class MemoryManager:
                 "residency",
                 f"{lane.lane_id}: no idle tenant is left to evict for {slot!r} on {why}: "
                 + ", ".join(
-                    f"{self._gpu(lane, o)} needs {need[o]} B free, has "
+                    f"{self._gpu(lane, o)} needs {need.get(o, 0)} B free, has "
                     f"{measured[o].free_bytes} of {measured[o].total_bytes}"
                     for o in sorted(left)
                 ),
@@ -544,20 +544,25 @@ class MemoryManager:
 
     def _victim(self, slot: str, short: set[int], tried: set[str]) -> Victim | None:
         """The next tenant to give room on `short`: a dead one, else the least recently used
-        idle one holding weights there. Never `slot`, never one in its turn, never twice."""
+        idle one holding weights there, else a busy one outside its turn (a load, an attempt's
+        tail) that can be cut mid-call through its budget cell. Never `slot`, never one in its
+        turn (a computing stage keeps its room), never twice."""
         dead: list[Victim] = []
         idle: list[Victim] = []
+        busy: list[Victim] = []
         for other, lane, row in self.tenants(short):
             executor = row.supervision.current if row.supervision is not None else None
             if other == slot or other in tried or executor is None:
                 continue
-            if executor.busy() and executor.alive() and not executor.poisoned:
-                continue  # mid-call (an attempt's tail, a load): a cut would wait for it
             if executor.poisoned or not executor.alive():
                 dead.append((other, lane, row, executor))
-            elif other not in self.active and holds(row, executor, short & set(lane.ordinals)):
+            elif other in self.active or not holds(row, executor, short & set(lane.ordinals)):
+                continue
+            elif not executor.busy():
                 idle.append((other, lane, row, executor))
-        for tier in (dead, idle):
+            elif executor.cell is not None:
+                busy.append((other, lane, row, executor))
+        for tier in (dead, idle, busy):
             if tier:
                 return min(tier, key=lambda item: item[2].last_used)
         return None
@@ -567,6 +572,8 @@ class MemoryManager:
         if executor.poisoned or not executor.alive():
             dead = executor.poisoned or "exited"
             self.reclaim(other, executor, f"reclaimed for {slot!r} on {why}: {dead}")
+        elif executor.busy() and executor.cell is not None:
+            self._cut_running(victim, slot, why)
         elif plane_capable(executor):
             self._cut_plane(victim, slot, why)
         else:
@@ -581,6 +588,24 @@ class MemoryManager:
             return
         lane = next(lane for lane in self.lanes if lane.ordinals and tenant in lane.rows)
         self._cut_plane((tenant, lane, row, executor), tenant, why)
+
+    def _cut_running(self, victim: Victim, slot: str, why: str) -> None:
+        """A busy tenant outside its turn gives its device bytes at its next block boundary,
+        down to what its open stages need. Its call goes on; its next grant restores it."""
+        other, lane, row, executor = victim
+        applied = executor.cut(0)
+        if applied is None:  # its call ended first: idle now, cut as one
+            if executor.alive() and not executor.busy():
+                self._cut_plane(victim, slot, why)
+            return
+        if row.ledger.plane is not None:
+            committed = min(row.ledger.plane.committed_bytes, applied)
+            row.ledger.plane = msgspec.structs.replace(row.ledger.plane, committed_bytes=committed)
+        self.note(
+            "residency",
+            f"{lane.lane_id}: {other!r} (epoch {executor.epoch} pid {executor.pid}) cut mid-call "
+            f"to {applied} B for {slot!r} on {why}",
+        )
 
     def _cut_plane(self, victim: Victim, slot: str, why: str) -> None:
         """Budget 0: the plane unmaps at once and keeps the bytes in its host tier (lowered to

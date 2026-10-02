@@ -34,7 +34,14 @@ import signed_claims
 from conftest import gpu_hidden
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.internal import accel, child_env, package_interface, proctree, weight_policy
+from cozy_runtime.internal import (
+    accel,
+    budget_cell,
+    child_env,
+    package_interface,
+    proctree,
+    weight_policy,
+)
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
@@ -1190,6 +1197,48 @@ def test_a_tenants_budget_leaves_what_an_executor_waiting_to_start_wants(
     assert budget() == {0: 29 * GiB - weight_policy.MARGIN}
     worker.memory.wanted[q0] = {0: 5 * GiB}
     assert budget() == {0: 29 * GiB - weight_policy.MARGIN}, "its own want is not held against it"
+
+
+@needs_executor
+def test_a_busy_tenant_outside_its_turn_gives_room_through_its_budget_cell(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An executor that runs out of device memory mid-call asks for room (`DeviceRoom`). A
+    tenant busy outside its turn (a load, an attempt's tail) gives it at its next block
+    boundary through its budget cell; a tenant in its turn is computing and keeps its room."""
+    shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    h3, q0 = by_lane["lane-0+1+2+3"], by_lane["lane-0"]
+    busy = worker.hosted[q0].supervision.current
+    assert busy is not None
+    cell, fd = budget_cell.Cell.create()
+    executor_side = budget_cell.Cell(fd)
+    os.close(fd)
+    busy.cell = cell
+    assert busy._calls.acquire(blocking=False)  # a call holds its seam: it is busy
+    applied: list[int] = []
+
+    def block_boundaries() -> None:  # the executor's side: one ask, applied at a boundary
+        while (wanted := executor_side.poll()) is None:
+            time.sleep(0.005)
+        applied.append(wanted + 512 * (1 << 20))  # never below its open stages' floor
+        executor_side.acknowledge(applied[-1])
+
+    group = worker._lane_of(h3)
+    machine.free["0"] = GiB  # type: ignore[attr-defined]
+    worker.memory.active.add(q0)
+    worker.memory.make_room(group, h3, {0: 4 * GiB}, "an op of the shot")
+    assert not applied, "a tenant in its turn is computing: it keeps its room"
+    worker.memory.active.discard(q0)
+    boundary = threading.Thread(target=block_boundaries, daemon=True)
+    boundary.start()
+    worker.memory.make_room(group, h3, {0: 4 * GiB}, "an op of the shot")
+    boundary.join(30)
+    busy._calls.release()
+    assert applied == [512 * (1 << 20)]
+    steps = [e.step for e in worker.activity]
+    assert [s for s in steps if f"{q0!r}" in s and "cut mid-call to 536870912 B" in s], steps
+    assert machine.granted(shot) == [0, 1, 2, 3]
 
 
 _RANK = """
