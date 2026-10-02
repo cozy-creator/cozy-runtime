@@ -482,6 +482,40 @@ def test_a_block_that_writes_its_inputs_recovers_op_by_op(card: Any) -> None:
 
 
 @on_card
+def test_budgets_cut_and_raised_while_streaming_stay_exact(card: Any) -> None:
+    """Xid 31 (a copy engine wrote into an unmapped address): the Worker's cuts land at block
+    boundaries while the cursor's copies are in flight, and every cut closes the ring and maps
+    a new one. Hundreds of them, alternately tight and roomy, compute the resident bits; run
+    under `compute-sanitizer --tool memcheck` this is the reproduction."""
+    from cozy_runtime.internal import budget_cell
+
+    weights = card.weights
+    model = load(weights, card.checkpoint, "churn")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    reference = run(model, x, passes=1)
+    cell, fd = budget_cell.Cell.create()
+    worker = budget_cell.Cell(fd)
+    os.close(fd)
+    weights.cell = cell
+    budgets = (tight(model), 1 << 30, model.residency.components["stack"].layout.common)
+    out = []
+    model.residency.admit("run", ("stack",))
+    try:
+        with torch.inference_mode():
+            for i in range(200):
+                worker.ask(budgets[i % len(budgets)])
+                out.append(model.stack(x))
+        torch.cuda.synchronize()
+    finally:
+        model.residency.release("run", ("stack",))
+        weights.cell = None
+        cell.close()
+        worker.close()
+    assert all(same(reference, [o]) for o in out)
+
+
+@on_card
 def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
     """The 3 GiB freeze (W5, 21:53): an allocation retried about 40 times in 1.3 s while the
     driver's free bytes never grew, each retry unmapping weights, closing and remapping the
