@@ -1291,23 +1291,11 @@ def rss_bytes(pid: int) -> int:
     return -1
 
 
-def _page_cache(stat: Path, prefix: str) -> int:
-    """A cgroup's file pages on its LRU lists (`memory.stat`), 0 when unreadable."""
-    names = (f"{prefix}inactive_file", f"{prefix}active_file")
-    try:
-        rows = (line.split() for line in stat.read_text().splitlines())
-        return sum(int(row[1]) for row in rows if len(row) == 2 and row[0] in names)
-    except (OSError, ValueError):
-        return 0
-
-
 def available_host_bytes() -> int:
     """The LIVE host budget, from the cgroup when there is one, else MemAvailable.
 
     §3.2's host-RAM rule: re-read at every grant, because a budget fixed at boot describes
-    a machine nobody else is on. -1 means UNREADABLE, never 0. A cgroup's page cache is
-    charged to it and reclaimable, as it is in MemAvailable: a pod that has just pulled its
-    weights would otherwise read as having no memory left.
+    a machine nobody else is on. -1 means UNREADABLE, never 0.
     """
     _linux_only("available_host_bytes")
     if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
@@ -1321,8 +1309,7 @@ def available_host_bytes() -> int:
             v2_limit = (cgroup / "memory.max").read_text().strip()
             if v2_limit != "max":
                 current = int((cgroup / "memory.current").read_text().strip())
-                cached = _page_cache(cgroup / "memory.stat", "")
-                return max(int(v2_limit) - current + cached, 0)
+                return max(int(v2_limit) - current, 0)
         except (OSError, StopIteration, ValueError):
             pass
     else:
@@ -1332,7 +1319,7 @@ def available_host_bytes() -> int:
             current = int((memory / "memory.usage_in_bytes").read_text().strip())
             # cgroup v1 represents "unlimited" as a page-rounded value near LONG_MAX.
             if 0 < v1_limit < (1 << 60):
-                return max(v1_limit - current + _page_cache(memory / "memory.stat", "total_"), 0)
+                return max(v1_limit - current, 0)
         except (ContainmentUnavailable, OSError, ValueError):
             pass
     try:

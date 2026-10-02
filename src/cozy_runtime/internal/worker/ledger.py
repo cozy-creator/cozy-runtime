@@ -93,10 +93,10 @@ METHODS: dict[str, tuple[str, str]] = {
     ),
     "host_available": (
         "measured",
-        "the LIVE host budget: cgroup memory.max minus memory.current plus its page cache when "
-        "this process is in a bounded cgroup, else /proc/meminfo MemAvailable - re-read every "
-        "time it is reported, because a host budget fixed at boot is a claim about a machine "
-        "nobody else is on",
+        "the LIVE host budget: cgroup memory.max minus memory.current when this process is "
+        "in a bounded cgroup, else /proc/meminfo MemAvailable - re-read every time it is "
+        "reported, because a host budget fixed at boot is a claim about a machine nobody "
+        "else is on",
     ),
     "device_reserved": (
         "measured",
