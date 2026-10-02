@@ -221,6 +221,86 @@ def test_the_pinned_tier_holds_every_part_where_the_layout_says(tmp_path: Path) 
     assert same(run(model, x, passes=1), [expected])
 
 
+def test_a_stored_tensor_the_code_does_not_build_is_skipped_and_never_read(
+    tmp_path: Path,
+) -> None:
+    """Qwen's text encoder stopped building `lm_head` and its checkpoint still stores it
+    (1.24 GB). The fit skips it with one warning, and nothing reads or maps its bytes: its
+    object leaves the store before the fill, which still lands every built weight."""
+    weights = Weights(torch, torch.device("cpu"), "cpu")
+    weights.set_budget(-1, pinned=1 << 30)
+    generator = torch.Generator().manual_seed(7)
+    values: dict[str, Any] = {"embed": torch.rand(HIDDEN, generator=generator) + 0.5}
+    for index in range(BLOCKS):
+        for name in ("proj", "out"):
+            values[f"blocks.{index}.{name}.weight"] = (
+                torch.randn(HIDDEN, HIDDEN, generator=generator) / HIDDEN**0.5
+            )
+        values[f"blocks.{index}.norm"] = torch.rand(HIDDEN, generator=generator) + 0.5
+    head = torch.randn(2 * HIDDEN, HIDDEN, generator=generator)
+    checkpoint = store_component(tmp_path, "stack", {**values, "lm_head.weight": head})
+    built = {key: value.half() for key, value in values.items()}
+    rows = checkpoint.rows("stack")
+
+    backend = PlaneBackend.for_script(
+        {"stack": checkpoint}, rows, weights=weights, construction="skip", release="plane-test/1"
+    )
+    with serving_substrate("cpu", Observations()):
+        module = Stack()
+    holder = SimpleNamespace(components={"stack": module})
+    walked = census(holder)
+    # As the executor does: completeness is over every stored key, and the fit takes the
+    # skipped ones out of it.
+    backend.expect({"stack": tuple(row.key for row in rows)})
+    verdict = backend.fit(walked, encoded_leaves="refuse")
+    assert verdict is not None and verdict["ok"], verdict
+    assert verdict["ignored"] == ["stack/lm_head.weight"]
+    skipped = head.numel() * 2
+    assert verdict["warnings"] == [
+        "1 stored tensor(s) the code does not build were skipped, not loaded: "
+        f"{skipped} B (stack/lm_head.weight)"
+    ]
+
+    # A read or a map of the skipped tensor would need its object: it is gone.
+    everything = checkpoint.read_plan([("stack", row.name) for row in rows], 1 << 24, ("stack",))
+    objects = {
+        item["object"].removeprefix("sha256:")
+        for item in everything.items()
+        if item["what"] == "stack/lm_head.weight#value"
+    }
+    assert objects, "the skipped tensor is stored as objects"
+    for hex_ in objects:
+        (tmp_path / "store" / "blobs" / hex_[:2] / hex_[2:4] / hex_).unlink()
+
+    live = backend.materialize(holder, walked)
+    for destination in walked.destinations:
+        backend.fill(destination.key, destination.spec, live[destination.key])
+    backend.commit()
+    component = backend.components["stack"]
+    # The pinned tier is the one a checkpoint without that tensor gets: no room for it.
+    plain = load(weights, store_component(tmp_path / "plain", "stack", values), "plain")
+    assert component.ws.nbytes == plain.backend.components["stack"].ws.nbytes
+    assert all(
+        weight.row.name != "lm_head.weight"
+        for region in component.regions
+        for weight in region.weights
+    )
+    assert_pinned(weights, component, built)
+    filled = sum(value.numel() * 2 for value in built.values())
+    ready = {row.name: row.host_ready_bytes for row in plane.stats(weights.plane).sets}
+    assert ready["skip/stack"] == filled, ready
+    model = SimpleNamespace(
+        stack=module,
+        residency=WeightResidency(weights, backend.components, {"run": ("stack",)}),
+    )
+    x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(3)).half()
+    reference = Stack()
+    reference.load_state_dict(built)
+    with torch.inference_mode():
+        expected = reference(x)
+    assert same(run(model, x, passes=1), [expected])
+
+
 def test_an_unbound_weight_is_parked_as_packages_know_it() -> None:
     """Run 2570: H3's finite-weight check read the storage of a text-encoder weight that was
     streaming (not on the card) and failed. A weight with no plane bytes bound has a zero-byte
