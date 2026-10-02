@@ -751,8 +751,7 @@ def test_a_restarted_runtime_holds_the_releases_it_prepared(
         assert kept is not None
         (kept / "malformed.json").write_bytes(b"{")
         (kept / "obsolete.json").write_bytes(
-            b'{"format":"cozy.worker.v1.PlacementSet/1",'
-            b'"placements":[{"package_interface":{}}]}'
+            b'{"format":"cozy.worker.v1.PlacementSet/1","placements":[{"package_interface":{}}]}'
         )
         machine.worker.shutdown()
         machine.boot()
@@ -1081,6 +1080,10 @@ def test_a_roots_catalog_slots_resolve_beside_each_other(
     finally:
         catalog.close()
     assert [row["parameter"] for row in rows] == ["model", "second"]
+    # A lane-pinned override of a second slot (H3's `turbo_lora`) is exactly that checkpoint.
+    assert [(r["repository"], r["release"], r["lane"], r["manifest"]) for r in rows] == [
+        (PACKAGE, RELEASE, LANE, {"digest": published.manifest, "length": 1})
+    ] * 2
     assert [urlsplit(path).path for path in catalog.reads] == [
         "/v1/models/resolve",
         "/v1/models/resolve",
@@ -1563,7 +1566,14 @@ def test_warm_serving_keeps_ordered_lora_views_and_reuses_the_same_preparation(
                     source_component="adapter",
                     scale=scale,
                 )
-            receipt, _ = submit(machine, request)
+            receipt, progress = submit(machine, request)
+            # Creator records each new answer as a `machine preparation` stage of the run.
+            recorded = [line for i, line in enumerate(progress) if line not in progress[:i][-1:]]
+            assert [line for line in recorded if line.startswith("adapter_")] == [
+                f"adapter_{index}: local/reuse-{'first' if artifact == first else 'second'} "
+                f"{artifact.manifest.digest} scale {scale} on transformer"
+                for index, (artifact, scale) in enumerate(stack)
+            ], recorded
             prepared = machine.executions.preparation(OWNER, receipt.request_id)
             placement = next(iter(prepared["installations"].values()))["placement"]
             models = {row["id"]: row for row in placement["models"]}
@@ -1578,6 +1588,10 @@ def test_warm_serving_keeps_ordered_lora_views_and_reuses_the_same_preparation(
             views[name] = models[slot["components"][0]["model_id"]]["manifest"]["digest"]
             assert (views[name] != base.manifest.digest) == bool(stack)
             assert preparations == expected_preparations, f"{name}: unexpected preparation count"
+        # The composition Runtime 0.18.100's canary candidate (55e5ce82) served for this stack.
+        assert views["stack"] == (
+            "sha256:14b8c0fd2191dc429831dc3e8a36348b7ff8aab213c89dccda47b7ff87cee397"
+        )
         assert views["repeat"] == views["stack"]
         assert views["reverse"] != views["stack"] and views["zero"] != views["stack"]
         assert views["baseline-after"] == views["baseline"]

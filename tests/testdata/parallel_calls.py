@@ -45,6 +45,7 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         *,
         check: bool = False,
         fail: bool = False,
+        fail_leader: bool = False,
         step: int | None = None,
     ) -> Any:
         assert in_gated_call()
@@ -57,6 +58,8 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
             return value
         if fail and torch.distributed.get_rank() > 0:
             raise ValueError("follower failed before joining the collective")
+        if fail_leader and torch.distributed.get_rank() == 0:
+            raise RuntimeError("GPU 0 ran out of memory")
         result = value.detach().cpu().clone() + torch.distributed.get_rank()
         torch.distributed.all_reduce(result)
         return result
@@ -89,6 +92,11 @@ class ModelCalls(Model[object]):
     def fail_before_collective(self) -> None:
         with torch.no_grad():
             self.block(torch.ones(1), fail=True)
+
+    @uses_components("block", "overlay")
+    def fail_on_leader(self) -> None:
+        with torch.no_grad():
+            self.block(torch.ones(1), fail_leader=True)
 
 
 def collective_model() -> ModelCalls:
@@ -501,6 +509,9 @@ def main() -> None:
                 assert refused is None, refused
         elif name == "run":
             reply = executor.run(command)
+        elif name == "attention":
+            # Holding rank 0's pin (`hosts`) or restoring the prepared selection.
+            reply = {"ok": True, "rank": args.rank, **({"hosts": {}} if "pin" in command else {})}
         elif name == "hello":
             reply = executor.hello()
             if args.before_plane:  # a Runtime from before the weight plane says no such thing
