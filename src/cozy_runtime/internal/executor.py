@@ -3217,7 +3217,10 @@ class Executor:
                 raise InvalidRequest(detail, code="attention_gpu_divergence")
             yield
         finally:
-            self._followers_attention()
+            # A broken group is rebuilt whole: no follower is left to restore, and a refusal
+            # here would replace the failure that broke it.
+            if not self.group.broken:
+                self._followers_attention()
 
     @staticmethod
     def _capture_options(

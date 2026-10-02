@@ -281,6 +281,50 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         assert not torch.cuda.is_initialized()
 
 
+def test_a_leader_failure_in_a_mirrored_call_stays_the_attempts_error(tmp_path: Path) -> None:
+    """Run 2436: rank 0 failed inside a mirrored forward, then restoring the followers'
+    attention on the broken group raised `group_broken` in its place. The original error
+    survives and the group's verdict names it."""
+    fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
+
+    def launch(module_argv: list[str], fd: int) -> spawn.Child:
+        return spawn.spawn_follower(
+            python=sys.executable,
+            module_argv=[str(fixture), *module_argv[2:]],
+            inherit_fd=fd,
+            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        )
+
+    group = RankGroup(degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    model: Any = collective_model()
+    roots = {"block": model.block, "overlay": model.overlay, "spare": model.spare}
+    ours, theirs = socket.socketpair()
+    leader: Any = Executor(Channel(ours), tmp_path, world=2)
+    leader.device_kind = "cpu"
+    leader.group = group
+    try:
+        group.spawn()
+        group.form(torch, {})
+        leader.pg = group.pg
+        mirror_component(
+            model.block,
+            name=("fixture", "block"),
+            prepared={("fixture", key): (model, root) for key, root in roots.items()},
+            group=group,
+            spool=lambda: tmp_path / "attempt",
+        )
+        with pytest.raises(RuntimeError) as failed:
+            with leader._ranks_attention("", SimpleNamespace(hosts={})):
+                model.fail_on_leader()
+        assert type(failed.value) is RuntimeError and str(failed.value) == "GPU 0 ran out of memory"
+        assert group.broken.endswith("failed: RuntimeError: GPU 0 ran out of memory"), group.broken
+    finally:
+        group.close()
+        ours.close()
+        theirs.close()
+    assert not torch.distributed.is_initialized()
+
+
 @pytest.mark.parametrize("before_plane", [False, True])
 def test_the_plane_budget_reaches_the_followers_that_answer_it(
     tmp_path: Path, before_plane: bool

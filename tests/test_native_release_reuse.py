@@ -12,7 +12,6 @@ import re
 import subprocess
 import tarfile
 import tomllib
-import urllib.request
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
@@ -28,6 +27,14 @@ def run(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
 
 
+def _fetch(url: str) -> bytes:
+    """curl races a host's addresses. urllib tries them in turn, so on a box whose IPv6 route
+    is dead it waits out every IPv6 address before its first IPv4 one, minutes per request."""
+    done = subprocess.run(("curl", "-fsSL", url), capture_output=True, check=False)
+    assert done.returncode == 0, done.stderr.decode()
+    return done.stdout
+
+
 @pytest.fixture(scope="session")
 def donor(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """The public donor publish.yaml pins, fetched once and checked against that pin."""
@@ -36,15 +43,10 @@ def donor(tmp_path_factory: pytest.TempPathFactory) -> Path:
     pinned = re.search(r"--native-sha256 ([0-9a-f]{64})", workflow)
     assert filename and pinned, "publish.yaml no longer names its native donor"
     version = filename.group(1).split("-")[1]
-    with urllib.request.urlopen(f"https://pypi.org/pypi/cozy-runtime/{version}/json") as response:
-        (url,) = [
-            row["url"]
-            for row in json.load(response)["urls"]
-            if row["filename"] == filename.group(1)
-        ]
+    listing = json.loads(_fetch(f"https://pypi.org/pypi/cozy-runtime/{version}/json"))
+    (url,) = [row["url"] for row in listing["urls"] if row["filename"] == filename.group(1)]
     path = tmp_path_factory.mktemp("donor") / filename.group(1)
-    with urllib.request.urlopen(url) as response:
-        path.write_bytes(response.read())
+    path.write_bytes(_fetch(url))
     assert hashlib.sha256(path.read_bytes()).hexdigest() == pinned.group(1)
     return path
 

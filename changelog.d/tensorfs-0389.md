@@ -1,0 +1,1 @@
+Hugging Face and Civitai ingests (`cozy model upload`) download like Hub pulls: the TensorFS floor is 0.3.89. Members are fetched as parallel ranged requests, a crawling or silent request is restarted instead of holding the ingest, and an interrupted ingest resumes from the chunks it recorded, each re-checked against its SHA-256.

@@ -1,0 +1,1 @@
+H3 states its attention length at intake for full-length (362-frame, 15 s) fl2va clips too: the statement's layout reads under the seconds ceiling `denoise` uses, so Sol's length compile starts during text conditioning instead of at the first dense step.

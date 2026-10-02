@@ -150,6 +150,7 @@ def test_captured_child_stack_builds_real_cpu_native_view_and_exact_census(tmp_p
         (selected,) = machine_model_defaults.select(
             worker, "owner", call, target, {}, model_choices=choices
         )
+        notes: list[str] = []
         prepared = machine_model_overrides.apply(
             worker,
             selected,
@@ -158,9 +159,15 @@ def test_captured_child_stack_builds_real_cpu_native_view_and_exact_census(tmp_p
             hub="",
             owner="proof",
             credentials={},
-            note=lambda *_: None,
+            note=lambda line, *_: notes.append(line),
             check=lambda: None,
         )
+        # Every applied adapter is recorded: ref, manifest digest, strength and target.
+        assert notes == [
+            f"adapter_0: proof/first {first.manifest.digest} scale 0.5 on transformer",
+            f"adapter_1: proof/second {second.manifest.digest} scale -0.25 on transformer",
+            "preparing model adapters",
+        ]
         same = machine_model_overrides.apply(
             worker,
             selected,

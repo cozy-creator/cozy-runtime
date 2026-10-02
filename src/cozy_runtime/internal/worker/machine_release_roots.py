@@ -13,6 +13,7 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -114,6 +115,8 @@ class _Job:
     moved: int = 0
     total: int = 0
     noted: float = 0.0  # when a byte count last woke the waiting submitter
+    #: stages the submitter has not been answered yet, oldest first: none is coalesced away
+    stages: deque[str] = field(default_factory=lambda: deque(maxlen=64))
     done: bool = False
     result: _Prepared | None = None
     error: BaseException | None = None
@@ -140,6 +143,9 @@ class ReleaseRoots:
         self.jobs: dict[tuple[str, str], _Job] = {}
         # Install facts by Hub and release, read at that catalog: immutable, read once.
         self.facts: dict[tuple[str, str], pb.DeferredInstallation] = {}
+        # Same-org index wheels, by Hub, that the Hub publishes no package for: dependencies
+        # a release carries, not callees. Read once per Runtime.
+        self.carried: set[tuple[str, str]] = set()
 
     def submit(
         self, owner: str, request: pb.MachineExecutionSubmit, context: ServicerContext
@@ -176,6 +182,10 @@ class ReleaseRoots:
                     daemon=True,
                 ).start()
             self._wait(job, context)
+            if job.stages:
+                stage = job.stages.popleft()
+                latest = stage == job.progress and not job.stages
+                raise Preparing(stage, *((job.moved, job.total) if latest else (0, 0)))
             if not job.done:
                 raise Preparing(job.progress, job.moved, job.total)
             del self.jobs[identity]
@@ -196,7 +206,7 @@ class ReleaseRoots:
         if not context.add_callback(leave):
             leave()  # the RPC already ended: its callback will never run
         seen = job.version
-        while not job.done and job.version == seen and not gone.is_set():
+        while not job.done and not job.stages and job.version == seen and not gone.is_set():
             self.changed.wait()
 
     def _note(self, job: _Job, progress: str, moved: int = 0, total: int = 0) -> None:
@@ -207,6 +217,8 @@ class ReleaseRoots:
                 (moved, total) == (job.moved, job.total) or now - job.noted < 1
             ):
                 return
+            if progress != job.progress:
+                job.stages.append(progress)
             job.progress, job.moved, job.total, job.noted = progress, moved, total, now
             job.version += 1
             self.changed.notify_all()
@@ -328,17 +340,25 @@ class ReleaseRoots:
             lock = self._locked(key, hub, held, own)
             for locked in machine_release_catalog.callees(package, lock):
                 callee = self._served(locked, hub)
+                if callee is None:
+                    continue
                 edges.add((key, callee))
                 pending.append(callee)
         return installed, sorted(edges)
 
-    def _served(self, locked: str, hub: str) -> str:
+    def _served(self, locked: str, hub: str) -> str | None:
         """A callee release a caller's lock names is a floor, not a pin: the newest release
         its Hub's catalog publishes at or above it serves the call, read once per package
-        until the controller that publishes names it to `forget`."""
+        until the controller that publishes names it to `forget`. None for a wheel the Hub
+        publishes no package for."""
         package, _, release = locked.partition("@")
+        if (hub, package) in self.carried:
+            return None
         try:
             served = self._newest(hub, package)
+        except machine_release_catalog.NotPublished:
+            self.carried.add((hub, package))
+            return None
         except WorkspaceRefusal:
             return locked
         return _key(package, served) if Version(served) > Version(release) else locked

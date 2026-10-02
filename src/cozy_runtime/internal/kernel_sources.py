@@ -271,7 +271,10 @@ RECIPES: dict[str, Recipe] = {
             unit_bytes=6 << 30,
             # Upstream updates the submodule with git, and off CUDA 12.8 downloads NVIDIA's
             # 12.6/12.8 compilers over this machine's toolkit; build with the toolkit present.
+            # It hard-codes C++17 and reads no append variable. Only `flash_api.cpp`, a host
+            # compiler unit, includes Torch; the CUDA units keep upstream's C++17.
             replace=(
+                ("hopper/setup.py", '"cxx": ["-O3", "-std=c++17"', '"cxx": ["-O3", "-std=c++20"'),
                 (
                     "hopper/setup.py",
                     'subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])',
