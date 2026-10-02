@@ -196,9 +196,13 @@ media = [
 # 0.3.82 hedges slow tail objects as fresh ranges (run 2322); 0.3.83 asks a wedged Hub again;
 # 0.3.84 carries the weight plane (`tensorfs.plane`) that executors load weights through.
 model-execution = ["tensorfs>=0.3.89,<0.4"]
+# peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
+# first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [
     "peft>=0.20,<0.21",
     "torch>=2.13",
+    "transformers>=5.16.1",
+    "tokenizers>=0.23.1",
 ]
 
 [[tool.mypy.overrides]]

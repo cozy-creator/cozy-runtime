@@ -414,7 +414,9 @@ dependencies = [
 [package.optional-dependencies]
 adapters = [
     { name = "peft" },
+    { name = "tokenizers" },
     { name = "torch" },
+    { name = "transformers" },
 ]
 assessment = [
     { name = "cozy-eval" },
@@ -487,6 +489,7 @@ requires-dist = [
     { name = "safetensors", marker = "extra == 'qwen-image21'", specifier = ">=0.8" },
     { name = "tensorfs", specifier = ">=0.3.89,<0.4" },
     { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.89,<0.4" },
+    { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "tokenizers", marker = "extra == 'minimax-h3'", specifier = ">=0.23.1" },
     { name = "tokenizers", marker = "extra == 'qwen-image21'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.13" },
@@ -496,6 +499,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'qwen-image21'", specifier = ">=2.13" },
     { name = "torchvision", marker = "extra == 'minimax-h3'", specifier = ">=0.28" },
     { name = "torchvision", marker = "extra == 'qwen-image21'", specifier = ">=0.28" },
+    { name = "transformers", marker = "extra == 'adapters'", specifier = ">=5.16.1" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40" },
     { name = "transformers", marker = "extra == 'minimax-h3'", specifier = ">=5.16.1" },
     { name = "transformers", marker = "extra == 'qwen-image21'", specifier = ">=5.17" },
