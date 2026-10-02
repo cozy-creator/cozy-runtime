@@ -25,7 +25,8 @@ Order matters and is the point:
    process, and nothing in the worker needs privilege to arrange it.
 6. **uid/gid** — dropped only when this process is privileged enough to drop them; on an
    unprivileged box there is nothing to drop and the step is a recorded no-op, never a
-   pretended success.
+   pretended success. Linux clears pdeathsig on credential changes: arm it again after
+   all transitions and re-check the expected parent before entering the executor.
 7. **signals** — default dispositions and an empty mask, so an inherited mask cannot make a
    child unkillable by the cancellation path.
 
@@ -47,6 +48,18 @@ def _fail(message: str, code: Exit) -> None:
     sys.stderr.write(f"trampoline: {message}\n")
     sys.stderr.flush()
     os._exit(int(code))
+
+
+def _arm_parent_death(expect_parent: int) -> None:
+    try:
+        proctree.arm_parent_death()
+    except proctree.ProcessTreeUnsupported as exc:
+        _fail(str(exc), Exit.structural)
+    except OSError as exc:
+        _fail(f"PR_SET_PDEATHSIG: {exc}", Exit.internal)
+    if expect_parent and os.getppid() != expect_parent:
+        # Arming covers future deaths, not a parent lost during setup/credential changes.
+        _fail("parent died before pdeathsig was armed", Exit.structural)
 
 
 def main(argv: list[str]) -> None:
@@ -99,15 +112,7 @@ def main(argv: list[str]) -> None:
             "child never becomes an executor",
             Exit.structural,
         )
-    try:
-        proctree.arm_parent_death()
-    except proctree.ProcessTreeUnsupported as exc:
-        _fail(str(exc), Exit.structural)
-    except OSError as exc:
-        _fail(f"PR_SET_PDEATHSIG: {exc}", Exit.internal)
-    if expect_parent and os.getppid() != expect_parent:
-        # The parent died in the window above; pdeathsig only covers FUTURE deaths.
-        _fail("parent died before pdeathsig was armed", Exit.structural)
+    _arm_parent_death(expect_parent)
     if scope_backend == "cgroup_v2":
         try:
             proctree.join_executor_cgroup(proctree.CgroupScope(cgroup_path, cgroup_inode))
@@ -134,6 +139,8 @@ def main(argv: list[str]) -> None:
                 "cannot become another user, and pretending it did is worse than refusing",
                 Exit.structural,
             )
+
+    _arm_parent_death(expect_parent)
 
     # Keep executor-directed signals out of the worker's group. Under process-tree
     # containment, stop before package import so the parent can fsync this exact birth and
