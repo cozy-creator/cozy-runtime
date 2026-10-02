@@ -140,6 +140,7 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptRecord,
     AttemptRefusal,
     AttemptSlot,
+    DeviceExhausted,
     Released,
     safe,
 )
@@ -5966,10 +5967,11 @@ class Worker:
         """LOAD the attempt's construction if its process has not built it, then ACTIVATE it.
 
         A turn-taking attempt loads beside whoever holds the GPU, and nothing of it has run, so
-        a device shortfall there is not yet this request's verdict. It loads again once a call
-        in flight beside it is past its stages, or when the shortfall changed since the last
-        try: the executor measured what it lacked (a first load's activations) and plans with
-        it. The same shortfall twice with nobody beside it is the request's own.
+        a device shortfall there is never a refusal for size. Every idle tenant of its GPU is
+        cut, least recently used first, and it loads again: once every call of another model
+        ahead of it has left, or when the shortfall changed since the last try (the executor
+        measured what it lacked and plans with it). The same shortfall twice, alone on a GPU
+        with every idle byte given, is FAILED with what did not fit (`DeviceExhausted`).
         """
         last = ""
         while True:
@@ -5979,19 +5981,23 @@ class Worker:
                 lane = self.lanes.by_id.get(attempt.lane_id)
                 if exc.code not in DEVICE_SHORTFALL_CODES or not attempt.stage_turns or not lane:
                     raise
-                waited = self.stages.await_clear(
-                    lane.ordinals,
-                    self._template(attempt.placement_id),
-                    lambda: bool(attempt.canceling) or self.stop.is_set(),
+                waited = self.stages.await_released(
+                    _demand(attempt), lambda: bool(attempt.canceling) or self.stop.is_set()
                 )
-                if attempt.canceling or self.stop.is_set() or (not waited and exc.detail == last):
+                if attempt.canceling or self.stop.is_set():
                     raise
+                if not waited and exc.detail == last:
+                    raise DeviceExhausted(
+                        exc.code,
+                        f"{exc.detail} (every idle byte of {execution_evidence.gpu_names(lane.entries)} was given)",
+                        cause=CAUSE.CAUSE_CODE_NO_CAPACITY,
+                    ) from exc
                 last = exc.detail
                 self.note(
                     "attempt",
                     f"{attempt.request_id}#{attempt.attempt} load was short of device memory "
                     + (
-                        "beside a call in flight; that call is past its stages"
+                        "beside a call of another model ahead of it; that call has left"
                         if waited
                         else "for a reason it had not met before"
                     )
@@ -5999,6 +6005,7 @@ class Worker:
                 )
                 self._rebuild_lane(lane, attempt.placement_id)
                 self.memory.unmap(attempt.placement_id, "its refused load")
+                self.memory.make_room(lane, attempt.placement_id, None, "its refused load")
 
     def _ensure_once(self, attempt: AttemptRecord) -> None:
         """One load and activation.
@@ -7324,9 +7331,7 @@ class Worker:
                 )
         except AttemptRefusal as exc:
             self.note("attempt", f"{key} refused at device entry: {exc.code}")
-            self.terminate(
-                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
-            )
+            self.terminate(attempt, self.engine.end_held, exc)
             return False
         return True
 
@@ -7387,9 +7392,7 @@ class Worker:
             self._ensure_construction(attempt)
         except AttemptRefusal as exc:
             self.note("attempt", f"{key} refused: {exc.code}")
-            self.terminate(
-                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
-            )
+            self.terminate(attempt, self.engine.end_held, exc)
             return False
         with self.control_lock:
             if self._admission_refused(attempt):

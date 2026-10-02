@@ -435,7 +435,11 @@ class MemoryManager:
         def usable(memory: DeviceMemory) -> int:
             return reach(memory.free_bytes, facts.committed_bytes, ledger.slack, grow)
 
-        read, evicted = self._give(lane, tenant, lambda o, m: want is None or usable(m) < want, why)
+        # A stage whose activations were never measured cannot say what it needs: every idle
+        # tenant of its GPUs gives room, least recently used first.
+        read, evicted = self._give(
+            lane, tenant, lambda o, m: banked is None or want is None or usable(m) < want, why
+        )
         if any(m.state != "measured" for m in read.values()):
             self.note("residency", f"{lane.lane_id}: unreadable; {tenant!r} derives its budget")
             return Budget(evicted=tuple(evicted))

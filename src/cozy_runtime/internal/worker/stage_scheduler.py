@@ -495,6 +495,32 @@ class StageScheduler:
             self.lock.wait_for(lambda: not flying() or stop())
             return not stop()
 
+    def await_released(self, key: str, stop: Callable[[], bool] = lambda: False) -> bool:
+        """Wait until every call of another template that is ahead of `key` on its GPUs and
+        took a turn there has left them (released, its whole attempt over). What a load short
+        of device memory waits on before its shortfall is its own; calls behind it cannot run
+        before it, so they are not waited for. False when none was there, or when `stop()`."""
+
+        def order(d: _Demand) -> tuple[int, int]:
+            return (self.roots.get(d.want.root, (UNROOTED, 0))[0], d.arrival)
+
+        def ahead() -> bool:
+            mine = self.demands.get(key)
+            return mine is not None and any(
+                d.granted
+                and d.want.template != mine.want.template
+                and set(d.gpus) & set(mine.gpus)
+                and order(d) < order(mine)
+                and not d.key.startswith("hold:")
+                for d in self.demands.values()
+            )
+
+        with self.lock:
+            if not ahead():
+                return False
+            self.lock.wait_for(lambda: not ahead() or stop())
+            return not stop()
+
     def _claimant(self, demand: _Demand) -> _Demand | None:
         """The earliest other call that asks, holds, prepares or waits on this one's GPUs."""
         return min(

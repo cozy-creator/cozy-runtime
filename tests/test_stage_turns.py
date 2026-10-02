@@ -38,7 +38,11 @@ from cozy_runtime.internal.executor_replies import PlaneFacts  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.stages import StageKind, StageSample  # noqa: E402
 from cozy_runtime.internal.weights import Weights  # noqa: E402
-from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptRefusal  # noqa: E402
+from cozy_runtime.internal.worker.attempts import (  # noqa: E402
+    AttemptRecord,
+    AttemptRefusal,
+    DeviceExhausted,
+)
 from cozy_runtime.internal.worker.stage_scheduler import Grant, Want  # noqa: E402
 from cozy_runtime.protocol import worker_pb2 as pb  # noqa: E402
 from test_gpu_scheduler import VIRTUAL, GiB, Machine, driverless  # noqa: E402
@@ -285,14 +289,17 @@ def test_a_device_start_waits_for_room_until_the_call_in_flight_is_past_its_stag
 def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Runs 2609 and 2628: Anima's first load ran out of device memory, beside a running SDXL
-    or alone, and its request was refused without ever starting. Nothing of it had run, so
-    the worker loads again: once the call in flight is past its stages, or when the shortfall
-    is one it had not met (its executor measured what it lacked). The same shortfall twice
-    with nobody beside it is the request's own."""
+    """Runs 2609 and 2628: Anima's first load ran out of device memory beside SDXL, and its
+    request was refused without ever starting; the same request a minute later ran. Nothing
+    of it had run, so the worker loads again: once every call of another model ahead of it
+    has left the GPU, or when the shortfall is one it had not met (its executor measured what
+    it lacked). The same shortfall twice with nobody ahead of it is the request's own."""
     worker = machine.worker
+    worker._turning["inst-b"] = True
     worker.stages.open_root("X", 1)
+    worker.stages.open_root("B", 2)
     worker.stages.want("X#1", Want(root="X", template=("inst-x", "b"), entrypoint="generate"))
+    worker.stages.want("B#1", Want(root="B", template=("inst-b", "b"), entrypoint="generate"))
     kind = worker.stages.kind("X#1", "denoise", ("unet",))
     assert worker.stages.enter("X#1", kind, lambda: False) is not None  # X computes
     _, attempt = tenant(machine, "tenant-b", "B")
@@ -318,7 +325,9 @@ def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
     while not loads:
         assert time.monotonic() < bound
         time.sleep(0.01)
-    assert loading.is_alive(), "it waits for the call in flight, and refuses nothing"
+    assert loading.is_alive(), "it waits for the call ahead of it, and refuses nothing"
+    worker.stages.exit("X#1", StageSample(kind=kind, wall_ns=1))
+    assert loading.is_alive(), "past its stages is not enough: its attempt's tail still runs"
     worker.stages.release("X#1")
     loading.join(30)
     assert loads == [True, False], "loaded again once X was past"
@@ -335,8 +344,26 @@ def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
         )
 
     monkeypatch.setattr(worker, "_ensure_once", short)
-    with pytest.raises(AttemptRefusal, match="a block ran out of memory"):
+    evicted: list[str] = []
+    monkeypatch.setattr(
+        worker.memory, "make_room", lambda lane, slot, need, why: evicted.append(slot) or {}
+    )
+    with pytest.raises(DeviceExhausted, match="a block ran out of memory"):
         worker._ensure_construction(attempt)
+    assert evicted == ["tenant-b", "tenant-b"], "every idle tenant is cut before each try"
+    statuses: list[int] = []
+    monkeypatch.setattr(
+        worker.engine, "outcome", lambda attempt, status, *rest: statuses.append(status)
+    )
+    worker.engine.end_held(
+        attempt, DeviceExhausted("device_shortfall", "x", cause=pb.CAUSE_CODE_NO_CAPACITY)
+    )
+    worker.engine.end_held(
+        attempt, AttemptRefusal("other", "x", cause=pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE)
+    )
+    assert statuses == [pb.OUTCOME_STATUS_FAILED, pb.OUTCOME_STATUS_REFUSED], (
+        "never REFUSED for size"
+    )
     assert tries == [
         "the decode ran out of memory",
         "a block ran out of memory",
