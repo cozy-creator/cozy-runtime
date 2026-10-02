@@ -367,6 +367,7 @@ class Weights:
             if region.bound is not None and region.bound <= pointer < region.bound + region.span
         ]
         accel.release_cached(self.torch, self.kind)
+        before = self.allocatable()
         if self.running:
             # Inside a block (one GPU of a group): nothing is re-placed under its lease. Other
             # weights leave, least recently used first; their blocks map them again as they run.
@@ -392,6 +393,25 @@ class Weights:
             raise ResidencyRefusal(
                 "device_shortfall",
                 f"an allocation of {need} B needed the room of the weights the same op reads",
+            )
+        self.progressed(before, need)
+
+    def allocatable(self) -> int:
+        """Device bytes torch can allocate now: the driver's free plus its own idle cache."""
+        memory = accel.allocation(self.torch, self.kind)
+        return memory["driver_free_bytes"] + max(
+            memory["reserved_bytes"] - memory["allocated_bytes"], 0
+        )
+
+    def progressed(self, before: int, need: int) -> None:
+        """An out-of-memory retry runs again only when unmapping gave the driver memory back:
+        the same failure, retried at the same free bytes, churns maps on a full card."""
+        after = self.allocatable()
+        if after <= before:
+            raise ResidencyRefusal(
+                "device_shortfall",
+                f"an allocation of {need} B: unmapping weights gave no device memory back "
+                f"({after} B allocatable before and after)",
             )
 
     def drain(self) -> None:
@@ -2101,18 +2121,19 @@ class WeightResidency:
         weights = self.weights
         opened = [component for _, _, component in weights.opened().values()]
         method = weights.open[-1][1] if weights.open else ""
+        before = weights.allocatable()
         for component in opened:
             close_cursor(component)
         # Mid-stage no component can refine (its leases hold the coarse regions).
         floor = sum(weight_policy.floor(replace(c.layout, fine=None)) for c in opened)
         if not weights.shrink(need, floor):
             raise self._shortfall(method, need, 0, "no weight bytes are left to unmap")
-        if not opened:
-            return
-        try:
-            self._plan(weights.applied, resume)
-        except self._budget_error as exc:
-            raise self._shortfall(method, need, weights.applied, str(exc)) from None
+        if opened:
+            try:
+                self._plan(weights.applied, resume)
+            except self._budget_error as exc:
+                raise self._shortfall(method, need, weights.applied, str(exc)) from None
+        weights.progressed(before, need)
 
     def _observe(self, component: Component, index: int) -> None:
         """Count passes and learn the blocks' execution order from a stage's first pass."""

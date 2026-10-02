@@ -482,6 +482,42 @@ def test_a_block_that_writes_its_inputs_recovers_op_by_op(card: Any) -> None:
 
 
 @on_card
+def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
+    """The 3 GiB freeze (W5, 21:53): an allocation retried about 40 times in 1.3 s while the
+    driver's free bytes never grew, each retry unmapping weights, closing and remapping the
+    stage's ring. A retry runs again only when unmapping gave memory back; else it fails."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "stuck")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    layout: weight_policy.Layout = model.residency.components["stack"].layout
+    weights.set_budget(tight(model))
+    run(model, x, passes=1)
+    calls = {"room": 0}
+    make_room = weights.make_room
+
+    def counted(need: int, operands: Any) -> None:
+        calls["room"] += 1
+        make_room(need, operands)
+
+    weights.make_room = counted
+    model.residency.admit("run", ("stack",))
+    try:
+        # far beyond the card: no amount of unmapping makes room for it
+        with (
+            weights.recovering(),
+            torch.inference_mode(),
+            pytest.raises(Exception, match=r"gave no device memory back|no weight bytes"),
+        ):
+            torch.empty(1 << 40, dtype=torch.uint8, device="cuda")
+    finally:
+        model.residency.release("run", ("stack",))
+        del weights.make_room
+        torch.cuda.empty_cache()
+    assert calls["room"] <= 1 + len(layout.blocks)
+    assert same(run(model, x, passes=1), run(model, x, passes=1))
+
+
+@on_card
 def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "oom")
