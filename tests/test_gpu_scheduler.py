@@ -34,10 +34,11 @@ import signed_claims
 from conftest import gpu_hidden
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.internal import accel, child_env, package_interface, proctree
+from cozy_runtime.internal import accel, child_env, package_interface, proctree, weight_policy
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.executor_replies import PlaneFacts
 from cozy_runtime.internal.readiness import RuntimeGPU
 from cozy_runtime.internal.worker import lanes, machine_model_defaults, memory
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
@@ -1158,6 +1159,36 @@ def test_a_waiting_tenant_is_short_only_while_its_gpu_lacks_room_for_it(
     assert not worker.memory.short(q0, need, gpus)
     machine.free["0"] = GiB  # type: ignore[attr-defined]
     assert worker.memory.short(q0, need, gpus)
+
+
+@needs_executor
+def test_a_tenants_budget_leaves_room_for_one_more_device_context(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resident tenant never fills its GPU: its plane budget leaves the room one more
+    executor's device context needs (the largest any executor there measured, and the
+    margin), or what an executor starting beside it wants when that is more."""
+    _shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    q0 = by_lane["lane-0"]
+    lane = worker._lane_of(q0)
+    if not memory.plane_capable(worker.hosted[q0].supervision.current):
+        return
+    mib = 1 << 20
+    lane.row(q0).ledger.plane = PlaneFacts(context_bytes=180 * mib)
+    need = memory.StageNeed(entrypoint="generate")
+    machine.free["0"] = 30 * GiB  # type: ignore[attr-defined]
+
+    def budget() -> dict[int, int]:
+        granted = worker.memory.start(q0, need, lane.ordinals)
+        worker.memory.end(q0)
+        assert isinstance(granted, memory.Budget)
+        return granted.vram
+
+    context = 180 * mib + weight_policy.MARGIN
+    assert budget() == {0: 30 * GiB - context - weight_policy.MARGIN}
+    worker.memory.wanted["machine-starting"] = {0: GiB}
+    assert budget() == {0: 29 * GiB - weight_policy.MARGIN}
 
 
 _RANK = """

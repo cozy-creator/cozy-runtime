@@ -5858,8 +5858,23 @@ class Worker:
         """Start every rank, admitting new model-bearing contexts through MemoryManager.
 
         Weightless starts keep their CPU overlap. Returns the actual startup
-        refusal, or "" once the process is started.
+        refusal, or "" once the process is started. A device out-of-memory at a start is the
+        room another call holds, not a verdict: once a turn there has ended, a fresh process
+        starts again, and nothing is recorded against the placement.
         """
+        while True:
+            since = self.stages.ended
+            refusal = self._start_once(tenant, executor, since)
+            if refusal is not None:
+                return refusal
+            fresh = self._own_executor(tenant)
+            if isinstance(fresh, str):
+                return fresh
+            executor = fresh
+
+    def _start_once(self, tenant: Tenant, executor: child.Executor, since: int) -> str | None:
+        """One start. None when it ran out of device memory beside another call whose turn has
+        since ended: the caller starts a fresh process."""
         lane = tenant.lane
         placement_id = tenant.placement.placement_id
         first = next(iter(tenant.bindings.values()), None)
@@ -5891,6 +5906,19 @@ class Worker:
         if not reply.get("ok"):
             self.monitor.end(f"start:{placement_id}", str(reply.get("code")))
             detail = str(reply.get("detail"))[:1024]
+            if reply.get("code") == "device_out_of_memory" and self.stages.await_turn(
+                lane.ordinals, self._template(tenant.slot), since, self.stop.is_set
+            ):
+                self.note(
+                    "boot",
+                    f"{placement_id!r} start ran out of device memory beside a running call; "
+                    "its turn ended, starting again",
+                )
+                try:
+                    tenant.supervision.retire_current(executor, "start out of device memory")
+                except ExecutorGone as exc:
+                    self.note("recovery", f"start refusal reclaim failed: {exc}")
+                return None
             for binding in tenant.bindings.values():
                 tenant.failed_bindings[binding.entrypoint_binding_digest] = (
                     f"{reply.get('code')}: {detail}"
@@ -6639,7 +6667,13 @@ class Worker:
                 return refuse("cancelled", "cancelled while waiting for its turn")
             return refuse("stage_unscheduled", f"{key} holds no GPU call to take a turn in")
         if not granted.start:
-            return StageGo(ok=True)
+            # Mid-call. An executor starting beside it may want room this stage can spare.
+            give = (
+                self.memory.give(slot, lane.ordinals, request.committed_bytes, request.components)
+                if granted.opened
+                else None
+            )
+            return StageGo(ok=True) if give is None else StageGo(ok=True, budget_bytes=give)
         need = self._stage_need(attempt, attempt.declared)
         budget = self.memory.start(slot, need, lane.ordinals, f"{key} {request.method}")
         if isinstance(budget, MemoryShortfall):
@@ -7001,17 +7035,42 @@ class Worker:
 
     @contextlib.contextmanager
     def _starting(self, lane: DeviceLane, slot: str) -> Iterator[None]:
-        """A new device context on `lane`: idle tenants there give room first. It starts beside
-        a running turn only when that turn's executor recovers from an out-of-memory at a block
-        boundary; otherwise it waits for a turn of its own."""
-        hold = (
-            contextlib.nullcontext()
-            if self.stages.quiet(lane.ordinals)
-            else self.stages.hold(lane.ordinals, f"executor startup {slot}")
-        )
-        with hold:
-            self.memory.make_room(lane, slot, None, "executor startup")
-            yield
+        """A new device context on `lane` starts only with room for it, measured now.
+
+        Idle tenants give it first. A call running there gives it at its next stage turn when
+        that costs its stage nothing (`memory.give`), else once it is past its stages; the
+        start waits for that turn to end, never for a clock, and never takes room from a stage
+        that is computing. With nobody left who could give, it starts and the driver decides.
+        Beside a whole turn in its device phase it waits for a turn of its own."""
+        need = self.memory.context_need(lane)
+        self.memory.wanted[slot] = need
+        try:
+            while need:
+                since = self.stages.ended
+                if self.memory.room(lane, slot, need, "executor startup"):
+                    break
+                template = self._template(slot)
+                if not self.stages.await_turn(lane.ordinals, template, since, self.stop.is_set):
+                    break
+            hold = (
+                contextlib.nullcontext()
+                if self.stages.quiet(lane.ordinals)
+                else self.stages.hold(lane.ordinals, f"executor startup {slot}")
+            )
+            with hold:
+                if not need:
+                    self.memory.make_room(lane, slot, None, "executor startup")
+                yield
+        finally:
+            self.memory.wanted.pop(slot, None)
+
+    def _template(self, slot: str) -> tuple[str, str]:
+        """The (installation, bindings) a tenant's calls are scheduled under."""
+        placement = self._placement_by_id(slot)
+        if placement is None:
+            return ("", "")
+        digest = placement.bindings_digest
+        return (placement.installation_id, documents.spell(digest) if digest else "")
 
     def _prefill(self, attempt: AttemptRecord) -> None:
         """While a staged attempt waits for its devices, its plane executor fills the host

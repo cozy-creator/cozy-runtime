@@ -32,8 +32,9 @@ from cozy_runtime.author._executor_requests import (  # noqa: E402
     StageGo,
     respond,
 )
-from cozy_runtime.internal import accel, plane  # noqa: E402
+from cozy_runtime.internal import accel, plane, weight_policy  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
+from cozy_runtime.internal.executor_replies import PlaneFacts  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.stages import StageKind, StageSample  # noqa: E402
 from cozy_runtime.internal.weights import Weights  # noqa: E402
@@ -218,6 +219,95 @@ def test_a_nested_scope_neither_ends_the_turn_nor_unmaps_the_outer_scopes_weight
     handler(StageExit(method="sample_turbo", components=("base",), yielded=True))
     waiting.join(30)
     assert granted == [Grant((0,), True)]
+
+
+def _driver(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """The GPU's free bytes as the driver reports them now, for the test to move."""
+    free = {"bytes": 80 * GiB}
+    monkeypatch.setattr(
+        accel,
+        "device_memory",
+        lambda entry, kind: accel.DeviceMemory("measured", free["bytes"], 80 * GiB),
+    )
+    return free
+
+
+def test_a_call_gives_room_at_its_next_turn_to_an_executor_starting_beside_it(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 2600/2601: SDXL filled a 6 GiB pool, the prepared Anima executor could not create
+    its CUDA context, and the running SDXL died. A call mid-flight is now answered, at its
+    next stage turn, with the budget that leaves a starting executor its room, as long as the
+    stage it is entering keeps its own weights."""
+    free = _driver(monkeypatch)
+    worker = machine.worker
+    worker._turning["inst-a"] = True
+    worker.stages.open_root("A", 1)
+    worker.stages.want("A#1", Want(root="A", template=("inst-a", "b"), entrypoint="generate"))
+    handler, _ = tenant(machine, "tenant-a", "A")
+    row = worker.lanes.by_id["lane-0"].row("tenant-a")
+    row.ledger.observe_construction(
+        {
+            "resident": {"encoder": GiB, "unet": 5 * GiB},
+            "declared_scopes": {"encode": ["encoder"], "denoise": ["unet"]},
+            "allocator_bytes": 6 * GiB,
+            "reserved_bytes": 6 * GiB,
+        }
+    )
+
+    def turn(committed: int) -> int:
+        go = handler(StageEnter(method="denoise", components=("unet",), committed_bytes=committed))
+        assert isinstance(go, StageGo) and go.ok
+        handler(StageExit(method="denoise", components=("unet",)))
+        return go.budget_bytes
+
+    turn(0)  # its first turn: its own budget
+    assert turn(6 * GiB) == -1, "nobody wants room: it keeps its budget"
+    mib = 1 << 20
+    worker.memory.wanted["tenant-b"] = {0: 300 * mib}
+    free["bytes"] = 10 * mib
+    assert turn(6 * GiB) == 6 * GiB + 10 * mib - 300 * mib, "the encoder's bytes go; the UNet stays"
+    assert turn(5 * GiB + 100 * mib) == -1, "it would take the UNet's own bytes: the start waits"
+    free["bytes"] = GiB
+    assert turn(6 * GiB) == -1, "the driver shows the room already"
+
+
+def test_a_device_start_waits_for_room_until_the_running_calls_turn_ends(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new device context starts only when the driver shows room for it. With a call
+    running on a full GPU it waits for that call's turn to end, not for a clock, and it
+    never starts into memory a computing stage holds."""
+    free = _driver(monkeypatch)
+    worker = machine.worker
+    worker._turning["inst-a"] = True
+    worker.stages.open_root("A", 1)
+    worker.stages.want("A#1", Want(root="A", template=("inst-a", "b"), entrypoint="generate"))
+    handler, _ = tenant(machine, "tenant-a", "A")
+    lane = worker.lanes.by_id["lane-0"]
+    mib = 1 << 20
+    row = lane.row("tenant-a")
+    row.model_bearing, row.ledger.plane = True, PlaneFacts(context_bytes=180 * mib)
+    assert worker.memory.context_need(lane) == {0: 180 * mib + weight_policy.MARGIN}
+    assert handler(StageEnter(method="denoise", components=("unet",))).ok  # A computes
+    free["bytes"] = 10 * mib
+    started: list[int] = []
+
+    def start() -> None:
+        with worker._starting(lane, "tenant-b"):
+            started.append(free["bytes"])
+
+    starting = threading.Thread(target=start, daemon=True)
+    starting.start()
+    bound = time.monotonic() + 30  # a hang bound on a loaded box, not a budget
+    while "tenant-b" not in worker.memory.wanted:
+        assert time.monotonic() < bound
+        time.sleep(0.01)
+    assert not started, "no room: it waits beside the running stage"
+    free["bytes"] = GiB  # as the executor unmaps under the lower budget its turn was given
+    handler(StageExit(method="denoise", components=("unet",)))
+    starting.join(30)
+    assert started == [GiB] and "tenant-b" not in worker.memory.wanted
 
 
 def test_a_scope_waiting_for_its_turn_is_not_counted_as_execution(

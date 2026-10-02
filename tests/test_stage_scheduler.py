@@ -392,7 +392,7 @@ def test_a_turn_belongs_to_the_calls_outermost_open_scope() -> None:
     outer.join(30)
     assert got == [Grant((0,), True)]
     inner = gpus.kind("H#1", "sample", ("lora",))
-    assert gpus.enter("H#1", inner, lambda: False) == Grant((0,), False)
+    assert gpus.enter("H#1", inner, lambda: False) == Grant((0,), False, opened=False)
     waiting, granted = ask(shell, "S#1", "encode")
     assert gpus.exit("H#1", StageSample(kind=inner, wall_ns=1)) == Exit()
     assert shell.held() == {"H#1": (0,)} and not granted, "the outer scope is still open"
