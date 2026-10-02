@@ -34,7 +34,14 @@ import signed_claims
 from conftest import gpu_hidden
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.internal import accel, child_env, package_interface, proctree
+from cozy_runtime.internal import (
+    accel,
+    budget_cell,
+    child_env,
+    package_interface,
+    proctree,
+    weight_policy,
+)
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
@@ -1086,9 +1093,10 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
 ) -> None:
     """Darkness 1513: the group's attempt freed only its lead card, and rank 3 refused
     `device_shortfall` beside an idle Qwen on card 3. A group short of room takes idle
-    co-tenants off the rank cards it is short on, LRU-first: a plane executor's unmeasured
-    shape is admitted optimistically, so only the short card's neighbour is cut; an older
-    executor's has every card. Their processes stay, and the caller is never its own victim."""
+    co-tenants off the rank cards it is short on, LRU-first. The shot's shape was never
+    measured, so it cannot say what it needs: every rank's idle neighbour gives room, for a
+    plane executor as for an older one. Their processes stay, and the caller is never its own
+    victim."""
     shot, by_lane = _warm_shot(machine, monkeypatch)
     worker = machine.worker
     before = machine.executors()
@@ -1122,8 +1130,7 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
         worker._arbitrate_residency(attempt, slot)
         worker.memory.end(h3)
     assert hosted.supervision.current is not None
-    plane = memory.plane_capable(hosted.supervision.current)
-    first = [q0] if plane else [q0, q1, q2]
+    first = [q0, q1, q2]
     assert vacated() == first
     # Qwen on card 1 needs room: the idle H3 group is its only co-tenant there
     machine.free.pop("0")  # type: ignore[attr-defined]
@@ -1158,6 +1165,121 @@ def test_a_waiting_tenant_is_short_only_while_its_gpu_lacks_room_for_it(
     assert not worker.memory.short(q0, need, gpus)
     machine.free["0"] = GiB  # type: ignore[attr-defined]
     assert worker.memory.short(q0, need, gpus)
+
+
+@needs_executor
+def test_a_tenants_budget_leaves_what_an_executor_waiting_to_start_wants(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While an executor waits to start on a GPU, a call that takes its first turn there is
+    budgeted around the room that executor wants, so the room it waits for is not taken. A
+    stage whose activations were never measured gets no grant: it measures them first."""
+    _shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    q0 = by_lane["lane-0"]
+    lane = worker._lane_of(q0)
+    if not memory.plane_capable(worker.hosted[q0].supervision.current):
+        return
+    unmeasured = worker.memory.start(q0, memory.StageNeed(entrypoint="generate"), lane.ordinals)
+    worker.memory.end(q0)
+    assert isinstance(unmeasured, memory.Budget) and unmeasured.plane_bytes == -1
+    need = memory.StageNeed(entrypoint="generate", activation_bytes=0)
+    machine.free["0"] = 30 * GiB  # type: ignore[attr-defined]
+
+    def budget() -> dict[int, int]:
+        granted = worker.memory.start(q0, need, lane.ordinals)
+        worker.memory.end(q0)
+        assert isinstance(granted, memory.Budget)
+        return granted.vram
+
+    assert budget() == {0: 30 * GiB - weight_policy.MARGIN}
+    worker.memory.wanted["machine-starting"] = {0: GiB}
+    assert budget() == {0: 29 * GiB - weight_policy.MARGIN}
+    worker.memory.wanted[q0] = {0: 5 * GiB}
+    assert budget() == {0: 29 * GiB - weight_policy.MARGIN}, "its own want is not held against it"
+
+
+@needs_executor
+def test_idle_contexts_are_reclaimed_least_recently_used_first_only_where_room_is_short(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every construction that ever ran leaves a process, and its device context, on its GPU
+    (8 of them took ~19 GB of one H100 and a later load did not fit). An idle executor stays
+    warm while there is room. When a measured need is still short after every idle weight
+    byte was cut, idle processes end, least recently used first, until it fits: only on the
+    short GPUs, never the asker's own, and each restarts at its next grant."""
+    shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    h3 = by_lane["lane-0+1+2+3"]
+    q0, q1, q2 = (by_lane[k] for k in ("lane-0", "lane-1", "lane-2"))
+    group = worker._lane_of(h3)
+    before = machine.executors()
+    for hosted in worker.hosted.values():  # each was started on its GPUs: it holds a context
+        assert hosted.supervision.current is not None
+        hosted.supervision.current.started = {"ok": True}
+    context = 2 * GiB
+    reclaim = worker.memory.reclaim
+
+    def ended(tenant: str, executor: Any, why: str) -> bool:
+        done = reclaim(tenant, executor, why)
+        gpu = str(worker._lane_of(tenant).ordinals[0])
+        machine.free[gpu] += context  # type: ignore[attr-defined]  # what the driver reads next
+        return done
+
+    monkeypatch.setattr(worker.memory, "reclaim", ended)
+    machine.free.update({"0": GiB, "1": GiB})  # type: ignore[attr-defined]
+    need = {0: 3 * GiB, 1: 3 * GiB, 2: 3 * GiB}
+
+    worker.memory.make_room(group, h3, need, "a load")
+    assert machine.executors() == before, "cuts alone end no process"
+    worker.memory.make_room(group, h3, need, "a load", contexts=True)
+    assert set(before) - set(machine.executors()) == {q0, q1}, "GPU 2 had room: q2 stays warm"
+    assert h3 in machine.executors() and q2 in machine.executors()
+    steps = [e.step for e in worker.activity if "holds only its device context" in e.step]
+    assert [s.split("'")[1] for s in steps] == [q0, q1], "least recently used first"
+    assert machine.granted(shot) == [0, 1, 2, 3]
+
+
+@needs_executor
+def test_a_busy_tenant_outside_its_turn_gives_room_through_its_budget_cell(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An executor that runs out of device memory mid-call asks for room (`DeviceRoom`). A
+    tenant busy outside its turn (a load, an attempt's tail) gives it at its next block
+    boundary through its budget cell; a tenant in its turn is computing and keeps its room."""
+    shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    h3, q0 = by_lane["lane-0+1+2+3"], by_lane["lane-0"]
+    busy = worker.hosted[q0].supervision.current
+    assert busy is not None
+    cell, fd = budget_cell.Cell.create()
+    executor_side = budget_cell.Cell(fd)
+    os.close(fd)
+    busy.cell = cell
+    assert busy._calls.acquire(blocking=False)  # a call holds its seam: it is busy
+    applied: list[int] = []
+
+    def block_boundaries() -> None:  # the executor's side: one ask, applied at a boundary
+        while (wanted := executor_side.poll()) is None:
+            time.sleep(0.005)
+        applied.append(wanted + 512 * (1 << 20))  # never below its open stages' floor
+        executor_side.acknowledge(applied[-1])
+
+    group = worker._lane_of(h3)
+    machine.free["0"] = GiB  # type: ignore[attr-defined]
+    worker.memory.active.add(q0)
+    worker.memory.make_room(group, h3, {0: 4 * GiB}, "an op of the shot")
+    assert not applied, "a tenant in its turn is computing: it keeps its room"
+    worker.memory.active.discard(q0)
+    boundary = threading.Thread(target=block_boundaries, daemon=True)
+    boundary.start()
+    worker.memory.make_room(group, h3, {0: 4 * GiB}, "an op of the shot")
+    boundary.join(30)
+    busy._calls.release()
+    assert applied == [512 * (1 << 20)]
+    steps = [e.step for e in worker.activity]
+    assert [s for s in steps if f"{q0!r}" in s and "cut mid-call to 536870912 B" in s], steps
+    assert machine.granted(shot) == [0, 1, 2, 3]
 
 
 _RANK = """

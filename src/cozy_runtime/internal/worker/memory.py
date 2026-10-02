@@ -205,6 +205,8 @@ class MemoryManager:
         self.active: set[str] = set()
         #: releases the pinned tiers the Worker keeps beyond the host's room (`HostTiers.trim`)
         self.trim: Callable[[], int] | None = None
+        #: device bytes a starting executor needs free, by tenant: nobody's budget takes them
+        self.wanted: dict[str, dict[int, int]] = {}
 
     def tenants(self, ordinals: set[int] | None = None) -> list[tuple[str, DeviceLane, LaneRow]]:
         """Every model-bearing tenant with a device among `ordinals` (None: any), each once."""
@@ -257,6 +259,36 @@ class MemoryManager:
         if executor is not None and plane_capable(executor):
             return self._start_plane(lane, tenant, row, stage, grow, why)
         return self._start_legacy(lane, tenant, row, grow, why)
+
+    def context_need(self, lane: DeviceLane) -> dict[int, int]:
+        """What a new executor needs free on each of `lane`'s devices before its first stage:
+        the largest context any executor there measured, as much again for the library
+        workspaces its first kernels allocate, and the margin. Empty before any was measured."""
+        need = {o: self._context(o) for o in lane.ordinals}
+        return need if all(need.values()) else {}
+
+    def _context(self, ordinal: int) -> int:
+        measured = max(
+            (
+                row.ledger.plane.context_bytes
+                for _slot, _lane, row in self.tenants({ordinal})
+                if row.ledger.plane is not None
+            ),
+            default=0,
+        )
+        return 2 * measured + weight_policy.MARGIN if measured > 0 else 0
+
+    def _reserved(self, tenant: str, ordinal: int) -> int:
+        """Device bytes `tenant`'s budget leaves free: what executors starting beside it want."""
+        return sum(need.get(ordinal, 0) for other, need in self.wanted.items() if other != tenant)
+
+    def room(self, lane: DeviceLane, slot: str, need: dict[int, int], why: str) -> bool:
+        """Cut idle tenants until `need` is free on each of `lane`'s devices. Whether it is,
+        as the driver measures it now: another process's memory counts as it stands."""
+        measured = self.make_room(lane, slot, need, why, contexts=True)
+        return all(
+            m.state == "measured" and m.free_bytes >= need.get(o, 0) for o, m in measured.items()
+        )
 
     def short(self, tenant: str, stage: StageNeed, gpus: Sequence[int]) -> bool:
         """Whether `tenant`'s turn on `gpus` would find less room than its weights and
@@ -369,15 +401,22 @@ class MemoryManager:
             row.activation.pop(shape, None)
 
     def make_room(
-        self, lane: DeviceLane, slot: str, need: dict[int, int] | None, why: str
+        self,
+        lane: DeviceLane,
+        slot: str,
+        need: dict[int, int] | None,
+        why: str,
+        *,
+        contexts: bool = False,
     ) -> dict[int, DeviceMemory]:
         """Cut idle tenants of `lane`'s devices until `need` is free on each (None: the whole
-        device), for a load or an older executor that asks for room."""
+        device), for a load or an older executor that asks for room. With `contexts`, a
+        shortfall that remains ends idle processes too, for the device contexts they hold."""
 
         def short(o: int, memory: DeviceMemory) -> bool:
-            return need is None or memory.free_bytes < need[o]
+            return need is None or memory.free_bytes < need.get(o, 0)
 
-        measured, _ = self._give(lane, slot, short, why)
+        measured, _ = self._give(lane, slot, short, why, contexts=contexts)
         if need is not None and (
             left := [o for o, m in measured.items() if m.state == "measured" and short(o, m)]
         ):
@@ -385,7 +424,7 @@ class MemoryManager:
                 "residency",
                 f"{lane.lane_id}: no idle tenant is left to evict for {slot!r} on {why}: "
                 + ", ".join(
-                    f"{self._gpu(lane, o)} needs {need[o]} B free, has "
+                    f"{self._gpu(lane, o)} needs {need.get(o, 0)} B free, has "
                     f"{measured[o].free_bytes} of {measured[o].total_bytes}"
                     for o in sorted(left)
                 ),
@@ -412,14 +451,47 @@ class MemoryManager:
         def usable(memory: DeviceMemory) -> int:
             return reach(memory.free_bytes, facts.committed_bytes, ledger.slack, grow)
 
-        read, evicted = self._give(lane, tenant, lambda o, m: want is None or usable(m) < want, why)
+        # A stage whose activations were never measured cannot say what it needs: every idle
+        # tenant of its GPUs gives room, least recently used first.
+        read, evicted = self._give(
+            lane, tenant, lambda o, m: banked is None or want is None or usable(m) < want, why
+        )
         if any(m.state != "measured" for m in read.values()):
             self.note("residency", f"{lane.lane_id}: unreadable; {tenant!r} derives its budget")
             return Budget(evicted=tuple(evicted))
         ledger.observe_devices(lane.device_facts(read))
+        if banked is None:
+            # Activations unmeasured: the executor keeps only the stage's own weights and
+            # measures them first; a grant here would hand their room to weights.
+            self.note(
+                "residency",
+                f"{lane.lane_id}: {tenant!r} starts {why} ({stage.entrypoint} "
+                f"{stage.cell or '-'}, activations unmeasured): it derives its budget; "
+                f"cut {evicted or 'nobody'}",
+            )
+            return Budget(evicted=tuple(evicted))
         # The grant must hold the weights' floor itself: that is the refusal line.
         least = floor_bytes(ledger.layouts, stage.components)
-        budget = {o: weight_policy.plane_budget(usable(m), grow) for o, m in read.items()}
+
+        def below(o: int, memory: DeviceMemory) -> bool:
+            return weight_policy.plane_budget(usable(memory), grow) < least
+
+        if any(below(o, m) for o, m in read.items()):
+            # Full residency is a wish and streams when unmet; the floor is a need. With every
+            # idle weight byte cut and the floor still unmet, idle processes end for the
+            # device contexts they hold.
+            read, ended = self._give(lane, tenant, below, why, contexts=True)
+            evicted += [name for name in ended if name not in evicted]
+            if any(m.state != "measured" for m in read.values()):
+                return Budget(evicted=tuple(evicted))
+        # What an executor waiting to start beside it wants stays free, down to the floor.
+        budget = {
+            o: max(
+                weight_policy.plane_budget(usable(m) - self._reserved(tenant, o), grow),
+                min(weight_policy.plane_budget(usable(m), grow), least),
+            )
+            for o, m in read.items()
+        }
         if any(value < least for value in budget.values()):
             floor = least + grow + weight_policy.MARGIN
             available = {o: usable(m) for o, m in read.items()}
@@ -432,11 +504,11 @@ class MemoryManager:
             return Shortfall(
                 needed=dict.fromkeys(available, floor), available=available, detail=detail
             )
-        if evicted or banked is None:
+        if evicted:
             self.note(
                 "residency",
                 f"{lane.lane_id}: {tenant!r} starts {why} ({stage.entrypoint} {stage.cell or '-'}, "
-                + (f"{grow} B of activations" if banked is not None else "activations unmeasured")
+                + f"{grow} B of activations"
                 + "): budget "
                 + ", ".join(f"{self._gpu(lane, o)} {b} B" for o, b in sorted(budget.items()))
                 + f"; cut {evicted or 'nobody'}",
@@ -457,7 +529,7 @@ class MemoryManager:
             refill = built if o in row.emptied else missing
             return grow is None or memory.free_bytes + min(ledger.slack, grow) < grow + refill
 
-        read, evicted = self._give(lane, tenant, short, why)
+        read, evicted = self._give(lane, tenant, short, why, contexts=grow is not None)
         fits = grow is None or all(
             m.state == "measured" and not short(o, m) for o, m in read.items()
         )
@@ -479,11 +551,20 @@ class MemoryManager:
         return Budget(whole=fits, evicted=tuple(evicted))
 
     def _give(
-        self, lane: DeviceLane, slot: str, short: Callable[[int, DeviceMemory], bool], why: str
+        self,
+        lane: DeviceLane,
+        slot: str,
+        short: Callable[[int, DeviceMemory], bool],
+        why: str,
+        *,
+        contexts: bool = False,
     ) -> tuple[dict[int, DeviceMemory], list[str]]:
         """Cut idle tenants from `lane`'s short devices until none is short or nobody is left:
-        one driver read, and one more after each cut."""
+        one driver read, and one more after each cut. With `contexts`, a measured need that
+        cuts did not meet then ends idle processes, least recently used first, for the device
+        contexts they hold: an idle executor stays warm only while there is room for it."""
         tried: set[str] = set()
+        ended: set[str] = set()
         evicted: list[str] = []
         while True:
             measured = lane.measure(self.kind)
@@ -492,28 +573,57 @@ class MemoryManager:
                 return measured, evicted
             devices = {o for o, m in measured.items() if short(o, m)}
             victim = self._victim(slot, devices, tried) if devices else None
-            if victim is None:
+            if victim is not None:
+                tried.add(victim[0])
+                evicted.append(victim[0])
+                self._cut(victim, slot, why, devices)
+                continue
+            idle = self._idle_context(slot, devices, ended) if devices and contexts else None
+            if idle is None:
                 return measured, evicted
-            tried.add(victim[0])
-            evicted.append(victim[0])
-            self._cut(victim, slot, why, devices)
+            other, other_lane, _row, executor = idle
+            ended.add(other)
+            evicted += [other] if other not in evicted else []
+            self.note(
+                "residency",
+                f"{other_lane.lane_id}: {other!r} (epoch {executor.epoch} pid {executor.pid}) is "
+                f"idle and holds only its device context; ended for {slot!r} on {why}",
+            )
+            self.reclaim(other, executor, f"idle context reclaimed for {slot!r} on {why}")
+
+    def _idle_context(self, slot: str, short: set[int], ended: set[str]) -> Victim | None:
+        """The least recently used idle process on `short` that holds a device context and
+        nothing a cut could still take. Never `slot`, never a tenant in its turn or mid-call."""
+        idle: list[Victim] = []
+        for other, lane, row in self.tenants(short):
+            executor = row.supervision.current if row.supervision is not None else None
+            if other == slot or other in ended or other in self.active or executor is None:
+                continue
+            if executor.started and executor.alive() and not executor.busy():
+                idle.append((other, lane, row, executor))
+        return min(idle, key=lambda item: item[2].last_used, default=None)
 
     def _victim(self, slot: str, short: set[int], tried: set[str]) -> Victim | None:
         """The next tenant to give room on `short`: a dead one, else the least recently used
-        idle one holding weights there. Never `slot`, never one in its turn, never twice."""
+        idle one holding weights there, else a busy one outside its turn (a load, an attempt's
+        tail) that can be cut mid-call through its budget cell. Never `slot`, never one in its
+        turn (a computing stage keeps its room), never twice."""
         dead: list[Victim] = []
         idle: list[Victim] = []
+        busy: list[Victim] = []
         for other, lane, row in self.tenants(short):
             executor = row.supervision.current if row.supervision is not None else None
             if other == slot or other in tried or executor is None:
                 continue
-            if executor.busy() and executor.alive() and not executor.poisoned:
-                continue  # mid-call (an attempt's tail, a load): a cut would wait for it
             if executor.poisoned or not executor.alive():
                 dead.append((other, lane, row, executor))
-            elif other not in self.active and holds(row, executor, short & set(lane.ordinals)):
+            elif other in self.active or not holds(row, executor, short & set(lane.ordinals)):
+                continue
+            elif not executor.busy():
                 idle.append((other, lane, row, executor))
-        for tier in (dead, idle):
+            elif executor.cell is not None:
+                busy.append((other, lane, row, executor))
+        for tier in (dead, idle, busy):
             if tier:
                 return min(tier, key=lambda item: item[2].last_used)
         return None
@@ -523,10 +633,40 @@ class MemoryManager:
         if executor.poisoned or not executor.alive():
             dead = executor.poisoned or "exited"
             self.reclaim(other, executor, f"reclaimed for {slot!r} on {why}: {dead}")
+        elif executor.busy() and executor.cell is not None:
+            self._cut_running(victim, slot, why)
         elif plane_capable(executor):
             self._cut_plane(victim, slot, why)
         else:
             self._vacate(victim, slot, why, short)
+
+    def unmap(self, tenant: str, why: str) -> None:
+        """Unmap every device byte of `tenant`'s plane (they stay pinned): what a refused load
+        left mapped would otherwise count against its own next try."""
+        row = self._row(tenant)
+        executor = row.executor() if row is not None else None
+        if row is None or executor is None or not plane_capable(executor) or executor.busy():
+            return
+        lane = next(lane for lane in self.lanes if lane.ordinals and tenant in lane.rows)
+        self._cut_plane((tenant, lane, row, executor), tenant, why)
+
+    def _cut_running(self, victim: Victim, slot: str, why: str) -> None:
+        """A busy tenant outside its turn gives its device bytes at its next block boundary,
+        down to what its open stages need. Its call goes on; its next grant restores it."""
+        other, lane, row, executor = victim
+        applied = executor.cut(0)
+        if applied is None:  # its call ended first: idle now, cut as one
+            if executor.alive() and not executor.busy():
+                self._cut_plane(victim, slot, why)
+            return
+        if row.ledger.plane is not None:
+            committed = min(row.ledger.plane.committed_bytes, applied)
+            row.ledger.plane = msgspec.structs.replace(row.ledger.plane, committed_bytes=committed)
+        self.note(
+            "residency",
+            f"{lane.lane_id}: {other!r} (epoch {executor.epoch} pid {executor.pid}) cut mid-call "
+            f"to {applied} B for {slot!r} on {why}",
+        )
 
     def _cut_plane(self, victim: Victim, slot: str, why: str) -> None:
         """Budget 0: the plane unmaps at once and keeps the bytes in its host tier (lowered to

@@ -469,6 +469,58 @@ class StageScheduler:
             self._free(key)
         self.resync()
 
+    def await_clear(
+        self,
+        ordinals: Ordinals,
+        template: tuple[str, str],
+        stop: Callable[[], bool] = lambda: False,
+    ) -> bool:
+        """Wait until no other template's call is in flight on `ordinals`: it holds a turn, or
+        has taken one and is not past its stages. What an executor of `template` waits on when
+        the GPU has no room for it beside such a call, never a clock. False when none was in
+        flight (waiting changes nothing), or when `stop()`."""
+
+        def flying() -> bool:
+            return any(
+                (d.running or d.tenant)
+                and d.want.template != template
+                and set(d.gpus) & set(ordinals)
+                and not d.key.startswith("hold:")
+                for d in self.demands.values()
+            )
+
+        with self.lock:
+            if not flying():
+                return False
+            self.lock.wait_for(lambda: not flying() or stop())
+            return not stop()
+
+    def await_released(self, key: str, stop: Callable[[], bool] = lambda: False) -> bool:
+        """Wait until every call of another template that is ahead of `key` on its GPUs and
+        took a turn there has left them (released, its whole attempt over). What a load short
+        of device memory waits on before its shortfall is its own; calls behind it cannot run
+        before it, so they are not waited for. False when none was there, or when `stop()`."""
+
+        def order(d: _Demand) -> tuple[int, int]:
+            return (self.roots.get(d.want.root, (UNROOTED, 0))[0], d.arrival)
+
+        def ahead() -> bool:
+            mine = self.demands.get(key)
+            return mine is not None and any(
+                d.granted
+                and d.want.template != mine.want.template
+                and set(d.gpus) & set(mine.gpus)
+                and order(d) < order(mine)
+                and not d.key.startswith("hold:")
+                for d in self.demands.values()
+            )
+
+        with self.lock:
+            if not ahead():
+                return False
+            self.lock.wait_for(lambda: not ahead() or stop())
+            return not stop()
+
     def _claimant(self, demand: _Demand) -> _Demand | None:
         """The earliest other call that asks, holds, prepares or waits on this one's GPUs."""
         return min(

@@ -140,6 +140,7 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptRecord,
     AttemptRefusal,
     AttemptSlot,
+    DeviceExhausted,
     Released,
     safe,
 )
@@ -5859,8 +5860,22 @@ class Worker:
         """Start every rank, admitting new model-bearing contexts through MemoryManager.
 
         Weightless starts keep their CPU overlap. Returns the actual startup
-        refusal, or "" once the process is started.
+        refusal, or "" once the process is started. A device out-of-memory at a start beside a
+        call in flight is the room that call holds, not a verdict: once it is past its stages
+        a fresh process starts again, and nothing is recorded against the placement.
         """
+        while True:
+            refusal = self._start_once(tenant, executor)
+            if refusal is not None:
+                return refusal
+            fresh = self._own_executor(tenant)
+            if isinstance(fresh, str):
+                return fresh
+            executor = fresh
+
+    def _start_once(self, tenant: Tenant, executor: child.Executor) -> str | None:
+        """One start. None when it ran out of device memory beside a call in flight that is
+        now past its stages: the caller starts a fresh process."""
         lane = tenant.lane
         placement_id = tenant.placement.placement_id
         first = next(iter(tenant.bindings.values()), None)
@@ -5892,6 +5907,19 @@ class Worker:
         if not reply.get("ok"):
             self.monitor.end(f"start:{placement_id}", str(reply.get("code")))
             detail = str(reply.get("detail"))[:1024]
+            if reply.get("code") == "device_out_of_memory" and self.stages.await_clear(
+                lane.ordinals, self._template(tenant.slot), self.stop.is_set
+            ):
+                self.note(
+                    "boot",
+                    f"{placement_id!r} start ran out of device memory beside a call in flight; "
+                    "that call is past its stages, starting again",
+                )
+                try:
+                    tenant.supervision.retire_current(executor, "start out of device memory")
+                except ExecutorGone as exc:
+                    self.note("recovery", f"start refusal reclaim failed: {exc}")
+                return None
             for binding in tenant.bindings.values():
                 tenant.failed_bindings[binding.entrypoint_binding_digest] = (
                     f"{reply.get('code')}: {detail}"
@@ -5938,6 +5966,60 @@ class Worker:
 
     def _ensure_construction(self, attempt: AttemptRecord) -> None:
         """LOAD the attempt's construction if its process has not built it, then ACTIVATE it.
+
+        Nothing of the attempt has run, so a device shortfall here is never a refusal for size.
+        Every idle tenant of its GPUs is cut, least recently used first, and it loads again:
+        once every call of another model ahead of it has left (a turn-taking attempt holds no
+        turn while it waits; one holding a whole turn does not wait), or when the shortfall
+        changed since the last try (the executor measured what it lacked and plans with it).
+        The same shortfall twice with every idle byte given is FAILED with what did not fit
+        (`DeviceExhausted`).
+        """
+        last = ""
+        while True:
+            try:
+                return self._ensure_once(attempt)
+            except AttemptRefusal as exc:
+                lane = self.lanes.by_id.get(attempt.lane_id)
+                if exc.code not in DEVICE_SHORTFALL_CODES or not lane:
+                    raise
+                waited = attempt.stage_turns and self.stages.await_released(
+                    _demand(attempt), lambda: bool(attempt.canceling) or self.stop.is_set()
+                )
+                if attempt.canceling or self.stop.is_set():
+                    raise
+                if not waited and exc.detail == last:
+                    raise self._exhausted(lane, exc) from exc
+                last = exc.detail
+                self.note(
+                    "attempt",
+                    f"{attempt.request_id}#{attempt.attempt} load was short of device memory "
+                    + (
+                        "beside a call of another model ahead of it; that call has left"
+                        if waited
+                        else "for a reason it had not met before"
+                    )
+                    + ", loading again",
+                )
+                self._rebuild_lane(lane, attempt.placement_id)
+                self.memory.unmap(attempt.placement_id, "its refused load")
+                self.memory.make_room(
+                    lane, attempt.placement_id, None, "its refused load", contexts=True
+                )
+
+    @staticmethod
+    def _exhausted(lane: DeviceLane, exc: AttemptRefusal | MemoryShortfall) -> DeviceExhausted:
+        """What did not fit, with every idle byte of `lane`'s GPUs given: a FAILED terminal."""
+        detail = exc.detail
+        gpus = execution_evidence.gpu_names(lane.entries)
+        return DeviceExhausted(
+            "device_shortfall",
+            f"{detail} (every idle byte of {gpus} was given)",
+            cause=CAUSE.CAUSE_CODE_NO_CAPACITY,
+        )
+
+    def _ensure_once(self, attempt: AttemptRecord) -> None:
+        """One load and activation.
 
         Runs under the lane's device lock and WITHOUT the control lock: a load moves
         gigabytes and the control plane keeps answering while it does. The placement is
@@ -6083,6 +6165,10 @@ class Worker:
             reply = {"ok": False, "code": "executor_gone_during_prepare", "detail": str(exc)}
         took = (time.perf_counter() - began) * 1000
         if not reply.get("ok"):
+            if reply.get("plane") is not None:
+                # What a refused load left mapped is cuttable: the next grant must see it.
+                with self.control_lock:
+                    self.memory.observe(tenant.row(), executor, reply)
             self._load_refused(tenant, executor, group, label, reply, took)
             code = str(reply.get("code") or "construction_load_refused")
             raise AttemptRefusal(
@@ -6461,9 +6547,7 @@ class Worker:
         why = f"attempt {attempt.request_id}#{attempt.attempt}"
         granted = self.memory.start(tenant, self._stage_need(attempt, declared), lane.ordinals, why)
         if isinstance(granted, MemoryShortfall):
-            raise AttemptRefusal(
-                "device_shortfall", granted.detail, cause=CAUSE.CAUSE_CODE_NO_CAPACITY
-            )
+            raise self._exhausted(lane, granted)  # every idle tenant was cut: FAILED, not sized
         attempt.room, attempt.plane_budget_bytes = granted.whole, granted.plane_bytes
         row = lane.row(tenant)
         executor = row.executor()
@@ -6590,7 +6674,9 @@ class Worker:
                 return refuse("no_durable_exchange", "device_room or host_tier only")
             need = request.free_bytes
             why = f"its executor needs {need} B free"
-            self.memory.make_room(lane, slot, {ordinal: need for ordinal in lane.ordinals}, why)
+            self.memory.make_room(
+                lane, slot, {ordinal: need for ordinal in lane.ordinals}, why, contexts=True
+            )
             try:
                 return Room(ok=True, authorized_device_limit_bytes=self._ceiling(lane, slot))
             except LaneRefusal as exc:
@@ -7002,17 +7088,40 @@ class Worker:
 
     @contextlib.contextmanager
     def _starting(self, lane: DeviceLane, slot: str) -> Iterator[None]:
-        """A new device context on `lane`: idle tenants there give room first. It starts beside
-        a running turn only when that turn's executor recovers from an out-of-memory at a block
-        boundary; otherwise it waits for a turn of its own."""
-        hold = (
-            contextlib.nullcontext()
-            if self.stages.quiet(lane.ordinals)
-            else self.stages.hold(lane.ordinals, f"executor startup {slot}")
-        )
-        with hold:
-            self.memory.make_room(lane, slot, None, "executor startup")
-            yield
+        """A new device context on `lane` starts only with room for it, measured now.
+
+        Idle tenants give it first. When a call in flight there holds the room, the start
+        waits until that call is past its stages (its tenant is then idle and is cut), never
+        for a clock, and it never takes room from a call that is computing. With nobody left
+        who could give, it starts and the driver decides. Beside a whole turn in its device
+        phase it waits for a turn of its own."""
+        need = self.memory.context_need(lane)
+        self.memory.wanted[slot] = need
+        try:
+            while need and not self.memory.room(lane, slot, need, "executor startup"):
+                if not self.stages.await_clear(
+                    lane.ordinals, self._template(slot), self.stop.is_set
+                ):
+                    break
+            hold = (
+                contextlib.nullcontext()
+                if self.stages.quiet(lane.ordinals)
+                else self.stages.hold(lane.ordinals, f"executor startup {slot}")
+            )
+            with hold:
+                if not need:
+                    self.memory.make_room(lane, slot, None, "executor startup")
+                yield
+        finally:
+            self.memory.wanted.pop(slot, None)
+
+    def _template(self, slot: str) -> tuple[str, str]:
+        """The (installation, bindings) a tenant's calls are scheduled under."""
+        placement = self._placement_by_id(slot)
+        if placement is None:
+            return ("", "")
+        digest = placement.bindings_digest
+        return (placement.installation_id, documents.spell(digest) if digest else "")
 
     def _prefill(self, attempt: AttemptRecord) -> None:
         """While a staged attempt waits for its devices, its plane executor fills the host
@@ -7233,9 +7342,7 @@ class Worker:
                 )
         except AttemptRefusal as exc:
             self.note("attempt", f"{key} refused at device entry: {exc.code}")
-            self.terminate(
-                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
-            )
+            self.terminate(attempt, self.engine.end_held, exc)
             return False
         return True
 
@@ -7296,9 +7403,7 @@ class Worker:
             self._ensure_construction(attempt)
         except AttemptRefusal as exc:
             self.note("attempt", f"{key} refused: {exc.code}")
-            self.terminate(
-                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
-            )
+            self.terminate(attempt, self.engine.end_held, exc)
             return False
         with self.control_lock:
             if self._admission_refused(attempt):

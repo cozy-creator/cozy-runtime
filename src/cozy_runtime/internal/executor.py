@@ -1244,9 +1244,13 @@ class Executor:
                     try:
                         refused = self._initialize_device(torch)
                     except RuntimeError as exc:
+                        # No room for a context is the device's memory, not its absence: the
+                        # worker starts again once a call beside it has given the room.
                         refused = {
                             "ok": False,
-                            "code": "accelerator_unavailable",
+                            "code": "device_out_of_memory"
+                            if is_device_oom(exc)
+                            else "accelerator_unavailable",
                             "detail": "the sealed devices "
                             f"{_SEALED.get('CUDA_VISIBLE_DEVICES')!r} "
                             f"could not be initialized: {exc}"[:900],
