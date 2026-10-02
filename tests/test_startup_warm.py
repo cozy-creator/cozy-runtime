@@ -1025,3 +1025,32 @@ def test_a_caller_arriving_while_the_replica_starts_starts_nothing_more(
     executor = hosted.supervision.current
     assert executor is not None and executor.alive() and executor is slot.executor
     assert slot.ready and slot.supervision.spawns == 1
+
+
+def test_an_executor_of_a_worker_that_sees_no_gpu_never_asks_the_cuda_driver(
+    warm: Callable[..., Warm],
+) -> None:
+    """A Worker with no GPU seals none into its executors, and a process sealed to none asks no
+    CUDA driver: not at its imports, not in its replies, not at a device start (refused for
+    want of a card). On a host with a driver every ask opens /dev/nvidiactl, nvidia-uvm and
+    nvidia0; a GPU benchmark beside a CPU test run was discarded for that."""
+    machine = warm(cards=0)
+    worker = machine.worker
+    imposed = worker.imposed(worker.lanes.orchestration)
+    assert imposed["CUDA_VISIBLE_DEVICES"] == ""
+    binding = _binding(machine)
+    supervision = worker._new_placement_supervision("machine-cpu")
+    installed = (worker.options.install_root or Path()) / "installations" / INSTALLATION
+    supervision.use_environment(str(installed / "venv" / "bin" / "python"), INSTALLATION)
+    executor = supervision.spawn(imposed=imposed)
+    try:
+        release = {"application": binding.application, "package_interface": binding.interface_path}
+        assert executor.call(Start(**release, import_only=True), timeout=None)["ok"]
+        assert _imported(executor)
+        refused = executor.call(Start(**release), timeout=None)
+        assert not refused["ok"] and refused["code"] == "accelerator_unavailable", refused
+        assert _attempts(machine) == [], "it asked the CUDA driver"
+        held = {os.readlink(fd) for fd in Path(f"/proc/{executor.pid}/fd").iterdir()}
+        assert not [node for node in held if node.startswith("/dev/nvidia")]
+    finally:
+        supervision.close()

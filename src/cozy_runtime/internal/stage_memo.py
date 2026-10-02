@@ -709,7 +709,7 @@ class GenerationMemo:
 
 def _rng(torch: ModuleType) -> tuple[bytes, ...]:
     states: list[Tensor] = [torch.random.get_rng_state()]
-    if torch.cuda.is_available() and torch.cuda.is_initialized():
+    if torch.cuda.is_initialized():
         states.append(torch.cuda.get_rng_state())
     return tuple(state.numpy().tobytes() for state in states)
 

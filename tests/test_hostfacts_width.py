@@ -24,6 +24,13 @@ H100 = "NVIDIA H100 80GB HBM3, 81559, 580.95.05, 9.0"
 H200 = "NVIDIA H200, 143771, 580.95.05, 9.0"
 
 
+@pytest.fixture(autouse=True)
+def _cards_visible(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These hosts' cards are the process's to see: a run that hides its own GPU
+    (`CUDA_VISIBLE_DEVICES=""`) would otherwise measure none without asking the driver."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+
 def _driver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *rows: str) -> None:
     """Put an `nvidia-smi` on PATH that answers `--query-gpu` with these CSV rows."""
     binary = tmp_path / "nvidia-smi"
@@ -124,3 +131,17 @@ def test_worker_measures_its_cards_once_per_boot(
     worker.executor_exited(cast(Any, SimpleNamespace(epoch=1, pid=1)))
     assert worker.host_facts().gpu_count == 4
     assert measured() == before + 4
+
+
+def test_a_process_that_sees_no_gpu_measures_none_without_asking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`CUDA_VISIBLE_DEVICES=""` hides the host's GPUs: the driver on PATH is never run."""
+    asked = tmp_path / "asked"
+    binary = tmp_path / "nvidia-smi"
+    binary.write_text(f"#!/bin/sh\ntouch {asked}\necho '{H100}'\n")
+    binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    facts = measure("cuda")
+    assert facts.backend == "none" and facts.gpu_count == 0 and not asked.exists()

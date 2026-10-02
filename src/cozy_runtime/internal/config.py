@@ -215,6 +215,14 @@ def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     return {name: env.get(name, "") for name in sorted(child_env.ALLOWLIST)}
 
 
+def sees_no_gpu(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether this process was told it has no GPU: `CUDA_VISIBLE_DEVICES` is set and empty,
+    as an operator hides a host's GPUs and as the seal of a CPU executor says. Such a process
+    asks no GPU driver (`accel`): each ask opens the NVIDIA device nodes."""
+    env = os.environ if environ is None else environ
+    return env.get("CUDA_VISIBLE_DEVICES") == ""
+
+
 def restore_seal(sealed: Mapping[str, str], names: Iterable[str]) -> None:
     """Re-impose sealed values in this process; an empty sealed value means unset."""
     for name in names:

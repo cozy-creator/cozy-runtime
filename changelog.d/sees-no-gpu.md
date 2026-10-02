@@ -1,0 +1,1 @@
+A process that sees no GPU (`CUDA_VISIBLE_DEVICES` set and empty) asks no GPU driver: not torch's CUDA probe, not NVML, not `nvidia-smi`. A CPU executor's start and replies, a hidden host's facts and a CPU run of the tests no longer open `/dev/nvidia*`.
