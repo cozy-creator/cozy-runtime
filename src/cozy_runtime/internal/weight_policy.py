@@ -23,6 +23,9 @@ MARGIN = 64 << 20
 #: itself (cuBLAS 36 MiB for a bf16 GEMM, 6 MiB more for fp16; cuDNN 2 MiB for a convolution;
 #: measured on an L4 with CUDA 13).
 LIBRARY_ROOM = 64 << 20
+#: Device bytes left free on a GPU that drives a display: its compositor allocates as windows
+#: open, and a card held at a few MiB free froze a laptop (2026-10-01).
+DISPLAY_FLOOR = 512 << 20
 #: The event model's fixed costs: one copy's issue, and one block's acquire/release hook.
 COPY_OVERHEAD_S = 20e-6
 HOOK_S = 15e-6
@@ -77,6 +80,12 @@ class BelowFloor(Exception):
 def plane_budget(free: int, activation: int, context: int = 0, margin: int = MARGIN) -> int:
     """`free - activation growth - context`: the device bytes the plane may map."""
     return max(free - activation - context - margin, 0)
+
+
+def free_floor(total: int, display: bool) -> int:
+    """The physical free bytes nothing on a GPU may take: on one that drives a display, the
+    larger of `DISPLAY_FLOOR` and a sixteenth of the card; none on any other."""
+    return max(DISPLAY_FLOOR, total // 16) if display else 0
 
 
 def pinned_total(available: int, pinned: int) -> int:

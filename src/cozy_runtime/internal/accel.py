@@ -20,6 +20,7 @@ hand in their `torch` module; this module imports none.
 from __future__ import annotations
 
 import ctypes
+import os
 import subprocess
 import threading
 from collections.abc import Iterator
@@ -321,6 +322,23 @@ def device_capability(device: str) -> int:
         handle, ctypes.byref(major), ctypes.byref(minor)
     )
     return major.value * 10 + minor.value if answer == _NVML_SUCCESS else 0
+
+
+def drives_display(index: int) -> bool:
+    """Whether CUDA device `index` of this process drives a display (NVML's display mode or
+    active state); False where NVML cannot say."""
+    entries = [e.strip() for e in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")]
+    entries = [e for e in entries if e]
+    library = _nvml_library()
+    entry = entries[index] if index < len(entries) else str(index)
+    handle = _nvml_handle(library, entry) if library is not None else None
+    if library is None or handle is None:
+        return False
+    for query in (library.nvmlDeviceGetDisplayMode, library.nvmlDeviceGetDisplayActive):
+        state = ctypes.c_int()
+        if query(handle, ctypes.byref(state)) == _NVML_SUCCESS and state.value == 1:
+            return True
+    return False
 
 
 def _device_memory_of(free: int, total: int) -> DeviceMemory:
