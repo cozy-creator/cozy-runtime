@@ -71,6 +71,7 @@ from cozy_runtime.author._errors import (
     InvalidRequest,
     Outcome,
     classify,
+    is_device_oom,
 )
 from cozy_runtime.author._executor_requests import (
     Answer,
