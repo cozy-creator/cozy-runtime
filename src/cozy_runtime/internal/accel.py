@@ -25,6 +25,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from cozy_runtime.internal.config import sees_no_gpu
+
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
 #: silently runs unsupported operations on CPU, which violates the CPU-refusal law. Forced,
 #: not defaulted — a package cannot opt back in.
@@ -59,6 +61,19 @@ class ProcessMemory:
     bytes: int = -1
 
 
+def _smi(*query: str) -> subprocess.CompletedProcess[str]:
+    """One `nvidia-smi` query, run to completion. A process that sees no GPU has no driver to
+    ask, as on a host without the tool."""
+    if sees_no_gpu():
+        raise FileNotFoundError("this process sees no GPU: nvidia-smi is not asked")
+    return subprocess.run(
+        ["nvidia-smi", *query, "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
 def process_memory(pid: int, kind: str) -> ProcessMemory:
     """Read per-process device memory from outside the executor.
 
@@ -85,16 +100,7 @@ def process_memories(pids: set[int], kind: str) -> dict[int, ProcessMemory]:
     table = _nvml_compute_table()
     if table is None:
         try:
-            out = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-compute-apps=pid,used_memory",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+            out = _smi("--query-compute-apps=pid,used_memory")
         except (OSError, subprocess.SubprocessError):
             return {pid: ProcessMemory("unreadable") for pid in pids}
         table = {}
@@ -129,7 +135,7 @@ def _nvml_library() -> ctypes.CDLL | None:
     host has none — a CPU box, or a container without the driver mounted."""
     global _nvml, _nvml_absent
     with _nvml_lock:
-        if _nvml is not None or _nvml_absent:
+        if _nvml is not None or _nvml_absent or sees_no_gpu():
             return _nvml
         try:
             library = ctypes.CDLL("libnvidia-ml.so.1")
@@ -239,17 +245,7 @@ def process_memories_by_device(
         else:
             try:
                 lines = (
-                    subprocess.run(
-                        [
-                            "nvidia-smi",
-                            f"--id={device}",
-                            "--query-compute-apps=pid,used_memory",
-                            "--format=csv,noheader,nounits",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    )
+                    _smi(f"--id={device}", "--query-compute-apps=pid,used_memory")
                     .stdout.strip()
                     .splitlines()
                 )
@@ -351,17 +347,7 @@ def device_memory(device: str, kind: str) -> DeviceMemory:
     if through_nvml is not None:
         return through_nvml
     try:
-        out = subprocess.run(
-            [
-                "nvidia-smi",
-                f"--id={device}",
-                "--query-gpu=memory.free,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        out = _smi(f"--id={device}", "--query-gpu=memory.free,memory.total")
         line = out.stdout.strip().splitlines()[0]
         free, total = (int(part.strip()) * 1024 * 1024 for part in line.split(","))
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
@@ -390,6 +376,8 @@ def initialize(torch: Any, kind: str) -> None:
     rather than a surprise inside the first kernel."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "initialize")
+    if sees_no_gpu():
+        raise RuntimeError("this process sees no GPU (CUDA_VISIBLE_DEVICES is empty)")
     if kind == "cuda":
         torch.cuda.init()
 
@@ -486,7 +474,7 @@ def present(torch: Any, kind: str) -> bool:
     refusal: a torch-bearing process with no card is a legitimate weightless executor."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "present")
-    return bool(torch.cuda.is_available())
+    return not sees_no_gpu() and bool(torch.cuda.is_available())
 
 
 def device_identity(torch: Any, kind: str, index: int = 0) -> dict[str, Any]:

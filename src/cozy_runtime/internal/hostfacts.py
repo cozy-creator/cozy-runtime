@@ -21,6 +21,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from cozy_runtime.internal.config import sees_no_gpu
+
 TORCH_VERSION_MAX_BYTES = 64 * 1024
 
 
@@ -61,7 +63,7 @@ def measure(expected_backend: str = "") -> HostFacts:
     unreadable: list[str] = []
     gpu_name, gpu_sm, vram, driver, backend = "", 0, 0, "", ""
     gpu_count = 0
-    if expected_backend == "none":
+    if expected_backend == "none" or sees_no_gpu():
         backend = "none"
     elif sys.platform == "darwin" and platform.machine() == "arm64":
         # Apple silicon: the FAMILY is present and that is all a torch-free process can
