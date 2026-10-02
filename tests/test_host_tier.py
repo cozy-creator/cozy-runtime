@@ -156,6 +156,14 @@ class GpuTier(Weights):  # a GPU executor's host tier, without its device
         finally:
             self.host_only = True
 
+if sys.argv[3]:  # fill the cgroup with page cache first, as a pod's downloaded weights do
+    with open(sys.argv[3], "wb") as file:
+        for _ in range(96):
+            file.write(os.urandom(8 << 20))
+    with open(sys.argv[3], "rb") as file:
+        while file.read(8 << 20):
+            pass
+cached = dict(line.split() for line in (cgroup / "memory.stat").read_text().splitlines())
 weights = GpuTier(torch, torch.device("cpu"), "cpu")
 started, models, throttled = time.monotonic(), [], False
 for index, (root, manifest) in enumerate(json.loads(sys.argv[2])):
@@ -176,6 +184,7 @@ while not throttled and len(grown) < 20:
 anon, shmem = held()
 print(json.dumps({"high": high, "anon": anon, "shmem": shmem, "loaded": len(models),
                   "throttled": throttled or anon + shmem >= high, "pinned_before": pinned,
+                  "cache": int(cached["inactive_file"]) + int(cached["active_file"]),
                   "pinned": plane.stats(weights.plane).host.used,
                   "seconds": round(time.monotonic() - started, 2)}), flush=True)
 os._exit(0)
@@ -183,7 +192,8 @@ os._exit(0)
 
 
 @pytest.mark.skipif(shutil.which("systemd-run") is None, reason="systemd-run for a cgroup")
-def test_the_pinned_tier_stays_under_the_cgroups_memory_high(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cached", [False, True])
+def test_the_pinned_tier_stays_under_the_cgroups_memory_high(tmp_path: Path, cached: bool) -> None:
     """The laptop under MemoryHigh 12 GiB / MemoryMax 16 GiB, no swap (rebench, 2026-10-02):
     the pinned tiers of SDXL and Anima grew to 10 GiB of shared memory beside 2.7 GiB of
     process memory, the cgroup sat over `memory.high`, and the kernel throttled a weight load
@@ -191,7 +201,9 @@ def test_the_pinned_tier_stays_under_the_cgroups_memory_high(tmp_path: Path) -> 
     `memory.high`. Here five weight sets (640 MiB) load in a cgroup whose `memory.high` is
     below them: every load completes, a prefix of the weights is pinned, the rest stays on
     disk, and what cannot be reclaimed stays under `memory.high`, also while the process
-    then grows by 320 MiB."""
+    then grows by 320 MiB. `cached`: the cgroup is first filled with page cache (a rented
+    pod sits at its limit with the weights it downloaded); that memory is reclaimable, so
+    the loads proceed and the tier still pins."""
     sets = [write_checkpoint(tmp_path / str(index))[0] for index in range(5)]
     scope = ("systemd-run", "--user", "--scope", "--quiet", "--collect")
     limits = (
@@ -207,8 +219,9 @@ def test_the_pinned_tier_stays_under_the_cgroups_memory_high(tmp_path: Path) -> 
         pytest.skip("this session cannot create a memory-limited scope")
     rows = json.dumps([[checkpoint.root, checkpoint.manifest_id] for checkpoint in sets])
     tests = str(Path(__file__).parent)
+    cache = str(tmp_path / "cache.bin") if cached else ""
     ran = subprocess.run(
-        [*scope, *limits, sys.executable, "-c", FILL, tests, rows],
+        [*scope, *limits, sys.executable, "-c", FILL, tests, rows, cache],
         capture_output=True,
         text=True,
         env=env,
@@ -219,3 +232,4 @@ def test_the_pinned_tier_stays_under_the_cgroups_memory_high(tmp_path: Path) -> 
     assert facts["anon"] + facts["shmem"] < facts["high"], facts
     assert 0 < facts["pinned_before"] < 640 << 20, facts  # a prefix is pinned, never all
     assert facts["pinned"] < facts["pinned_before"], facts  # and it gave way to the process
+    assert not cached or facts["cache"] > 256 << 20, facts  # the cgroup really was full of it
