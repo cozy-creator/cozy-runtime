@@ -128,6 +128,7 @@ from cozy_runtime.internal import weights as weight_stages
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
+    LOAD_PINNED,
     Activate,
     Attention,
     Binding,
@@ -601,7 +602,7 @@ class Executor:
             "memory": [
                 "import_only",
                 "vacate_ranks",
-                *([plane.CAPABILITY, STAGE_TURNS] if plane.available() else []),
+                *([plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED] if plane.available() else []),
             ],
             "memo": [stage_memo.CAPABILITY],
             "pgid": os.getpgrp(),
@@ -1964,8 +1965,10 @@ class Executor:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
         # A load plans in what the driver has: the Worker made room for it, and an earlier
-        # cut to 0 is no grant for this construction.
-        weights.set_budget(-1)
+        # cut to 0 is no grant for this construction. Its pinned budget arrives with it, so
+        # the fill stays inside it (a CPU executor computes on its tier: never cut there).
+        pinned = command.pinned_bytes // self.world if command.pinned_bytes >= 0 else -1
+        weights.set_budget(-1, -1 if weights.host_only else pinned)
         backend = PlaneBackend(
             checkpoints,
             rows,
@@ -2341,6 +2344,7 @@ class Executor:
                     else UNSET,
                     sequence_parallel_degree=max(self.world, 1),
                     host_tier=command.host_tier,
+                    pinned_bytes=command.pinned_bytes,
                 ),
                 optional_attention_scope=True,
             )

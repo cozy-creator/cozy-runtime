@@ -45,7 +45,8 @@ class HostStats(msgspec.Struct, frozen=True, kw_only=True):
     registered_bytes: int = 0
     fill_bytes: int = 0
     fill_ns: int = 0
-    disk_read_bytes: int = 0
+    #: -1: a TensorFS before 0.3.92 does not count it (a 0 there was never a measurement)
+    disk_read_bytes: int = -1
     evictions: int = 0
 
 

@@ -6179,7 +6179,16 @@ class Worker:
             attention_pin=attention_pin,
         )
         if plane_capable(executor):
-            command = msgspec.structs.replace(command, host_tier=True, stages=turns)
+            pinned = (
+                -1
+                if first.weightless
+                else self.memory.load_pinned(
+                    slot, max(binding.logical_weight_bytes for binding in group)
+                )
+            )
+            command = msgspec.structs.replace(
+                command, host_tier=True, stages=turns, pinned_bytes=pinned
+            )
         subject = f"load:{label}"
         began = time.perf_counter()
         self.monitor.start(subject, "load")

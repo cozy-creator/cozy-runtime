@@ -119,6 +119,42 @@ def test_the_seam_carries_only_memfds_as_tiers(tmp_path: Path) -> None:
             os.close(memfd)
 
 
+class GpuTier(Weights):
+    """A GPU executor's host tier, without its device: `register` fills as a card's does."""
+
+    def register(self, component: object) -> None:
+        self.host_only = False
+        try:
+            super().register(component)  # type: ignore[arg-type]
+        finally:
+            self.host_only = True
+
+
+def test_a_pinned_budget_given_with_the_load_bounds_the_fill_from_its_first_byte(
+    tmp_path: Path,
+) -> None:
+    """The Rust machine's pilot pinned SDXL whole (7.13 GB) and only then cut it to the 4 GiB
+    it sent after Load. The budget now comes with the Load (`Load.pinned_bytes`), applied
+    before the weight set registers: a prefix fills inside it, and nothing is pinned past it
+    and punched back. Without one, the executor sizes its own tier from the host."""
+    checkpoint = write_checkpoint(tmp_path)[0]
+    budget = 96 << 20  # below the set's 128 MiB
+    weights = GpuTier(torch, torch.device("cpu"), "cpu")
+    weights.set_budget(-1, budget)  # what `Executor.load` applies from `Load.pinned_bytes`
+    filling = load(weights, checkpoint, "bounded").residency.components["stack"].filling
+    assert filling is not None
+    filling.wait()
+    held = plane.stats(weights.plane).host
+    assert 0 < held.fill_bytes <= held.used <= budget == held.budget, held
+    assert held.evictions == 0, held
+
+    unbounded = GpuTier(torch, torch.device("cpu"), "cpu")
+    filling = load(unbounded, checkpoint, "own").residency.components["stack"].filling
+    assert filling is not None
+    filling.wait()
+    assert plane.stats(unbounded.plane).host.used > budget  # its own share holds the set
+
+
 #: Runs inside a small cgroup: fill the host tier of every weight set given, as a GPU executor
 #: does at load (`Weights.register`), and report what the cgroup holds. It stops the moment
 #: memory that cannot be reclaimed reaches `memory.high`, where the kernel throttles the fill.

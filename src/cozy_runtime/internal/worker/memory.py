@@ -744,17 +744,34 @@ class MemoryManager:
         and `first` ahead of all; -1 when the host or its weights are unreadable."""
         return self._shares(tenant if first else "").get(tenant, -1)
 
-    def _shares(self, first: str = "") -> dict[str, int]:
+    def load_pinned(self, tenant: str, size: int) -> int:
+        """The pinned budget `tenant`'s first load starts with (`Load.pinned_bytes`): its share
+        of `size` weight bytes ahead of every other tenant, so the fill never pins past it.
+        -1 for a later load (its tier's budget stands) or an unreadable host."""
+        row = self._row(tenant)
+        if row is None or row.ledger.plane is not None or size <= 0:
+            return -1
+        return self._shares(tenant, loading=size).get(tenant, -1)
+
+    def _shares(self, first: str = "", loading: int = 0) -> dict[str, int]:
         """Every plane tenant's share of the machine's pinned total, most recently used first
-        and `first` ahead of all. Empty when the host is unreadable."""
+        and `first` ahead of all; `loading` is the weights `first` loads before it has a plane.
+        Empty when the host is unreadable."""
         memory = read_host_memory()
         if memory.available < 0:
             return {}
         rows = sorted(
-            ((slot, row) for slot, _lane, row in self.tenants() if row.ledger.plane),
+            (
+                (slot, row)
+                for slot, _lane, row in self.tenants()
+                if row.ledger.plane or (loading and slot == first)
+            ),
             key=lambda item: (item[0] != first, -item[1].last_used),
         )
-        sizes = {slot: weights(row.ledger) for slot, row in rows}
+        sizes = {
+            slot: loading if loading and slot == first else weights(row.ledger)
+            for slot, row in rows
+        }
         split = pinned_split(
             memory.available,
             [
