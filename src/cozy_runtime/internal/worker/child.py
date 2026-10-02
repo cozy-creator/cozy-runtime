@@ -494,9 +494,9 @@ class ExecutorSupervision:
                 flush=True,
             )
             self._root_lease = proctree.acquire_worker_root_lease(lock, wait=True)
-        # Rank 0 writes warm-call tensors before any request has an attempt spool.
-        # Provision that subtree before dropping privileges; the worker root remains
-        # traverse-only for the executor and cannot be created beneath by that UID.
+        # An older executor's rank 0 writes `Model.warm`'s call tensors before any request has
+        # an attempt spool. Provision that subtree before dropping privileges; the worker root
+        # remains traverse-only for the executor and cannot be created beneath by that UID.
         warm = self.root / "warm"
         warm.mkdir(mode=0o700, exist_ok=True)
         if self.isolated:

@@ -220,9 +220,9 @@ def test_the_worker_imposes_the_jit_scope_for_every_executor(tmp_path: Path) -> 
     assert all(os.path.abspath(value) == value for value in imposed.values())
 
 
-def test_warm_refuses_only_the_wrapping_spelling() -> None:
-    """`Model.warm`'s guard (cr-110): `torch.compile(module)` refuses, naming the site in the
-    author's frame; the in-place `module.compile()` runs and moves no key."""
+def test_construction_refuses_both_compile_spellings() -> None:
+    """Construction's guard: `torch.compile(module)` and the lazy `module.compile()` both
+    refuse, naming the site in the author's frame, and move no key."""
     import torch
     from torch import nn
 
@@ -232,15 +232,11 @@ def test_warm_refuses_only_the_wrapping_spelling() -> None:
         block = nn.Sequential(nn.Linear(8, 8), nn.SiLU(), nn.Linear(8, 8))
     keys = sorted(block.state_dict())
 
-    with refuse_compile(lazy=False):
+    with refuse_compile():
         with pytest.raises(ConstructionFault) as refused:
             torch.compile(block)
-        block.compile()
+        with pytest.raises(ConstructionFault):
+            block.compile()
     assert refused.value.construct == "torch.compile"
-    assert "module.compile()" in refused.value.message
     assert __file__ in refused.value.site
     assert sorted(block.state_dict()) == keys
-
-    # Construction's guard still refuses both, because there the lazy one traces fake tensors.
-    with refuse_compile(lazy=True), pytest.raises(ConstructionFault):
-        block.compile()

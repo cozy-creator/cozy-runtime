@@ -771,6 +771,92 @@ def test_a_restarted_machine_prewarms_what_its_card_last_served(
             second.worker.shutdown()
 
 
+def test_a_restarted_machine_prewarms_before_its_claim_and_store_walk(
+    warm: Callable[..., Warm], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restarted machine's boot starts the executors its card served last before any claim
+    names its owner and before it verifies the store's held manifests (0.6 s on the laptop):
+    the executor start is a cold run's longest leg, so it begins first. The owner is the
+    journal's newest. Real Worker boot (`run`), real journal; the store walk is held open."""
+    del warm  # its driver fakes only: both boots share one machine root
+    with tempfile.TemporaryDirectory(prefix="cz-boot.", dir="/tmp") as raw:
+        first = Warm(Path(raw), CARDS[0])
+        origin = Origin(Path(tempfile.mkdtemp(prefix="cz-origin.", dir="/tmp")))
+        try:
+            first.captured_root("A", origin)
+            origin.release.set()
+            call, request = _call("A")
+            serving = first.worker.machine_calls.serving  # type: ignore[union-attr]
+            landing = serving._shared(
+                OWNER, call, first.target(origin.checkpoint), request, {}, speculative=False
+            )
+            assert landing is not None and landing.result(120)
+            first.finish("A")
+            first.direct_root("D1", origin.checkpoint)
+            _wait(lambda: first.executions.status(OWNER, "D1").state in TERMINAL, "D1 served")
+        finally:
+            origin.close()
+            first.worker.shutdown()
+
+        walking, walked, prewarmed = threading.Event(), threading.Event(), threading.Event()
+        owners: list[str] = []
+        rebuild, prewarm = Worker._rebuild_held_manifests, prespawn.Prespawns.prewarm
+
+        def walk(worker: Worker) -> None:
+            walking.set()
+            assert walked.wait(300)  # a hang bound on a loaded box, not a budget
+            rebuild(worker)
+
+        def seen(prespawns: prespawn.Prespawns, owner: str) -> None:
+            owners.append(owner)
+            prewarmed.set()
+            prewarm(prespawns, owner)
+
+        monkeypatch.setattr(Worker, "_rebuild_held_manifests", walk)
+        monkeypatch.setattr(prespawn.Prespawns, "prewarm", seen)
+        # A machine start is a new boot: no control history, so no owner until a claim.
+        assert first.worker.ownership_path is not None
+        first.worker.ownership_path.unlink()
+        second = Worker(first.worker.config, first.worker.options, InMemoryControlHost())
+        thread = threading.Thread(target=second.run, daemon=True)
+        thread.start()
+        try:
+            assert walking.wait(60) and prewarmed.wait(60), "the prewarm waited for the walk"
+            assert owners == [OWNER] and not second.fence.record_owner_recorded
+            slot = _wait(lambda: second.prespawns.slots.get((INSTALLATION, (0,))), "its slot")
+            assert slot.started.wait(300)  # torn down after its process exists, not mid-spawn
+        finally:
+            walked.set()
+            second.request_stop()
+            second.host.stop()
+            thread.join(60)
+        assert not thread.is_alive()
+
+
+def test_a_replica_acquires_beside_its_prespawns_imports(
+    warm: Callable[..., Warm], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replica's acquisition (0.3 s on the laptop) runs while the process started for it is
+    still importing, and takes the process after: the imports are never waited out first."""
+    machine = warm()
+    machine.submit_root("A")
+    target = machine.target({"digest": "sha256:" + "0" * 64, "length": 1})
+    machine.worker.prespawns.request(OWNER, "A", target, lambda frame: None)
+    slot = _wait(lambda: machine.worker.prespawns.slots.get((INSTALLATION, (0,))), "a prespawn")
+    importing: list[bool] = []
+    acquire = Worker._acquire
+
+    def acquiring(worker: Worker, placement: Any, revision: int) -> Any:
+        importing.append(not slot.started.is_set())
+        return acquire(worker, placement, revision)
+
+    monkeypatch.setattr(Worker, "_acquire", acquiring)
+    machine.direct_root("D1")
+    machine.tick()
+    assert _wait(lambda: importing, "the replica's acquisition") == [True]
+    assert slot.claimed.is_set() and slot.started.wait(300)
+
+
 def test_the_adopting_start_is_the_device_start_alone(warm: Callable[..., Warm]) -> None:
     """A grant that arrives while the process is still importing waits out only those imports
     (it would pay them itself), takes that very process at the worker's priority, and sends

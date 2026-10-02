@@ -4,7 +4,7 @@ Three things live here because they are one idea — what the worker knows about
 bounded and kept honest.
 
 **Boot is attributed per step, and every step is typed.** `download | load | derive` are
-the closed vocabulary (an author's `Model.warm` is a leg of `load`, cr-110); a step emits
+the closed vocabulary; a step emits
 `started` at POSITION ZERO so a wedge before the first unit still renders, and it ends
 with an outcome. A compile/derive slice is named as
 its own step even though nothing measures it yet: leaving it unnamed is how the cache door's

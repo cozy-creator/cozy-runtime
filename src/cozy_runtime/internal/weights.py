@@ -30,7 +30,15 @@ import tensorfs
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._stage_memo import inexact
-from cozy_runtime.internal import accel, budget_cell, canonical, plane, proctree, weight_policy
+from cozy_runtime.internal import (
+    accel,
+    budget_cell,
+    canonical,
+    image_vae,
+    plane,
+    proctree,
+    weight_policy,
+)
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
@@ -531,7 +539,7 @@ class Weights:
         if row.state == "present":
             reserved = accel.allocation(self.torch, self.kind)["reserved_bytes"]
             mapped = max(plane.stats(self.plane).device(self.index).committed, 0)
-            self.context_bytes = max(row.bytes - reserved - mapped, 0)
+            self.context_bytes = max(row.bytes - reserved - mapped, self.context_bytes, 0)
 
     def resident_bytes(self, component: Component) -> int:
         return plane.stats(self.plane).ready(component.key, self.index)
@@ -2458,18 +2466,20 @@ class WeightResidency:
         """An image VAE's decode mode, decided before the call from what is free plus what the
         plane may unmap: untiled when its measured activations fit, else tiled with the tile
         clamped to what is free. A size never measured at or above runs untiled (its blocks
-        retry on OOM; a fixed cost makes small decodes' per-pixel peaks overstate large ones).
+        retry on OOM), sized by the largest size measured below it: a fixed cost makes small
+        decodes' per-pixel peaks overstate large ones.
         A decode that cannot run untiled even with every idle weight unmapped runs again tiled,
         and a tile that does not fit runs again at half the side, down to the smallest tile.
         The mode is recorded in the run's outputs."""
-        root: Any = self.components[name].root  # diffusers' AutoencoderKL, read as it is
+        root: Any = self.components[name].root  # a diffusers image VAE, read as it is
+        vae = image_vae.geometry(root)
+        assert vae is not None
         weights = self.weights
         #: pixels -> the untiled peak measured at that size
         peaks: dict[int, int] = {}
         #: pixels -> the tile side that last fit
         sides: dict[int, int] = {}
-        scale = 2 ** (len(root.config.block_out_channels) - 1)
-        default = int(root.tile_sample_min_size)
+        scale = vae.scale
 
         def run(z: Tensor, *args: object, **kwargs: object) -> object:
             if self.active is not None:
@@ -2478,25 +2488,26 @@ class WeightResidency:
             pixels = int(z.shape[0]) * height * width
             free, evictable = self.room((name,))
             size = min((n for n in peaks if n >= pixels), default=0)
-            per_pixel = peaks[size] // size if size else 0
+            known = size or max(peaks, default=0)
+            per_pixel = peaks[known] // known if known else 0
             mode = (
                 weight_policy.decode_mode(free, evictable, per_pixel * pixels)
                 if size
                 else "untiled"
             )
             # Activations first: idle weights leave before a decode needs their room (all of
-            # them unless a measured untiled peak says less), since a decode's convolutions
-            # outside any block hook cannot retry.
-            need = per_pixel * pixels if mode == "untiled" and size else free + evictable
-            free = self._room_for_decode(name, free, evictable, need)
+            # them unless a measured untiled peak says less), since a decode run short of
+            # memory takes slower convolutions.
+            need = per_pixel * pixels if mode == "untiled" and known else free + evictable
+            free = self._room_for_decode(name, free, evictable, min(need, free + evictable))
             # a tile under half the image, so tiling always lowers the peak
-            largest = _side(min(default, min(height, width) // 2))
+            largest = _side(min(height, width) // 2)
             side = min(_side(free // max(per_pixel, 1)), sides.get(pixels, largest), largest)
             baseline = accel.allocated(weights.torch, weights.kind)
             accel.reset_peak(weights.torch, weights.kind)
             while True:
                 if mode == "tiled":
-                    _tile(root, side, scale)
+                    vae.tile(side)
                 else:
                     root.disable_tiling()
                 try:
@@ -2564,8 +2575,8 @@ class WeightResidency:
 
     def _room_for_decode(self, name: str, free: int, evictable: int, need: int) -> int:
         """Activations first: idle weights leave before a decode needs their room (never what
-        the stage holds, which may still be filling), since a decode's convolutions outside
-        any block hook cannot retry. Returns what is free after."""
+        the stage holds, which may still be filling), since a decode run short of memory takes
+        slower convolutions. Returns what is free after."""
         if need <= free or evictable <= 0:
             return free
         weights = self.weights
@@ -2683,20 +2694,11 @@ def _requested(exc: BaseException) -> int:
 
 
 def _image_vae(root: Module) -> bool:
-    """diffusers' image `AutoencoderKL`: one decode call, one frame, tiling it can switch."""
-    return any(
-        kind.__name__ == "AutoencoderKL" and kind.__module__.startswith("diffusers.")
-        for kind in type(root).__mro__
-    )
+    """An image VAE whose decode the plane sizes: one frame, tiling it can switch."""
+    return image_vae.geometry(root) is not None
 
 
 def _side(pixels: int) -> int:
     """The largest tile side, a multiple of 64 and at least the smallest tile, whose square
     is at most `pixels`."""
     return max(int(max(pixels, 0) ** 0.5) // 64 * 64, MIN_TILE)
-
-
-def _tile(root: Any, side: int, scale: int) -> None:
-    root.enable_tiling()
-    root.tile_sample_min_size = side
-    root.tile_latent_min_size = side // scale

@@ -486,7 +486,7 @@ class Machine:
     def activate_warm(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Replicas activate as started executors (`start`) instead of acquiring a package."""
         monkeypatch.setattr(
-            Worker, "_activate_hosted", lambda worker, hosted, revision: self.start(hosted)
+            Worker, "_activate_hosted", lambda worker, hosted, *_: self.start(hosted)
         )
 
     def executors(self) -> dict[str, tuple[int, int]]:

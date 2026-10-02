@@ -1115,6 +1115,8 @@ class Worker:
         self._activating: set[str] = set()
         #: the owner this process's one boot reconcile ran for
         self._reconciled = ""
+        #: the owner whose last-served installations were prewarmed
+        self._prewarmed = ""
         #: terminal executions whose hold this boot releases once their effects settle
         self.releasing: set[str] = set()
         self.failure_reason = ""
@@ -2431,8 +2433,24 @@ class Worker:
             self.execution(owner, request)
         for request in self.machine_calls.journal.unsettled_effects(owner):
             self.execution(owner, request)
-        if not owed:
-            # Off the boot path: readiness and the claim never wait on its journal read.
+        self._prewarm()
+
+    def _prewarm(self) -> None:
+        """Start the executors of the installations each GPU set served last, once per owner
+        and only when the journal owes that owner no work. A fresh boot learns its owner from
+        the first claim; before it, the journal's newest owner is the one prewarmed. Off the
+        boot path: readiness and the claim never wait on its journal read."""
+        if self.executions is None:
+            return
+        owner = (
+            self.fence.record_owner_id
+            if self.fence.record_owner_recorded
+            else self.executions.last_owner()
+        )
+        if not owner or self._prewarmed == owner:
+            return
+        if not self.executions.owed(owner, self.options.worker_id):
+            self._prewarmed = owner
             self.supervisor.spawn("prewarm", lambda _: self.prespawns.prewarm(owner))
 
     def submit_execution(
@@ -3230,14 +3248,17 @@ class Worker:
                 self.lanes.envelope.forget("")
                 self.job_slots.pop("envelope", None)
             self.accepted.mode = "serving"
+
+        def adopt() -> None:
+            if warm is not None:
+                self.prespawns.settle(warm, placement.placement_id)
+            current = self.supervision.current
+            if job and current is not None:
+                self.supervision.retire_current(current, "a machine replica takes the devices")
+
         try:
             with self._call_phase(request_id, attempt, "Starting model executor"):
-                if warm is not None:
-                    self.prespawns.settle(warm, placement.placement_id)
-                current = self.supervision.current
-                if job and current is not None:
-                    self.supervision.retire_current(current, "a machine replica takes the devices")
-                self._activate_hosted(hosted, None)
+                self._activate_hosted(hosted, None, adopt)
         except Exception as exc:
             hosted.latched = f"replica_activation_failed: {type(exc).__name__}: {exc}"[:200]
             self._settle()
@@ -5102,14 +5123,25 @@ class Worker:
                 self.accepted.converged_revision = revision
             self._settle()
 
-    def _activate_hosted(self, hosted: HostedPlacement, revision: int | None) -> None:
+    def _activate_hosted(
+        self,
+        hosted: HostedPlacement,
+        revision: int | None,
+        adopt: Callable[[], None] | None = None,
+    ) -> None:
         """Acquire, place and activate one hosted placement in its own uv environment.
 
-        A machine replica passes no revision: no desired state supersedes it."""
+        A machine replica passes no revision: no desired state supersedes it. `adopt` takes
+        its executor once the acquisition is done: a process still importing (`prespawn`)
+        imports beside it, not before it."""
 
         placement = hosted.placement
         placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_MATERIALIZING
-        acquired = self._acquire(placement, revision or 0)
+        try:
+            acquired = self._acquire(placement, revision or 0)
+        finally:
+            if adopt is not None:
+                adopt()
         if acquired is None or (
             revision is not None and revision != self.accepted.accepted_desired_state_revision
         ):
@@ -5157,7 +5189,7 @@ class Worker:
 
         The serving edge is the hosted placement's own; the worker-level latch is not
         touched — a hosted placement that cannot prepare latches itself and the others keep
-        serving. The author's `Model.warm` ran inside its prepare, as for every placement.
+        serving.
         """
         placement = hosted.placement
         self._hosted_set_serving(
@@ -6121,7 +6153,7 @@ class Worker:
         turns = attempt is not None and attempt.stage_turns
         if not first.weightless and not turns:
             # Idle tenants of every device give room for the weights first: an executor before
-            # the plane fills them onto the device, and a plane executor's `Model.warm` stages
+            # the plane fills them onto the device, and a plane executor's first stage maps
             # them. A plane tenant gives room by a budget cut, so its bytes stay pinned.
             # Bindings of one construction share its weights, so they are counted once.
             declared = max(binding.logical_weight_bytes for binding in group)
@@ -6487,11 +6519,7 @@ class Worker:
         )
 
     def _finish_activation(self) -> None:
-        """Publish the activation edge, or its typed failure when the executor was lost.
-
-        No entrypoint-level warm pass runs here any more (cr-110): the author's `Model.warm`
-        ran INSIDE the prepare, on every worker, before the executor reported Ready.
-        """
+        """Publish the activation edge, or its typed failure when the executor was lost."""
         executor = self.supervision.current
         if executor is None or not self.supervision.owns(executor):
             self.latched = self.latched or "executor_lost_during_activation"
@@ -8068,6 +8096,8 @@ class Worker:
             # lanes are all real. It moves
             # here and not at the first claim, because a worker is online whether or not a
             # RecordOwner has dialled it — and admission is CLOSED until the barrier anyway.
+            # The executor start is a cold run's longest leg: it begins before the rest.
+            self._prewarm()
             self._rebuild_held_manifests()
             self.set_phase(pb.WorkerPhase.WORKER_PHASE_ONLINE, "boot completed")
             threading.Thread(

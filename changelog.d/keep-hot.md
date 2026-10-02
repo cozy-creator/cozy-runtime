@@ -1,0 +1,1 @@
+A model's next request finds its weights mapped: a call past its last stage no longer unmaps them for its own model's queued request, which then uploaded all of them again (6.4 GiB per SDXL request on an 8 GB card). An image decode larger than any measured is sized by the largest measured below it instead of unmapping every idle weight.

@@ -112,6 +112,7 @@ from cozy_runtime.internal import (
     child_env,
     execution_evidence,
     executor_commands,
+    image_vae,
     kernel_cache,
     model_config,
     native_interfaces,
@@ -396,6 +397,9 @@ class _CompositeResidency:
         }
 
 
+#: Model classes that still define `warm` (packages built for an older Runtime), noted once each.
+_WARM_NOTED: set[type] = set()
+
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
 #: is a missed saving and never a wrong answer: the prepare imports what it needs either
@@ -410,7 +414,6 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.fill",
     "cozy_runtime.internal.fusion",
     "cozy_runtime.internal.planfacts",
-    "cozy_runtime.internal.warm",
     "cozy_runtime.internal.probe",
     "cozy_runtime.internal.weights",
     "cozy_runtime.internal.resolution",
@@ -1091,26 +1094,6 @@ class Executor:
         weights = self.host.weights
         return weights.recovering() if weights is not None else contextlib.nullcontext()
 
-    def _warm_model(self, model: Any) -> float:
-        """Preparation has its own spool; component calls need no request to warm."""
-        from cozy_runtime.internal.warm import warm_generation
-
-        if self.residency is not None:
-            self.residency.open_attempt()
-        owner = self.host
-        owner._attempt_spool = (
-            self.root / "warm" / hashlib.sha256(self._group_model_key.encode()).hexdigest()
-        )
-        try:
-            with self._recovering(), owner._turns(self.residency, owner.stage_turns):
-                return warm_generation(
-                    model, device=self._device(), cancel=lambda: bool(self.poisoned)
-                )
-        finally:
-            owner._attempt_spool = None
-            if self.residency is not None:
-                self.residency.unpark()
-
     def _warm_package(self) -> str:
         """Give the package its ONE chance to pay its deferred import cost off the lock.
 
@@ -1771,7 +1754,6 @@ class Executor:
             Variant,
             resolve,
         )
-        from cozy_runtime.internal.warm import WarmFailed
 
         stage("runtime_imports")
         _restore_seal()
@@ -1884,6 +1866,14 @@ class Executor:
         stage("qualify")
         objective = binding.objective or "latency"
         model_cls = getattr(self.discovered.module, binding.model_class)
+        if callable(getattr(model_cls, "warm", None)) and model_cls not in _WARM_NOTED:
+            _WARM_NOTED.add(model_cls)
+            print(
+                f"[executor] {model_cls.__qualname__}.warm is not called: the call that waits "
+                "on a load pays its own first launches",
+                file=sys.stderr,
+                flush=True,
+            )
         config_checkpoint = next(
             (
                 checkpoint
@@ -2108,10 +2098,12 @@ class Executor:
                 if consent in ("accept", "require")
                 else None
             )
+            roots = backend.roots
+            for root in roots.values():
+                image_vae.fast_decode(root)
             stage("execution_plan")
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
             # per attention site and before any warm step (see `_prepare_attention`).
-            roots = backend.roots
             reselect = functools.partial(
                 self._prepare_attention,
                 binding,
@@ -2203,39 +2195,8 @@ class Executor:
         if refused is not None:
             return refused
         stage("install")
-        # THE AUTHOR'S ONE WARM MOMENT (cr-110): after registration, the execution plan, the
-        # residency install and the group mirror; before this generation is Ready. Its
-        # stages stream from the host tier like any request's, and teach the residency the
-        # blocks' execution order.
-        warm_ms = 0.0
-        refused = None
-        if self.rank == 0:
-            try:
-                warm_ms = self._warm_model(model)
-            except WarmFailed as exc:
-                cause = exc.__cause__
-                short = cause if isinstance(cause, ResidencyRefusal) else None
-                oom = cause is not None and is_device_oom(cause)
-                refused = {
-                    "ok": False,
-                    "code": short.code if short else "device_out_of_memory" if oom else exc.code,
-                    "shortfall": short.shortfall if short else None,
-                    "detail": str(exc)[:900],
-                    "traceback": prepare_diagnostics.exception_trace(exc),
-                }
-                capacity = short is not None or oom
-        if refused is not None:
-            # Outside `except`, so the failed warm's frames hold no view of a weight set. A
-            # capacity refusal gives this construction's weight sets back and the process
-            # keeps serving; a group's followers hold their half, so it is replaced.
-            if capacity and self.world == 1:
-                backend.close()
-            else:
-                self.poisoned = f"warm failed: {refused['detail']}"[:200]
-                with contextlib.suppress(Exception):  # the warm's own failure is the report
-                    backend.poison(())
-            return {**refused, "state": backend.state}
-        stage("warm")
+        # No warm step: a call waits on every load, so a dry render only delays it. Its first
+        # stage maps the weights and pays the first launches (the ledger re-baselines once).
         weights.measure_context()
         if "sol-attn" in applied.totals():
             frozen = attention._baked_in(dict(backend.roots))
@@ -2262,7 +2223,6 @@ class Executor:
             "substrate_census": list(record.weightless),
             "execution_optimization_refusal": optimization_refusal,
             "execution_fusion": fused.document() if fused is not None else None,
-            "warm_ms": round(warm_ms, 2),
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
             "device_free_bytes": memory["driver_free_bytes"],
@@ -2512,7 +2472,6 @@ class Executor:
                 sum(int((facts.get("substrate_census") or (0, 0, 0))[i]) for _, facts in facts_rows)
                 for i in range(3)
             ],
-            "warm_ms": sum(float(facts.get("warm_ms", 0)) for _, facts in facts_rows),
             "filled": sum(int(facts.get("filled", 0)) for _, facts in facts_rows),
             "filled_bytes": sum(int(facts.get("filled_bytes", 0)) for _, facts in facts_rows),
             "device_free_bytes": int(last.get("device_free_bytes", -1)),
@@ -2867,6 +2826,9 @@ class Executor:
             else attention.observed(self._attention_roots())
         )
         self._emit_attention(record, restored, "attention.restored")
+        # The first stages launch the libraries' kernels and workspaces: the context grows.
+        if self.host.weights is not None:
+            self.host.weights.measure_context()
         # THE MODES THIS ATTEMPT RAN IN (weight-plane.md principle 7): decode tiling and batch
         # layout, each decided before its stage and recorded with the run.
         plane_facts = self._plane_facts()

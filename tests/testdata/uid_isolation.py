@@ -1,7 +1,7 @@
-"""Real Gloo ranks exercising warm and request spools under the executor UID.
+"""Real Gloo ranks exercising request spools under the executor UID.
 
 Model filling and H3 numerics are separate gates. This fixture runs the actual
-warm, component scope, mirror, tensor transport, and follower execution code.
+component scope, mirror, tensor transport, and follower execution code.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any
 import msgspec
 import torch
 
-from cozy_runtime.author import Context, Model, uses_components
+from cozy_runtime.author import Model, uses_components
 from cozy_runtime.internal import spawn
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import Join
@@ -33,12 +33,8 @@ class Collective(torch.nn.Module):  # type: ignore[misc]
         return result
 
 
-class WarmModel(Model[object]):
+class CollectiveModel(Model[object]):
     block: Any
-
-    def warm(self, ctx: Context) -> None:
-        ctx.raise_if_cancelled()
-        self.compute()
 
     @uses_components("block")
     def compute(self) -> None:
@@ -53,7 +49,7 @@ def follower(args: argparse.Namespace) -> None:
     executor = Executor(channel, args.root, rank=args.rank, world=args.world)
     executor.device_kind = "cpu"  # type: ignore[assignment]  # CPU/Gloo hardware boundary.
     executor.torch = torch
-    model = WarmModel.for_test(block=Collective())
+    model = CollectiveModel.for_test(block=Collective())
     executor.group_components = {("fixture", "block"): (model, model.block)}
     executor.group_sharded.add(("fixture", "block"))
     executor.ready = True
@@ -75,7 +71,7 @@ def follower(args: argparse.Namespace) -> None:
 def leader(args: argparse.Namespace) -> None:
     assert os.getuid() == os.getgid() == 65533
     assert os.getgroups() == []
-    # The worker's records must remain inaccessible while the named warm path works.
+    # The worker's records must remain inaccessible while the named request paths work.
     for operation in (
         lambda: list(args.root.iterdir()),
         lambda: (args.root / "private").read_bytes(),
@@ -102,7 +98,7 @@ def leader(args: argparse.Namespace) -> None:
     executor.device_kind = "cpu"  # type: ignore[assignment]  # CPU/Gloo hardware boundary.
     executor.torch = torch
     executor._group_model_key = "fixture"
-    model = WarmModel.for_test(block=Collective())
+    model = CollectiveModel.for_test(block=Collective())
     try:
         group.spawn()
         group.form(torch, {})
@@ -115,14 +111,11 @@ def leader(args: argparse.Namespace) -> None:
             group=group,
             spool=lambda: executor._attempt_spool,
         )
-        assert executor._warm_model(model) >= 0
-        assert executor._attempt_spool is None
-        assert not list((args.root / "warm").rglob("tensor-*.raw"))
         for index in range(2):
             executor._attempt_spool = args.requests / str(index)
             model.compute()
             assert not list(executor._attempt_spool.rglob("tensor-*.raw"))
-        print(json.dumps({"uid": os.getuid(), "degree": args.world, "warm": True, "requests": 2}))
+        print(json.dumps({"uid": os.getuid(), "degree": args.world, "requests": 2}))
     finally:
         group.close()
         ours.close()

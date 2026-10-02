@@ -1,7 +1,7 @@
 # Preparation failure diagnostics (h3a-092)
 
 H3 request778 downloaded its base/PDD checkpoints and formed a four-GPU lane,
-then failed in `Model.warm` with an NCCL error. The reply retained only the short
+then failed preparing with an NCCL error. The reply retained only the short
 exception message. Its chained traceback disappeared when the executor was
 retired, and the worker printed absent memory readings as peak0/allocated-1.
 Those numbers were renderer defaults, not observations.
@@ -30,8 +30,8 @@ initialization or a collective fails before an executor reply exists.
 Missing, negative, non-integer and boolean memory readings render as unknown.
 An explicitly reported integer zero remains a valid reading.
 
-CPU regressions exercise a real chained `warm_generation` failure, retained
+CPU regressions exercise a real chained preparation failure, retained
 diagnostics through an oversized real IPC reply, secret/local/source exclusion,
 bounds/cycles, unknown versus measured-zero memory, actual Linux protection
 observation, and logging at the executor boundary without CUDA initialization.
-Real multi-GPU warm qualification remains a separate gate.
+Real multi-GPU qualification remains a separate gate.
