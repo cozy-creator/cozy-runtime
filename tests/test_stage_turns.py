@@ -344,13 +344,15 @@ def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
         )
 
     monkeypatch.setattr(worker, "_ensure_once", short)
-    evicted: list[str] = []
+    evicted: list[tuple[str, bool]] = []
     monkeypatch.setattr(
-        worker.memory, "make_room", lambda lane, slot, need, why: evicted.append(slot) or {}
+        worker.memory,
+        "make_room",
+        lambda lane, slot, need, why, contexts=False: evicted.append((slot, contexts)) or {},
     )
     with pytest.raises(DeviceExhausted, match="a block ran out of memory"):
         worker._ensure_construction(attempt)
-    assert evicted == ["tenant-b", "tenant-b"], "every idle tenant is cut before each try"
+    assert evicted == [("tenant-b", True)] * 2, "idle weights and idle contexts go before each try"
     statuses: list[int] = []
     monkeypatch.setattr(
         worker.engine, "outcome", lambda attempt, status, *rest: statuses.append(status)
