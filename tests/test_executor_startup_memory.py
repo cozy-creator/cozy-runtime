@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from typing import Any
 
 import pytest
 
@@ -234,6 +235,29 @@ def test_a_prespawn_lane_is_no_placement(machine: Machine) -> None:
     assert lane.ordinals == (0, 1) and lane.devices == "64,65"
     # The temporary startup lane is not another placement or scheduler grant.
     assert not lane.placements and lane.lane_id not in machine.worker.lanes.composition
+
+
+@needs_executor
+def test_start_ends_an_idle_tenant_whose_executor_is_already_gone(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 2567: the idle tenant on the cards was a group that had just broken. Cutting its
+    budget wrote to its closed seam, and the next replica's activation failed on a bad file
+    descriptor. A closed seam is an executor that is gone: it is ended and the start goes on."""
+    idle, fresh, occupied = contexts(machine, monkeypatch)
+    old, executor = idle.supervision.current, fresh.supervision.current
+    assert old is not None and executor is not None
+    calls, _ = allocation(machine, fresh, monkeypatch, idle, occupied)
+    old.close()
+    reclaim = machine.worker.memory.reclaim
+
+    def ended(*args: Any) -> None:
+        occupied.clear()  # the driver frees a dead process's memory
+        reclaim(*args)
+
+    monkeypatch.setattr(machine.worker.memory, "reclaim", ended)
+    assert machine.worker._start_executor(fresh, executor) == ""
+    assert len(calls) == 1 and not occupied
 
 
 @needs_executor

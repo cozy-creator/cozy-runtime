@@ -21,9 +21,9 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from cozy_runtime.author import Model, placeable, uses_components
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
 from cozy_runtime.author._loader import census
-from cozy_runtime.internal import attention
+from cozy_runtime.internal import attention, plane
 from cozy_runtime.internal.encoding import SPEC_PLAIN, DeviceFacts
-from cozy_runtime.internal.executor import Executor, _capture_seal
+from cozy_runtime.internal.executor import Executor, _capture_seal, answer
 from cozy_runtime.internal.executor_commands import decode
 from cozy_runtime.internal.fill import Checkpoint
 from cozy_runtime.internal.parallel.cp import in_gated_call
@@ -454,6 +454,7 @@ def main() -> None:
     parser.add_argument("--staged", action="store_true")
     parser.add_argument("--hosted", action="store_true")
     parser.add_argument("--spread", action="store_true")
+    parser.add_argument("--before-plane", action="store_true")
     args = parser.parse_args()
     args.h3 = args.h3 or args.h3_lora or args.hosted or args.spread
     torch.set_num_threads(1)
@@ -500,8 +501,16 @@ def main() -> None:
                 assert refused is None, refused
         elif name == "run":
             reply = executor.run(command)
+        elif name == "hello":
+            reply = executor.hello()
+            if args.before_plane:  # a Runtime from before the weight plane says no such thing
+                reply["memory"] = [m for m in reply["memory"] if m != plane.CAPABILITY]
+        elif name == "budget" and args.before_plane:
+            reply = {"ok": False, "code": "follower_command_unsupported", "detail": "budget"}
         else:
-            raise AssertionError(name)
+            answered = answer(executor, command)
+            assert answered is not None, name
+            reply = answered
         channel.send({**reply, "reply": name})
 
 

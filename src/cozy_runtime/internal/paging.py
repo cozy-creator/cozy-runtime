@@ -10,13 +10,17 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from itertools import chain
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch import Tensor
+    from torch.nn import Module
 
 
 @dataclass(frozen=True)
 class PageUnit:
     path: str
-    owners: tuple[tuple[str, Any], ...]
+    owners: tuple[tuple[str, Module], ...]
     nbytes: int
     keys: tuple[str, ...]
 
@@ -44,7 +48,7 @@ class BlockLayout:
         }
 
 
-def partition(root: Any, limit: int | None = None) -> BlockLayout | None:
+def partition(root: Module, limit: int | None = None) -> BlockLayout | None:
     """Use declared indivisible blocks; never guess an arbitrary ModuleList's semantics.
 
     With `limit`, the units are instead the largest module subtrees of at most `limit` bytes
@@ -74,10 +78,10 @@ def partition(root: Any, limit: int | None = None) -> BlockLayout | None:
         blocks = [unit for unit in _split(root, "", limit) if unit]
     if not blocks:
         return None
-    owners: dict[str, list[tuple[str, Any]]] = {"": [], **{path: [] for path in blocks}}
+    owners: dict[str, list[tuple[str, Module]]] = {"": [], **{path: [] for path in blocks}}
     sizes = dict.fromkeys(owners, 0)
     keys: dict[str, list[str]] = {path: [] for path in owners}
-    storage_units: dict[Any, str] = {}
+    storage_units: dict[object, str] = {}
     module_units: dict[int, str] = {}
     for path, module in modules:
         unit = next(
@@ -108,7 +112,7 @@ def partition(root: Any, limit: int | None = None) -> BlockLayout | None:
     return BlockLayout(units[""], tuple(units[path] for path in blocks))
 
 
-def _split(root: Any, path: str, limit: int) -> list[str]:
+def _split(root: Module, path: str, limit: int) -> list[str]:
     """`path`, or its children's units when its weights exceed `limit`."""
     module = root.get_submodule(path) if path else root
     children = [
@@ -121,16 +125,16 @@ def _split(root: Any, path: str, limit: int) -> list[str]:
     return [unit for child in children for unit in _split(root, child, limit)]
 
 
-def _container(module: Any) -> bool:
+def _container(module: Module) -> bool:
     """A ModuleList or ModuleDict: never called itself (its owner calls its members), so it
     can never be a unit, whose module call is what binds it."""
     return getattr(type(module).forward, "__name__", "") == "_forward_unimplemented"
 
 
-def _tensors(module: Any) -> Iterator[Any]:
+def _tensors(module: Module) -> Iterator[Tensor]:
     """Parameters and buffers: an encoded leaf holds its stored roles as buffers."""
     return chain(module.parameters(), module.buffers())
 
 
-def _bytes(module: Any) -> int:
+def _bytes(module: Module) -> int:
     return sum(int(t.numel() * t.element_size()) for t in _tensors(module))

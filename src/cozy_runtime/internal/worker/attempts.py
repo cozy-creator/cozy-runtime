@@ -1455,6 +1455,16 @@ class AttemptEngine:
                         with executor.watched("probe"):
                             after = executor.call(Probe(), timeout=None)
                     ledger.observe_probe(after)
+                    if held := ledger.unaccounted(attempt.opened):
+                        # Cyclic garbage holding a device tensor reads as a leak until it is
+                        # collected: collect, then read again, on a mismatch only.
+                        with executor.watched("probe"):
+                            after = executor.call(Probe(collect=True), timeout=None)
+                        ledger.observe_probe(after)
+                        if not ledger.unaccounted(attempt.opened):
+                            _LOG.warning(
+                                "%s: %d B of device memory were held by cyclic garbage", key, held
+                            )
                     processes = list(after.get("processes") or [])
                     ledger.device_process = self.device_process(executor.pid)
                 except ExecutorGone:

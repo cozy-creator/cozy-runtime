@@ -35,7 +35,8 @@ class Shutdown(Command, frozen=True, kw_only=True, tag="shutdown"):
 
 
 class Probe(Command, frozen=True, kw_only=True, tag="probe"):
-    pass
+    #: collect cyclic garbage first: a cycle holding a device tensor is not a leak
+    collect: bool = False
 
 
 class Residency(Command, frozen=True, kw_only=True, tag="residency"):

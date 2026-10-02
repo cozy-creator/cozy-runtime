@@ -28,7 +28,9 @@ from cozy_runtime.internal import (  # noqa: E402
     plane,
     spawn,
 )
+from cozy_runtime.internal.config import seal_snapshot  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
+from cozy_runtime.internal.executor_commands import Budget, Prefetch  # noqa: E402
 from cozy_runtime.internal.parallel import cp, mirror, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
@@ -277,6 +279,56 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
     assert not torch.distributed.is_initialized()
     if kind == "h3-lora":
         assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("before_plane", [False, True])
+def test_the_plane_budget_reaches_the_followers_that_answer_it(
+    tmp_path: Path, before_plane: bool
+) -> None:
+    """Run 2566: GPU 0 sent the plane's `budget` to a follower that refused the command, and
+    the group broke. Every follower of this Runtime answers it. One from before the plane
+    does not say `weight_plane/1` in its hello, so it is never sent it, and the group serves."""
+    if not plane.available():
+        pytest.skip("a TensorFS with the weight plane")
+    fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
+    env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+
+    def launch(module_argv: list[str], fd: int) -> spawn.Child:
+        return spawn.spawn_follower(
+            python=sys.executable,
+            module_argv=[
+                str(fixture),
+                *module_argv[2:],
+                "--staged",
+                *(["--before-plane"] if before_plane else []),
+            ],
+            inherit_fd=fd,
+            env=env,
+        )
+
+    group = RankGroup(degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    model = collective_model()
+    plane_backend = plane_residency(tmp_path / "rank-0", model)
+    ours, theirs = socket.socketpair()
+    leader: Any = Executor(Channel(ours), tmp_path, world=2)
+    leader.device_kind = "cpu"
+    leader.group = group
+    residency: Any = model._cozy_residency
+    leader.weights = residency.weights
+    try:
+        group.spawn()
+        group.dial_back(seal_snapshot(env))
+        assert [plane.CAPABILITY in f.memory for f in group.followers] == [not before_plane]
+        assert leader.budget(Budget(vram_bytes=-1, pinned_bytes=1 << 20))["ok"]
+        # every GPU pins its own weights: each takes its share of the group's host budget
+        assert leader.weights.pinned == 1 << 19
+        assert leader.prefetch(Prefetch(construction="parallel-test"))["ok"]
+        assert not group.broken
+    finally:
+        group.close()
+        plane_backend.close()
+        ours.close()
+        theirs.close()
 
 
 @pytest.mark.parametrize("degree", [2, 4])
