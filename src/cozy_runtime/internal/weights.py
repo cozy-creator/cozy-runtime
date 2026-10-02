@@ -215,6 +215,11 @@ class Weights:
         self.open: list[tuple[WeightResidency, str, tuple[str, ...]]] = []
         self.residencies: weakref.WeakSet[WeightResidency] = weakref.WeakSet()
         self._recovery: Any = None
+        #: one GPU of a group: a block's forward holds collectives the other GPUs are already
+        #: in, so it can never run again; its ops recover one by one instead
+        self.grouped = False
+        #: blocks in their forward now (their leases pin their own weights)
+        self.running = 0
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
 
@@ -338,7 +343,21 @@ class Weights:
             if region.bound is not None and region.bound <= pointer < region.bound + region.span
         ]
         accel.release_cached(self.torch, self.kind)
-        if self.open:
+        if self.running:
+            # Inside a block (one GPU of a group): nothing is re-placed under its lease. Other
+            # weights leave, least recently used first; their blocks map them again as they run.
+            floor = sum(
+                weight_policy.floor(replace(component.layout, fine=None))
+                for _, _, component in self.opened().values()
+            )
+            if not self.shrink(need, floor):
+                raise ResidencyRefusal(
+                    "device_shortfall",
+                    f"an allocation of {need} B does not fit beside the stage's smallest "
+                    f"weights ({floor} B) on this GPU",
+                )
+            self.drain()
+        elif self.open:
             self.open[-1][0]._make_room(need)
         elif not self.shrink(need, 0):
             raise ResidencyRefusal(
@@ -1873,6 +1892,8 @@ class WeightResidency:
 
         def run(*args: Any, **kwargs: Any) -> Any:
             try:
+                if weights.grouped:  # its ops recover one by one (`Weights.make_room`)
+                    return attempt(*args, **kwargs)
                 with self._quiet():  # the block retries as a unit, not op by op
                     return attempt(*args, **kwargs)
             except self._poisoned_error as exc:
@@ -1892,7 +1913,11 @@ class WeightResidency:
                 try:
                     try:
                         bind(torch, region, lease)
-                        return forward(*args, **kwargs)
+                        weights.running += 1
+                        try:
+                            return forward(*args, **kwargs)
+                        finally:
+                            weights.running -= 1
                     except Exception as exc:
                         if not is_device_oom(exc):
                             raise
@@ -1901,6 +1926,14 @@ class WeightResidency:
                     if lease.ring_offset is not None:
                         unbind(region)
                     lease.release()
+                if weights.grouped:
+                    raise self._shortfall(
+                        self.active[0] if self.active else "",
+                        need,
+                        0,
+                        f"{component.name}.{region.path} ran out of memory outside torch's "
+                        "own ops, inside a call its group shares, so it cannot run again",
+                    )
                 if _versions(args, kwargs) != versions:
                     raise self._shortfall(
                         self.active[0] if self.active else "",

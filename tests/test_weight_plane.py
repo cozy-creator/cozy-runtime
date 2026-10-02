@@ -624,12 +624,14 @@ def test_h3_with_its_loras_computes_on_the_pinned_tier(tmp_path: Path) -> None:
 
 
 @on_card
-def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
+@pytest.mark.parametrize("grouped", [False, True])
+def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path, grouped: bool) -> None:
     """Run 2549: H3's DiT with a request LoRA under the turbo LoRA ran out of device memory.
     Here its weights get a budget far below their size, and mid-denoise another allocation
     takes the room its activations had. It still computes the fully resident run's bits: the
     turbo LoRA's stage shares the DiT's budget, blocks stream, and the allocation that fails
-    unmaps weights and runs again."""
+    unmaps weights and runs again. One GPU of a group (run 2589) recovers op by op: its
+    block holds the group's collectives and never runs twice."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
     dit, turbo = h3_models(weights, tmp_path, "h3")
@@ -647,6 +649,10 @@ def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
     weights.set_budget(weight_policy.floor(layout) + overlay + spare)
     assert weights.budget < (layout.total + overlay) // 2
     was = weights.facts()
+    weights.grouped = grouped
+    calls = {"block": 0}
+    block = dit.stack.transformer_blocks[0].attn
+    block.register_forward_hook(lambda *_: calls.__setitem__("block", calls["block"] + 1))
 
     def squeeze(step: int) -> Any:
         if step != 1:
@@ -664,6 +670,7 @@ def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
     assert now.h2d_bytes > was.h2d_bytes and now.evictions > was.evictions
     assert now.oom_retries > was.oom_retries
     assert same(list(resident), list(paged))
+    assert not grouped or calls["block"] == 3  # once per evaluation: no block ran again
 
 
 @on_card

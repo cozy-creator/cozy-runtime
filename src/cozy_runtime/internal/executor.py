@@ -1953,6 +1953,9 @@ class Executor:
         if host.weights is None:
             try:
                 host.weights = Weights(torch, self._rank_device(torch), self.device_kind)
+                # One GPU of a group: its blocks hold the group's collectives, so they
+                # recover from an out-of-memory op by op, never by running a block again.
+                host.weights.grouped = self.world > 1
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
