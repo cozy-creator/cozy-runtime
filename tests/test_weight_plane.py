@@ -867,6 +867,43 @@ def test_the_worker_lowers_a_running_stage_at_its_next_block(card: Any) -> None:
     assert same(reference, outputs)
 
 
+@on_card
+def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> None:
+    """Room for another executor, or a display's floor, made while a call runs: the owner
+    asks for a smaller process cap through the budget cell; from its next block the stage
+    streams inside it and the process holds no more than the cap, with the same bits."""
+    from cozy_runtime.internal import budget_cell
+
+    weights = card.weights
+    model = load(weights, card.checkpoint, "cap-cut")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    reference = run(model, x)
+    weights.measure_context()
+    cap = weights.context_bytes + torch.cuda.memory_reserved() + tight(model) + weight_policy.MARGIN
+    cell, fd = budget_cell.Cell.create()
+    owner = budget_cell.Cell(fd)
+    os.close(fd)
+    weights.cell = cell
+    model.residency.admit("run", ("stack",))
+    try:
+        with torch.inference_mode():
+            outputs = [model.stack(x)]
+            ticket = owner.ask(budget_cell.CAP - cap)
+            outputs += [model.stack(x), model.stack(x)]
+    finally:
+        model.residency.release("run", ("stack",))
+        weights.cell = None
+        applied = owner.answered(ticket)
+        cell.close()
+        owner.close()
+        weights.set_cap(-1)
+    facts = weights.facts()
+    assert applied is not None and applied == weights.applied
+    assert facts.streamed["stack"].resident_blocks < BLOCKS
+    assert weights.context_bytes + torch.cuda.memory_reserved() + facts.committed_bytes <= cap
+    assert same(reference, outputs)
+
+
 class WritingBlock(Block):
     """A block that writes its result into its input (a VAE's in-place activations)."""
 

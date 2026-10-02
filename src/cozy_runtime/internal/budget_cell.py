@@ -6,6 +6,10 @@ the cell at every block boundary, applies a new ask there (unmapping, then placi
 stages again) and writes what it applied, then `done = asked`. Only the Worker writes the
 first two words and only the executor the last two, each in that order, so a reader that
 sees the counter has the value it guards.
+
+A `wanted` at or below `CAP` asks for a process cap instead (`process_cap/1`): `CAP - wanted`
+bytes for the whole process, its plane re-placed inside it. Only an owner that read the
+capability writes one.
 """
 
 from __future__ import annotations
@@ -17,6 +21,8 @@ import struct
 
 #: asked, wanted, done, applied
 _LAYOUT = struct.Struct("<qqqq")
+#: `wanted` at or below this is a process cap of `CAP - wanted` bytes
+CAP = -2
 _MFD_CLOEXEC = 1
 
 

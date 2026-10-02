@@ -2163,9 +2163,13 @@ class WeightResidency:
         floor = weights.floor()
         for component in opened:
             close_cursor(component)
-        before = weights.applied
+        before, capped = weights.applied, wanted <= budget_cell.CAP
+        if capped:  # a process cap: the plane re-placed inside it
+            weights.set_cap(budget_cell.CAP - wanted)
+            wanted = weights.stage_budget(weights.open[-1][1]) if weights.open else -1
         weights.set_budget(max(wanted, floor) if wanted >= 0 else wanted)
-        if weights.cap >= 0:  # an ask moves the cap by what it moved the plane
+        if not capped and wanted >= 0 and weights.cap >= 0:
+            # a plane ask moves the cap by what it moved the plane
             weights.set_cap(max(weights.cap + weights.applied - before, 0))
         weights.drain()
         if opened and weights.open:
