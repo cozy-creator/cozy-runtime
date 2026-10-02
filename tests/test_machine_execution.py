@@ -1350,7 +1350,10 @@ def serve(payload: Request) -> Result:
                     )
                 ]
             assert client.GetMachineExecution(query, timeout=5).state == "succeeded", child_failures
-            assert client.ControlMachineExecution(resume, timeout=5) == resumed
+            again = client.ControlMachineExecution(resume, timeout=5)
+            for answer in (again, resumed):
+                answer.ClearField("gpu")  # the live GPU view; a job is placed as it resumes
+            assert again == resumed
             assert worker.prepared_installations and worker.engine.jobs
             channel.close()
         finally:

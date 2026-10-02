@@ -838,23 +838,25 @@ class Executions:
         return cast(dict[str, Json], canonical_json.decode(row[0])) if row is not None else None
 
     def last_grants(self, owner: str) -> list[tuple[str, tuple[int, ...]]]:
-        """Each GPU set's most recent grant, newest first: the granted execution and its set.
-        Only the journal's newest `GRANT_TAIL` rows are read, newest first by rowid (`+owner`
-        keeps the owner index out of the plan), so a long history costs nothing; a set whose
-        last grant is older than that is not prewarmed."""
+        """GPU calls newest first, each with its GPU set: a call granted its turn (`gpu.grant`)
+        or prepared ahead of it (`stage.prepare`). Only the journal's newest `GRANT_TAIL` rows
+        are read, newest first by rowid (`+owner` keeps the owner index out of the plan), so a
+        long history costs nothing."""
         with self.workspace.locked() as db:
             rows = db.execute(
                 "SELECT json_extract(CAST(body AS TEXT),'$.key'), "
                 "json_extract(CAST(body AS TEXT),'$.ordinals') FROM execution_events "
                 "WHERE rowid > (SELECT MAX(rowid) FROM execution_events) - ? "
-                "AND +owner=? AND kind='gpu.grant' ORDER BY rowid DESC LIMIT ?",
+                "AND +owner=? AND kind IN ('gpu.grant','stage.prepare') "
+                "ORDER BY rowid DESC LIMIT ?",
                 (GRANT_TAIL, owner, MAX_PAGE),
             ).fetchall()
-        latest: dict[tuple[int, ...], str] = {}
+        calls: dict[str, tuple[int, ...]] = {}
         for key, ordinals in rows:
-            cards = msgspec.json.decode(ordinals, type=tuple[int, ...])
-            latest.setdefault(cards, str(key).rpartition("#")[0])
-        return [(request, cards) for cards, request in latest.items()]
+            calls.setdefault(
+                str(key).rpartition("#")[0], msgspec.json.decode(ordinals, type=tuple[int, ...])
+            )
+        return list(calls.items())
 
     def active(self, owner: str) -> bool:
         with self.workspace.locked() as db:

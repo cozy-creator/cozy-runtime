@@ -1,10 +1,10 @@
 """Device lanes: the serialized per-device resource inside ONE worker (cr-066).
 
-A LANE owns a set of envelope-local device ordinals, the lock that serializes execution on
-them, one ledger row per resident executor generation, and the placements assigned to those
-devices. Attempts run on their own threads and take the lane's lock for their device phase.
-Law 8 (one active attempt per PHYSICAL device, #451) is a lane fact; `admission_epoch` and
-`admission_state` stay worker facts.
+A LANE owns a set of envelope-local device ordinals, one ledger row per resident executor
+generation (each with the seat its executor's users take one at a time), and the placements
+assigned to those devices. Who runs on a device when is the stage scheduler's: law 8 (one
+active turn per PHYSICAL device, #451) is its rule. `admission_epoch` and `admission_state`
+stay worker facts.
 
 The worker's envelope is a launcher fact (`--devices 0,1`, pod inventory). It is split
 into one lane per entry, in envelope order, so ordinal `i` is `entries[i]` and the seal a
@@ -16,13 +16,10 @@ door), never a serving placement's.
 A GROUP lane has d > 1 ordinals (cr-068): ONE executor sealed to all d devices, one seat
 and one staged, one `DeviceFacts` row per device. Lanes OVERLAP: a group over 0-3 and the
 device lanes 0..3 exist together, so a device holds any number of tenants (the owner's
-"allow models to share GPUs"). `gpu_scheduler` decides which ordinals a placement gets and
-`bind` binds exactly those; nothing is refused or retired for occupancy.
-
-EXECUTION is exclusive per physical device (law 8): each device has one lock and a lane
-takes its devices' locks in ordinal order. RESIDENCY is shared and belongs to the machine's
-memory manager (`memory.py`): the device lock is the reservation, and idle tenants of a
-device give room to the one holding it.
+"allow models to share GPUs"). The stage scheduler decides which ordinals a placement gets and
+`bind` binds exactly those; nothing is refused or retired for occupancy. RESIDENCY is shared
+and belongs to the machine's memory manager (`memory.py`): idle tenants of a device give room
+to the one whose turn it is.
 """
 
 from __future__ import annotations
@@ -44,24 +41,6 @@ ENVELOPE_LANE = "envelope"
 HOST_LANE = "host-"
 #: The LRU clock, worker-wide so tenants of different lanes on one device compare
 _CLOCK = itertools.count(1)
-
-
-class Devices:
-    """A lane's devices as ONE re-entrant lock: each device's lock, taken in ordinal order,
-    so lanes sharing a device serialize on it and overlapping lanes never deadlock."""
-
-    __slots__ = ("locks",)
-
-    def __init__(self, locks: tuple[threading.RLock, ...]) -> None:
-        self.locks = locks
-
-    def __enter__(self) -> None:
-        for lock in self.locks:
-            lock.acquire()
-
-    def __exit__(self, *_: object) -> None:
-        for lock in reversed(self.locks):
-            lock.release()
 
 
 class LaneRefusal(Exception):
@@ -91,6 +70,9 @@ class LaneRow:
     activation: dict[tuple[str, str], int] = field(default_factory=dict)
     #: ordinals an older executor's vacate emptied since it last restored or ran
     emptied: set[int] = field(default_factory=set)
+    #: its executor's users, one at a time: an attempt from entry to its rebuild, or a
+    #: replacement or unload. Re-entrant: an attempt's own thread rebuilds inside it.
+    seat: threading.RLock = field(default_factory=threading.RLock)
 
     def resident_bytes(self) -> int:
         """Device bytes its weights hold now: the plane's, else the older executor's."""
@@ -106,16 +88,10 @@ class LaneRow:
 
 
 class DeviceLane:
-    """ONE serialized resource: devices, their lock, one row per executor."""
+    """ONE set of devices: its seal and one row per executor generation on it."""
 
     def __init__(
-        self,
-        lane_id: str,
-        ordinals: tuple[int, ...],
-        devices: str,
-        *,
-        worker_pid: int,
-        locks: tuple[threading.RLock, ...] = (),
+        self, lane_id: str, ordinals: tuple[int, ...], devices: str, *, worker_pid: int
     ) -> None:
         self.lane_id = lane_id
         #: envelope-local ordinals (position in the worker's `--devices` list)
@@ -130,18 +106,10 @@ class DeviceLane:
         #: placement ids assigned to this lane, whether or not they are dispatchable yet
         self.placements: set[str] = set()
         #: the POST PHASE (cr-079) of this lane's released attempts, one at a time, in
-        #: release order. It never takes `device`: everything it reads left the executor.
+        #: release order. It never takes a seat: everything it reads left the executor.
         self.posting = threading.Lock()
         #: this lane's gate: has it STOPPED moving? A rebuild on another lane leaves it set.
         self.settled = threading.Event()
-        #: one lock per physical device, shared with every lane over that device
-        self.locks = locks or (threading.RLock(),)
-        #: THE DEVICES, as a lock: held by an attempt from its admission to its device
-        #: release, and by any model-bearing prepare or rebuild on this lane. Residency
-        #: arbitration vacates co-tenants under it, so a tenant is never evicted while its
-        #: own attempt is on the card. Re-entrant because an attempt's own thread rebuilds
-        #: (prepares) inside its hold.
-        self.device = Devices(self.locks)
 
     def __repr__(self) -> str:
         return f"DeviceLane({self.lane_id!r}, devices={self.devices!r})"
@@ -304,8 +272,8 @@ class LaneSet:
         )
 
     def group(self, ordinals: tuple[int, ...]) -> DeviceLane:
-        """The lane over exactly `ordinals` (K >= 2), sharing each device's lock with its
-        device lane; created on first use and gone when its last placement leaves."""
+        """The lane over exactly `ordinals` (K >= 2), created on first use and gone when its
+        last placement leaves."""
         lane = self.by_id.get(lane_id_for(ordinals))
         if lane is None:
             devices = [self.by_id[lane_id_for((ordinal,))] for ordinal in ordinals]
@@ -314,7 +282,6 @@ class LaneSet:
                 ordinals,
                 ",".join(device.devices for device in devices),
                 worker_pid=self.worker_pid,
-                locks=tuple(device.locks[0] for device in devices),
             )
             self.lanes = tuple(sorted((*self.lanes, lane), key=lambda other: other.ordinals))
             self.by_id[lane.lane_id] = lane
@@ -394,61 +361,3 @@ class LaneSet:
         lane = self.group(ordinals) if len(ordinals) > 1 else self.by_id[lane_id_for(ordinals)]
         lane.placements.add(placement_id)
         return lane
-
-    def choose(
-        self,
-        candidates: tuple[int, ...],
-        width: int,
-        *,
-        model_bearing: bool,
-        declared_bytes: int,
-        measured: Mapping[int, DeviceMemory],
-    ) -> tuple[int, ...]:
-        """Pick `width` ordinals for a placement no scheduler grant pinned exactly.
-
-        A group takes the first `width` candidates. One device is chosen by measured fit,
-        envelope order within each step: a device with no model-bearing tenant whose free
-        bytes cover the declared weights; one whose free bytes cover them beside its
-        tenants (cr-022 co-fit); one whose total covers them (time-sliced); any readable
-        device (bounded preparation decides the working set). A weightless placement goes
-        to the candidate device lane with the fewest placements.
-        """
-        if not candidates or not set(candidates) <= set(range(len(self.entries))):
-            raise LaneRefusal(
-                "device_pin_infeasible",
-                f"{list(candidates)} names ordinals outside this worker's "
-                f"{len(self.entries)}-device envelope",
-            )
-        if width > 1:
-            return tuple(sorted(candidates)[:width])
-        pool = [self.by_id[lane_id_for((o,))] for o in dict.fromkeys(candidates)]
-        if not model_bearing:
-            return min(pool, key=lambda lane: (len(lane.placements), lane.ordinals)).ordinals
-        readable = [
-            (lane, memory)
-            for lane in pool
-            if (memory := measured.get(lane.ordinals[0], DeviceMemory("unreadable"))).state
-            == "measured"
-        ]
-
-        def tenants(lane: DeviceLane) -> int:
-            return sum(
-                row.model_bearing for other in self.sharing(lane) for row in other.rows.values()
-            )
-
-        def crowd(lane: DeviceLane) -> tuple[int, tuple[int, ...]]:
-            return tenants(lane), lane.ordinals
-
-        steps = (
-            [lane for lane, m in readable if not tenants(lane) and m.free_bytes >= declared_bytes],
-            [lane for lane, m in readable if m.free_bytes >= declared_bytes],
-            sorted((lane for lane, m in readable if m.total_bytes >= declared_bytes), key=crowd),
-            sorted((lane for lane, _m in readable), key=crowd),
-        )
-        for step in steps:
-            if step:
-                return step[0].ordinals
-        raise LaneRefusal(
-            "device_lane_infeasible",
-            f"no lane among {list(candidates)} has readable free bytes",
-        )

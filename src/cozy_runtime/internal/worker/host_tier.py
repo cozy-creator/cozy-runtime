@@ -73,6 +73,14 @@ class HostTiers:
         with self.lock:
             return self._nbytes()
 
+    def contents(self) -> dict[str, int]:
+        """Bytes held per weight set (its construction and component), for placement."""
+        with self.lock:
+            held: dict[str, int] = {}
+            for (name, _layout), row in self.held.items():
+                held[name] = held.get(name, 0) + row.nbytes
+            return held
+
     def _nbytes(self) -> int:
         return sum(row.nbytes for row in self.held.values())
 

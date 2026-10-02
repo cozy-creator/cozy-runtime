@@ -412,7 +412,13 @@ def test_a_release_root_is_installed_resolved_and_prepared_by_the_machine(
             for event in machine.executions.events(OWNER, "pinned").events
             if event.kind == "resolved"
         ] == [{"digest": machine.manifest, "length": length}]
-        # An observer holds one read open until the next event, instead of polling.
+        # An observer holds one read open until the next event, instead of polling. Each
+        # call placed on its own GPU imported ahead there; those processes (which cannot dial
+        # back here) say so on their calls first.
+        bound = time.monotonic() + 120  # a hang bound on a loaded box, not a budget
+        while machine.worker.prespawns.slots:
+            assert time.monotonic() < bound
+            time.sleep(0.01)
         head = machine.executions.events(OWNER, "second").head_sequence
         query = pb.MachineExecutionEventsQuery(
             execution=pb.MachineExecutionQuery(

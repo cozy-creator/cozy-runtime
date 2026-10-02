@@ -166,9 +166,36 @@ class HostTier(_Request, frozen=True, kw_only=True, tag="host_tier"):
     memfd: int = -1
 
 
+class StageEnter(_Request, frozen=True, kw_only=True, tag="stage_enter"):
+    """A component-use scope asks for its turn on the executor's devices (`stage/1`); the
+    worker answers `StageGo` once the turn is this attempt's."""
+
+    method: str
+    components: tuple[str, ...] = ()
+
+
+class StageExit(_Request, frozen=True, kw_only=True, tag="stage_exit"):
+    """A component-use scope ended: its turn ends, and what it measured teaches the worker's
+    cost book."""
+
+    method: str
+    components: tuple[str, ...] = ()
+    #: block passes over its regions: steps for a whole-loop scope, 2 for serial CFG
+    passes: int = 1
+    wall_ns: int = 0
+    #: the allocator's peak during the scope above its bytes at entry
+    growth_bytes: int = 0
+    stall_ns: int = 0
+    #: the second half of an exit answered with a budget: that budget is applied, so the
+    #: turn the worker kept for it passes on
+    yielded: bool = False
+
+
 type _Tagged = (
     DeviceRoom
     | HostTier
+    | StageEnter
+    | StageExit
     | ChildEvents
     | Checkpoint
     | ChildCall
@@ -216,6 +243,13 @@ class Tier(Answer, frozen=True, kw_only=True):
 
     held: bool = False
     descriptor: int = -1
+
+
+class StageGo(Answer, frozen=True, kw_only=True):
+    """The turn is the attempt's. `budget_bytes` is the plane's device budget for this rank;
+    -1 keeps the one it has (the same tenant ran the previous turn here)."""
+
+    budget_bytes: int = -1
 
 
 class Room(Answer, frozen=True, kw_only=True):

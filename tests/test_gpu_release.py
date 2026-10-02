@@ -1,6 +1,6 @@
 """A request done with its GPUs hands them to the next one while it finishes its CPU work.
 
-Policy tests drive `GpuScheduler` alone. Worker tests use `test_gpu_scheduler.Machine`: a
+The policy's cases are `test_stage_scheduler`. These use `test_gpu_scheduler.Machine`: a
 real Worker with four device entries, its durable journal and its execution units; the
 release reaches it through the worker's own executor-exchange handler. The end-to-end test runs the
 workflow's Python in a real executor, so `ctx.release_gpus()` crosses the real seam. The only
@@ -30,7 +30,6 @@ from cozy_runtime.internal import accel, child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import GrpcControlHost
-from cozy_runtime.internal.worker.gpu_scheduler import Demand, GpuScheduler
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import documents
@@ -41,72 +40,6 @@ from test_end_to_end import NO_EXECUTOR
 from test_gpu_scheduler import OWNER, VIRTUAL, GiB, Machine, driverless
 
 RELEASED = {"ordinals": [], "cause": "released_by_root"}
-
-
-# ------------------------------------------------------------------------------ policy
-
-
-def test_a_released_root_hands_its_gpus_on_and_a_later_call_waits_its_turn() -> None:
-    gpus = GpuScheduler(4)
-    roots = {"A": 1, "B": 2}
-    assert gpus.sync(roots, [Demand("a1#1", "A", 4)]) == {"a1#1": (0, 1, 2, 3)}
-    gpus.release("a1#1")
-    assert gpus.sync(roots, [Demand("b1#1", "B", 4)]) == {}  # A's gap holds its lease
-    gpus.release_root("A")
-    gpus.release_root("A")  # idempotent
-    assert gpus.view()["leases"] == {}
-    assert gpus.sync(roots, [Demand("b1#1", "B", 4)]) == {"b1#1": (0, 1, 2, 3)}
-    # A's GPU call after its release waits at A's priority for B's call on the GPUs; B's
-    # gap then holds nothing against the older A
-    live = [Demand("b1#1", "B", 4), Demand("a2#1", "A", 4)]
-    assert gpus.sync(roots, live) == {"b1#1": (0, 1, 2, 3)}
-    assert gpus.view()["waiting"] == {"a2#1": ["B"]}
-    gpus.release("b1#1")
-    assert gpus.sync(roots, live[1:]) == {"a2#1": (0, 1, 2, 3)}
-    assert gpus.view()["leases"] == {"A": [0, 1, 2, 3]}
-    gpus.release("a2#1")  # the new lease holds A's next gap again
-    assert gpus.sync({"A": 1, "C": 3}, [Demand("c#1", "C", 1)]) == {}
-    leases = [(root, body) for root, kind, body in gpus.drain() if kind == "gpu.lease"]
-    assert leases.count(("A", RELEASED)) == 1
-
-
-def test_a_call_in_flight_keeps_its_gpu_until_it_exits() -> None:
-    gpus = GpuScheduler(4)
-    roots = {"A": 1, "B": 2}
-    refs = [Demand("r0#1", "A", 1), Demand("r1#1", "A", 1)]
-    assert gpus.sync(roots, refs) == {"r0#1": (0,), "r1#1": (1,)}
-    gpus.release("r0#1")
-    gpus.release_root("A")  # r1 is still on GPU 1
-    assert gpus.view()["leases"] == {"A": [1]}
-    wide = Demand("b#1", "B", 4)
-    assert gpus.sync(roots, [refs[1], wide]) == {"r1#1": (1,)}
-    gpus.release("r1#1")  # GPU 1 goes to the pool, not back to A
-    assert gpus.view()["leases"] == {"B": [0, 2, 3]}
-    assert gpus.sync(roots, [wide]) == {"b#1": (0, 1, 2, 3)}
-
-
-def test_a_root_that_is_its_own_gpu_call_releases_at_device_exit() -> None:
-    gpus = GpuScheduler(4)
-    roots = {"S": 1, "B": 2}
-    demands = [Demand("S#1", "S", 4), Demand("b#1", "B", 1)]
-    assert gpus.sync(roots, demands) == {"S#1": (0, 1, 2, 3)}
-    gpus.release("S#1")  # S now encodes and sends its outputs; it is still an open root
-    assert gpus.view()["leases"] == {}
-    assert gpus.sync(roots, demands) == {"b#1": (0,)}
-    events = [(root, kind, body) for root, kind, body in gpus.drain()]
-    assert ("S", "gpu.lease", {"ordinals": [], "cause": "device_exit"}) in events
-
-
-def test_a_release_ends_with_its_root_and_the_next_attempt_holds_normally() -> None:
-    gpus = GpuScheduler(2)
-    gpus.sync({"A": 1}, [Demand("a1#1", "A", 2)])
-    gpus.release("a1#1")
-    gpus.release_root("A")
-    gpus.sync({}, [])  # A stopped: retry-wait, pause, cancel, or a worker restart
-    assert gpus.yielded == {}
-    gpus.sync({"A": 1}, [Demand("a1#2", "A", 2)])
-    gpus.release("a1#2")
-    assert gpus.sync({"A": 1, "B": 2}, [Demand("b#1", "B", 1)]) == {}
 
 
 # ----------------------------------------------------------------------- the worker
@@ -172,7 +105,7 @@ def test_a_released_root_lets_the_next_root_start_while_its_python_runs(
     assert granted_at >= released_at
     # A calls a GPU function again. B's call has left the GPUs (its template names no
     # installed package), and B's gap holds nothing against the older A.
-    assert machine.worker.gpu.view()["leases"] == {"B": [0, 1, 2, 3]}
+    assert machine.worker.stages.view()["leases"] == {"B": [0, 1, 2, 3]}
     a2 = machine.child("A", "h3")
     machine.tick()
     assert machine.granted(a2) == [0, 1, 2, 3]
@@ -189,23 +122,20 @@ def test_a_serving_root_releases_its_gpus_at_device_exit(
     b1 = machine.child("B", "qwen")
     machine.await_granted("A")
     bound = time.monotonic() + 120  # B's call asks for its GPU on its own unit
-    while not (view := machine.worker.gpu.view())["waiting"]:
+    while not (view := machine.worker.stages.view())["waiting"]:
         assert time.monotonic() < bound
         time.sleep(0.01)
     assert machine.granted("A") == [0, 1, 2, 3] and view["waiting"] == {b1 + "#1": ["A"]}
     # the lane's device exit (`Worker.run_lane`); A's encode and output transfer follow it
-    machine.worker.gpu.release("A#1", ranks=[])
-    # The same pass that ends A's lease grants B: no tick between them.
-    assert machine.worker.gpu.view()["leases"] == {"B": [0]}
+    machine.worker.stages.release("A#1", ranks=[])
+    # The same pass that ends A's call grants B: no tick between them.
+    assert machine.worker.stages.view()["leases"] == {"B": [0]}
     assert machine.worker.gpu_status("A").phase == "none"
     assert machine.granted(b1) == [0]
     downloaded.set()
     machine.tick()
-    leases = [body for _, kind, body in machine.journal("A") if kind == "gpu.lease"]
-    assert leases == [
-        {"ordinals": [0, 1, 2, 3], "cause": "granted A#1"},
-        {"ordinals": [], "cause": "device_exit"},
-    ]
+    # A root that is itself the GPU call holds no lease: nothing of it outlives its exit.
+    assert [kind for _, kind, _ in machine.journal("A") if kind == "gpu.lease"] == []
 
 
 def test_a_restarted_worker_fails_a_dispatched_root_and_frees_its_gpus(
@@ -394,7 +324,7 @@ def test_a_workflow_releases_from_its_executor_and_b_starts_during_its_cpu_tail(
             calls.calls, calls.children = worker.machine_calls, {"root": 99}
             shot = calls.child("root", "h3")
             until(lambda: worker.execution_status(claim, shot).state == "failed")
-            assert worker.gpu.view()["leases"] == {"root": [0, 1, 2, 3]}
+            assert worker.stages.view()["leases"] == {"root": [0, 1, 2, 3]}
             calls.serving("B", "h3")
             until(lambda: any(kind == "gpu.wait" for _, kind, _ in calls.journal("B")))
             (gates / "shots").touch()

@@ -16,8 +16,8 @@ worker-protocol/02 fixes:
 Two things are deliberately NOT here, because they are not the worker's: retryability (a
 RecordOwner projection over status/cause/origin) and attempt-selection order beyond this
 worker (dispatch is the RecordOwner's; below that boundary service class does not exist and
-there is no field to carry it). Two attempts assigned to this worker SERIALIZE on the single
-device lease, in arrival order, and that is the whole of local arbitration.
+there is no field to carry it). Who runs on which GPU, and when, is the stage scheduler's
+(`stage_scheduler.py`): one turn per GPU at a time, in acceptance order.
 
 Metric attestation lives here too: what the executor reports is a CLAIM. Wall-clock is
 clamped to the worker-observed dispatch->result window, and the fields the worker
@@ -54,10 +54,13 @@ from cozy_runtime.author._executor_requests import (
     CheckpointReceipt,
     DeviceRoom,
     Handler,
+    HostTier,
     Publish,
     Published,
     Reply,
     Request,
+    StageEnter,
+    StageExit,
     StageMemoLookup,
     StageMemoStore,
     TreeMember,
@@ -333,6 +336,8 @@ class AttemptRecord:
     room: bool = True
     #: the plane budget the memory manager granted a plane executor; -1: it derives it
     plane_budget_bytes: int = -1
+    #: each component-use scope takes its own turn (`stage/1`); else one turn holds it all
+    stage_turns: bool = False
     declared: DeclaredBinding | None = None
     #: what THIS worker's prepare resolved for that binding — never what it declared
     prepared_model: PreparedModel | None = None
@@ -1625,8 +1630,8 @@ class AttemptEngine:
                 return self.publish(attempt, request)
             case Checkpoint():
                 return self.checkpoint_exchange(attempt, request)
-            case DeviceRoom():
-                return refuse("no_durable_exchange", "a job's executor is granted no device room")
+            case DeviceRoom() | HostTier() | StageEnter() | StageExit():
+                return refuse("no_durable_exchange", "a job's executor holds its whole turn")
             case TreeMember():
                 if self.calls is None:
                     return refuse("child_broker_absent", "no RecordOwner call lane")
@@ -1900,6 +1905,7 @@ class AttemptEngine:
             deadline_s=seconds,
             spool=str(spool),
             plane_budget_bytes=attempt.plane_budget_bytes,
+            stages=attempt.stage_turns,
             # cr-012: the VERIFIED inputs, by their stable identity. Paths into this
             # attempt's own spool and nothing else — no URL, no credential and no fetch
             # reaches the executor. What the executor CAN still do is dial one of its own,

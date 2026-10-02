@@ -81,4 +81,9 @@ def test_explicit_cpu_model_source_and_output_stay_on_cpu(monkeypatch: pytest.Mo
             assert isinstance(raw, bytes)
             state = pb.DesiredWorkerState.FromString(base64.b64decode(json.loads(raw)["state"]))
             assert state.job.orchestration and not state.job.resource_caps.device_required
-        assert pod.worker.gpu.view() == {"leases": {}, "grants": {}, "waiting": {}}
+        assert pod.worker.stages.view() == {
+            "leases": {},
+            "waiting": {},
+            "holders": {},
+            "demands": {},
+        }
