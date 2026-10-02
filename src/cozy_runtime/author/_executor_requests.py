@@ -180,9 +180,6 @@ class StageEnter(_Request, frozen=True, kw_only=True, tag="stage_enter"):
 
     method: str
     components: tuple[str, ...] = ()
-    #: the device bytes this executor's plane maps now, so the worker can ask for some back
-    #: when another executor needs room to start; -1 from one that does not say
-    committed_bytes: int = -1
 
 
 class StageExit(_Request, frozen=True, kw_only=True, tag="stage_exit"):

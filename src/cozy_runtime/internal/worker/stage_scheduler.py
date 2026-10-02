@@ -77,12 +77,10 @@ class Want(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Grant(msgspec.Struct, frozen=True):
-    """A stage turn. `start`: the tenant needs a budget (its first turn, or after it was idle).
-    `opened` is false for a scope inside a turn the call already holds."""
+    """A stage turn. `start`: the tenant needs a budget (its first turn, or after it was idle)."""
 
     gpus: Ordinals
     start: bool
-    opened: bool = True
 
 
 @dataclass
@@ -184,8 +182,6 @@ class StageScheduler:
         self.holder: dict[int, str] = {}
         self.events: list[Event] = []
         self.prefilled: set[str] = set()
-        #: turns ended so far: what a starting executor waits on for room (`await_turn`)
-        self.ended = 0
         #: roots that said they are done with GPUs: their calls add to no lease until the next
         self.released: set[str] = set()
         #: the book changed since it was saved
@@ -388,10 +384,10 @@ class StageScheduler:
             if demand is None or not demand.gpus:
                 return None
             if demand.whole and demand.running:
-                return Grant(demand.gpus, False, False)  # inside its own whole turn
+                return Grant(demand.gpus, False)  # inside its own whole turn
             if demand.depth:
                 demand.depth += 1
-                return Grant(demand.gpus, False, False)
+                return Grant(demand.gpus, False)
             if cell and not demand.want.cell:
                 self._refine(demand, cell)
             if counted:
@@ -473,20 +469,20 @@ class StageScheduler:
             self._free(key)
         self.resync()
 
-    def await_turn(
+    def await_clear(
         self,
         ordinals: Ordinals,
         template: tuple[str, str],
-        since: int,
         stop: Callable[[], bool] = lambda: False,
     ) -> bool:
-        """Wait until a turn has ended after `since` (a reading of `ended`): what an executor
-        of `template` starting on `ordinals` waits on for room, never a clock. False when no
-        other template's call is dispatched there (nothing will end), or when `stop()`."""
+        """Wait until no other template's call is in flight on `ordinals`: it holds a turn, or
+        has taken one and is not past its stages. What an executor of `template` waits on when
+        the GPU has no room for it beside such a call, never a clock. False when none was in
+        flight (waiting changes nothing), or when `stop()`."""
 
-        def others() -> bool:
+        def flying() -> bool:
             return any(
-                d.dispatched
+                (d.running or d.tenant)
                 and d.want.template != template
                 and set(d.gpus) & set(ordinals)
                 and not d.key.startswith("hold:")
@@ -494,8 +490,10 @@ class StageScheduler:
             )
 
         with self.lock:
-            self.lock.wait_for(lambda: self.ended != since or not others() or stop())
-            return self.ended != since
+            if not flying():
+                return False
+            self.lock.wait_for(lambda: not flying() or stop())
+            return not stop()
 
     def _claimant(self, demand: _Demand) -> _Demand | None:
         """The earliest other call that asks, holds, prepares or waits on this one's GPUs."""
@@ -817,7 +815,6 @@ class StageScheduler:
         if demand is not None:
             demand.running = demand.asking = False
             demand.depth = 0
-        self.ended += 1
         for o in [o for o, k in self.holder.items() if k == key]:
             del self.holder[o]
 

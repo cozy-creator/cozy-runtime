@@ -202,8 +202,6 @@ class MemoryManager:
         self.active: set[str] = set()
         #: device bytes a starting executor needs free, by tenant: nobody's budget takes them
         self.wanted: dict[str, dict[int, int]] = {}
-        #: the plane budget each tenant holds, per device, since its latest turn's grant
-        self.granted: dict[str, dict[int, int]] = {}
 
     def tenants(self, ordinals: set[int] | None = None) -> list[tuple[str, DeviceLane, LaneRow]]:
         """Every model-bearing tenant with a device among `ordinals` (None: any), each once."""
@@ -258,9 +256,9 @@ class MemoryManager:
         return self._start_legacy(lane, tenant, row, grow, why)
 
     def context_need(self, lane: DeviceLane) -> dict[int, int]:
-        """What a new device context needs free on each of `lane`'s devices: the largest any
-        executor there measured (its CUDA context and library workspaces) and the margin.
-        Empty before any was measured."""
+        """What a new executor needs free on each of `lane`'s devices before its first stage:
+        the largest context any executor there measured, as much again for the library
+        workspaces its first kernels allocate, and the margin. Empty before any was measured."""
         need = {o: self._context(o) for o in lane.ordinals}
         return need if all(need.values()) else {}
 
@@ -273,13 +271,11 @@ class MemoryManager:
             ),
             default=0,
         )
-        return measured + weight_policy.MARGIN if measured > 0 else 0
+        return 2 * measured + weight_policy.MARGIN if measured > 0 else 0
 
     def _reserved(self, tenant: str, ordinal: int) -> int:
-        """Device bytes `tenant`'s budget leaves free: what executors starting beside it want,
-        else one more context's worth, so a resident tenant never fills its device."""
-        wanted = sum(need.get(ordinal, 0) for other, need in self.wanted.items() if other != tenant)
-        return max(wanted, self._context(ordinal))
+        """Device bytes `tenant`'s budget leaves free: what executors starting beside it want."""
+        return sum(need.get(ordinal, 0) for other, need in self.wanted.items() if other != tenant)
 
     def room(self, lane: DeviceLane, slot: str, need: dict[int, int], why: str) -> bool:
         """Cut idle tenants until `need` is free on each of `lane`'s devices. Whether it is,
@@ -288,35 +284,6 @@ class MemoryManager:
         return all(
             m.state == "measured" and m.free_bytes >= need.get(o, 0) for o, m in measured.items()
         )
-
-    def give(
-        self, tenant: str, gpus: Sequence[int], committed: int, components: Collection[str]
-    ) -> int | None:
-        """A call mid-flight takes its next turn while an executor starting beside it wants
-        room: the plane budget that leaves that room, or None when its budget leaves it
-        already, or when giving it would take the weights of the stage it is entering (the
-        starting executor then waits for this call to be past its stages)."""
-        if len(gpus) != 1 or committed < 0:
-            return None
-        ordinal = gpus[0]
-        wanted = sum(need.get(ordinal, 0) for other, need in self.wanted.items() if other != tenant)
-        if not wanted:
-            return None
-        lane = self._lane(tenant, gpus)
-        memory = lane.measure(self.kind)[ordinal]
-        if memory.state != "measured":
-            return None
-        budget = committed + memory.free_bytes - wanted
-        held = self.granted.get(tenant, {}).get(ordinal, -1)
-        if 0 <= held <= budget or budget < weights(lane.row(tenant).ledger, components):
-            return None
-        self.granted.setdefault(tenant, {})[ordinal] = budget
-        self.note(
-            "residency",
-            f"{lane.lane_id}: {tenant!r} gives {max(held, committed) - budget} B for an executor "
-            f"starting beside it: budget {self._gpu(lane, ordinal)} {budget} B",
-        )
-        return budget
 
     def short(self, tenant: str, stage: StageNeed, gpus: Sequence[int]) -> bool:
         """Whether `tenant`'s turn on `gpus` would find less room than its weights and
@@ -475,14 +442,14 @@ class MemoryManager:
         ledger.observe_devices(lane.device_facts(read))
         # The grant must hold the weights' floor itself: that is the refusal line.
         least = floor_bytes(ledger.layouts, stage.components)
-        # Room for one more device context stays free, unless that would take a whole
-        # component off the device: then a newcomer waits for this call instead.
-        largest = max((layout.total for layout in ledger.layouts.values()), default=0)
-        budget = {}
-        for o, m in read.items():
-            roomy = weight_policy.plane_budget(usable(m) - self._reserved(tenant, o), grow)
-            full = weight_policy.plane_budget(usable(m), grow)
-            budget[o] = roomy if roomy >= max(least, min(largest, full)) else full
+        # What an executor waiting to start beside it wants stays free, down to the floor.
+        budget = {
+            o: max(
+                weight_policy.plane_budget(usable(m) - self._reserved(tenant, o), grow),
+                min(weight_policy.plane_budget(usable(m), grow), least),
+            )
+            for o, m in read.items()
+        }
         if any(value < least for value in budget.values()):
             floor = least + grow + weight_policy.MARGIN
             available = {o: usable(m) for o, m in read.items()}
@@ -505,7 +472,6 @@ class MemoryManager:
                 + f"; cut {evicted or 'nobody'}",
             )
         whole = want is not None and all(usable(m) >= want for m in read.values())
-        self.granted[tenant] = budget
         return Budget(vram=budget, whole=whole, evicted=tuple(evicted))
 
     def _start_legacy(

@@ -232,63 +232,33 @@ def _driver(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     return free
 
 
-def test_a_call_gives_room_at_its_next_turn_to_an_executor_starting_beside_it(
+def test_a_device_start_waits_for_room_until_the_call_in_flight_is_past_its_stages(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Run 2600/2601: SDXL filled a 6 GiB pool, the prepared Anima executor could not create
-    its CUDA context, and the running SDXL died. A call mid-flight is now answered, at its
-    next stage turn, with the budget that leaves a starting executor its room, as long as the
-    stage it is entering keeps its own weights."""
+    """Runs 2600/2601: SDXL filled a 6 GiB pool, the Anima executor prepared beside it could
+    not create its CUDA context, and the running SDXL died. A new device context now starts
+    only when the driver shows room for it. With a call in flight on a full GPU it waits until
+    that call is past its stages, not for a clock, and takes nothing from it meanwhile."""
     free = _driver(monkeypatch)
     worker = machine.worker
     worker._turning["inst-a"] = True
+    kind = StageKind("inst-a/generate", "denoise", ("unet",))
+    worker.stages.book.record("inst-a/generate", "c", [StageSample(kind=kind, wall_ns=10**6)] * 2)
     worker.stages.open_root("A", 1)
-    worker.stages.want("A#1", Want(root="A", template=("inst-a", "b"), entrypoint="generate"))
-    handler, _ = tenant(machine, "tenant-a", "A")
-    row = worker.lanes.by_id["lane-0"].row("tenant-a")
-    row.ledger.observe_construction(
-        {
-            "resident": {"encoder": GiB, "unet": 5 * GiB},
-            "declared_scopes": {"encode": ["encoder"], "denoise": ["unet"]},
-            "allocator_bytes": 6 * GiB,
-            "reserved_bytes": 6 * GiB,
-        }
+    worker.stages.want(
+        "A#1", Want(root="A", template=("inst-a", "b"), entrypoint="generate", cell="c")
     )
-
-    def turn(committed: int) -> int:
-        go = handler(StageEnter(method="denoise", components=("unet",), committed_bytes=committed))
-        assert isinstance(go, StageGo) and go.ok
-        handler(StageExit(method="denoise", components=("unet",)))
-        return go.budget_bytes
-
-    turn(0)  # its first turn: its own budget
-    assert turn(6 * GiB) == -1, "nobody wants room: it keeps its budget"
-    mib = 1 << 20
-    worker.memory.wanted["tenant-b"] = {0: 300 * mib}
-    free["bytes"] = 10 * mib
-    assert turn(6 * GiB) == 6 * GiB + 10 * mib - 300 * mib, "the encoder's bytes go; the UNet stays"
-    assert turn(5 * GiB + 100 * mib) == -1, "it would take the UNet's own bytes: the start waits"
-    free["bytes"] = GiB
-    assert turn(6 * GiB) == -1, "the driver shows the room already"
-
-
-def test_a_device_start_waits_for_room_until_the_running_calls_turn_ends(
-    machine: Machine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A new device context starts only when the driver shows room for it. With a call
-    running on a full GPU it waits for that call's turn to end, not for a clock, and it
-    never starts into memory a computing stage holds."""
-    free = _driver(monkeypatch)
-    worker = machine.worker
-    worker._turning["inst-a"] = True
-    worker.stages.open_root("A", 1)
-    worker.stages.want("A#1", Want(root="A", template=("inst-a", "b"), entrypoint="generate"))
     handler, _ = tenant(machine, "tenant-a", "A")
     lane = worker.lanes.by_id["lane-0"]
     mib = 1 << 20
     row = lane.row("tenant-a")
     row.model_bearing, row.ledger.plane = True, PlaneFacts(context_bytes=180 * mib)
-    assert worker.memory.context_need(lane) == {0: 180 * mib + weight_policy.MARGIN}
+    assert worker.memory.context_need(lane) == {0: 360 * mib + weight_policy.MARGIN}
+
+    def step() -> None:
+        assert handler(StageEnter(method="denoise", components=("unet",))).ok
+        handler(StageExit(method="denoise", components=("unet",)))
+
     assert handler(StageEnter(method="denoise", components=("unet",))).ok  # A computes
     free["bytes"] = 10 * mib
     started: list[int] = []
@@ -303,9 +273,10 @@ def test_a_device_start_waits_for_room_until_the_running_calls_turn_ends(
     while "tenant-b" not in worker.memory.wanted:
         assert time.monotonic() < bound
         time.sleep(0.01)
-    assert not started, "no room: it waits beside the running stage"
-    free["bytes"] = GiB  # as the executor unmaps under the lower budget its turn was given
     handler(StageExit(method="denoise", components=("unet",)))
+    assert not started, "between A's stages: A is still in flight, and the GPU is still full"
+    step()  # A's last stage: past it, A's tenant is idle
+    free["bytes"] = GiB  # as the driver reads once A's weights are unmapped
     starting.join(30)
     assert started == [GiB] and "tenant-b" not in worker.memory.wanted
 

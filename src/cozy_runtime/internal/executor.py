@@ -3788,25 +3788,11 @@ class Executor:
             for row in rows:
                 row.turn = row.exit = None
 
-    def _mapped(self) -> int:
-        """The device bytes this process's plane maps now; -1 without a device plane."""
-        weights = self.weights
-        if weights is None or weights.host_only:
-            return -1
-        return max(plane.stats(weights.plane).device(weights.index).committed, 0)
-
     def _stage_enter(self, method: str, components: tuple[str, ...]) -> int | None:
         """Wait for this scope's turn: the plane budget the worker granted, or None to keep the
         current one. A refusal is the scope's failure, with the worker's numbers."""
         with blocked():
-            answer = self._durable(
-                StageEnter(
-                    method=method,
-                    components=tuple(components),
-                    committed_bytes=self._mapped(),
-                ),
-                StageGo,
-            )
+            answer = self._durable(StageEnter(method=method, components=tuple(components)), StageGo)
         if answer.ok:
             return answer.budget_bytes if answer.budget_bytes >= 0 else None
         if answer.code == "cancelled":

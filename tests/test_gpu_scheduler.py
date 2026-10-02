@@ -38,7 +38,6 @@ from cozy_runtime.internal import accel, child_env, package_interface, proctree,
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.executor_replies import PlaneFacts
 from cozy_runtime.internal.readiness import RuntimeGPU
 from cozy_runtime.internal.worker import lanes, machine_model_defaults, memory
 from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptSlot
@@ -1162,20 +1161,17 @@ def test_a_waiting_tenant_is_short_only_while_its_gpu_lacks_room_for_it(
 
 
 @needs_executor
-def test_a_tenants_budget_leaves_room_for_one_more_device_context(
+def test_a_tenants_budget_leaves_what_an_executor_waiting_to_start_wants(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A resident tenant never fills its GPU: its plane budget leaves the room one more
-    executor's device context needs (the largest any executor there measured, and the
-    margin), or what an executor starting beside it wants when that is more."""
+    """While an executor waits to start on a GPU, a call that takes its first turn there is
+    budgeted around the room that executor wants, so the room it waits for is not taken."""
     _shot, by_lane = _warm_shot(machine, monkeypatch)
     worker = machine.worker
     q0 = by_lane["lane-0"]
     lane = worker._lane_of(q0)
     if not memory.plane_capable(worker.hosted[q0].supervision.current):
         return
-    mib = 1 << 20
-    lane.row(q0).ledger.plane = PlaneFacts(context_bytes=180 * mib)
     need = memory.StageNeed(entrypoint="generate")
     machine.free["0"] = 30 * GiB  # type: ignore[attr-defined]
 
@@ -1185,10 +1181,11 @@ def test_a_tenants_budget_leaves_room_for_one_more_device_context(
         assert isinstance(granted, memory.Budget)
         return granted.vram
 
-    context = 180 * mib + weight_policy.MARGIN
-    assert budget() == {0: 30 * GiB - context - weight_policy.MARGIN}
+    assert budget() == {0: 30 * GiB - weight_policy.MARGIN}
     worker.memory.wanted["machine-starting"] = {0: GiB}
     assert budget() == {0: 29 * GiB - weight_policy.MARGIN}
+    worker.memory.wanted[q0] = {0: 5 * GiB}
+    assert budget() == {0: 29 * GiB - weight_policy.MARGIN}, "its own want is not held against it"
 
 
 _RANK = """

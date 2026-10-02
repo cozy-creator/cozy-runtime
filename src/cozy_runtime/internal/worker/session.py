@@ -5858,13 +5858,12 @@ class Worker:
         """Start every rank, admitting new model-bearing contexts through MemoryManager.
 
         Weightless starts keep their CPU overlap. Returns the actual startup
-        refusal, or "" once the process is started. A device out-of-memory at a start is the
-        room another call holds, not a verdict: once a turn there has ended, a fresh process
-        starts again, and nothing is recorded against the placement.
+        refusal, or "" once the process is started. A device out-of-memory at a start beside a
+        call in flight is the room that call holds, not a verdict: once it is past its stages
+        a fresh process starts again, and nothing is recorded against the placement.
         """
         while True:
-            since = self.stages.ended
-            refusal = self._start_once(tenant, executor, since)
+            refusal = self._start_once(tenant, executor)
             if refusal is not None:
                 return refusal
             fresh = self._own_executor(tenant)
@@ -5872,9 +5871,9 @@ class Worker:
                 return fresh
             executor = fresh
 
-    def _start_once(self, tenant: Tenant, executor: child.Executor, since: int) -> str | None:
-        """One start. None when it ran out of device memory beside another call whose turn has
-        since ended: the caller starts a fresh process."""
+    def _start_once(self, tenant: Tenant, executor: child.Executor) -> str | None:
+        """One start. None when it ran out of device memory beside a call in flight that is
+        now past its stages: the caller starts a fresh process."""
         lane = tenant.lane
         placement_id = tenant.placement.placement_id
         first = next(iter(tenant.bindings.values()), None)
@@ -5906,13 +5905,13 @@ class Worker:
         if not reply.get("ok"):
             self.monitor.end(f"start:{placement_id}", str(reply.get("code")))
             detail = str(reply.get("detail"))[:1024]
-            if reply.get("code") == "device_out_of_memory" and self.stages.await_turn(
-                lane.ordinals, self._template(tenant.slot), since, self.stop.is_set
+            if reply.get("code") == "device_out_of_memory" and self.stages.await_clear(
+                lane.ordinals, self._template(tenant.slot), self.stop.is_set
             ):
                 self.note(
                     "boot",
-                    f"{placement_id!r} start ran out of device memory beside a running call; "
-                    "its turn ended, starting again",
+                    f"{placement_id!r} start ran out of device memory beside a call in flight; "
+                    "that call is past its stages, starting again",
                 )
                 try:
                     tenant.supervision.retire_current(executor, "start out of device memory")
@@ -5965,6 +5964,36 @@ class Worker:
 
     def _ensure_construction(self, attempt: AttemptRecord) -> None:
         """LOAD the attempt's construction if its process has not built it, then ACTIVATE it.
+
+        A turn-taking attempt loads beside whoever holds the GPU. A device shortfall there is
+        the room a call in flight holds, not this request's verdict: once that call is past
+        its stages the load runs again, in a fresh process when the refusal took the old one.
+        """
+        while True:
+            try:
+                return self._ensure_once(attempt)
+            except AttemptRefusal as exc:
+                lane = self.lanes.by_id.get(attempt.lane_id)
+                if (
+                    exc.code not in DEVICE_SHORTFALL_CODES
+                    or not attempt.stage_turns
+                    or lane is None
+                    or not self.stages.await_clear(
+                        lane.ordinals,
+                        self._template(attempt.placement_id),
+                        lambda: bool(attempt.canceling) or self.stop.is_set(),
+                    )
+                ):
+                    raise
+                self.note(
+                    "attempt",
+                    f"{attempt.request_id}#{attempt.attempt} load was short of device memory "
+                    "beside a call in flight; that call is past its stages, loading again",
+                )
+                self._rebuild_lane(lane, attempt.placement_id)
+
+    def _ensure_once(self, attempt: AttemptRecord) -> None:
+        """One load and activation.
 
         Runs under the lane's device lock and WITHOUT the control lock: a load moves
         gigabytes and the control plane keeps answering while it does. The placement is
@@ -6667,13 +6696,7 @@ class Worker:
                 return refuse("cancelled", "cancelled while waiting for its turn")
             return refuse("stage_unscheduled", f"{key} holds no GPU call to take a turn in")
         if not granted.start:
-            # Mid-call. An executor starting beside it may want room this stage can spare.
-            give = (
-                self.memory.give(slot, lane.ordinals, request.committed_bytes, request.components)
-                if granted.opened
-                else None
-            )
-            return StageGo(ok=True) if give is None else StageGo(ok=True, budget_bytes=give)
+            return StageGo(ok=True)
         need = self._stage_need(attempt, attempt.declared)
         budget = self.memory.start(slot, need, lane.ordinals, f"{key} {request.method}")
         if isinstance(budget, MemoryShortfall):
@@ -7037,20 +7060,18 @@ class Worker:
     def _starting(self, lane: DeviceLane, slot: str) -> Iterator[None]:
         """A new device context on `lane` starts only with room for it, measured now.
 
-        Idle tenants give it first. A call running there gives it at its next stage turn when
-        that costs its stage nothing (`memory.give`), else once it is past its stages; the
-        start waits for that turn to end, never for a clock, and never takes room from a stage
-        that is computing. With nobody left who could give, it starts and the driver decides.
-        Beside a whole turn in its device phase it waits for a turn of its own."""
+        Idle tenants give it first. When a call in flight there holds the room, the start
+        waits until that call is past its stages (its tenant is then idle and is cut), never
+        for a clock, and it never takes room from a call that is computing. With nobody left
+        who could give, it starts and the driver decides. Beside a whole turn in its device
+        phase it waits for a turn of its own."""
         need = self.memory.context_need(lane)
         self.memory.wanted[slot] = need
         try:
-            while need:
-                since = self.stages.ended
-                if self.memory.room(lane, slot, need, "executor startup"):
-                    break
-                template = self._template(slot)
-                if not self.stages.await_turn(lane.ordinals, template, since, self.stop.is_set):
+            while need and not self.memory.room(lane, slot, need, "executor startup"):
+                if not self.stages.await_clear(
+                    lane.ordinals, self._template(slot), self.stop.is_set
+                ):
                     break
             hold = (
                 contextlib.nullcontext()
