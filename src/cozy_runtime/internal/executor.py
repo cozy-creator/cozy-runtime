@@ -3773,8 +3773,11 @@ class Executor:
 
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
-        once they gave what they could (an older worker refuses, and nothing changes)."""
-        self._durable(DeviceRoom(free_bytes=free_bytes), Room)
+        once they gave what they could, with this process's cap raised into that room when it
+        holds one (an older worker refuses, and nothing changes)."""
+        answer = self._durable(DeviceRoom(free_bytes=free_bytes), Room)
+        if answer.ok and answer.cap_bytes >= 0 and self.weights is not None:
+            self.weights.set_cap(answer.cap_bytes)
 
     def _budget_cell(self) -> budget_cell.Cell | None:
         """Hand the worker this process's budget cell; None from an older worker."""

@@ -332,6 +332,8 @@ class StageGo(Answer, frozen=True, kw_only=True):
 
 class Room(Answer, frozen=True, kw_only=True):
     authorized_device_limit_bytes: int | UnsetType = UNSET
+    #: The process cap once room was made (`process_cap/1`); -1 keeps the one it has
+    cap_bytes: int = -1
 
 
 class CheckpointReceipt(Answer, frozen=True, kw_only=True):
