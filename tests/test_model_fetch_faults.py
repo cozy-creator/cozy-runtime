@@ -182,7 +182,7 @@ def test_a_hub_that_has_not_answered_shows_as_waiting_for_it(tmp_path: Path) -> 
 def test_a_dripping_object_does_not_hold_the_pull_to_its_crawl(tmp_path: Path) -> None:
     """Run 2322: a 33 GB pull landed its body at 400 MB/s, then eight objects crawled at
     6-50 KB/s for 15 minutes. Two objects here crawl at 16 KiB/s, 256 s each alone; the pull
-    must finish far inside that, by asking for their ranges afresh (TensorFS 0.3.82 on)."""
+    must finish far inside that, by restarting their slow requests (TensorFS 0.3.85 on)."""
     size, rate = 4 << 20, 16 << 10
     point = weights(tmp_path / "origin", tensors=16, size=size)
     parts = sorted(hex_ for hex_, body in point.bodies.items() if len(body) == size)
@@ -200,4 +200,4 @@ def test_a_dripping_object_does_not_hold_the_pull_to_its_crawl(tmp_path: Path) -
     crawl = size / rate
     assert tail < crawl / 4, f"the tail crawled: {tail:.1f} s against a {body:.1f} s body"
     decisions = (store_root / "logs" / "transport.log").read_text()
-    assert " hedge " in decisions and " won " in decisions and "hedges_won=" in decisions
+    assert " restart " in decisions and "restarts=" in decisions

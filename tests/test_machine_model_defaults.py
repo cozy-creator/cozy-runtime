@@ -30,7 +30,7 @@ from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from fault_hub import HEADER, FaultHub, Gate, Stall, Watched, checkpoint, on, temps
+from fault_hub import ALWAYS, HEADER, FaultHub, Gate, Stall, Watched, checkpoint, on, temps
 from test_device_lanes import _config
 from test_machine_execution import ack, complete, offer
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
@@ -698,7 +698,10 @@ def test_a_second_pull_of_one_checkpoint_waits_in_tensorfs_and_can_leave(tmp_pat
     """Two preparations of one checkpoint share TensorFS's flight. The one that waits shows
     TensorFS's waiting samples and leaves when canceled, while the first still holds it."""
     point = checkpoint(tmp_path / "origin")
-    with FaultHub(point, on(HEADER, 1, 1, Stall(after=10))) as hub:
+    # TensorFS asks a silent object again: every later ask is held until the pulls have left.
+    released = threading.Event()
+    stalled = on(HEADER, 1, 1, Stall(after=10)), on(HEADER, 2, ALWAYS, Gate(released))
+    with FaultHub(point, *stalled) as hub:
         root = tmp_path / "store"
         tensorfs.Store.init(str(root))
         worker = peer({})
@@ -724,15 +727,17 @@ def test_a_second_pull_of_one_checkpoint_waits_in_tensorfs_and_can_leave(tmp_pat
         second.cancel()
         with pytest.raises(WorkspaceRefusal):
             waiting.result()
-        assert leading.thread.is_alive() and hub.asks(HEADER) == 1, hub.log()
+        assert leading.thread.is_alive(), hub.log()
         first.cancel()
         with pytest.raises(WorkspaceRefusal):
             leading.result()
+        released.set()
+        asked = hub.asks(HEADER)
         defaults.materialize(worker, [row])
         tensorfs.Store.open(str(root)).verify_checkpoint_source(
             point.model, point.manifest, point.length
         )
-        assert temps(root) == [] and hub.asks(HEADER) == 2, hub.log()
+        assert temps(root) == [] and hub.asks(HEADER) == asked + 1, hub.log()
 
 
 def test_a_preparation_reports_its_whole_size_only_once_every_pull_has_one(
