@@ -6140,7 +6140,12 @@ class Worker:
             warm_ms=float(facts.get("warm_ms", 0)),
             custody=str(facts.get("custody", "canonical")),
             ignored_extra_keys=", ".join(facts.get("ignored_extra_keys", ())),
+            ignored_extra_warnings="; ".join(facts.get("ignored_extra_warnings", ())),
         )
+        # Stored tensors the code does not build were skipped: said once per checkpoint, on
+        # the durable activity lane, never refused.
+        for line in facts.get("ignored_extra_warnings", ()):
+            self.note("warning", f"{first.entrypoint}: {line}")
         self._note_construction(placement_id, label, reply, facts)
         parked = [str(name).removeprefix("sha256:")[:12] for name in reply.get("parked") or ()]
         self.note(

@@ -2288,6 +2288,7 @@ class Executor:
                 method: list(names) for method, names in sorted(component_use(model_cls).items())
             },
             "ignored_extra_keys": list(record.ignored_extras),
+            "ignored_extra_warnings": list(record.ignored_warnings),
             "fit": record.fit,
             "plan": plan.seam_document(),
             "delivery": plan.wire_document(),
@@ -2527,6 +2528,11 @@ class Executor:
                 f"{parameter}/{key}"
                 for parameter, facts in facts_rows
                 for key in facts.get("ignored_extra_keys", [])
+            ],
+            "ignored_extra_warnings": [
+                f"{parameter}: {line}"
+                for parameter, facts in facts_rows
+                for line in facts.get("ignored_extra_warnings", [])
             ],
             "delivery": delivery,
             "models": {parameter: facts for parameter, facts in facts_rows},
