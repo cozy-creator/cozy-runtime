@@ -134,23 +134,18 @@ def _wrapped(tensor: object) -> tuple[object, ...]:
 
 
 @contextmanager
-def refuse_compile(*, lazy: bool) -> Iterator[None]:
-    """`torch.compile(module)` REFUSES, naming itself; `lazy` refuses `nn.Module.compile` too.
+def refuse_compile() -> Iterator[None]:
+    """`torch.compile(module)` and `nn.Module.compile` REFUSE during construction, naming
+    themselves.
 
     The wrapping spelling returns an `OptimizedModule` whose every `state_dict` key gains an
-    `_orig_mod.` prefix. Under CONSTRUCTION (`lazy=True`) the derived tensor requirements
-    would then demand `blk._orig_mod.weight` from checkpoints that carry `blk.weight` — a
-    construction no artifact satisfies — and the lazy `nn.Module.compile` is refused there
-    too, for a different reason: derive is derive-by-execution, so the callable it installs
-    would trace under fake tensors and launch real kernels on fake pointers (pgw#1659, the
-    day v1's neutered-to-eager compile killed a CUDA context process-wide).
-
-    Under `Model.warm` (`lazy=False`, cr-110) the tensors are real and the destinations
-    filled, so only the wrapping spelling is refused: the object the author's code would then
-    call is not the one the construction record and the residency plane hold. The in-place
-    spellings (`module.compile()`, diffusers' `compile_repeated_blocks`) move no key,
-    parameter or storage and are allowed (#702). Neither refusal reaches the invocation
-    path, and neither is a ruling that `torch.compile` cannot ship.
+    `_orig_mod.` prefix, so the derived tensor requirements would demand `blk._orig_mod.weight`
+    from checkpoints that carry `blk.weight` — a construction no artifact satisfies. The lazy
+    `nn.Module.compile` is refused for a different reason: derive is derive-by-execution, so
+    the callable it installs would trace under fake tensors and launch real kernels on fake
+    pointers (pgw#1659, the day v1's neutered-to-eager compile killed a CUDA context
+    process-wide). Neither refusal reaches the invocation path, and neither is a ruling that
+    `torch.compile` cannot ship.
     """
     torch = torch_module()
     original = torch.compile
@@ -159,23 +154,13 @@ def refuse_compile(*, lazy: bool) -> Iterator[None]:
         "compiling during construction renames every destination with an `_orig_mod.` "
         "prefix, so the derived tensor requirements matches no checkpoint. Compilation is a "
         "runtime plan decision, never a construction fact — delete the call from load()"
-        if lazy
-        else "torch.compile(module) wraps the module and prefixes every state_dict key with "
-        "`_orig_mod.`, so what warm() then calls is not the object the fill and residency "
-        "planes hold — use the in-place spelling, module.compile(), which moves no key"
     )
 
     def refuse(*args: object, **kwargs: object) -> object:
-        target = args[0] if args else kwargs.get("model")
-        if not lazy and not isinstance(target, torch.nn.Module):
-            # A function or a bound method: nothing is wrapped and no key moves. This is
-            # the call `nn.Module.compile` itself makes, over `_call_impl`.
-            return original(*args, **kwargs)
         raise ConstructionFault("torch.compile", why, site=_author_site())
 
     torch.compile = refuse  # type: ignore[assignment,attr-defined]
-    if lazy:
-        torch.nn.Module.compile = refuse  # type: ignore[assignment,method-assign]
+    torch.nn.Module.compile = refuse  # type: ignore[assignment,method-assign]
     try:
         yield
     finally:
@@ -476,7 +461,7 @@ def meta_substrate(variant: str, seen: Observations) -> Iterator[_Capability]:
         torch.__future__.set_swap_module_params_on_conversion(False)
         stack.callback(torch.__future__.set_swap_module_params_on_conversion, swap)
         stack.enter_context(torch.device("meta"))
-        stack.enter_context(refuse_compile(lazy=True))
+        stack.enter_context(refuse_compile())
         stack.enter_context(_capability(cap))
         stack.enter_context(_track_registrations(seen))
         stack.enter_context(_guard_mode(seen))
@@ -535,7 +520,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         stack.callback(setattr, nn.Module, "register_parameter", original)
         nn.Module.register_buffer = register_buffer
         stack.callback(setattr, nn.Module, "register_buffer", original_buffer)
-        stack.enter_context(refuse_compile(lazy=True))
+        stack.enter_context(refuse_compile())
         stack.enter_context(_capability(cap))
         stack.enter_context(_guard_mode(seen))
         yield cap

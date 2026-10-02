@@ -191,15 +191,6 @@ class H3Calls(Model[object]):
     dit: Any
     text_encoder: Any
 
-    def warm(self, ctx: Any) -> None:
-        ctx.raise_if_cancelled()
-        self.warm_dit()
-
-    @uses_components("dit")
-    def warm_dit(self) -> None:
-        with torch.no_grad():
-            self.dit(**h3_batch())
-
     @uses_components("dit")
     def compute(self, batch: dict[str, Any], expected: tuple[Any, Any]) -> Any:
         with torch.no_grad():
@@ -210,11 +201,6 @@ class H3Calls(Model[object]):
 
 class H3LoRACalls(H3Calls):
     turbo_overlay: torch.nn.Module
-
-    @uses_components("dit", "turbo_overlay")
-    def warm_dit(self) -> None:
-        with torch.no_grad():
-            self.dit(**h3_turbo_inputs(h3_batch(), self.turbo_overlay))
 
     @uses_components("dit", "turbo_overlay")
     def compute(

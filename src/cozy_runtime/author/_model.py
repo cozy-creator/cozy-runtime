@@ -150,7 +150,7 @@ EXCLUDED_KEYWORDS: Mapping[str, str] = {
 _RUNTIME_MEMBERS = frozenset(
     {
         "load",
-        "warm",
+        "warm",  # reserved: packages built before 0.18.101 define one; nothing calls it
         "unload",
         "for_request",
         "for_test",
@@ -469,9 +469,8 @@ def _refuse_lazy(method: str, result: object) -> None:
 class Model[PipelineT]:
     """Base of a package's reusable model class — the ONE long-lived model boundary.
 
-    The author owns WHAT the model is: the three lifecycle methods `load` (construct under
-    fake tensors, then fill), optional `warm` (post-fill, pre-serving work with real
-    tensors) and `unload` (release when the construction leaves the worker), the declared
+    The author owns WHAT the model is: the lifecycle methods `load` (construct under fake
+    tensors, then fill) and `unload` (release when the construction leaves the worker), the declared
     persistent state, and the component-touching methods handlers call. The runtime owns
     WHEN they run and where every byte lives (model-lifecycle.md). A bare typed parameter
     is the whole declaration, and its presence in a signature is what derives `gpu`.
@@ -575,24 +574,6 @@ class Model[PipelineT]:
         one was skipped, and falls back to its recommendation when none serves.
         Approximate attention remains the model author's quality decision, independent
         of FP8 checkpoint storage. Developer request overrides take precedence.
-        """
-        return None
-
-    def warm(self, ctx: Context) -> None:
-        """Optional post-fill, pre-serving work — the ONE place for it (cr-110, #708).
-
-        The runtime calls it once per construction fill: after the fill and its
-        verification, before the placement reports DISPATCHABLE, on every worker, with the
-        device lease held and real tensors in place. Never again on a component stage or
-        evict — module objects survive residency, only bytes move — and again only when the
-        construction is rebuilt. What goes here is the author's choice: an in-place
-        `module.compile()` or `compile_repeated_blocks`, Triton/kernel loading, autotune,
-        a dry step at the canonical shape, or nothing. `torch.compile(module)` is refused
-        here as under derive: it wraps the module and renames every state_dict key, so the
-        object the code then calls is not the one the fill and residency planes hold.
-        `ctx` carries the device, the fill's deadline and cancellation; it has no request
-        and can reserve no package call. A raise is a construction failure naming the
-        exception, and the generation never serves.
         """
         return None
 
@@ -753,14 +734,6 @@ class Model[PipelineT]:
                 fields=[name],
             )
         object.__delattr__(self, name)
-
-
-def warm_context(where: Device, *, deadline: float, cancel: Callable[[], bool]) -> Context:
-    """The Context `Model.warm` receives: where it runs, how long the fill may take, and
-    whether the generation is still wanted. No request id and no adapters, because there
-    is no attempt; the package-call broker only `invoke` binds is absent, so an invocable
-    called here refuses `child_broker_absent` by construction (cr-110)."""
-    return Context("", deadline, where, cancel)
 
 
 def _carries_view(value: object) -> bool:
