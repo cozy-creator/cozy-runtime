@@ -30,7 +30,15 @@ import tensorfs
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._stage_memo import inexact
-from cozy_runtime.internal import accel, budget_cell, canonical, plane, proctree, weight_policy
+from cozy_runtime.internal import (
+    accel,
+    budget_cell,
+    canonical,
+    image_vae,
+    plane,
+    proctree,
+    weight_policy,
+)
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
@@ -531,7 +539,7 @@ class Weights:
         if row.state == "present":
             reserved = accel.allocation(self.torch, self.kind)["reserved_bytes"]
             mapped = max(plane.stats(self.plane).device(self.index).committed, 0)
-            self.context_bytes = max(row.bytes - reserved - mapped, 0)
+            self.context_bytes = max(row.bytes - reserved - mapped, self.context_bytes, 0)
 
     def resident_bytes(self, component: Component) -> int:
         return plane.stats(self.plane).ready(component.key, self.index)
@@ -2460,14 +2468,15 @@ class WeightResidency:
         A decode that cannot run untiled even with every idle weight unmapped runs again tiled,
         and a tile that does not fit runs again at half the side, down to the smallest tile.
         The mode is recorded in the run's outputs."""
-        root: Any = self.components[name].root  # diffusers' AutoencoderKL, read as it is
+        root: Any = self.components[name].root  # a diffusers image VAE, read as it is
+        vae = image_vae.geometry(root)
+        assert vae is not None
         weights = self.weights
         #: pixels -> the untiled peak measured at that size
         peaks: dict[int, int] = {}
         #: pixels -> the tile side that last fit
         sides: dict[int, int] = {}
-        scale = 2 ** (len(root.config.block_out_channels) - 1)
-        default = int(root.tile_sample_min_size)
+        scale = vae.scale
 
         def run(z: Tensor, *args: object, **kwargs: object) -> object:
             if self.active is not None:
@@ -2488,13 +2497,13 @@ class WeightResidency:
             need = per_pixel * pixels if mode == "untiled" and size else free + evictable
             free = self._room_for_decode(name, free, evictable, need)
             # a tile under half the image, so tiling always lowers the peak
-            largest = _side(min(default, min(height, width) // 2))
+            largest = _side(min(height, width) // 2)
             side = min(_side(free // max(per_pixel, 1)), sides.get(pixels, largest), largest)
             baseline = accel.allocated(weights.torch, weights.kind)
             accel.reset_peak(weights.torch, weights.kind)
             while True:
                 if mode == "tiled":
-                    _tile(root, side, scale)
+                    vae.tile(side)
                 else:
                     root.disable_tiling()
                 try:
@@ -2681,20 +2690,11 @@ def _requested(exc: BaseException) -> int:
 
 
 def _image_vae(root: Module) -> bool:
-    """diffusers' image `AutoencoderKL`: one decode call, one frame, tiling it can switch."""
-    return any(
-        kind.__name__ == "AutoencoderKL" and kind.__module__.startswith("diffusers.")
-        for kind in type(root).__mro__
-    )
+    """An image VAE whose decode the plane sizes: one frame, tiling it can switch."""
+    return image_vae.geometry(root) is not None
 
 
 def _side(pixels: int) -> int:
     """The largest tile side, a multiple of 64 and at least the smallest tile, whose square
     is at most `pixels`."""
     return max(int(max(pixels, 0) ** 0.5) // 64 * 64, MIN_TILE)
-
-
-def _tile(root: Any, side: int, scale: int) -> None:
-    root.enable_tiling()
-    root.tile_sample_min_size = side
-    root.tile_latent_min_size = side // scale

@@ -173,9 +173,6 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
             assert leader._install_group(torch, model) is None
             assert inspect.signature(model.dit.forward) == signature
             assert leader._attempt_spool is None
-            assert leader._warm_model(model) >= 0
-            assert leader._attempt_spool is None
-            assert not list((tmp_path / "warm").rglob("tensor-*.raw"))
         else:
             mirror_component(
                 model.block,

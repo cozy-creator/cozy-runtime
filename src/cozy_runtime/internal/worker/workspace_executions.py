@@ -837,6 +837,16 @@ class Executions:
             ).fetchone()
         return cast(dict[str, Json], canonical_json.decode(row[0])) if row is not None else None
 
+    def last_owner(self) -> str:
+        """The owner of the journal's newest row: whose calls a fresh boot prewarms before
+        any claim names its owner."""
+        with self.workspace.locked() as db:
+            row = db.execute(
+                "SELECT owner FROM execution_events "
+                "WHERE rowid = (SELECT MAX(rowid) FROM execution_events)"
+            ).fetchone()
+        return str(row[0]) if row is not None else ""
+
     def last_grants(self, owner: str) -> list[tuple[str, tuple[int, ...]]]:
         """GPU calls newest first, each with its GPU set: a call granted its turn (`gpu.grant`)
         or prepared ahead of it (`stage.prepare`). Only the journal's newest `GRANT_TAIL` rows
