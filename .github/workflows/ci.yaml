@@ -114,7 +114,7 @@ jobs:
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: >-
           uv run mypy --follow-imports=silent
-          --exclude 'src/cozy/worker/v1/worker_pb2|src/cozy_runtime/models/qwen_image21/upstream|^tests/testdata/'
+          --exclude 'src/cozy/worker/v1/worker_pb2|^tests/testdata/'
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run python checks/architecture.py
       - name: Reproducible wheel
