@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from cozy_runtime.author import _activity
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import Attempt, ProgressFrame, Telemetry
@@ -220,6 +221,37 @@ def test_author_observation_details_cross_the_real_executor_seam(tmp_path: Path)
         assert stage["type"] == "stage"
         assert stage["payload"]["name"] == "conditioning"
         assert stage["payload"]["value"] >= 0
+
+
+def test_a_wait_for_weights_is_off_the_stage_clock_and_its_own_stage(tmp_path: Path) -> None:
+    telemetry, frames = _telemetry(tmp_path)
+    attempt = telemetry._attempt
+
+    def record(name: str, ms: float) -> None:
+        attempt.attribution.stage(name, ms)
+        attempt.emit("stage", name, round(ms, 3))
+
+    with _activity.asides(record), telemetry.stage("encode"):
+        with _activity.aside("loading weights"):
+            time.sleep(0.2)
+        with _activity.aside("loading weights"):
+            pass  # a wait that was none is not a row
+    stages = attempt.attribution.stages
+    assert stages["loading weights"].total_ms >= 200 and stages["loading weights"].count == 1
+    assert stages["encode"].total_ms < 100, "the wait was counted in the stage open around it"
+    rows = [row.name for row in frames if isinstance(row, Observation) and row.kind == "stage"]
+    assert rows == ["loading weights", "encode"]
+
+
+def test_a_stage_ends_when_its_device_work_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    telemetry, _ = _telemetry(tmp_path)
+    # What a device does: the kernels a stage queued finish after the host left it.
+    monkeypatch.setattr(_activity, "_SETTLE", lambda: time.sleep(0.2))
+    with telemetry.stage("denoise"):
+        pass
+    assert telemetry._attempt.attribution.stages["denoise"].total_ms >= 200
 
 
 def test_load_progress_preserves_component_and_measured_position() -> None:

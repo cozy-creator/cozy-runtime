@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, cast
 import msgspec
 import tensorfs
 
+from cozy_runtime.author._activity import aside
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom, is_library_refusal
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._stage_memo import inexact
@@ -2144,6 +2145,7 @@ class WeightResidency:
         opened = weights.opened()
         components = {key: component for key, (_, _, component) in opened.items()}
         method = weights.open[-1][1]
+        arriving: list[Ticket] = []
 
         def stage(
             layouts: Mapping[str, weight_policy.Layout],
@@ -2225,17 +2227,25 @@ class WeightResidency:
                 for index in stale:
                     unbind(component.regions[index])
             try:
-                weights.plane.want(
-                    component.ws,
-                    weights.index,
-                    list(component.resident),
-                    priority=plane.PREFIX + clock,
+                arriving.append(
+                    weights.plane.want(
+                        component.ws,
+                        weights.index,
+                        list(component.resident),
+                        priority=plane.PREFIX + clock,
+                    )
                 )
             except self._shortfall_error as exc:
                 raise self._shortfall(method, need, budget, str(exc)) from None
         # Every eviction so far is past: its regions leave their bindings now, before the
         # resident sets bind (a region evicted earlier and wanted again binds after this).
         weights.drain()
+        # The plan's bytes reach the device before they bind: the stage cannot compute without
+        # them, and that wait is loading, in the record by its own name and off the stage's
+        # clock. A fill that failed is reported where its region is used, as before.
+        with aside("loading weights"), suppress(plane.error("PlaneError")):
+            for ticket in arriving:
+                ticket.wait()
         stream = weights.stream()
         for key, residence in placed.items():
             component = components[key]

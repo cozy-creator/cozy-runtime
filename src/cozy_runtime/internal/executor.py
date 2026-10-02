@@ -61,7 +61,7 @@ import msgspec
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime.author._activity import blocked
+from cozy_runtime.author._activity import blocked, settles
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
@@ -1952,6 +1952,7 @@ class Executor:
         if host.weights is None:
             try:
                 host.weights = Weights(torch, self._rank_device(torch), self.device_kind)
+                settles(host.weights.quiesce)
                 # One GPU of a group: its blocks hold the group's collectives, so they
                 # recover from an out-of-memory op by op, never by running a block again.
                 host.weights.grouped = self.world > 1

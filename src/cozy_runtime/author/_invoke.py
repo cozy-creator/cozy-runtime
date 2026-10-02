@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, get_args, get_type_hints
 
 import msgspec
 
+from cozy_runtime.author._activity import asides
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import (
@@ -390,8 +391,14 @@ def run_prepared(
         publish=inv.publish,
         ignored=prepared.overlay.ignored,
     )
+
+    def aside(name: str, ms: float) -> None:
+        record.attribution.stage(name, ms)
+        record.emit("stage", name, round(ms, 3))
+
     try:
-        return invoke(prepared, inv, record), SUCCEEDED, record
+        with asides(aside):
+            return invoke(prepared, inv, record), SUCCEEDED, record
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
