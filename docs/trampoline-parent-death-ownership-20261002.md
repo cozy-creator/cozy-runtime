@@ -25,6 +25,8 @@
   `:78-79` restores them, and `:41-42` skips adoption for nonroot callers. Neither
   transition re-arms PDEATHSIG. The fixture opens the actual native Store after
   changing the fixture Store's owner, rather than simulating native behavior.
+  Guard loss is recorded as xfail, so this probe does not require unsafe behavior to
+  remain when the independently owned native identity policy is repaired.
 - Ruff passes on all changed Python files. A scoped mypy invocation reports only
   146 existing generated `worker_pb2.pyi` errors, with none in the three owned files.
 - The FD observer test duplicates a real pidfd above 2048; its test process raises

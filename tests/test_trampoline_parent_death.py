@@ -71,7 +71,7 @@ def test_actual_creator_death_kills_the_executor(uid: int, gid: int) -> None:
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="requires privileged store-owner fixture")
-def test_native_foreign_store_fs_credentials_clear_the_guard() -> None:
+def test_native_foreign_store_keeps_the_guard_or_records_known_gap() -> None:
     result = subprocess.run(
         [sys.executable, str(FIXTURE), "filesystem_identity"],
         capture_output=True,
@@ -79,7 +79,10 @@ def test_native_foreign_store_fs_credentials_clear_the_guard() -> None:
         check=True,
     )
     facts = json.loads(result.stdout)
-    assert facts == {"before": signal.SIGKILL, "after": 0, "uid": 0}
+    assert facts["before"] == signal.SIGKILL and facts["uid"] == 0
+    if facts["after"] == 0:
+        pytest.xfail("native foreign Store-owner fscredentials clear PDEATHSIG after trampoline")
+    assert facts["after"] == signal.SIGKILL
 
 
 def test_wrong_expected_parent_refuses_before_exec() -> None:
