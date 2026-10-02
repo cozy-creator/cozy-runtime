@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -46,7 +47,7 @@ from cozy_runtime.internal.worker.attempts import (  # noqa: E402
 from cozy_runtime.internal.worker.stage_scheduler import Grant, Want  # noqa: E402
 from cozy_runtime.protocol import worker_pb2 as pb  # noqa: E402
 from test_gpu_scheduler import VIRTUAL, GiB, Machine, driverless  # noqa: E402
-from test_weight_plane import HIDDEN, Stack, load, write_checkpoint  # noqa: E402
+from test_weight_plane import HIDDEN, Stack, load, on_card, write_checkpoint  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
 
@@ -71,21 +72,23 @@ class Seamed:
     """An executor host on one end of a socket pair, with the plane's host tier, and the
     Worker's handler answering its durable requests on the other."""
 
-    def __init__(self, root: Path, handler: Handler) -> None:
+    def __init__(self, root: Path, handler: Handler, device: str = "cpu") -> None:
         left, right = socket.socketpair()
         self.worker = Channel(right)
         self.host = Executor(Channel(left), root / "executor")
-        self.weights = Weights(torch, torch.device("cpu"), "cpu")
+        self.weights = Weights(torch, torch.device(device), device)
         self.weights.set_budget(-1, pinned=1 << 30)
         self.host.weights = self.weights
         checkpoint, self.values = write_checkpoint(root)
         self.model = load(self.weights, checkpoint, "construction")
-        self.answering = threading.Thread(target=self._answer, args=(handler,), daemon=True)
+        #: the Worker's handler for the attempt this executor runs now
+        self.handler = handler
+        self.answering = threading.Thread(target=self._answer, daemon=True)
         self.answering.start()
 
-    def _answer(self, handler: Handler) -> None:
+    def _answer(self) -> None:
         while (frame := self.worker.recv()) is not None:
-            answer, _ = respond(frame, handler)
+            answer, _ = respond(frame, self.handler)
             self.worker.send(answer)
 
     def scope(self, x: Any) -> Any:
@@ -180,6 +183,43 @@ def test_past_its_last_stage_a_call_gives_its_bytes_back_to_the_one_waiting(
         waiting.join(30)
         assert granted == [Grant((0,), True)]
         assert budgets == [0], "B's turn came after A had unmapped, so B measures real room"
+    finally:
+        executor.close()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=on_card)])
+def test_a_models_next_request_finds_its_weights_mapped_and_uploads_none(
+    machine: Machine, tmp_path: Path, device: str
+) -> None:
+    """Runs 2955-2957, three queued SDXL requests on an 8 GB card: each was told to unmap for
+    the next, its own model's, and that one uploaded all 6.4 GiB again."""
+    worker = machine.worker
+    worker._turning["inst-a"] = True
+    worker.stages.book.record("inst-a/generate", "c", [StageSample(kind=SCOPE, wall_ns=10**6)])
+    # The model's executor holds device weights: its next call waits outside it for the turn.
+    worker.stages.holds = lambda template, gpus: True
+    want = Want(root="A", template=("inst-a", "b"), entrypoint="generate", cell="c")
+    for order, root in enumerate(("A", "B"), 1):
+        worker.stages.open_root(root, order)
+        worker.stages.want(f"{root}#1", msgspec.structs.replace(want, root=root))
+    assert worker.stages.turn_taking("A#1"), "at its device entry it goes stage by stage"
+    assert not worker.stages.ready("B#1") and worker.stages.planned("B#1") == (0,)
+    assert worker.stages.view()["waiting"] == {"B#1": ["A"]}
+    handler, _ = tenant(machine, "tenant-a", "A")
+    executor = Seamed(tmp_path, handler, device)
+    try:
+        x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(5)).half().to(device)
+        executor.scope(x)  # A's one observed stage: past it, B is the call that waits
+        assert executor.weights.budget != 0, "nobody but its own model wants the room"
+        was = executor.weights.facts()
+        assert device == "cpu" or was.h2d_bytes > 0, "its first request uploaded them"
+        worker.stages.release("A#1", ok=True, cell="c")
+        assert worker.stages.ready("B#1") and worker.stages.turn_taking("B#1")
+        executor.handler, _ = tenant(machine, "tenant-a", "B")
+        executor.scope(x * 2)
+        now = executor.weights.facts()
+        assert (now.h2d_bytes, now.evictions) == (was.h2d_bytes, was.evictions)
+        assert worker.stages.view()["demands"]["B#1"]["stage"] == 1, "B took its own turn"
     finally:
         executor.close()
 
