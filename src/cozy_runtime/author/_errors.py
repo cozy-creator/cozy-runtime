@@ -177,6 +177,15 @@ def is_device_oom(exc: BaseException) -> bool:
     )
 
 
+def is_library_refusal(exc: BaseException) -> bool:
+    """A cuBLAS or cuDNN status raised from a library call. Each takes device memory for itself
+    at a first launch (its handle, a workspace, a kernel's code) and reports its absence under
+    several names (INTERNAL_ERROR, NOT_SUPPORTED, EXECUTION_FAILED, NOT_INITIALIZED), so under
+    a memory budget one is run again once with room made; a second is the library's own."""
+    text = str(exc)
+    return isinstance(exc, RuntimeError) and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
+
+
 def classify(exc: BaseException | None) -> Outcome:
     """Map what escaped a handler onto the neutral set.
 

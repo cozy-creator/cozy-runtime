@@ -19,6 +19,10 @@ MAX_WINDOW = 6
 #: Allocator fragmentation between the plane's budget and torch's activations. Small because a
 #: torch OOM at a block boundary lowers the budget and retries (§4, activations first).
 MARGIN = 64 << 20
+#: Room a GPU library is given when its call is refused: a first launch takes memory for
+#: itself (cuBLAS 36 MiB for a bf16 GEMM, 6 MiB more for fp16; cuDNN 2 MiB for a convolution;
+#: measured on an L4 with CUDA 13).
+LIBRARY_ROOM = 64 << 20
 #: The event model's fixed costs: one copy's issue, and one block's acquire/release hook.
 COPY_OVERHEAD_S = 20e-6
 HOOK_S = 15e-6

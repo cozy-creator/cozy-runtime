@@ -681,6 +681,7 @@ class Executor:
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
+        accel.first_launches(torch, self.device_kind)
         accel.reset_peak(torch, self.device_kind)
         self._device_ready = True
         return None
