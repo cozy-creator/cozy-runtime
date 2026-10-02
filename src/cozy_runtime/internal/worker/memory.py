@@ -445,11 +445,7 @@ class MemoryManager:
         # A stage whose activations were never measured cannot say what it needs: every idle
         # tenant of its GPUs gives room, least recently used first.
         read, evicted = self._give(
-            lane,
-            tenant,
-            lambda o, m: banked is None or want is None or usable(m) < want,
-            why,
-            contexts=banked is not None,
+            lane, tenant, lambda o, m: banked is None or want is None or usable(m) < want, why
         )
         if any(m.state != "measured" for m in read.values()):
             self.note("residency", f"{lane.lane_id}: unreadable; {tenant!r} derives its budget")
@@ -467,6 +463,18 @@ class MemoryManager:
             return Budget(evicted=tuple(evicted))
         # The grant must hold the weights' floor itself: that is the refusal line.
         least = floor_bytes(ledger.layouts, stage.components)
+
+        def below(o: int, memory: DeviceMemory) -> bool:
+            return weight_policy.plane_budget(usable(memory), grow) < least
+
+        if any(below(o, m) for o, m in read.items()):
+            # Full residency is a wish and streams when unmet; the floor is a need. With every
+            # idle weight byte cut and the floor still unmet, idle processes end for the
+            # device contexts they hold.
+            read, ended = self._give(lane, tenant, below, why, contexts=True)
+            evicted += [name for name in ended if name not in evicted]
+            if any(m.state != "measured" for m in read.values()):
+                return Budget(evicted=tuple(evicted))
         # What an executor waiting to start beside it wants stays free, down to the floor.
         budget = {
             o: max(
