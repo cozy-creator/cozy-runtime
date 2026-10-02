@@ -614,7 +614,11 @@ def _unbound_type(torch: Any) -> type:
 
         @staticmethod
         def __new__(cls, shape: tuple[int, ...], dtype: Any, device: Any) -> Any:
-            return torch.Tensor._make_wrapper_subclass(cls, shape, dtype=dtype, device=device)
+            # A zero-byte storage, as packages know a parked weight (H3's numerical checks
+            # skip one): its shape and device are facts, its bytes are not here.
+            return torch.Tensor._make_wrapper_subclass(
+                cls, shape, dtype=dtype, device=device, storage_size=0
+            )
 
         @classmethod
         def __torch_dispatch__(

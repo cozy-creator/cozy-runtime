@@ -208,6 +208,22 @@ def test_the_pinned_tier_holds_every_part_where_the_layout_says(tmp_path: Path) 
     assert same(run(model, x, passes=1), [expected])
 
 
+def test_an_unbound_weight_is_parked_as_packages_know_it() -> None:
+    """Run 2570: H3's finite-weight check read the storage of a text-encoder weight that was
+    streaming (not on the card) and failed. A weight with no plane bytes bound has a zero-byte
+    storage, which is how packages already tell a parked weight; its shape, dtype and device
+    stay facts."""
+    from cozy_runtime.internal.weights import unbound
+    from cozy_runtime.models.minimax_h3.official import _inspectable
+
+    held = torch.nn.Parameter(torch.empty(4, 8, dtype=torch.bfloat16), requires_grad=False)
+    standin = unbound(torch, held, torch.device("cpu"))
+    assert standin.untyped_storage().nbytes() == 0 and standin.numel() == 32
+    assert (standin.shape, standin.dtype, standin.device.type) == (held.shape, held.dtype, "cpu")
+    assert not _inspectable(standin) and _inspectable(held)
+    assert standin.to(torch.float32).untyped_storage().nbytes() == 0
+
+
 def assert_pinned(weights: Weights, component: Any, values: dict[str, Any]) -> None:
     weights.plane.want(component.ws, "pinned").wait()
     held = mmap.mmap(component.ws.host_fd, component.ws.nbytes, prot=mmap.PROT_READ)
