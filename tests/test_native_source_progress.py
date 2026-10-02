@@ -28,8 +28,15 @@ FIXTURE = Path(__file__).parent / "testdata/native_source"
 
 
 @contextmanager
-def origin(body: bytes, pieces: int, pause: threading.Event, gap: float) -> Iterator[int]:
-    """A stand-in Hugging Face origin that sends one carrier in `pieces` spaced writes."""
+def origin(
+    body: bytes,
+    pieces: int,
+    pause: threading.Event,
+    gap: float,
+    sent: threading.Event | None = None,
+) -> Iterator[int]:
+    """A stand-in Hugging Face origin that sends one carrier in `pieces` spaced writes, and
+    sets `sent` once the first has left."""
     digest = hashlib.sha256(body).hexdigest()
 
     class Handler(BaseHTTPRequestHandler):
@@ -65,6 +72,8 @@ def origin(body: bytes, pieces: int, pause: threading.Event, gap: float) -> Iter
                         pause.wait(gap)
                     self.wfile.write(data[offset : offset + step])
                     self.wfile.flush()
+                    if sent is not None:
+                        sent.set()
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -168,8 +177,8 @@ def test_download_and_conversion_report_bytes_rate_and_stage_timings(tmp_path: P
 
 def test_crashed_source_worker_failure_carries_its_signal_and_stderr_tail(tmp_path: Path) -> None:
     body = (FIXTURE / "first.safetensors").read_bytes()
-    held = threading.Event()
-    with origin(body, 2, held, 60) as port:
+    held, sent = threading.Event(), threading.Event()
+    with origin(body, 2, held, 60, sent) as port:
         workspace = Workspace(tmp_path / "store")
         messages: queue.Queue[pb.NativeSourceStatus] = queue.Queue()
         frames: list[tuple[str, int, int, dict[str, Any]]] = []
@@ -183,9 +192,8 @@ def test_crashed_source_worker_failure_carries_its_signal_and_stderr_tail(tmp_pa
         )
         source = resolved(calls, messages, accepted(workspace, "crashing"))
         calls.handle(source)
-        while not any("position" in frame for *_, frame in frames):
-            assert messages.empty(), "download ended before its first byte sample"
-            held.wait(0.05)
+        # TensorFS reports a chunk once it is durable; this one is half sent and then held.
+        assert sent.wait(60), "the origin was never asked for the carrier"
         with calls.lock:
             process = calls.processes[source.service_id]
             assert process is not None
