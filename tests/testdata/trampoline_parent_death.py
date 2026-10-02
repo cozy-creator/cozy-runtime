@@ -82,6 +82,8 @@ def filesystem_identity() -> None:
 
     libc = ctypes.CDLL(None, use_errno=True)
     with tempfile.TemporaryDirectory(prefix="cozy-pdeath-store.") as directory:
+        # Scoped native I/O uses the Store owner's fsUID and must traverse this fixture.
+        Path(directory).chmod(0o755)
         root = Path(directory) / "store"
         tensorfs.Store.init(root)
         for current, directories, files in os.walk(root):
