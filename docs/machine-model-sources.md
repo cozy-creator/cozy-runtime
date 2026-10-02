@@ -37,10 +37,12 @@ exchange, existing Checkpoint metadata/read-plan, and native host-plane fill. It
 exact bytes, no consumer store/catalog/CUDA, descriptor coalescing, old Load defaults,
 readonly transport and malformed-response fd cleanup. It is not real SDXL/GPU inference.
 
-On 2026-10-02, all 33 selected CPU tests passed: four source/transport checks plus the
+On 2026-10-02, all 34 selected CPU tests passed: five source/transport checks plus the
 existing read-lease and cross-version seam checks, using the compiled TensorFS descriptor
 dependency. Ruff, compilation and whitespace checks passed. The dependency's native plane
 metadata/fill/stub checks and 17 Rust descriptor/legacy-host tests passed separately.
+An unqualified group source mode refuses the affected operation before Torch/device
+preparation; it does not prevent the peer's baseline operations.
 
 The Rust machine adapter must implement the source kind and authorize each grant; the
 TensorFS descriptor-source candidate must be installed as a coherent native package.

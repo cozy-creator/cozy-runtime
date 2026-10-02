@@ -132,6 +132,19 @@ def test_new_load_flag_is_optional_and_additive():
     assert load.descriptor_sources is True
 
 
+def test_unqualified_group_source_mode_refuses_before_device_preparation(tmp_path: Path):
+    local, remote = socket.socketpair()
+    try:
+        executor = Executor(Channel(local), tmp_path, world=2)
+        reply = executor.load(Load(construction="group", descriptor_sources=True))
+        assert not reply["ok"] and reply["code"] == "model_source_unavailable"
+        assert executor.torch is None and not executor.started
+        assert "libcuda" not in Path("/proc/self/maps").read_text()
+    finally:
+        local.close()
+        remote.close()
+
+
 def test_readonly_file_transport_rejects_writable_and_keeps_caller_ownership(tmp_path: Path):
     local, remote = socket.socketpair()
     try:
