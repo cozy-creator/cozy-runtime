@@ -405,6 +405,14 @@ class Weights:
             for name in local
         }
 
+    def floor(self) -> int:
+        """The plane bytes the open stages cannot run below, each component at its grain
+        (mid-stage none can refine: its leases hold the coarse regions)."""
+        return sum(
+            weight_policy.floor(replace(component.planned, fine=None))
+            for _, _, component in self.opened().values()
+        )
+
     @contextmanager
     def recovering(self, watch: frozenset[int] = frozenset()) -> Iterator[Watch]:
         """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
@@ -434,11 +442,7 @@ class Weights:
         if self.running:
             # Inside a block (one GPU of a group): nothing is re-placed under its lease. Other
             # weights leave, least recently used first; their blocks map them again as they run.
-            floor = sum(
-                weight_policy.floor(replace(component.planned, fine=None))
-                for _, _, component in self.opened().values()
-            )
-            self.shrink(need, floor)
+            self.shrink(need, self.floor())
             self.drain()
         elif self.open:
             self.open[-1][0]._make_room(need, op=op)
@@ -1898,11 +1902,9 @@ class WeightResidency:
         the failure by its own name when that is no less than before."""
         weights = self.weights
         accel.release_cached(weights.torch, weights.kind)
-        opened = [component for _, _, component in weights.opened().values()]
         mapped = max(plane.stats(weights.plane).device(weights.index).committed, 0)
         room = mapped + weights.decoded() + weights.allocatable() - need - weight_policy.MARGIN
-        floor = sum(weight_policy.floor(replace(c.planned, fine=None)) for c in opened)
-        lowered = max(min(room, budget - weight_policy.MARGIN), floor)
+        lowered = max(min(room, budget - weight_policy.MARGIN), weights.floor())
         if lowered >= budget:
             raise self._shortfall(
                 method,
@@ -1930,7 +1932,7 @@ class WeightResidency:
         if wanted is None:
             return
         opened = [component for _, _, component in weights.opened().values()]
-        floor = sum(weight_policy.floor(replace(c.planned, fine=None)) for c in opened)
+        floor = weights.floor()
         for component in opened:
             close_cursor(component)
         weights.set_budget(max(wanted, floor) if wanted >= 0 else wanted)
@@ -2447,9 +2449,7 @@ class WeightResidency:
         before = weights.allocatable()
         for component in opened:
             close_cursor(component)
-        # Mid-stage no component can refine (its leases hold the coarse regions).
-        floor = sum(weight_policy.floor(replace(c.planned, fine=None)) for c in opened)
-        weights.shrink(need, floor)
+        weights.shrink(need, weights.floor())
         if opened:
             self._place(weights.applied, resume)
         weights.progressed(before, need, op or f"{method}()")
@@ -2510,7 +2510,7 @@ class WeightResidency:
             need = per_pixel * pixels if mode == "untiled" and known else free + evictable
             free = self._room_for_decode(name, free, evictable, min(need, free + evictable))
             # a tile under half the image, so tiling always lowers the peak
-            largest = _side(min(height, width) // 2)
+            largest = _tile(min(height, width) // 2)
             side = min(_side(free // max(per_pixel, 1)), sides.get(pixels, largest), largest)
             baseline = accel.allocated(weights.torch, weights.kind)
             accel.reset_peak(weights.torch, weights.kind)
@@ -2531,7 +2531,7 @@ class WeightResidency:
                 # outside `except`, so the failed call's frames are gone
                 accel.release_cached(weights.torch, weights.kind)
                 if mode == "tiled":
-                    side = _side(side // 2)
+                    side = _tile(side // 2)
                     continue
                 # it needs more than all it had: the next decode of this size starts tiled
                 peaks[pixels] = max(peaks.get(pixels, 0), free + evictable + 1)
@@ -2583,23 +2583,16 @@ class WeightResidency:
             raise failure
 
     def _room_for_decode(self, name: str, free: int, evictable: int, need: int) -> int:
-        """Activations first: idle weights leave before a decode needs their room (never what
-        the stage holds, which may still be filling), since a decode run short of memory takes
-        slower convolutions. Returns what is free after."""
+        """Activations first: idle weights leave before a decode needs their room, since a
+        decode run short of memory takes slower convolutions. Never what the open stages hold
+        (it may still be filling) and never their floor: a component that streams has little
+        resident, and its next block needs its ring. Returns what is free after."""
         if need <= free or evictable <= 0:
             return free
         weights = self.weights
         mapped = plane.stats(weights.plane).device(weights.index).committed
-        weights.shrink(need - free, max(mapped - evictable, self._floor((name,))))
+        weights.shrink(need - free, max(mapped - evictable, weights.floor()))
         return self.room((name,))[0]
-
-    def _floor(self, names: Sequence[str]) -> int:
-        """The plane bytes `names` cannot run below at their current grain."""
-        return sum(
-            weight_policy.floor(replace(self.components[n].planned, fine=None))
-            for n in names
-            if n in self.components
-        )
 
     def _drop(self, components: Sequence[Component]) -> None:
         weights = self.weights
@@ -2721,7 +2714,11 @@ def _image_vae(root: Module) -> bool:
     return image_vae.geometry(root) is not None
 
 
+def _tile(side: int) -> int:
+    """`side` as a tile's: a multiple of 64, at least the smallest tile."""
+    return max(side // 64 * 64, MIN_TILE)
+
+
 def _side(pixels: int) -> int:
-    """The largest tile side, a multiple of 64 and at least the smallest tile, whose square
-    is at most `pixels`."""
-    return max(int(max(pixels, 0) ** 0.5) // 64 * 64, MIN_TILE)
+    """The largest tile side whose square is at most `pixels`."""
+    return _tile(int(max(pixels, 0) ** 0.5))
