@@ -1650,8 +1650,6 @@ class WeightResidency:
         above `budget` and never below a two-block streaming window. Returns the budget used."""
         weights = self.weights
         method = weights.open[-1][1]
-        for _, _, component in weights.opened().values():
-            self._seal(component)  # what this stage's kernels read, until they are done
         try:
             self._plan(budget, resume)
             return budget
@@ -1711,6 +1709,7 @@ class WeightResidency:
             return  # no room to grow into: the floor's plan carries on
         for _, _, component in weights.opened().values():
             close_cursor(component)
+            self._seal(component)
         self._place(budget)
 
     def _entered(self, method: str) -> None:
@@ -2282,7 +2281,9 @@ class WeightResidency:
         stream = weights.stream()
         common = component.common.index if component.common is not None else -1
         for index in component.resident:
-            if index != common:  # the common lease is released at the stage's end already
+            # the common lease is released at the stage's end; an unbound region was unmapped
+            # already (by a cut that waited for its kernels, or between calls)
+            if index != common and component.regions[index].bound is not None:
                 weights.plane.acquire(component.ws, weights.index, index, stream).release(stream)
 
     def _room_for_decode(self, name: str, free: int, evictable: int, need: int) -> int:

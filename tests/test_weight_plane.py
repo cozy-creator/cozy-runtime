@@ -517,36 +517,54 @@ def test_budgets_cut_and_raised_while_streaming_stay_exact(card: Any) -> None:
 
 
 @on_card
-def test_a_cut_waits_for_the_kernels_that_read_what_it_unmaps(card: Any) -> None:
-    """A stage's resident set holds no lease while its kernels run: they are queued long
-    before they read. A cut at a block boundary, with the GPU far behind the host, must not
-    unmap what queued kernels still read (else a fault, or another tenant's bytes read)."""
+@pytest.mark.parametrize("cut", ["next stage", "worker", "oom"])
+def test_weights_leave_only_after_the_kernels_that_read_them(tmp_path: Path, cut: str) -> None:
+    """A stage's resident set is bound for the whole stage, and code reads it outside block
+    forwards too (a tied embedding, a numerical check, a LoRA merge): those kernels hold no
+    lease, and they are queued long before they run (here behind a one-second kernel).
+    Whatever unmaps the set next (the next stage's weights, a Worker's mid-call cut, an
+    out-of-memory cut) waits for them; unmapping under them was an illegal address (on a
+    laptop, an MMU fault that can freeze it)."""
     from cozy_runtime.internal import budget_cell
 
-    weights = card.weights
-    model = load(weights, card.checkpoint, "behind")
-    x = torch.randn(32768, HIDDEN, device="cuda", dtype=torch.float16)  # slow kernels
-    weights.set_budget(1 << 30)
-    reference = run(model, x, passes=1)
-    layout: weight_policy.Layout = model.residency.components["stack"].layout
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    checkpoint = write_checkpoint(tmp_path)[0]
+    first, second = load(weights, checkpoint, "first"), load(weights, checkpoint, "second")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    layout: weight_policy.Layout = first.residency.components["stack"].layout
+    weights.set_budget(layout.total + (8 << 20))  # one construction's weights at a time
+
+    def outside(model: Any) -> Any:  # a read outside every block forward
+        return x @ model.stack.blocks[3].proj.weight.T
+
+    first.residency.admit("run", ("stack",))
+    with torch.inference_mode():
+        reference = outside(first)
+    first.residency.release("run", ("stack",))
     cell, fd = budget_cell.Cell.create()
     worker = budget_cell.Cell(fd)
     os.close(fd)
     weights.cell = cell
-    out = []
-    model.residency.admit("run", ("stack",))
     try:
         with torch.inference_mode():
-            for i in range(12):
-                worker.ask(layout.common if i % 2 else 1 << 30)  # the cut lands mid-pass
-                out.append(model.stack(x))
+            first.residency.admit("run", ("stack",))
+            torch.cuda._sleep(int(2e9))  # the GPU falls a second behind the host
+            late = outside(first)  # reads a resident weight after the sleep
+            if cut == "worker":
+                worker.ask(layout.common)  # applied at the next block boundary
+                first.stack(x)
+            elif cut == "oom":
+                weights.shrink(layout.total, 0)
+            first.residency.release("run", ("stack",))
+            if cut == "next stage":
+                run(second, x, passes=1)  # wants the room: evicts the first's resident set
         torch.cuda.synchronize()
     finally:
-        model.residency.release("run", ("stack",))
         weights.cell = None
         cell.close()
         worker.close()
-    assert all(same(reference, [o]) for o in out)
+    assert torch.equal(reference, late)
 
 
 @on_card
