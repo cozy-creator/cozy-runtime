@@ -9,9 +9,11 @@ card, so run it under the shared GPU lock.
 
 from __future__ import annotations
 
+import gc
 import io
 import mmap
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -170,6 +172,15 @@ def tight(model: Any) -> int:
     """The floor at a window of two, plus one resident block: the rest must stream."""
     layout: weight_policy.Layout = model.residency.components["stack"].layout
     return layout.common + 3 * layout.largest
+
+
+@pytest.fixture(autouse=True)
+def _collected() -> Iterator[None]:
+    """A construction is a reference cycle (its blocks' hooks hold it) that keeps one file
+    open per stored tensor: the last test's is collected before this one opens its own."""
+    gc.collect()
+    yield
+    gc.collect()
 
 
 @pytest.fixture
