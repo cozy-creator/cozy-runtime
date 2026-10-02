@@ -448,6 +448,8 @@ class WritingBlock(Block):
 
 
 class WritingStack(Stack):
+    _no_split_modules = ("WritingBlock",)
+
     def __init__(self) -> None:
         super().__init__()
         self.blocks = torch.nn.ModuleList([WritingBlock() for _ in range(BLOCKS)])
@@ -465,7 +467,7 @@ def test_a_block_that_writes_its_inputs_recovers_op_by_op(card: Any) -> None:
     weights.set_budget(1 << 30)
     reference = run(model, x, passes=1)
     blocks = model.residency.components["stack"].blocks
-    assert all(region.mutates for region in blocks)
+    assert len(blocks) == BLOCKS and all(region.mutates for region in blocks)
     retries = weights.facts().oom_retries
     torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()
