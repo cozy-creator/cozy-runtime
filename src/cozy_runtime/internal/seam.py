@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import array
 import contextlib
+import fcntl
 import json
 import os
 import socket
@@ -177,6 +178,30 @@ class Channel:
         try:
             _require_memfd(received)
         except SeamError:
+            os.close(received)
+            raise
+        return received
+
+    def send_readonly_file(self, fd: int) -> None:
+        """Transfer one immutable-source file capability; it is not a socket/host tier."""
+        _require_readonly_file(fd)
+        try:
+            sent = self.sock.sendmsg(
+                [b"\0"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))]
+            )
+        except OSError as exc:
+            self._raise(exc)
+        if sent != 1:
+            raise SeamError("seam_descriptor", "readonly-file handoff was truncated")
+        self.sent_bytes += 1
+
+    def recv_readonly_file(self) -> int:
+        """Receive one readonly regular file with explicit close-on-exec custody."""
+        received = self._recv_fd()
+        try:
+            _require_readonly_file(received)
+            os.set_inheritable(received, False)
+        except (OSError, SeamError):
             os.close(received)
             raise
         return received
@@ -333,3 +358,13 @@ def _require_memfd(fd: int) -> None:
         raise SeamError("seam_descriptor", f"memfd unreadable: {exc}") from exc
     if not regular or not named.startswith("/memfd:"):
         raise SeamError("seam_descriptor", "capability must be a memfd")
+
+
+def _require_readonly_file(fd: int) -> None:
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        readonly = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"source descriptor unreadable: {exc}") from exc
+    if not regular or not readonly:
+        raise SeamError("seam_descriptor", "source capability must be a readonly regular file")

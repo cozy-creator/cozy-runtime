@@ -223,6 +223,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: The worker grants a turn per component-use scope (`stage/1`): `StageEnter` before each
     #: scope plans, `StageExit` after it. Older workers never set it.
     stages: bool = False
+    #: Negotiated model_sources.descriptors/1: the machine owns model byte/catalog sources.
+    descriptor_sources: bool = False
 
     def single(self) -> ModelLoad:
         return ModelLoad(
