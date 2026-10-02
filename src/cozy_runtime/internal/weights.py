@@ -378,20 +378,12 @@ class Weights:
                 weight_policy.floor(replace(component.layout, fine=None))
                 for _, _, component in self.opened().values()
             )
-            if not self.shrink(need, floor):
-                raise ResidencyRefusal(
-                    "device_shortfall",
-                    f"an allocation of {need} B does not fit beside the stage's smallest "
-                    f"weights ({floor} B) on this GPU",
-                )
+            self.shrink(need, floor)
             self.drain()
         elif self.open:
-            self.open[-1][0]._make_room(need)
-        elif not self.shrink(need, 0):
-            raise ResidencyRefusal(
-                "device_shortfall",
-                f"an allocation of {need} B does not fit and no weight bytes are left to unmap",
-            )
+            self.open[-1][0]._make_room(need, op=op)
+        else:
+            self.shrink(need, 0)
         if any(region.bound != address for region, address in read):
             raise ResidencyRefusal(
                 "device_shortfall",
@@ -1629,23 +1621,7 @@ class WeightResidency:
                     # a window of two blocks: one more than the floor, so nothing refines
                     sum(o.common + 2 * o.largest if weights.grouped else o.total for o in own),
                 )
-            try:
-                self._plan(budget)
-            except self._budget_error as exc:
-                if not _device_pool(exc):
-                    raise self._shortfall(method, 0, budget, str(exc)) from None
-                # The driver had less than the budget (another process, or torch's idle cache,
-                # holds it): plan again inside what it has now, never above the grant, and
-                # never below a two-block streaming window while the driver can map one.
-                accel.release_cached(weights.torch, weights.kind)
-                window = sum(
-                    c.layout.common + 2 * c.layout.largest for _, _, c in weights.opened().values()
-                )
-                budget = min(budget, max(weights.driver_budget(method), window))
-                try:
-                    self._plan(budget)
-                except self._budget_error as again:
-                    raise self._shortfall(method, 0, budget, str(again)) from None
+            budget = self._place(budget)
             stream = weights.stream()
             for name in local:
                 component = self.components[name]
@@ -1664,6 +1640,29 @@ class WeightResidency:
             self._left()
             raise
         self._entered(method)
+
+    def _place(self, budget: int, resume: Mapping[str, int] = {}) -> int:
+        """`_plan` the open stages in `budget`. When the driver itself has less (another
+        process, or torch's idle cache, holds it), plan again inside what it has now, never
+        above `budget` and never below a two-block streaming window. Returns the budget used."""
+        weights = self.weights
+        method = weights.open[-1][1]
+        try:
+            self._plan(budget, resume)
+            return budget
+        except self._budget_error as exc:
+            if not _device_pool(exc):
+                raise self._shortfall(method, 0, budget, str(exc)) from None
+        accel.release_cached(weights.torch, weights.kind)
+        window = sum(
+            c.layout.common + 2 * c.layout.largest for _, _, c in weights.opened().values()
+        )
+        budget = min(budget, max(weights.driver_budget(method), window))
+        try:
+            self._plan(budget, resume)
+        except self._budget_error as again:
+            raise self._shortfall(method, 0, budget, str(again)) from None
+        return budget
 
     def _left(self) -> None:
         if self.active is not None:
@@ -1688,7 +1687,7 @@ class WeightResidency:
         weights.set_budget(max(wanted, floor) if wanted >= 0 else wanted)
         weights.drain()
         if opened and weights.open:
-            self._plan(max(weights.applied, floor), resume)
+            self._place(max(weights.applied, floor), resume)
         weights.cell.acknowledge(weights.applied)
 
     def _grow(self) -> None:
@@ -1706,10 +1705,7 @@ class WeightResidency:
             return  # no room to grow into: the floor's plan carries on
         for _, _, component in weights.opened().values():
             close_cursor(component)
-        try:
-            self._plan(budget)
-        except self._budget_error as exc:
-            raise self._shortfall(method, 0, budget, str(exc)) from None
+        self._place(budget)
 
     def _entered(self, method: str) -> None:
         weights = self.weights
@@ -2068,7 +2064,11 @@ class WeightResidency:
                 try:
                     lease = self._acquire(component, region.index, stream)
                 except self._capacity:
-                    self._make_room(region.span, {component.key: region.index})
+                    self._make_room(
+                        region.span,
+                        {component.key: region.index},
+                        f"{component.name}.{region.path}",
+                    )
                     continue
                 need = 0
                 try:
@@ -2104,7 +2104,9 @@ class WeightResidency:
                         f"{component.name}.{region.path} ran out of memory after changing its "
                         "inputs in place, so it cannot run again",
                     )
-                self._make_room(need, {component.key: region.index})
+                self._make_room(
+                    need, {component.key: region.index}, f"{component.name}.{region.path}"
+                )
 
         return run
 
@@ -2122,7 +2124,7 @@ class WeightResidency:
         )
         return lease
 
-    def _make_room(self, need: int, resume: Mapping[str, int] = {}) -> None:
+    def _make_room(self, need: int, resume: Mapping[str, int] = {}, op: str = "") -> None:
         """Activations first: unmap `need` bytes of weights, idle ones first, then re-place the
         open stages (a block that runs again resumes its component's cursor: `resume`)."""
         weights = self.weights
@@ -2133,14 +2135,10 @@ class WeightResidency:
             close_cursor(component)
         # Mid-stage no component can refine (its leases hold the coarse regions).
         floor = sum(weight_policy.floor(replace(c.layout, fine=None)) for c in opened)
-        if not weights.shrink(need, floor):
-            raise self._shortfall(method, need, 0, "no weight bytes are left to unmap")
+        weights.shrink(need, floor)
         if opened:
-            try:
-                self._plan(weights.applied, resume)
-            except self._budget_error as exc:
-                raise self._shortfall(method, need, weights.applied, str(exc)) from None
-        weights.progressed(before, need)
+            self._place(weights.applied, resume)
+        weights.progressed(before, need, op or f"{method}()")
 
     def _observe(self, component: Component, index: int) -> None:
         """Count passes and learn the blocks' execution order from a stage's first pass."""

@@ -214,6 +214,7 @@ def test_an_unbound_weight_is_parked_as_packages_know_it() -> None:
     streaming (not on the card) and failed. A weight with no plane bytes bound has a zero-byte
     storage, which is how packages already tell a parked weight; its shape, dtype and device
     stay facts."""
+    pytest.importorskip("diffusers")
     from cozy_runtime.internal.weights import unbound
     from cozy_runtime.models.minimax_h3.official import _inspectable
 
@@ -531,9 +532,9 @@ def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
     calls = {"room": 0}
     make_room = weights.make_room
 
-    def counted(need: int, operands: Any) -> None:
+    def counted(need: int, operands: Any, op: str = "") -> None:
         calls["room"] += 1
-        make_room(need, operands)
+        make_room(need, operands, op)
 
     weights.make_room = counted
     asked: list[int] = []
