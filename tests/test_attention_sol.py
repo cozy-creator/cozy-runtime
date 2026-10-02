@@ -12,7 +12,7 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
-from cozy_runtime.internal import attention, attention_sol, attention_ulysses
+from cozy_runtime.internal import accel, attention, attention_sol, attention_ulysses
 from cozy_runtime.internal.parallel import wire
 
 
@@ -149,7 +149,7 @@ def test_missing_semantics_and_cpu_execution_refuse() -> None:
 
 def test_native_sol_preserves_protected_queries_and_input_bytes() -> None:
     torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+    if not accel.present(torch, "cuda") or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("requires an owned SM90 CUDA qualification worker")
     if importlib.util.find_spec("sol_attn") is None:
         pytest.skip("requires the declared upstream sol-attn package")

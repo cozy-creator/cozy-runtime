@@ -37,7 +37,7 @@ from typing import Any
 import pytest
 
 from cozy_runtime.author import ConformanceError, Model
-from cozy_runtime.internal import fusion, fusion_install, kernel_cache, kernel_compile
+from cozy_runtime.internal import accel, fusion, fusion_install, kernel_cache, kernel_compile
 from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf, quantize_activation_rowwise
 
 try:
@@ -57,7 +57,7 @@ else:
 def _card() -> str:
     if CARD_ABSENT:
         return CARD_ABSENT
-    if not torch.cuda.is_available():
+    if not accel.present(torch, "cuda"):
         return "a CUDA device is required"
     if torch.cuda.get_device_capability()[0] < 8:
         return "the fused glue needs sm80+"

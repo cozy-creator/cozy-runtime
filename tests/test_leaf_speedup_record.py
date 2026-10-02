@@ -27,7 +27,7 @@ from pathlib import Path
 import msgspec
 import pytest
 
-from cozy_runtime.internal import probe
+from cozy_runtime.internal import accel, probe
 from cozy_runtime.internal.encoding import (
     SPEC_ROWWISE,
     SPEC_ROWWISE_KEEPDIM,
@@ -250,7 +250,7 @@ def _cuda_skip() -> str:
         return "torch is not installed"
     import torch
 
-    if not torch.cuda.is_available():
+    if not accel.present(torch, "cuda"):
         return "no CUDA device"
     major, minor = torch.cuda.get_device_capability()
     if major * 10 + minor < 89:

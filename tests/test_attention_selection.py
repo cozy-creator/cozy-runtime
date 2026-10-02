@@ -30,6 +30,7 @@ from cozy_runtime.author._observations import (
     EventRing,
 )
 from cozy_runtime.internal import (
+    accel,
     attention,
     attention_fp8,
     attention_upstream,
@@ -646,7 +647,7 @@ def _cuda_proof_skip() -> str:
         return why
     import torch
 
-    if not torch.cuda.is_available():
+    if not accel.present(torch, "cuda"):
         return "no CUDA device"
     return ""
 

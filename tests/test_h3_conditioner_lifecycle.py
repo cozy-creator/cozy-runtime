@@ -4,6 +4,8 @@ from typing import Any
 
 import pytest
 
+from cozy_runtime.internal import accel
+
 
 def _conditioner(torch: Any, device: str) -> Any:
     from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
@@ -70,7 +72,7 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
 ) -> None:
     torch = pytest.importorskip("torch")
     pytest.importorskip("transformers")
-    if device == "cuda" and not torch.cuda.is_available():
+    if device == "cuda" and not accel.present(torch, "cuda"):
         pytest.skip("CUDA allocation proof requires a local accelerator")
     from cozy_runtime.internal.worker.ledger import Ledger
     from cozy_runtime.models.minimax_h3.conditioner import FinalHiddenState, release_position_cache

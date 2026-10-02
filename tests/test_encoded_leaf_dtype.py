@@ -10,6 +10,7 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest("the Torch/Diffusers integration environment is required") from exc
 
+from cozy_runtime.internal import accel
 from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf, quantize_activation_rowwise
 
 
@@ -42,7 +43,7 @@ class EncodedLeafDtypeTest(unittest.TestCase):
                 torch.testing.assert_close(leaf.data.float(), payload.float())
                 torch.testing.assert_close(leaf.scale, scales)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires a real CUDA FP8 device")
+    @unittest.skipUnless(accel.present(torch, "cuda"), "requires a real CUDA FP8 device")
     def test_upstream_cast_preserves_nonunit_scaled_gpu_forward(self) -> None:
         if torch.cuda.get_device_capability()[0] < 9:
             self.skipTest("rowwise FP8 proof requires Hopper or newer")

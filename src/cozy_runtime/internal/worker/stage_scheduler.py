@@ -28,10 +28,11 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import msgspec
 
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.stages import (
     CostBook,
     StageCost,
@@ -46,7 +47,8 @@ from cozy_runtime.internal.worker.supervisor import fault_text
 
 Ordinals = tuple[int, ...]
 #: A JSON-shaped fact: a journaled scheduling event's body or a status document.
-Document = dict[str, Any]
+#: one journal row's body, or the scheduler's view: JSON as the journal writes it
+Document = dict[str, Json]
 #: (root, event kind, body): one observation to journal on its root.
 Event = tuple[str, str, Document]
 #: Live demands per GPU: the one holding it and the next one, getting ready.
@@ -117,6 +119,15 @@ class _Demand:
     entered: bool = False
     #: open scopes of its stage turn: the turn is the outermost one's
     depth: int = 0
+
+
+class Status(NamedTuple):
+    """What one execution holds or waits for: `MachineExecutionGpu`'s fields."""
+
+    phase: str = "none"
+    width: int = 0
+    ordinals: Ordinals = ()
+    blocked_by: tuple[str, ...] = ()
 
 
 class Exit(NamedTuple):
@@ -884,34 +895,27 @@ class StageScheduler:
 
     # ------------------------------------------------------------------ reading
 
-    def status(self, request: str, on_device: Callable[[str], bool]) -> Document:
+    def status(self, request: str, on_device: Callable[[str], bool]) -> Status:
         """One execution and, for a root, its calls: waiting, executing, granted, holding."""
         with self.lock:
 
             def mine(demand: _Demand) -> bool:
                 return demand.want.root == request or demand.key.rpartition("#")[0] == request
 
-            status: Document = {"phase": "none", "width": 0, "ordinals": [], "blocked_by": []}
             for demand in self.demands.values():
                 if mine(demand) and demand.waiting is not None:
-                    return {
-                        **status,
-                        "phase": "waiting",
-                        "width": demand.waiting[0],
-                        "ordinals": list(demand.gpus),
-                        "blocked_by": [demand.waiting[1]] if demand.waiting[1] else [],
-                    }
+                    width, behind = demand.waiting
+                    return Status("waiting", width, demand.gpus, (behind,) if behind else ())
             granted = [d for d in self.demands.values() if mine(d) and d.granted]
             if granted:
-                return {
-                    **status,
-                    "phase": "executing" if any(on_device(d.key) for d in granted) else "granted",
-                    "width": max(len(d.gpus) for d in granted),
-                    "ordinals": sorted({o for d in granted for o in d.gpus}),
-                }
+                return Status(
+                    "executing" if any(on_device(d.key) for d in granted) else "granted",
+                    max(len(d.gpus) for d in granted),
+                    tuple(sorted({o for d in granted for o in d.gpus})),
+                )
             if self.leases.get(request):
-                return {**status, "phase": "holding", "ordinals": sorted(self.leases[request])}
-            return status
+                return Status("holding", ordinals=tuple(sorted(self.leases[request])))
+            return Status()
 
     def held_by(self, root: str) -> set[int]:
         """GPUs a root's calls hold or are prepared on now."""

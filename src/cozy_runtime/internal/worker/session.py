@@ -2638,7 +2638,13 @@ class Worker:
             held = self.engine.live.get(key.rpartition("#")[0])
             return held is not None and held.state in ON_DEVICE
 
-        return pb.MachineExecutionGpu(**self.stages.status(request, on_device))
+        status = self.stages.status(request, on_device)
+        return pb.MachineExecutionGpu(
+            phase=status.phase,
+            width=status.width,
+            ordinals=status.ordinals,
+            blocked_by=status.blocked_by,
+        )
 
     # ------------------------------------------------------------------ the scheduler's facts
 
