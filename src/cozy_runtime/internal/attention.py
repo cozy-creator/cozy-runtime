@@ -757,7 +757,7 @@ def _projection_dtype(projection: Any) -> str:
     import torch
 
     peft_linear = getattr(sys.modules.get("peft.tuners.lora.layer"), "Linear", None)
-    if peft_linear is not None and type(projection) is peft_linear:
+    if peft_linear is not None and isinstance(projection, peft_linear):
         # PEFT returns the base result's dtype, even with differently typed factors.
         # Inspect the current base: encoded fill can replace it after construction.
         projection = projection.get_base_layer()

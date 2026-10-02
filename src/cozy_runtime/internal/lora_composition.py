@@ -262,11 +262,12 @@ def prepare(base: SourceCapability, selections: Sequence[Selection]) -> Prepared
 
 
 def composer(graph: Graph) -> Callable[[object], None]:
-    """Construct upstream PEFT layers before the ordinary census and fill.
+    """Construct PEFT layers before the ordinary census and fill.
 
     Imports happen before the caller enters its weightless construction substrate.
-    PEFT owns the arithmetic, including its normal adapter dtype/rounding behavior.
-    No state is merged into the base, and this transform allocates no weight values.
+    PEFT owns the layer, its keys and scales; each update accumulates into the base output
+    in place at the activation's precision, never copying the input to the factor dtype
+    (#1077). No state is merged into the base, and this transform allocates no weight values.
     """
     if not graph.layers:
         return lambda _obj: None
@@ -284,6 +285,20 @@ def composer(graph: Graph) -> Callable[[object], None]:
 
     # Private construction recipe only; rank and alpha are set independently for each term.
     config = LoraConfig(init_lora_weights=False, inference_mode=True, lora_dropout=0.0)
+
+    class _Linear(PeftLinear):  # type: ignore[misc]
+        def forward(self, x: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+            # Base hooks (Turbo's overlay) run inside `base_layer`. Extra memory: [rows, rank].
+            result = self.base_layer(x, *args, **kwargs).contiguous()
+            flat, rows = result.view(-1, result.shape[-1]), x.reshape(-1, x.shape[-1])
+            for name in self.active_adapters:
+                low = nn.functional.linear(rows, self.lora_A[name].weight.to(rows.dtype))
+                flat.addmm_(
+                    low.to(flat.dtype),
+                    self.lora_B[name].weight.to(flat.dtype).t(),
+                    alpha=self.scaling[name],
+                )
+            return result
 
     def apply(obj: object) -> None:
         members = getattr(obj, "components", None)
@@ -313,7 +328,7 @@ def composer(graph: Graph) -> Callable[[object], None]:
             if len({row.adapter for row in rows}) != len(rows):
                 raise _refuse("graph", f"{component}.{path} repeats one adapter term")
             first, *others = rows
-            layer = PeftLinear(
+            layer = _Linear(
                 base, first.adapter, config=config, r=first.rank, lora_alpha=first.alpha
             )
             for row in others:
