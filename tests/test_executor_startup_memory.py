@@ -255,8 +255,7 @@ def test_start_ends_an_idle_tenant_whose_executor_is_already_gone(
         reclaim(*args)
 
     monkeypatch.setattr(machine.worker.memory, "reclaim", ended)
-    with fresh.lane.device:
-        assert machine.worker._start_executor(fresh, executor) == ""
+    assert machine.worker._start_executor(fresh, executor) == ""
     assert len(calls) == 1 and not occupied
 
 
