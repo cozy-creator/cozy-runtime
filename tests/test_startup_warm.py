@@ -1177,10 +1177,13 @@ def test_an_executor_of_a_worker_that_sees_no_gpu_never_asks_the_cuda_driver(
     supervision.use_environment(str(installed / "venv" / "bin" / "python"), INSTALLATION)
     executor = supervision.spawn(imposed=imposed)
     try:
-        release = {"application": binding.application, "package_interface": binding.interface_path}
-        assert executor.call(Start(**release, import_only=True), timeout=None)["ok"]
+        application, interface = binding.application, binding.interface_path
+        importing = Start(application=application, package_interface=interface, import_only=True)
+        assert executor.call(importing, timeout=None)["ok"]
         assert _imported(executor)
-        refused = executor.call(Start(**release), timeout=None)
+        refused = executor.call(
+            Start(application=application, package_interface=interface), timeout=None
+        )
         assert not refused["ok"] and refused["code"] == "accelerator_unavailable", refused
         assert _attempts(machine) == [], "it asked the CUDA driver"
         held = {os.readlink(fd) for fd in Path(f"/proc/{executor.pid}/fd").iterdir()}

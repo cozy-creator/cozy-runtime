@@ -24,13 +24,15 @@ H3 = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
 
 def main() -> None:
     published = Path(sys.argv[1])
-    placed = kernel_site.activate()
+    # `activate`, `warm` and `evidence(...).probes` are those releases' API, not this tree's.
+    warm, evidence = getattr(attention, "warm"), getattr(attention, "evidence")  # noqa: B009
+    placed = getattr(kernel_site, "activate")()  # noqa: B009
     device = measure_device(torch, 0)
-    before = attention.warm(device, H3)
+    before = warm(device, H3)
     published.with_suffix(".waiting").write_text("")
     while not published.exists():
         time.sleep(0.2)
-    after = attention.warm(device, H3)
+    after = warm(device, H3)
     print(
         json.dumps(
             {
@@ -41,7 +43,7 @@ def main() -> None:
                 "sageattention": version("sageattention"),
                 "probes": [
                     {"kernel": row.kernel, "status": row.status, "rel_l2": row.rel_l2_by_rows}
-                    for row in attention.evidence({"sageattention"}).probes
+                    for row in evidence({"sageattention"}).probes
                 ],
             }
         )
