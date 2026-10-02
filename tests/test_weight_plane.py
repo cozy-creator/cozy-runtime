@@ -1461,3 +1461,115 @@ def test_a_larger_decode_is_sized_by_the_largest_one_measured(card: Any, tmp_pat
     assert weights.resident_bytes(stack) < mapped
     # short of memory cuDNN may take an algorithm with a smaller workspace: fp16 rounding
     torch.testing.assert_close(image, references[2], atol=1e-2, rtol=0)
+
+
+@on_card
+def test_a_decode_that_does_not_fit_takes_the_largest_tile_that_does(
+    card: Any, tmp_path: Path
+) -> None:
+    """Run 3156: every tiled decode ran at the 128-pixel minimum (the tile side was the
+    square root of a side), 8.7 s for one 1536x1536 image and no smaller tile left to try. A
+    decode whose measured peak does not fit starts at half the image."""
+    diffusers = pytest.importorskip("diffusers")
+    weights = card.weights
+    weights.set_budget(1 << 30)
+
+    def vae() -> Any:
+        torch.manual_seed(5)
+        return diffusers.AutoencoderKL(
+            down_block_types=("DownEncoderBlock2D",) * 2,
+            up_block_types=("UpDecoderBlock2D",) * 2,
+            block_out_channels=(32, 64),
+        ).to(torch.float16)
+
+    values = {k: v.float() for k, v in vae().state_dict().items()}
+    (tmp_path / "vae").mkdir()
+    model = load(
+        weights, store_component(tmp_path / "vae", "vae", values), "kl", name="vae", factory=vae
+    )
+    plain = vae().cuda().eval()
+    plain.load_state_dict({k: v.half() for k, v in values.items()})
+    z = torch.randn(1, 4, 512, 512, device="cuda", dtype=torch.float16)  # 1024x1024 pixels
+    with torch.inference_mode():
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        plain.decode(z)
+        peak = torch.cuda.max_memory_allocated() - before
+        plain.enable_tiling()
+        plain.tile_sample_min_size, plain.tile_latent_min_size = 512, 256
+        reference = plain.decode(z).sample
+    del plain
+
+    def decode(left: int = 0) -> Any:
+        ballast = None
+        model.residency.admit("run", ("vae",))
+        try:
+            with weights.recovering(), torch.inference_mode():
+                torch.cuda.empty_cache()
+                free, _ = torch.cuda.mem_get_info()
+                ballast = torch.empty(free - left if left else 0, dtype=torch.uint8, device="cuda")
+                return model.stack.decode(z).sample
+        finally:
+            model.residency.release("run", ("vae",))
+            del ballast
+            torch.cuda.empty_cache()
+
+    decode()  # the size is measured
+    assert weights.modes["vae.decode"] == "untiled"
+    image = decode(left=peak * 3 // 4)
+    assert weights.modes["vae.decode"] == "tiled 512"
+    torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
+
+
+@on_card
+def test_a_decode_takes_no_room_from_its_stages_floor(card: Any, tmp_path: Path) -> None:
+    """Run 3143 (Anima with 3 GiB free): the VAE decodes inside a stage that also holds a
+    streamed component. Making room for the decode cut the plane to what was resident then,
+    under that stage's floor; the VAE's next block had no room to arrive in, the plan it asked
+    for was refused at every tile size, and the run ended `device_shortfall` with 2.6 GiB
+    allocatable. The room a decode takes is never its open stages' floor."""
+    diffusers = pytest.importorskip("diffusers")
+    weights = card.weights
+    weights.set_budget(-1, pinned=2 << 30)
+    denoiser = load(weights, card.checkpoint, "beside", scope="render")
+
+    def vae() -> Any:
+        torch.manual_seed(5)
+        return diffusers.AutoencoderKL(
+            down_block_types=("DownEncoderBlock2D",) * 2,
+            up_block_types=("UpDecoderBlock2D",) * 2,
+            block_out_channels=(256, 512),
+        ).to(torch.float16)
+
+    values = {k: v.float() for k, v in vae().state_dict().items()}
+    (tmp_path / "vae").mkdir()
+    model = load(
+        weights, store_component(tmp_path / "vae", "vae", values), "kl", name="vae", factory=vae
+    )
+    plain = vae().cuda().eval()
+    plain.load_state_dict({k: v.half() for k, v in values.items()})
+    z = torch.randn(1, 4, 64, 64, device="cuda", dtype=torch.float16)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    with torch.inference_mode():
+        reference = plain.decode(z).sample
+    del plain
+    # Both stream: the VAE in regions larger than the stage's common weights together.
+    stack = denoiser.residency.components["stack"].layout
+    fine = refined(model, "vae")
+    assert fine.largest > stack.common + fine.common
+    weights.set_budget(weight_policy.floor(stack) + weight_policy.floor(fine) + (2 << 20))
+    denoiser.residency.admit("render", ("stack",))
+    try:
+        model.residency.admit("run", ("vae",))
+        try:
+            with weights.recovering(), torch.inference_mode():
+                denoiser.stack(x)  # its last blocks stay mapped: room the decode may take
+                image = model.stack.decode(z).sample
+            assert weights.applied >= weights.floor()
+        finally:
+            model.residency.release("run", ("vae",))
+    finally:
+        denoiser.residency.release("render", ("stack",))
+        torch.cuda.empty_cache()
+    assert weights.modes["vae.decode"] == "untiled"
+    torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
